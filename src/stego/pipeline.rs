@@ -1,0 +1,214 @@
+use crate::jpeg::JpegImage;
+use crate::stego::cost::uerd::compute_uerd;
+use crate::stego::crypto;
+use crate::stego::error::StegoError;
+use crate::stego::frame::{self, MAX_FRAME_BITS};
+use crate::stego::permute;
+use crate::stego::stc::{embed, extract, hhat};
+
+/// STC constraint length for Ghost Phase 1.
+const STC_H: usize = 7;
+
+/// Compute the STC width `w` and usable cover length from the total number of
+/// AC positions. Both encoder and decoder must agree on these values.
+///
+/// Uses `w = floor(n / m_max)` so that `n_used = m_max * w <= n` and the
+/// extraction produces exactly `m_max` bits.
+fn compute_stc_params(n: usize) -> Result<(usize, usize), StegoError> {
+    let m_max = MAX_FRAME_BITS;
+    let w = n / m_max; // floor division
+    if w < 1 {
+        return Err(StegoError::ImageTooSmall);
+    }
+    let n_used = m_max * w;
+    Ok((w, n_used))
+}
+
+/// Encode a text message into a cover JPEG using Ghost mode.
+pub fn ghost_encode(
+    image_bytes: &[u8],
+    message: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    let mut img = JpegImage::from_bytes(image_bytes)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    // 1. Compute UERD costs for Y channel.
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+    let cost_map = compute_uerd(img.dct_grid(0), qt);
+
+    // 2. Derive structural key (Tier 1).
+    let structural_key = crypto::derive_structural_key(passphrase);
+    let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
+    let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
+
+    // 3. Select and permute all AC positions, then truncate to n_used.
+    let positions = permute::select_and_permute(&cost_map, &perm_seed);
+    let n = positions.len();
+    let (w, n_used) = compute_stc_params(n)?;
+    let positions = &positions[..n_used];
+
+    // 4. Encrypt message (Tier 2 key with random salt).
+    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+
+    // 5. Build payload frame and pad to m_max bits.
+    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bits = frame::bytes_to_bits(&frame_bytes);
+    let m = frame_bits.len();
+
+    if m > MAX_FRAME_BITS {
+        return Err(StegoError::MessageTooLarge);
+    }
+
+    let m_max = MAX_FRAME_BITS;
+    let mut padded_bits = vec![0u8; m_max];
+    padded_bits[..m].copy_from_slice(&frame_bits);
+
+    // 6. Extract cover LSBs and costs in permuted order.
+    let grid = img.dct_grid(0);
+    let cover_bits: Vec<u8> = positions.iter().map(|p| {
+        let coeff = flat_get(grid, p.flat_idx);
+        (coeff.unsigned_abs() & 1) as u8
+    }).collect();
+    let costs: Vec<f64> = positions.iter().map(|p| p.cost).collect();
+
+    // 7. Generate H-hat and embed.
+    let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+    let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, STC_H, w)
+        .ok_or(StegoError::MessageTooLarge)?;
+
+    // 8. Apply LSB changes to DctGrid.
+    // For |coeff| > 1: move toward zero (nsF5 convention).
+    // For |coeff| == 1: move AWAY from zero (±1 → ±2) to prevent shrinkage,
+    // which would break encoder-decoder position alignment.
+    let grid_mut = img.dct_grid_mut(0);
+    for (idx, pos) in positions.iter().enumerate() {
+        let old_bit = cover_bits[idx];
+        let new_bit = result.stego_bits[idx];
+        if old_bit != new_bit {
+            let coeff = flat_get_from_mut(grid_mut, pos.flat_idx);
+            let modified = if coeff == 1 {
+                2 // away from zero to prevent shrinkage
+            } else if coeff == -1 {
+                -2 // away from zero to prevent shrinkage
+            } else if coeff > 1 {
+                coeff - 1 // toward zero
+            } else if coeff < -1 {
+                coeff + 1 // toward zero
+            } else {
+                coeff // zero: should never happen (filtered out)
+            };
+            flat_set(grid_mut, pos.flat_idx, modified);
+        }
+    }
+
+    // 9. Rebuild Huffman tables (coefficient changes may need new symbols).
+    img.rebuild_huffman_tables();
+
+    // 10. Write modified JPEG.
+    let stego_bytes = img.to_bytes().map_err(StegoError::InvalidJpeg)?;
+    Ok(stego_bytes)
+}
+
+/// Decode a text message from a stego JPEG using Ghost mode.
+pub fn ghost_decode(
+    stego_bytes: &[u8],
+    passphrase: &str,
+) -> Result<String, StegoError> {
+    let img = JpegImage::from_bytes(stego_bytes)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    // 1. Compute UERD costs (for consistent position selection).
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+    let cost_map = compute_uerd(img.dct_grid(0), qt);
+
+    // 2. Derive structural key.
+    let structural_key = crypto::derive_structural_key(passphrase);
+    let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
+    let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
+
+    // 3. Select and permute AC positions, truncate to n_used (same as encoder).
+    let positions = permute::select_and_permute(&cost_map, &perm_seed);
+    let n = positions.len();
+    let (w, n_used) = compute_stc_params(n)?;
+    let positions = &positions[..n_used];
+
+    // 4. Extract stego LSBs.
+    let grid = img.dct_grid(0);
+    let stego_bits: Vec<u8> = positions.iter().map(|p| {
+        let coeff = flat_get(grid, p.flat_idx);
+        (coeff.unsigned_abs() & 1) as u8
+    }).collect();
+
+    // 5. Generate H-hat and extract message bits.
+    let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+    let extracted_bits = extract::stc_extract(&stego_bits, &hhat_matrix, STC_H, w);
+
+    // 6. Convert bits to bytes and parse frame.
+    let m_max = MAX_FRAME_BITS;
+    let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
+    let parsed = frame::parse_frame(&frame_bytes)?;
+
+    // 7. Decrypt.
+    let plaintext = crypto::decrypt(
+        &parsed.ciphertext,
+        passphrase,
+        &parsed.salt,
+        &parsed.nonce,
+    )?;
+
+    // 8. Truncate to declared length and validate UTF-8.
+    let len = parsed.plaintext_len as usize;
+    if len > plaintext.len() {
+        return Err(StegoError::FrameCorrupted);
+    }
+    let text = std::str::from_utf8(&plaintext[..len])
+        .map_err(|_| StegoError::InvalidUtf8)?;
+
+    Ok(text.to_string())
+}
+
+// --- DctGrid flat access helpers ---
+
+use crate::jpeg::dct::DctGrid;
+
+fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
+    let bw = grid.blocks_wide();
+    let block_idx = flat_idx / 64;
+    let pos = flat_idx % 64;
+    let br = block_idx / bw;
+    let bc = block_idx % bw;
+    let i = pos / 8;
+    let j = pos % 8;
+    grid.get(br, bc, i, j)
+}
+
+fn flat_get_from_mut(grid: &mut DctGrid, flat_idx: usize) -> i16 {
+    let bw = grid.blocks_wide();
+    let block_idx = flat_idx / 64;
+    let pos = flat_idx % 64;
+    let br = block_idx / bw;
+    let bc = block_idx % bw;
+    let i = pos / 8;
+    let j = pos % 8;
+    grid.get(br, bc, i, j)
+}
+
+fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
+    let bw = grid.blocks_wide();
+    let block_idx = flat_idx / 64;
+    let pos = flat_idx % 64;
+    let br = block_idx / bw;
+    let bc = block_idx % bw;
+    let i = pos / 8;
+    let j = pos % 8;
+    grid.set(br, bc, i, j, val);
+}

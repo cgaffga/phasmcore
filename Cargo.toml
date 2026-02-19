@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+rand_chacha = "0.3"
+crc32fast = "1.4"
