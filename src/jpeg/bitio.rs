@@ -70,20 +70,39 @@ impl<'a> BitReader<'a> {
         self.marker_found
     }
 
-    /// Check if the next two bytes form a restart marker (0xFFD0–0xFFD7).
-    /// If so, consume them and return the marker's low nibble (0–7).
+    /// Check if a restart marker (0xFFD0–0xFFD7) is present.
+    /// Checks both the `marker_found` flag (set if `fill_byte` already consumed
+    /// a RST marker during Huffman decoding) and the next bytes in the stream.
+    /// If found, consume the marker and return the marker's low nibble (0–7).
     pub fn check_restart_marker(&mut self) -> Result<Option<u8>> {
         self.byte_align();
-        if self.pos + 1 < self.data.len()
-            && self.data[self.pos] == 0xFF
-            && (self.data[self.pos + 1] & 0xF8) == 0xD0
-        {
-            let rst = self.data[self.pos + 1] & 0x07;
-            self.pos += 2;
-            Ok(Some(rst))
-        } else {
-            Ok(None)
+
+        // Case 1: fill_byte already consumed a RST marker during Huffman decoding
+        if let Some(m) = self.marker_found {
+            if (m & 0xF8) == 0xD0 {
+                self.marker_found = None;
+                return Ok(Some(m & 0x07));
+            }
         }
+
+        // Case 2: RST marker is at the current position in the stream
+        // Also skip any fill 0xFF bytes before the marker
+        while self.pos + 1 < self.data.len() && self.data[self.pos] == 0xFF {
+            let next = self.data[self.pos + 1];
+            if next == 0xFF {
+                // Fill byte — skip it
+                self.pos += 1;
+                continue;
+            }
+            if (next & 0xF8) == 0xD0 {
+                let rst = next & 0x07;
+                self.pos += 2;
+                return Ok(Some(rst));
+            }
+            break;
+        }
+
+        Ok(None)
     }
 
     fn fill_byte(&mut self) -> Result<()> {

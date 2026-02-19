@@ -106,11 +106,17 @@ pub fn ghost_encode(
         }
     }
 
-    // 9. Rebuild Huffman tables (coefficient changes may need new symbols).
-    img.rebuild_huffman_tables();
-
-    // 10. Write modified JPEG.
-    let stego_bytes = img.to_bytes().map_err(StegoError::InvalidJpeg)?;
+    // 9. Write modified JPEG.
+    // Prefer original Huffman tables to avoid coefficient drift from rebuild.
+    // Fall back to rebuilt tables only if the original tables can't encode
+    // a new symbol introduced by the ±1/±2 coefficient changes.
+    let stego_bytes = match img.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            img.rebuild_huffman_tables();
+            img.to_bytes().map_err(StegoError::InvalidJpeg)?
+        }
+    };
     Ok(stego_bytes)
 }
 

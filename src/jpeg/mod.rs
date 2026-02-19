@@ -245,10 +245,22 @@ impl JpegImage {
         }
 
         // Count symbols by simulating the scan encoding.
+        // Must match encode_scan exactly, including restart interval DC pred resets.
         let mut dc_pred = vec![0i16; self.scan_components.len()];
+        let mut mcu_count = 0usize;
 
         for mcu_row in 0..self.frame.mcus_tall as usize {
             for mcu_col in 0..self.frame.mcus_wide as usize {
+                // Reset DC predictors at restart boundaries (must match encode_scan)
+                if self.restart_interval > 0
+                    && mcu_count > 0
+                    && mcu_count % (self.restart_interval as usize) == 0
+                {
+                    for pred in &mut dc_pred {
+                        *pred = 0;
+                    }
+                }
+
                 for (sci, sc) in self.scan_components.iter().enumerate() {
                     let comp = &self.frame.components[sc.comp_idx];
                     for v in 0..comp.v_sampling as usize {
@@ -293,6 +305,8 @@ impl JpegImage {
                         }
                     }
                 }
+
+                mcu_count += 1;
             }
         }
 

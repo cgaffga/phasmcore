@@ -69,22 +69,15 @@ pub fn decode_scan(
 
     let mut reader = BitReader::new(data, scan_start);
     let mut mcu_count = 0usize;
-    let mut restart_count = 0u16;
 
     for mcu_row in 0..frame.mcus_tall as usize {
         for mcu_col in 0..frame.mcus_wide as usize {
             // Check for restart
             if restart_interval > 0 && mcu_count > 0 && mcu_count % (restart_interval as usize) == 0 {
                 reader.byte_align();
-                // Look for RST marker
-                let rst = reader.check_restart_marker()?;
-                if let Some(rst_id) = rst {
-                    let expected = restart_count % 8;
-                    if rst_id != (expected as u8) {
-                        return Err(JpegError::InvalidMarkerData("wrong RST marker sequence"));
-                    }
-                    restart_count += 1;
-                }
+                // Look for RST marker — accept any RST without strict sequence
+                // validation, matching libjpeg/libjpeg-turbo behavior.
+                let _rst = reader.check_restart_marker()?;
                 // Reset DC predictors
                 for pred in &mut dc_pred {
                     *pred = 0;
