@@ -1,14 +1,6 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod jpeg;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use jpeg::error::{JpegError, Result as JpegResult};
+pub use jpeg::dct::{DctGrid, QuantTable};
+pub use jpeg::frame::FrameInfo;
+pub use jpeg::JpegImage;
