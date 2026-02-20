@@ -28,16 +28,16 @@ pub use error::StegoError;
 pub use pipeline::ghost_encode;
 pub use pipeline::ghost_decode;
 pub use capacity::estimate_capacity as ghost_capacity;
-pub use armor::pipeline::{armor_encode, armor_decode};
+pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 
 /// Unified decode: auto-detects Ghost or Armor mode from the embedded frame.
 ///
-/// Tries Ghost first, then Armor. Returns the decoded message and the mode used.
-pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, u8), StegoError> {
+/// Tries Ghost first, then Armor. Returns the decoded message and quality info.
+pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     // Try Ghost first
     match ghost_decode(stego_bytes, passphrase) {
-        Ok(text) => return Ok((text, frame::MODE_GHOST)),
+        Ok(text) => return Ok((text, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => {
             // Could be wrong passphrase for Ghost — still try Armor
         }
@@ -48,7 +48,7 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, u8)
             // Fundamental error (bad JPEG, too small, etc.) — try Armor anyway
             // in case Ghost fails for mode-specific reasons
             match armor_decode(stego_bytes, passphrase) {
-                Ok(text) => return Ok((text, frame::MODE_ARMOR)),
+                Ok((text, quality)) => return Ok((text, quality)),
                 Err(_) => return Err(e), // Return original Ghost error
             }
         }
@@ -56,7 +56,7 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, u8)
 
     // Try Armor
     match armor_decode(stego_bytes, passphrase) {
-        Ok(text) => Ok((text, frame::MODE_ARMOR)),
+        Ok((text, quality)) => Ok((text, quality)),
         Err(_) => Err(StegoError::DecryptionFailed),
     }
 }

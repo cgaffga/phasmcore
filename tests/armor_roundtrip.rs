@@ -11,8 +11,11 @@ fn armor_roundtrip_basic() {
     let passphrase = "test-passphrase-123";
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
-    let decoded = armor_decode(&stego, passphrase).unwrap();
+    let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
     assert_eq!(decoded, message);
+    assert_eq!(quality.mode, 0x02, "should be Armor mode");
+    assert_eq!(quality.rs_errors_corrected, 0, "no recompression = no errors");
+    assert_eq!(quality.integrity_percent, 100);
 }
 
 #[test]
@@ -52,8 +55,9 @@ fn armor_roundtrip_unicode() {
     let passphrase = "unicode-key";
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
-    let decoded = armor_decode(&stego, passphrase).unwrap();
+    let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
     assert_eq!(decoded, message);
+    assert_eq!(quality.integrity_percent, 100);
 }
 
 #[test]
@@ -63,9 +67,11 @@ fn smart_decode_detects_ghost() {
     let passphrase = "shared-pass";
 
     let stego = phasm_core::ghost_encode(&cover, message, passphrase).unwrap();
-    let (decoded, mode) = smart_decode(&stego, passphrase).unwrap();
+    let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
     assert_eq!(decoded, message);
-    assert_eq!(mode, 0x01, "should detect Ghost mode");
+    assert_eq!(quality.mode, 0x01, "should detect Ghost mode");
+    assert_eq!(quality.integrity_percent, 100, "Ghost is always 100%");
+    assert_eq!(quality.rs_errors_corrected, 0, "Ghost has no RS");
 }
 
 #[test]
@@ -75,9 +81,10 @@ fn smart_decode_detects_armor() {
     let passphrase = "shared-pass";
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
-    let (decoded, mode) = smart_decode(&stego, passphrase).unwrap();
+    let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
     assert_eq!(decoded, message);
-    assert_eq!(mode, 0x02, "should detect Armor mode");
+    assert_eq!(quality.mode, 0x02, "should detect Armor mode");
+    assert_eq!(quality.integrity_percent, 100);
 }
 
 #[test]

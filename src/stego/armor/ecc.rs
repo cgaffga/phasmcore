@@ -17,7 +17,7 @@ const K_DEFAULT: usize = 191;
 const PARITY_LEN: usize = N_MAX - K_DEFAULT; // 64
 
 /// Error correction capability: t = parity_len / 2 = 32.
-const T_MAX: usize = PARITY_LEN / 2;
+pub const T_MAX: usize = PARITY_LEN / 2;
 
 // --- GF(2^8) Arithmetic ---
 
@@ -398,7 +398,7 @@ impl core::fmt::Display for RsDecodeError {
 /// - `data_len`: Original data length (before parity was appended).
 ///
 /// # Returns
-/// The corrected data of length `data_len`.
+/// A tuple of (corrected data of length `data_len`, number of symbol errors corrected).
 ///
 /// # Panics
 /// Panics if `received.len() != data_len + PARITY_LEN`.
@@ -410,7 +410,7 @@ impl core::fmt::Display for RsDecodeError {
 /// For shortened codes (`data_len < K_DEFAULT`), the received block is
 /// conceptually zero-padded at the front to form a full 255-symbol block
 /// during syndrome computation.
-pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeError> {
+pub fn rs_decode(received: &[u8], data_len: usize) -> Result<(Vec<u8>, usize), RsDecodeError> {
     let block_len = data_len + PARITY_LEN;
     assert_eq!(
         received.len(),
@@ -429,7 +429,7 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeEr
     let syndromes = compute_syndromes(&full_block);
 
     if syndromes_are_zero(&syndromes) {
-        return Ok(received[..data_len].to_vec());
+        return Ok((received[..data_len].to_vec(), 0));
     }
 
     // Find error locator polynomial (ascending power)
@@ -463,14 +463,27 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeEr
     }
 
     // Extract data (skip padding)
-    Ok(corrected[padding..padding + data_len].to_vec())
+    Ok((corrected[padding..padding + data_len].to_vec(), num_errors))
+}
+
+/// Statistics from RS decoding across all blocks.
+#[derive(Debug, Clone, Default)]
+pub struct RsDecodeStats {
+    /// Total symbol errors corrected across all blocks.
+    pub total_errors: usize,
+    /// Maximum correctable errors per block (T_MAX × num_blocks).
+    pub error_capacity: usize,
+    /// Maximum errors found in any single block.
+    pub max_block_errors: usize,
+    /// Number of RS blocks decoded.
+    pub num_blocks: usize,
 }
 
 /// RS-decode a payload that was encoded with [`rs_encode_blocks`].
 ///
 /// Splits the encoded data into blocks based on `total_data_len`, decodes
 /// each block independently (correcting up to `t=32` symbol errors per block),
-/// and concatenates the results.
+/// and concatenates the results. Returns decode stats with error counts.
 ///
 /// # Arguments
 /// - `encoded`: The RS-encoded data (output of `rs_encode_blocks`).
@@ -479,10 +492,11 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeEr
 /// # Errors
 /// Returns [`RsDecodeError`] if any block has too many errors to correct
 /// or the encoded data is too short.
-pub fn rs_decode_blocks(encoded: &[u8], total_data_len: usize) -> Result<Vec<u8>, RsDecodeError> {
+pub fn rs_decode_blocks(encoded: &[u8], total_data_len: usize) -> Result<(Vec<u8>, RsDecodeStats), RsDecodeError> {
     let mut decoded = Vec::with_capacity(total_data_len);
     let mut remaining_data = total_data_len;
     let mut offset = 0;
+    let mut stats = RsDecodeStats::default();
 
     while remaining_data > 0 {
         let chunk_data_len = remaining_data.min(K_DEFAULT);
@@ -493,14 +507,21 @@ pub fn rs_decode_blocks(encoded: &[u8], total_data_len: usize) -> Result<Vec<u8>
         }
 
         let block = &encoded[offset..offset + block_len];
-        let data = rs_decode(block, chunk_data_len)?;
+        let (data, errors) = rs_decode(block, chunk_data_len)?;
         decoded.extend_from_slice(&data);
+
+        stats.total_errors += errors;
+        stats.num_blocks += 1;
+        if errors > stats.max_block_errors {
+            stats.max_block_errors = errors;
+        }
 
         offset += block_len;
         remaining_data -= chunk_data_len;
     }
 
-    Ok(decoded)
+    stats.error_capacity = stats.num_blocks * T_MAX;
+    Ok((decoded, stats))
 }
 
 /// Return the RS-encoded length for a given data length.
@@ -565,8 +586,9 @@ mod tests {
     fn encode_decode_no_errors() {
         let data = b"Hello, Reed-Solomon!";
         let encoded = rs_encode(data);
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 0);
     }
 
     #[test]
@@ -574,20 +596,23 @@ mod tests {
         let data = b"Test message for RS error correction.";
         let mut encoded = rs_encode(data);
 
-        // Introduce 10 symbol errors (well within t=32 correction capability)
+        // Introduce 10 symbol errors (well within t=32 correction capability).
+        // Note: data.len()=37, so avoid position 37 in the data region to
+        // prevent overlap with the first parity error at data.len().
         encoded[0] ^= 0xFF;
         encoded[5] ^= 0xAA;
         encoded[10] ^= 0x55;
-        encoded[20] ^= 0x11;
-        encoded[30] ^= 0x22;
-        encoded[35] ^= 0x33;
-        encoded[37] ^= 0x01;
+        encoded[15] ^= 0x11;
+        encoded[20] ^= 0x22;
+        encoded[25] ^= 0x33;
+        encoded[30] ^= 0x01;
         encoded[data.len()] ^= 0x77; // error in parity
         encoded[data.len() + 10] ^= 0x88;
         encoded[data.len() + 30] ^= 0x99;
 
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 10);
     }
 
     #[test]
@@ -600,8 +625,9 @@ mod tests {
             encoded[i * 3] ^= 0xFF;
         }
 
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 32);
     }
 
     #[test]
@@ -624,8 +650,9 @@ mod tests {
         let encoded = rs_encode(data);
         assert_eq!(encoded.len(), data.len() + PARITY_LEN);
 
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 0);
     }
 
     #[test]
@@ -635,8 +662,9 @@ mod tests {
         encoded[0] ^= 0xFF;
         encoded[2] ^= 0xAA;
 
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 2);
     }
 
     #[test]
@@ -648,8 +676,9 @@ mod tests {
         // Should be 2 blocks: 191+64=255 and 209+64=273 → 528 total
         assert_eq!(encoded.len(), rs_encoded_len(data.len()));
 
-        let decoded = rs_decode_blocks(&encoded, data.len()).unwrap();
+        let (decoded, stats) = rs_decode_blocks(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(stats.total_errors, 0);
     }
 
     #[test]
@@ -666,8 +695,10 @@ mod tests {
         // Block 3 starts at 510 (len 82)
         encoded[520] ^= 0x33;
 
-        let decoded = rs_decode_blocks(&encoded, data.len()).unwrap();
+        let (decoded, stats) = rs_decode_blocks(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(stats.total_errors, 5);
+        assert!(stats.max_block_errors <= 2);
     }
 
     #[test]
@@ -675,8 +706,9 @@ mod tests {
         let data: &[u8] = &[];
         let encoded = rs_encode(data);
         assert_eq!(encoded.len(), PARITY_LEN);
-        let decoded = rs_decode(&encoded, 0).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, 0).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 0);
     }
 
     #[test]
@@ -703,8 +735,9 @@ mod tests {
         let data = vec![42u8; K_DEFAULT];
         let mut encoded = rs_encode(&data);
         encoded[50] ^= 0x01;
-        let decoded = rs_decode(&encoded, K_DEFAULT).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, K_DEFAULT).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 1);
     }
 
     #[test]
@@ -712,8 +745,9 @@ mod tests {
         let data = b"Short";
         let mut encoded = rs_encode(data);
         encoded[0] ^= 0xFF;
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 1);
     }
 
     #[test]
@@ -722,8 +756,9 @@ mod tests {
         let mut encoded = rs_encode(&data);
         encoded[0] ^= 0xFF;
         encoded[50] ^= 0xAA;
-        let decoded = rs_decode(&encoded, K_DEFAULT).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, K_DEFAULT).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 2);
     }
 
     #[test]
@@ -732,8 +767,9 @@ mod tests {
         let mut encoded = rs_encode(data);
         encoded[0] ^= 0xFF;
         encoded[2] ^= 0xAA;
-        let decoded = rs_decode(&encoded, data.len()).unwrap();
+        let (decoded, errors) = rs_decode(&encoded, data.len()).unwrap();
         assert_eq!(decoded, data);
+        assert_eq!(errors, 2);
     }
 
     #[test]

@@ -122,6 +122,47 @@ pub fn armor_encode(
     Ok(stego_bytes)
 }
 
+/// Quality information from a successful decode.
+#[derive(Debug, Clone)]
+pub struct DecodeQuality {
+    /// Mode that was used: `frame::MODE_GHOST` or `frame::MODE_ARMOR`.
+    pub mode: u8,
+    /// Number of RS symbol errors corrected (0 for Ghost).
+    pub rs_errors_corrected: u32,
+    /// Maximum correctable RS errors across all blocks (0 for Ghost).
+    pub rs_error_capacity: u32,
+    /// Integrity percentage: 100 = pristine, 0 = barely recovered.
+    pub integrity_percent: u8,
+}
+
+impl DecodeQuality {
+    /// Create quality info for a Ghost decode (binary: always 100% if successful).
+    pub fn ghost() -> Self {
+        Self {
+            mode: super::super::frame::MODE_GHOST,
+            rs_errors_corrected: 0,
+            rs_error_capacity: 0,
+            integrity_percent: 100,
+        }
+    }
+
+    /// Create quality info from Armor RS decode stats.
+    pub fn from_rs_stats(stats: &ecc::RsDecodeStats) -> Self {
+        let integrity = if stats.error_capacity == 0 {
+            100
+        } else {
+            let ratio = stats.total_errors as f64 / stats.error_capacity as f64;
+            ((1.0 - ratio) * 100.0).round().max(0.0).min(100.0) as u8
+        };
+        Self {
+            mode: super::super::frame::MODE_ARMOR,
+            rs_errors_corrected: stats.total_errors as u32,
+            rs_error_capacity: stats.error_capacity as u32,
+            integrity_percent: integrity,
+        }
+    }
+}
+
 /// Decode a text message from a stego JPEG using Armor mode.
 ///
 /// # Arguments
@@ -129,13 +170,13 @@ pub fn armor_encode(
 /// - `passphrase`: The passphrase used during encoding.
 ///
 /// # Returns
-/// The decoded plaintext message, or an error if decoding fails.
+/// A tuple of (decoded plaintext message, decode quality info).
 ///
 /// # Errors
 /// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
 /// - [`StegoError::FrameCorrupted`] if RS decoding or CRC check fails.
 /// - [`StegoError::InvalidUtf8`] if the decrypted payload is not valid UTF-8.
-pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, StegoError> {
+pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
 
     if img.num_components() == 0 {
@@ -193,7 +234,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
     //    First, try to read the frame header to get the plaintext length,
     //    then compute expected RS block sizes.
     //    Strategy: try decoding with decreasing assumed data lengths.
-    let decoded_frame = try_rs_decode_frame(&extracted_bytes)?;
+    let (decoded_frame, rs_stats) = try_rs_decode_frame(&extracted_bytes)?;
 
     // 9. Parse frame.
     let parsed = frame::parse_frame(&decoded_frame)?;
@@ -215,7 +256,8 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
     let text =
         std::str::from_utf8(&plaintext[..len]).map_err(|_| StegoError::InvalidUtf8)?;
 
-    Ok(text.to_string())
+    let quality = DecodeQuality::from_rs_stats(&rs_stats);
+    Ok((text.to_string(), quality))
 }
 
 /// Try to RS-decode a frame from extracted bytes.
@@ -231,7 +273,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
 /// 1. RS decoding fails fast for incorrect block sizes (syndrome check)
 /// 2. The CRC provides additional validation
 /// 3. AES-GCM-SIV authentication catches any remaining corruption
-fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
+fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecodeStats), StegoError> {
     // The first RS block contains the frame header.
     // For a shortened RS block of data_len d, the encoded block is d + 64 bytes.
     // We need to figure out d. The frame header is: len(2) + ...
@@ -255,7 +297,7 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
             break;
         }
 
-        if let Ok(first_block_data) = ecc::rs_decode(&extracted_bytes[..block_len], data_len) {
+        if let Ok((first_block_data, first_errors)) = ecc::rs_decode(&extracted_bytes[..block_len], data_len) {
             // Check if this looks like a valid frame header
             if first_block_data.len() >= 2 {
                 let pt_len =
@@ -270,12 +312,24 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
 
                 if total_frame_len == data_len {
                     // Single block decode succeeded with exact size
-                    return Ok(first_block_data);
+                    let stats = ecc::RsDecodeStats {
+                        total_errors: first_errors,
+                        error_capacity: ecc::T_MAX,
+                        max_block_errors: first_errors,
+                        num_blocks: 1,
+                    };
+                    return Ok((first_block_data, stats));
                 }
 
                 if total_frame_len <= data_len {
                     // Frame fits in a single block
-                    return Ok(first_block_data[..total_frame_len].to_vec());
+                    let stats = ecc::RsDecodeStats {
+                        total_errors: first_errors,
+                        error_capacity: ecc::T_MAX,
+                        max_block_errors: first_errors,
+                        num_blocks: 1,
+                    };
+                    return Ok((first_block_data[..total_frame_len].to_vec(), stats));
                 }
 
                 // Need multiple blocks
@@ -283,11 +337,11 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
                     // Try full multi-block decode
                     let rs_encoded_len = ecc::rs_encoded_len(total_frame_len);
                     if rs_encoded_len <= extracted_bytes.len() {
-                        if let Ok(decoded) = ecc::rs_decode_blocks(
+                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks(
                             &extracted_bytes[..rs_encoded_len],
                             total_frame_len,
                         ) {
-                            return Ok(decoded);
+                            return Ok((decoded, stats));
                         }
                     }
                 }
