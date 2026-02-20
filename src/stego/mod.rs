@@ -35,10 +35,13 @@ pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 ///
 /// Tries Ghost first, then Armor. Returns the decoded message and quality info.
 pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    let mut saw_decryption_failed = false;
+
     // Try Ghost first
     match ghost_decode(stego_bytes, passphrase) {
         Ok(text) => return Ok((text, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => {
+            saw_decryption_failed = true;
             // Could be wrong passphrase for Ghost — still try Armor
         }
         Err(StegoError::FrameCorrupted) => {
@@ -57,6 +60,16 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
     // Try Armor
     match armor_decode(stego_bytes, passphrase) {
         Ok((text, quality)) => Ok((text, quality)),
-        Err(_) => Err(StegoError::DecryptionFailed),
+        Err(StegoError::DecryptionFailed) => Err(StegoError::DecryptionFailed),
+        Err(e) => {
+            // Only report DecryptionFailed if at least one mode actually
+            // reached the decryption stage. Otherwise the image likely has
+            // no hidden message at all (or is too corrupted to decode).
+            if saw_decryption_failed {
+                Err(StegoError::DecryptionFailed)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
