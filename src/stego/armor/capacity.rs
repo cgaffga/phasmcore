@@ -15,6 +15,11 @@ use crate::stego::frame::FRAME_OVERHEAD;
 /// - Reed-Solomon parity overhead (64 bytes per 191-byte block)
 /// - Frame overhead (length, salt, nonce, auth tag, CRC)
 ///
+/// Note: Phase 2 adaptive robustness (higher RS parity, repetition coding,
+/// adaptive delta) uses spare capacity automatically when the message is small
+/// relative to the image. This does not reduce the maximum capacity reported
+/// here — it only improves robustness for messages well below this limit.
+///
 /// # Errors
 /// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
 /// or its quantization table is missing.

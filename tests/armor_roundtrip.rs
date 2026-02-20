@@ -97,3 +97,79 @@ fn both_modes_have_positive_capacity() {
     assert!(armor_cap > 0, "Armor capacity should be positive");
     assert!(ghost_cap > 0, "Ghost capacity should be positive");
 }
+
+// --- Phase 2 adaptive robustness tests ---
+
+#[test]
+fn armor_phase2_short_message_activates_repetition() {
+    // "armor message" (13 chars) in 320x240 should trigger Phase 2 (r>=3)
+    let cover = load_test_image("photo_320x240_q75_420.jpg");
+    let message = "armor message";
+    let passphrase = "phase2-test-key";
+
+    let stego = armor_encode(&cover, message, passphrase).unwrap();
+    let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
+    assert_eq!(decoded, message);
+    assert_eq!(quality.mode, 0x02);
+    assert_eq!(quality.integrity_percent, 100);
+    // Phase 2 should use higher parity and/or repetition
+    assert!(
+        quality.repetition_factor >= 3 || quality.parity_len > 64,
+        "Phase 2 should activate for short message: r={}, parity={}",
+        quality.repetition_factor, quality.parity_len
+    );
+}
+
+#[test]
+fn armor_phase2_quality_fields_present() {
+    let cover = load_test_image("photo_320x240_q75_420.jpg");
+    let message = "test";
+    let passphrase = "quality-fields-test";
+
+    let stego = armor_encode(&cover, message, passphrase).unwrap();
+    let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
+    assert_eq!(decoded, message);
+    // New quality fields should be populated
+    assert!(quality.parity_len > 0, "parity_len should be set");
+}
+
+#[test]
+fn armor_phase1_large_message_no_repetition() {
+    // A message that fills most of the capacity should use Phase 1 (r=1)
+    let cover = load_test_image("photo_320x240_q75_420.jpg");
+    let img = JpegImage::from_bytes(&cover).unwrap();
+    let cap = armor_capacity(&img).unwrap();
+
+    // Use ~80% of capacity
+    let msg_len = (cap * 4 / 5).min(cap);
+    if msg_len < 10 {
+        return; // Image too small for this test
+    }
+    let message: String = "A".repeat(msg_len);
+    let passphrase = "large-msg-test";
+
+    let stego = armor_encode(&cover, &message, passphrase).unwrap();
+    let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
+    assert_eq!(decoded, message);
+    assert_eq!(quality.integrity_percent, 100);
+    // Phase 1 should be used (no repetition or r=1)
+    assert!(
+        quality.repetition_factor <= 1,
+        "Large message should use Phase 1: r={}",
+        quality.repetition_factor
+    );
+}
+
+#[test]
+fn armor_phase2_smart_decode_works() {
+    // smart_decode should work with Phase 2 encoded images
+    let cover = load_test_image("photo_320x240_q75_420.jpg");
+    let message = "smart decode p2";
+    let passphrase = "smart-p2-key";
+
+    let stego = armor_encode(&cover, message, passphrase).unwrap();
+    let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
+    assert_eq!(decoded, message);
+    assert_eq!(quality.mode, 0x02, "should detect Armor mode");
+    assert_eq!(quality.integrity_percent, 100);
+}

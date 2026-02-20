@@ -19,6 +19,9 @@ const PARITY_LEN: usize = N_MAX - K_DEFAULT; // 64
 /// Error correction capability: t = parity_len / 2 = 32.
 pub const T_MAX: usize = PARITY_LEN / 2;
 
+/// Fixed parity tiers for adaptive RS (limits decoder search space to 4 attempts).
+pub const PARITY_TIERS: [usize; 4] = [64, 128, 192, 240];
+
 // --- GF(2^8) Arithmetic ---
 
 /// Precomputed log and exp tables for GF(2^8).
@@ -130,6 +133,32 @@ fn gen_poly() -> &'static Vec<u8> {
     use std::sync::OnceLock;
     static GEN: OnceLock<Vec<u8>> = OnceLock::new();
     GEN.get_or_init(|| build_gen_poly(PARITY_LEN))
+}
+
+/// Cached generator polynomial for a given parity length.
+/// Uses OnceLock per tier to avoid recomputing.
+fn gen_poly_for(parity_len: usize) -> &'static Vec<u8> {
+    use std::sync::OnceLock;
+    static GEN_64: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_128: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_192: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_240: OnceLock<Vec<u8>> = OnceLock::new();
+
+    match parity_len {
+        64 => GEN_64.get_or_init(|| build_gen_poly(64)),
+        128 => GEN_128.get_or_init(|| build_gen_poly(128)),
+        192 => GEN_192.get_or_init(|| build_gen_poly(192)),
+        240 => GEN_240.get_or_init(|| build_gen_poly(240)),
+        _ => {
+            // For the default parity, reuse the existing cache
+            if parity_len == PARITY_LEN {
+                gen_poly()
+            } else {
+                // Fallback: compute fresh (not cached, but should not hit this in practice)
+                Box::leak(Box::new(build_gen_poly(parity_len)))
+            }
+        }
+    }
 }
 
 // --- Encoding ---
@@ -540,6 +569,194 @@ pub const fn parity_len() -> usize {
     PARITY_LEN
 }
 
+// --- Adaptive RS with configurable parity ---
+
+/// RS-encode a single data block with configurable parity length.
+///
+/// # Arguments
+/// - `data`: Data bytes of length <= `255 - parity_len`.
+/// - `parity_len`: Number of parity symbols (must be even, <= 240).
+///
+/// # Returns
+/// A vector of `data.len() + parity_len` bytes.
+pub fn rs_encode_with_parity(data: &[u8], parity_len: usize) -> Vec<u8> {
+    let k_max = N_MAX - parity_len;
+    assert!(
+        data.len() <= k_max,
+        "data length {} exceeds max {} for parity_len={}",
+        data.len(),
+        k_max,
+        parity_len
+    );
+    assert!(parity_len <= 240, "parity_len {} exceeds 240", parity_len);
+
+    let gpoly = gen_poly_for(parity_len);
+    let mut shift_reg = vec![0u8; parity_len];
+
+    for &byte in data {
+        let feedback = gf_add(byte, shift_reg[0]);
+        for j in 0..parity_len - 1 {
+            shift_reg[j] = gf_add(shift_reg[j + 1], gf_mul(feedback, gpoly[j + 1]));
+        }
+        shift_reg[parity_len - 1] = gf_mul(feedback, gpoly[parity_len]);
+    }
+
+    let mut encoded = Vec::with_capacity(data.len() + parity_len);
+    encoded.extend_from_slice(data);
+    encoded.extend_from_slice(&shift_reg);
+    encoded
+}
+
+/// RS-decode a single block with configurable parity length.
+///
+/// # Arguments
+/// - `received`: Received block of length `data_len + parity_len`.
+/// - `data_len`: Original data length.
+/// - `parity_len`: Parity symbols used during encoding.
+///
+/// # Returns
+/// (corrected data, number of errors corrected).
+pub fn rs_decode_with_parity(
+    received: &[u8],
+    data_len: usize,
+    parity_len: usize,
+) -> Result<(Vec<u8>, usize), RsDecodeError> {
+    let block_len = data_len + parity_len;
+    assert_eq!(
+        received.len(),
+        block_len,
+        "received length {} != expected {}",
+        received.len(),
+        block_len
+    );
+
+    let padding = N_MAX - block_len;
+    let mut full_block = vec![0u8; N_MAX];
+    full_block[padding..].copy_from_slice(received);
+
+    // Compute syndromes with the given parity length
+    let tab = gf_tables();
+    let mut syndromes = vec![0u8; parity_len];
+    for i in 0..parity_len {
+        syndromes[i] = poly_eval(&full_block, tab.exp[i]);
+    }
+
+    if syndromes.iter().all(|&s| s == 0) {
+        return Ok((received[..data_len].to_vec(), 0));
+    }
+
+    let t_max = parity_len / 2;
+    let sigma_asc = berlekamp_massey(&syndromes);
+    let num_errors = sigma_asc.len() - 1;
+
+    if num_errors > t_max {
+        return Err(RsDecodeError);
+    }
+
+    let found = chien_search(&sigma_asc, N_MAX).ok_or(RsDecodeError)?;
+    let magnitudes = forney(&sigma_asc, &syndromes, &found);
+
+    let mut corrected = full_block;
+    for (i, &(_, array_pos)) in found.iter().enumerate() {
+        if array_pos < padding {
+            return Err(RsDecodeError);
+        }
+        corrected[array_pos] = gf_add(corrected[array_pos], magnitudes[i]);
+    }
+
+    // Verify syndromes are now zero
+    let mut check_ok = true;
+    for i in 0..parity_len {
+        if poly_eval(&corrected, tab.exp[i]) != 0 {
+            check_ok = false;
+            break;
+        }
+    }
+    if !check_ok {
+        return Err(RsDecodeError);
+    }
+
+    Ok((corrected[padding..padding + data_len].to_vec(), num_errors))
+}
+
+/// RS-encode an arbitrarily long payload with configurable parity, splitting into blocks.
+pub fn rs_encode_blocks_with_parity(payload: &[u8], parity_len: usize) -> Vec<u8> {
+    let k_max = N_MAX - parity_len;
+    let mut encoded = Vec::new();
+    for chunk in payload.chunks(k_max) {
+        encoded.extend_from_slice(&rs_encode_with_parity(chunk, parity_len));
+    }
+    encoded
+}
+
+/// RS-decode a payload encoded with [`rs_encode_blocks_with_parity`].
+pub fn rs_decode_blocks_with_parity(
+    encoded: &[u8],
+    total_data_len: usize,
+    parity_len: usize,
+) -> Result<(Vec<u8>, RsDecodeStats), RsDecodeError> {
+    let k_max = N_MAX - parity_len;
+    let t_max = parity_len / 2;
+    let mut decoded = Vec::with_capacity(total_data_len);
+    let mut remaining_data = total_data_len;
+    let mut offset = 0;
+    let mut stats = RsDecodeStats::default();
+
+    while remaining_data > 0 {
+        let chunk_data_len = remaining_data.min(k_max);
+        let block_len = chunk_data_len + parity_len;
+
+        if offset + block_len > encoded.len() {
+            return Err(RsDecodeError);
+        }
+
+        let block = &encoded[offset..offset + block_len];
+        let (data, errors) = rs_decode_with_parity(block, chunk_data_len, parity_len)?;
+        decoded.extend_from_slice(&data);
+
+        stats.total_errors += errors;
+        stats.num_blocks += 1;
+        if errors > stats.max_block_errors {
+            stats.max_block_errors = errors;
+        }
+
+        offset += block_len;
+        remaining_data -= chunk_data_len;
+    }
+
+    stats.error_capacity = stats.num_blocks * t_max;
+    Ok((decoded, stats))
+}
+
+/// Return the RS-encoded length for a given data length and parity length.
+pub fn rs_encoded_len_with_parity(data_len: usize, parity_len: usize) -> usize {
+    let k_max = N_MAX - parity_len;
+    let full_blocks = data_len / k_max;
+    let remainder = data_len % k_max;
+    let mut total = full_blocks * (k_max + parity_len);
+    if remainder > 0 {
+        total += remainder + parity_len;
+    }
+    total
+}
+
+/// Choose the best parity tier for a given frame size and embedding capacity (in bits).
+///
+/// Picks the largest parity from [`PARITY_TIERS`] where the RS-encoded data
+/// (in bits) still fits within `num_units`.
+pub fn choose_parity_tier(frame_len: usize, num_units: usize) -> usize {
+    let mut best = PARITY_TIERS[0]; // fallback to smallest
+    for &tier in &PARITY_TIERS {
+        let rs_bits = rs_encoded_len_with_parity(frame_len, tier) * 8;
+        if rs_bits <= num_units {
+            best = tier;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,5 +1001,75 @@ mod tests {
         for i in 0..PARITY_LEN {
             assert_eq!(poly_eval(gpoly, t.exp[i]), 0, "root alpha^{i} failed");
         }
+    }
+
+    // --- Adaptive RS tests ---
+
+    #[test]
+    fn adaptive_rs_roundtrip_each_tier() {
+        for &parity in &PARITY_TIERS {
+            let k_max = N_MAX - parity;
+            let data: Vec<u8> = (0..k_max.min(100)).map(|i| (i % 256) as u8).collect();
+            let encoded = rs_encode_with_parity(&data, parity);
+            assert_eq!(encoded.len(), data.len() + parity);
+            let (decoded, errors) = rs_decode_with_parity(&encoded, data.len(), parity).unwrap();
+            assert_eq!(decoded, data, "parity={parity}");
+            assert_eq!(errors, 0, "parity={parity}");
+        }
+    }
+
+    #[test]
+    fn adaptive_rs_corrects_errors_at_each_tier() {
+        for &parity in &PARITY_TIERS {
+            let k_max = N_MAX - parity;
+            let t = parity / 2;
+            let data: Vec<u8> = (0..k_max.min(50)).map(|i| (i % 256) as u8).collect();
+            let mut encoded = rs_encode_with_parity(&data, parity);
+
+            // Introduce t/2 errors (well within correction capability)
+            let num_errors = (t / 2).min(encoded.len());
+            let elen = encoded.len();
+            for i in 0..num_errors {
+                encoded[i * 2 % elen] ^= 0xFF;
+            }
+
+            let (decoded, errors) = rs_decode_with_parity(&encoded, data.len(), parity).unwrap();
+            assert_eq!(decoded, data, "parity={parity}");
+            assert!(errors > 0, "parity={parity}");
+        }
+    }
+
+    #[test]
+    fn adaptive_rs_blocks_roundtrip() {
+        let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
+        for &parity in &PARITY_TIERS {
+            let encoded = rs_encode_blocks_with_parity(&data, parity);
+            assert_eq!(encoded.len(), rs_encoded_len_with_parity(data.len(), parity));
+            let (decoded, stats) = rs_decode_blocks_with_parity(&encoded, data.len(), parity).unwrap();
+            assert_eq!(decoded, data, "parity={parity}");
+            assert_eq!(stats.total_errors, 0, "parity={parity}");
+        }
+    }
+
+    #[test]
+    fn rs_encoded_len_with_parity_correct() {
+        // With parity=128, k_max=127
+        assert_eq!(rs_encoded_len_with_parity(100, 128), 100 + 128);
+        assert_eq!(rs_encoded_len_with_parity(127, 128), 127 + 128);
+        // 128 bytes at parity=128: k_max=127, so 2 blocks: 127+128 + 1+128
+        assert_eq!(rs_encoded_len_with_parity(128, 128), (127 + 128) + (1 + 128));
+    }
+
+    #[test]
+    fn choose_parity_tier_picks_largest_fitting() {
+        // 100-byte frame, 10000 embedding units
+        // tier 64: rs_len = 100+64=164 bytes = 1312 bits → fits
+        // tier 128: rs_len = 100+128=228 bytes = 1824 bits → fits
+        // tier 192: rs_len = 100+192=292 bytes (but k_max=63, 100>63, so 2 blocks)
+        //   = 63+192 + 37+192 = 484 bytes = 3872 bits → fits
+        // tier 240: rs_len = 100+240 but k_max=15, many blocks
+        //   = ceil(100/15)*255 = 7*255 = 1785 bytes = 14280 bits → exceeds 10000
+        let tier = choose_parity_tier(100, 10000);
+        assert_eq!(tier, 192);
     }
 }

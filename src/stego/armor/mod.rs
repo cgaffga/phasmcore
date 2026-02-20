@@ -8,11 +8,22 @@
 //! - **Stability analysis** to select coefficient positions that survive
 //!   quality factor changes
 //!
-//! The pipeline: encrypt -> frame -> RS encode -> STDM embed per bit.
+//! **Phase 2 adaptive robustness:** When the message is small relative to the
+//! image capacity, the encoder automatically maximizes robustness by:
+//! - Increasing RS parity (up to 240/255 symbols, from fixed 64/255)
+//! - Repeating the RS-encoded bitstream r times across spare capacity
+//! - Using soft majority voting with STDM log-likelihood ratios on decode
+//! - Increasing the STDM delta for larger decision regions
+//!
+//! Phase 2 activates transparently when r >= 3. Phase 1 images (r <= 1) are
+//! decoded using the original path for full backward compatibility.
+//!
+//! The pipeline: encrypt -> frame -> RS encode -> [repeat r×] -> STDM embed.
 
 pub mod ecc;
 pub mod selection;
 pub mod spreading;
 pub mod embedding;
+pub mod repetition;
 pub mod capacity;
 pub mod pipeline;
