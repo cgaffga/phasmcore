@@ -26,4 +26,7 @@ pub mod spreading;
 pub mod embedding;
 pub mod repetition;
 pub mod capacity;
+pub mod fft2d;
+pub mod template;
+pub mod resample;
 pub mod pipeline;

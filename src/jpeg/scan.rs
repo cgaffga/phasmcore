@@ -15,6 +15,7 @@ use super::tables::HuffmanSpec;
 use super::zigzag::{NATURAL_TO_ZIGZAG, ZIGZAG_TO_NATURAL};
 
 /// Component selector for one scan component.
+#[derive(Clone)]
 pub struct ScanComponent {
     /// Index into FrameInfo.components.
     pub comp_idx: usize,

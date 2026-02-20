@@ -28,6 +28,7 @@ pub mod huffman;
 pub mod frame;
 pub mod marker;
 pub mod scan;
+pub mod pixels;
 
 use dct::DctGrid;
 use error::{JpegError, Result};
@@ -45,6 +46,7 @@ use zigzag::NATURAL_TO_ZIGZAG;
 /// call [`JpegImage::to_bytes`] to re-encode. If coefficient modifications
 /// introduce symbols not present in the original Huffman tables, call
 /// [`JpegImage::rebuild_huffman_tables`] first.
+#[derive(Clone)]
 pub struct JpegImage {
     /// Frame information (dimensions, components, sampling factors).
     frame: FrameInfo,

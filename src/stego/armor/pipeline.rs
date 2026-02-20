@@ -12,11 +12,15 @@
 
 use crate::jpeg::JpegImage;
 use crate::jpeg::dct::DctGrid;
+use crate::jpeg::pixels;
 use crate::stego::armor::ecc;
 use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract, stdm_extract_soft};
+use crate::stego::armor::fft2d;
 use crate::stego::armor::repetition;
+use crate::stego::armor::resample;
 use crate::stego::armor::selection::compute_stability_map;
 use crate::stego::armor::spreading::{generate_spreading_vectors, SPREAD_LEN};
+use crate::stego::armor::template;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame;
@@ -54,7 +58,12 @@ pub fn armor_encode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute stability map for Y channel.
+    // Phase 3: Embed DFT template BEFORE STDM for geometry resilience.
+    // The template operates in the pixel/frequency domain and is invisible
+    // to the DCT-level STDM embedding that follows.
+    embed_dft_template(&mut img, passphrase)?;
+
+    // 1. Compute stability map for Y channel (now on templated image).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img
         .quant_table(qt_id)
@@ -205,6 +214,14 @@ pub struct DecodeQuality {
     pub repetition_factor: u8,
     /// RS parity symbols used per block.
     pub parity_len: u16,
+    /// True if geometric recovery (Phase 3) was used to decode.
+    pub geometry_corrected: bool,
+    /// Number of template peaks detected (out of 32).
+    pub template_peaks_detected: u8,
+    /// Estimated rotation angle in degrees (0 if no geometry correction).
+    pub estimated_rotation_deg: f32,
+    /// Estimated scale factor (1.0 if no geometry correction).
+    pub estimated_scale: f32,
 }
 
 impl DecodeQuality {
@@ -217,6 +234,10 @@ impl DecodeQuality {
             integrity_percent: 100,
             repetition_factor: 0,
             parity_len: 0,
+            geometry_corrected: false,
+            template_peaks_detected: 0,
+            estimated_rotation_deg: 0.0,
+            estimated_scale: 1.0,
         }
     }
 
@@ -244,6 +265,10 @@ impl DecodeQuality {
             integrity_percent: integrity,
             repetition_factor,
             parity_len,
+            geometry_corrected: false,
+            template_peaks_detected: 0,
+            estimated_rotation_deg: 0.0,
+            estimated_scale: 1.0,
         }
     }
 }
@@ -267,6 +292,21 @@ impl DecodeQuality {
 /// - [`StegoError::FrameCorrupted`] if RS decoding or CRC check fails.
 /// - [`StegoError::InvalidUtf8`] if the decrypted payload is not valid UTF-8.
 pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    // Fast path: try standard decode (zero overhead for unmodified images).
+    match try_armor_decode(stego_bytes, passphrase) {
+        Ok(result) => return Ok(result),
+        Err(fast_err) => {
+            // Fast path failed — try geometric recovery (Phase 3).
+            match try_geometric_recovery(stego_bytes, passphrase) {
+                Ok(result) => return Ok(result),
+                Err(_) => return Err(fast_err),
+            }
+        }
+    }
+}
+
+/// Standard Armor decode path (Phase 1 + Phase 2, no geometric correction).
+fn try_armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
 
     if img.num_components() == 0 {
@@ -316,6 +356,61 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
 
     // Phase 2 path: adaptive RS + repetition + soft voting
     decode_phase2(grid, positions, &vectors, &qt.values, baseline_delta, num_units, r, passphrase)
+}
+
+/// Phase 3 geometric recovery: detect DFT template, estimate transform, resample, retry.
+fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    let img = JpegImage::from_bytes(stego_bytes)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    // Convert to pixel domain and compute 2D FFT.
+    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(&img);
+    let spectrum = fft2d::fft2d(&luma_pixels, w, h);
+
+    // Generate expected template peaks and search for them.
+    let peaks = template::generate_template_peaks(passphrase, w, h);
+    let detected = template::detect_template(&spectrum, &peaks);
+
+    // Estimate the geometric transform from detected peaks.
+    let transform = template::estimate_transform(&detected)
+        .ok_or(StegoError::FrameCorrupted)?;
+
+    // Skip if transform is essentially identity (fast path would have worked).
+    if transform.rotation_rad.abs() < 0.001 && (transform.scale - 1.0).abs() < 0.001 {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    // Resample the pixel image to undo the geometric transform.
+    let corrected_pixels = resample::resample_bilinear(
+        &luma_pixels, w, h, &transform, w, h,
+    );
+
+    // Write corrected pixels back into JPEG coefficients.
+    let mut corrected_img = img.clone();
+    pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img);
+
+    // Re-encode to JPEG bytes for the standard decode path.
+    let corrected_bytes = match corrected_img.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            corrected_img.rebuild_huffman_tables();
+            corrected_img.to_bytes().map_err(StegoError::InvalidJpeg)?
+        }
+    };
+
+    // Retry standard decode on the corrected image.
+    let (text, mut quality) = try_armor_decode(&corrected_bytes, passphrase)?;
+
+    // Annotate quality with geometry correction info.
+    quality.geometry_corrected = true;
+    quality.template_peaks_detected = detected.len() as u8;
+    quality.estimated_rotation_deg = transform.rotation_rad.to_degrees() as f32;
+    quality.estimated_scale = transform.scale as f32;
+
+    Ok((text, quality))
 }
 
 /// Extract the r-header from the first 56 embedding units.
@@ -644,4 +739,20 @@ fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     let i = pos / 8;
     let j = pos % 8;
     grid.set(br, bc, i, j, val);
+}
+
+/// Embed a DFT template into the luminance channel for geometry resilience.
+///
+/// Converts Y-channel DCT coefficients to pixel domain, applies 2D FFT,
+/// embeds passphrase-derived peaks in the magnitude spectrum, then converts
+/// back to DCT coefficients. The template survives geometric transforms
+/// and allows the decoder to estimate and undo rotation/scaling.
+fn embed_dft_template(img: &mut JpegImage, passphrase: &str) -> Result<(), StegoError> {
+    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(img);
+    let mut spectrum = fft2d::fft2d(&luma_pixels, w, h);
+    let peaks = template::generate_template_peaks(passphrase, w, h);
+    template::embed_template(&mut spectrum, &peaks);
+    let modified = fft2d::ifft2d(&spectrum);
+    pixels::luma_f64_to_jpeg(&modified, w, h, img);
+    Ok(())
 }
