@@ -1,3 +1,8 @@
+//! JPEG frame header (SOF0) parsing.
+//!
+//! Extracts image dimensions, component information, and sampling factors
+//! from the Start of Frame marker segment.
+
 use super::error::{JpegError, Result};
 
 /// Information about one image component from SOF.

@@ -1,3 +1,24 @@
+//! Pure-Rust JPEG coefficient codec (zero external dependencies).
+//!
+//! Reads and writes baseline JPEG files (SOF0), providing direct access to
+//! quantized DCT coefficients without any pixel-domain processing. This is
+//! the foundation for steganographic embedding, which operates entirely in
+//! the DCT domain.
+//!
+//! Supports:
+//! - Baseline sequential DCT (SOF0), 8-bit precision
+//! - YCbCr, grayscale, and arbitrary component counts
+//! - Chroma subsampling: 4:2:0, 4:2:2, 4:4:4
+//! - Restart markers (DRI/RST)
+//! - Byte-for-byte round-trip for unmodified images
+//! - Huffman table rebuild for modified coefficients
+//!
+//! Does NOT support:
+//! - Progressive JPEG (SOF2) -- rejected at parse time
+//! - Arithmetic coding (SOF9+) -- rejected at parse time
+//! - 12-bit precision -- rejected at parse time
+//! - Multi-scan images
+
 pub mod error;
 pub mod zigzag;
 pub mod dct;
@@ -18,6 +39,12 @@ use tables::{HuffmanSpec, parse_dqt, parse_dht};
 use zigzag::NATURAL_TO_ZIGZAG;
 
 /// A decoded JPEG image providing access to quantized DCT coefficients.
+///
+/// Created by parsing a JPEG byte stream with [`JpegImage::from_bytes`].
+/// After modifying DCT coefficients (e.g., for steganographic embedding),
+/// call [`JpegImage::to_bytes`] to re-encode. If coefficient modifications
+/// introduce symbols not present in the original Huffman tables, call
+/// [`JpegImage::rebuild_huffman_tables`] first.
 pub struct JpegImage {
     /// Frame information (dimensions, components, sampling factors).
     frame: FrameInfo,

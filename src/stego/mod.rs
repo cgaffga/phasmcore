@@ -1,3 +1,19 @@
+//! Steganographic encoding and decoding pipelines.
+//!
+//! This module provides two embedding modes:
+//!
+//! - **Ghost** (`ghost_encode` / `ghost_decode`): Stealth mode using UERD cost
+//!   function and Syndrome-Trellis Coding (STC) to minimize statistical
+//!   detectability. Best for images that will not be recompressed.
+//!
+//! - **Armor** (`armor_encode` / `armor_decode`): Robustness mode using STDM
+//!   (Spread Transform Dither Modulation) with Reed-Solomon error correction to
+//!   survive JPEG recompression. Trades capacity for survivability.
+//!
+//! Both modes share the same payload frame format, encryption (AES-256-GCM-SIV),
+//! and key derivation (Argon2id two-tier). The `smart_decode` function
+//! auto-detects which mode was used.
+
 pub mod error;
 pub mod cost;
 pub mod stc;
@@ -25,7 +41,7 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, u8)
         Err(StegoError::DecryptionFailed) => {
             // Could be wrong passphrase for Ghost — still try Armor
         }
-        Err(StegoError::FrameCorrupted) | Err(StegoError::UnknownFrameMode(_)) => {
+        Err(StegoError::FrameCorrupted) => {
             // Likely not Ghost — try Armor
         }
         Err(e) => {

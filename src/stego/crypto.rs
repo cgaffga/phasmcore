@@ -1,3 +1,19 @@
+//! Cryptographic primitives for payload encryption.
+//!
+//! Implements a two-tier key derivation scheme using Argon2id:
+//!
+//! - **Tier 1 (structural)**: Deterministic key derived from passphrase + fixed
+//!   salt. Produces `perm_seed` (coefficient permutation) and `hhat_seed`
+//!   (STC matrix generation). Both encoder and decoder derive identical keys.
+//!
+//! - **Tier 2 (encryption)**: AES-256-GCM-SIV key derived from passphrase +
+//!   random salt. The random salt is embedded in the payload frame, so the
+//!   decoder recovers it from the extracted data.
+//!
+//! AES-256-GCM-SIV is chosen over AES-256-GCM for its nonce-misuse resistance,
+//! which provides an extra safety margin since the nonce is randomly generated
+//! and embedded alongside the ciphertext.
+
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use aes_gcm_siv::aead::Aead;
 use argon2::Argon2;
@@ -135,5 +151,36 @@ mod tests {
         let a = derive_structural_key("pass1");
         let b = derive_structural_key("pass2");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn ghost_and_armor_structural_keys_differ() {
+        let ghost = derive_structural_key("same_pass");
+        let armor = derive_armor_structural_key("same_pass");
+        assert_ne!(ghost, armor, "Ghost and Armor keys must differ for the same passphrase");
+    }
+
+    #[test]
+    fn armor_structural_key_deterministic() {
+        let a = derive_armor_structural_key("mypass");
+        let b = derive_armor_structural_key("mypass");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn encryption_key_differs_by_salt() {
+        let key1 = derive_encryption_key("pass", &[0u8; 16]);
+        let key2 = derive_encryption_key("pass", &[1u8; 16]);
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn ciphertext_differs_per_encryption() {
+        // Even with the same plaintext and passphrase, each encryption
+        // should produce different ciphertext (due to random salt + nonce).
+        let msg = b"same message";
+        let (ct1, _, _) = encrypt(msg, "pass");
+        let (ct2, _, _) = encrypt(msg, "pass");
+        assert_ne!(ct1, ct2, "repeated encryptions should produce different ciphertext");
     }
 }

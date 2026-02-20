@@ -1,3 +1,9 @@
+//! Viterbi-based STC embedding.
+//!
+//! Implements the forward (Viterbi) and backward (traceback) passes of the
+//! STC embedding algorithm. The encoder finds the minimum-cost stego bit
+//! sequence whose syndrome (under the H-hat matrix) matches the message.
+
 use super::hhat;
 use super::extract::stc_extract;
 

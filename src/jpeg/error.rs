@@ -1,3 +1,5 @@
+//! Error types for JPEG parsing and encoding.
+
 use std::fmt;
 
 /// Errors that can occur during JPEG parsing or encoding.

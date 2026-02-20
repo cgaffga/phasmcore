@@ -16,6 +16,21 @@ use crate::stego::frame;
 use crate::stego::permute;
 
 /// Encode a text message into a cover JPEG using Armor mode.
+///
+/// # Arguments
+/// - `image_bytes`: Raw bytes of the cover JPEG image.
+/// - `message`: The plaintext message to embed (must fit within capacity).
+/// - `passphrase`: Used for both structural key derivation and encryption.
+///
+/// # Returns
+/// The stego JPEG image as bytes, or an error if the image is too small
+/// or the message exceeds the embedding capacity.
+///
+/// # Errors
+/// - [`StegoError::InvalidJpeg`] if `image_bytes` is not a valid baseline JPEG.
+/// - [`StegoError::NoLuminanceChannel`] if the image has no Y component.
+/// - [`StegoError::ImageTooSmall`] if there are too few stable positions.
+/// - [`StegoError::MessageTooLarge`] if the RS-encoded frame exceeds capacity.
 pub fn armor_encode(
     image_bytes: &[u8],
     message: &str,
@@ -52,8 +67,7 @@ pub fn armor_encode(
     let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
 
     // 5. Build payload frame.
-    let frame_bytes = frame::build_frame_with_mode(
-        frame::MODE_ARMOR,
+    let frame_bytes = frame::build_frame(
         message.len() as u16,
         &salt,
         &nonce,
@@ -74,11 +88,7 @@ pub fn armor_encode(
     // 8. Generate spreading vectors.
     let vectors = generate_spreading_vectors(&spread_seed, rs_bits.len());
 
-    // 9. STDM embed each bit.
-    let grid = img.dct_grid(0);
-    let bw = grid.blocks_wide();
-
-    // Collect coefficient groups and embed
+    // 9. STDM embed each bit into coefficient groups.
     let grid_mut = img.dct_grid_mut(0);
     for (bit_idx, &bit) in rs_bits.iter().enumerate() {
         let group_start = bit_idx * SPREAD_LEN;
@@ -87,7 +97,7 @@ pub fn armor_encode(
         // Read current coefficient values as f64
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get_from_grid(grid_mut, pos.flat_idx, bw) as f64;
+            coeffs[k] = flat_get(grid_mut, pos.flat_idx) as f64;
         }
 
         // Embed
@@ -96,7 +106,7 @@ pub fn armor_encode(
         // Write back rounded values
         for (k, pos) in group.iter().enumerate() {
             let new_val = coeffs[k].round() as i16;
-            flat_set_in_grid(grid_mut, pos.flat_idx, bw, new_val);
+            flat_set(grid_mut, pos.flat_idx, new_val);
         }
     }
 
@@ -113,6 +123,18 @@ pub fn armor_encode(
 }
 
 /// Decode a text message from a stego JPEG using Armor mode.
+///
+/// # Arguments
+/// - `stego_bytes`: Raw bytes of the stego JPEG image.
+/// - `passphrase`: The passphrase used during encoding.
+///
+/// # Returns
+/// The decoded plaintext message, or an error if decoding fails.
+///
+/// # Errors
+/// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
+/// - [`StegoError::FrameCorrupted`] if RS decoding or CRC check fails.
+/// - [`StegoError::InvalidUtf8`] if the decrypted payload is not valid UTF-8.
 pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
 
@@ -149,7 +171,6 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
 
     // 6. Extract all bits via STDM.
     let grid = img.dct_grid(0);
-    let bw = grid.blocks_wide();
 
     let mut extracted_bits = Vec::with_capacity(num_units);
     for unit_idx in 0..num_units {
@@ -158,7 +179,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
 
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx, bw) as f64;
+            coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
         }
 
         let bit = stdm_extract(&coeffs, &vectors[unit_idx], delta);
@@ -175,10 +196,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
     let decoded_frame = try_rs_decode_frame(&extracted_bytes)?;
 
     // 9. Parse frame.
-    let parsed = frame::parse_frame_any_mode(&decoded_frame)?;
-    if parsed.mode != frame::MODE_ARMOR {
-        return Err(StegoError::UnknownFrameMode(parsed.mode));
-    }
+    let parsed = frame::parse_frame(&decoded_frame)?;
 
     // 10. Decrypt.
     let plaintext = crypto::decrypt(
@@ -202,14 +220,21 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<String, Steg
 
 /// Try to RS-decode a frame from extracted bytes.
 ///
-/// We don't know the exact original frame length, but we can estimate it
-/// from the frame header (mode + plaintext_len in the first 3 bytes).
-/// We try to read those bytes, compute the expected frame length,
-/// then RS-decode that many blocks.
+/// The decoder faces a chicken-and-egg problem: the RS block boundaries
+/// depend on the frame length, which is inside the RS-encoded data. This
+/// function resolves it by trying progressively larger data sizes for the
+/// first RS block until one successfully decodes and reveals a valid
+/// frame header (plaintext length). The header then determines the full
+/// frame size and any additional RS blocks.
+///
+/// This is robust because:
+/// 1. RS decoding fails fast for incorrect block sizes (syndrome check)
+/// 2. The CRC provides additional validation
+/// 3. AES-GCM-SIV authentication catches any remaining corruption
 fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
     // The first RS block contains the frame header.
     // For a shortened RS block of data_len d, the encoded block is d + 64 bytes.
-    // We need to figure out d. The frame header is: mode(1) + len(2) + ...
+    // We need to figure out d. The frame header is: len(2) + ...
     // Minimum frame is FRAME_OVERHEAD bytes.
     //
     // Strategy: try to decode the first RS block at various sizes to find
@@ -232,15 +257,16 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
 
         if let Ok(first_block_data) = ecc::rs_decode(&extracted_bytes[..block_len], data_len) {
             // Check if this looks like a valid frame header
-            if first_block_data.len() >= 3 {
-                let mode = first_block_data[0];
-                if mode != frame::MODE_ARMOR {
+            if first_block_data.len() >= 2 {
+                let pt_len =
+                    u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
+                let ct_len = pt_len + 16; // AES-GCM tag
+                let total_frame_len = 2 + 16 + 12 + ct_len + 4; // frame format
+
+                // Sanity check: reject implausible plaintext lengths
+                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
                     continue;
                 }
-                let pt_len =
-                    u16::from_be_bytes([first_block_data[1], first_block_data[2]]) as usize;
-                let ct_len = pt_len + 16; // AES-GCM tag
-                let total_frame_len = 1 + 2 + 16 + 12 + ct_len + 4; // frame format
 
                 if total_frame_len == data_len {
                     // Single block decode succeeded with exact size
@@ -274,7 +300,9 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<Vec<u8>, StegoError> {
 
 // --- DctGrid flat access helpers ---
 
-fn flat_get(grid: &DctGrid, flat_idx: usize, bw: usize) -> i16 {
+/// Read a coefficient from a `DctGrid` using a flat index.
+fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
+    let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;
     let pos = flat_idx % 64;
     let br = block_idx / bw;
@@ -284,17 +312,9 @@ fn flat_get(grid: &DctGrid, flat_idx: usize, bw: usize) -> i16 {
     grid.get(br, bc, i, j)
 }
 
-fn flat_get_from_grid(grid: &mut DctGrid, flat_idx: usize, bw: usize) -> i16 {
-    let block_idx = flat_idx / 64;
-    let pos = flat_idx % 64;
-    let br = block_idx / bw;
-    let bc = block_idx % bw;
-    let i = pos / 8;
-    let j = pos % 8;
-    grid.get(br, bc, i, j)
-}
-
-fn flat_set_in_grid(grid: &mut DctGrid, flat_idx: usize, bw: usize, val: i16) {
+/// Write a coefficient into a `DctGrid` using a flat index.
+fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
+    let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;
     let pos = flat_idx % 64;
     let br = block_idx / bw;

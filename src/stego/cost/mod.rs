@@ -1,3 +1,12 @@
+//! Embedding cost functions for steganographic coding.
+//!
+//! Cost functions assign a distortion value to each DCT coefficient position,
+//! guiding the STC encoder to modify only the least detectable positions.
+//! Lower cost = safer to modify. Infinite cost (`WET_COST`) = must never modify.
+//!
+//! Currently implements UERD (Uniform Embedding Revisited Distortion). Future
+//! phases will add J-UNIWARD and SI-UNIWARD.
+
 pub mod uerd;
 
 /// Cost assigned to coefficients that must never be modified.

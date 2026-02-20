@@ -9,6 +9,15 @@ use crate::stego::frame::FRAME_OVERHEAD;
 
 /// Estimate the maximum plaintext message size (in bytes) that can be embedded
 /// in the given cover JPEG image using Armor mode.
+///
+/// The estimate accounts for:
+/// - SPREAD_LEN coefficients per embedded bit (STDM spreading)
+/// - Reed-Solomon parity overhead (64 bytes per 191-byte block)
+/// - Frame overhead (length, salt, nonce, auth tag, CRC)
+///
+/// # Errors
+/// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
+/// or its quantization table is missing.
 pub fn estimate_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let qt_id = img.frame_info().components[0].quant_table_id as usize;

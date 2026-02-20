@@ -1,3 +1,23 @@
+//! Payload frame construction and parsing.
+//!
+//! The frame is the binary container that wraps the encrypted message before
+//! embedding into DCT coefficients. Both Ghost and Armor modes use the same
+//! frame format:
+//!
+//! ```text
+//! [2 bytes ] plaintext length (big-endian u16)
+//! [16 bytes] Argon2 salt (for Tier-2 key derivation)
+//! [12 bytes] AES-GCM-SIV nonce
+//! [N bytes ] ciphertext (plaintext_len + 16 bytes for auth tag)
+//! [4 bytes ] CRC-32 of everything above
+//! ```
+//!
+//! Total frame size = 50 + plaintext_len bytes.
+//!
+//! Note: The mode byte was removed from the frame format to eliminate known
+//! plaintext and improve stealth. Mode detection is handled by trial decoding
+//! in `smart_decode`.
+
 use crate::stego::crypto::{NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
 
@@ -6,23 +26,22 @@ pub const MODE_GHOST: u8 = 0x01;
 /// Armor mode identifier byte.
 pub const MODE_ARMOR: u8 = 0x02;
 
-/// Fixed overhead: mode(1) + length(2) + salt(16) + nonce(12) + tag(16) + crc(4) = 51 bytes.
+/// Fixed overhead: length(2) + salt(16) + nonce(12) + tag(16) + crc(4) = 50 bytes.
 /// Plus the ciphertext length equals plaintext length (AES-GCM stream cipher).
-/// So total frame = 35 + plaintext_len + 16(tag) = 51 + plaintext_len.
-pub const FRAME_OVERHEAD: usize = 1 + 2 + SALT_LEN + NONCE_LEN + 16 + 4; // 51
+/// So total frame = 34 + plaintext_len + 16(tag) = 50 + plaintext_len.
+pub const FRAME_OVERHEAD: usize = 2 + SALT_LEN + NONCE_LEN + 16 + 4; // 50
 
 /// Maximum payload frame size in bytes (supports up to ~1KB messages).
-/// 1024 (max message) + 51 (overhead) = 1075 bytes.
-pub const MAX_FRAME_BYTES: usize = 1075;
+/// 1024 (max message) + 50 (overhead) = 1074 bytes.
+pub const MAX_FRAME_BYTES: usize = 1074;
 
 /// Maximum payload frame size in bits.
 pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;
 
-/// Build a payload frame from encrypted components (Ghost mode).
+/// Build a payload frame from encrypted components.
 ///
 /// Frame layout:
 /// ```text
-/// [1 byte  ] mode = 0x01 (Ghost)
 /// [2 bytes ] plaintext length (BE u16)
 /// [16 bytes] Argon2 salt
 /// [12 bytes] AES-GCM nonce
@@ -35,20 +54,8 @@ pub fn build_frame(
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    build_frame_with_mode(MODE_GHOST, plaintext_len, salt, nonce, ciphertext)
-}
+    let mut frame = Vec::with_capacity(2 + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
 
-/// Build a payload frame with an explicit mode byte.
-pub fn build_frame_with_mode(
-    mode: u8,
-    plaintext_len: u16,
-    salt: &[u8; SALT_LEN],
-    nonce: &[u8; NONCE_LEN],
-    ciphertext: &[u8],
-) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(1 + 2 + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
-
-    frame.push(mode);
     frame.extend_from_slice(&plaintext_len.to_be_bytes());
     frame.extend_from_slice(salt);
     frame.extend_from_slice(nonce);
@@ -61,27 +68,43 @@ pub fn build_frame_with_mode(
 }
 
 /// Parsed payload frame.
+///
+/// Contains all fields needed to decrypt the embedded message:
+/// the original plaintext length, the Argon2 salt and AES-GCM-SIV nonce
+/// for key derivation/decryption, and the ciphertext (including auth tag).
 pub struct ParsedFrame {
+    /// Original plaintext length in bytes (before encryption).
     pub plaintext_len: u16,
+    /// Argon2 salt for Tier-2 encryption key derivation.
     pub salt: [u8; SALT_LEN],
+    /// AES-GCM-SIV nonce.
     pub nonce: [u8; NONCE_LEN],
+    /// Ciphertext including 16-byte authentication tag.
     pub ciphertext: Vec<u8>,
 }
 
-/// Parse a payload frame, verifying the CRC and mode byte.
+/// Parse a payload frame, verifying the CRC.
 ///
 /// The input `data` may be larger than the actual frame (e.g. zero-padded).
 /// The actual frame length is determined from the embedded `plaintext_len` field.
+///
+/// Returns `Err(StegoError::FrameCorrupted)` if the CRC check fails or the
+/// frame is truncated.
 pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
-    // Need at least 3 bytes to read mode + plaintext_len.
-    if data.len() < 3 {
+    // Need at least 2 bytes to read plaintext_len.
+    if data.len() < 2 {
         return Err(StegoError::FrameCorrupted);
     }
 
     // Read plaintext_len to compute the actual frame size.
-    let plaintext_len = u16::from_be_bytes([data[1], data[2]]);
-    let ciphertext_len = plaintext_len as usize + 16; // AES-GCM auth tag
-    let total_frame_len = 1 + 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
+    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
+    let ciphertext_len = plaintext_len as usize + 16; // AES-GCM-SIV auth tag
+    let total_frame_len = 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
+
+    // Reject frames that exceed the maximum supported size.
+    if total_frame_len > MAX_FRAME_BYTES + 1024 {
+        return Err(StegoError::FrameCorrupted);
+    }
 
     if data.len() < total_frame_len {
         return Err(StegoError::FrameCorrupted);
@@ -97,76 +120,15 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     }
 
     // Parse fields.
-    let mode = payload[0];
-    if mode != MODE_GHOST {
-        return Err(StegoError::UnknownFrameMode(mode));
-    }
-
     let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&payload[3..3 + SALT_LEN]);
+    salt.copy_from_slice(&payload[2..2 + SALT_LEN]);
 
     let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&payload[3 + SALT_LEN..3 + SALT_LEN + NONCE_LEN]);
+    nonce.copy_from_slice(&payload[2 + SALT_LEN..2 + SALT_LEN + NONCE_LEN]);
 
-    let ciphertext = payload[3 + SALT_LEN + NONCE_LEN..].to_vec();
+    let ciphertext = payload[2 + SALT_LEN + NONCE_LEN..].to_vec();
 
     Ok(ParsedFrame {
-        plaintext_len,
-        salt,
-        nonce,
-        ciphertext,
-    })
-}
-
-/// Parsed payload frame with mode byte.
-pub struct ParsedFrameWithMode {
-    pub mode: u8,
-    pub plaintext_len: u16,
-    pub salt: [u8; SALT_LEN],
-    pub nonce: [u8; NONCE_LEN],
-    pub ciphertext: Vec<u8>,
-}
-
-/// Parse a payload frame, verifying CRC but accepting any mode byte.
-///
-/// Unlike `parse_frame` which rejects non-Ghost modes, this accepts any
-/// known mode and returns it in the result for the caller to dispatch on.
-pub fn parse_frame_any_mode(data: &[u8]) -> Result<ParsedFrameWithMode, StegoError> {
-    if data.len() < 3 {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    let mode = data[0];
-    let plaintext_len = u16::from_be_bytes([data[1], data[2]]);
-    let ciphertext_len = plaintext_len as usize + 16;
-    let total_frame_len = 1 + 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
-
-    if data.len() < total_frame_len {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    let payload = &data[..total_frame_len - 4];
-    let crc_bytes = &data[total_frame_len - 4..total_frame_len];
-    let stored_crc = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
-    let computed_crc = crc32fast::hash(payload);
-    if stored_crc != computed_crc {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    if mode != MODE_GHOST && mode != MODE_ARMOR {
-        return Err(StegoError::UnknownFrameMode(mode));
-    }
-
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&payload[3..3 + SALT_LEN]);
-
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&payload[3 + SALT_LEN..3 + SALT_LEN + NONCE_LEN]);
-
-    let ciphertext = payload[3 + SALT_LEN + NONCE_LEN..].to_vec();
-
-    Ok(ParsedFrameWithMode {
-        mode,
         plaintext_len,
         salt,
         nonce,
@@ -234,18 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn wrong_mode_rejected() {
+    fn corrupted_length_detected() {
         let salt = [0u8; SALT_LEN];
         let nonce = [0u8; NONCE_LEN];
         // plaintext_len=4, ciphertext=4+16=20 bytes.
         let ciphertext = vec![0u8; 20];
         let mut frame = build_frame(4, &salt, &nonce, &ciphertext);
-        // Change mode byte and recompute CRC.
+        // Corrupt the plaintext_len field (byte 0) without updating CRC.
         frame[0] = 0xFF;
-        let crc = crc32fast::hash(&frame[..frame.len() - 4]);
-        let len = frame.len();
-        frame[len - 4..].copy_from_slice(&crc.to_be_bytes());
-        assert!(matches!(parse_frame(&frame), Err(StegoError::UnknownFrameMode(0xFF))));
+        assert!(matches!(parse_frame(&frame), Err(StegoError::FrameCorrupted)));
     }
 
     #[test]
@@ -255,5 +214,59 @@ mod tests {
         assert_eq!(bits.len(), 32);
         let recovered = bits_to_bytes(&bits);
         assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn truncated_data_rejected() {
+        // Too short to even read plaintext_len
+        assert!(matches!(parse_frame(&[0x00]), Err(StegoError::FrameCorrupted)));
+        assert!(matches!(parse_frame(&[]), Err(StegoError::FrameCorrupted)));
+    }
+
+    #[test]
+    fn frame_no_mode_byte() {
+        // Verify the frame format has no mode byte -- the frame starts with
+        // plaintext_len (2 bytes), so a frame for plaintext_len=4 should
+        // start with [0x00, 0x04].
+        let salt = [3u8; SALT_LEN];
+        let nonce = [4u8; NONCE_LEN];
+        let ciphertext = vec![0x55u8; 20]; // plaintext_len=4
+        let frame = build_frame(4, &salt, &nonce, &ciphertext);
+
+        // First two bytes are plaintext_len in big-endian
+        assert_eq!(frame[0], 0x00);
+        assert_eq!(frame[1], 0x04);
+
+        // Total size: 2 + 16 + 12 + 20 + 4 = 54
+        assert_eq!(frame.len(), 2 + SALT_LEN + NONCE_LEN + 20 + 4);
+
+        // Roundtrip should work
+        let parsed = parse_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 4);
+        assert_eq!(parsed.salt, salt);
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.ciphertext, ciphertext);
+    }
+
+    #[test]
+    fn frame_with_zero_length_data() {
+        let salt = [0u8; SALT_LEN];
+        let nonce = [0u8; NONCE_LEN];
+        // plaintext_len=0, ciphertext=0+16=16 bytes (auth tag only)
+        let ciphertext = vec![0u8; 16];
+        let frame = build_frame(0, &salt, &nonce, &ciphertext);
+        let parsed = parse_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 0);
+        assert_eq!(parsed.ciphertext.len(), 16);
+    }
+
+    #[test]
+    fn bits_to_bytes_partial_byte() {
+        // 5 bits should produce 1 byte, padded with zeros
+        let bits = vec![1u8, 0, 1, 1, 0];
+        let bytes = bits_to_bytes(&bits);
+        assert_eq!(bytes.len(), 1);
+        // 10110_000 = 0xB0
+        assert_eq!(bytes[0], 0xB0);
     }
 }

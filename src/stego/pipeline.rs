@@ -1,3 +1,12 @@
+//! Ghost mode encode/decode pipeline.
+//!
+//! Ghost mode embeds encrypted messages into JPEG DCT coefficients using:
+//! 1. UERD cost function to identify low-detectability embedding positions
+//! 2. Fisher-Yates permutation (keyed by passphrase) to scatter the payload
+//! 3. Syndrome-Trellis Coding (STC) to minimize total embedding distortion
+//! 4. nsF5-style LSB modification (toward zero for |coeff| > 1, away from
+//!    zero for |coeff| == 1 to prevent shrinkage)
+
 use crate::jpeg::JpegImage;
 use crate::stego::cost::uerd::compute_uerd;
 use crate::stego::crypto;
@@ -14,6 +23,13 @@ const STC_H: usize = 7;
 ///
 /// Uses `w = floor(n / m_max)` so that `n_used = m_max * w <= n` and the
 /// extraction produces exactly `m_max` bits.
+///
+/// # Returns
+/// `(w, n_used)` where `w` is the STC submatrix width and `n_used` is the
+/// number of cover positions to use (always <= `n`).
+///
+/// # Errors
+/// Returns [`StegoError::ImageTooSmall`] if `n < MAX_FRAME_BITS` (w would be 0).
 fn compute_stc_params(n: usize) -> Result<(usize, usize), StegoError> {
     let m_max = MAX_FRAME_BITS;
     let w = n / m_max; // floor division
@@ -25,6 +41,21 @@ fn compute_stc_params(n: usize) -> Result<(usize, usize), StegoError> {
 }
 
 /// Encode a text message into a cover JPEG using Ghost mode.
+///
+/// # Arguments
+/// - `image_bytes`: Raw bytes of the cover JPEG image.
+/// - `message`: The plaintext message to embed (must fit within capacity).
+/// - `passphrase`: Used for both structural key derivation and encryption.
+///
+/// # Returns
+/// The stego JPEG image as bytes, or an error if the image is too small
+/// or the message exceeds the embedding capacity.
+///
+/// # Errors
+/// - [`StegoError::InvalidJpeg`] if `image_bytes` is not a valid baseline JPEG.
+/// - [`StegoError::NoLuminanceChannel`] if the image has no Y component.
+/// - [`StegoError::ImageTooSmall`] if the cover has too few usable coefficients.
+/// - [`StegoError::MessageTooLarge`] if the message exceeds STC capacity.
 pub fn ghost_encode(
     image_bytes: &[u8],
     message: &str,
@@ -90,7 +121,7 @@ pub fn ghost_encode(
         let old_bit = cover_bits[idx];
         let new_bit = result.stego_bits[idx];
         if old_bit != new_bit {
-            let coeff = flat_get_from_mut(grid_mut, pos.flat_idx);
+            let coeff = flat_get(grid_mut, pos.flat_idx);
             let modified = if coeff == 1 {
                 2 // away from zero to prevent shrinkage
             } else if coeff == -1 {
@@ -121,6 +152,18 @@ pub fn ghost_encode(
 }
 
 /// Decode a text message from a stego JPEG using Ghost mode.
+///
+/// # Arguments
+/// - `stego_bytes`: Raw bytes of the stego JPEG image.
+/// - `passphrase`: The passphrase used during encoding.
+///
+/// # Returns
+/// The decoded plaintext message, or an error if decoding fails.
+///
+/// # Errors
+/// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
+/// - [`StegoError::FrameCorrupted`] if the CRC check fails.
+/// - [`StegoError::InvalidUtf8`] if the decrypted payload is not valid UTF-8.
 pub fn ghost_decode(
     stego_bytes: &[u8],
     passphrase: &str,
@@ -186,6 +229,10 @@ pub fn ghost_decode(
 
 use crate::jpeg::dct::DctGrid;
 
+/// Read a coefficient from a `DctGrid` using a flat index.
+///
+/// The flat index encodes `block_index * 64 + row * 8 + col`, where
+/// `block_index = block_row * blocks_wide + block_col`.
 fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
     let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;
@@ -197,17 +244,7 @@ fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
     grid.get(br, bc, i, j)
 }
 
-fn flat_get_from_mut(grid: &mut DctGrid, flat_idx: usize) -> i16 {
-    let bw = grid.blocks_wide();
-    let block_idx = flat_idx / 64;
-    let pos = flat_idx % 64;
-    let br = block_idx / bw;
-    let bc = block_idx % bw;
-    let i = pos / 8;
-    let j = pos % 8;
-    grid.get(br, bc, i, j)
-}
-
+/// Write a coefficient into a `DctGrid` using a flat index.
 fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;

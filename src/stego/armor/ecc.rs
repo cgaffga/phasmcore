@@ -134,13 +134,21 @@ fn gen_poly() -> &'static Vec<u8> {
 
 // --- Encoding ---
 
-/// RS-encode a data block.
+/// RS-encode a single data block (systematic encoding).
 ///
-/// Input: `data` of length <= K_DEFAULT bytes.
-/// Output: data + parity bytes (systematic encoding).
+/// # Arguments
+/// - `data`: Data bytes of length <= `K_DEFAULT` (191).
 ///
-/// For shortened codes (data.len() < K_DEFAULT), the data is conceptually
+/// # Returns
+/// A vector of `data.len() + PARITY_LEN` bytes: the original data followed
+/// by 64 parity symbols.
+///
+/// # Panics
+/// Panics if `data.len() > K_DEFAULT`.
+///
+/// For shortened codes (`data.len() < K_DEFAULT`), the data is conceptually
 /// zero-padded at the front to K_DEFAULT, encoded, then the padding is removed.
+/// The parity symbols are computed over this virtual full-length block.
 pub fn rs_encode(data: &[u8]) -> Vec<u8> {
     assert!(
         data.len() <= K_DEFAULT,
@@ -172,10 +180,11 @@ pub fn rs_encode(data: &[u8]) -> Vec<u8> {
     encoded
 }
 
-/// RS-encode an arbitrarily long payload, splitting into K_DEFAULT-byte blocks.
+/// RS-encode an arbitrarily long payload, splitting into [`K_DEFAULT`]-byte blocks.
 ///
-/// Returns the concatenation of all RS-encoded blocks.
-/// The last block may be a shortened code if payload.len() % K_DEFAULT != 0.
+/// Returns the concatenation of all RS-encoded blocks. Each block has
+/// `min(remaining_data, K_DEFAULT) + PARITY_LEN` bytes. The last block
+/// may be a shortened code if `payload.len() % K_DEFAULT != 0`.
 pub fn rs_encode_blocks(payload: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::new();
     for chunk in payload.chunks(K_DEFAULT) {
@@ -382,13 +391,25 @@ impl core::fmt::Display for RsDecodeError {
     }
 }
 
-/// RS-decode a single block.
+/// RS-decode a single block with error correction.
 ///
-/// Input: received block of length data_len + PARITY_LEN.
-/// Output: corrected data of length data_len.
+/// # Arguments
+/// - `received`: Received block of length `data_len + PARITY_LEN`.
+/// - `data_len`: Original data length (before parity was appended).
 ///
-/// For shortened codes, `data_len` < K_DEFAULT. The received block is
-/// conceptually zero-padded at the front during syndrome computation.
+/// # Returns
+/// The corrected data of length `data_len`.
+///
+/// # Panics
+/// Panics if `received.len() != data_len + PARITY_LEN`.
+///
+/// # Errors
+/// Returns [`RsDecodeError`] if there are more than `t=32` symbol errors,
+/// or if errors fall in the zero-padded region of a shortened code.
+///
+/// For shortened codes (`data_len < K_DEFAULT`), the received block is
+/// conceptually zero-padded at the front to form a full 255-symbol block
+/// during syndrome computation.
 pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeError> {
     let block_len = data_len + PARITY_LEN;
     assert_eq!(
@@ -445,9 +466,19 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<Vec<u8>, RsDecodeEr
     Ok(corrected[padding..padding + data_len].to_vec())
 }
 
-/// RS-decode a payload that was encoded with `rs_encode_blocks`.
+/// RS-decode a payload that was encoded with [`rs_encode_blocks`].
 ///
-/// `total_data_len` is the original payload length before encoding.
+/// Splits the encoded data into blocks based on `total_data_len`, decodes
+/// each block independently (correcting up to `t=32` symbol errors per block),
+/// and concatenates the results.
+///
+/// # Arguments
+/// - `encoded`: The RS-encoded data (output of `rs_encode_blocks`).
+/// - `total_data_len`: The original payload length before encoding.
+///
+/// # Errors
+/// Returns [`RsDecodeError`] if any block has too many errors to correct
+/// or the encoded data is too short.
 pub fn rs_decode_blocks(encoded: &[u8], total_data_len: usize) -> Result<Vec<u8>, RsDecodeError> {
     let mut decoded = Vec::with_capacity(total_data_len);
     let mut remaining_data = total_data_len;
@@ -655,6 +686,16 @@ mod tests {
         assert_eq!(rs_encoded_len(192), (191 + 64) + (1 + 64));
         // 400 / 191 = 2 full blocks (382), remainder 18 → 3 blocks
         assert_eq!(rs_encoded_len(400), 2 * (191 + 64) + (18 + 64));
+    }
+
+    #[test]
+    fn rs_encoded_len_edge_cases() {
+        assert_eq!(rs_encoded_len(0), 0);
+        assert_eq!(rs_encoded_len(1), 1 + 64);
+        // Full block boundary
+        assert_eq!(rs_encoded_len(191), 191 + 64);
+        // Just over one block
+        assert_eq!(rs_encoded_len(192), (191 + 64) + (1 + 64));
     }
 
     #[test]

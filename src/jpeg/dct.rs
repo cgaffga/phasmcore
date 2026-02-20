@@ -1,3 +1,8 @@
+//! DCT coefficient storage and quantization tables.
+//!
+//! Provides [`DctGrid`] for storing quantized DCT coefficients in block-raster
+//! order, and [`QuantTable`] for the 64-entry quantization matrices.
+
 /// Quantization table: 64 values in natural (row-major) order.
 #[derive(Debug, Clone)]
 pub struct QuantTable {

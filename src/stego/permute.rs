@@ -1,3 +1,11 @@
+//! Coefficient position selection and permutation.
+//!
+//! Selects embeddable AC coefficient positions from the cost map and applies
+//! a Fisher-Yates shuffle using a ChaCha20 PRNG seeded from the passphrase.
+//! The permutation ensures that both encoder and decoder process coefficients
+//! in the same pseudo-random order, making the embedding resistant to
+//! position-based attacks.
+
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
@@ -12,11 +20,18 @@ pub struct CoeffPos {
     pub cost: f64,
 }
 
-/// Select all AC coefficient positions and apply a Fisher-Yates permutation.
+/// Select embeddable AC coefficient positions and apply a Fisher-Yates permutation.
 ///
-/// Returns positions in a deterministic pseudo-random order derived from `seed`.
-/// All 63 AC positions per block are included (even zeros, which have WET_COST).
-/// DC positions (flat_idx % 64 == 0) are excluded.
+/// Collects all AC positions with finite cost (non-WET) in deterministic raster
+/// order, then shuffles them using a ChaCha20 PRNG seeded by `seed`.
+///
+/// # Arguments
+/// - `cost_map`: Embedding costs for each coefficient position.
+/// - `seed`: 32-byte seed (derived from the passphrase) for the PRNG.
+///
+/// # Returns
+/// A vector of [`CoeffPos`] in pseudo-random order. DC positions and zero-valued
+/// coefficients (which have infinite/WET cost) are excluded.
 pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> {
     let total_blocks = cost_map.total_blocks();
     let bt = cost_map.blocks_tall();

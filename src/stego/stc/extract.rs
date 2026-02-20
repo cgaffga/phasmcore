@@ -1,3 +1,9 @@
+//! STC message extraction via syndrome computation.
+//!
+//! Extracts the embedded message from a stego bit sequence by computing
+//! the syndrome under the H-hat matrix. This is the decoder counterpart
+//! to the Viterbi embedding in [`super::embed`].
+
 use super::hhat;
 
 /// Extract a message from stego bits using the STC syndrome computation.

@@ -1,3 +1,9 @@
+//! JPEG scan data encoding and decoding.
+//!
+//! Decodes entropy-coded scan data into [`DctGrid`]s (one per component)
+//! and re-encodes modified grids back to entropy-coded bytes. Handles
+//! interleaved MCU ordering, restart markers, and DC prediction.
+
 use super::bitio::{BitReader, BitWriter};
 use super::dct::DctGrid;
 use super::error::{JpegError, Result};

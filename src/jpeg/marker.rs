@@ -1,3 +1,10 @@
+//! JPEG marker parsing and iteration.
+//!
+//! Walks the marker segments in a JPEG byte stream, extracting headers
+//! (DQT, DHT, SOF, DRI, SOS) and preserving unknown markers verbatim.
+//! Stops at the SOS marker, returning the byte offset where entropy-coded
+//! scan data begins.
+
 use super::error::{JpegError, Result};
 
 /// JPEG marker constants.

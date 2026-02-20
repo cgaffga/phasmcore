@@ -1,3 +1,8 @@
+//! Error types for the steganography pipeline.
+//!
+//! [`StegoError`] covers all failure modes from JPEG parsing through
+//! encryption and frame extraction.
+
 use core::fmt;
 
 /// Errors that can occur during steganographic encoding or decoding.
@@ -32,6 +37,15 @@ impl fmt::Display for StegoError {
             Self::DecryptionFailed => write!(f, "decryption failed (wrong passphrase?)"),
             Self::InvalidUtf8 => write!(f, "extracted text is not valid UTF-8"),
             Self::NoLuminanceChannel => write!(f, "image has no luminance channel"),
+        }
+    }
+}
+
+impl std::error::Error for StegoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidJpeg(e) => Some(e),
+            _ => None,
         }
     }
 }

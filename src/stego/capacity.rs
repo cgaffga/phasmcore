@@ -1,3 +1,11 @@
+//! Ghost mode capacity estimation.
+//!
+//! Estimates the maximum plaintext message size that can be embedded in a
+//! given JPEG cover image using Ghost mode. The estimate accounts for:
+//! - Number of usable (non-WET) AC coefficients
+//! - Minimum capacity ratio to ensure reliable STC embedding
+//! - Frame overhead (length, salt, nonce, auth tag, CRC)
+
 use crate::jpeg::JpegImage;
 use crate::stego::cost::uerd::compute_uerd;
 use crate::stego::frame::FRAME_OVERHEAD;
@@ -9,6 +17,20 @@ const MIN_CAPACITY_RATIO: f64 = 5.0;
 
 /// Estimate the maximum plaintext message size (in bytes) that can be embedded
 /// in the given cover JPEG image using Ghost mode.
+///
+/// The estimate is conservative: it divides the usable coefficient count by
+/// [`MIN_CAPACITY_RATIO`] (5.0) to ensure the STC has sufficient slack for
+/// low-distortion embedding, then subtracts the frame overhead.
+///
+/// # Arguments
+/// - `img`: A parsed JPEG image.
+///
+/// # Returns
+/// The estimated capacity in bytes, or 0 if the image is too small.
+///
+/// # Errors
+/// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
+/// or its quantization table is missing.
 pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
@@ -17,7 +39,6 @@ pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let cost_map = compute_uerd(grid, qt);
 
     // Count usable (non-WET) AC coefficients.
-    let total_ac = cost_map.total_blocks() * 63;
     let mut usable = 0usize;
     let bt = cost_map.blocks_tall();
     let bw = cost_map.blocks_wide();
@@ -45,12 +66,8 @@ pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
         return Ok(0);
     }
 
-    // Subtract overhead (mode + length + salt + nonce + tag + crc) to get plaintext capacity.
+    // Subtract overhead (length + salt + nonce + tag + crc) to get plaintext capacity.
     let capacity = max_frame_bytes - FRAME_OVERHEAD;
-
-    // Also report for diagnostics:
-    // total_ac, usable, capacity
-    let _ = total_ac; // suppress unused warning in release
 
     Ok(capacity)
 }

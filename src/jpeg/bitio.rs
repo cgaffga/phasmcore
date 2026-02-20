@@ -1,3 +1,9 @@
+//! Bit-level I/O for JPEG entropy-coded data.
+//!
+//! Provides [`BitReader`] for decoding and [`BitWriter`] for encoding the
+//! entropy-coded scan data. Both handle JPEG byte-stuffing (0xFF -> 0xFF 0x00)
+//! and operate in MSB-first bit order.
+
 use super::error::{JpegError, Result};
 
 /// Bit-level reader for JPEG entropy-coded data.

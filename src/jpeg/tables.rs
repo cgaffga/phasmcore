@@ -1,3 +1,9 @@
+//! Quantization and Huffman table parsing/serialization.
+//!
+//! Handles DQT (Define Quantization Table) and DHT (Define Huffman Table)
+//! marker segments. Supports both 8-bit and 16-bit quantization precision
+//! and multiple tables per marker segment.
+
 use super::dct::QuantTable;
 use super::error::{JpegError, Result};
 use super::zigzag::ZIGZAG_TO_NATURAL;

@@ -1,3 +1,12 @@
+//! H-hat submatrix generation for STC.
+//!
+//! The H-hat matrix defines the parity-check structure of the STC code.
+//! It has `h` rows and `w` columns, where each column is a packed `u32`
+//! with odd Hamming weight (ensuring every column contributes to the syndrome).
+//!
+//! The matrix is generated deterministically from a seed so encoder and
+//! decoder produce identical matrices.
+
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
