@@ -1,14 +1,18 @@
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use aes_gcm::aead::Aead;
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
+use aes_gcm_siv::aead::Aead;
 use argon2::Argon2;
 use crate::stego::error::StegoError;
 
-/// Fixed salt for Tier-1 (structural) key derivation.
+/// Fixed salt for Ghost Tier-1 (structural) key derivation.
 /// This is intentionally fixed so the decoder can reproduce perm_seed/hhat_seed
 /// from the passphrase alone, before extracting the payload.
 const STRUCTURAL_SALT: &[u8; 16] = b"phasm-ghost-v1\0\0";
 
-/// AES-GCM nonce length in bytes.
+/// Fixed salt for Armor Tier-1 (structural) key derivation.
+/// Different from Ghost so the same passphrase produces different permutations.
+const ARMOR_STRUCTURAL_SALT: &[u8; 16] = b"phasm-armor-v1\0\0";
+
+/// AES-GCM-SIV nonce length in bytes.
 pub const NONCE_LEN: usize = 12;
 /// Argon2 salt length in bytes.
 pub const SALT_LEN: usize = 16;
@@ -25,6 +29,18 @@ pub fn derive_structural_key(passphrase: &str) -> [u8; 64] {
     output
 }
 
+/// Derive the Armor structural key (Tier 1) from a passphrase.
+///
+/// Same structure as Ghost but uses a different salt so the same passphrase
+/// produces different permutation/spreading seeds.
+pub fn derive_armor_structural_key(passphrase: &str) -> [u8; 64] {
+    let mut output = [0u8; 64];
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), ARMOR_STRUCTURAL_SALT, &mut output)
+        .expect("Argon2 structural key derivation should not fail");
+    output
+}
+
 /// Derive the AES-256 encryption key (Tier 2) from passphrase + random salt.
 pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     let mut key = [0u8; 32];
@@ -34,10 +50,10 @@ pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     key
 }
 
-/// Encrypt plaintext with AES-256-GCM.
+/// Encrypt plaintext with AES-256-GCM-SIV.
 ///
 /// Returns (ciphertext_with_tag, nonce, salt).
-/// The ciphertext includes the 16-byte authentication tag appended by AES-GCM.
+/// The ciphertext includes the 16-byte authentication tag appended by AES-GCM-SIV.
 pub fn encrypt(plaintext: &[u8], passphrase: &str) -> (Vec<u8>, [u8; NONCE_LEN], [u8; SALT_LEN]) {
     use rand::RngCore;
     let mut rng = rand::thread_rng();
@@ -49,15 +65,15 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> (Vec<u8>, [u8; NONCE_LEN],
     rng.fill_bytes(&mut nonce_bytes);
 
     let key = derive_encryption_key(passphrase, &salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("valid key length");
+    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM encrypt should not fail");
+    let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
 
     (ciphertext, nonce_bytes, salt)
 }
 
-/// Decrypt ciphertext with AES-256-GCM.
+/// Decrypt ciphertext with AES-256-GCM-SIV.
 ///
 /// Returns the plaintext or `StegoError::DecryptionFailed` if the passphrase is wrong
 /// or data is corrupted.
@@ -68,7 +84,7 @@ pub fn decrypt(
     nonce_bytes: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, StegoError> {
     let key = derive_encryption_key(passphrase, salt);
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("valid key length");
+    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher

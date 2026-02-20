@@ -2,7 +2,9 @@ use crate::stego::crypto::{NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
 
 /// Ghost mode identifier byte.
-const MODE_GHOST: u8 = 0x01;
+pub const MODE_GHOST: u8 = 0x01;
+/// Armor mode identifier byte.
+pub const MODE_ARMOR: u8 = 0x02;
 
 /// Fixed overhead: mode(1) + length(2) + salt(16) + nonce(12) + tag(16) + crc(4) = 51 bytes.
 /// Plus the ciphertext length equals plaintext length (AES-GCM stream cipher).
@@ -16,7 +18,7 @@ pub const MAX_FRAME_BYTES: usize = 1075;
 /// Maximum payload frame size in bits.
 pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;
 
-/// Build a payload frame from encrypted components.
+/// Build a payload frame from encrypted components (Ghost mode).
 ///
 /// Frame layout:
 /// ```text
@@ -33,9 +35,20 @@ pub fn build_frame(
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Vec<u8> {
+    build_frame_with_mode(MODE_GHOST, plaintext_len, salt, nonce, ciphertext)
+}
+
+/// Build a payload frame with an explicit mode byte.
+pub fn build_frame_with_mode(
+    mode: u8,
+    plaintext_len: u16,
+    salt: &[u8; SALT_LEN],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+) -> Vec<u8> {
     let mut frame = Vec::with_capacity(1 + 2 + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
 
-    frame.push(MODE_GHOST);
+    frame.push(mode);
     frame.extend_from_slice(&plaintext_len.to_be_bytes());
     frame.extend_from_slice(salt);
     frame.extend_from_slice(nonce);
@@ -98,6 +111,62 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     let ciphertext = payload[3 + SALT_LEN + NONCE_LEN..].to_vec();
 
     Ok(ParsedFrame {
+        plaintext_len,
+        salt,
+        nonce,
+        ciphertext,
+    })
+}
+
+/// Parsed payload frame with mode byte.
+pub struct ParsedFrameWithMode {
+    pub mode: u8,
+    pub plaintext_len: u16,
+    pub salt: [u8; SALT_LEN],
+    pub nonce: [u8; NONCE_LEN],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Parse a payload frame, verifying CRC but accepting any mode byte.
+///
+/// Unlike `parse_frame` which rejects non-Ghost modes, this accepts any
+/// known mode and returns it in the result for the caller to dispatch on.
+pub fn parse_frame_any_mode(data: &[u8]) -> Result<ParsedFrameWithMode, StegoError> {
+    if data.len() < 3 {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let mode = data[0];
+    let plaintext_len = u16::from_be_bytes([data[1], data[2]]);
+    let ciphertext_len = plaintext_len as usize + 16;
+    let total_frame_len = 1 + 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
+
+    if data.len() < total_frame_len {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let payload = &data[..total_frame_len - 4];
+    let crc_bytes = &data[total_frame_len - 4..total_frame_len];
+    let stored_crc = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+    let computed_crc = crc32fast::hash(payload);
+    if stored_crc != computed_crc {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    if mode != MODE_GHOST && mode != MODE_ARMOR {
+        return Err(StegoError::UnknownFrameMode(mode));
+    }
+
+    let mut salt = [0u8; SALT_LEN];
+    salt.copy_from_slice(&payload[3..3 + SALT_LEN]);
+
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&payload[3 + SALT_LEN..3 + SALT_LEN + NONCE_LEN]);
+
+    let ciphertext = payload[3 + SALT_LEN + NONCE_LEN..].to_vec();
+
+    Ok(ParsedFrameWithMode {
+        mode,
         plaintext_len,
         salt,
         nonce,
