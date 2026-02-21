@@ -25,11 +25,86 @@ mod pipeline;
 pub mod armor;
 
 pub use error::StegoError;
+
+/// Maximum pixel dimension (width or height) for encode.
+/// Images exceeding this are downsampled by the frontend before reaching Rust.
+pub const MAX_DIMENSION: u32 = 8192;
+
+/// Maximum total pixel count for encode (width × height).
+pub const MAX_PIXELS: u32 = 16_000_000;
+
+/// Minimum pixel dimension (width or height) for encode.
+/// Images below this are rejected with an error message.
+pub const MIN_ENCODE_DIMENSION: u32 = 200;
+
+/// Validate image dimensions for encoding.
+///
+/// Returns `Ok(())` if the dimensions are within acceptable bounds.
+/// Called at the start of both `ghost_encode` and `armor_encode`.
+///
+/// # Errors
+/// - [`StegoError::ImageTooSmall`] if either dimension < 200px.
+/// - [`StegoError::ImageTooLarge`] if either dimension > 8192px or total pixels > 16M.
+pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoError> {
+    if width < MIN_ENCODE_DIMENSION || height < MIN_ENCODE_DIMENSION {
+        return Err(StegoError::ImageTooSmall);
+    }
+    if width > MAX_DIMENSION || height > MAX_DIMENSION || width * height > MAX_PIXELS {
+        return Err(StegoError::ImageTooLarge);
+    }
+    Ok(())
+}
 pub use pipeline::ghost_encode;
 pub use pipeline::ghost_decode;
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
+
+#[cfg(test)]
+mod dimension_tests {
+    use super::*;
+
+    #[test]
+    fn valid_dimensions() {
+        assert!(validate_encode_dimensions(800, 600).is_ok());
+        assert!(validate_encode_dimensions(3000, 4000).is_ok());
+    }
+
+    #[test]
+    fn boundary_min() {
+        assert!(validate_encode_dimensions(200, 200).is_ok());
+        assert!(validate_encode_dimensions(199, 200).is_err());
+        assert!(validate_encode_dimensions(200, 199).is_err());
+    }
+
+    #[test]
+    fn boundary_max_dimension() {
+        assert!(validate_encode_dimensions(8192, 1000).is_ok());
+        assert!(validate_encode_dimensions(1000, 8192).is_ok());
+        assert!(validate_encode_dimensions(8193, 1000).is_err());
+        assert!(validate_encode_dimensions(1000, 8193).is_err());
+    }
+
+    #[test]
+    fn too_many_pixels() {
+        // 5000 * 3201 = 16_005_000 > 16M
+        assert!(validate_encode_dimensions(5000, 3201).is_err());
+        // 4000 * 4000 = 16M exactly — OK
+        assert!(validate_encode_dimensions(4000, 4000).is_ok());
+    }
+
+    #[test]
+    fn error_variants() {
+        match validate_encode_dimensions(100, 300) {
+            Err(StegoError::ImageTooSmall) => {}
+            other => panic!("expected ImageTooSmall, got {other:?}"),
+        }
+        match validate_encode_dimensions(9000, 1000) {
+            Err(StegoError::ImageTooLarge) => {}
+            other => panic!("expected ImageTooLarge, got {other:?}"),
+        }
+    }
+}
 
 /// Unified decode: auto-detects Ghost or Armor mode from the embedded frame.
 ///

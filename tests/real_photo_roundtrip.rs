@@ -14,7 +14,7 @@
 
 use phasm_core::{
     armor_capacity, armor_decode, armor_encode, ghost_capacity, ghost_decode, ghost_encode,
-    JpegImage,
+    validate_encode_dimensions, JpegImage,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -151,6 +151,12 @@ fn ghost_with_passphrase_real_photos() {
         let tag = if converted { " (converted)" } else { "" };
 
         let img = JpegImage::from_bytes(&data).unwrap();
+        let fi = img.frame_info();
+        if validate_encode_dimensions(fi.width as u32, fi.height as u32).is_err() {
+            eprintln!("  SKIP {label}{tag}: dimensions {}x{} outside valid range", fi.width, fi.height);
+            skipped += 1;
+            continue;
+        }
         let cap = match ghost_capacity(&img) {
             Ok(c) if c >= SHORT_MSG.len() + 100 => c,
             Ok(c) => {
@@ -213,6 +219,8 @@ fn ghost_without_passphrase_real_photos() {
         let tag = if converted { " (converted)" } else { "" };
 
         let img = JpegImage::from_bytes(&data).unwrap();
+        let fi = img.frame_info();
+        if validate_encode_dimensions(fi.width as u32, fi.height as u32).is_err() { skipped += 1; continue; }
         let cap = ghost_capacity(&img).unwrap_or(0);
         if cap < SHORT_MSG.len() + 100 { skipped += 1; continue; }
 
@@ -268,6 +276,8 @@ fn armor_with_passphrase_real_photos() {
         let tag = if converted { " (converted)" } else { "" };
 
         let img = JpegImage::from_bytes(&data).unwrap();
+        let fi = img.frame_info();
+        if validate_encode_dimensions(fi.width as u32, fi.height as u32).is_err() { skipped += 1; continue; }
         let cap = match armor_capacity(&img) {
             Ok(c) if c >= SHORT_MSG.len() + 100 => c,
             Ok(c) => {
@@ -327,6 +337,8 @@ fn armor_without_passphrase_real_photos() {
         let tag = if converted { " (converted)" } else { "" };
 
         let img = JpegImage::from_bytes(&data).unwrap();
+        let fi = img.frame_info();
+        if validate_encode_dimensions(fi.width as u32, fi.height as u32).is_err() { skipped += 1; continue; }
         let cap = armor_capacity(&img).unwrap_or(0);
         if cap < SHORT_MSG.len() + 100 { skipped += 1; continue; }
 
@@ -375,6 +387,8 @@ fn cross_mode_rejection_real_photos() {
         };
 
         let img = JpegImage::from_bytes(&data).unwrap();
+        let fi = img.frame_info();
+        if validate_encode_dimensions(fi.width as u32, fi.height as u32).is_err() { continue; }
         let ghost_cap = ghost_capacity(&img).unwrap_or(0);
         let armor_cap = armor_capacity(&img).unwrap_or(0);
 

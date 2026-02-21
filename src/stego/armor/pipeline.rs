@@ -54,6 +54,10 @@ pub fn armor_encode(
 ) -> Result<Vec<u8>, StegoError> {
     let mut img = JpegImage::from_bytes(image_bytes)?;
 
+    // Validate dimensions before any heavy processing.
+    let fi = img.frame_info();
+    crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }

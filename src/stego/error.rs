@@ -12,6 +12,8 @@ pub enum StegoError {
     InvalidJpeg(crate::jpeg::error::JpegError),
     /// The image is too small or has too few usable coefficients.
     ImageTooSmall,
+    /// The image dimensions exceed the maximum allowed (8192px / 16MP).
+    ImageTooLarge,
     /// The message is too large for the cover image's embedding capacity.
     MessageTooLarge,
     /// CRC check failed on the extracted payload frame.
@@ -31,6 +33,7 @@ impl fmt::Display for StegoError {
         match self {
             Self::InvalidJpeg(e) => write!(f, "invalid JPEG: {e}"),
             Self::ImageTooSmall => write!(f, "image too small for embedding"),
+            Self::ImageTooLarge => write!(f, "image too large (max 8192px / 16MP)"),
             Self::MessageTooLarge => write!(f, "message too large for this image"),
             Self::FrameCorrupted => write!(f, "payload frame CRC mismatch"),
             Self::UnknownFrameMode(m) => write!(f, "unknown frame mode: 0x{m:02x}"),

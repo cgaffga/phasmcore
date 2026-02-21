@@ -32,3 +32,4 @@ pub use jpeg::frame::FrameInfo;
 pub use jpeg::JpegImage;
 pub use stego::{ghost_encode, ghost_decode, ghost_capacity, StegoError};
 pub use stego::{armor_encode, armor_decode, armor_capacity, smart_decode, DecodeQuality};
+pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION};
