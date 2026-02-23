@@ -188,7 +188,7 @@ pub fn ghost_decode(
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
-    // 3. Select and permute AC positions, truncate to n_used (same as encoder).
+    // 3. Select and permute AC positions (portable u32 shuffle).
     let positions = permute::select_and_permute(&cost_map, &perm_seed);
     let n = positions.len();
     let (w, n_used) = compute_stc_params(n)?;

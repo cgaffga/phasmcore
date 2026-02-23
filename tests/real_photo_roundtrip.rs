@@ -1,8 +1,17 @@
 /// Real-world photo integration tests.
 ///
-/// Drop ANY photos into `core/tests/real_photos/` and run:
+/// These tests are marked `#[ignore]` because they are slow (3-4 minutes).
+/// They are skipped by default when running `cargo test` or `./build.sh test`.
 ///
-///     cargo test -p phasm-core --test real_photo_roundtrip -- --nocapture
+/// To run them explicitly:
+///
+///     ./build.sh test-all
+///     # or:
+///     cargo test -p phasm-core -- --include-ignored --nocapture
+///     # or just the real photo tests:
+///     cargo test -p phasm-core --test real_photo_roundtrip -- --ignored --nocapture
+///
+/// Drop ANY photos into `core/tests/real_photos/` before running.
 ///
 /// Supported formats: JPEG, PNG, HEIC, WebP, TIFF, GIF, BMP — anything macOS
 /// can read. Non-baseline JPEGs (progressive, etc.) and non-JPEG formats are
@@ -125,6 +134,7 @@ const TEST_PASS: &str = "correct-horse-battery-staple";
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore] // Slow: runs on real photos in tests/real_photos/. Use `./build.sh test-all` to include.
 fn ghost_with_passphrase_real_photos() {
     let files = collect_image_files();
     if files.is_empty() {
@@ -199,6 +209,7 @@ fn ghost_with_passphrase_real_photos() {
 }
 
 #[test]
+#[ignore] // Slow: runs on real photos in tests/real_photos/. Use `./build.sh test-all` to include.
 fn ghost_without_passphrase_real_photos() {
     let files = collect_image_files();
     if files.is_empty() {
@@ -256,6 +267,7 @@ fn ghost_without_passphrase_real_photos() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore] // Slow: runs on real photos in tests/real_photos/. Use `./build.sh test-all` to include.
 fn armor_with_passphrase_real_photos() {
     let files = collect_image_files();
     if files.is_empty() {
@@ -317,6 +329,7 @@ fn armor_with_passphrase_real_photos() {
 }
 
 #[test]
+#[ignore] // Slow: runs on real photos in tests/real_photos/. Use `./build.sh test-all` to include.
 fn armor_without_passphrase_real_photos() {
     let files = collect_image_files();
     if files.is_empty() {
@@ -374,6 +387,7 @@ fn armor_without_passphrase_real_photos() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore] // Slow: runs on real photos in tests/real_photos/. Use `./build.sh test-all` to include.
 fn cross_mode_rejection_real_photos() {
     let files = collect_image_files();
     if files.is_empty() {

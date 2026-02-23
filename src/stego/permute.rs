@@ -5,6 +5,13 @@
 //! The permutation ensures that both encoder and decoder process coefficients
 //! in the same pseudo-random order, making the embedding resistant to
 //! position-based attacks.
+//!
+//! # Cross-platform portability
+//!
+//! The Fisher-Yates shuffle uses `u32` for `gen_range` (not `usize`) to ensure
+//! identical permutations on all platforms. `usize` is 32-bit on WASM but
+//! 64-bit on native, which causes `rand::Rng::gen_range` to consume different
+//! amounts of PRNG entropy per step — producing completely different shuffles.
 
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -20,26 +27,12 @@ pub struct CoeffPos {
     pub cost: f64,
 }
 
-/// Select embeddable AC coefficient positions and apply a Fisher-Yates permutation.
-///
-/// Collects all AC positions with finite cost (non-WET) in deterministic raster
-/// order, then shuffles them using a ChaCha20 PRNG seeded by `seed`.
-///
-/// # Arguments
-/// - `cost_map`: Embedding costs for each coefficient position.
-/// - `seed`: 32-byte seed (derived from the passphrase) for the PRNG.
-///
-/// # Returns
-/// A vector of [`CoeffPos`] in pseudo-random order. DC positions and zero-valued
-/// coefficients (which have infinite/WET cost) are excluded.
-pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> {
+/// Collect embeddable AC positions from the cost map in deterministic raster order.
+fn collect_positions(cost_map: &CostMap) -> Vec<CoeffPos> {
     let total_blocks = cost_map.total_blocks();
     let bt = cost_map.blocks_tall();
     let bw = cost_map.blocks_wide();
 
-    // Collect nonzero AC positions in deterministic raster order.
-    // Positions with infinite cost (DC and zero-valued coefficients) are excluded
-    // so the STC only operates on modifiable positions.
     let mut positions: Vec<CoeffPos> = Vec::with_capacity(total_blocks * 63);
     for br in 0..bt {
         for bc in 0..bw {
@@ -58,17 +51,39 @@ pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> 
             }
         }
     }
+    positions
+}
 
-    // Fisher-Yates shuffle with deterministic PRNG.
+/// Apply Fisher-Yates shuffle using `u32` for portable cross-platform behavior.
+fn shuffle_portable(positions: &mut [CoeffPos], seed: &[u8; 32]) {
     let mut rng = ChaCha20Rng::from_seed(*seed);
     let n = positions.len();
     for i in (1..n).rev() {
-        let j = rng.gen_range(0..=i);
+        let j = rng.gen_range(0..=(i as u32)) as usize;
         positions.swap(i, j);
     }
+}
 
+
+/// Select embeddable AC coefficient positions and apply a portable Fisher-Yates
+/// permutation.
+///
+/// Uses `u32` for the random range to ensure identical shuffles on native (64-bit)
+/// and WASM (32-bit) platforms.
+///
+/// # Arguments
+/// - `cost_map`: Embedding costs for each coefficient position.
+/// - `seed`: 32-byte seed (derived from the passphrase) for the PRNG.
+///
+/// # Returns
+/// A vector of [`CoeffPos`] in pseudo-random order. DC positions and zero-valued
+/// coefficients (which have infinite/WET cost) are excluded.
+pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> {
+    let mut positions = collect_positions(cost_map);
+    shuffle_portable(&mut positions, seed);
     positions
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -147,4 +162,5 @@ mod tests {
             );
         }
     }
+
 }
