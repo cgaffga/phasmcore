@@ -19,6 +19,7 @@ use crate::jpeg::pixels;
 use crate::stego::armor::ecc;
 use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract_soft};
 use crate::stego::armor::fft2d;
+use crate::stego::armor::fortress;
 use crate::stego::armor::repetition;
 use crate::stego::armor::resample;
 use crate::stego::armor::selection::compute_stability_map;
@@ -65,6 +66,26 @@ pub fn armor_encode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
+    // Encrypt message once (shared by both Fortress and STDM paths).
+    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
+
+    // Try Fortress (BA-QIM on DC) first if the message fits.
+    if let Ok(max_fort) = fortress::fortress_max_frame_bytes(&img) {
+        if frame_bytes.len() <= max_fort {
+            // Fortress doesn't use DFT template or pre-clamp (DC-only embedding).
+            fortress::fortress_encode(&mut img, &frame_bytes, passphrase)?;
+            let stego_bytes = match img.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    img.rebuild_huffman_tables();
+                    img.to_bytes().map_err(StegoError::InvalidJpeg)?
+                }
+            };
+            return Ok(stego_bytes);
+        }
+    }
+
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
     embed_dft_template(&mut img, passphrase, message)?;
 
@@ -94,16 +115,7 @@ pub fn armor_encode(
     let n_used = num_units * SPREAD_LEN;
     let positions = &positions[..n_used];
 
-    // 4. Encrypt message (Tier 2 key with random salt).
-    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
-
-    // 5. Build payload frame.
-    let frame_bytes = frame::build_frame(
-        message.len() as u16,
-        &salt,
-        &nonce,
-        &ciphertext,
-    );
+    // 4-5. frame_bytes already built above (shared with Fortress path).
 
     // 6. Compute mean QT from actual quantization table.
     let mean_qt = embedding::compute_mean_qt(&qt.values);
@@ -256,6 +268,8 @@ pub struct DecodeQuality {
     pub dft_ring_used: bool,
     /// DFT ring capacity in bytes (0 if not applicable).
     pub dft_ring_capacity: u16,
+    /// True if Fortress sub-mode (BA-QIM) was used for encoding.
+    pub fortress_used: bool,
 }
 
 impl DecodeQuality {
@@ -274,6 +288,7 @@ impl DecodeQuality {
             estimated_scale: 1.0,
             dft_ring_used: false,
             dft_ring_capacity: 0,
+            fortress_used: false,
         }
     }
 
@@ -307,6 +322,7 @@ impl DecodeQuality {
             estimated_scale: 1.0,
             dft_ring_used: false,
             dft_ring_capacity: 0,
+            fortress_used: false,
         }
     }
 }
@@ -323,7 +339,15 @@ impl DecodeQuality {
 /// # Returns
 /// A tuple of (decoded plaintext message, decode quality info).
 pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
-    // Try standard decode with delta sweep.
+    // Try Fortress first (fast magic-byte check on DC coefficients).
+    let img = JpegImage::from_bytes(stego_bytes)?;
+    if img.num_components() > 0 {
+        if let Ok(result) = fortress::fortress_decode(&img, passphrase) {
+            return Ok(result);
+        }
+    }
+
+    // Try standard STDM decode with delta sweep.
     match try_armor_decode(stego_bytes, passphrase) {
         Ok(result) => return Ok(result),
         Err(new_err) => {
@@ -471,6 +495,7 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
                     estimated_scale: 1.0,
                     dft_ring_used: true,
                     dft_ring_capacity: ring_cap as u16,
+                    fortress_used: false,
                 }));
             }
         }
@@ -527,6 +552,7 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
                             estimated_scale: transform.scale as f32,
                             dft_ring_used: true,
                             dft_ring_capacity: ring_cap as u16,
+                            fortress_used: false,
                         }));
                     }
                 }
@@ -938,6 +964,38 @@ fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     let i = pos / 8;
     let j = pos % 8;
     grid.set(br, bc, i, j, val);
+}
+
+/// Dual-tier capacity information for Armor mode.
+///
+/// Reports both Fortress (BA-QIM) and STDM capacities so the UI can show
+/// which sub-mode will be used for the current message length.
+#[derive(Debug, Clone)]
+pub struct ArmorCapacityInfo {
+    /// Maximum plaintext bytes embeddable via Fortress (BA-QIM). 0 if image too small.
+    pub fortress_capacity: usize,
+    /// Maximum plaintext bytes embeddable via STDM (standard Armor).
+    pub stdm_capacity: usize,
+}
+
+/// Compute dual-tier capacity information for an Armor-mode image.
+///
+/// Returns both Fortress and STDM capacities. The existing `armor_capacity()`
+/// function continues to return `stdm_capacity` for backward compatibility.
+pub fn armor_capacity_info(jpeg_bytes: &[u8]) -> Result<ArmorCapacityInfo, StegoError> {
+    let img = JpegImage::from_bytes(jpeg_bytes)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    let fortress_cap = fortress::fortress_capacity(&img).unwrap_or(0);
+    let stdm_cap = super::capacity::estimate_armor_capacity(&img).unwrap_or(0);
+
+    Ok(ArmorCapacityInfo {
+        fortress_capacity: fortress_cap,
+        stdm_capacity: stdm_cap,
+    })
 }
 
 /// Embed a DFT template and ring payload into the luminance channel.

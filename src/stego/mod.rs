@@ -57,7 +57,7 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
 pub use pipeline::ghost_encode;
 pub use pipeline::ghost_decode;
 pub use capacity::estimate_capacity as ghost_capacity;
-pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality};
+pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 
 #[cfg(test)]

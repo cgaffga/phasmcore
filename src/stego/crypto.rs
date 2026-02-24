@@ -32,6 +32,10 @@ const ARMOR_STRUCTURAL_SALT: &[u8; 16] = b"phasm-armor-v1\0\0";
 /// Independent from structural/armor keys so the template peaks are uncorrelated.
 const TEMPLATE_SALT: &[u8; 16] = b"phasm-tmpl-v1\0\0\0";
 
+/// Fixed salt for Fortress structural key derivation (BA-QIM block permutation).
+/// Independent from Armor STDM keys so the block order is uncorrelated.
+const FORTRESS_STRUCTURAL_SALT: &[u8; 16] = b"phasm-fort-v1\0\0\0";
+
 /// AES-GCM-SIV nonce length in bytes.
 pub const NONCE_LEN: usize = 12;
 /// Argon2 salt length in bytes.
@@ -70,6 +74,18 @@ pub fn derive_template_key(passphrase: &str) -> [u8; 32] {
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), TEMPLATE_SALT, &mut output)
         .expect("Argon2 template key derivation should not fail");
+    output
+}
+
+/// Derive the Fortress structural key from a passphrase.
+///
+/// Returns a 32-byte key used as a ChaCha20 seed for generating block
+/// permutation. Independent from Ghost/Armor/Template structural keys.
+pub fn derive_fortress_structural_key(passphrase: &str) -> [u8; 32] {
+    let mut output = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), FORTRESS_STRUCTURAL_SALT, &mut output)
+        .expect("Argon2 fortress key derivation should not fail");
     output
 }
 
@@ -188,6 +204,24 @@ mod tests {
         let a = derive_template_key("mypass");
         let b = derive_template_key("mypass");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fortress_key_deterministic() {
+        let a = derive_fortress_structural_key("mypass");
+        let b = derive_fortress_structural_key("mypass");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fortress_key_differs_from_others() {
+        let ghost = derive_structural_key("same_pass");
+        let armor = derive_armor_structural_key("same_pass");
+        let fortress = derive_fortress_structural_key("same_pass");
+        let template = derive_template_key("same_pass");
+        assert_ne!(&ghost[..32], &fortress[..]);
+        assert_ne!(&armor[..32], &fortress[..]);
+        assert_ne!(&template[..], &fortress[..]);
     }
 
     #[test]

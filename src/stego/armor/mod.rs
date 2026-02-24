@@ -30,4 +30,5 @@ pub mod fft2d;
 pub mod template;
 pub mod resample;
 pub mod dft_payload;
+pub mod fortress;
 pub mod pipeline;
