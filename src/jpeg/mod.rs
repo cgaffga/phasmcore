@@ -390,19 +390,77 @@ impl JpegImage {
             },
         );
     }
+
+    /// Replace a quantization table by ID and rebuild the DQT marker segments.
+    ///
+    /// Call this after modifying DCT coefficients to reflect new quantization
+    /// (e.g., for recompression simulation). Updates both the internal table
+    /// and the raw DQT segments so that `to_bytes()` produces correct output.
+    pub fn set_quant_table(&mut self, id: usize, qt: dct::QuantTable) {
+        self.quant_tables[id] = Some(qt);
+        self.rebuild_dqt_segments();
+    }
+
+    /// Rebuild DQT marker segments from internal quantization table state.
+    ///
+    /// Removes all existing DQT entries from `raw_segments` and inserts fresh
+    /// ones before the SOF0 marker (matching the standard JPEG header order).
+    fn rebuild_dqt_segments(&mut self) {
+        use zigzag::NATURAL_TO_ZIGZAG;
+
+        // Remove old DQT segments.
+        self.raw_segments.retain(|s| s.marker != marker::DQT);
+
+        // Build new DQT data: one segment containing all defined tables.
+        let mut dqt_data = Vec::new();
+        for id in 0..4u8 {
+            if let Some(qt) = &self.quant_tables[id as usize] {
+                // precision_and_id: precision=0 (8-bit) for values ≤255
+                let precision: u8 = if qt.values.iter().all(|&v| v <= 255) { 0 } else { 1 };
+                dqt_data.push((precision << 4) | id);
+                for zi in 0..64 {
+                    let ni = NATURAL_TO_ZIGZAG[zi];
+                    if precision == 0 {
+                        dqt_data.push(qt.values[ni] as u8);
+                    } else {
+                        dqt_data.extend_from_slice(&qt.values[ni].to_be_bytes());
+                    }
+                }
+            }
+        }
+
+        // Insert before SOF0 (same position strategy as DHT rebuild).
+        let sof_pos = self
+            .raw_segments
+            .iter()
+            .position(|s| s.marker == marker::SOF0)
+            .unwrap_or(self.raw_segments.len());
+
+        self.raw_segments.insert(
+            sof_pos,
+            MarkerSegment {
+                marker: marker::DQT,
+                data: dqt_data,
+            },
+        );
+    }
 }
 
 /// Build an optimal Huffman spec from symbol frequency counts.
 ///
-/// Uses a simplified version of the JPEG Annex K algorithm:
-/// sorts symbols by frequency, assigns code lengths, limits to 16 bits.
+/// Implements JPEG Annex K (Figures K.1–K.4) with the libjpeg pseudo-symbol
+/// technique: a dummy symbol 256 with frequency 1 is added before tree
+/// construction. This guarantees:
+/// - No real symbol gets the all-ones codeword.
+/// - The Kraft inequality is strictly satisfied after code-length limiting.
+/// - Output tables are fully compatible with libjpeg/libjpeg-turbo.
 fn build_huffman_spec(class: u8, id: u8, freq: &[u32]) -> HuffmanSpec {
-    // Collect symbols with nonzero frequency.
-    let mut symbols: Vec<(u8, u32)> = freq
+    // Collect symbols with nonzero frequency (u16 to accommodate pseudo-symbol 256).
+    let mut symbols: Vec<(u16, u32)> = freq
         .iter()
         .enumerate()
         .filter(|&(_, &f)| f > 0)
-        .map(|(sym, &f)| (sym as u8, f))
+        .map(|(sym, &f)| (sym as u16, f))
         .collect();
 
     if symbols.is_empty() {
@@ -410,9 +468,9 @@ fn build_huffman_spec(class: u8, id: u8, freq: &[u32]) -> HuffmanSpec {
         symbols.push((0, 1));
     }
 
-    // If only one symbol, we still need a valid Huffman code (1-bit code).
+    // If only one real symbol, we still need a valid Huffman code (1-bit code).
     if symbols.len() == 1 {
-        let sym = symbols[0].0;
+        let sym = symbols[0].0 as u8;
         return HuffmanSpec {
             class,
             id,
@@ -421,35 +479,28 @@ fn build_huffman_spec(class: u8, id: u8, freq: &[u32]) -> HuffmanSpec {
         };
     }
 
-    let n = symbols.len();
+    // Add pseudo-symbol 256 with frequency 1 (libjpeg technique).
+    // This symbol will get the longest code, preventing any real symbol from
+    // receiving the all-ones codeword and providing a Kraft inequality safety
+    // margin after Annex K.3 code-length limiting.
+    symbols.push((256, 1));
 
-    // Sort by frequency descending (most frequent → shortest code).
-    symbols.sort_by(|a, b| b.1.cmp(&a.1));
+    let n = symbols.len(); // includes pseudo-symbol
 
-    // Assign code lengths using a simple heuristic: use the "package-merge"
-    // idea simplified. For correctness, we use a standard approach:
-    // build a Huffman tree via the standard algorithm, then extract lengths.
+    // Sort ascending by (frequency, symbol) for the tree-building merge.
+    // Higher symbol number breaks ties → pseudo-symbol 256 sorts last among
+    // freq-1 symbols, ensuring it gets the longest code.
+    symbols.sort_by_key(|&(sym, f)| (f, sym));
 
-    // Build Huffman tree using a priority queue (min-heap via sorted vec).
-    let mut nodes: Vec<(u64, Option<usize>)> = symbols
-        .iter()
-        .enumerate()
-        .map(|(i, &(_, f))| (f as u64, Some(i)))
-        .collect();
-
-    // Also need parent tracking for code length computation.
+    // Build Huffman tree using two-queue merge (standard algorithm).
     let total_nodes = 2 * n - 1;
     let mut parent = vec![0usize; total_nodes];
     let mut next_internal = n;
 
-    // Sort ascending by frequency for the merge process.
-    nodes.sort_by_key(|&(f, _)| f);
-
-    // Simple two-queue merge (Huffman algorithm).
-    let mut q1: std::collections::VecDeque<(u64, usize)> = nodes
+    let mut q1: std::collections::VecDeque<(u64, usize)> = symbols
         .iter()
         .enumerate()
-        .map(|(idx, &(f, _))| (f, idx))
+        .map(|(idx, &(_, f))| (f as u64, idx))
         .collect();
     let mut q2: std::collections::VecDeque<(u64, usize)> = std::collections::VecDeque::new();
 
@@ -482,17 +533,6 @@ fn build_huffman_spec(class: u8, id: u8, freq: &[u32]) -> HuffmanSpec {
     // Compute code lengths by walking from each leaf to the root.
     let root = total_nodes - 1;
     let mut code_lengths = vec![0u8; n];
-    // Map from sorted index to original symbol.
-    let sorted_syms: Vec<u8> = {
-        let mut s: Vec<(u64, usize)> = symbols
-            .iter()
-            .enumerate()
-            .map(|(i, &(_, f))| (f as u64, i))
-            .collect();
-        s.sort_by_key(|&(f, _)| f);
-        s.iter().map(|&(_, orig)| symbols[orig].0).collect()
-    };
-
     for i in 0..n {
         let mut depth = 0u8;
         let mut node = i;
@@ -503,46 +543,69 @@ fn build_huffman_spec(class: u8, id: u8, freq: &[u32]) -> HuffmanSpec {
         code_lengths[i] = depth;
     }
 
-    // Limit code lengths to 16 bits (JPEG requirement).
-    // Use the algorithm from JPEG spec Annex K.3.
-    loop {
-        let max_len = code_lengths.iter().copied().max().unwrap_or(0);
-        if max_len <= 16 {
-            break;
+    // Limit code lengths to 16 bits (JPEG Annex K.3 — Adjust_BITS procedure).
+    let max_len = code_lengths.iter().copied().max().unwrap_or(0) as usize;
+
+    let mut bits_count = vec![0u32; max_len + 1];
+    for &len in &code_lengths {
+        bits_count[len as usize] += 1;
+    }
+
+    if max_len > 16 {
+        let mut i = max_len;
+        while i > 16 {
+            while bits_count[i] > 0 {
+                // Find a donor level j (j <= i-2) that has codes to split.
+                let mut j = i - 2;
+                while j > 0 && bits_count[j] == 0 {
+                    j -= 1;
+                }
+                debug_assert!(j > 0, "Annex K.3: no donor found (pseudo-symbol should prevent this)");
+                if j == 0 {
+                    // Safety fallback (should never happen with pseudo-symbol).
+                    bits_count[16] += bits_count[i];
+                    bits_count[i] = 0;
+                    break;
+                }
+                bits_count[i] -= 2;
+                bits_count[i - 1] += 1;
+                bits_count[j + 1] += 2;
+                bits_count[j] -= 1;
+            }
+            i -= 1;
         }
-        // Find the deepest leaf and reduce its length by promoting it.
-        for len in (17..=max_len).rev() {
-            while code_lengths.iter().any(|&l| l == len) {
-                // Find a node at `len` and one at `len-2` to swap.
-                let deep_idx = code_lengths.iter().position(|&l| l == len).unwrap();
-                code_lengths[deep_idx] = len - 1;
-                // Find another node at the same depth and reduce.
-                if let Some(sibling) = code_lengths.iter().position(|&l| l == len) {
-                    code_lengths[sibling] = len - 1;
-                }
-                // Add a new node at len-1 by splitting one from len-2.
-                if let Some(donor) = code_lengths.iter().position(|&l| l == len - 2) {
-                    code_lengths[donor] = len - 1;
-                }
+
+        // Reassign code_lengths from the adjusted bits_count[].
+        // Longest codes go to least-frequent symbols (lowest indices).
+        let mut pos = 0;
+        for len in (1..=16u8).rev() {
+            let count = bits_count[len as usize] as usize;
+            for _ in 0..count {
+                code_lengths[pos] = len;
+                pos += 1;
             }
         }
     }
 
-    // Build bits[] and huffval[] arrays.
-    // Sort symbols by (code_length, symbol_value) for canonical ordering.
-    let mut sym_len: Vec<(u8, u8)> = sorted_syms
+    // Build bits[] and huffval[] arrays, excluding pseudo-symbol 256.
+    // Sort by (code_length, symbol_value) for canonical Huffman ordering.
+    let mut sym_len: Vec<(u16, u8)> = symbols
         .iter()
         .zip(code_lengths.iter())
-        .map(|(&sym, &len)| (sym, len))
+        .map(|(&(sym, _), &len)| (sym, len))
         .collect();
     sym_len.sort_by_key(|&(sym, len)| (len, sym));
 
     let mut bits = [0u8; 16];
     let mut huffval = Vec::with_capacity(n);
     for &(sym, len) in &sym_len {
+        // Skip pseudo-symbol 256 — it served its purpose in tree construction.
+        if sym == 256 {
+            continue;
+        }
         if len > 0 && len <= 16 {
             bits[(len - 1) as usize] += 1;
-            huffval.push(sym);
+            huffval.push(sym as u8);
         }
     }
 
