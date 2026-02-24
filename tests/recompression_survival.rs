@@ -673,3 +673,1198 @@ fn armor_platform_simulation_matrix() {
     println!("PLATFORM total: {survived}/{total} survived ({:.1}%)",
         if total > 0 { survived as f64 / total as f64 * 100.0 } else { 0.0 });
 }
+
+// =============================================================================
+// Social Media Mode Experiment
+// =============================================================================
+
+/// Preprocessing configuration for the social media experiment.
+struct PreprocessConfig {
+    name: &'static str,
+    max_long_edge: u32,
+    quality: u8,
+}
+
+const SOCIAL_MEDIA_PREPROCESS: &[PreprocessConfig] = &[
+    PreprocessConfig { name: "SocMedia/QF70", max_long_edge: 1600, quality: 70 },
+    PreprocessConfig { name: "SocMedia/QF75", max_long_edge: 1600, quality: 75 },
+];
+
+/// Pre-process a cover image for social media mode using ImageMagick.
+///
+/// Resizes to max_long_edge (shrink only) and recompresses at the target QF.
+/// Forces baseline JPEG. Returns the preprocessed bytes, or None on failure.
+fn preprocess_for_social_media(cover_bytes: &[u8], config: &PreprocessConfig) -> Option<Vec<u8>> {
+    use std::process::Command;
+
+    let pid = std::process::id();
+    let tid: u64 = config.quality as u64 * 10000 + config.max_long_edge as u64;
+    let dir = std::env::temp_dir();
+    let input_path = dir.join(format!("phasm_sm_input_{pid}_{tid}.jpg"));
+    let output_path = dir.join(format!("phasm_sm_output_{pid}_{tid}.jpg"));
+
+    std::fs::write(&input_path, cover_bytes).ok()?;
+
+    let dim = config.max_long_edge;
+    let status = Command::new("/opt/ImageMagick/bin/convert")
+        .args([
+            &input_path.to_string_lossy().to_string(),
+            "-resize", &format!("{dim}x{dim}>"),
+            "-quality", &config.quality.to_string(),
+            "-interlace", "none",
+            &output_path.to_string_lossy().to_string(),
+        ])
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&input_path);
+        return None;
+    }
+
+    let result = std::fs::read(&output_path).ok();
+    let _ = std::fs::remove_file(&input_path);
+    let _ = std::fs::remove_file(&output_path);
+    result
+}
+
+/// Social Media Mode A/B experiment.
+///
+/// Compares Armor survival rates:
+///   A (Baseline): encode original cover → platform recompression → decode
+///   B (Social Media): preprocess cover (resize 1600px + recompress QF 70/75) → encode → platform recomp → decode
+///
+/// Run with: cargo test -p phasm-core -- --ignored armor_social_media_experiment --nocapture
+#[test]
+#[ignore]
+fn armor_social_media_experiment() {
+    // Check ImageMagick availability
+    let im_available = std::process::Command::new("/opt/ImageMagick/bin/convert")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !im_available {
+        println!("\nSKIPPED: ImageMagick not found at /opt/ImageMagick/bin/convert");
+        return;
+    }
+
+    let test_images: Vec<(&str, Vec<u8>)> = vec![
+        ("photo_320x240", load_test_vector("photo_320x240_q75_420.jpg")),
+        ("fractal_100x75", load_test_vector("fractal_100x75_q85_420.jpg")),
+        ("istock_612x408", load_real_photo("istockphoto-612x612-baseline.jpg")),
+        ("real_1290x1715", load_real_photo("637586123-baseline.jpg")),
+    ];
+
+    let experiment_msg_lengths: &[usize] = &[10, 20, 50, 100];
+    let passphrase = "social-media-experiment-2026";
+
+    // Track results per mode for summary
+    struct ModeStats {
+        name: String,
+        total: u32,
+        survived: u32,
+    }
+    let mut all_stats: Vec<ModeStats> = Vec::new();
+
+    // Per-platform stats for the final breakdown
+    struct PlatformModeStats {
+        mode_name: String,
+        platform_name: String,
+        total: u32,
+        survived: u32,
+    }
+    let mut platform_stats: Vec<PlatformModeStats> = Vec::new();
+
+    // =========================================================================
+    // Phase 1: Capacity diagnostic report
+    // =========================================================================
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║          SOCIAL MEDIA MODE — A/B EXPERIMENT                     ║");
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+    println!("CAPACITY DIAGNOSTIC REPORT");
+    println!("{:<16} {:<14} {:>10} {:>10} {:>8}",
+        "Image", "Mode", "Dimensions", "FileSize", "Capacity");
+    println!("{}", "-".repeat(62));
+
+    for (img_name, cover_bytes) in &test_images {
+        // Original
+        if let Ok(img) = JpegImage::from_bytes(cover_bytes) {
+            let fi = img.frame_info();
+            let cap = armor_capacity(&img).unwrap_or(0);
+            println!("{:<16} {:<14} {:>4}x{:<5} {:>8} {:>8}",
+                img_name, "Original", fi.width, fi.height,
+                format!("{}K", cover_bytes.len() / 1024), format!("{cap}B"));
+        }
+
+        // Preprocessed variants
+        for config in SOCIAL_MEDIA_PREPROCESS {
+            if let Some(pp_bytes) = preprocess_for_social_media(cover_bytes, config) {
+                if let Ok(img) = JpegImage::from_bytes(&pp_bytes) {
+                    let fi = img.frame_info();
+                    let cap = armor_capacity(&img).unwrap_or(0);
+                    println!("{:<16} {:<14} {:>4}x{:<5} {:>8} {:>8}",
+                        img_name, config.name, fi.width, fi.height,
+                        format!("{}K", pp_bytes.len() / 1024), format!("{cap}B"));
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Phase 2: Full experiment matrix
+    // =========================================================================
+    println!();
+    println!("EXPERIMENT MATRIX");
+    println!("{:<14} {:<16} {:>4} {:<12} {:>3}  {:>8} {:>6} {:>6} {:>4}",
+        "Mode", "Image", "Msg", "Platform", "QF", "Result", "Integ", "RSErr", "r");
+    println!("{}", "-".repeat(95));
+
+    // --- Mode A: Baseline ---
+    {
+        let mode_name = "Baseline";
+        let mut mode_total = 0u32;
+        let mut mode_survived = 0u32;
+
+        for (img_name, cover_bytes) in &test_images {
+            let img = match JpegImage::from_bytes(cover_bytes) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            let cap = armor_capacity(&img).unwrap_or(0);
+
+            for &msg_len in experiment_msg_lengths {
+                if msg_len > cap { continue; }
+
+                let message = generate_message(msg_len);
+                let stego = match armor_encode(cover_bytes, &message, passphrase) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for profile in PLATFORMS {
+                    mode_total += 1;
+                    let recompressed = match simulate_platform(&stego, profile) {
+                        Some(r) => r,
+                        None => {
+                            println!("{:<14} {:<16} {:>4} {:<12} {:>3}  {:>8} {:>6} {:>6} {:>4}",
+                                mode_name, img_name, msg_len, profile.name, profile.quality,
+                                "IM_ERR", "-", "-", "-");
+                            continue;
+                        }
+                    };
+                    let (survived_str, integ, rs_err, rep_f) = match armor_decode(&recompressed, passphrase) {
+                        Ok((decoded, quality)) => {
+                            let ok = decoded == message;
+                            if ok { mode_survived += 1; }
+                            // Track per-platform stats
+                            let ps = platform_stats.iter_mut().find(|p| p.mode_name == mode_name && p.platform_name == profile.name);
+                            if let Some(ps) = ps {
+                                ps.total += 1;
+                                if ok { ps.survived += 1; }
+                            } else {
+                                platform_stats.push(PlatformModeStats {
+                                    mode_name: mode_name.to_string(),
+                                    platform_name: profile.name.to_string(),
+                                    total: 1,
+                                    survived: if ok { 1 } else { 0 },
+                                });
+                            }
+                            (
+                                if ok { "YES" } else { "CORRUPT" },
+                                format!("{}%", quality.integrity_percent),
+                                format!("{}", quality.rs_errors_corrected),
+                                format!("{}", quality.repetition_factor),
+                            )
+                        }
+                        Err(_) => {
+                            let ps = platform_stats.iter_mut().find(|p| p.mode_name == mode_name && p.platform_name == profile.name);
+                            if let Some(ps) = ps { ps.total += 1; }
+                            else {
+                                platform_stats.push(PlatformModeStats {
+                                    mode_name: mode_name.to_string(),
+                                    platform_name: profile.name.to_string(),
+                                    total: 1, survived: 0,
+                                });
+                            }
+                            ("FAIL", "-".to_string(), "-".to_string(), "-".to_string())
+                        }
+                    };
+                    println!("{:<14} {:<16} {:>4} {:<12} {:>3}  {:>8} {:>6} {:>6} {:>4}",
+                        mode_name, img_name, msg_len, profile.name, profile.quality,
+                        survived_str, integ, rs_err, rep_f);
+                }
+            }
+        }
+
+        all_stats.push(ModeStats { name: mode_name.to_string(), total: mode_total, survived: mode_survived });
+    }
+
+    // --- Mode B: Social Media Mode (for each QF) ---
+    for config in SOCIAL_MEDIA_PREPROCESS {
+        let mode_name = config.name;
+        let mut mode_total = 0u32;
+        let mut mode_survived = 0u32;
+
+        for (img_name, cover_bytes) in &test_images {
+            // Preprocess the cover
+            let pp_bytes = match preprocess_for_social_media(cover_bytes, config) {
+                Some(b) => b,
+                None => {
+                    println!("{:<14} {:<16} PREPROCESS FAILED", mode_name, img_name);
+                    continue;
+                }
+            };
+
+            let img = match JpegImage::from_bytes(&pp_bytes) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            let cap = armor_capacity(&img).unwrap_or(0);
+
+            for &msg_len in experiment_msg_lengths {
+                if msg_len > cap { continue; }
+
+                let message = generate_message(msg_len);
+                let stego = match armor_encode(&pp_bytes, &message, passphrase) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for profile in PLATFORMS {
+                    mode_total += 1;
+                    let recompressed = match simulate_platform(&stego, profile) {
+                        Some(r) => r,
+                        None => {
+                            println!("{:<14} {:<16} {:>4} {:<12} {:>3}  {:>8} {:>6} {:>6} {:>4}",
+                                mode_name, img_name, msg_len, profile.name, profile.quality,
+                                "IM_ERR", "-", "-", "-");
+                            continue;
+                        }
+                    };
+                    let (survived_str, integ, rs_err, rep_f) = match armor_decode(&recompressed, passphrase) {
+                        Ok((decoded, quality)) => {
+                            let ok = decoded == message;
+                            if ok { mode_survived += 1; }
+                            let ps = platform_stats.iter_mut().find(|p| p.mode_name == mode_name && p.platform_name == profile.name);
+                            if let Some(ps) = ps {
+                                ps.total += 1;
+                                if ok { ps.survived += 1; }
+                            } else {
+                                platform_stats.push(PlatformModeStats {
+                                    mode_name: mode_name.to_string(),
+                                    platform_name: profile.name.to_string(),
+                                    total: 1,
+                                    survived: if ok { 1 } else { 0 },
+                                });
+                            }
+                            (
+                                if ok { "YES" } else { "CORRUPT" },
+                                format!("{}%", quality.integrity_percent),
+                                format!("{}", quality.rs_errors_corrected),
+                                format!("{}", quality.repetition_factor),
+                            )
+                        }
+                        Err(_) => {
+                            let ps = platform_stats.iter_mut().find(|p| p.mode_name == mode_name && p.platform_name == profile.name);
+                            if let Some(ps) = ps { ps.total += 1; }
+                            else {
+                                platform_stats.push(PlatformModeStats {
+                                    mode_name: mode_name.to_string(),
+                                    platform_name: profile.name.to_string(),
+                                    total: 1, survived: 0,
+                                });
+                            }
+                            ("FAIL", "-".to_string(), "-".to_string(), "-".to_string())
+                        }
+                    };
+                    println!("{:<14} {:<16} {:>4} {:<12} {:>3}  {:>8} {:>6} {:>6} {:>4}",
+                        mode_name, img_name, msg_len, profile.name, profile.quality,
+                        survived_str, integ, rs_err, rep_f);
+                }
+            }
+        }
+
+        all_stats.push(ModeStats { name: mode_name.to_string(), total: mode_total, survived: mode_survived });
+    }
+
+    // =========================================================================
+    // Phase 3: Summary
+    // =========================================================================
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════");
+    println!("SUMMARY — Overall Survival Rates");
+    println!("{:<16} {:>8} {:>8} {:>8}", "Mode", "Survived", "Total", "Rate");
+    println!("{}", "-".repeat(44));
+    for stat in &all_stats {
+        let rate = if stat.total > 0 { stat.survived as f64 / stat.total as f64 * 100.0 } else { 0.0 };
+        println!("{:<16} {:>8} {:>8} {:>7.1}%", stat.name, stat.survived, stat.total, rate);
+    }
+
+    println!();
+    println!("SUMMARY — Per-Platform Breakdown");
+    println!("{:<12} {:>16} {:>16} {:>16}", "Platform",
+        all_stats.get(0).map(|s| s.name.as_str()).unwrap_or("-"),
+        all_stats.get(1).map(|s| s.name.as_str()).unwrap_or("-"),
+        all_stats.get(2).map(|s| s.name.as_str()).unwrap_or("-"));
+    println!("{}", "-".repeat(64));
+
+    for profile in PLATFORMS {
+        let rates: Vec<String> = all_stats.iter().map(|mode_stat| {
+            if let Some(ps) = platform_stats.iter().find(|p| p.mode_name == mode_stat.name && p.platform_name == profile.name) {
+                if ps.total > 0 {
+                    format!("{}/{} ({:.0}%)", ps.survived, ps.total,
+                        ps.survived as f64 / ps.total as f64 * 100.0)
+                } else {
+                    "-".to_string()
+                }
+            } else {
+                "-".to_string()
+            }
+        }).collect();
+
+        println!("{:<12} {:>16} {:>16} {:>16}",
+            profile.name,
+            rates.get(0).map(|s| s.as_str()).unwrap_or("-"),
+            rates.get(1).map(|s| s.as_str()).unwrap_or("-"),
+            rates.get(2).map(|s| s.as_str()).unwrap_or("-"));
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════");
+}
+
+// =============================================================================
+// Real Encoder Experiment (libjpeg-turbo, MozJPEG, AppleJPEG)
+// =============================================================================
+
+/// Encoder profile for real JPEG encoder tools.
+struct EncoderProfile {
+    name: &'static str,
+    /// Shell out: decompress stego → recompress at target QF.
+    /// Returns the recompressed JPEG bytes, or None on failure.
+    recompress_fn: fn(stego_bytes: &[u8], qf: u8) -> Option<Vec<u8>>,
+    /// Quality factors to test.
+    qfs: &'static [u8],
+}
+
+/// Recompress using libjpeg-turbo (djpeg → cjpeg pipeline).
+/// Twitter, Discord, Telegram Android, WhatsApp Android.
+fn recompress_libjpeg_turbo(stego_bytes: &[u8], qf: u8) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("phasm_ljt_in_{pid}.jpg"));
+    let ppm = dir.join(format!("phasm_ljt_{pid}.ppm"));
+    let output = dir.join(format!("phasm_ljt_out_{pid}.jpg"));
+
+    std::fs::write(&input, stego_bytes).ok()?;
+
+    // Decompress
+    let djpeg_out = Command::new("/opt/homebrew/bin/djpeg")
+        .arg("-ppm")
+        .arg("-outfile").arg(&ppm)
+        .arg(&input)
+        .output().ok()?;
+    if !djpeg_out.status.success() {
+        let _ = std::fs::remove_file(&input);
+        return None;
+    }
+
+    // Recompress with libjpeg-turbo cjpeg (baseline by default)
+    let cjpeg_out = Command::new("/opt/homebrew/bin/cjpeg")
+        .arg("-quality").arg(qf.to_string())
+        .arg("-baseline")
+        .arg("-outfile").arg(&output)
+        .arg(&ppm)
+        .output().ok()?;
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&ppm);
+
+    if !cjpeg_out.status.success() {
+        let _ = std::fs::remove_file(&output);
+        return None;
+    }
+
+    let result = std::fs::read(&output).ok();
+    let _ = std::fs::remove_file(&output);
+    result
+}
+
+/// Recompress using MozJPEG (djpeg → cjpeg pipeline).
+/// Facebook, Instagram.
+fn recompress_mozjpeg(stego_bytes: &[u8], qf: u8) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("phasm_moz_in_{pid}.jpg"));
+    let ppm = dir.join(format!("phasm_moz_{pid}.ppm"));
+    let output = dir.join(format!("phasm_moz_out_{pid}.jpg"));
+
+    std::fs::write(&input, stego_bytes).ok()?;
+
+    // Use libjpeg-turbo djpeg for decompression (MozJPEG's djpeg also works)
+    let djpeg_out = Command::new("/opt/homebrew/bin/djpeg")
+        .arg("-ppm")
+        .arg("-outfile").arg(&ppm)
+        .arg(&input)
+        .output().ok()?;
+    if !djpeg_out.status.success() {
+        let _ = std::fs::remove_file(&input);
+        return None;
+    }
+
+    // Recompress with MozJPEG cjpeg (-baseline forces non-progressive)
+    let cjpeg_out = Command::new("/opt/homebrew/opt/mozjpeg/bin/cjpeg")
+        .arg("-quality").arg(qf.to_string())
+        .arg("-baseline")
+        .arg("-outfile").arg(&output)
+        .arg(&ppm)
+        .output().ok()?;
+
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_file(&ppm);
+
+    if !cjpeg_out.status.success() {
+        let _ = std::fs::remove_file(&output);
+        return None;
+    }
+
+    let result = std::fs::read(&output).ok();
+    let _ = std::fs::remove_file(&output);
+    result
+}
+
+/// Recompress using Apple's sips (CoreImage/AppleJPEG framework).
+/// iMessage, WhatsApp iOS, Telegram iOS.
+fn recompress_sips(stego_bytes: &[u8], qf: u8) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("phasm_sips_in_{pid}.jpg"));
+    let output = dir.join(format!("phasm_sips_out_{pid}.jpg"));
+
+    std::fs::write(&input, stego_bytes).ok()?;
+
+    // sips recompresses directly (pixel-domain round-trip through CoreImage)
+    let sips_out = Command::new("/usr/bin/sips")
+        .arg("-s").arg("format").arg("jpeg")
+        .arg("-s").arg("formatOptions").arg(qf.to_string())
+        .arg(&input)
+        .arg("--out").arg(&output)
+        .output().ok()?;
+
+    let _ = std::fs::remove_file(&input);
+
+    if !sips_out.status.success() {
+        let _ = std::fs::remove_file(&output);
+        return None;
+    }
+
+    let result = std::fs::read(&output).ok();
+    let _ = std::fs::remove_file(&output);
+    result
+}
+
+/// Recompress using our internal pixel-domain simulation.
+/// Provides a pure-Rust comparison baseline.
+fn recompress_internal(stego_bytes: &[u8], qf: u8) -> Option<Vec<u8>> {
+    simulate_pixel_recompression(stego_bytes, qf)
+}
+
+/// Real encoder experiment: tests Armor survival against three real JPEG
+/// encoder families (libjpeg-turbo, MozJPEG, AppleJPEG) plus internal sim.
+///
+/// Run with: cargo test -p phasm-core -- --ignored armor_real_encoder_experiment --nocapture
+#[test]
+#[ignore]
+fn armor_real_encoder_experiment() {
+    // Check encoder availability
+    let ljt_available = std::process::Command::new("/opt/homebrew/bin/cjpeg")
+        .arg("-version").output().map(|o| o.status.success() || !o.stderr.is_empty()).unwrap_or(false);
+    let moz_available = std::process::Command::new("/opt/homebrew/opt/mozjpeg/bin/cjpeg")
+        .arg("-version").output().map(|o| o.status.success() || !o.stderr.is_empty()).unwrap_or(false);
+    let sips_available = std::process::Command::new("/usr/bin/sips")
+        .arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
+
+    println!();
+    println!("╔══════════════════════════════════════════════════════════════════════╗");
+    println!("║     REAL ENCODER EXPERIMENT — Armor Robustness Fixes               ║");
+    println!("╠══════════════════════════════════════════════════════════════════════╣");
+    println!("║  Encoders:                                                         ║");
+    println!("║  • libjpeg-turbo: {} (Twitter, Discord, Telegram Android)      ║",
+        if ljt_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • MozJPEG:       {} (Facebook, Instagram)                     ║",
+        if moz_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • AppleJPEG:     {} (iMessage, WhatsApp iOS, Telegram iOS)    ║",
+        if sips_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • Internal sim:  AVAILABLE (pure-Rust baseline)                   ║");
+    println!("╚══════════════════════════════════════════════════════════════════════╝");
+
+    let encoders: Vec<EncoderProfile> = vec![
+        EncoderProfile {
+            name: "Internal",
+            recompress_fn: recompress_internal,
+            qfs: &[95, 85, 80, 75, 70, 53],
+        },
+        EncoderProfile {
+            name: "libjpeg-turbo",
+            recompress_fn: recompress_libjpeg_turbo,
+            qfs: &[95, 85, 80, 75, 70, 53],
+        },
+        EncoderProfile {
+            name: "MozJPEG",
+            recompress_fn: recompress_mozjpeg,
+            qfs: &[95, 85, 80, 75, 70, 53],
+        },
+        EncoderProfile {
+            name: "AppleJPEG",
+            recompress_fn: recompress_sips,
+            qfs: &[95, 85, 80, 75, 70, 53],
+        },
+    ];
+
+    let test_images: Vec<(&str, Vec<u8>)> = vec![
+        ("photo_320x240", load_test_vector("photo_320x240_q75_420.jpg")),
+        ("fractal_100x75", load_test_vector("fractal_100x75_q85_420.jpg")),
+        ("istock_612x408", load_real_photo("istockphoto-612x612-baseline.jpg")),
+        ("real_1290x1715", load_real_photo("637586123-baseline.jpg")),
+    ];
+
+    let msg_lengths: &[usize] = &[10, 20, 50, 100, 200, 500];
+    let passphrase = "real-encoder-experiment-2026";
+
+    // Capacity report
+    println!();
+    println!("CAPACITY REPORT (with robustness fixes)");
+    println!("{:<16} {:>10} {:>10}", "Image", "Dimensions", "Capacity");
+    println!("{}", "-".repeat(40));
+    for (img_name, cover_bytes) in &test_images {
+        if let Ok(img) = JpegImage::from_bytes(cover_bytes) {
+            let fi = img.frame_info();
+            let cap = armor_capacity(&img).unwrap_or(0);
+            println!("{:<16} {:>4}x{:<5} {:>8}B", img_name, fi.width, fi.height, cap);
+        }
+    }
+
+    // Per-encoder summary tracking
+    struct EncoderStats {
+        name: String,
+        total: u32,
+        survived: u32,
+    }
+    let mut encoder_summaries: Vec<EncoderStats> = Vec::new();
+
+    // Per-encoder × QF tracking
+    struct QfStats {
+        encoder: String,
+        qf: u8,
+        total: u32,
+        survived: u32,
+    }
+    let mut qf_summaries: Vec<QfStats> = Vec::new();
+
+    // Per-encoder × image tracking
+    struct ImgStats {
+        encoder: String,
+        image: String,
+        total: u32,
+        survived: u32,
+    }
+    let mut img_summaries: Vec<ImgStats> = Vec::new();
+
+    // Full matrix
+    println!();
+    println!("FULL EXPERIMENT MATRIX");
+    println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+        "Encoder", "Image", "Msg", "QF", "Result", "Integ", "RSErr", "r", "Parity");
+    println!("{}", "-".repeat(88));
+
+    for encoder in &encoders {
+        if encoder.name == "libjpeg-turbo" && !ljt_available { continue; }
+        if encoder.name == "MozJPEG" && !moz_available { continue; }
+        if encoder.name == "AppleJPEG" && !sips_available { continue; }
+
+        let mut enc_total = 0u32;
+        let mut enc_survived = 0u32;
+
+        for (img_name, cover_bytes) in &test_images {
+            let img = match JpegImage::from_bytes(cover_bytes) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            let cap = armor_capacity(&img).unwrap_or(0);
+
+            for &msg_len in msg_lengths {
+                if msg_len > cap { continue; }
+
+                let message = generate_message(msg_len);
+                let stego = match armor_encode(cover_bytes, &message, passphrase) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for &qf in encoder.qfs {
+                    enc_total += 1;
+
+                    let recompressed = match (encoder.recompress_fn)(&stego, qf) {
+                        Some(r) => r,
+                        None => {
+                            println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+                                encoder.name, img_name, msg_len, qf,
+                                "ENC_ERR", "-", "-", "-", "-");
+                            // Track
+                            let qs = qf_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.qf == qf);
+                            if let Some(qs) = qs { qs.total += 1; }
+                            else { qf_summaries.push(QfStats { encoder: encoder.name.to_string(), qf, total: 1, survived: 0 }); }
+                            let is = img_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.image == *img_name);
+                            if let Some(is) = is { is.total += 1; }
+                            else { img_summaries.push(ImgStats { encoder: encoder.name.to_string(), image: img_name.to_string(), total: 1, survived: 0 }); }
+                            continue;
+                        }
+                    };
+
+                    let (result_str, integ, rs_err, rep_f, parity) = match armor_decode(&recompressed, passphrase) {
+                        Ok((decoded, quality)) => {
+                            let ok = decoded == message;
+                            if ok { enc_survived += 1; }
+                            // Track QF
+                            let qs = qf_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.qf == qf);
+                            if let Some(qs) = qs { qs.total += 1; if ok { qs.survived += 1; } }
+                            else { qf_summaries.push(QfStats { encoder: encoder.name.to_string(), qf, total: 1, survived: if ok { 1 } else { 0 } }); }
+                            // Track image
+                            let is = img_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.image == *img_name);
+                            if let Some(is) = is { is.total += 1; if ok { is.survived += 1; } }
+                            else { img_summaries.push(ImgStats { encoder: encoder.name.to_string(), image: img_name.to_string(), total: 1, survived: if ok { 1 } else { 0 } }); }
+                            (
+                                if ok { "YES" } else { "CORRUPT" },
+                                format!("{}%", quality.integrity_percent),
+                                format!("{}", quality.rs_errors_corrected),
+                                format!("{}", quality.repetition_factor),
+                                format!("{}", quality.parity_len),
+                            )
+                        }
+                        Err(_) => {
+                            let qs = qf_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.qf == qf);
+                            if let Some(qs) = qs { qs.total += 1; }
+                            else { qf_summaries.push(QfStats { encoder: encoder.name.to_string(), qf, total: 1, survived: 0 }); }
+                            let is = img_summaries.iter_mut().find(|s| s.encoder == encoder.name && s.image == *img_name);
+                            if let Some(is) = is { is.total += 1; }
+                            else { img_summaries.push(ImgStats { encoder: encoder.name.to_string(), image: img_name.to_string(), total: 1, survived: 0 }); }
+                            ("FAIL", "-".to_string(), "-".to_string(), "-".to_string(), "-".to_string())
+                        }
+                    };
+
+                    println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+                        encoder.name, img_name, msg_len, qf,
+                        result_str, integ, rs_err, rep_f, parity);
+                }
+            }
+        }
+
+        encoder_summaries.push(EncoderStats {
+            name: encoder.name.to_string(),
+            total: enc_total,
+            survived: enc_survived,
+        });
+    }
+
+    // =========================================================================
+    // Summary tables
+    // =========================================================================
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════════");
+    println!("SUMMARY — Overall by Encoder");
+    println!("{:<16} {:>8} {:>8} {:>8}", "Encoder", "Survived", "Total", "Rate");
+    println!("{}", "-".repeat(44));
+    for es in &encoder_summaries {
+        let rate = if es.total > 0 { es.survived as f64 / es.total as f64 * 100.0 } else { 0.0 };
+        println!("{:<16} {:>8} {:>8} {:>7.1}%", es.name, es.survived, es.total, rate);
+    }
+
+    println!();
+    println!("SUMMARY — By Encoder × Quality Factor");
+    print!("{:>4}", "QF");
+    for es in &encoder_summaries {
+        print!(" {:>16}", es.name);
+    }
+    println!();
+    println!("{}", "-".repeat(4 + encoder_summaries.len() * 17));
+    for &qf in &[95u8, 85, 80, 75, 70, 53] {
+        print!("{:>4}", qf);
+        for es in &encoder_summaries {
+            if let Some(qs) = qf_summaries.iter().find(|s| s.encoder == es.name && s.qf == qf) {
+                let rate = if qs.total > 0 { qs.survived as f64 / qs.total as f64 * 100.0 } else { 0.0 };
+                print!(" {:>5}/{:<4} ({:>4.0}%)", qs.survived, qs.total, rate);
+            } else {
+                print!(" {:>16}", "-");
+            }
+        }
+        println!();
+    }
+
+    println!();
+    println!("SUMMARY — By Encoder × Image");
+    print!("{:<16}", "Image");
+    for es in &encoder_summaries {
+        print!(" {:>16}", es.name);
+    }
+    println!();
+    println!("{}", "-".repeat(16 + encoder_summaries.len() * 17));
+    for (img_name, _) in &test_images {
+        print!("{:<16}", img_name);
+        for es in &encoder_summaries {
+            if let Some(is) = img_summaries.iter().find(|s| s.encoder == es.name && s.image == *img_name) {
+                let rate = if is.total > 0 { is.survived as f64 / is.total as f64 * 100.0 } else { 0.0 };
+                print!(" {:>5}/{:<4} ({:>4.0}%)", is.survived, is.total, rate);
+            } else {
+                print!(" {:>16}", "-");
+            }
+        }
+        println!();
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════════");
+}
+
+// =============================================================================
+// Real Encoder Experiment V2 — WITH 1600px long-edge resize
+// =============================================================================
+
+/// Resize a JPEG to max long-edge using sips+djpeg, outputting PPM.
+/// PPM is used instead of BMP because cjpeg accepts PPM natively.
+/// Returns the PPM file path, or None if resize not needed / failed.
+fn resize_to_ppm(stego_bytes: &[u8], max_long_edge: u32) -> Option<std::path::PathBuf> {
+    // Check if resize is needed
+    let img = JpegImage::from_bytes(stego_bytes).ok()?;
+    let fi = img.frame_info();
+    let long_edge = fi.width.max(fi.height) as u32;
+    if long_edge <= max_long_edge {
+        return None; // No resize needed
+    }
+
+    use std::process::Command;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("phasm_rsz_in_{pid}.jpg"));
+    let resized_jpg = dir.join(format!("phasm_rsz_tmp_{pid}.jpg"));
+    let ppm_out = dir.join(format!("phasm_rsz_{pid}.ppm"));
+
+    std::fs::write(&input, stego_bytes).ok()?;
+
+    // Step 1: sips resize to temp JPEG (high quality to minimize loss)
+    let sips_out = Command::new("/usr/bin/sips")
+        .arg("-Z").arg(max_long_edge.to_string())
+        .arg("-s").arg("format").arg("jpeg")
+        .arg("-s").arg("formatOptions").arg("98")
+        .arg(&input)
+        .arg("--out").arg(&resized_jpg)
+        .output().ok()?;
+
+    let _ = std::fs::remove_file(&input);
+
+    if !sips_out.status.success() {
+        let _ = std::fs::remove_file(&resized_jpg);
+        return None;
+    }
+
+    // Step 2: djpeg to PPM (lossless decompression for cjpeg input)
+    let djpeg_out = Command::new("/opt/homebrew/bin/djpeg")
+        .arg("-ppm")
+        .arg("-outfile").arg(&ppm_out)
+        .arg(&resized_jpg)
+        .output().ok()?;
+
+    let _ = std::fs::remove_file(&resized_jpg);
+
+    if !djpeg_out.status.success() {
+        let _ = std::fs::remove_file(&ppm_out);
+        return None;
+    }
+
+    Some(ppm_out)
+}
+
+/// Platform-realistic recompression: optional resize + encoder-specific recompression.
+/// Simulates: decode → resize (if long edge > max_dim) → encode at target QF.
+///
+/// For libjpeg-turbo/MozJPEG: resize to BMP (lossless), then cjpeg the BMP.
+/// For AppleJPEG: sips handles resize + recompress in one step.
+/// For Internal: resize via sips to temp JPEG, then pixel-domain sim.
+fn platform_recompress(
+    stego_bytes: &[u8],
+    qf: u8,
+    max_long_edge: u32,
+    encoder: &str,
+) -> Option<Vec<u8>> {
+    use std::process::Command;
+    let pid = std::process::id();
+    let dir = std::env::temp_dir();
+
+    // Check if resize needed
+    let img = JpegImage::from_bytes(stego_bytes).ok()?;
+    let fi = img.frame_info();
+    let long_edge = fi.width.max(fi.height) as u32;
+    let needs_resize = long_edge > max_long_edge;
+
+    match encoder {
+        "AppleJPEG" => {
+            // sips handles resize + recompress in one step
+            let input = dir.join(format!("phasm_v2_sips_in_{pid}.jpg"));
+            let output = dir.join(format!("phasm_v2_sips_out_{pid}.jpg"));
+            std::fs::write(&input, stego_bytes).ok()?;
+
+            let mut cmd = Command::new("/usr/bin/sips");
+            if needs_resize {
+                cmd.arg("-Z").arg(max_long_edge.to_string());
+            }
+            cmd.arg("-s").arg("format").arg("jpeg")
+                .arg("-s").arg("formatOptions").arg(qf.to_string())
+                .arg(&input)
+                .arg("--out").arg(&output);
+
+            let out = cmd.output().ok()?;
+            let _ = std::fs::remove_file(&input);
+            if !out.status.success() {
+                let _ = std::fs::remove_file(&output);
+                return None;
+            }
+            let result = std::fs::read(&output).ok();
+            let _ = std::fs::remove_file(&output);
+            result
+        }
+        "Internal" => {
+            if needs_resize {
+                // Resize via sips to temp JPEG at high quality, then pixel-domain sim
+                let input = dir.join(format!("phasm_v2_int_in_{pid}.jpg"));
+                let resized = dir.join(format!("phasm_v2_int_rsz_{pid}.jpg"));
+                std::fs::write(&input, stego_bytes).ok()?;
+
+                let out = Command::new("/usr/bin/sips")
+                    .arg("-Z").arg(max_long_edge.to_string())
+                    .arg("-s").arg("format").arg("jpeg")
+                    .arg("-s").arg("formatOptions").arg("95")
+                    .arg(&input)
+                    .arg("--out").arg(&resized)
+                    .output().ok()?;
+                let _ = std::fs::remove_file(&input);
+                if !out.status.success() {
+                    let _ = std::fs::remove_file(&resized);
+                    return None;
+                }
+                let resized_bytes = std::fs::read(&resized).ok()?;
+                let _ = std::fs::remove_file(&resized);
+                simulate_pixel_recompression(&resized_bytes, qf)
+            } else {
+                simulate_pixel_recompression(stego_bytes, qf)
+            }
+        }
+        "libjpeg-turbo" | "MozJPEG" => {
+            let cjpeg_path = if encoder == "MozJPEG" {
+                "/opt/homebrew/opt/mozjpeg/bin/cjpeg"
+            } else {
+                "/opt/homebrew/bin/cjpeg"
+            };
+
+            if needs_resize {
+                // Resize to PPM (lossless), then compress PPM with cjpeg
+                let ppm_path = resize_to_ppm(stego_bytes, max_long_edge)?;
+                let output = dir.join(format!("phasm_v2_{}_out_{pid}.jpg",
+                    if encoder == "MozJPEG" { "moz" } else { "ljt" }));
+
+                let out = Command::new(cjpeg_path)
+                    .arg("-quality").arg(qf.to_string())
+                    .arg("-baseline")
+                    .arg("-outfile").arg(&output)
+                    .arg(&ppm_path)
+                    .output().ok()?;
+                let _ = std::fs::remove_file(&ppm_path);
+                if !out.status.success() {
+                    let _ = std::fs::remove_file(&output);
+                    return None;
+                }
+                let result = std::fs::read(&output).ok();
+                let _ = std::fs::remove_file(&output);
+                result
+            } else {
+                // No resize — standard djpeg → cjpeg pipeline
+                let input = dir.join(format!("phasm_v2_{}_in_{pid}.jpg",
+                    if encoder == "MozJPEG" { "moz" } else { "ljt" }));
+                let ppm = dir.join(format!("phasm_v2_{}_ppm_{pid}.ppm",
+                    if encoder == "MozJPEG" { "moz" } else { "ljt" }));
+                let output = dir.join(format!("phasm_v2_{}_out_{pid}.jpg",
+                    if encoder == "MozJPEG" { "moz" } else { "ljt" }));
+
+                std::fs::write(&input, stego_bytes).ok()?;
+
+                let djpeg_out = Command::new("/opt/homebrew/bin/djpeg")
+                    .arg("-ppm")
+                    .arg("-outfile").arg(&ppm)
+                    .arg(&input)
+                    .output().ok()?;
+                let _ = std::fs::remove_file(&input);
+                if !djpeg_out.status.success() {
+                    return None;
+                }
+
+                let cjpeg_out = Command::new(cjpeg_path)
+                    .arg("-quality").arg(qf.to_string())
+                    .arg("-baseline")
+                    .arg("-outfile").arg(&output)
+                    .arg(&ppm)
+                    .output().ok()?;
+                let _ = std::fs::remove_file(&ppm);
+                if !cjpeg_out.status.success() {
+                    let _ = std::fs::remove_file(&output);
+                    return None;
+                }
+                let result = std::fs::read(&output).ok();
+                let _ = std::fs::remove_file(&output);
+                result
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Real encoder experiment V2: with 1600px long-edge resize.
+///
+/// Simulates realistic platform processing: resize to ≤1600px long edge,
+/// then recompress with each encoder family at various quality factors.
+///
+/// Run with: cargo test -p phasm-core -- --ignored armor_real_encoder_v2 --nocapture
+#[test]
+#[ignore]
+fn armor_real_encoder_v2() {
+    let max_long_edge = 1600u32;
+
+    let ljt_available = std::process::Command::new("/opt/homebrew/bin/cjpeg")
+        .arg("-version").output().map(|o| o.status.success() || !o.stderr.is_empty()).unwrap_or(false);
+    let moz_available = std::process::Command::new("/opt/homebrew/opt/mozjpeg/bin/cjpeg")
+        .arg("-version").output().map(|o| o.status.success() || !o.stderr.is_empty()).unwrap_or(false);
+    let sips_available = std::process::Command::new("/usr/bin/sips")
+        .arg("--help").output().map(|o| o.status.success()).unwrap_or(false);
+
+    println!();
+    println!("╔═══════════════════════════════════════════════════════════════════════╗");
+    println!("║  REAL ENCODER EXPERIMENT V2 — WITH 1600px RESIZE                     ║");
+    println!("╠═══════════════════════════════════════════════════════════════════════╣");
+    println!("║  Resize: long edge > {max_long_edge}px → downscale to {max_long_edge}px (via sips)             ║");
+    println!("║  Encoders:                                                           ║");
+    println!("║  • libjpeg-turbo: {} (Twitter, Discord, Telegram Android)        ║",
+        if ljt_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • MozJPEG:       {} (Facebook, Instagram)                       ║",
+        if moz_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • AppleJPEG:     {} (iMessage, WhatsApp iOS, Telegram iOS)      ║",
+        if sips_available { "AVAILABLE" } else { "MISSING  " });
+    println!("║  • Internal sim:  AVAILABLE (pixel-domain baseline)                  ║");
+    println!("╚═══════════════════════════════════════════════════════════════════════╝");
+
+    let encoder_names: Vec<&str> = {
+        let mut v = vec!["Internal"];
+        if ljt_available { v.push("libjpeg-turbo"); }
+        if moz_available { v.push("MozJPEG"); }
+        if sips_available { v.push("AppleJPEG"); }
+        v
+    };
+
+    let test_images: Vec<(&str, Vec<u8>)> = vec![
+        ("photo_320x240", load_test_vector("photo_320x240_q75_420.jpg")),
+        ("istock_612x408", load_real_photo("istockphoto-612x612-baseline.jpg")),
+        ("real_1290x1715", load_real_photo("637586123-baseline.jpg")),
+    ];
+
+    let qfs: &[u8] = &[95, 85, 80, 75, 70, 53];
+    let msg_lengths: &[usize] = &[10, 20, 50, 100, 200, 500];
+    let passphrase = "real-encoder-v2-resize-2026";
+
+    // Report dimensions + resize info
+    println!();
+    println!("IMAGE DIMENSIONS");
+    println!("{:<16} {:>10} {:>10} {:>10} {:>10}", "Image", "Original", "Resized", "Cap(orig)", "Cap(rsz)");
+    println!("{}", "-".repeat(60));
+    for (img_name, cover_bytes) in &test_images {
+        if let Ok(img) = JpegImage::from_bytes(cover_bytes) {
+            let fi = img.frame_info();
+            let orig_dims = format!("{}x{}", fi.width, fi.height);
+            let cap_orig = armor_capacity(&img).unwrap_or(0);
+
+            let long_edge = fi.width.max(fi.height) as u32;
+            if long_edge > max_long_edge {
+                // Compute resized capacity
+                let pid = std::process::id();
+                let dir = std::env::temp_dir();
+                let tmp_in = dir.join(format!("phasm_cap_{pid}.jpg"));
+                let tmp_out = dir.join(format!("phasm_cap_rsz_{pid}.jpg"));
+                std::fs::write(&tmp_in, cover_bytes).unwrap();
+                let _ = std::process::Command::new("/usr/bin/sips")
+                    .arg("-Z").arg(max_long_edge.to_string())
+                    .arg("-s").arg("format").arg("jpeg")
+                    .arg("-s").arg("formatOptions").arg("95")
+                    .arg(&tmp_in).arg("--out").arg(&tmp_out)
+                    .output();
+                let _ = std::fs::remove_file(&tmp_in);
+                let rsz_bytes = std::fs::read(&tmp_out).unwrap_or_default();
+                let _ = std::fs::remove_file(&tmp_out);
+                if let Ok(rsz_img) = JpegImage::from_bytes(&rsz_bytes) {
+                    let rsz_fi = rsz_img.frame_info();
+                    let rsz_dims = format!("{}x{}", rsz_fi.width, rsz_fi.height);
+                    let cap_rsz = armor_capacity(&rsz_img).unwrap_or(0);
+                    println!("{:<16} {:>10} {:>10} {:>8}B {:>8}B",
+                        img_name, orig_dims, rsz_dims, cap_orig, cap_rsz);
+                }
+            } else {
+                println!("{:<16} {:>10} {:>10} {:>8}B {:>8}",
+                    img_name, orig_dims, "(no rsz)", cap_orig, "-");
+            }
+        }
+    }
+
+    // Stats tracking
+    struct Stats { name: String, total: u32, survived: u32 }
+    struct QfS { enc: String, qf: u8, total: u32, survived: u32 }
+    struct ImgS { enc: String, img: String, total: u32, survived: u32 }
+    let mut enc_stats: Vec<Stats> = Vec::new();
+    let mut qf_stats: Vec<QfS> = Vec::new();
+    let mut img_stats: Vec<ImgS> = Vec::new();
+
+    fn bump(stats: &mut Vec<QfS>, enc: &str, qf: u8, ok: bool) {
+        if let Some(s) = stats.iter_mut().find(|s| s.enc == enc && s.qf == qf) {
+            s.total += 1; if ok { s.survived += 1; }
+        } else {
+            stats.push(QfS { enc: enc.to_string(), qf, total: 1, survived: if ok { 1 } else { 0 } });
+        }
+    }
+    fn bump_img(stats: &mut Vec<ImgS>, enc: &str, img: &str, ok: bool) {
+        if let Some(s) = stats.iter_mut().find(|s| s.enc == enc && s.img == img) {
+            s.total += 1; if ok { s.survived += 1; }
+        } else {
+            stats.push(ImgS { enc: enc.to_string(), img: img.to_string(), total: 1, survived: if ok { 1 } else { 0 } });
+        }
+    }
+
+    // Full matrix
+    println!();
+    println!("FULL EXPERIMENT MATRIX (with {max_long_edge}px resize)");
+    println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+        "Encoder", "Image", "Msg", "QF", "Result", "Integ", "RSErr", "r", "Parity");
+    println!("{}", "-".repeat(88));
+
+    for &enc_name in &encoder_names {
+        let mut et = 0u32;
+        let mut es = 0u32;
+
+        for (img_name, cover_bytes) in &test_images {
+            let img = match JpegImage::from_bytes(cover_bytes) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            let cap = armor_capacity(&img).unwrap_or(0);
+
+            for &msg_len in msg_lengths {
+                if msg_len > cap { continue; }
+
+                let message = generate_message(msg_len);
+                let stego = match armor_encode(cover_bytes, &message, passphrase) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                for &qf in qfs {
+                    et += 1;
+                    let recompressed = match platform_recompress(&stego, qf, max_long_edge, enc_name) {
+                        Some(r) => r,
+                        None => {
+                            println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+                                enc_name, img_name, msg_len, qf, "ENC_ERR", "-", "-", "-", "-");
+                            bump(&mut qf_stats, enc_name, qf, false);
+                            bump_img(&mut img_stats, enc_name, img_name, false);
+                            continue;
+                        }
+                    };
+
+                    match armor_decode(&recompressed, passphrase) {
+                        Ok((decoded, quality)) => {
+                            let ok = decoded == message;
+                            if ok { es += 1; }
+                            bump(&mut qf_stats, enc_name, qf, ok);
+                            bump_img(&mut img_stats, enc_name, img_name, ok);
+                            println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+                                enc_name, img_name, msg_len, qf,
+                                if ok { "YES" } else { "CORRUPT" },
+                                format!("{}%", quality.integrity_percent),
+                                format!("{}", quality.rs_errors_corrected),
+                                format!("{}", quality.repetition_factor),
+                                format!("{}", quality.parity_len));
+                        }
+                        Err(_) => {
+                            bump(&mut qf_stats, enc_name, qf, false);
+                            bump_img(&mut img_stats, enc_name, img_name, false);
+                            println!("{:<14} {:<16} {:>4} {:>3}  {:>8} {:>6} {:>6} {:>4} {:>6}",
+                                enc_name, img_name, msg_len, qf, "FAIL", "-", "-", "-", "-");
+                        }
+                    }
+                }
+            }
+        }
+
+        enc_stats.push(Stats { name: enc_name.to_string(), total: et, survived: es });
+    }
+
+    // Summaries
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════════");
+    println!("SUMMARY — Overall by Encoder (with {max_long_edge}px resize)");
+    println!("{:<16} {:>8} {:>8} {:>8}", "Encoder", "Survived", "Total", "Rate");
+    println!("{}", "-".repeat(44));
+    for s in &enc_stats {
+        let rate = if s.total > 0 { s.survived as f64 / s.total as f64 * 100.0 } else { 0.0 };
+        println!("{:<16} {:>8} {:>8} {:>7.1}%", s.name, s.survived, s.total, rate);
+    }
+
+    println!();
+    println!("SUMMARY — By Encoder × Quality Factor");
+    print!("{:>4}", "QF");
+    for s in &enc_stats { print!(" {:>16}", s.name); }
+    println!();
+    println!("{}", "-".repeat(4 + enc_stats.len() * 17));
+    for &qf in qfs {
+        print!("{:>4}", qf);
+        for s in &enc_stats {
+            if let Some(q) = qf_stats.iter().find(|q| q.enc == s.name && q.qf == qf) {
+                let rate = if q.total > 0 { q.survived as f64 / q.total as f64 * 100.0 } else { 0.0 };
+                print!(" {:>5}/{:<4} ({:>4.0}%)", q.survived, q.total, rate);
+            } else {
+                print!(" {:>16}", "-");
+            }
+        }
+        println!();
+    }
+
+    println!();
+    println!("SUMMARY — By Encoder × Image");
+    print!("{:<16}", "Image");
+    for s in &enc_stats { print!(" {:>16}", s.name); }
+    println!();
+    println!("{}", "-".repeat(16 + enc_stats.len() * 17));
+    for (img_name, _) in &test_images {
+        print!("{:<16}", img_name);
+        for s in &enc_stats {
+            if let Some(i) = img_stats.iter().find(|i| i.enc == s.name && i.img == *img_name) {
+                let rate = if i.total > 0 { i.survived as f64 / i.total as f64 * 100.0 } else { 0.0 };
+                print!(" {:>5}/{:<4} ({:>4.0}%)", i.survived, i.total, rate);
+            } else {
+                print!(" {:>16}", "-");
+            }
+        }
+        println!();
+    }
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════════════════");
+}

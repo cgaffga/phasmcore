@@ -18,7 +18,7 @@ use crate::stego::frame::FRAME_OVERHEAD;
 /// Note: Phase 2 adaptive robustness (higher RS parity, repetition coding,
 /// adaptive delta) uses spare capacity automatically when the message is small
 /// relative to the image. This does not reduce the maximum capacity reported
-/// here — it only improves robustness for messages well below this limit.
+/// here -- it only improves robustness for messages well below this limit.
 ///
 /// # Errors
 /// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
@@ -52,8 +52,16 @@ pub fn estimate_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     }
 
     // Each SPREAD_LEN stable positions carry 1 bit
-    let embeddable_bits = stable_count / SPREAD_LEN;
-    let embeddable_bytes = embeddable_bits / 8;
+    let num_units = stable_count / SPREAD_LEN;
+
+    // Subtract header overhead (56 units for 1-byte mean-QT header)
+    let qf_header_units = super::embedding::HEADER_UNITS;
+    if num_units <= qf_header_units {
+        return Ok(0);
+    }
+    let payload_units = num_units - qf_header_units;
+
+    let embeddable_bytes = payload_units / 8;
 
     if embeddable_bytes == 0 {
         return Ok(0);

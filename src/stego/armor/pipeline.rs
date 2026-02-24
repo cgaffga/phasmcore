@@ -1,20 +1,23 @@
-//! Armor mode encode/decode pipeline.
+//! Armor encode/decode pipeline.
 //!
 //! Armor embeds messages using STDM (Spread Transform Dither Modulation)
 //! into recompression-stable DCT coefficients, protected by Reed-Solomon
 //! error correction.
 //!
-//! **Phase 2 (adaptive robustness):** When the message is small relative to
-//! image capacity, the encoder automatically uses stronger RS parity, repeats
-//! the RS-encoded bitstream across spare capacity, and increases the STDM delta.
-//! On decode, soft majority voting combines redundant copies for dramatically
-//! improved recompression survival.
+//! **Robustness features:**
+//! - Frequency-restricted embedding (zigzag 1..=15) for stability
+//! - Pre-clamp for pixel-domain settling
+//! - 1-byte mean-QT header with 7x majority voting (56 units)
+//! - Sequential repetition copies for soft majority voting
+//! - +/-30% decode-side delta sweep (~21 candidates)
+//! - Brute-force (r, parity) search on decode -- no fragile r-header
+//! - DFT ring payload: resize-robust second layer in frequency domain
 
 use crate::jpeg::JpegImage;
 use crate::jpeg::dct::DctGrid;
 use crate::jpeg::pixels;
 use crate::stego::armor::ecc;
-use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract, stdm_extract_soft};
+use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract_soft};
 use crate::stego::armor::fft2d;
 use crate::stego::armor::repetition;
 use crate::stego::armor::resample;
@@ -26,10 +29,10 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::permute;
 
-/// Number of embedding units reserved for the r-header.
-/// 7 copies × 8 bits = 56 units encode the repetition factor (1 byte).
-const R_HEADER_UNITS: usize = 56;
-const R_HEADER_COPIES: usize = 7;
+/// Number of embedding units for the header.
+/// 1 byte x 8 bits x 7 copies = 56 units.
+const HEADER_UNITS: usize = embedding::HEADER_UNITS; // 56
+const HEADER_COPIES: usize = embedding::HEADER_COPIES; // 7
 
 /// Encode a text message into a cover JPEG using Armor mode.
 ///
@@ -62,12 +65,15 @@ pub fn armor_encode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // Phase 3: Embed DFT template BEFORE STDM for geometry resilience.
-    // The template operates in the pixel/frequency domain and is invisible
-    // to the DCT-level STDM embedding that follows.
-    embed_dft_template(&mut img, passphrase)?;
+    // Phase 3: Embed DFT template + ring payload BEFORE STDM.
+    embed_dft_template(&mut img, passphrase, message)?;
 
-    // 1. Compute stability map for Y channel (now on templated image).
+    // Pre-clamp pass: IDCT -> clamp [0,255] -> DCT on all Y-channel blocks.
+    // Settles coefficients so they already produce valid pixel values,
+    // reducing systematic distortion from pixel clamping during recompression.
+    pre_clamp_y_channel(&mut img);
+
+    // 1. Compute stability map for Y channel (frequency-restricted).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img
         .quant_table(qt_id)
@@ -99,79 +105,99 @@ pub fn armor_encode(
         &ciphertext,
     );
 
-    // 6. Decide Phase 1 vs Phase 2 encoding.
-    //
-    // Phase 2 (adaptive RS + repetition + r-header) only activates when:
-    //   - There's room for the r-header (num_units > R_HEADER_UNITS)
-    //   - Repetition r >= 3 (otherwise the overhead isn't worth it)
-    //
-    // If Phase 2 isn't beneficial, fall back to Phase 1 (fixed RS parity=64).
-    let baseline_delta = embedding::compute_delta(&qt.values);
+    // 6. Compute mean QT from actual quantization table.
+    let mean_qt = embedding::compute_mean_qt(&qt.values);
+    let header_byte = embedding::encode_mean_qt(mean_qt);
+    let bootstrap_delta = embedding::BOOTSTRAP_DELTA;
+    let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
 
-    // Probe Phase 2 viability
-    let use_phase2 = if num_units > R_HEADER_UNITS {
-        let payload_units = num_units - R_HEADER_UNITS;
-        let parity = ecc::choose_parity_tier(frame_bytes.len(), payload_units);
-        let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
-        let rs_bits_len = rs_encoded.len() * 8;
-        let r = repetition::compute_r(rs_bits_len, payload_units);
-        r >= 3 && rs_bits_len <= payload_units
+    // 7. Build header: 7 copies of 1 header byte (1 x 8 bits x 7 copies = 56 units)
+    let mut all_bits = Vec::with_capacity(num_units);
+    for _ in 0..HEADER_COPIES {
+        for bp in (0..8).rev() {
+            all_bits.push((header_byte >> bp) & 1);
+        }
+    }
+
+    // 8. Decide Phase 1 vs Phase 2 encoding.
+    let payload_units = if num_units > HEADER_UNITS {
+        num_units - HEADER_UNITS
     } else {
-        false
+        return Err(StegoError::ImageTooSmall);
     };
 
-    let (all_bits, embed_delta_fn): (Vec<u8>, Box<dyn Fn(usize) -> f64>) = if use_phase2 {
-        // --- Phase 2 encode ---
-        let payload_units = num_units - R_HEADER_UNITS;
-        let parity = ecc::choose_parity_tier(frame_bytes.len(), payload_units);
-        let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
+    // Force Phase 2 (r>=3) when capacity allows.
+    let use_phase2 = {
+        let mut found = false;
+        for &parity in &ecc::PARITY_TIERS {
+            let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
+            let rs_bits_len = rs_encoded.len() * 8;
+            if rs_bits_len <= payload_units {
+                let r = repetition::compute_r(rs_bits_len, payload_units);
+                if r >= 3 {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    let embed_delta_fn: Box<dyn Fn(usize) -> f64> = if use_phase2 {
+        // --- Phase 2 encode: find smallest parity tier with r>=3 ---
+        let mut chosen_parity = ecc::PARITY_TIERS[0]; // fallback
+        for &parity in &ecc::PARITY_TIERS {
+            let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
+            let rs_bits_len = rs_encoded.len() * 8;
+            if rs_bits_len <= payload_units {
+                let r = repetition::compute_r(rs_bits_len, payload_units);
+                if r >= 3 {
+                    chosen_parity = parity;
+                    break;
+                }
+            }
+        }
+
+        let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, chosen_parity);
         let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
         let r = repetition::compute_r(rs_bits.len(), payload_units);
-
-        // Pad RS bits to payload_units / r so encoder and decoder agree on copy length.
-        // The decoder computes rs_bit_count = payload_units / r without knowing rs_bits.len().
         let rs_bit_count_aligned = payload_units / r;
         let mut rs_bits_padded = rs_bits;
         rs_bits_padded.resize(rs_bit_count_aligned, 0);
-        let (payload_bits, _) = repetition::repetition_encode(&rs_bits_padded, payload_units);
+        let (rep_bits, _) = repetition::repetition_encode(&rs_bits_padded, payload_units);
 
-        let adaptive_delta = embedding::compute_delta_adaptive(&qt.values, r);
+        let adaptive_delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
 
-        // Build r-header: 7 copies of r as 8 bits
-        let r_byte = r as u8;
-        let r_bits_vec: Vec<u8> = (0..8).rev().map(|bp| (r_byte >> bp) & 1).collect();
-        let mut combined = Vec::with_capacity(num_units);
-        for _ in 0..R_HEADER_COPIES {
-            combined.extend_from_slice(&r_bits_vec);
-        }
-        combined.extend_from_slice(&payload_bits[..payload_units.min(payload_bits.len())]);
+        all_bits.extend_from_slice(&rep_bits[..payload_units.min(rep_bits.len())]);
 
-        (combined, Box::new(move |bit_idx| {
-            if bit_idx < R_HEADER_UNITS { baseline_delta } else { adaptive_delta }
-        }))
+        Box::new(move |bit_idx| {
+            if bit_idx < HEADER_UNITS { bootstrap_delta } else { adaptive_delta }
+        })
     } else {
-        // --- Phase 1 encode (unchanged from original) ---
+        // --- Phase 1 encode: fixed RS parity=64, no repetition ---
         let rs_encoded = ecc::rs_encode_blocks(&frame_bytes);
         let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
-        if rs_bits.len() > num_units {
+        if rs_bits.len() > payload_units {
             return Err(StegoError::MessageTooLarge);
         }
 
-        // Pad to num_units (unused bits are zero)
-        let mut bits = rs_bits;
-        bits.resize(num_units, 0);
+        let mut payload_bits = rs_bits;
+        payload_bits.resize(payload_units, 0);
+        all_bits.extend_from_slice(&payload_bits);
 
-        (bits, Box::new(move |_| baseline_delta))
+        Box::new(move |bit_idx| {
+            if bit_idx < HEADER_UNITS { bootstrap_delta } else { reference_delta }
+        })
     };
 
     let embed_count = all_bits.len().min(num_units);
 
-    // 7. Generate spreading vectors.
+    // 9. Generate spreading vectors.
     let vectors = generate_spreading_vectors(&spread_seed, embed_count);
 
-    // 8. STDM embed each bit into coefficient groups.
+    // 10. STDM embed each bit into coefficient groups.
     let grid_mut = img.dct_grid_mut(0);
     for bit_idx in 0..embed_count {
         let group_start = bit_idx * SPREAD_LEN;
@@ -191,7 +217,7 @@ pub fn armor_encode(
         }
     }
 
-    // 15. Write modified JPEG.
+    // 11. Write modified JPEG.
     let stego_bytes = match img.to_bytes() {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -226,6 +252,10 @@ pub struct DecodeQuality {
     pub estimated_rotation_deg: f32,
     /// Estimated scale factor (1.0 if no geometry correction).
     pub estimated_scale: f32,
+    /// True if DFT ring was used (message may be truncated).
+    pub dft_ring_used: bool,
+    /// DFT ring capacity in bytes (0 if not applicable).
+    pub dft_ring_capacity: u16,
 }
 
 impl DecodeQuality {
@@ -242,6 +272,8 @@ impl DecodeQuality {
             template_peaks_detected: 0,
             estimated_rotation_deg: 0.0,
             estimated_scale: 1.0,
+            dft_ring_used: false,
+            dft_ring_capacity: 0,
         }
     }
 
@@ -273,16 +305,16 @@ impl DecodeQuality {
             template_peaks_detected: 0,
             estimated_rotation_deg: 0.0,
             estimated_scale: 1.0,
+            dft_ring_used: false,
+            dft_ring_capacity: 0,
         }
     }
 }
 
 /// Decode a text message from a stego JPEG using Armor mode.
 ///
-/// Supports both Phase 1 (fixed RS, no repetition) and Phase 2 (adaptive RS,
-/// repetition with soft majority voting) images. Phase detection is automatic
-/// via the r-header: Phase 1 images have no header (r reads as 0 or 1),
-/// falling back to the original decode path.
+/// Tries standard decode with delta sweep first, then falls back to
+/// geometric recovery (Phase 3) for rotated/scaled images.
 ///
 /// # Arguments
 /// - `stego_bytes`: Raw bytes of the stego JPEG image.
@@ -290,26 +322,21 @@ impl DecodeQuality {
 ///
 /// # Returns
 /// A tuple of (decoded plaintext message, decode quality info).
-///
-/// # Errors
-/// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
-/// - [`StegoError::FrameCorrupted`] if RS decoding or CRC check fails.
-/// - [`StegoError::InvalidUtf8`] if the decrypted payload is not valid UTF-8.
 pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
-    // Fast path: try standard decode (zero overhead for unmodified images).
+    // Try standard decode with delta sweep.
     match try_armor_decode(stego_bytes, passphrase) {
         Ok(result) => return Ok(result),
-        Err(fast_err) => {
-            // Fast path failed — try geometric recovery (Phase 3).
+        Err(new_err) => {
+            // Try geometric recovery (Phase 3).
             match try_geometric_recovery(stego_bytes, passphrase) {
                 Ok(result) => return Ok(result),
-                Err(_) => return Err(fast_err),
+                Err(_) => return Err(new_err),
             }
         }
     }
 }
 
-/// Standard Armor decode path (Phase 1 + Phase 2, no geometric correction).
+/// Armor decode with delta sweep: parse image once, try multiple mean_qt candidates.
 fn try_armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
 
@@ -317,7 +344,7 @@ fn try_armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute stability map.
+    // 1. Compute frequency-restricted stability map.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img
         .quant_table(qt_id)
@@ -338,32 +365,75 @@ fn try_armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
     let n_used = num_units * SPREAD_LEN;
     let positions = &positions[..n_used];
 
-    // 4. Compute baseline delta.
-    let baseline_delta = embedding::compute_delta(&qt.values);
-
-    // 5. Generate spreading vectors for all units.
+    // 4. Generate spreading vectors for all units.
     let vectors = generate_spreading_vectors(&spread_seed, num_units);
 
-    // 6. Extract r-header using baseline delta (first 56 units).
     let grid = img.dct_grid(0);
-    let r = if num_units > R_HEADER_UNITS {
-        extract_r_header(grid, positions, &vectors, baseline_delta)
-    } else {
-        0
-    };
 
-    // 7. Decide decode path based on r.
-    if r <= 1 {
-        // Phase 1 path: extract all bits with baseline delta, progressive RS decode
-        return decode_phase1(grid, positions, &vectors, baseline_delta, num_units, passphrase);
+    // 5. Extract 1-byte header at bootstrap delta.
+    if num_units <= HEADER_UNITS {
+        return Err(StegoError::ImageTooSmall);
+    }
+    let header_byte = extract_header_byte(grid, positions, &vectors, embedding::BOOTSTRAP_DELTA, 0);
+    let header_mean_qt = embedding::decode_mean_qt(header_byte);
+
+    // 6. Compute current image's mean QT for comparison.
+    let current_mean_qt = embedding::compute_mean_qt(&qt.values);
+
+    let payload_units = num_units - HEADER_UNITS;
+
+    // 7. Build candidate mean_qt values for delta sweep.
+    // Wider sweep +/-30% in 3% steps (~21 candidates) from both header and current.
+    let mut raw_candidates = Vec::with_capacity(24);
+    raw_candidates.push(header_mean_qt);
+    raw_candidates.push(current_mean_qt);
+    for step in 1..=10 {
+        let factor = step as f64 * 0.03;
+        raw_candidates.push(header_mean_qt * (1.0 - factor));
+        raw_candidates.push(header_mean_qt * (1.0 + factor));
     }
 
-    // Phase 2 path: adaptive RS + repetition + soft voting
-    decode_phase2(grid, positions, &vectors, &qt.values, baseline_delta, num_units, r, passphrase)
+    // Deduplicate (within 0.1 tolerance)
+    let mut candidates: Vec<f64> = Vec::with_capacity(raw_candidates.len());
+    for &c in &raw_candidates {
+        if c > 0.1 && !candidates.iter().any(|&existing| (existing - c).abs() < 0.1) {
+            candidates.push(c);
+        }
+    }
+
+    // 8. LLR cache for deduplication across delta values.
+    let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
+
+    // 9. Try each candidate.
+    for &mean_qt in &candidates {
+        let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
+
+        // Try Phase 1 decode with this delta.
+        if let Ok(result) = decode_phase1_with_offset(
+            grid, positions, &vectors, reference_delta, num_units, HEADER_UNITS,
+            passphrase,
+        ) {
+            return Ok(result);
+        }
+
+        // Try Phase 2: brute-force search over (r, parity) combinations.
+        if let Ok(result) = decode_phase2_search(
+            grid, positions, &vectors, mean_qt,
+            num_units, payload_units, passphrase,
+            &mut cached_llrs,
+        ) {
+            return Ok(result);
+        }
+    }
+
+    Err(StegoError::FrameCorrupted)
 }
 
 /// Phase 3 geometric recovery: detect DFT template, estimate transform, resample, retry.
+/// Also tries DFT ring payload extraction as fallback.
 fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    use crate::stego::armor::dft_payload;
+
     let img = JpegImage::from_bytes(stego_bytes)?;
 
     if img.num_components() == 0 {
@@ -384,6 +454,26 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
 
     // Skip if transform is essentially identity (fast path would have worked).
     if transform.rotation_rad.abs() < 0.001 && (transform.scale - 1.0).abs() < 0.001 {
+        // Try DFT ring extraction directly (no geometry correction needed)
+        if let Some(plaintext) = dft_payload::extract_ring_payload(&spectrum, passphrase) {
+            if let Ok(text) = std::str::from_utf8(&plaintext) {
+                let ring_cap = dft_payload::ring_capacity(w, h);
+                return Ok((text.to_string(), DecodeQuality {
+                    mode: super::super::frame::MODE_ARMOR,
+                    rs_errors_corrected: 0,
+                    rs_error_capacity: 0,
+                    integrity_percent: 50, // truncated message
+                    repetition_factor: 0,
+                    parity_len: 0,
+                    geometry_corrected: false,
+                    template_peaks_detected: detected.len() as u8,
+                    estimated_rotation_deg: 0.0,
+                    estimated_scale: 1.0,
+                    dft_ring_used: true,
+                    dft_ring_capacity: ring_cap as u16,
+                }));
+            }
+        }
         return Err(StegoError::FrameCorrupted);
     }
 
@@ -406,30 +496,60 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
     };
 
     // Retry standard decode on the corrected image.
-    let (text, mut quality) = try_armor_decode(&corrected_bytes, passphrase)?;
+    match try_armor_decode(&corrected_bytes, passphrase) {
+        Ok((text, mut quality)) => {
+            quality.geometry_corrected = true;
+            quality.template_peaks_detected = detected.len() as u8;
+            quality.estimated_rotation_deg = transform.rotation_rad.to_degrees() as f32;
+            quality.estimated_scale = transform.scale as f32;
+            return Ok((text, quality));
+        }
+        Err(_) => {
+            // STDM decode failed after geometry correction -- try DFT ring
+            // Recompute FFT from corrected image for ring extraction
+            let corrected_img2 = JpegImage::from_bytes(&corrected_bytes).ok();
+            if let Some(ci) = corrected_img2 {
+                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&ci);
+                let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
+                if let Some(plaintext) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
+                    if let Ok(text) = std::str::from_utf8(&plaintext) {
+                        let ring_cap = dft_payload::ring_capacity(cw, ch);
+                        return Ok((text.to_string(), DecodeQuality {
+                            mode: super::super::frame::MODE_ARMOR,
+                            rs_errors_corrected: 0,
+                            rs_error_capacity: 0,
+                            integrity_percent: 50,
+                            repetition_factor: 0,
+                            parity_len: 0,
+                            geometry_corrected: true,
+                            template_peaks_detected: detected.len() as u8,
+                            estimated_rotation_deg: transform.rotation_rad.to_degrees() as f32,
+                            estimated_scale: transform.scale as f32,
+                            dft_ring_used: true,
+                            dft_ring_capacity: ring_cap as u16,
+                        }));
+                    }
+                }
+            }
+        }
+    }
 
-    // Annotate quality with geometry correction info.
-    quality.geometry_corrected = true;
-    quality.template_peaks_detected = detected.len() as u8;
-    quality.estimated_rotation_deg = transform.rotation_rad.to_degrees() as f32;
-    quality.estimated_scale = transform.scale as f32;
-
-    Ok((text, quality))
+    Err(StegoError::FrameCorrupted)
 }
 
-/// Extract the r-header from the first 56 embedding units.
+/// Extract the 1-byte mean-QT header from embedding units using soft majority voting.
 ///
-/// The header is 7 copies of a single byte (r). Uses hard majority voting
-/// with baseline delta.
-fn extract_r_header(
+/// Reads 7 copies x 1 byte x 8 bits = 56 units at the given delta and offset.
+fn extract_header_byte(
     grid: &DctGrid,
     positions: &[crate::stego::permute::CoeffPos],
     vectors: &[[f64; SPREAD_LEN]],
-    baseline_delta: f64,
+    delta: f64,
+    offset: usize,
 ) -> u8 {
-    // Extract 56 soft LLR values
-    let mut header_llrs = [0.0f64; R_HEADER_UNITS];
-    for unit_idx in 0..R_HEADER_UNITS {
+    let mut header_llrs = [0.0f64; 56]; // 7 copies x 8 bits
+    for i in 0..56 {
+        let unit_idx = offset + i;
         let group_start = unit_idx * SPREAD_LEN;
         let group = &positions[group_start..group_start + SPREAD_LEN];
 
@@ -438,36 +558,38 @@ fn extract_r_header(
             coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
         }
 
-        header_llrs[unit_idx] = stdm_extract_soft(&coeffs, &vectors[unit_idx], baseline_delta);
+        header_llrs[i] = stdm_extract_soft(&coeffs, &vectors[unit_idx], delta);
     }
 
-    // Soft majority vote across 7 copies of 8 bits
-    let mut r_byte = 0u8;
+    // Majority vote across 7 copies for each of 8 bits
+    let mut byte = 0u8;
     for bit_pos in 0..8 {
-        let mut total_llr = 0.0;
-        for copy in 0..R_HEADER_COPIES {
-            total_llr += header_llrs[copy * 8 + bit_pos];
+        let mut total = 0.0;
+        for copy in 0..7 {
+            total += header_llrs[copy * 8 + bit_pos];
         }
-        if total_llr < 0.0 {
-            r_byte |= 1 << (7 - bit_pos);
+        if total < 0.0 {
+            byte |= 1 << (7 - bit_pos);
         }
     }
-
-    r_byte
+    byte
 }
 
-/// Phase 1 decode path (backward compatible with Phase 1 images).
-fn decode_phase1(
+/// Phase 1 decode: extract all bits with given delta, then RS decode.
+fn decode_phase1_with_offset(
     grid: &DctGrid,
     positions: &[crate::stego::permute::CoeffPos],
     vectors: &[[f64; SPREAD_LEN]],
     delta: f64,
     num_units: usize,
+    payload_offset: usize,
     passphrase: &str,
 ) -> Result<(String, DecodeQuality), StegoError> {
-    // Extract all bits via STDM with baseline delta
-    let mut extracted_bits = Vec::with_capacity(num_units);
-    for unit_idx in 0..num_units {
+    let payload_units = num_units - payload_offset;
+
+    // Extract all LLRs from payload region
+    let mut all_llrs = Vec::with_capacity(payload_units);
+    for unit_idx in payload_offset..num_units {
         let group_start = unit_idx * SPREAD_LEN;
         let group = &positions[group_start..group_start + SPREAD_LEN];
 
@@ -476,9 +598,13 @@ fn decode_phase1(
             coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
         }
 
-        let bit = stdm_extract(&coeffs, &vectors[unit_idx], delta);
-        extracted_bits.push(bit);
+        all_llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
     }
+
+    // Convert LLRs to hard bits
+    let extracted_bits: Vec<u8> = all_llrs.iter()
+        .map(|&llr| if llr >= 0.0 { 0 } else { 1 })
+        .collect();
 
     let extracted_bytes = frame::bits_to_bytes(&extracted_bits);
     let (decoded_frame, rs_stats) = try_rs_decode_frame(&extracted_bytes)?;
@@ -501,25 +627,114 @@ fn decode_phase1(
     Ok((text.to_string(), quality))
 }
 
-/// Phase 2 decode path: adaptive RS + repetition with soft majority voting.
-fn decode_phase2(
+/// Phase 2 brute-force search: try all plausible (r, parity) combinations.
+///
+/// For each parity tier, sweeps possible frame lengths to find distinct r values,
+/// then attempts decode with each (r, parity, delta) combination.
+fn decode_phase2_search(
     grid: &DctGrid,
     positions: &[crate::stego::permute::CoeffPos],
     vectors: &[[f64; SPREAD_LEN]],
-    qt_values: &[u16; 64],
-    _baseline_delta: f64,
+    mean_qt: f64,
     num_units: usize,
-    r: u8,
+    payload_units: usize,
     passphrase: &str,
+    cached_llrs: &mut Vec<(f64, Vec<f64>)>,
 ) -> Result<(String, DecodeQuality), StegoError> {
-    let payload_units = num_units - R_HEADER_UNITS;
+    for &parity in &ecc::PARITY_TIERS {
+        // Compute the set of distinct r values for this parity tier.
+        let candidate_rs = compute_candidate_rs(payload_units, parity);
 
-    // Compute adaptive delta from r (same formula as encoder)
-    let adaptive_delta = embedding::compute_delta_adaptive(qt_values, r as usize);
+        for r in candidate_rs {
+            let adaptive_delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
 
-    // Extract all payload units with soft LLR values
-    let mut payload_llrs = Vec::with_capacity(payload_units);
-    for unit_idx in R_HEADER_UNITS..num_units {
+            // Get or compute raw LLRs for this delta
+            let raw_llrs = get_or_extract_llrs(
+                cached_llrs, adaptive_delta,
+                grid, positions, vectors, num_units, HEADER_UNITS,
+            );
+
+            // Repetition decode
+            let rs_bit_count = payload_units / r;
+            if rs_bit_count == 0 {
+                continue;
+            }
+            let used_llrs = rs_bit_count * r;
+            if used_llrs > raw_llrs.len() {
+                continue;
+            }
+
+            let voted_bits = repetition::repetition_decode_soft(&raw_llrs[..used_llrs], rs_bit_count);
+            let voted_bytes = frame::bits_to_bytes(&voted_bits);
+
+            // Try RS decode with this parity
+            if let Some((decoded_frame, rs_stats)) = try_rs_decode_frame_with_parity(&voted_bytes, parity) {
+                if let Ok(parsed) = frame::parse_frame(&decoded_frame) {
+                    if let Ok(plaintext) = crypto::decrypt(
+                        &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
+                    ) {
+                        let len = parsed.plaintext_len as usize;
+                        if len <= plaintext.len() {
+                            if let Ok(text) = std::str::from_utf8(&plaintext[..len]) {
+                                let quality = DecodeQuality::from_rs_stats_with_phase2(
+                                    &rs_stats, r as u8, parity as u16,
+                                );
+                                return Ok((text.to_string(), quality));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(StegoError::FrameCorrupted)
+}
+
+/// Compute distinct candidate r values for a given parity tier and payload capacity.
+fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<usize> {
+    let mut rs_set = std::collections::BTreeSet::new();
+
+    // Sweep possible frame lengths to find all distinct r values
+    let min_frame = frame::FRAME_OVERHEAD;
+    let max_frame = frame::MAX_FRAME_BYTES;
+
+    for frame_len in min_frame..=max_frame {
+        let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
+        let rs_bits = rs_encoded_len * 8;
+        if rs_bits > payload_units {
+            continue;
+        }
+        let r = repetition::compute_r(rs_bits, payload_units);
+        if r >= 3 {
+            rs_set.insert(r);
+        }
+    }
+
+    rs_set.into_iter().collect()
+}
+
+/// Get cached LLRs for a delta value, or extract them from the grid.
+fn get_or_extract_llrs(
+    cache: &mut Vec<(f64, Vec<f64>)>,
+    delta: f64,
+    grid: &DctGrid,
+    positions: &[crate::stego::permute::CoeffPos],
+    vectors: &[[f64; SPREAD_LEN]],
+    num_units: usize,
+    payload_offset: usize,
+) -> Vec<f64> {
+    // Check cache (use approximate comparison for f64)
+    for (cached_delta, cached_llrs) in cache.iter() {
+        if (cached_delta - delta).abs() < 0.001 {
+            return cached_llrs.clone();
+        }
+    }
+
+    // Extract fresh LLRs
+    let payload_units = num_units - payload_offset;
+    let mut llrs = Vec::with_capacity(payload_units);
+    for unit_idx in payload_offset..num_units {
         let group_start = unit_idx * SPREAD_LEN;
         let group = &positions[group_start..group_start + SPREAD_LEN];
 
@@ -528,71 +743,51 @@ fn decode_phase2(
             coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
         }
 
-        payload_llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], adaptive_delta));
+        llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
     }
 
-    // Compute rs_bit_count from r and payload_units
-    let rs_bit_count = payload_units / (r as usize);
-    if rs_bit_count == 0 {
-        return Err(StegoError::FrameCorrupted);
-    }
+    cache.push((delta, llrs.clone()));
+    llrs
+}
 
-    // Soft majority vote across r copies
-    let voted_bits = repetition::repetition_decode_soft(
-        &payload_llrs[..rs_bit_count * (r as usize)],
-        rs_bit_count,
-    );
+/// Pre-clamp the Y channel: IDCT -> clamp [0, 255] -> DCT for all blocks.
+///
+/// This "settles" the cover image's coefficients so they produce valid pixel
+/// values. Without this, recompression through a pixel-domain pipeline
+/// (IDCT -> clamp -> DCT) introduces systematic distortion from clamping.
+fn pre_clamp_y_channel(img: &mut JpegImage) {
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt_values = img.quant_table(qt_id).expect("Y quant table must exist").values;
+    let grid = img.dct_grid_mut(0);
+    let bw = grid.blocks_wide();
+    let bt = grid.blocks_tall();
 
-    // Convert voted bits to bytes
-    let voted_bytes = frame::bits_to_bytes(&voted_bits);
+    for br in 0..bt {
+        for bc in 0..bw {
+            let block_slice = grid.block(br, bc);
+            let quantized: [i16; 64] = block_slice.try_into().unwrap();
 
-    // Try RS decode at each parity tier until one succeeds
-    for &parity in &ecc::PARITY_TIERS {
-        if let Some(result) = try_rs_decode_frame_with_parity(&voted_bytes, parity) {
-            let (decoded_frame, rs_stats) = result;
+            // IDCT with quant table -> pixel values
+            let mut px = pixels::idct_block(&quantized, &qt_values);
 
-            // Parse frame
-            if let Ok(parsed) = frame::parse_frame(&decoded_frame) {
-                // Decrypt
-                if let Ok(plaintext) = crypto::decrypt(
-                    &parsed.ciphertext,
-                    passphrase,
-                    &parsed.salt,
-                    &parsed.nonce,
-                ) {
-                    let len = parsed.plaintext_len as usize;
-                    if len <= plaintext.len() {
-                        if let Ok(text) = std::str::from_utf8(&plaintext[..len]) {
-                            let quality = DecodeQuality::from_rs_stats_with_phase2(
-                                &rs_stats,
-                                r,
-                                parity as u16,
-                            );
-                            return Ok((text.to_string(), quality));
-                        }
-                    }
-                }
+            // Clamp to valid pixel range
+            for p in px.iter_mut() {
+                *p = p.clamp(0.0, 255.0);
             }
+
+            // Forward DCT + quantize back
+            let settled = pixels::dct_block(&px, &qt_values);
+            grid.block_mut(br, bc).copy_from_slice(&settled);
         }
     }
-
-    // If no parity tier worked, fall back to Phase 1 decode as last resort
-    // (in case r-header was misread)
-    let _baseline_delta2 = embedding::compute_delta(qt_values);
-    decode_phase1(grid, positions, vectors, _baseline_delta2, num_units, passphrase)
 }
 
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
-///
-/// For high-parity tiers (e.g. 240 where k_max=15), the entire frame doesn't
-/// fit in one block. We decode the first block to read plaintext_len (2 bytes),
-/// compute the total frame length, then do a full multi-block decode.
 fn try_rs_decode_frame_with_parity(
     extracted_bytes: &[u8],
     parity: usize,
 ) -> Option<(Vec<u8>, ecc::RsDecodeStats)> {
     let k_max = 255 - parity;
-    // Need at least 2 bytes in the first block for plaintext_len
     let min_data = 2usize.min(k_max);
 
     for data_len in min_data..=k_max.min(extracted_bytes.len().saturating_sub(parity)) {
@@ -745,17 +940,27 @@ fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     grid.set(br, bc, i, j, val);
 }
 
-/// Embed a DFT template into the luminance channel for geometry resilience.
+/// Embed a DFT template and ring payload into the luminance channel.
 ///
-/// Converts Y-channel DCT coefficients to pixel domain, applies 2D FFT,
-/// embeds passphrase-derived peaks in the magnitude spectrum, then converts
-/// back to DCT coefficients. The template survives geometric transforms
-/// and allows the decoder to estimate and undo rotation/scaling.
-fn embed_dft_template(img: &mut JpegImage, passphrase: &str) -> Result<(), StegoError> {
+/// Embeds both template peaks (for geometry resilience) and the DFT ring
+/// payload (resize-robust second layer) in the same FFT pass.
+fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> Result<(), StegoError> {
     let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(img);
     let mut spectrum = fft2d::fft2d(&luma_pixels, w, h);
+
+    // Template peaks for geometry estimation
     let peaks = template::generate_template_peaks(passphrase, w, h);
     template::embed_template(&mut spectrum, &peaks);
+
+    // Ring payload -- truncate message to ring capacity
+    use crate::stego::armor::dft_payload;
+    let ring_cap = dft_payload::ring_capacity(w, h);
+    if ring_cap > 0 && !message.is_empty() {
+        let truncated_len = message.len().min(ring_cap);
+        let truncated = &message.as_bytes()[..truncated_len];
+        dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase);
+    }
+
     let modified = fft2d::ifft2d(&spectrum);
     pixels::luma_f64_to_jpeg(&modified, w, h, img);
     Ok(())

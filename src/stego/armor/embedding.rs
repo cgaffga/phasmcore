@@ -5,9 +5,73 @@
 //! step `delta` controls robustness vs. distortion.
 
 use super::spreading::SPREAD_LEN;
+use crate::jpeg::zigzag::NATURAL_TO_ZIGZAG;
 
-/// Default delta multiplier: delta = DELTA_MULT × mean quantization step.
-pub const DELTA_MULT: f64 = 2.0;
+/// Fixed bootstrap delta for the header region.
+///
+/// This constant is used to embed/extract the mean-QT byte at the start
+/// of the embedding stream. It must be robust enough to survive recompression
+/// (56 units with 7× redundancy).
+pub const BOOTSTRAP_DELTA: f64 = 100.0;
+
+/// Maximum zigzag position for frequency-restricted embedding.
+/// Positions 1..=MAX_ARMOR_ZIGZAG are used; higher frequencies are excluded
+/// to prevent pixel clamping issues during recompression.
+pub const MAX_ARMOR_ZIGZAG: usize = 15;
+
+/// Mean of actual QT values at zigzag positions 1..=MAX_ARMOR_ZIGZAG.
+pub fn compute_mean_qt(qt_values: &[u16; 64]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for nat_idx in 0..64 {
+        let zz = NATURAL_TO_ZIGZAG[nat_idx];
+        if zz >= 1 && zz <= MAX_ARMOR_ZIGZAG {
+            sum += qt_values[nat_idx] as f64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 10.0; // fallback
+    }
+    sum / count as f64
+}
+
+/// Encode mean QT as a header byte: round(mean * 4).clamp(1, 255).
+pub fn encode_mean_qt(mean_qt: f64) -> u8 {
+    (mean_qt * 4.0).round().clamp(1.0, 255.0) as u8
+}
+
+/// Decode header byte back to mean QT: byte / 4.0.
+pub fn decode_mean_qt(header_byte: u8) -> f64 {
+    header_byte as f64 / 4.0
+}
+
+/// Number of header bytes (mean QT byte).
+pub const HEADER_BYTES: usize = 1;
+
+/// Number of embedding units for the header.
+/// 1 byte × 8 bits × 7 copies = 56 units.
+pub const HEADER_UNITS: usize = HEADER_BYTES * 8 * HEADER_COPIES;
+
+/// Number of copies for header majority voting.
+pub const HEADER_COPIES: usize = 7;
+
+/// Compute delta from mean QT value and repetition factor.
+/// Uses adaptive multipliers scaled by r for larger decision regions.
+pub fn compute_delta_from_mean_qt(mean_qt: f64, r: usize) -> f64 {
+    let mult = if r >= 7 {
+        8.0
+    } else if r >= 5 {
+        7.0
+    } else if r >= 3 {
+        6.0
+    } else if r >= 2 {
+        4.0
+    } else {
+        3.0 // Phase 1 base: was 2.0, now 3.0
+    };
+    mult * mean_qt
+}
 
 /// Embed a single bit into a group of coefficients using STDM.
 ///
@@ -76,37 +140,6 @@ pub fn stdm_extract_soft(coeffs: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], delt
 
     // LLR: positive favors bit 0, negative favors bit 1
     d1 - d0
-}
-
-/// Compute the default delta for an image given its quantization table.
-///
-/// delta = DELTA_MULT × mean of quantization step values for AC positions.
-pub fn compute_delta(qt_values: &[u16; 64]) -> f64 {
-    compute_delta_with_mult(qt_values, DELTA_MULT)
-}
-
-/// Compute delta with a custom multiplier.
-pub fn compute_delta_with_mult(qt_values: &[u16; 64], mult: f64) -> f64 {
-    let sum: f64 = qt_values[1..].iter().map(|&q| q as f64).sum();
-    let mean = sum / 63.0;
-    mult * mean
-}
-
-/// Compute adaptive delta based on the repetition factor.
-///
-/// Higher repetition = smaller message relative to capacity = more room
-/// for larger decision regions = more robust to recompression.
-pub fn compute_delta_adaptive(qt_values: &[u16; 64], r: usize) -> f64 {
-    let mult = if r >= 7 {
-        4.0
-    } else if r >= 3 {
-        3.0
-    } else if r >= 2 {
-        2.5
-    } else {
-        DELTA_MULT
-    };
-    compute_delta_with_mult(qt_values, mult)
 }
 
 #[cfg(test)]
@@ -196,8 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_delta_reasonable() {
-        // Standard luma QT at QF 75 has mean AC step ~20
+    fn compute_mean_qt_reasonable() {
+        // Standard luma QT at QF 75 (approximate)
         let qt = [8, 6, 5, 8, 12, 20, 26, 31,
                    6, 6, 7, 10, 13, 29, 30, 28,
                    7, 7, 8, 12, 20, 29, 35, 28,
@@ -206,9 +239,18 @@ mod tests {
                    12, 18, 28, 32, 41, 52, 57, 46,
                    25, 32, 39, 44, 52, 61, 60, 51,
                    36, 46, 48, 49, 56, 50, 52, 50];
-        let delta = compute_delta(&qt);
-        // Mean of AC positions ≈ 30, delta ≈ 60
-        assert!(delta > 20.0 && delta < 120.0, "delta={delta}");
+        let mean = compute_mean_qt(&qt);
+        // Mean of low-freq AC positions should be reasonable
+        assert!(mean > 5.0 && mean < 30.0, "mean_qt={mean}");
+    }
+
+    #[test]
+    fn mean_qt_encode_decode_roundtrip() {
+        for qt_val in [5.0, 10.0, 15.5, 25.0, 50.0, 63.0] {
+            let encoded = encode_mean_qt(qt_val);
+            let decoded = decode_mean_qt(encoded);
+            assert!((decoded - qt_val).abs() < 0.5, "roundtrip failed: {qt_val} -> {encoded} -> {decoded}");
+        }
     }
 
     #[test]
@@ -251,24 +293,30 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_delta_increases_with_r() {
-        let qt = [8, 6, 5, 8, 12, 20, 26, 31,
-                   6, 6, 7, 10, 13, 29, 30, 28,
-                   7, 7, 8, 12, 20, 29, 35, 28,
-                   7, 9, 11, 15, 26, 44, 40, 31,
-                   9, 11, 19, 28, 34, 55, 52, 39,
-                   12, 18, 28, 32, 41, 52, 57, 46,
-                   25, 32, 39, 44, 52, 61, 60, 51,
-                   36, 46, 48, 49, 56, 50, 52, 50];
+    fn header_units_constant_correct() {
+        assert_eq!(HEADER_UNITS, HEADER_BYTES * 8 * HEADER_COPIES);
+        assert_eq!(HEADER_UNITS, 56);
+    }
 
-        let d1 = compute_delta_adaptive(&qt, 1);
-        let d2 = compute_delta_adaptive(&qt, 2);
-        let d3 = compute_delta_adaptive(&qt, 3);
-        let d7 = compute_delta_adaptive(&qt, 7);
+    #[test]
+    fn delta_increases_with_r() {
+        let mean_qt = 10.0;
+        let d1 = compute_delta_from_mean_qt(mean_qt, 1);
+        let d2 = compute_delta_from_mean_qt(mean_qt, 2);
+        let d3 = compute_delta_from_mean_qt(mean_qt, 3);
+        let d5 = compute_delta_from_mean_qt(mean_qt, 5);
+        let d7 = compute_delta_from_mean_qt(mean_qt, 7);
 
-        assert_eq!(d1, compute_delta(&qt), "r=1 should use baseline delta");
         assert!(d2 > d1, "r=2 should increase delta");
         assert!(d3 > d2, "r=3 should increase delta more");
-        assert!(d7 > d3, "r=7 should increase delta further");
+        assert!(d5 > d3, "r=5 should increase delta further");
+        assert!(d7 > d5, "r=7 should increase delta even more");
+
+        // Verify exact multipliers
+        assert!((d1 - 30.0).abs() < 1e-10, "r=1: 3.0 * 10.0 = 30.0, got {d1}");
+        assert!((d2 - 40.0).abs() < 1e-10, "r=2: 4.0 * 10.0 = 40.0, got {d2}");
+        assert!((d3 - 60.0).abs() < 1e-10, "r=3: 6.0 * 10.0 = 60.0, got {d3}");
+        assert!((d5 - 70.0).abs() < 1e-10, "r=5: 7.0 * 10.0 = 70.0, got {d5}");
+        assert!((d7 - 80.0).abs() < 1e-10, "r=7: 8.0 * 10.0 = 80.0, got {d7}");
     }
 }

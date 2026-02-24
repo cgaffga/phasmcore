@@ -1,6 +1,6 @@
 //! Repetition coding with soft majority voting.
 //!
-//! Lays out `r` copies of RS-encoded bits interleaved across embedding
+//! Lays out `r` copies of RS-encoded bits sequentially across embedding
 //! positions. On extraction, soft majority voting using STDM log-likelihood
 //! ratios combines redundant copies for dramatically improved robustness.
 
@@ -33,17 +33,19 @@ pub fn compute_r(rs_bit_count: usize, num_units: usize) -> usize {
 
 /// Lay out `r` copies of RS-encoded bits across `num_units` embedding positions.
 ///
-/// Returns (output_bits, r_used). The first `r * rs_bits.len()` positions are
-/// filled; any remaining positions are zero-padded.
+/// Uses sequential layout — copy `j` of the RS bitstream starts at offset
+/// `j * rs_bits.len()`. Each copy is a contiguous block.
+///
+/// Returns (output_bits, r_used). Any remaining positions are zero-padded.
 pub fn repetition_encode(rs_bits: &[u8], num_units: usize) -> (Vec<u8>, usize) {
     let r = compute_r(rs_bits.len(), num_units);
     let mut output = vec![0u8; num_units];
 
     for copy in 0..r {
-        let offset = copy * rs_bits.len();
+        let start = copy * rs_bits.len();
         for (i, &bit) in rs_bits.iter().enumerate() {
-            if offset + i < num_units {
-                output[offset + i] = bit;
+            if start + i < num_units {
+                output[start + i] = bit;
             }
         }
     }
@@ -53,8 +55,8 @@ pub fn repetition_encode(rs_bits: &[u8], num_units: usize) -> (Vec<u8>, usize) {
 
 /// Soft majority voting across `r` copies of RS-encoded bits.
 ///
-/// Takes LLR values for all extracted units and the known RS bit count.
-/// For each RS bit position, sums LLR across all `r` copies and decides:
+/// Uses sequential layout — copy `j` of bit `i` is at position
+/// `j * rs_bit_count + i`. Sums LLR across all copies and decides:
 /// positive total → bit 0, negative → bit 1.
 pub fn repetition_decode_soft(llrs: &[f64], rs_bit_count: usize) -> Vec<u8> {
     if rs_bit_count == 0 {
@@ -138,16 +140,19 @@ mod tests {
         let r = 5;
         let rs_bit_count = rs_bits.len();
 
-        // Create 5 copies of LLRs, with 2 copies having flipped bit 0
-        let mut llrs = Vec::new();
-        for copy in 0..r {
-            for &bit in &rs_bits {
-                let base_llr = if bit == 0 { 3.0 } else { -3.0 };
-                if copy < 2 && bit == rs_bits[0] {
+        // Sequential layout: copy j of bit i at position j * rs_bit_count + i
+        // Create LLRs for 5 copies × 4 bits = 20 positions
+        let total = rs_bit_count * r;
+        let mut llrs = vec![0.0f64; total];
+        for i in 0..rs_bit_count {
+            let base_llr = if rs_bits[i] == 0 { 3.0 } else { -3.0 };
+            for copy in 0..r {
+                let idx = copy * rs_bit_count + i;
+                if i == 0 && copy < 2 {
                     // Flip the sign for 2 out of 5 copies of bit 0
-                    llrs.push(-base_llr);
+                    llrs[idx] = -base_llr;
                 } else {
-                    llrs.push(base_llr);
+                    llrs[idx] = base_llr;
                 }
             }
         }
