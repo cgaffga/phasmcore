@@ -1,14 +1,14 @@
 //! Ghost mode encode/decode pipeline.
 //!
 //! Ghost mode embeds encrypted messages into JPEG DCT coefficients using:
-//! 1. UERD cost function to identify low-detectability embedding positions
+//! 1. J-UNIWARD cost function to identify low-detectability embedding positions
 //! 2. Fisher-Yates permutation (keyed by passphrase) to scatter the payload
 //! 3. Syndrome-Trellis Coding (STC) to minimize total embedding distortion
 //! 4. nsF5-style LSB modification (toward zero for |coeff| > 1, away from
 //!    zero for |coeff| == 1 to prevent shrinkage)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uerd::compute_uerd;
+use crate::stego::cost::uniward::compute_uniward;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
@@ -71,10 +71,10 @@ pub fn ghost_encode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute UERD costs for Y channel.
+    // 1. Compute J-UNIWARD costs for Y channel.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uerd(img.dct_grid(0), qt);
+    let cost_map = compute_uniward(img.dct_grid(0), qt);
 
     // 2. Derive structural key (Tier 1).
     let structural_key = crypto::derive_structural_key(passphrase);
@@ -178,10 +178,10 @@ pub fn ghost_decode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute UERD costs (for consistent position selection).
+    // 1. Compute J-UNIWARD costs (for consistent position selection).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uerd(img.dct_grid(0), qt);
+    let cost_map = compute_uniward(img.dct_grid(0), qt);
 
     // 2. Derive structural key.
     let structural_key = crypto::derive_structural_key(passphrase);

@@ -3,7 +3,7 @@
 //! Pure-Rust steganography engine for hiding encrypted text messages in JPEG
 //! photos. Provides two embedding modes:
 //!
-//! - **Ghost** (stealth): UERD cost function + STC coding to resist
+//! - **Ghost** (stealth): J-UNIWARD cost function + STC coding to resist
 //!   statistical steganalysis. Optimizes for undetectability.
 //! - **Armor** (robust): STDM embedding + Reed-Solomon ECC to survive
 //!   JPEG recompression. Optimizes for message survivability.

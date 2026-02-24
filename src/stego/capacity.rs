@@ -7,7 +7,7 @@
 //! - Frame overhead (length, salt, nonce, auth tag, CRC)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uerd::compute_uerd;
+use crate::stego::cost::uniward::compute_uniward;
 use crate::stego::frame::FRAME_OVERHEAD;
 use crate::stego::error::StegoError;
 
@@ -36,7 +36,7 @@ pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
 
-    let cost_map = compute_uerd(grid, qt);
+    let cost_map = compute_uniward(grid, qt);
 
     // Count usable (non-WET) AC coefficients.
     let mut usable = 0usize;

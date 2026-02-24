@@ -4,10 +4,14 @@
 //! guiding the STC encoder to modify only the least detectable positions.
 //! Lower cost = safer to modify. Infinite cost (`WET_COST`) = must never modify.
 //!
-//! Currently implements UERD (Uniform Embedding Revisited Distortion). Future
-//! phases will add J-UNIWARD and SI-UNIWARD.
+//! Implements:
+//! - **UERD** (Uniform Embedding Revisited Distortion): simple block-energy cost.
+//! - **J-UNIWARD** (JPEG Universal Wavelet Relative Distortion): state-of-the-art
+//!   cost function using directional wavelet decomposition for superior
+//!   steganalysis resistance.
 
 pub mod uerd;
+pub mod uniward;
 
 /// Cost assigned to coefficients that must never be modified.
 /// Using infinity ensures the Viterbi STC never selects these positions for flipping.

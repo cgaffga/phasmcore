@@ -2,8 +2,8 @@
 //!
 //! This module provides two embedding modes:
 //!
-//! - **Ghost** (`ghost_encode` / `ghost_decode`): Stealth mode using UERD cost
-//!   function and Syndrome-Trellis Coding (STC) to minimize statistical
+//! - **Ghost** (`ghost_encode` / `ghost_decode`): Stealth mode using J-UNIWARD
+//!   cost function and Syndrome-Trellis Coding (STC) to minimize statistical
 //!   detectability. Best for images that will not be recompressed.
 //!
 //! - **Armor** (`armor_encode` / `armor_decode`): Robustness mode using STDM
