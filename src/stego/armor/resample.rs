@@ -22,8 +22,7 @@ pub fn resample_bilinear(
     let mut result = vec![128.0f64; dst_w * dst_h];
 
     // Inverse transform: rotate by -θ, scale by 1/s
-    let cos_t = transform.rotation_rad.cos();
-    let sin_t = transform.rotation_rad.sin();
+    let (sin_t, cos_t) = crate::det_math::det_sincos(transform.rotation_rad);
     let inv_scale = if transform.scale.abs() > 1e-12 { 1.0 / transform.scale } else { 1.0 };
 
     // Centers of source and destination

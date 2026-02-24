@@ -21,7 +21,7 @@ fn cosine_table() -> &'static [[f64; 8]; 8] {
         let mut table = [[0.0f64; 8]; 8];
         for u in 0..8 {
             for x in 0..8 {
-                table[u][x] = ((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI / 16.0).cos();
+                table[u][x] = crate::det_math::det_cos((2 * x + 1) as f64 * u as f64 * std::f64::consts::PI / 16.0);
             }
         }
         table

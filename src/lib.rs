@@ -23,6 +23,7 @@
 //! assert_eq!(decoded, "secret message");
 //! ```
 
+pub mod det_math;
 pub mod jpeg;
 pub mod stego;
 

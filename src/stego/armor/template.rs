@@ -81,8 +81,9 @@ pub fn generate_template_peaks(passphrase: &str, width: usize, height: usize) ->
         let angle: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
         let radius: f64 = rng.gen_range(r_min..r_max);
 
-        let u = radius * angle.cos();
-        let v = radius * angle.sin();
+        let (sin_a, cos_a) = crate::det_math::det_sincos(angle);
+        let u = radius * cos_a;
+        let v = radius * sin_a;
 
         peaks.push(TemplatePeak {
             u,
@@ -122,8 +123,9 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
 
         // Add along existing phase direction
         let existing = spectrum.data[idx];
-        let phase = if existing.norm() > 1e-12 {
-            existing / existing.norm()
+        let enorm = crate::det_math::det_hypot(existing.re, existing.im);
+        let phase = if enorm > 1e-12 {
+            existing / enorm
         } else {
             Complex64::new(1.0, 0.0)
         };
@@ -136,8 +138,9 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
             let conj_idx = cv as usize * w + cu as usize;
             if conj_idx != idx {
                 let conj_existing = spectrum.data[conj_idx];
-                let conj_phase = if conj_existing.norm() > 1e-12 {
-                    conj_existing / conj_existing.norm()
+                let cnorm = crate::det_math::det_hypot(conj_existing.re, conj_existing.im);
+                let conj_phase = if cnorm > 1e-12 {
+                    conj_existing / cnorm
                 } else {
                     Complex64::new(1.0, 0.0)
                 };
@@ -264,7 +267,7 @@ pub fn estimate_transform(detected: &[DetectedPeak]) -> Option<AffineTransform> 
     let a = num_a / denom;
     let b = num_b / denom;
 
-    let rotation_rad = b.atan2(a);
+    let rotation_rad = crate::det_math::det_atan2(b, a);
     let scale = (a * a + b * b).sqrt();
 
     Some(AffineTransform {
@@ -287,7 +290,8 @@ fn local_mean_magnitude(spectrum: &Spectrum2D, u: usize, v: usize) -> f64 {
             let nu = u as i32 + du;
             let nv = v as i32 + dv;
             if nu >= 0 && nu < w as i32 && nv >= 0 && nv < h as i32 {
-                sum += spectrum.data[nv as usize * w + nu as usize].norm();
+                let c = spectrum.data[nv as usize * w + nu as usize];
+                sum += crate::det_math::det_hypot(c.re, c.im);
                 count += 1;
             }
         }
