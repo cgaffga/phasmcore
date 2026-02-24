@@ -37,6 +37,12 @@ pub const MAX_PIXELS: u32 = 16_000_000;
 /// Images below this are rejected with an error message.
 pub const MIN_ENCODE_DIMENSION: u32 = 200;
 
+/// Target pixel dimension (longest side) for Armor/Fortress pre-resize.
+/// Images larger than this are downsampled by the frontend before encoding
+/// in Armor mode, so that the 8×8 block grid survives platform recompression
+/// (e.g. WhatsApp resizes to ~1600px on the longest side).
+pub const ARMOR_TARGET_DIMENSION: u32 = 1600;
+
 /// Validate image dimensions for encoding.
 ///
 /// Returns `Ok(())` if the dimensions are within acceptable bounds.
