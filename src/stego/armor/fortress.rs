@@ -33,9 +33,15 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 /// QIM step size in pixel-level units.
-/// Block averages shift <2 levels through recompression, so step=16 gives
-/// a 6-level margin on each side of the decision boundary.
-const QIM_STEP: f64 = 16.0;
+/// Block averages shift <2 levels through QF70+ recompression, so step=8 gives
+/// a 2-level margin on each side of the decision boundary — sufficient for
+/// pre-settled images (QF70 encode → QF75 WhatsApp recompression).
+const QIM_STEP: f64 = 8.0;
+
+/// Minimum repetition factor for Fortress encode.
+/// Higher minimum = earlier switchover to STDM for longer messages = better quality.
+/// At r=5, a 1200×1600 image holds ~444 chars; a 1280×720 image holds ~197 chars.
+const FORTRESS_MIN_R: usize = 5;
 
 /// Magic byte embedded in the fortress header for fast detection.
 const FORTRESS_MAGIC: u8 = 0xF5;
@@ -141,7 +147,7 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
                 continue;
             }
             let r = repetition::compute_r(rs_bits, payload_blocks);
-            if r >= 3 && rs_bits <= payload_blocks {
+            if r >= FORTRESS_MIN_R && rs_bits <= payload_blocks {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -153,7 +159,7 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
             let rs_bits = rs_encoded_len * 8;
             if rs_bits <= payload_blocks {
                 let r = repetition::compute_r(rs_bits, payload_blocks);
-                if r >= 3 {
+                if r >= FORTRESS_MIN_R {
                     best_frame_bytes = lo;
                 }
             }
@@ -204,14 +210,14 @@ pub fn fortress_encode(
     let fort_key = crypto::derive_fortress_structural_key(passphrase);
     let perm = permute_blocks(total_blocks, &fort_key);
 
-    // RS-encode with best parity tier (smallest parity where r >= 3).
+    // RS-encode with best parity tier (smallest parity where r >= FORTRESS_MIN_R).
     let mut chosen_parity = ecc::PARITY_TIERS[0];
     for &parity in &ecc::PARITY_TIERS {
         let rs_encoded = ecc::rs_encode_blocks_with_parity(frame_bytes, parity);
         let rs_bits_len = rs_encoded.len() * 8;
         if rs_bits_len <= payload_blocks {
             let r = repetition::compute_r(rs_bits_len, payload_blocks);
-            if r >= 3 {
+            if r >= FORTRESS_MIN_R {
                 chosen_parity = parity;
                 break;
             }
@@ -222,7 +228,7 @@ pub fn fortress_encode(
     let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
     let r = repetition::compute_r(rs_bits.len(), payload_blocks);
-    if r < 3 {
+    if r < FORTRESS_MIN_R {
         return Err(StegoError::MessageTooLarge);
     }
 
@@ -272,6 +278,7 @@ pub fn fortress_decode(
     img: &JpegImage,
     passphrase: &str,
 ) -> Result<(String, super::pipeline::DecodeQuality), StegoError> {
+    let step = QIM_STEP;
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt_dc = img
         .quant_table(qt_id)
@@ -299,7 +306,7 @@ pub fn fortress_decode(
         let bc = block_idx % blocks_wide;
         let dc = grid.get(br, bc, 0, 0);
         let avg = dc_to_avg(dc, qt_dc);
-        all_llrs.push(qim_extract_soft(avg, QIM_STEP));
+        all_llrs.push(qim_extract_soft(avg, step));
     }
 
     // Check magic header: majority vote across 7 copies
@@ -312,7 +319,9 @@ pub fn fortress_decode(
     let payload_llrs = &all_llrs[FORTRESS_HEADER_BLOCKS..];
     let payload_llrs = &payload_llrs[..payload_blocks.min(payload_llrs.len())];
 
-    // Brute-force (r, parity) search — same pattern as STDM Phase 2
+    // Brute-force (r, parity) search — same pattern as STDM Phase 2.
+    // Use r >= 3 on decode (not FORTRESS_MIN_R) for backward compatibility
+    // with images encoded before the min-r increase.
     for &parity in &ecc::PARITY_TIERS {
         let candidate_rs = compute_fortress_candidate_rs(payload_blocks, parity);
 
