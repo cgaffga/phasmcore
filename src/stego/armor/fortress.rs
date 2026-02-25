@@ -53,6 +53,9 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// QIM step size in pixel-level units.
 /// Block averages shift <2 levels through QF70+ recompression, so step=12 gives
 /// a 4-level margin on each side of the decision boundary — improved robustness
@@ -235,32 +238,48 @@ fn compute_watson_factors(grid: &DctGrid) -> WatsonFactors {
     let blocks_tall = grid.blocks_tall();
     let total_blocks = blocks_wide * blocks_tall;
 
-    // 1. Compute AC energy per block (same as compute_watson_tiers).
-    let mut ac_energies: Vec<f64> = Vec::with_capacity(total_blocks);
-    for br in 0..blocks_tall {
-        for bc in 0..blocks_wide {
-            let block = grid.block(br, bc);
-            let mut energy: f64 = 0.0;
-            for k in 1..64 {
-                let c = block[k];
-                if c.abs() >= 2 {
-                    energy += (c as f64) * (c as f64);
-                }
-            }
-            ac_energies.push(energy);
-        }
-    }
+    // 1. Compute AC energy per block — embarrassingly parallel.
+    let block_indices: Vec<usize> = (0..total_blocks).collect();
 
-    // 2. Median.
+    let compute_energy = |&block_idx: &usize| -> f64 {
+        let br = block_idx / blocks_wide;
+        let bc = block_idx % blocks_wide;
+        let block = grid.block(br, bc);
+        let mut energy: f64 = 0.0;
+        for k in 1..64 {
+            let c = block[k];
+            if c.abs() >= 2 {
+                energy += (c as f64) * (c as f64);
+            }
+        }
+        energy
+    };
+
+    #[cfg(feature = "parallel")]
+    let ac_energies: Vec<f64> = block_indices.par_iter().map(compute_energy).collect();
+    #[cfg(not(feature = "parallel"))]
+    let ac_energies: Vec<f64> = block_indices.iter().map(compute_energy).collect();
+
+    // 2. Median (parallel sort when available).
     let mut sorted = ac_energies.clone();
+    #[cfg(feature = "parallel")]
+    sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    #[cfg(not(feature = "parallel"))]
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
     let median = if total_blocks == 0 {
         1.0
     } else {
         sorted[total_blocks / 2].max(1.0)
     };
 
-    // 3. Continuous factor per block.
+    // 3. Continuous factor per block — parallel map.
+    #[cfg(feature = "parallel")]
+    let factors = ac_energies
+        .par_iter()
+        .map(|&energy| watson_continuous_factor(energy / median))
+        .collect();
+    #[cfg(not(feature = "parallel"))]
     let factors = ac_energies
         .iter()
         .map(|&energy| watson_continuous_factor(energy / median))
@@ -585,60 +604,61 @@ fn decode_fortress_payload(
     passphrase: &str,
 ) -> Result<(String, super::pipeline::DecodeQuality), StegoError> {
     // Reference LLR for pristine QIM embedding: step / 2.
-    // For Watson mode, the per-block step varies by tier, but the base step
-    // (QIM_STEP) is used as the reference since the average tier factor is ~1.0.
     let reference_llr = QIM_STEP / 2.0;
 
-    // Use r >= 3 on decode (not FORTRESS_MIN_R) for backward compatibility
-    // with images encoded before the min-r increase.
+    // Build a flat list of (parity, r) candidates in priority order
+    // (smallest parity first, then by r within each parity tier).
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for &parity in &ecc::PARITY_TIERS {
         let candidate_rs = super::pipeline::compute_candidate_rs(payload_blocks, parity);
-
         for r in candidate_rs {
-            let rs_bit_count = payload_blocks / r;
-            if rs_bit_count == 0 {
-                continue;
-            }
-            let used_llrs = rs_bit_count * r;
-            if used_llrs > payload_llrs.len() {
-                continue;
-            }
-
-            let (voted_bits, rep_quality) =
-                repetition::repetition_decode_soft_with_quality(&payload_llrs[..used_llrs], rs_bit_count);
-            let voted_bytes = frame::bits_to_bytes(&voted_bits);
-
-            if let Some((decoded_frame, rs_stats)) =
-                super::pipeline::try_rs_decode_frame_with_parity(&voted_bytes, parity)
-            {
-                if let Ok(parsed) = frame::parse_frame(&decoded_frame) {
-                    if let Ok(plaintext) = crypto::decrypt(
-                        &parsed.ciphertext,
-                        passphrase,
-                        &parsed.salt,
-                        &parsed.nonce,
-                    ) {
-                        let len = parsed.plaintext_len as usize;
-                        if len <= plaintext.len() {
-                            if let Ok(text) = std::str::from_utf8(&plaintext[..len]) {
-                                let mut q = super::pipeline::DecodeQuality::from_rs_stats_with_signal(
-                                    &rs_stats,
-                                    r as u8,
-                                    parity as u16,
-                                    rep_quality.avg_abs_llr_per_copy,
-                                    reference_llr,
-                                );
-                                q.fortress_used = true;
-                                return Ok((text.to_string(), q));
-                            }
-                        }
-                    }
-                }
-            }
+            candidates.push((parity, r));
         }
     }
 
-    Err(StegoError::FrameCorrupted)
+    // Try each candidate — parallel when available, sequential otherwise.
+    let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(String, super::pipeline::DecodeQuality)> {
+        let rs_bit_count = payload_blocks / r;
+        if rs_bit_count == 0 {
+            return None;
+        }
+        let used_llrs = rs_bit_count * r;
+        if used_llrs > payload_llrs.len() {
+            return None;
+        }
+
+        let (voted_bits, rep_quality) =
+            repetition::repetition_decode_soft_with_quality(&payload_llrs[..used_llrs], rs_bit_count);
+        let voted_bytes = frame::bits_to_bytes(&voted_bits);
+
+        let (decoded_frame, rs_stats) =
+            super::pipeline::try_rs_decode_frame_with_parity(&voted_bytes, parity)?;
+        let parsed = frame::parse_frame(&decoded_frame).ok()?;
+        let plaintext = crypto::decrypt(
+            &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
+        ).ok()?;
+
+        let len = parsed.plaintext_len as usize;
+        if len > plaintext.len() {
+            return None;
+        }
+        let text = std::str::from_utf8(&plaintext[..len]).ok()?;
+
+        let mut q = super::pipeline::DecodeQuality::from_rs_stats_with_signal(
+            &rs_stats, r as u8, parity as u16,
+            rep_quality.avg_abs_llr_per_copy, reference_llr,
+        );
+        q.fortress_used = true;
+        Some((text.to_string(), q))
+    };
+
+    // find_map_first preserves priority ordering (smallest parity wins).
+    #[cfg(feature = "parallel")]
+    let result = candidates.par_iter().find_map_first(try_candidate);
+    #[cfg(not(feature = "parallel"))]
+    let result = candidates.iter().find_map(try_candidate);
+
+    result.ok_or(StegoError::FrameCorrupted)
 }
 
 /// Extract magic byte from header LLRs using soft majority voting.

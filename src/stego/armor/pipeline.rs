@@ -30,6 +30,9 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::permute;
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// Number of embedding units for the header.
 /// 1 byte x 8 bits x 7 copies = 56 units.
 const HEADER_UNITS: usize = embedding::HEADER_UNITS; // 56
@@ -732,59 +735,78 @@ fn decode_phase2_search(
     passphrase: &str,
     cached_llrs: &mut Vec<(f64, Vec<f64>)>,
 ) -> Result<(String, DecodeQuality), StegoError> {
+    // Build all (parity, r, delta) candidates and pre-extract unique delta LLR sets
+    // so the search can run in parallel without &mut cache.
+    let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
     for &parity in &ecc::PARITY_TIERS {
-        // Compute the set of distinct r values for this parity tier.
         let candidate_rs = compute_candidate_rs(payload_units, parity);
-
         for r in candidate_rs {
-            let adaptive_delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
-
-            // Get or compute raw LLRs for this delta
-            let raw_llrs = get_or_extract_llrs(
-                cached_llrs, adaptive_delta,
-                grid, positions, vectors, num_units, HEADER_UNITS,
-            );
-
-            // Repetition decode
-            let rs_bit_count = payload_units / r;
-            if rs_bit_count == 0 {
-                continue;
-            }
-            let used_llrs = rs_bit_count * r;
-            if used_llrs > raw_llrs.len() {
-                continue;
-            }
-
-            let (voted_bits, rep_quality) = repetition::repetition_decode_soft_with_quality(
-                &raw_llrs[..used_llrs], rs_bit_count,
-            );
-            let voted_bytes = frame::bits_to_bytes(&voted_bits);
-
-            // Try RS decode with this parity
-            if let Some((decoded_frame, rs_stats)) = try_rs_decode_frame_with_parity(&voted_bytes, parity) {
-                if let Ok(parsed) = frame::parse_frame(&decoded_frame) {
-                    if let Ok(plaintext) = crypto::decrypt(
-                        &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
-                    ) {
-                        let len = parsed.plaintext_len as usize;
-                        if len <= plaintext.len() {
-                            if let Ok(text) = std::str::from_utf8(&plaintext[..len]) {
-                                // Reference LLR for STDM: delta / 2
-                                let reference_llr = adaptive_delta / 2.0;
-                                let quality = DecodeQuality::from_rs_stats_with_signal(
-                                    &rs_stats, r as u8, parity as u16,
-                                    rep_quality.avg_abs_llr_per_copy, reference_llr,
-                                );
-                                return Ok((text.to_string(), quality));
-                            }
-                        }
-                    }
-                }
-            }
+            let delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
+            candidates.push((parity, r, delta));
         }
     }
 
-    Err(StegoError::FrameCorrupted)
+    // Pre-extract LLRs for all unique deltas (populates cache sequentially)
+    for &(_, _, delta) in &candidates {
+        get_or_extract_llrs(
+            cached_llrs, delta,
+            grid, positions, vectors, num_units, HEADER_UNITS,
+        );
+    }
+
+    // Snapshot the cache for read-only parallel access
+    let llr_cache: &[(f64, Vec<f64>)] = cached_llrs;
+
+    let find_llrs = |delta: f64| -> &[f64] {
+        for (cached_delta, cached_llrs) in llr_cache.iter() {
+            if (cached_delta - delta).abs() < 0.001 {
+                return cached_llrs;
+            }
+        }
+        &[]
+    };
+
+    let try_candidate = |&(parity, r, adaptive_delta): &(usize, usize, f64)| -> Option<(String, DecodeQuality)> {
+        let raw_llrs = find_llrs(adaptive_delta);
+
+        let rs_bit_count = payload_units / r;
+        if rs_bit_count == 0 {
+            return None;
+        }
+        let used_llrs = rs_bit_count * r;
+        if used_llrs > raw_llrs.len() {
+            return None;
+        }
+
+        let (voted_bits, rep_quality) = repetition::repetition_decode_soft_with_quality(
+            &raw_llrs[..used_llrs], rs_bit_count,
+        );
+        let voted_bytes = frame::bits_to_bytes(&voted_bits);
+
+        let (decoded_frame, rs_stats) = try_rs_decode_frame_with_parity(&voted_bytes, parity)?;
+        let parsed = frame::parse_frame(&decoded_frame).ok()?;
+        let plaintext = crypto::decrypt(
+            &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
+        ).ok()?;
+        let len = parsed.plaintext_len as usize;
+        if len > plaintext.len() {
+            return None;
+        }
+        let text = std::str::from_utf8(&plaintext[..len]).ok()?;
+        let reference_llr = adaptive_delta / 2.0;
+        let quality = DecodeQuality::from_rs_stats_with_signal(
+            &rs_stats, r as u8, parity as u16,
+            rep_quality.avg_abs_llr_per_copy, reference_llr,
+        );
+        Some((text.to_string(), quality))
+    };
+
+    #[cfg(feature = "parallel")]
+    let result = candidates.par_iter().find_map_first(try_candidate);
+    #[cfg(not(feature = "parallel"))]
+    let result = candidates.iter().find_map(try_candidate);
+
+    result.ok_or(StegoError::FrameCorrupted)
 }
 
 /// Compute distinct candidate r values for a given parity tier and payload capacity.
@@ -828,9 +850,9 @@ fn get_or_extract_llrs(
     }
 
     // Extract fresh LLRs
-    let payload_units = num_units - payload_offset;
-    let mut llrs = Vec::with_capacity(payload_units);
-    for unit_idx in payload_offset..num_units {
+    let unit_indices: Vec<usize> = (payload_offset..num_units).collect();
+
+    let extract_one = |&unit_idx: &usize| -> f64 {
         let group_start = unit_idx * SPREAD_LEN;
         let group = &positions[group_start..group_start + SPREAD_LEN];
 
@@ -839,8 +861,13 @@ fn get_or_extract_llrs(
             coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
         }
 
-        llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
-    }
+        stdm_extract_soft(&coeffs, &vectors[unit_idx], delta)
+    };
+
+    #[cfg(feature = "parallel")]
+    let llrs: Vec<f64> = unit_indices.par_iter().map(extract_one).collect();
+    #[cfg(not(feature = "parallel"))]
+    let llrs: Vec<f64> = unit_indices.iter().map(extract_one).collect();
 
     cache.push((delta, llrs.clone()));
     llrs
@@ -855,27 +882,21 @@ fn pre_clamp_y_channel(img: &mut JpegImage) {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt_values = img.quant_table(qt_id).expect("Y quant table must exist").values;
     let grid = img.dct_grid_mut(0);
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
 
-    for br in 0..bt {
-        for bc in 0..bw {
-            let block_slice = grid.block(br, bc);
-            let quantized: [i16; 64] = block_slice.try_into().unwrap();
-
-            // IDCT with quant table -> pixel values
-            let mut px = pixels::idct_block(&quantized, &qt_values);
-
-            // Clamp to valid pixel range
-            for p in px.iter_mut() {
-                *p = p.clamp(0.0, 255.0);
-            }
-
-            // Forward DCT + quantize back
-            let settled = pixels::dct_block(&px, &qt_values);
-            grid.block_mut(br, bc).copy_from_slice(&settled);
+    let process_block = |chunk: &mut [i16]| {
+        let quantized: [i16; 64] = chunk.try_into().unwrap();
+        let mut px = pixels::idct_block(&quantized, &qt_values);
+        for p in px.iter_mut() {
+            *p = p.clamp(0.0, 255.0);
         }
-    }
+        let settled = pixels::dct_block(&px, &qt_values);
+        chunk.copy_from_slice(&settled);
+    };
+
+    #[cfg(feature = "parallel")]
+    grid.coeffs_mut().par_chunks_mut(64).for_each(process_block);
+    #[cfg(not(feature = "parallel"))]
+    grid.coeffs_mut().chunks_mut(64).for_each(process_block);
 }
 
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
@@ -1173,24 +1194,23 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
         };
         let new_qt = compute_jpeg_qt(base, target_qf);
 
-        // Re-quantize all blocks in this component
+        // Re-quantize all blocks in this component — parallel when available.
         let grid = img.dct_grid_mut(comp_idx);
-        let bw = grid.blocks_wide();
-        let bt = grid.blocks_tall();
-        for br in 0..bt {
-            for bc in 0..bw {
-                let block_slice = grid.block(br, bc);
-                let quantized: [i16; 64] = block_slice.try_into().unwrap();
 
-                // IDCT with old QT → pixel values → clamp → DCT with new QT
-                let mut px = pixels::idct_block(&quantized, &old_qt);
-                for p in px.iter_mut() {
-                    *p = p.clamp(0.0, 255.0);
-                }
-                let settled = pixels::dct_block(&px, &new_qt);
-                grid.block_mut(br, bc).copy_from_slice(&settled);
+        let process_block = |chunk: &mut [i16]| {
+            let quantized: [i16; 64] = chunk.try_into().unwrap();
+            let mut px = pixels::idct_block(&quantized, &old_qt);
+            for p in px.iter_mut() {
+                *p = p.clamp(0.0, 255.0);
             }
-        }
+            let settled = pixels::dct_block(&px, &new_qt);
+            chunk.copy_from_slice(&settled);
+        };
+
+        #[cfg(feature = "parallel")]
+        grid.coeffs_mut().par_chunks_mut(64).for_each(process_block);
+        #[cfg(not(feature = "parallel"))]
+        grid.coeffs_mut().chunks_mut(64).for_each(process_block);
 
         new_qts.push((qt_id, old_qt, new_qt));
     }

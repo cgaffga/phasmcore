@@ -78,6 +78,20 @@ impl DctGrid {
         self.blocks_wide * self.blocks_tall
     }
 
+    /// Raw mutable access to all coefficients.
+    ///
+    /// Layout: `blocks_tall * blocks_wide * 64` contiguous i16 values in
+    /// block-raster order. Each 64-element chunk is one 8×8 block.
+    /// Used by parallel processing (Rayon `par_chunks_mut`).
+    pub fn coeffs_mut(&mut self) -> &mut [i16] {
+        &mut self.coeffs
+    }
+
+    /// Raw read-only access to all coefficients.
+    pub fn coeffs(&self) -> &[i16] {
+        &self.coeffs
+    }
+
     fn index(&self, br: usize, bc: usize, i: usize, j: usize) -> usize {
         debug_assert!(br < self.blocks_tall, "block row {br} >= {}", self.blocks_tall);
         debug_assert!(bc < self.blocks_wide, "block col {bc} >= {}", self.blocks_wide);

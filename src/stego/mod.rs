@@ -115,7 +115,17 @@ mod dimension_tests {
 /// Unified decode: auto-detects Ghost or Armor mode from the embedded frame.
 ///
 /// Tries Ghost first, then Armor. Returns the decoded message and quality info.
+///
+/// When the `parallel` feature is enabled, Ghost and Armor decodes run
+/// concurrently via `rayon::join`, roughly halving decode latency on
+/// multi-core devices.
 pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    smart_decode_inner(stego_bytes, passphrase)
+}
+
+/// Serial smart_decode implementation (default path and WASM).
+#[cfg(not(feature = "parallel"))]
+fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     let mut saw_decryption_failed = false;
 
     // Try Ghost first
@@ -153,4 +163,41 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
             }
         }
     }
+}
+
+/// Parallel smart_decode: run Ghost and Armor decodes concurrently via rayon::join.
+///
+/// Both decoders parse the JPEG independently (they each call `JpegImage::from_bytes`
+/// internally), so there is no shared mutable state. The first successful result wins.
+#[cfg(feature = "parallel")]
+fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+    let (ghost_result, armor_result) = rayon::join(
+        || ghost_decode(stego_bytes, passphrase),
+        || armor_decode(stego_bytes, passphrase),
+    );
+
+    // Prefer Ghost if it succeeded.
+    if let Ok(text) = ghost_result {
+        return Ok((text, DecodeQuality::ghost()));
+    }
+
+    // Try Armor.
+    if let Ok((text, quality)) = armor_result {
+        return Ok((text, quality));
+    }
+
+    // Both failed — determine the best error to report.
+    let ghost_err = ghost_result.unwrap_err();
+    let armor_err = armor_result.unwrap_err();
+
+    // If either decoder reached the decryption stage, report DecryptionFailed
+    // (likely wrong passphrase rather than no hidden message).
+    if matches!(ghost_err, StegoError::DecryptionFailed)
+        || matches!(armor_err, StegoError::DecryptionFailed)
+    {
+        return Err(StegoError::DecryptionFailed);
+    }
+
+    // Return the Armor error (usually more informative than Ghost's FrameCorrupted).
+    Err(armor_err)
 }
