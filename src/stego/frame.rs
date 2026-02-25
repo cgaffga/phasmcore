@@ -136,6 +136,75 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     })
 }
 
+/// Compact frame overhead for Fortress empty-passphrase mode.
+/// Salt and nonce are omitted (derived from constants on both sides).
+/// Layout: length(2) + ciphertext(N+16) + crc(4) = 22 + plaintext_len.
+pub const FORTRESS_COMPACT_FRAME_OVERHEAD: usize = 2 + 16 + 4; // 22
+
+/// Build a compact fortress frame (no salt, no nonce embedded).
+///
+/// Frame layout:
+/// ```text
+/// [2 bytes ] plaintext length (BE u16)
+/// [N bytes ] AES-GCM ciphertext (includes 16-byte auth tag)
+/// [4 bytes ] CRC-32 of everything above
+/// ```
+pub fn build_fortress_compact_frame(
+    plaintext_len: u16,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(2 + ciphertext.len() + 4);
+
+    frame.extend_from_slice(&plaintext_len.to_be_bytes());
+    frame.extend_from_slice(ciphertext);
+
+    let crc = crc32fast::hash(&frame);
+    frame.extend_from_slice(&crc.to_be_bytes());
+
+    frame
+}
+
+/// Parse a compact fortress frame, verifying the CRC.
+///
+/// Returns a `ParsedFrame` with `salt` and `nonce` set to the known Fortress
+/// empty-passphrase constants (the caller should use them for decryption).
+pub fn parse_fortress_compact_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
+    use crate::stego::crypto::{FORTRESS_EMPTY_SALT, FORTRESS_EMPTY_NONCE};
+
+    if data.len() < 2 {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
+    let ciphertext_len = plaintext_len as usize + 16;
+    let total_frame_len = 2 + ciphertext_len + 4;
+
+    if total_frame_len > MAX_FRAME_BYTES {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    if data.len() < total_frame_len {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let payload = &data[..total_frame_len - 4];
+    let crc_bytes = &data[total_frame_len - 4..total_frame_len];
+    let stored_crc = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+    let computed_crc = crc32fast::hash(payload);
+    if stored_crc != computed_crc {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let ciphertext = payload[2..].to_vec();
+
+    Ok(ParsedFrame {
+        plaintext_len,
+        salt: FORTRESS_EMPTY_SALT,
+        nonce: FORTRESS_EMPTY_NONCE,
+        ciphertext,
+    })
+}
+
 /// Convert bytes to a bit vector (MSB first within each byte).
 pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
     let mut bits = Vec::with_capacity(bytes.len() * 8);
@@ -268,5 +337,77 @@ mod tests {
         assert_eq!(bytes.len(), 1);
         // 10110_000 = 0xB0
         assert_eq!(bytes[0], 0xB0);
+    }
+
+    // --- Compact fortress frame tests ---
+
+    #[test]
+    fn compact_frame_build_parse_roundtrip() {
+        // plaintext_len=4, ciphertext=4+16=20 bytes (AES-GCM tag).
+        let ciphertext = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+                              0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                              0x77, 0x88, 0x99, 0x00, 0xAA, 0xBB,
+                              0xCC, 0xDD];
+        let frame = build_fortress_compact_frame(4, &ciphertext);
+
+        // Total size: 2 + 20 + 4 = 26
+        assert_eq!(frame.len(), 2 + 20 + 4);
+
+        let parsed = parse_fortress_compact_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 4);
+        assert_eq!(parsed.ciphertext, ciphertext);
+        // Salt and nonce should be the fixed constants
+        assert_eq!(parsed.salt, crate::stego::crypto::FORTRESS_EMPTY_SALT);
+        assert_eq!(parsed.nonce, crate::stego::crypto::FORTRESS_EMPTY_NONCE);
+    }
+
+    #[test]
+    fn compact_frame_smaller_than_full() {
+        // Same plaintext_len=4, ciphertext=20 bytes
+        let salt = [1u8; SALT_LEN];
+        let nonce = [2u8; NONCE_LEN];
+        let ciphertext = vec![0u8; 20];
+
+        let full_frame = build_frame(4, &salt, &nonce, &ciphertext);
+        let compact_frame = build_fortress_compact_frame(4, &ciphertext);
+
+        // Full: 2 + 16 + 12 + 20 + 4 = 54
+        // Compact: 2 + 20 + 4 = 26
+        assert_eq!(full_frame.len() - compact_frame.len(), SALT_LEN + NONCE_LEN);
+        assert_eq!(full_frame.len() - compact_frame.len(), 28);
+    }
+
+    #[test]
+    fn compact_frame_corrupted_crc_detected() {
+        let ciphertext = vec![0u8; 20];
+        let mut frame = build_fortress_compact_frame(4, &ciphertext);
+        let len = frame.len();
+        frame[len - 1] ^= 0xFF;
+        assert!(matches!(parse_fortress_compact_frame(&frame), Err(StegoError::FrameCorrupted)));
+    }
+
+    #[test]
+    fn compact_frame_truncated_rejected() {
+        assert!(matches!(parse_fortress_compact_frame(&[0x00]), Err(StegoError::FrameCorrupted)));
+        assert!(matches!(parse_fortress_compact_frame(&[]), Err(StegoError::FrameCorrupted)));
+    }
+
+    #[test]
+    fn compact_frame_zero_length() {
+        // plaintext_len=0, ciphertext=0+16=16 bytes (auth tag only)
+        let ciphertext = vec![0u8; 16];
+        let frame = build_fortress_compact_frame(0, &ciphertext);
+        let parsed = parse_fortress_compact_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 0);
+        assert_eq!(parsed.ciphertext.len(), 16);
+    }
+
+    #[test]
+    fn compact_frame_overhead_is_28_less() {
+        assert_eq!(
+            FRAME_OVERHEAD - FORTRESS_COMPACT_FRAME_OVERHEAD,
+            28,
+            "Compact frame saves exactly 28 bytes (salt + nonce)"
+        );
     }
 }

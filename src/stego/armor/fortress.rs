@@ -21,25 +21,19 @@
 //! 7-copy majority voting (8 bits x 7 copies = 56 blocks). This allows fast
 //! detection on decode: if the magic doesn't match, fall through to STDM.
 //!
-//! # Watson Perceptual Masking (magic 0xF6)
+//! # Adaptive Watson Perceptual Masking
 //!
-//! Watson-inspired adaptive QIM uses AC energy per block to scale the QIM step.
-//! Two strategies are available, selected by `WATSON_CONTINUOUS`:
+//! The QIM step and Watson masking range adapt continuously based on the
+//! repetition factor (r), using linear interpolation between:
+//!   r = 15 (minimum): step=12, Watson [0.9, 1.1] — max robustness
+//!   r = 61 (cap):     step=6.5, Watson [0.62, 1.26] — max quality
 //!
-//! **Option A — Discrete tiers** (fallback):
-//! - Tier 0 (factor 0.3): smooth blocks — reduced step for minimal artifacts
-//! - Tier 1 (factor 0.7): lightly textured — smaller QIM step
-//! - Tier 2 (factor 1.0): average texture — base QIM step
-//! - Tier 3 (factor 1.5): heavy texture — larger QIM step (hidden by texture)
+//! Watson factors are computed from a continuous piecewise-linear base curve
+//! (AC energy ratio → [0.3, 1.5]), then remapped to the adaptive range.
+//! Uses only basic IEEE 754 arithmetic — deterministic on all platforms.
 //!
-//! **Option C — Continuous piecewise-linear** (default):
-//! Smoothly interpolates the factor from 0.3 (smooth) to 1.5 (heavy texture)
-//! using only basic IEEE 754 arithmetic — deterministic on all platforms.
-//!
-//! ALL blocks are used for embedding (no skip tier). This guarantees that the
-//! payload block list is identical on encode and decode, even after JPEG
-//! recompression changes AC coefficients. Masking only affects the per-block
-//! QIM step size for visual quality adaptation.
+//! ALL blocks are used for embedding (no skip tier). On decode, r is brute-forced
+//! per candidate, so the adaptive step is implicitly known.
 
 use crate::jpeg::dct::DctGrid;
 use crate::jpeg::JpegImage;
@@ -56,19 +50,15 @@ use rand_chacha::ChaCha20Rng;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// QIM step size in pixel-level units.
-/// Block averages shift <2 levels through QF70+ recompression, so step=12 gives
-/// a 4-level margin on each side of the decision boundary — improved robustness
-/// for pre-settled images (QF70 encode → QF75 WhatsApp recompression).
-const QIM_STEP: f64 = 12.0;
+/// Fixed QIM step for the magic header (always step=12, majority-voted 7x).
+const HEADER_QIM_STEP: f64 = 12.0;
 
 /// Minimum repetition factor for Fortress encode.
-/// Higher minimum = earlier switchover to STDM for longer messages = better quality.
-/// At r=7, capacity is lower but robustness is significantly improved.
-const FORTRESS_MIN_R: usize = 7;
+/// r≥15 ensures sufficient majority-voting margin at the BER levels observed
+/// in WhatsApp recompression (~19% at step=12 with narrow Watson).
+const FORTRESS_MIN_R: usize = 15;
 
 /// Magic byte embedded in the fortress header for fast detection.
-/// Uses Watson-adaptive QIM with per-block step sizes based on AC energy.
 const FORTRESS_MAGIC: u8 = 0xF6;
 
 /// Number of blocks used for the magic header: 1 byte x 8 bits x 7 copies.
@@ -77,115 +67,56 @@ const FORTRESS_HEADER_BLOCKS: usize = 56;
 /// Number of majority-vote copies of the magic byte.
 const FORTRESS_HEADER_COPIES: usize = 7;
 
-// --- Watson tier constants ---
+// --- Adaptive QIM parameters ---
+//
+// The base QIM step and Watson masking range adapt based on the repetition
+// factor (r). Short messages have high r and can tolerate more BER, so we
+// use a smaller step for better image quality. Longer messages need lower
+// BER, so we use a larger step and narrower Watson range.
+//
+// On decode, r is brute-forced per candidate, so the step is implicitly known.
 
-/// Blocks with AC energy ratio below this are tier 0 (smooth — base step).
-/// Previously these were skipped, but skipping causes catastrophic payload
-/// misalignment when recompression changes AC energies across QF levels.
-/// Now all blocks are used; tier 0 simply gets the base step factor (1.0).
-const WATSON_SKIP_RATIO: f64 = 0.01;
+/// Adaptive fortress parameters for a given repetition factor.
+struct AdaptiveParams {
+    base_step: f64,
+    watson_lo: f64,
+    watson_hi: f64,
+}
 
-/// Blocks with AC energy ratio below this (but >= SKIP) are tier 1 (smooth).
-const WATSON_LOW_RATIO: f64 = 0.35;
+/// Determine adaptive QIM step and Watson range from repetition factor.
+///
+/// Continuous linear interpolation between:
+///   r = 15 (minimum): step=12, Watson [0.9, 1.1] — max robustness
+///   r = 61 (cap):     step=6.5, Watson [0.62, 1.26] — max quality
+///
+/// R_MAX=61 is the "elbow": smooth shift ≈ 2.0px (perceptual threshold),
+/// BER stays at floor 17% (diff=2 blocks just survive), and majority voting
+/// at r=61 handles 17% BER with error rate ≈ 10⁻⁸. Beyond 61, quality
+/// gains are imperceptible but diff=2 blocks start flipping.
+fn adaptive_params(r: usize) -> AdaptiveParams {
+    const R_MIN: f64 = 15.0;
+    const R_MAX: f64 = 61.0;
+    // Clamp r into [R_MIN, R_MAX], compute t in [0, 1]
+    let r_clamped = (r as f64).max(R_MIN).min(R_MAX);
+    let t = (r_clamped - R_MIN) / (R_MAX - R_MIN);
 
-/// Blocks with AC energy ratio >= this are tier 3 (heavy texture).
-const WATSON_HIGH_RATIO: f64 = 2.0;
-
-/// QIM step factor per tier. ALL tiers are used for embedding (no skip).
-/// Tier 0 uses a reduced step (0.3) — smooth blocks contribute with lower
-/// confidence but cause minimal visible artifacts (max ~1.8 pixel levels vs
-/// 6.0 at 1.0). The soft-LLR decode naturally weights these lower-confidence
-/// bits less. This gives 3.6x margin over WhatsApp recompression shifts.
-const WATSON_TIER_FACTORS: [f64; 4] = [0.3, 0.7, 1.0, 1.5];
+    AdaptiveParams {
+        base_step: 12.0 + t * (6.5 - 12.0),       // 12 → 6.5
+        watson_lo: 0.9 + t * (0.62 - 0.9),          // 0.9 → 0.62
+        watson_hi: 1.1 + t * (1.26 - 1.1),          // 1.1 → 1.26
+    }
+}
 
 // --- Watson perceptual masking ---
+//
+// Continuous piecewise-linear mapping from AC energy ratio to a base factor
+// in [0.3, 1.5], then remapped to the adaptive [watson_lo, watson_hi] range.
+// Uses only basic IEEE 754 arithmetic — deterministic on all platforms.
 
-/// Watson tier assignment for all blocks in the Y-channel DctGrid.
-struct WatsonTiers {
-    /// Per-block tier (0/1/2/3 = embed with corresponding step factor).
-    /// All tiers are used for embedding — no blocks are skipped.
-    tiers: Vec<u8>,
-}
-
-/// Compute Watson tiers from AC energy of each Y-channel 8x8 block.
-///
-/// AC energy = sum of squared non-DC coefficients. The ratio of each block's
-/// AC energy to the median AC energy determines the tier. Only f64 division
-/// is used (no `powf`, no `sqrt`) to ensure cross-platform determinism.
-fn compute_watson_tiers(grid: &DctGrid) -> WatsonTiers {
-    let blocks_wide = grid.blocks_wide();
-    let blocks_tall = grid.blocks_tall();
-    let total_blocks = blocks_wide * blocks_tall;
-
-    // 1. Compute AC energy per block.
-    let mut ac_energies: Vec<f64> = Vec::with_capacity(total_blocks);
-    for br in 0..blocks_tall {
-        for bc in 0..blocks_wide {
-            let block = grid.block(br, bc);
-            // Sum of squares of AC coefficients with |c| >= 2.
-            // Ignoring |c| <= 1 makes energy robust to recompression:
-            // small coefficients are the first to be zeroed by re-quantization,
-            // but coefficients with |c| >= 2 are 99.99%+ stable.
-            let mut energy: f64 = 0.0;
-            for k in 1..64 {
-                let c = block[k];
-                if c.abs() >= 2 {
-                    energy += (c as f64) * (c as f64);
-                }
-            }
-            ac_energies.push(energy);
-        }
-    }
-
-    // 2. Sort a clone to find median (avoid modifying original order).
-    let mut sorted = ac_energies.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = if total_blocks == 0 {
-        1.0
-    } else {
-        sorted[total_blocks / 2].max(1.0)
-    };
-
-    // 3. Assign tier based on ratio = energy / median.
-    //    All tiers (including 0) are used for embedding — no blocks are skipped.
-    //    Tiers only affect the QIM step size for visual quality adaptation.
-    let mut tiers = Vec::with_capacity(total_blocks);
-    for &energy in &ac_energies {
-        let ratio = energy / median;
-        let tier = if ratio < WATSON_SKIP_RATIO {
-            0u8
-        } else if ratio < WATSON_LOW_RATIO {
-            1u8
-        } else if ratio < WATSON_HIGH_RATIO {
-            2u8
-        } else {
-            3u8
-        };
-        tiers.push(tier);
-    }
-
-    WatsonTiers { tiers }
-}
-
-/// Get the QIM step factor for a given Watson tier.
-fn watson_step_factor(tier: u8) -> f64 {
-    WATSON_TIER_FACTORS[tier as usize]
-}
-
-/// When true, use continuous Watson factors (Option C).
-/// When false, use discrete Watson tiers (Option A fallback).
-const WATSON_CONTINUOUS: bool = true;
-
-/// Continuous Watson factor: piecewise-linear mapping from AC energy ratio
-/// to QIM step factor. Uses only basic arithmetic — deterministic on all
-/// platforms including WASM.
-///
-/// Anchor points (matching the discrete tier boundaries):
-///   ratio <= 0.01 → 0.3 (floor: very smooth)
-///   ratio  = 0.35 → 0.7 (light texture)
-///   ratio  = 2.0  → 1.0 (average texture)
-///   ratio >= 4.0  → 1.5 (ceiling: heavy texture)
-fn watson_continuous_factor(ratio: f64) -> f64 {
+/// Base Watson curve: maps AC energy ratio to a factor in [0.3, 1.5].
+/// This defines the SHAPE of the adaptation; the output range is then
+/// remapped to the adaptive [watson_lo, watson_hi] range via `adaptive_params`.
+fn watson_base_factor(ratio: f64) -> f64 {
     const R0: f64 = 0.01;
     const R1: f64 = 0.35;
     const R2: f64 = 2.0;
@@ -208,37 +139,25 @@ fn watson_continuous_factor(ratio: f64) -> f64 {
     }
 }
 
-/// Continuous Watson factor assignment for all blocks.
-struct WatsonFactors {
-    factors: Vec<f64>,
+/// Remap a base Watson factor from [0.3, 1.5] to a custom [lo, hi] range.
+fn remap_watson(base_factor: f64, lo: f64, hi: f64) -> f64 {
+    let t = (base_factor - 0.3) / (1.5 - 0.3);
+    lo + t * (hi - lo)
 }
 
-/// Watson masking data — either discrete (Option A) or continuous (Option C).
-enum WatsonMasking {
-    Tiers(WatsonTiers),
-    Factors(WatsonFactors),
+/// Pre-computed energy ratios for all blocks. Computed once per image,
+/// reused across adaptive candidates on decode.
+struct EnergyRatios {
+    ratios: Vec<f64>,
 }
 
-impl WatsonMasking {
-    fn step_factor(&self, block_idx: usize) -> f64 {
-        match self {
-            WatsonMasking::Tiers(wt) => watson_step_factor(wt.tiers[block_idx]),
-            WatsonMasking::Factors(wf) => wf.factors[block_idx],
-        }
-    }
-}
-
-/// Compute continuous Watson factors from AC energy of each Y-channel 8x8 block.
-///
-/// Same AC energy + median logic as `compute_watson_tiers()`, but maps each
-/// block's energy ratio through `watson_continuous_factor()` for smooth
-/// step-size adaptation.
-fn compute_watson_factors(grid: &DctGrid) -> WatsonFactors {
+/// Compute per-block AC energy ratios (energy / median).
+/// Only counts |c| >= 2 AC coefficients for recompression stability.
+fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     let blocks_wide = grid.blocks_wide();
     let blocks_tall = grid.blocks_tall();
     let total_blocks = blocks_wide * blocks_tall;
 
-    // 1. Compute AC energy per block — embarrassingly parallel.
     let block_indices: Vec<usize> = (0..total_blocks).collect();
 
     let compute_energy = |&block_idx: &usize| -> f64 {
@@ -260,7 +179,6 @@ fn compute_watson_factors(grid: &DctGrid) -> WatsonFactors {
     #[cfg(not(feature = "parallel"))]
     let ac_energies: Vec<f64> = block_indices.iter().map(compute_energy).collect();
 
-    // 2. Median (parallel sort when available).
     let mut sorted = ac_energies.clone();
     #[cfg(feature = "parallel")]
     sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -273,29 +191,17 @@ fn compute_watson_factors(grid: &DctGrid) -> WatsonFactors {
         sorted[total_blocks / 2].max(1.0)
     };
 
-    // 3. Continuous factor per block — parallel map.
-    #[cfg(feature = "parallel")]
-    let factors = ac_energies
-        .par_iter()
-        .map(|&energy| watson_continuous_factor(energy / median))
-        .collect();
-    #[cfg(not(feature = "parallel"))]
-    let factors = ac_energies
-        .iter()
-        .map(|&energy| watson_continuous_factor(energy / median))
-        .collect();
-
-    WatsonFactors { factors }
+    let ratios = ac_energies.iter().map(|&e| e / median).collect();
+    EnergyRatios { ratios }
 }
 
-/// Compute Watson masking: dispatches to tiers or continuous factors
-/// based on `WATSON_CONTINUOUS`.
-fn compute_watson_masking(grid: &DctGrid) -> WatsonMasking {
-    if WATSON_CONTINUOUS {
-        WatsonMasking::Factors(compute_watson_factors(grid))
-    } else {
-        WatsonMasking::Tiers(compute_watson_tiers(grid))
-    }
+/// Compute Watson step factors from energy ratios + adaptive range.
+fn watson_factors(ratios: &EnergyRatios, watson_lo: f64, watson_hi: f64) -> Vec<f64> {
+    ratios
+        .ratios
+        .iter()
+        .map(|&r| remap_watson(watson_base_factor(r), watson_lo, watson_hi))
+        .collect()
 }
 
 // --- BA-QIM core functions ---
@@ -360,7 +266,19 @@ fn permute_blocks(total_blocks: usize, seed: &[u8; 32]) -> Vec<usize> {
 /// Returns the max frame_bytes (before RS encoding) that fits in the available
 /// blocks, accounting for header, RS parity, and repetition coding (r >= MIN_R).
 /// All blocks are used for payload (no Watson skip filtering).
+///
+/// Uses full frame overhead (50 bytes) for capacity calculation.
 pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
+    fortress_max_frame_bytes_ext(img, false)
+}
+
+/// Maximum frame bytes with optional compact frame support.
+///
+/// When `compact` is true, uses the smaller compact frame overhead (22 bytes)
+/// for Fortress empty-passphrase mode, enabling larger messages.
+/// The `compact` flag is used by `fortress_capacity_compact` to know which
+/// overhead to subtract; the binary search itself is format-agnostic.
+pub fn fortress_max_frame_bytes_ext(img: &JpegImage, _compact: bool) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let total_blocks = grid.blocks_wide() * grid.blocks_tall();
 
@@ -409,6 +327,9 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
 }
 
 /// Estimate fortress plaintext capacity (max message bytes).
+///
+/// Uses full frame overhead (50 bytes). For compact frame capacity, use
+/// `fortress_capacity_compact`.
 pub fn fortress_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let max_frame = fortress_max_frame_bytes(img)?;
     if max_frame <= frame::FRAME_OVERHEAD {
@@ -417,15 +338,27 @@ pub fn fortress_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     Ok(max_frame - frame::FRAME_OVERHEAD)
 }
 
+/// Estimate fortress plaintext capacity for compact frame mode (empty passphrase).
+///
+/// Uses the smaller compact frame overhead (22 bytes instead of 50), giving
+/// 28 more bytes of message capacity.
+pub fn fortress_capacity_compact(img: &JpegImage) -> Result<usize, StegoError> {
+    let max_frame = fortress_max_frame_bytes_ext(img, true)?;
+    if max_frame <= frame::FORTRESS_COMPACT_FRAME_OVERHEAD {
+        return Ok(0);
+    }
+    Ok(max_frame - frame::FORTRESS_COMPACT_FRAME_OVERHEAD)
+}
+
 // --- Fortress encode ---
 
 /// Encode a payload frame into an image using BA-QIM on DC block averages
-/// with Watson perceptual masking.
+/// with adaptive Watson perceptual masking.
 ///
 /// The caller must have already built the frame_bytes (encrypted + framed).
-/// This function embeds the Watson magic header and the RS+repetition encoded
-/// payload into permuted, Watson-filtered Y-channel block DCs with per-block
-/// adaptive QIM step sizes.
+/// This function embeds the magic header and the RS+repetition encoded
+/// payload into permuted Y-channel block DCs with per-block adaptive QIM
+/// step sizes (Watson energy-based scaling).
 pub fn fortress_encode(
     img: &mut JpegImage,
     frame_bytes: &[u8],
@@ -446,17 +379,10 @@ pub fn fortress_encode(
         return Err(StegoError::ImageTooSmall);
     }
 
-    // Compute Watson masking from AC energy (before any DC modifications).
-    // All blocks are used for embedding — masking only affects step size.
-    let watson = compute_watson_masking(grid);
-
     // Derive fortress structural key for block permutation.
     let fort_key = crypto::derive_fortress_structural_key(passphrase);
     let perm = permute_blocks(total_blocks, &fort_key);
 
-    // Payload block list: ALL permuted blocks after header (no filtering).
-    // This guarantees the same block list on encode and decode regardless
-    // of AC energy changes from recompression.
     let header_perm = &perm[..FORTRESS_HEADER_BLOCKS];
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
     let payload_blocks = remaining_perm.len();
@@ -483,12 +409,17 @@ pub fn fortress_encode(
         return Err(StegoError::MessageTooLarge);
     }
 
+    // Determine adaptive QIM step and Watson range based on repetition factor.
+    let params = adaptive_params(r);
+    let energy = compute_energy_ratios(grid);
+    let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
+
     let rs_bit_count_aligned = payload_blocks / r;
     let mut rs_bits_padded = rs_bits;
     rs_bits_padded.resize(rs_bit_count_aligned, 0);
     let (rep_bits, _) = repetition::repetition_encode(&rs_bits_padded, payload_blocks);
 
-    // Build header bits: 7 copies of magic byte
+    // Build header bits: 7 copies of magic byte.
     let mut header_bits = Vec::with_capacity(FORTRESS_HEADER_BLOCKS);
     for _ in 0..FORTRESS_HEADER_COPIES {
         for bp in (0..8).rev() {
@@ -496,25 +427,24 @@ pub fn fortress_encode(
         }
     }
 
-    // Embed header using fixed QIM_STEP on the first 56 permuted blocks
-    // (unfiltered permutation, same as legacy).
+    // Embed header using fixed step on the first 56 permuted blocks.
     let grid_mut = img.dct_grid_mut(0);
     for (bit_idx, &block_idx) in header_perm.iter().enumerate() {
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
         let dc = grid_mut.get(br, bc, 0, 0);
         let avg = dc_to_avg(dc, qt_dc);
-        let new_avg = qim_embed_avg(avg, QIM_STEP, header_bits[bit_idx]);
+        let new_avg = qim_embed_avg(avg, HEADER_QIM_STEP, header_bits[bit_idx]);
         let new_dc = avg_to_dc(new_avg, qt_dc);
         grid_mut.set(br, bc, 0, 0, new_dc);
     }
 
-    // Embed payload using Watson-adaptive per-block QIM step.
+    // Embed payload using adaptive per-block QIM step.
     for (payload_idx, &block_idx) in remaining_perm.iter().enumerate() {
         if payload_idx >= rep_bits.len() {
             break;
         }
-        let step = QIM_STEP * watson.step_factor(block_idx);
+        let step = params.base_step * factors[block_idx];
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
         let dc = grid_mut.get(br, bc, 0, 0);
@@ -556,68 +486,67 @@ pub fn fortress_decode(
     let fort_key = crypto::derive_fortress_structural_key(passphrase);
     let perm = permute_blocks(total_blocks, &fort_key);
 
-    // Extract header LLRs with fixed QIM_STEP.
+    // Extract header LLRs with fixed step.
     let mut header_llrs = Vec::with_capacity(FORTRESS_HEADER_BLOCKS);
     for &block_idx in &perm[..FORTRESS_HEADER_BLOCKS] {
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
         let dc = grid.get(br, bc, 0, 0);
         let avg = dc_to_avg(dc, qt_dc);
-        header_llrs.push(qim_extract_soft(avg, QIM_STEP));
+        header_llrs.push(qim_extract_soft(avg, HEADER_QIM_STEP));
     }
 
-    // Check magic header: majority vote across 7 copies
     let magic = extract_magic_byte(&header_llrs);
-
     if magic != FORTRESS_MAGIC {
-        // Not a fortress image — fall through to STDM.
         return Err(StegoError::FrameCorrupted);
     }
 
-    // Watson adaptive step sizes: compute masking for per-block step factors.
-    // ALL blocks are used — no filtering. This guarantees alignment with encoder.
-    let watson = compute_watson_masking(grid);
+    // Pre-compute energy ratios once for reuse across adaptive candidates.
+    let energy = compute_energy_ratios(grid);
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
+    let payload_blocks = remaining_perm.len();
 
-    // Extract per-block LLRs from ALL payload blocks (no skip filtering).
-    let mut payload_llrs = Vec::with_capacity(remaining_perm.len());
-    for &block_idx in remaining_perm {
-        let step = QIM_STEP * watson.step_factor(block_idx);
-        let br = block_idx / blocks_wide;
-        let bc = block_idx % blocks_wide;
-        let dc = grid.get(br, bc, 0, 0);
-        let avg = dc_to_avg(dc, qt_dc);
-        payload_llrs.push(qim_extract_soft(avg, step));
-    }
+    // Pre-compute block averages (read-only, shared across candidates).
+    let block_avgs: Vec<f64> = remaining_perm
+        .iter()
+        .map(|&block_idx| {
+            let br = block_idx / blocks_wide;
+            let bc = block_idx % blocks_wide;
+            dc_to_avg(grid.get(br, bc, 0, 0), qt_dc)
+        })
+        .collect();
 
-    let payload_blocks = payload_llrs.len();
-    decode_fortress_payload(&payload_llrs, payload_blocks, passphrase)
-}
+    // Determine whether to use compact frame format (empty passphrase).
+    let use_compact = passphrase.is_empty();
 
-/// Shared payload decode logic for both legacy and Watson fortress modes.
-///
-/// Brute-force searches over (r, parity) combinations to find the correct
-/// RS decode parameters, then decrypts and returns the plaintext.
-fn decode_fortress_payload(
-    payload_llrs: &[f64],
-    payload_blocks: usize,
-    passphrase: &str,
-) -> Result<(String, super::pipeline::DecodeQuality), StegoError> {
-    // Reference LLR for pristine QIM embedding: step / 2.
-    let reference_llr = QIM_STEP / 2.0;
-
-    // Build a flat list of (parity, r) candidates in priority order
-    // (smallest parity first, then by r within each parity tier).
+    // Build all (parity, r) candidates.
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     for &parity in &ecc::PARITY_TIERS {
-        let candidate_rs = super::pipeline::compute_candidate_rs(payload_blocks, parity);
+        let candidate_rs = if use_compact {
+            super::pipeline::compute_candidate_rs_compact(payload_blocks, parity)
+        } else {
+            super::pipeline::compute_candidate_rs(payload_blocks, parity)
+        };
         for r in candidate_rs {
             candidates.push((parity, r));
         }
     }
 
-    // Try each candidate — parallel when available, sequential otherwise.
+    // Try each candidate with per-r Watson factors (continuous adaptive).
     let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(String, super::pipeline::DecodeQuality)> {
+        let params = adaptive_params(r);
+        let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
+        let reference_llr = params.base_step / 2.0;
+
+        let payload_llrs: Vec<f64> = remaining_perm
+            .iter()
+            .enumerate()
+            .map(|(i, &block_idx)| {
+                let step = params.base_step * factors[block_idx];
+                qim_extract_soft(block_avgs[i], step)
+            })
+            .collect();
+
         let rs_bit_count = payload_blocks / r;
         if rs_bit_count == 0 {
             return None;
@@ -631,9 +560,19 @@ fn decode_fortress_payload(
             repetition::repetition_decode_soft_with_quality(&payload_llrs[..used_llrs], rs_bit_count);
         let voted_bytes = frame::bits_to_bytes(&voted_bits);
 
-        let (decoded_frame, rs_stats) =
-            super::pipeline::try_rs_decode_frame_with_parity(&voted_bytes, parity)?;
-        let parsed = frame::parse_frame(&decoded_frame).ok()?;
+        // Use compact or full frame RS decode + parse based on passphrase.
+        let (decoded_frame, rs_stats) = if use_compact {
+            super::pipeline::try_rs_decode_compact_frame_with_parity(&voted_bytes, parity)?
+        } else {
+            super::pipeline::try_rs_decode_frame_with_parity(&voted_bytes, parity)?
+        };
+
+        let parsed = if use_compact {
+            frame::parse_fortress_compact_frame(&decoded_frame).ok()?
+        } else {
+            frame::parse_frame(&decoded_frame).ok()?
+        };
+
         let plaintext = crypto::decrypt(
             &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
         ).ok()?;
@@ -652,13 +591,15 @@ fn decode_fortress_payload(
         Some((text.to_string(), q))
     };
 
-    // find_map_first preserves priority ordering (smallest parity wins).
     #[cfg(feature = "parallel")]
     let result = candidates.par_iter().find_map_first(try_candidate);
     #[cfg(not(feature = "parallel"))]
     let result = candidates.iter().find_map(try_candidate);
 
-    result.ok_or(StegoError::FrameCorrupted)
+    match result {
+        Some(result) => Ok(result),
+        None => Err(StegoError::FrameCorrupted),
+    }
 }
 
 /// Extract magic byte from header LLRs using soft majority voting.
@@ -689,8 +630,8 @@ mod tests {
     fn qim_embed_extract_roundtrip() {
         for avg in [0.0, 50.0, 100.0, 200.0, -50.0, 127.5] {
             for bit in [0u8, 1] {
-                let embedded = qim_embed_avg(avg, QIM_STEP, bit);
-                let llr = qim_extract_soft(embedded, QIM_STEP);
+                let embedded = qim_embed_avg(avg, HEADER_QIM_STEP, bit);
+                let llr = qim_extract_soft(embedded, HEADER_QIM_STEP);
                 let extracted_bit = if llr >= 0.0 { 0u8 } else { 1u8 };
                 assert_eq!(
                     extracted_bit, bit,
@@ -704,8 +645,8 @@ mod tests {
     fn qim_soft_llr_sign_matches_hard() {
         for avg in [10.0, 50.0, 128.0, 250.0] {
             for bit in [0u8, 1] {
-                let embedded = qim_embed_avg(avg, QIM_STEP, bit);
-                let llr = qim_extract_soft(embedded, QIM_STEP);
+                let embedded = qim_embed_avg(avg, HEADER_QIM_STEP, bit);
+                let llr = qim_extract_soft(embedded, HEADER_QIM_STEP);
                 // Positive LLR = bit 0, negative = bit 1
                 if bit == 0 {
                     assert!(llr >= 0.0, "Expected positive LLR for bit 0, got {llr}");
@@ -780,8 +721,8 @@ mod tests {
     fn fortress_capacity_reasonable() {
         // A 1280x720 image has 160*90 = 14400 blocks
         // Payload blocks = 14400 - 56 = 14344
-        // With r=3, rs_bit_count = ~4781 bits = ~597 bytes
-        // With parity=64, frame_bytes up to ~533
+        // With r=15, rs_bit_count = ~956 bits = ~119 bytes
+        // With parity=64, frame_bytes up to ~55
         // Plaintext = frame_bytes - 50 overhead
         let total_blocks = 14400usize;
         let payload_blocks = total_blocks - FORTRESS_HEADER_BLOCKS;
@@ -835,8 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn watson_tiers_smooth_vs_textured() {
-        // Build a 4x1 grid: 2 smooth blocks, 1 medium, 1 textured.
+    fn watson_energy_smooth_vs_textured() {
         let blocks = vec![
             smooth_block(),
             smooth_block(),
@@ -844,30 +784,23 @@ mod tests {
             textured_block(),
         ];
         let grid = make_grid(4, 1, &blocks);
-        let watson = compute_watson_tiers(&grid);
+        let energy = compute_energy_ratios(&grid);
 
-        assert_eq!(watson.tiers.len(), 4);
-
-        // Smooth blocks (AC energy = 0) should be tier 0 (base step).
-        assert_eq!(watson.tiers[0], 0, "Smooth block should be tier 0");
-        assert_eq!(watson.tiers[1], 0, "Smooth block should be tier 0");
-
-        // Textured block should be tier 2 or 3 (high energy).
+        assert_eq!(energy.ratios.len(), 4);
+        assert_eq!(energy.ratios[0], 0.0, "Smooth block should have zero ratio");
+        assert_eq!(energy.ratios[1], 0.0, "Smooth block should have zero ratio");
         assert!(
-            watson.tiers[3] >= 2,
-            "Textured block should be tier 2 or 3, got {}",
-            watson.tiers[3]
+            energy.ratios[3] > energy.ratios[2],
+            "Textured block should have higher ratio than medium"
         );
     }
 
     #[test]
-    fn watson_tier_deterministic() {
-        // Same grid should always produce the same tiers.
+    fn watson_energy_deterministic() {
         let blocks: Vec<[i16; 64]> = (0..16)
             .map(|i| {
                 let mut b = [0i16; 64];
                 b[0] = 100;
-                // Vary AC energy across blocks
                 for k in 1..(1 + (i % 10) + 1).min(64) {
                     b[k] = (i as i16 + 1) * 3;
                 }
@@ -876,17 +809,13 @@ mod tests {
             .collect();
 
         let grid = make_grid(4, 4, &blocks);
-        let watson_a = compute_watson_tiers(&grid);
-        let watson_b = compute_watson_tiers(&grid);
-
-        assert_eq!(watson_a.tiers, watson_b.tiers, "Watson tiers must be deterministic");
+        let a = compute_energy_ratios(&grid);
+        let b = compute_energy_ratios(&grid);
+        assert_eq!(a.ratios, b.ratios, "Energy ratios must be deterministic");
     }
 
     #[test]
     fn watson_ac_energy_invariant() {
-        // Verify that AC energy (|c| >= 2 only) is unchanged after DC modification.
-        // This is the key invariant that makes Watson tiers identical on
-        // encode and decode: Fortress only modifies DC (index 0), not AC.
         let mut block = textured_block();
         let original_ac_energy: f64 = block[1..64]
             .iter()
@@ -894,8 +823,7 @@ mod tests {
             .map(|&c| (c as f64) * (c as f64))
             .sum();
 
-        // Modify DC (simulating QIM embedding)
-        block[0] = 42;
+        block[0] = 42; // modify DC only
         let modified_ac_energy: f64 = block[1..64]
             .iter()
             .filter(|&&c| c.abs() >= 2)
@@ -909,43 +837,31 @@ mod tests {
     }
 
     #[test]
-    fn watson_encode_decode_roundtrip() {
-        // Full encode/decode roundtrip with Watson magic.
+    fn adaptive_fortress_encode_decode_roundtrip() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        // Use a larger JPEG from the test vectors (640x480 is too small for
-        // QIM_STEP=12, FORTRESS_MIN_R=7).
         let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
             .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
 
-        let passphrase = "test-watson-pass";
-
-        // Check fortress capacity and pick a message that fits.
+        let passphrase = "test-adaptive-pass";
         let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
         let fort_cap = fortress_capacity(&img).unwrap();
-        assert!(
-            fort_cap >= 1,
-            "Fortress capacity ({fort_cap}) must be at least 1 byte for 1200x1600 photo"
-        );
+        assert!(fort_cap >= 1, "Fortress capacity ({fort_cap}) must be >= 1");
 
-        // Use the shortest meaningful message that fits.
         let message = if fort_cap >= 4 { "Hi!!" } else { "Hi" };
 
-        // Encode
         let stego_bytes = armor_encode(&test_jpeg, message, passphrase)
-            .expect("Watson fortress encode should succeed");
+            .expect("Adaptive fortress encode should succeed");
 
-        // Decode
         let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
-            .expect("Watson fortress decode should succeed");
+            .expect("Adaptive fortress decode should succeed");
 
         assert_eq!(decoded_msg, message, "Decoded message must match original");
-        assert!(quality.fortress_used, "Should use fortress mode for short message");
+        assert!(quality.fortress_used, "Should use fortress mode");
     }
 
     #[test]
     fn watson_magic_extraction() {
-        // Verify magic byte extraction works correctly.
         let mut header_llrs = Vec::with_capacity(56);
         for _ in 0..FORTRESS_HEADER_COPIES {
             for bp in (0..8).rev() {
@@ -959,142 +875,137 @@ mod tests {
     }
 
     #[test]
-    fn watson_step_factors_correct() {
-        // Verify the step factor lookup works for all tiers.
-        assert_eq!(watson_step_factor(0), 0.3);
-        assert_eq!(watson_step_factor(1), 0.7);
-        assert_eq!(watson_step_factor(2), 1.0);
-        assert_eq!(watson_step_factor(3), 1.5);
-    }
-
-    #[test]
-    fn watson_all_smooth_skips_all() {
-        // If all blocks are perfectly smooth (AC energy = 0), all are tier 0.
+    fn watson_all_smooth_base_factor() {
         let blocks: Vec<[i16; 64]> = (0..9).map(|_| smooth_block()).collect();
         let grid = make_grid(3, 3, &blocks);
-        let watson = compute_watson_tiers(&grid);
-
-        // All blocks have zero AC energy (no |c| >= 2), median = max(0, 1.0) = 1.0,
-        // ratio = 0 / 1.0 = 0.0 < 0.01, so all are tier 0 (base step, not skipped).
-        assert!(watson.tiers.iter().all(|&t| t == 0));
+        let energy = compute_energy_ratios(&grid);
+        for &r in &energy.ratios {
+            assert_eq!(watson_base_factor(r), 0.3, "Smooth block base factor should be 0.3");
+        }
     }
 
     #[test]
-    fn watson_uniform_texture_all_tier2() {
-        // If all blocks have identical non-zero AC energy, ratio = 1.0 → tier 2.
+    fn watson_uniform_texture_base_factor() {
         let blocks: Vec<[i16; 64]> = (0..9).map(|_| textured_block()).collect();
         let grid = make_grid(3, 3, &blocks);
-        let watson = compute_watson_tiers(&grid);
-
-        // All blocks have the same energy, ratio = energy/energy = 1.0,
-        // which falls in [0.35, 2.0) → tier 2.
-        // All blocks are always usable now (no skip tier).
-        assert!(
-            watson.tiers.iter().all(|&t| t == 2),
-            "All blocks with ratio=1.0 should be tier 2"
-        );
+        let energy = compute_energy_ratios(&grid);
+        for &r in &energy.ratios {
+            let f = watson_base_factor(r);
+            assert!(
+                (0.7..=1.0).contains(&f),
+                "Uniform texture ratio={r} should give factor in [0.7, 1.0], got {f}"
+            );
+        }
     }
 
-    // --- Continuous Watson factor tests ---
+    // --- Watson base factor tests ---
 
     #[test]
-    fn watson_continuous_factor_anchor_points() {
-        // Verify exact values at anchor points.
-        assert_eq!(watson_continuous_factor(0.0), 0.3, "ratio=0.0 → 0.3");
-        assert_eq!(watson_continuous_factor(0.01), 0.3, "ratio=0.01 → 0.3");
-        assert!((watson_continuous_factor(0.35) - 0.7).abs() < 1e-12, "ratio=0.35 → 0.7");
-        assert!((watson_continuous_factor(2.0) - 1.0).abs() < 1e-12, "ratio=2.0 → 1.0");
-        assert!((watson_continuous_factor(4.0) - 1.5).abs() < 1e-12, "ratio=4.0 → 1.5");
-        assert_eq!(watson_continuous_factor(10.0), 1.5, "ratio=10.0 → 1.5");
+    fn watson_base_factor_anchor_points() {
+        assert_eq!(watson_base_factor(0.0), 0.3);
+        assert_eq!(watson_base_factor(0.01), 0.3);
+        assert!((watson_base_factor(0.35) - 0.7).abs() < 1e-12);
+        assert!((watson_base_factor(2.0) - 1.0).abs() < 1e-12);
+        assert!((watson_base_factor(4.0) - 1.5).abs() < 1e-12);
+        assert_eq!(watson_base_factor(10.0), 1.5);
     }
 
     #[test]
-    fn watson_continuous_factor_monotonic() {
-        // Sweep 0..10 in 0.001 steps, assert non-decreasing.
-        let mut prev = watson_continuous_factor(0.0);
+    fn watson_base_factor_monotonic() {
+        let mut prev = watson_base_factor(0.0);
         let mut r = 0.001;
         while r <= 10.0 {
-            let f = watson_continuous_factor(r);
-            assert!(
-                f >= prev - 1e-12,
-                "Not monotonic at ratio={r}: {f} < {prev}"
-            );
+            let f = watson_base_factor(r);
+            assert!(f >= prev - 1e-12, "Not monotonic at ratio={r}: {f} < {prev}");
             prev = f;
             r += 0.001;
         }
     }
 
     #[test]
-    fn watson_continuous_factor_midpoints() {
-        // Verify interpolation at segment midpoints.
-        // Midpoint of [0.01, 0.35] → midpoint of [0.3, 0.7] = 0.5
-        let mid1 = watson_continuous_factor((0.01 + 0.35) / 2.0);
+    fn watson_base_factor_midpoints() {
+        let mid1 = watson_base_factor((0.01 + 0.35) / 2.0);
         assert!((mid1 - 0.5).abs() < 1e-10, "Midpoint segment 1: expected ~0.5, got {mid1}");
 
-        // Midpoint of [0.35, 2.0] → midpoint of [0.7, 1.0] = 0.85
-        let mid2 = watson_continuous_factor((0.35 + 2.0) / 2.0);
+        let mid2 = watson_base_factor((0.35 + 2.0) / 2.0);
         assert!((mid2 - 0.85).abs() < 1e-10, "Midpoint segment 2: expected ~0.85, got {mid2}");
 
-        // Midpoint of [2.0, 4.0] → midpoint of [1.0, 1.5] = 1.25
-        let mid3 = watson_continuous_factor((2.0 + 4.0) / 2.0);
+        let mid3 = watson_base_factor((2.0 + 4.0) / 2.0);
         assert!((mid3 - 1.25).abs() < 1e-10, "Midpoint segment 3: expected ~1.25, got {mid3}");
     }
 
     #[test]
-    fn watson_continuous_factor_deterministic() {
-        // Same input must produce bit-identical output.
+    fn watson_base_factor_deterministic() {
         for ratio in [0.0, 0.005, 0.18, 1.0, 3.0, 5.0, 100.0] {
-            let a = watson_continuous_factor(ratio);
-            let b = watson_continuous_factor(ratio);
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "Not bit-identical at ratio={ratio}"
-            );
+            let a = watson_base_factor(ratio);
+            let b = watson_base_factor(ratio);
+            assert_eq!(a.to_bits(), b.to_bits(), "Not bit-identical at ratio={ratio}");
         }
+    }
+
+    // --- Remap + adaptive params tests ---
+
+    #[test]
+    fn remap_watson_full_range() {
+        assert!((remap_watson(0.3, 0.3, 1.5) - 0.3).abs() < 1e-12);
+        assert!((remap_watson(1.5, 0.3, 1.5) - 1.5).abs() < 1e-12);
+        assert!((remap_watson(0.9, 0.3, 1.5) - 0.9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn remap_watson_narrow_range() {
+        assert!((remap_watson(0.3, 0.9, 1.1) - 0.9).abs() < 1e-12);
+        assert!((remap_watson(1.5, 0.9, 1.1) - 1.1).abs() < 1e-12);
+        let mid = remap_watson(0.9, 0.9, 1.1);
+        assert!((mid - 1.0).abs() < 1e-12, "Midpoint should remap to 1.0, got {mid}");
+    }
+
+    #[test]
+    fn adaptive_params_continuous() {
+        // At r=15 (minimum): max robustness
+        let p = adaptive_params(15);
+        assert_eq!(p.base_step, 12.0);
+        assert_eq!(p.watson_lo, 0.9);
+        assert_eq!(p.watson_hi, 1.1);
+
+        // At r=61 (cap): max quality
+        let p = adaptive_params(61);
+        assert_eq!(p.base_step, 6.5);
+        assert_eq!(p.watson_lo, 0.62);
+        assert_eq!(p.watson_hi, 1.26);
+
+        // Mid-range: r=38 (roughly halfway)
+        let p = adaptive_params(38);
+        assert!(p.base_step > 6.5 && p.base_step < 12.0);
+        assert!(p.watson_lo > 0.62 && p.watson_lo < 0.9);
+        assert!(p.watson_hi > 1.1 && p.watson_hi < 1.26);
+
+        // Monotonic: higher r = smaller step
+        let p15 = adaptive_params(15);
+        let p38 = adaptive_params(38);
+        let p61 = adaptive_params(61);
+        assert!(p15.base_step > p38.base_step);
+        assert!(p38.base_step > p61.base_step);
+
+        // Clamped above 61
+        let p200 = adaptive_params(200);
+        assert_eq!(p200.base_step, 6.5);
     }
 
     #[test]
     fn watson_factors_all_smooth() {
-        // All-smooth grid → all factors = 0.3 (floor).
         let blocks: Vec<[i16; 64]> = (0..9).map(|_| smooth_block()).collect();
         let grid = make_grid(3, 3, &blocks);
-        let wf = compute_watson_factors(&grid);
+        let energy = compute_energy_ratios(&grid);
+        let factors = watson_factors(&energy, 0.9, 1.1);
         assert!(
-            wf.factors.iter().all(|&f| f == 0.3),
-            "All smooth blocks should have factor 0.3"
+            factors.iter().all(|&f| (f - 0.9).abs() < 1e-12),
+            "All smooth blocks should have factor 0.9 (watson_lo)"
         );
     }
 
     #[test]
-    fn watson_factors_encode_decode_roundtrip() {
-        // Full encode/decode roundtrip with continuous Watson factors.
-        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
-
-        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
-            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
-
-        let passphrase = "continuous-watson-test";
-
-        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
-        let fort_cap = fortress_capacity(&img).unwrap();
-        assert!(fort_cap >= 1, "Fortress capacity must be >= 1");
-
-        let message = if fort_cap >= 4 { "Hi!!" } else { "Hi" };
-
-        let stego_bytes = armor_encode(&test_jpeg, message, passphrase)
-            .expect("Continuous Watson encode should succeed");
-
-        let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
-            .expect("Continuous Watson decode should succeed");
-
-        assert_eq!(decoded_msg, message, "Decoded message must match");
-        assert!(quality.fortress_used, "Should use fortress mode");
-    }
-
-    #[test]
-    fn watson_masking_dispatch() {
-        // Verify WatsonMasking dispatches correctly to both backends.
+    fn watson_factors_range_respected() {
         let blocks = vec![
             smooth_block(),
             smooth_block(),
@@ -1102,15 +1013,125 @@ mod tests {
             textured_block(),
         ];
         let grid = make_grid(4, 1, &blocks);
+        let energy = compute_energy_ratios(&grid);
 
-        let masking = compute_watson_masking(&grid);
-        // All blocks should return a factor in [0.3, 1.5].
-        for i in 0..4 {
-            let f = masking.step_factor(i);
+        for (lo, hi) in [(0.8, 1.2), (0.9, 1.1)] {
+            let factors = watson_factors(&energy, lo, hi);
+            for (i, &f) in factors.iter().enumerate() {
+                assert!(
+                    f >= lo - 1e-12 && f <= hi + 1e-12,
+                    "Factor {f} for block {i} out of [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_encode_decode_roundtrip() {
+        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
+
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        let passphrase = "adaptive-watson-test";
+        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let fort_cap = fortress_capacity(&img).unwrap();
+        assert!(fort_cap >= 1, "Fortress capacity must be >= 1");
+
+        let message = if fort_cap >= 4 { "Hi!!" } else { "Hi" };
+
+        let stego_bytes = armor_encode(&test_jpeg, message, passphrase)
+            .expect("Adaptive encode should succeed");
+
+        let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
+            .expect("Adaptive decode should succeed");
+
+        assert_eq!(decoded_msg, message, "Decoded message must match");
+        assert!(quality.fortress_used, "Should use fortress mode");
+    }
+
+    // --- Compact frame (empty passphrase) tests ---
+
+    #[test]
+    fn fortress_compact_encode_decode_roundtrip() {
+        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
+
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        let passphrase = ""; // empty passphrase triggers compact frame
+        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let fort_cap = fortress_capacity_compact(&img).unwrap();
+        assert!(fort_cap >= 1, "Fortress compact capacity ({fort_cap}) must be >= 1");
+
+        let message = if fort_cap >= 4 { "Hi!!" } else { "Hi" };
+
+        let stego_bytes = armor_encode(&test_jpeg, message, passphrase)
+            .expect("Compact fortress encode should succeed");
+
+        let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
+            .expect("Compact fortress decode should succeed");
+
+        assert_eq!(decoded_msg, message, "Decoded message must match");
+        assert!(quality.fortress_used, "Should use fortress mode");
+    }
+
+    #[test]
+    fn fortress_compact_capacity_larger_than_full() {
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let full_cap = fortress_capacity(&img).unwrap();
+        let compact_cap = fortress_capacity_compact(&img).unwrap();
+
+        assert!(
+            compact_cap >= full_cap,
+            "Compact capacity ({compact_cap}) should be >= full capacity ({full_cap})"
+        );
+        // The 28-byte saving should translate to >= 28 more plaintext bytes.
+        if full_cap > 0 {
             assert!(
-                (0.3..=1.5).contains(&f),
-                "Factor for block {i} out of range: {f}"
+                compact_cap - full_cap >= 28,
+                "Compact frame saves 28 bytes overhead, so capacity should increase by >= 28: \
+                 compact={compact_cap}, full={full_cap}, diff={}",
+                compact_cap - full_cap
             );
         }
+    }
+
+    #[test]
+    fn fortress_nonempty_passphrase_still_uses_full_frame() {
+        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
+
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        let passphrase = "some-secret";
+
+        let stego_bytes = armor_encode(&test_jpeg, "Hi", passphrase)
+            .expect("Non-empty passphrase fortress encode should succeed");
+
+        let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
+            .expect("Non-empty passphrase fortress decode should succeed");
+
+        assert_eq!(decoded_msg, "Hi");
+        assert!(quality.fortress_used, "Should use fortress mode");
+    }
+
+    #[test]
+    fn fortress_compact_wrong_passphrase_fails() {
+        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
+
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        // Encode with empty passphrase (compact frame)
+        let stego_bytes = armor_encode(&test_jpeg, "Hi", "")
+            .expect("Compact fortress encode should succeed");
+
+        // Decode with non-empty passphrase should fail
+        let result = armor_decode(&stego_bytes, "wrong");
+        assert!(result.is_err(), "Decoding compact frame with wrong passphrase should fail");
     }
 }

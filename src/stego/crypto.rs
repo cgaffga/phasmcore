@@ -41,6 +41,19 @@ pub const NONCE_LEN: usize = 12;
 /// Argon2 salt length in bytes.
 pub const SALT_LEN: usize = 16;
 
+/// Fixed salt for Fortress empty-passphrase optimization.
+/// When passphrase is empty, we use this deterministic salt so it doesn't need
+/// to be embedded in the frame (saving 16 bytes). The message is still
+/// AES-encrypted so the payload looks random for steganalysis resistance.
+/// NOT secret — just a constant to feed into AES key derivation.
+pub const FORTRESS_EMPTY_SALT: [u8; SALT_LEN] = *b"phasm-fe-salt00\0";
+
+/// Fixed nonce for Fortress empty-passphrase optimization.
+/// When passphrase is empty, we use this deterministic nonce so it doesn't
+/// need to be embedded in the frame (saving 12 bytes).
+/// NOT secret — just a constant to feed into AES-GCM-SIV.
+pub const FORTRESS_EMPTY_NONCE: [u8; NONCE_LEN] = *b"ph-fe-nonce\0";
+
 /// Derive the structural key (Tier 1) from a passphrase.
 ///
 /// Returns a 64-byte buffer: first 32 bytes = perm_seed, last 32 bytes = hhat_seed.
@@ -119,6 +132,23 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> (Vec<u8>, [u8; NONCE_LEN],
     let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
 
     (ciphertext, nonce_bytes, salt)
+}
+
+/// Encrypt plaintext with AES-256-GCM-SIV using caller-provided salt and nonce.
+///
+/// Used by the Fortress compact frame path where salt and nonce are fixed
+/// constants rather than random values.
+pub fn encrypt_with(
+    plaintext: &[u8],
+    passphrase: &str,
+    salt: &[u8; SALT_LEN],
+    nonce_bytes: &[u8; NONCE_LEN],
+) -> Vec<u8> {
+    let key = derive_encryption_key(passphrase, salt);
+    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail")
 }
 
 /// Decrypt ciphertext with AES-256-GCM-SIV.

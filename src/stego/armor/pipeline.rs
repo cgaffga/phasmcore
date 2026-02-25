@@ -69,13 +69,24 @@ pub fn armor_encode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // Encrypt message once (shared by both Fortress and STDM paths).
-    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
-    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
-
     // Try Fortress (BA-QIM on DC) first if the message fits.
-    if let Ok(max_fort) = fortress::fortress_max_frame_bytes(&img) {
-        if frame_bytes.len() <= max_fort {
+    // For empty passphrase, use compact frame (saves 28 bytes of overhead).
+    let use_compact = passphrase.is_empty();
+    if let Ok(max_fort) = fortress::fortress_max_frame_bytes_ext(&img, use_compact) {
+        let fortress_frame = if use_compact {
+            let ct = crypto::encrypt_with(
+                message.as_bytes(),
+                passphrase,
+                &crypto::FORTRESS_EMPTY_SALT,
+                &crypto::FORTRESS_EMPTY_NONCE,
+            );
+            frame::build_fortress_compact_frame(message.len() as u16, &ct)
+        } else {
+            let (ct, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+            frame::build_frame(message.len() as u16, &salt, &nonce, &ct)
+        };
+
+        if fortress_frame.len() <= max_fort {
             // Pre-settle Y channel to QF75 QT tables before Fortress embedding.
             // This ensures block averages are on the same quantization grid that
             // WhatsApp (and most social media) use for recompression, making the
@@ -83,7 +94,7 @@ pub fn armor_encode(
             // Platform-side quality settings vary wildly (iOS 0.65 ≈ libjpeg Q90,
             // Android Q70, Web 0.65 ≈ varies), so we normalize here in the core.
             pre_settle_for_fortress(&mut img);
-            fortress::fortress_encode(&mut img, &frame_bytes, passphrase)?;
+            fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
             let stego_bytes = match img.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -94,6 +105,10 @@ pub fn armor_encode(
             return Ok(stego_bytes);
         }
     }
+
+    // Full frame for STDM path (always uses random salt + nonce).
+    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
 
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
     embed_dft_template(&mut img, passphrase, message)?;
@@ -832,6 +847,31 @@ pub(super) fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<u
     rs_set.into_iter().collect()
 }
 
+/// Compute candidate repetition factors for fortress compact frames.
+///
+/// Same as `compute_candidate_rs` but uses the compact frame overhead
+/// (22 bytes instead of 50) for minimum frame length.
+pub(super) fn compute_candidate_rs_compact(payload_units: usize, parity: usize) -> Vec<usize> {
+    let mut rs_set = std::collections::BTreeSet::new();
+
+    let min_frame = frame::FORTRESS_COMPACT_FRAME_OVERHEAD;
+    let max_frame = frame::MAX_FRAME_BYTES;
+
+    for frame_len in min_frame..=max_frame {
+        let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
+        let rs_bits = rs_encoded_len * 8;
+        if rs_bits > payload_units {
+            continue;
+        }
+        let r = repetition::compute_r(rs_bits, payload_units);
+        if r >= 3 {
+            rs_set.insert(r);
+        }
+    }
+
+    rs_set.into_iter().collect()
+}
+
 /// Get cached LLRs for a delta value, or extract them from the grid.
 fn get_or_extract_llrs(
     cache: &mut Vec<(f64, Vec<f64>)>,
@@ -921,6 +961,79 @@ pub(super) fn try_rs_decode_frame_with_parity(
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
                 let ct_len = pt_len + 16;
                 let total_frame_len = 2 + 16 + 12 + ct_len + 4;
+
+                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
+                    continue;
+                }
+
+                if total_frame_len == data_len {
+                    let t_max = parity / 2;
+                    let stats = ecc::RsDecodeStats {
+                        total_errors: first_errors,
+                        error_capacity: t_max,
+                        max_block_errors: first_errors,
+                        num_blocks: 1,
+                    };
+                    return Some((first_block_data, stats));
+                }
+
+                if total_frame_len < data_len {
+                    let t_max = parity / 2;
+                    let stats = ecc::RsDecodeStats {
+                        total_errors: first_errors,
+                        error_capacity: t_max,
+                        max_block_errors: first_errors,
+                        num_blocks: 1,
+                    };
+                    return Some((first_block_data[..total_frame_len].to_vec(), stats));
+                }
+
+                if total_frame_len > data_len {
+                    let rs_encoded_len =
+                        ecc::rs_encoded_len_with_parity(total_frame_len, parity);
+                    if rs_encoded_len <= extracted_bytes.len() {
+                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
+                            &extracted_bytes[..rs_encoded_len],
+                            total_frame_len,
+                            parity,
+                        ) {
+                            return Some((decoded, stats));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Try to RS-decode a compact fortress frame from extracted bytes.
+///
+/// Same logic as `try_rs_decode_frame_with_parity` but uses the compact frame
+/// overhead (no salt/nonce) when computing the expected total frame length.
+pub(super) fn try_rs_decode_compact_frame_with_parity(
+    extracted_bytes: &[u8],
+    parity: usize,
+) -> Option<(Vec<u8>, ecc::RsDecodeStats)> {
+    let k_max = 255 - parity;
+    let min_data = 2usize.min(k_max);
+
+    for data_len in min_data..=k_max.min(extracted_bytes.len().saturating_sub(parity)) {
+        let block_len = data_len + parity;
+        if block_len > extracted_bytes.len() {
+            break;
+        }
+
+        if let Ok((first_block_data, first_errors)) =
+            ecc::rs_decode_with_parity(&extracted_bytes[..block_len], data_len, parity)
+        {
+            if first_block_data.len() >= 2 {
+                let pt_len =
+                    u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
+                let ct_len = pt_len + 16;
+                // Compact frame: no salt (16) or nonce (12)
+                let total_frame_len = 2 + ct_len + 4;
 
                 if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
                     continue;
