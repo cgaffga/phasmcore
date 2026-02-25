@@ -1088,16 +1088,13 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
     let num_components = img.num_components();
     let target_qf = 75u32;
 
-    // Pre-compute target QT tables for each QT slot used by any component.
-    // Component 0 (Y) uses luminance base table, others use chrominance.
-    let mut settled_qt_ids = [false; 4];
+    // Pre-compute target QT for each QT slot (luminance vs chrominance base).
+    // We must re-quantize ALL components, even those sharing a QT ID,
+    // because each component has its own DctGrid with separate coefficients.
+    let mut new_qts: Vec<(usize, [u16; 64], [u16; 64])> = Vec::new(); // (qt_id, old, new)
 
     for comp_idx in 0..num_components {
         let qt_id = img.frame_info().components[comp_idx].quant_table_id as usize;
-        if settled_qt_ids[qt_id] {
-            continue; // Already settled this QT (e.g., Cb and Cr share QT 1)
-        }
-
         let old_qt = img.quant_table(qt_id).expect("quant table must exist").values;
         let base = if comp_idx == 0 {
             &JPEG_BASE_LUMINANCE_QT
@@ -1125,8 +1122,15 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
             }
         }
 
-        // Replace the quantization table
-        img.set_quant_table(qt_id, QuantTable::new(new_qt));
-        settled_qt_ids[qt_id] = true;
+        new_qts.push((qt_id, old_qt, new_qt));
+    }
+
+    // Replace quantization tables (deduplicate by QT ID)
+    let mut replaced = [false; 4];
+    for (qt_id, _old, new_qt) in &new_qts {
+        if !replaced[*qt_id] {
+            img.set_quant_table(*qt_id, QuantTable::new(*new_qt));
+            replaced[*qt_id] = true;
+        }
     }
 }
