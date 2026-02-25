@@ -144,16 +144,16 @@ pub fn armor_encode(
         return Err(StegoError::ImageTooSmall);
     };
 
-    // Force Phase 2 (r>=3) when capacity allows.
-    let use_phase2 = {
-        let mut found = false;
+    // Find best Phase 2 parity tier (r>=3) in a single pass, caching the RS result.
+    let phase2_result: Option<(usize, Vec<u8>)> = {
+        let mut found = None;
         for &parity in &ecc::PARITY_TIERS {
             let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
             let rs_bits_len = rs_encoded.len() * 8;
             if rs_bits_len <= payload_units {
                 let r = repetition::compute_r(rs_bits_len, payload_units);
                 if r >= 3 {
-                    found = true;
+                    found = Some((parity, rs_encoded));
                     break;
                 }
             }
@@ -161,22 +161,8 @@ pub fn armor_encode(
         found
     };
 
-    let embed_delta_fn: Box<dyn Fn(usize) -> f64> = if use_phase2 {
-        // --- Phase 2 encode: find smallest parity tier with r>=3 ---
-        let mut chosen_parity = ecc::PARITY_TIERS[0]; // fallback
-        for &parity in &ecc::PARITY_TIERS {
-            let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity);
-            let rs_bits_len = rs_encoded.len() * 8;
-            if rs_bits_len <= payload_units {
-                let r = repetition::compute_r(rs_bits_len, payload_units);
-                if r >= 3 {
-                    chosen_parity = parity;
-                    break;
-                }
-            }
-        }
-
-        let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, chosen_parity);
+    let embed_delta_fn: Box<dyn Fn(usize) -> f64> = if let Some((_chosen_parity, rs_encoded)) = phase2_result {
+        // --- Phase 2 encode: use cached RS result ---
         let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
         let r = repetition::compute_r(rs_bits.len(), payload_units);
@@ -300,11 +286,6 @@ impl DecodeQuality {
             fortress_used: false,
             signal_strength: 0.0,
         }
-    }
-
-    /// Create quality info from Armor RS decode stats.
-    pub fn from_rs_stats(stats: &ecc::RsDecodeStats) -> Self {
-        Self::from_rs_stats_with_phase2(stats, 1, ecc::parity_len() as u16)
     }
 
     /// Create quality info from Armor RS decode stats with Phase 2 metadata.
@@ -434,8 +415,8 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
         }
     }
 
-    // Try standard STDM decode with delta sweep.
-    match try_armor_decode(stego_bytes, passphrase) {
+    // Try standard STDM decode with delta sweep (reuse already-parsed image).
+    match try_armor_decode(&img, passphrase) {
         Ok(result) => return Ok(result),
         Err(new_err) => {
             // Try geometric recovery (Phase 3).
@@ -448,9 +429,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
 }
 
 /// Armor decode with delta sweep: parse image once, try multiple mean_qt candidates.
-fn try_armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
-    let img = JpegImage::from_bytes(stego_bytes)?;
-
+fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
@@ -599,17 +578,8 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
     let mut corrected_img = img.clone();
     pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img);
 
-    // Re-encode to JPEG bytes for the standard decode path.
-    let corrected_bytes = match corrected_img.to_bytes() {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            corrected_img.rebuild_huffman_tables();
-            corrected_img.to_bytes().map_err(StegoError::InvalidJpeg)?
-        }
-    };
-
-    // Retry standard decode on the corrected image.
-    match try_armor_decode(&corrected_bytes, passphrase) {
+    // Retry standard decode on the corrected image (no re-encode/re-parse needed).
+    match try_armor_decode(&corrected_img, passphrase) {
         Ok((text, mut quality)) => {
             quality.geometry_corrected = true;
             quality.template_peaks_detected = detected.len() as u8;
@@ -620,9 +590,8 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
         Err(_) => {
             // STDM decode failed after geometry correction -- try DFT ring
             // Recompute FFT from corrected image for ring extraction
-            let corrected_img2 = JpegImage::from_bytes(&corrected_bytes).ok();
-            if let Some(ci) = corrected_img2 {
-                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&ci);
+            {
+                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img);
                 let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
                 if let Some(plaintext) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
                     if let Ok(text) = std::str::from_utf8(&plaintext) {
@@ -819,7 +788,7 @@ fn decode_phase2_search(
 }
 
 /// Compute distinct candidate r values for a given parity tier and payload capacity.
-fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<usize> {
+pub(super) fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<usize> {
     let mut rs_set = std::collections::BTreeSet::new();
 
     // Sweep possible frame lengths to find all distinct r values
@@ -910,7 +879,7 @@ fn pre_clamp_y_channel(img: &mut JpegImage) {
 }
 
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
-fn try_rs_decode_frame_with_parity(
+pub(super) fn try_rs_decode_frame_with_parity(
     extracted_bytes: &[u8],
     parity: usize,
 ) -> Option<(Vec<u8>, ecc::RsDecodeStats)> {
@@ -1129,6 +1098,8 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
 
 /// Standard JPEG luminance quantization table (Table K.1 from the JPEG spec).
 /// These are the base values before quality-factor scaling.
+/// NOTE: Duplicates STD_LUMA_QT in selection.rs — kept here to avoid coupling
+/// the Fortress pre-settlement path to the stability-map module.
 const JPEG_BASE_LUMINANCE_QT: [u16; 64] = [
     16, 11, 10, 16,  24,  40,  51,  61,
     12, 12, 14, 19,  26,  58,  60,  55,
@@ -1141,6 +1112,7 @@ const JPEG_BASE_LUMINANCE_QT: [u16; 64] = [
 ];
 
 /// Standard JPEG chrominance quantization table (Table K.2 from the JPEG spec).
+/// NOTE: Duplicates STD_CHROMA_QT in selection.rs — kept here for the same reason.
 const JPEG_BASE_CHROMINANCE_QT: [u16; 64] = [
     17, 18, 24, 47, 99, 99, 99, 99,
     18, 21, 26, 66, 99, 99, 99, 99,
@@ -1157,6 +1129,9 @@ const JPEG_BASE_CHROMINANCE_QT: [u16; 64] = [
 /// Uses the standard libjpeg scaling formula:
 /// - QF >= 50: scale = 200 - 2 * QF
 /// - QF <  50: scale = 5000 / QF
+///
+/// NOTE: Duplicates scale_quant_table() in selection.rs — kept here to avoid
+/// coupling the Fortress pre-settlement path to the stability-map module.
 fn compute_jpeg_qt(base: &[u16; 64], qf: u32) -> [u16; 64] {
     let scale = if qf >= 50 { 200 - 2 * qf } else { 5000 / qf };
     let mut qt = [0u16; 64];

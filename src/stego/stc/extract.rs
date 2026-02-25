@@ -12,7 +12,7 @@ use super::hhat;
 /// it accumulates the syndrome over cover elements [i*w, (i+1)*w) using H-hat
 /// columns, then reads the bottom bit of the state as message[i] and shifts
 /// the state right by 1 to advance the syndrome window.
-pub fn stc_extract(stego_bits: &[u8], hhat: &[Vec<u32>], _h: usize, w: usize) -> Vec<u8> {
+pub fn stc_extract(stego_bits: &[u8], hhat: &[Vec<u32>], w: usize) -> Vec<u8> {
     let n = stego_bits.len();
     let m = (n + w - 1) / w; // ceil(n / w)
 
@@ -53,7 +53,7 @@ mod tests {
         let w = 4;
         let hhat = generate_hhat(h, w, &[99u8; 32]);
         let stego = vec![0u8; 12]; // n=12, m=3
-        let msg = stc_extract(&stego, &hhat, h, w);
+        let msg = stc_extract(&stego, &hhat, w);
         assert_eq!(msg, vec![0, 0, 0]);
     }
 }

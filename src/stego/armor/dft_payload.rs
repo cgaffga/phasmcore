@@ -150,8 +150,8 @@ fn compute_sector_magnitude(
                 continue;
             }
 
-            let fu = ((cx as i32 + dx) as usize) % w;
-            let fv = ((cy as i32 + dy) as usize) % h;
+            let fu = (cx as i32 + dx).rem_euclid(w as i32) as usize;
+            let fv = (cy as i32 + dy).rem_euclid(h as i32) as usize;
             let idx = fv * w + fu;
             if idx < spectrum.data.len() {
                 let mag = det_hypot(spectrum.data[idx].re, spectrum.data[idx].im);
@@ -201,8 +201,8 @@ fn set_sector_magnitude(
                 continue;
             }
 
-            let fu = ((cx as i32 + dx) as usize) % w;
-            let fv = ((cy as i32 + dy) as usize) % h;
+            let fu = (cx as i32 + dx).rem_euclid(w as i32) as usize;
+            let fv = (cy as i32 + dy).rem_euclid(h as i32) as usize;
             let idx = fv * w + fu;
             if idx >= spectrum.data.len() {
                 continue;

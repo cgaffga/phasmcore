@@ -30,6 +30,7 @@ pub fn generate_spreading_vectors(seed: &[u8; 32], count: usize) -> Vec<[f64; SP
         }
 
         // Normalize to unit length
+        // sqrt() is IEEE 754 correctly-rounded — deterministic across all platforms
         let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm > 1e-10 {
             for val in v.iter_mut() {

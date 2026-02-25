@@ -78,8 +78,6 @@ fn armor_geometry_rotation_15deg() {
     let rotated = apply_geometry(&stego, &AffineTransform {
         rotation_rad: 15.0_f64.to_radians(),
         scale: 1.0,
-        tx: 0.0,
-        ty: 0.0,
     });
 
     let result = armor_decode(&rotated, passphrase);
@@ -115,8 +113,6 @@ fn armor_geometry_scale_90pct() {
     let scaled = apply_geometry(&stego, &AffineTransform {
         rotation_rad: 0.0,
         scale: 0.9,
-        tx: 0.0,
-        ty: 0.0,
     });
 
     let result = armor_decode(&scaled, passphrase);
@@ -148,8 +144,6 @@ fn armor_geometry_small_rotation_5deg() {
     let rotated = apply_geometry(&stego, &AffineTransform {
         rotation_rad: 5.0_f64.to_radians(),
         scale: 1.0,
-        tx: 0.0,
-        ty: 0.0,
     });
 
     let result = armor_decode(&rotated, passphrase);
@@ -174,8 +168,6 @@ fn armor_geometry_wrong_passphrase_still_fails() {
     let rotated = apply_geometry(&stego, &AffineTransform {
         rotation_rad: 5.0_f64.to_radians(),
         scale: 1.0,
-        tx: 0.0,
-        ty: 0.0,
     });
 
     let result = armor_decode(&rotated, "wrong-pass");

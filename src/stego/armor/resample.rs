@@ -101,8 +101,6 @@ mod tests {
         let identity = AffineTransform {
             rotation_rad: 0.0,
             scale: 1.0,
-            tx: 0.0,
-            ty: 0.0,
         };
 
         let result = resample_bilinear(&pixels, w, h, &identity, w, h);
@@ -131,8 +129,6 @@ mod tests {
         let rot180 = AffineTransform {
             rotation_rad: std::f64::consts::PI,
             scale: 1.0,
-            tx: 0.0,
-            ty: 0.0,
         };
 
         let rotated = resample_bilinear(&pixels, w, h, &rot180, w, h);
@@ -161,14 +157,10 @@ mod tests {
         let scale2 = AffineTransform {
             rotation_rad: 0.0,
             scale: 2.0,
-            tx: 0.0,
-            ty: 0.0,
         };
         let scale_half = AffineTransform {
             rotation_rad: 0.0,
             scale: 0.5,
-            tx: 0.0,
-            ty: 0.0,
         };
 
         let scaled_up = resample_bilinear(&pixels, w, h, &scale2, w, h);

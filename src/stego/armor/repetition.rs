@@ -58,6 +58,7 @@ pub fn repetition_encode(rs_bits: &[u8], num_units: usize) -> (Vec<u8>, usize) {
 /// Uses sequential layout — copy `j` of bit `i` is at position
 /// `j * rs_bit_count + i`. Sums LLR across all copies and decides:
 /// positive total → bit 0, negative → bit 1.
+#[cfg(test)]
 pub fn repetition_decode_soft(llrs: &[f64], rs_bit_count: usize) -> Vec<u8> {
     if rs_bit_count == 0 {
         return Vec::new();

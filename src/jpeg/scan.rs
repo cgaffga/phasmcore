@@ -103,6 +103,36 @@ pub fn decode_scan(
                         let block_row = mcu_row * (comp.v_sampling as usize) + v;
                         let block_col = mcu_col * (comp.h_sampling as usize) + h;
 
+                        // Bounds check: skip blocks outside the grid (malformed JPEGs)
+                        let blocks_tall = grids[sci].blocks_tall();
+                        let blocks_wide = grids[sci].blocks_wide();
+                        if block_row >= blocks_tall || block_col >= blocks_wide {
+                            // Still need to consume the entropy-coded data for this block
+                            // to keep the bitstream in sync, so decode but discard.
+                            let dc_size = dc_tab.decode(&mut reader)?;
+                            if dc_size > 0 {
+                                let dc_bits = reader.read_bits(dc_size)?;
+                                let dc_diff = extend_sign(dc_bits, dc_size);
+                                dc_pred[sci] += dc_diff;
+                            }
+                            let mut k = 1;
+                            while k < 64 {
+                                let rs = ac_tab.decode(&mut reader)?;
+                                let run = (rs >> 4) as usize;
+                                let size = rs & 0x0F;
+                                if size == 0 {
+                                    if run == 0 || run != 15 { break; }
+                                    k += 16;
+                                    continue;
+                                }
+                                k += run;
+                                if k >= 64 { return Err(JpegError::HuffmanDecode); }
+                                let _ac_bits = reader.read_bits(size)?;
+                                k += 1;
+                            }
+                            continue;
+                        }
+
                         let mut zz = [0i16; 64];
 
                         // Decode DC coefficient

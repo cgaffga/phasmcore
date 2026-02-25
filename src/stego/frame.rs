@@ -102,7 +102,7 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     let total_frame_len = 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
 
     // Reject frames that exceed the maximum supported size.
-    if total_frame_len > MAX_FRAME_BYTES + 1024 {
+    if total_frame_len > MAX_FRAME_BYTES {
         return Err(StegoError::FrameCorrupted);
     }
 

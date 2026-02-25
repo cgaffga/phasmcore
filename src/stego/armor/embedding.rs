@@ -102,6 +102,7 @@ pub fn stdm_embed(coeffs: &mut [f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], bit: u8
 /// - `delta`: quantization step size (same as used for embedding)
 ///
 /// Returns the extracted bit (0 or 1).
+#[cfg(test)]
 pub fn stdm_extract(coeffs: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], delta: f64) -> u8 {
     let p: f64 = coeffs.iter().zip(v.iter()).map(|(&c, &vi)| c * vi).sum();
 

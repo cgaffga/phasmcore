@@ -1,5 +1,5 @@
 use phasm_core::JpegImage;
-use phasm_core::stego::cost::uerd::compute_uerd;
+use phasm_core::stego::cost::uniward::compute_uniward;
 use phasm_core::stego::permute;
 use phasm_core::stego::crypto;
 use phasm_core::stego::frame::{self, MAX_FRAME_BITS};
@@ -36,7 +36,7 @@ fn full_pipeline_diagnostic() {
     let mut img = JpegImage::from_bytes(&cover_data).unwrap();
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).unwrap();
-    let cost_map = compute_uerd(img.dct_grid(0), qt);
+    let cost_map = compute_uniward(img.dct_grid(0), qt);
 
     let structural_key = crypto::derive_structural_key(passphrase);
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
@@ -77,7 +77,7 @@ fn full_pipeline_diagnostic() {
     let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, 7, w).unwrap();
 
     // Verify pre-JPEG extraction
-    let pre_extracted = extract::stc_extract(&result.stego_bits, &hhat_matrix, 7, w);
+    let pre_extracted = extract::stc_extract(&result.stego_bits, &hhat_matrix, w);
     assert_eq!(&pre_extracted[..m_max], &padded_bits[..], "pre-JPEG extraction mismatch");
 
     // Apply modifications (same logic as pipeline)
@@ -125,7 +125,7 @@ fn full_pipeline_diagnostic() {
     assert_eq!(jpeg_mismatches, 0, "JPEG round-trip changed LSBs");
 
     // === DECODE SIDE (using stego image positions) ===
-    let stego_cost_map = compute_uerd(stego_img.dct_grid(0), stego_img.quant_table(qt_id).unwrap());
+    let stego_cost_map = compute_uniward(stego_img.dct_grid(0), stego_img.quant_table(qt_id).unwrap());
     let stego_all_positions = permute::select_and_permute(&stego_cost_map, &perm_seed);
     let n_stego = stego_all_positions.len();
     let w_stego = n_stego / m_max;
@@ -156,6 +156,6 @@ fn full_pipeline_diagnostic() {
     let hhat_matrix_decode = hhat::generate_hhat(7, w_stego, &hhat_seed);
     assert_eq!(hhat_matrix, hhat_matrix_decode, "H-hat matrices differ");
 
-    let decoded_bits = extract::stc_extract(&decoder_stego_bits, &hhat_matrix_decode, 7, w_stego);
+    let decoded_bits = extract::stc_extract(&decoder_stego_bits, &hhat_matrix_decode, w_stego);
     assert_eq!(&decoded_bits[..m_max], &padded_bits[..], "decoded bits != original padded bits");
 }

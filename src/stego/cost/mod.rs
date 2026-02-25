@@ -5,11 +5,12 @@
 //! Lower cost = safer to modify. Infinite cost (`WET_COST`) = must never modify.
 //!
 //! Implements:
-//! - **UERD** (Uniform Embedding Revisited Distortion): simple block-energy cost.
 //! - **J-UNIWARD** (JPEG Universal Wavelet Relative Distortion): state-of-the-art
 //!   cost function using directional wavelet decomposition for superior
 //!   steganalysis resistance.
+//! - **UERD** (test-only): simple block-energy cost, replaced by J-UNIWARD in production.
 
+#[cfg(test)]
 pub mod uerd;
 pub mod uniward;
 
@@ -61,11 +62,6 @@ impl CostMap {
     pub fn set(&mut self, br: usize, bc: usize, i: usize, j: usize, val: f64) {
         let idx = self.index(br, bc, i, j);
         self.costs[idx] = val;
-    }
-
-    /// Get cost by flat coefficient index (block_idx * 64 + pos_in_block).
-    pub fn get_flat(&self, idx: usize) -> f64 {
-        self.costs[idx]
     }
 
     fn index(&self, br: usize, bc: usize, i: usize, j: usize) -> usize {

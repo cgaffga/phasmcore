@@ -203,7 +203,7 @@ pub fn ghost_decode(
 
     // 5. Generate H-hat and extract message bits.
     let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
-    let extracted_bits = extract::stc_extract(&stego_bits, &hhat_matrix, STC_H, w);
+    let extracted_bits = extract::stc_extract(&stego_bits, &hhat_matrix, w);
 
     // 6. Convert bits to bytes and parse frame.
     let m_max = MAX_FRAME_BITS;

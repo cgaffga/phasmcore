@@ -59,8 +59,6 @@ pub struct DetectedPeak {
 pub struct AffineTransform {
     pub rotation_rad: f64,
     pub scale: f64,
-    pub tx: f64,
-    pub ty: f64,
 }
 
 /// Generate K=32 peak positions from passphrase via ChaCha20 PRNG.
@@ -210,6 +208,7 @@ pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<Det
 
         let noise_mean = noise_sum / noise_count as f64;
         let noise_var = (noise_sq_sum / noise_count as f64) - noise_mean * noise_mean;
+        // sqrt() is IEEE 754 correctly-rounded — deterministic across all platforms
         let noise_std = noise_var.max(0.0).sqrt().max(1e-12);
 
         let confidence = (best_mag - noise_mean) / noise_std;
@@ -268,13 +267,12 @@ pub fn estimate_transform(detected: &[DetectedPeak]) -> Option<AffineTransform> 
     let b = num_b / denom;
 
     let rotation_rad = crate::det_math::det_atan2(b, a);
+    // sqrt() is IEEE 754 correctly-rounded — deterministic across all platforms
     let scale = (a * a + b * b).sqrt();
 
     Some(AffineTransform {
         rotation_rad,
         scale,
-        tx: 0.0,
-        ty: 0.0,
     })
 }
 

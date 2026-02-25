@@ -18,8 +18,6 @@ pub enum StegoError {
     MessageTooLarge,
     /// CRC check failed on the extracted payload frame.
     FrameCorrupted,
-    /// The payload frame has an unrecognized mode byte.
-    UnknownFrameMode(u8),
     /// AES-GCM decryption failed (wrong passphrase or corrupted data).
     DecryptionFailed,
     /// The extracted plaintext is not valid UTF-8.
@@ -36,7 +34,6 @@ impl fmt::Display for StegoError {
             Self::ImageTooLarge => write!(f, "image too large (max 8192px / 16MP)"),
             Self::MessageTooLarge => write!(f, "message too large for this image"),
             Self::FrameCorrupted => write!(f, "payload frame CRC mismatch"),
-            Self::UnknownFrameMode(m) => write!(f, "unknown frame mode: 0x{m:02x}"),
             Self::DecryptionFailed => write!(f, "decryption failed (wrong passphrase?)"),
             Self::InvalidUtf8 => write!(f, "extracted text is not valid UTF-8"),
             Self::NoLuminanceChannel => write!(f, "image has no luminance channel"),

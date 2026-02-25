@@ -20,7 +20,7 @@ pub struct EmbedResult {
 /// bit is emitted (the bottom bit of the state), and the state shifts right by 1.
 ///
 /// - `cover_bits`: LSBs of the cover coefficients (length n)
-/// - `costs`: cost of flipping each cover bit (length n). Use 1e13 for WET.
+/// - `costs`: cost of flipping each cover bit (length n). Use `WET_COST` (f64::INFINITY) for WET.
 /// - `message`: message bits to embed (length m)
 /// - `hhat_matrix`: the H-hat submatrix (h rows × w columns)
 /// - `h`: constraint length
@@ -188,10 +188,7 @@ pub fn stc_embed(
             step += 1; // cover step
             let col_idx = j % w;
             if col_idx == w - 1 && mi < m {
-                step_is_shift.resize(step_is_shift.len().max(step + 1), false);
-                if step < step_is_shift.len() {
-                    step_is_shift[step] = true;
-                }
+                step_is_shift[step] = true;
                 step += 1; // shift step
                 mi += 1;
             }
@@ -223,7 +220,7 @@ pub fn stc_embed(
 
     // Verify correctness.
     debug_assert_eq!(
-        stc_extract(&stego_bits, hhat_matrix, h, w)[..m],
+        stc_extract(&stego_bits, hhat_matrix, w)[..m],
         message[..m],
     );
 
@@ -255,7 +252,7 @@ mod tests {
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
         assert_eq!(result.stego_bits.len(), n);
 
-        let extracted = stc_extract(&result.stego_bits, &hhat, h, w);
+        let extracted = stc_extract(&result.stego_bits, &hhat, w);
         assert_eq!(&extracted[..m], &message[..]);
     }
 
@@ -273,7 +270,7 @@ mod tests {
         let message: Vec<u8> = (0..m).map(|i| (i % 2) as u8).collect();
 
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
-        let extracted = stc_extract(&result.stego_bits, &hhat, h, w);
+        let extracted = stc_extract(&result.stego_bits, &hhat, w);
         assert_eq!(&extracted[..m], &message[..]);
     }
 
@@ -305,7 +302,7 @@ mod tests {
         }
 
         // Message still recoverable
-        let extracted = stc_extract(&result.stego_bits, &hhat, h, w);
+        let extracted = stc_extract(&result.stego_bits, &hhat, w);
         assert_eq!(&extracted[..m], &message[..]);
     }
 

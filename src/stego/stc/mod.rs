@@ -15,11 +15,3 @@
 pub mod hhat;
 pub mod embed;
 pub mod extract;
-
-/// Parameters for the STC codec.
-pub struct StcParams {
-    /// Submatrix height (constraint length). h=7 gives 128 Viterbi states.
-    pub h: usize,
-    /// Submatrix width: floor(n / m) where n = cover length, m = message length.
-    pub w: usize,
-}
