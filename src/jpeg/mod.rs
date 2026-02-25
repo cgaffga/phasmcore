@@ -406,12 +406,15 @@ impl JpegImage {
     /// Removes all existing DQT entries from `raw_segments` and inserts fresh
     /// ones before the SOF0 marker (matching the standard JPEG header order).
     fn rebuild_dqt_segments(&mut self) {
-        use zigzag::NATURAL_TO_ZIGZAG;
+        use zigzag::ZIGZAG_TO_NATURAL;
 
         // Remove old DQT segments.
         self.raw_segments.retain(|s| s.marker != marker::DQT);
 
         // Build new DQT data: one segment containing all defined tables.
+        // DQT stores values in zigzag order. Our internal tables are in
+        // natural (row-major) order. For each zigzag index zi, we need
+        // the natural index: ni = ZIGZAG_TO_NATURAL[zi].
         let mut dqt_data = Vec::new();
         for id in 0..4u8 {
             if let Some(qt) = &self.quant_tables[id as usize] {
@@ -419,7 +422,7 @@ impl JpegImage {
                 let precision: u8 = if qt.values.iter().all(|&v| v <= 255) { 0 } else { 1 };
                 dqt_data.push((precision << 4) | id);
                 for zi in 0..64 {
-                    let ni = NATURAL_TO_ZIGZAG[zi];
+                    let ni = ZIGZAG_TO_NATURAL[zi];
                     if precision == 0 {
                         dqt_data.push(qt.values[ni] as u8);
                     } else {

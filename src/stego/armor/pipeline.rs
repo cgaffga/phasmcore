@@ -73,7 +73,13 @@ pub fn armor_encode(
     // Try Fortress (BA-QIM on DC) first if the message fits.
     if let Ok(max_fort) = fortress::fortress_max_frame_bytes(&img) {
         if frame_bytes.len() <= max_fort {
-            // Fortress doesn't use DFT template or pre-clamp (DC-only embedding).
+            // Pre-settle Y channel to QF75 QT tables before Fortress embedding.
+            // This ensures block averages are on the same quantization grid that
+            // WhatsApp (and most social media) use for recompression, making the
+            // QIM embedding nearly idempotent under Q75 recompression.
+            // Platform-side quality settings vary wildly (iOS 0.65 ≈ libjpeg Q90,
+            // Android Q70, Web 0.65 ≈ varies), so we normalize here in the core.
+            pre_settle_for_fortress(&mut img);
             fortress::fortress_encode(&mut img, &frame_bytes, passphrase)?;
             let stego_bytes = match img.to_bytes() {
                 Ok(bytes) => bytes,
@@ -1022,4 +1028,105 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
     let modified = fft2d::ifft2d(&spectrum);
     pixels::luma_f64_to_jpeg(&modified, w, h, img);
     Ok(())
+}
+
+// --- Fortress QF75 pre-settlement ---
+
+/// Standard JPEG luminance quantization table (Table K.1 from the JPEG spec).
+/// These are the base values before quality-factor scaling.
+const JPEG_BASE_LUMINANCE_QT: [u16; 64] = [
+    16, 11, 10, 16,  24,  40,  51,  61,
+    12, 12, 14, 19,  26,  58,  60,  55,
+    14, 13, 16, 24,  40,  57,  69,  56,
+    14, 17, 22, 29,  51,  87,  80,  62,
+    18, 22, 37, 56,  68, 109, 103,  77,
+    24, 35, 55, 64,  81, 104, 113,  92,
+    49, 64, 78, 87, 103, 121, 120, 101,
+    72, 92, 95, 98, 112, 100, 103,  99,
+];
+
+/// Standard JPEG chrominance quantization table (Table K.2 from the JPEG spec).
+const JPEG_BASE_CHROMINANCE_QT: [u16; 64] = [
+    17, 18, 24, 47, 99, 99, 99, 99,
+    18, 21, 26, 66, 99, 99, 99, 99,
+    24, 26, 56, 99, 99, 99, 99, 99,
+    47, 66, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+    99, 99, 99, 99, 99, 99, 99, 99,
+];
+
+/// Compute a JPEG quantization table for a given quality factor (1-100).
+///
+/// Uses the standard libjpeg scaling formula:
+/// - QF >= 50: scale = 200 - 2 * QF
+/// - QF <  50: scale = 5000 / QF
+fn compute_jpeg_qt(base: &[u16; 64], qf: u32) -> [u16; 64] {
+    let scale = if qf >= 50 { 200 - 2 * qf } else { 5000 / qf };
+    let mut qt = [0u16; 64];
+    for i in 0..64 {
+        let val = (base[i] as u32 * scale + 50) / 100;
+        qt[i] = val.clamp(1, 255) as u16;
+    }
+    qt
+}
+
+/// Pre-settle all image components to QF75 quantization tables.
+///
+/// For each component, performs IDCT → pixel clamp → DCT with QF75 QT tables,
+/// then replaces the component's quantization table. This makes the coefficients
+/// (especially Y-channel DCs used by Fortress) nearly idempotent under Q75
+/// recompression, which is what WhatsApp and most social media platforms use.
+///
+/// Without this, platform-side quality settings vary wildly (iOS 0.65 ≈ Q90,
+/// Android Q70, Web 0.65 ≈ varies), leaving coefficients on a fine grid that
+/// shifts dramatically when recompressed to Q75.
+fn pre_settle_for_fortress(img: &mut JpegImage) {
+    use crate::jpeg::dct::QuantTable;
+
+    let num_components = img.num_components();
+    let target_qf = 75u32;
+
+    // Pre-compute target QT tables for each QT slot used by any component.
+    // Component 0 (Y) uses luminance base table, others use chrominance.
+    let mut settled_qt_ids = [false; 4];
+
+    for comp_idx in 0..num_components {
+        let qt_id = img.frame_info().components[comp_idx].quant_table_id as usize;
+        if settled_qt_ids[qt_id] {
+            continue; // Already settled this QT (e.g., Cb and Cr share QT 1)
+        }
+
+        let old_qt = img.quant_table(qt_id).expect("quant table must exist").values;
+        let base = if comp_idx == 0 {
+            &JPEG_BASE_LUMINANCE_QT
+        } else {
+            &JPEG_BASE_CHROMINANCE_QT
+        };
+        let new_qt = compute_jpeg_qt(base, target_qf);
+
+        // Re-quantize all blocks in this component
+        let grid = img.dct_grid_mut(comp_idx);
+        let bw = grid.blocks_wide();
+        let bt = grid.blocks_tall();
+        for br in 0..bt {
+            for bc in 0..bw {
+                let block_slice = grid.block(br, bc);
+                let quantized: [i16; 64] = block_slice.try_into().unwrap();
+
+                // IDCT with old QT → pixel values → clamp → DCT with new QT
+                let mut px = pixels::idct_block(&quantized, &old_qt);
+                for p in px.iter_mut() {
+                    *p = p.clamp(0.0, 255.0);
+                }
+                let settled = pixels::dct_block(&px, &new_qt);
+                grid.block_mut(br, bc).copy_from_slice(&settled);
+            }
+        }
+
+        // Replace the quantization table
+        img.set_quant_table(qt_id, QuantTable::new(new_qt));
+        settled_qt_ids[qt_id] = true;
+    }
 }
