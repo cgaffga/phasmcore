@@ -23,15 +23,22 @@
 //!
 //! # Watson Perceptual Masking (magic 0xF6)
 //!
-//! Watson-inspired adaptive QIM uses AC energy per block to assign tiers:
-//! - Tier 0 (factor 1.0): smooth blocks — base QIM step
+//! Watson-inspired adaptive QIM uses AC energy per block to scale the QIM step.
+//! Two strategies are available, selected by `WATSON_CONTINUOUS`:
+//!
+//! **Option A — Discrete tiers** (fallback):
+//! - Tier 0 (factor 0.3): smooth blocks — reduced step for minimal artifacts
 //! - Tier 1 (factor 0.7): lightly textured — smaller QIM step
 //! - Tier 2 (factor 1.0): average texture — base QIM step
 //! - Tier 3 (factor 1.5): heavy texture — larger QIM step (hidden by texture)
 //!
+//! **Option C — Continuous piecewise-linear** (default):
+//! Smoothly interpolates the factor from 0.3 (smooth) to 1.5 (heavy texture)
+//! using only basic IEEE 754 arithmetic — deterministic on all platforms.
+//!
 //! ALL blocks are used for embedding (no skip tier). This guarantees that the
 //! payload block list is identical on encode and decode, even after JPEG
-//! recompression changes AC coefficients. Tiers only affect the per-block
+//! recompression changes AC coefficients. Masking only affects the per-block
 //! QIM step size for visual quality adaptation.
 
 use crate::jpeg::dct::DctGrid;
@@ -82,9 +89,11 @@ const WATSON_LOW_RATIO: f64 = 0.35;
 const WATSON_HIGH_RATIO: f64 = 2.0;
 
 /// QIM step factor per tier. ALL tiers are used for embedding (no skip).
-/// Tier 0 uses base step (1.0) — smooth blocks accept slight visibility
-/// in exchange for guaranteed payload alignment after recompression.
-const WATSON_TIER_FACTORS: [f64; 4] = [1.0, 0.7, 1.0, 1.5];
+/// Tier 0 uses a reduced step (0.3) — smooth blocks contribute with lower
+/// confidence but cause minimal visible artifacts (max ~1.8 pixel levels vs
+/// 6.0 at 1.0). The soft-LLR decode naturally weights these lower-confidence
+/// bits less. This gives 3.6x margin over WhatsApp recompression shifts.
+const WATSON_TIER_FACTORS: [f64; 4] = [0.3, 0.7, 1.0, 1.5];
 
 // --- Watson perceptual masking ---
 
@@ -158,6 +167,116 @@ fn compute_watson_tiers(grid: &DctGrid) -> WatsonTiers {
 /// Get the QIM step factor for a given Watson tier.
 fn watson_step_factor(tier: u8) -> f64 {
     WATSON_TIER_FACTORS[tier as usize]
+}
+
+/// When true, use continuous Watson factors (Option C).
+/// When false, use discrete Watson tiers (Option A fallback).
+const WATSON_CONTINUOUS: bool = true;
+
+/// Continuous Watson factor: piecewise-linear mapping from AC energy ratio
+/// to QIM step factor. Uses only basic arithmetic — deterministic on all
+/// platforms including WASM.
+///
+/// Anchor points (matching the discrete tier boundaries):
+///   ratio <= 0.01 → 0.3 (floor: very smooth)
+///   ratio  = 0.35 → 0.7 (light texture)
+///   ratio  = 2.0  → 1.0 (average texture)
+///   ratio >= 4.0  → 1.5 (ceiling: heavy texture)
+fn watson_continuous_factor(ratio: f64) -> f64 {
+    const R0: f64 = 0.01;
+    const R1: f64 = 0.35;
+    const R2: f64 = 2.0;
+    const R3: f64 = 4.0;
+    const F0: f64 = 0.3;
+    const F1: f64 = 0.7;
+    const F2: f64 = 1.0;
+    const F3: f64 = 1.5;
+
+    if ratio <= R0 {
+        F0
+    } else if ratio <= R1 {
+        F0 + (ratio - R0) / (R1 - R0) * (F1 - F0)
+    } else if ratio <= R2 {
+        F1 + (ratio - R1) / (R2 - R1) * (F2 - F1)
+    } else if ratio <= R3 {
+        F2 + (ratio - R2) / (R3 - R2) * (F3 - F2)
+    } else {
+        F3
+    }
+}
+
+/// Continuous Watson factor assignment for all blocks.
+struct WatsonFactors {
+    factors: Vec<f64>,
+}
+
+/// Watson masking data — either discrete (Option A) or continuous (Option C).
+enum WatsonMasking {
+    Tiers(WatsonTiers),
+    Factors(WatsonFactors),
+}
+
+impl WatsonMasking {
+    fn step_factor(&self, block_idx: usize) -> f64 {
+        match self {
+            WatsonMasking::Tiers(wt) => watson_step_factor(wt.tiers[block_idx]),
+            WatsonMasking::Factors(wf) => wf.factors[block_idx],
+        }
+    }
+}
+
+/// Compute continuous Watson factors from AC energy of each Y-channel 8x8 block.
+///
+/// Same AC energy + median logic as `compute_watson_tiers()`, but maps each
+/// block's energy ratio through `watson_continuous_factor()` for smooth
+/// step-size adaptation.
+fn compute_watson_factors(grid: &DctGrid) -> WatsonFactors {
+    let blocks_wide = grid.blocks_wide();
+    let blocks_tall = grid.blocks_tall();
+    let total_blocks = blocks_wide * blocks_tall;
+
+    // 1. Compute AC energy per block (same as compute_watson_tiers).
+    let mut ac_energies: Vec<f64> = Vec::with_capacity(total_blocks);
+    for br in 0..blocks_tall {
+        for bc in 0..blocks_wide {
+            let block = grid.block(br, bc);
+            let mut energy: f64 = 0.0;
+            for k in 1..64 {
+                let c = block[k];
+                if c.abs() >= 2 {
+                    energy += (c as f64) * (c as f64);
+                }
+            }
+            ac_energies.push(energy);
+        }
+    }
+
+    // 2. Median.
+    let mut sorted = ac_energies.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = if total_blocks == 0 {
+        1.0
+    } else {
+        sorted[total_blocks / 2].max(1.0)
+    };
+
+    // 3. Continuous factor per block.
+    let factors = ac_energies
+        .iter()
+        .map(|&energy| watson_continuous_factor(energy / median))
+        .collect();
+
+    WatsonFactors { factors }
+}
+
+/// Compute Watson masking: dispatches to tiers or continuous factors
+/// based on `WATSON_CONTINUOUS`.
+fn compute_watson_masking(grid: &DctGrid) -> WatsonMasking {
+    if WATSON_CONTINUOUS {
+        WatsonMasking::Factors(compute_watson_factors(grid))
+    } else {
+        WatsonMasking::Tiers(compute_watson_tiers(grid))
+    }
 }
 
 // --- BA-QIM core functions ---
@@ -308,9 +427,9 @@ pub fn fortress_encode(
         return Err(StegoError::ImageTooSmall);
     }
 
-    // Compute Watson tiers from AC energy (before any DC modifications).
-    // All tiers are used for embedding — tiers only affect step size.
-    let watson = compute_watson_tiers(grid);
+    // Compute Watson masking from AC energy (before any DC modifications).
+    // All blocks are used for embedding — masking only affects step size.
+    let watson = compute_watson_masking(grid);
 
     // Derive fortress structural key for block permutation.
     let fort_key = crypto::derive_fortress_structural_key(passphrase);
@@ -376,8 +495,7 @@ pub fn fortress_encode(
         if payload_idx >= rep_bits.len() {
             break;
         }
-        let tier = watson.tiers[block_idx];
-        let step = QIM_STEP * watson_step_factor(tier);
+        let step = QIM_STEP * watson.step_factor(block_idx);
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
         let dc = grid_mut.get(br, bc, 0, 0);
@@ -437,16 +555,15 @@ pub fn fortress_decode(
         return Err(StegoError::FrameCorrupted);
     }
 
-    // Watson adaptive step sizes: compute tiers for per-block step factors.
+    // Watson adaptive step sizes: compute masking for per-block step factors.
     // ALL blocks are used — no filtering. This guarantees alignment with encoder.
-    let watson = compute_watson_tiers(grid);
+    let watson = compute_watson_masking(grid);
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
 
     // Extract per-block LLRs from ALL payload blocks (no skip filtering).
     let mut payload_llrs = Vec::with_capacity(remaining_perm.len());
     for &block_idx in remaining_perm {
-        let tier = watson.tiers[block_idx];
-        let step = QIM_STEP * watson_step_factor(tier);
+        let step = QIM_STEP * watson.step_factor(block_idx);
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
         let dc = grid.get(br, bc, 0, 0);
@@ -824,7 +941,7 @@ mod tests {
     #[test]
     fn watson_step_factors_correct() {
         // Verify the step factor lookup works for all tiers.
-        assert_eq!(watson_step_factor(0), 1.0);
+        assert_eq!(watson_step_factor(0), 0.3);
         assert_eq!(watson_step_factor(1), 0.7);
         assert_eq!(watson_step_factor(2), 1.0);
         assert_eq!(watson_step_factor(3), 1.5);
@@ -856,5 +973,124 @@ mod tests {
             watson.tiers.iter().all(|&t| t == 2),
             "All blocks with ratio=1.0 should be tier 2"
         );
+    }
+
+    // --- Continuous Watson factor tests ---
+
+    #[test]
+    fn watson_continuous_factor_anchor_points() {
+        // Verify exact values at anchor points.
+        assert_eq!(watson_continuous_factor(0.0), 0.3, "ratio=0.0 → 0.3");
+        assert_eq!(watson_continuous_factor(0.01), 0.3, "ratio=0.01 → 0.3");
+        assert!((watson_continuous_factor(0.35) - 0.7).abs() < 1e-12, "ratio=0.35 → 0.7");
+        assert!((watson_continuous_factor(2.0) - 1.0).abs() < 1e-12, "ratio=2.0 → 1.0");
+        assert!((watson_continuous_factor(4.0) - 1.5).abs() < 1e-12, "ratio=4.0 → 1.5");
+        assert_eq!(watson_continuous_factor(10.0), 1.5, "ratio=10.0 → 1.5");
+    }
+
+    #[test]
+    fn watson_continuous_factor_monotonic() {
+        // Sweep 0..10 in 0.001 steps, assert non-decreasing.
+        let mut prev = watson_continuous_factor(0.0);
+        let mut r = 0.001;
+        while r <= 10.0 {
+            let f = watson_continuous_factor(r);
+            assert!(
+                f >= prev - 1e-12,
+                "Not monotonic at ratio={r}: {f} < {prev}"
+            );
+            prev = f;
+            r += 0.001;
+        }
+    }
+
+    #[test]
+    fn watson_continuous_factor_midpoints() {
+        // Verify interpolation at segment midpoints.
+        // Midpoint of [0.01, 0.35] → midpoint of [0.3, 0.7] = 0.5
+        let mid1 = watson_continuous_factor((0.01 + 0.35) / 2.0);
+        assert!((mid1 - 0.5).abs() < 1e-10, "Midpoint segment 1: expected ~0.5, got {mid1}");
+
+        // Midpoint of [0.35, 2.0] → midpoint of [0.7, 1.0] = 0.85
+        let mid2 = watson_continuous_factor((0.35 + 2.0) / 2.0);
+        assert!((mid2 - 0.85).abs() < 1e-10, "Midpoint segment 2: expected ~0.85, got {mid2}");
+
+        // Midpoint of [2.0, 4.0] → midpoint of [1.0, 1.5] = 1.25
+        let mid3 = watson_continuous_factor((2.0 + 4.0) / 2.0);
+        assert!((mid3 - 1.25).abs() < 1e-10, "Midpoint segment 3: expected ~1.25, got {mid3}");
+    }
+
+    #[test]
+    fn watson_continuous_factor_deterministic() {
+        // Same input must produce bit-identical output.
+        for ratio in [0.0, 0.005, 0.18, 1.0, 3.0, 5.0, 100.0] {
+            let a = watson_continuous_factor(ratio);
+            let b = watson_continuous_factor(ratio);
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "Not bit-identical at ratio={ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn watson_factors_all_smooth() {
+        // All-smooth grid → all factors = 0.3 (floor).
+        let blocks: Vec<[i16; 64]> = (0..9).map(|_| smooth_block()).collect();
+        let grid = make_grid(3, 3, &blocks);
+        let wf = compute_watson_factors(&grid);
+        assert!(
+            wf.factors.iter().all(|&f| f == 0.3),
+            "All smooth blocks should have factor 0.3"
+        );
+    }
+
+    #[test]
+    fn watson_factors_encode_decode_roundtrip() {
+        // Full encode/decode roundtrip with continuous Watson factors.
+        use crate::stego::armor::pipeline::{armor_encode, armor_decode};
+
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
+
+        let passphrase = "continuous-watson-test";
+
+        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let fort_cap = fortress_capacity(&img).unwrap();
+        assert!(fort_cap >= 1, "Fortress capacity must be >= 1");
+
+        let message = if fort_cap >= 4 { "Hi!!" } else { "Hi" };
+
+        let stego_bytes = armor_encode(&test_jpeg, message, passphrase)
+            .expect("Continuous Watson encode should succeed");
+
+        let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
+            .expect("Continuous Watson decode should succeed");
+
+        assert_eq!(decoded_msg, message, "Decoded message must match");
+        assert!(quality.fortress_used, "Should use fortress mode");
+    }
+
+    #[test]
+    fn watson_masking_dispatch() {
+        // Verify WatsonMasking dispatches correctly to both backends.
+        let blocks = vec![
+            smooth_block(),
+            smooth_block(),
+            medium_block(),
+            textured_block(),
+        ];
+        let grid = make_grid(4, 1, &blocks);
+
+        let masking = compute_watson_masking(&grid);
+        // All blocks should return a factor in [0.3, 1.5].
+        for i in 0..4 {
+            let f = masking.step_factor(i);
+            assert!(
+                (0.3..=1.5).contains(&f),
+                "Factor for block {i} out of range: {f}"
+            );
+        }
     }
 }
