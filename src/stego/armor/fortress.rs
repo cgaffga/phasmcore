@@ -24,13 +24,15 @@
 //! # Watson Perceptual Masking (magic 0xF6)
 //!
 //! Watson-inspired adaptive QIM uses AC energy per block to assign tiers:
-//! - Tier 0 (skip): extremely smooth blocks — don't embed
-//! - Tier 1 (factor 0.7): smooth blocks — smaller QIM step (less visible)
+//! - Tier 0 (factor 1.0): smooth blocks — base QIM step
+//! - Tier 1 (factor 0.7): lightly textured — smaller QIM step
 //! - Tier 2 (factor 1.0): average texture — base QIM step
 //! - Tier 3 (factor 1.5): heavy texture — larger QIM step (hidden by texture)
 //!
-//! This improves visual quality by adapting the embedding strength to the
-//! perceptual masking capability of each block.
+//! ALL blocks are used for embedding (no skip tier). This guarantees that the
+//! payload block list is identical on encode and decode, even after JPEG
+//! recompression changes AC coefficients. Tiers only affect the per-block
+//! QIM step size for visual quality adaptation.
 
 use crate::jpeg::dct::DctGrid;
 use crate::jpeg::JpegImage;
@@ -67,8 +69,11 @@ const FORTRESS_HEADER_COPIES: usize = 7;
 
 // --- Watson tier constants ---
 
-/// Blocks with AC energy ratio below this are skipped (tier 0).
-const WATSON_SKIP_RATIO: f64 = 0.06;
+/// Blocks with AC energy ratio below this are tier 0 (smooth — base step).
+/// Previously these were skipped, but skipping causes catastrophic payload
+/// misalignment when recompression changes AC energies across QF levels.
+/// Now all blocks are used; tier 0 simply gets the base step factor (1.0).
+const WATSON_SKIP_RATIO: f64 = 0.01;
 
 /// Blocks with AC energy ratio below this (but >= SKIP) are tier 1 (smooth).
 const WATSON_LOW_RATIO: f64 = 0.35;
@@ -76,17 +81,18 @@ const WATSON_LOW_RATIO: f64 = 0.35;
 /// Blocks with AC energy ratio >= this are tier 3 (heavy texture).
 const WATSON_HIGH_RATIO: f64 = 2.0;
 
-/// QIM step factor per tier. Tier 0 is unused (skip), tiers 1-3 scale the base step.
-const WATSON_TIER_FACTORS: [f64; 4] = [0.0, 0.7, 1.0, 1.5];
+/// QIM step factor per tier. ALL tiers are used for embedding (no skip).
+/// Tier 0 uses base step (1.0) — smooth blocks accept slight visibility
+/// in exchange for guaranteed payload alignment after recompression.
+const WATSON_TIER_FACTORS: [f64; 4] = [1.0, 0.7, 1.0, 1.5];
 
 // --- Watson perceptual masking ---
 
 /// Watson tier assignment for all blocks in the Y-channel DctGrid.
 struct WatsonTiers {
-    /// Per-block tier (0 = skip, 1/2/3 = embed with corresponding factor).
+    /// Per-block tier (0/1/2/3 = embed with corresponding step factor).
+    /// All tiers are used for embedding — no blocks are skipped.
     tiers: Vec<u8>,
-    /// Number of blocks with tier >= 1 (usable for embedding).
-    usable_count: usize,
 }
 
 /// Compute Watson tiers from AC energy of each Y-channel 8x8 block.
@@ -104,11 +110,16 @@ fn compute_watson_tiers(grid: &DctGrid) -> WatsonTiers {
     for br in 0..blocks_tall {
         for bc in 0..blocks_wide {
             let block = grid.block(br, bc);
-            // Sum of squares of all non-DC coefficients (indices 1..64)
+            // Sum of squares of AC coefficients with |c| >= 2.
+            // Ignoring |c| <= 1 makes energy robust to recompression:
+            // small coefficients are the first to be zeroed by re-quantization,
+            // but coefficients with |c| >= 2 are 99.99%+ stable.
             let mut energy: f64 = 0.0;
             for k in 1..64 {
-                let c = block[k] as f64;
-                energy += c * c;
+                let c = block[k];
+                if c.abs() >= 2 {
+                    energy += (c as f64) * (c as f64);
+                }
             }
             ac_energies.push(energy);
         }
@@ -124,8 +135,9 @@ fn compute_watson_tiers(grid: &DctGrid) -> WatsonTiers {
     };
 
     // 3. Assign tier based on ratio = energy / median.
+    //    All tiers (including 0) are used for embedding — no blocks are skipped.
+    //    Tiers only affect the QIM step size for visual quality adaptation.
     let mut tiers = Vec::with_capacity(total_blocks);
-    let mut usable_count = 0usize;
     for &energy in &ac_energies {
         let ratio = energy / median;
         let tier = if ratio < WATSON_SKIP_RATIO {
@@ -137,16 +149,10 @@ fn compute_watson_tiers(grid: &DctGrid) -> WatsonTiers {
         } else {
             3u8
         };
-        if tier > 0 {
-            usable_count += 1;
-        }
         tiers.push(tier);
     }
 
-    WatsonTiers {
-        tiers,
-        usable_count,
-    }
+    WatsonTiers { tiers }
 }
 
 /// Get the QIM step factor for a given Watson tier.
@@ -214,8 +220,8 @@ fn permute_blocks(total_blocks: usize, seed: &[u8; 32]) -> Vec<usize> {
 /// Maximum frame bytes that can be embedded in a fortress-encoded image.
 ///
 /// Returns the max frame_bytes (before RS encoding) that fits in the available
-/// blocks, accounting for header, RS parity, repetition coding (r >= 5),
-/// and Watson filtering (approximated as usable_count / total_blocks ratio).
+/// blocks, accounting for header, RS parity, and repetition coding (r >= MIN_R).
+/// All blocks are used for payload (no Watson skip filtering).
 pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let total_blocks = grid.blocks_wide() * grid.blocks_tall();
@@ -224,23 +230,7 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
         return Ok(0);
     }
 
-    // Compute Watson tiers for capacity estimation.
-    let watson = compute_watson_tiers(grid);
-
-    // Approximate Watson-filtered payload blocks.
-    // We don't have the passphrase here (no permutation), so we estimate:
-    // payload_blocks = (total_blocks - HEADER_BLOCKS) * watson.usable_count / total_blocks
-    // This is a safe underestimate.
-    let raw_payload = total_blocks - FORTRESS_HEADER_BLOCKS;
-    let payload_blocks = if total_blocks > 0 {
-        raw_payload * watson.usable_count / total_blocks
-    } else {
-        0
-    };
-
-    if payload_blocks == 0 {
-        return Ok(0);
-    }
+    let payload_blocks = total_blocks - FORTRESS_HEADER_BLOCKS;
 
     // Try each parity tier to find the best fit.
     let mut best_frame_bytes = 0usize;
@@ -319,26 +309,19 @@ pub fn fortress_encode(
     }
 
     // Compute Watson tiers from AC energy (before any DC modifications).
+    // All tiers are used for embedding — tiers only affect step size.
     let watson = compute_watson_tiers(grid);
 
     // Derive fortress structural key for block permutation.
     let fort_key = crypto::derive_fortress_structural_key(passphrase);
     let perm = permute_blocks(total_blocks, &fort_key);
 
-    // Build Watson-filtered payload block list: permuted blocks after header,
-    // excluding tier-0 (skip) blocks.
+    // Payload block list: ALL permuted blocks after header (no filtering).
+    // This guarantees the same block list on encode and decode regardless
+    // of AC energy changes from recompression.
     let header_perm = &perm[..FORTRESS_HEADER_BLOCKS];
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
-    let payload_block_indices: Vec<usize> = remaining_perm
-        .iter()
-        .copied()
-        .filter(|&block_idx| watson.tiers[block_idx] > 0)
-        .collect();
-    let payload_blocks = payload_block_indices.len();
-
-    if payload_blocks == 0 {
-        return Err(StegoError::ImageTooSmall);
-    }
+    let payload_blocks = remaining_perm.len();
 
     // RS-encode with best parity tier (smallest parity where r >= FORTRESS_MIN_R).
     let mut chosen_parity = ecc::PARITY_TIERS[0];
@@ -389,7 +372,7 @@ pub fn fortress_encode(
     }
 
     // Embed payload using Watson-adaptive per-block QIM step.
-    for (payload_idx, &block_idx) in payload_block_indices.iter().enumerate() {
+    for (payload_idx, &block_idx) in remaining_perm.iter().enumerate() {
         if payload_idx >= rep_bits.len() {
             break;
         }
@@ -454,17 +437,15 @@ pub fn fortress_decode(
         return Err(StegoError::FrameCorrupted);
     }
 
-    // Watson mode: compute tiers, filter payload blocks, use per-block steps.
+    // Watson adaptive step sizes: compute tiers for per-block step factors.
+    // ALL blocks are used — no filtering. This guarantees alignment with encoder.
     let watson = compute_watson_tiers(grid);
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
 
-    // Build Watson-filtered payload blocks + per-block LLRs.
-    let mut payload_llrs = Vec::new();
+    // Extract per-block LLRs from ALL payload blocks (no skip filtering).
+    let mut payload_llrs = Vec::with_capacity(remaining_perm.len());
     for &block_idx in remaining_perm {
         let tier = watson.tiers[block_idx];
-        if tier == 0 {
-            continue; // skip smooth blocks
-        }
         let step = QIM_STEP * watson_step_factor(tier);
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
@@ -494,7 +475,7 @@ fn decode_fortress_payload(
     // Use r >= 3 on decode (not FORTRESS_MIN_R) for backward compatibility
     // with images encoded before the min-r increase.
     for &parity in &ecc::PARITY_TIERS {
-        let candidate_rs = compute_fortress_candidate_rs(payload_blocks, parity);
+        let candidate_rs = super::pipeline::compute_candidate_rs(payload_blocks, parity);
 
         for r in candidate_rs {
             let rs_bit_count = payload_blocks / r;
@@ -511,7 +492,7 @@ fn decode_fortress_payload(
             let voted_bytes = frame::bits_to_bytes(&voted_bits);
 
             if let Some((decoded_frame, rs_stats)) =
-                try_fortress_rs_decode(&voted_bytes, parity)
+                super::pipeline::try_rs_decode_frame_with_parity(&voted_bytes, parity)
             {
                 if let Ok(parsed) = frame::parse_frame(&decoded_frame) {
                     if let Ok(plaintext) = crypto::decrypt(
@@ -560,97 +541,6 @@ fn extract_magic_byte(header_llrs: &[f64]) -> u8 {
         }
     }
     byte
-}
-
-/// Compute distinct candidate r values for fortress decode.
-fn compute_fortress_candidate_rs(payload_blocks: usize, parity: usize) -> Vec<usize> {
-    let mut rs_set = std::collections::BTreeSet::new();
-
-    let min_frame = frame::FRAME_OVERHEAD;
-    let max_frame = frame::MAX_FRAME_BYTES;
-
-    for frame_len in min_frame..=max_frame {
-        let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
-        let rs_bits = rs_encoded_len * 8;
-        if rs_bits > payload_blocks {
-            continue;
-        }
-        let r = repetition::compute_r(rs_bits, payload_blocks);
-        if r >= 3 {
-            rs_set.insert(r);
-        }
-    }
-
-    rs_set.into_iter().collect()
-}
-
-/// Try RS decode with a specific parity — mirrors pipeline's try_rs_decode_frame_with_parity.
-fn try_fortress_rs_decode(
-    extracted_bytes: &[u8],
-    parity: usize,
-) -> Option<(Vec<u8>, ecc::RsDecodeStats)> {
-    let k_max = 255 - parity;
-    let min_data = 2usize.min(k_max);
-
-    for data_len in min_data..=k_max.min(extracted_bytes.len().saturating_sub(parity)) {
-        let block_len = data_len + parity;
-        if block_len > extracted_bytes.len() {
-            break;
-        }
-
-        if let Ok((first_block_data, first_errors)) =
-            ecc::rs_decode_with_parity(&extracted_bytes[..block_len], data_len, parity)
-        {
-            if first_block_data.len() >= 2 {
-                let pt_len =
-                    u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
-                let ct_len = pt_len + 16;
-                let total_frame_len = 2 + 16 + 12 + ct_len + 4;
-
-                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
-                    continue;
-                }
-
-                if total_frame_len == data_len {
-                    let t_max = parity / 2;
-                    let stats = ecc::RsDecodeStats {
-                        total_errors: first_errors,
-                        error_capacity: t_max,
-                        max_block_errors: first_errors,
-                        num_blocks: 1,
-                    };
-                    return Some((first_block_data, stats));
-                }
-
-                if total_frame_len < data_len {
-                    let t_max = parity / 2;
-                    let stats = ecc::RsDecodeStats {
-                        total_errors: first_errors,
-                        error_capacity: t_max,
-                        max_block_errors: first_errors,
-                        num_blocks: 1,
-                    };
-                    return Some((first_block_data[..total_frame_len].to_vec(), stats));
-                }
-
-                if total_frame_len > data_len {
-                    let rs_encoded_len =
-                        ecc::rs_encoded_len_with_parity(total_frame_len, parity);
-                    if rs_encoded_len <= extracted_bytes.len() {
-                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
-                            &extracted_bytes[..rs_encoded_len],
-                            total_frame_len,
-                            parity,
-                        ) {
-                            return Some((decoded, stats));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -821,25 +711,15 @@ mod tests {
 
         assert_eq!(watson.tiers.len(), 4);
 
-        // Smooth blocks (AC energy = 0) should be tier 0 (skip).
-        assert_eq!(watson.tiers[0], 0, "Smooth block should be tier 0 (skip)");
-        assert_eq!(watson.tiers[1], 0, "Smooth block should be tier 0 (skip)");
+        // Smooth blocks (AC energy = 0) should be tier 0 (base step).
+        assert_eq!(watson.tiers[0], 0, "Smooth block should be tier 0");
+        assert_eq!(watson.tiers[1], 0, "Smooth block should be tier 0");
 
         // Textured block should be tier 2 or 3 (high energy).
         assert!(
             watson.tiers[3] >= 2,
             "Textured block should be tier 2 or 3, got {}",
             watson.tiers[3]
-        );
-
-        // usable_count should exclude tier-0 blocks.
-        assert!(
-            watson.usable_count >= 1,
-            "Should have at least 1 usable block"
-        );
-        assert!(
-            watson.usable_count <= 4,
-            "Cannot have more usable blocks than total"
         );
     }
 
@@ -863,20 +743,17 @@ mod tests {
         let watson_b = compute_watson_tiers(&grid);
 
         assert_eq!(watson_a.tiers, watson_b.tiers, "Watson tiers must be deterministic");
-        assert_eq!(
-            watson_a.usable_count, watson_b.usable_count,
-            "Usable count must be deterministic"
-        );
     }
 
     #[test]
     fn watson_ac_energy_invariant() {
-        // Verify that AC energy is unchanged after DC modification.
+        // Verify that AC energy (|c| >= 2 only) is unchanged after DC modification.
         // This is the key invariant that makes Watson tiers identical on
         // encode and decode: Fortress only modifies DC (index 0), not AC.
         let mut block = textured_block();
         let original_ac_energy: f64 = block[1..64]
             .iter()
+            .filter(|&&c| c.abs() >= 2)
             .map(|&c| (c as f64) * (c as f64))
             .sum();
 
@@ -884,6 +761,7 @@ mod tests {
         block[0] = 42;
         let modified_ac_energy: f64 = block[1..64]
             .iter()
+            .filter(|&&c| c.abs() >= 2)
             .map(|&c| (c as f64) * (c as f64))
             .sum();
 
@@ -946,7 +824,7 @@ mod tests {
     #[test]
     fn watson_step_factors_correct() {
         // Verify the step factor lookup works for all tiers.
-        assert_eq!(watson_step_factor(0), 0.0);
+        assert_eq!(watson_step_factor(0), 1.0);
         assert_eq!(watson_step_factor(1), 0.7);
         assert_eq!(watson_step_factor(2), 1.0);
         assert_eq!(watson_step_factor(3), 1.5);
@@ -959,9 +837,8 @@ mod tests {
         let grid = make_grid(3, 3, &blocks);
         let watson = compute_watson_tiers(&grid);
 
-        // All blocks have zero AC energy, median = max(0, 1.0) = 1.0,
-        // ratio = 0 / 1.0 = 0.0 < 0.06, so all are tier 0.
-        assert_eq!(watson.usable_count, 0, "All smooth blocks should be skipped");
+        // All blocks have zero AC energy (no |c| >= 2), median = max(0, 1.0) = 1.0,
+        // ratio = 0 / 1.0 = 0.0 < 0.01, so all are tier 0 (base step, not skipped).
         assert!(watson.tiers.iter().all(|&t| t == 0));
     }
 
@@ -974,7 +851,7 @@ mod tests {
 
         // All blocks have the same energy, ratio = energy/energy = 1.0,
         // which falls in [0.35, 2.0) → tier 2.
-        assert_eq!(watson.usable_count, 9, "All uniform-texture blocks should be usable");
+        // All blocks are always usable now (no skip tier).
         assert!(
             watson.tiers.iter().all(|&t| t == 2),
             "All blocks with ratio=1.0 should be tier 2"
