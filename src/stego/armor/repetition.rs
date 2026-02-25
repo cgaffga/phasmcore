@@ -80,6 +80,68 @@ pub fn repetition_decode_soft(llrs: &[f64], rs_bit_count: usize) -> Vec<u8> {
     voted
 }
 
+/// Stats from repetition decode for signal quality measurement.
+#[derive(Debug, Clone)]
+pub struct RepetitionQuality {
+    /// Average |LLR| per copy per bit position.
+    ///
+    /// For each bit position, we sum the LLR across r copies, take the absolute
+    /// value, divide by r to get the per-copy average, then average across all
+    /// bit positions. This normalizes out the repetition factor so the reference
+    /// value is always `delta/2` (STDM) or `step/2` (QIM) regardless of r.
+    pub avg_abs_llr_per_copy: f64,
+}
+
+/// Soft majority voting with quality statistics.
+///
+/// Same logic as `repetition_decode_soft`, but also tracks the average |LLR|
+/// per copy per bit position for signal quality measurement.
+pub fn repetition_decode_soft_with_quality(
+    llrs: &[f64],
+    rs_bit_count: usize,
+) -> (Vec<u8>, RepetitionQuality) {
+    if rs_bit_count == 0 {
+        return (
+            Vec::new(),
+            RepetitionQuality {
+                avg_abs_llr_per_copy: 0.0,
+            },
+        );
+    }
+
+    let r = llrs.len() / rs_bit_count;
+    let mut voted = Vec::with_capacity(rs_bit_count);
+    let mut sum_abs_llr_per_copy = 0.0;
+
+    for i in 0..rs_bit_count {
+        let mut total_llr = 0.0;
+        for copy in 0..r {
+            let idx = copy * rs_bit_count + i;
+            if idx < llrs.len() {
+                total_llr += llrs[idx];
+            }
+        }
+        voted.push(if total_llr >= 0.0 { 0 } else { 1 });
+        // |summed_LLR| / r gives per-copy average for this bit position
+        if r > 0 {
+            sum_abs_llr_per_copy += total_llr.abs() / r as f64;
+        }
+    }
+
+    let avg_abs_llr_per_copy = if rs_bit_count > 0 {
+        sum_abs_llr_per_copy / rs_bit_count as f64
+    } else {
+        0.0
+    };
+
+    (
+        voted,
+        RepetitionQuality {
+            avg_abs_llr_per_copy,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +238,70 @@ mod tests {
             .collect();
         let voted = repetition_decode_soft(&llrs, rs_bits.len());
         assert_eq!(voted, rs_bits);
+    }
+
+    #[test]
+    fn with_quality_matches_soft_decode() {
+        // Verify that repetition_decode_soft_with_quality returns the same
+        // voted bits as repetition_decode_soft.
+        let rs_bits = vec![0, 1, 1, 0, 1, 0, 0, 1];
+        let num_units = 100;
+        let (encoded, r) = repetition_encode(&rs_bits, num_units);
+        let used = r * rs_bits.len();
+        let llrs: Vec<f64> = encoded[..used]
+            .iter()
+            .map(|&bit| if bit == 0 { 5.0 } else { -5.0 })
+            .collect();
+
+        let voted_plain = repetition_decode_soft(&llrs, rs_bits.len());
+        let (voted_quality, quality) = repetition_decode_soft_with_quality(&llrs, rs_bits.len());
+        assert_eq!(voted_plain, voted_quality, "Quality variant must produce same bits");
+        assert_eq!(voted_quality, rs_bits);
+        // For pristine LLRs of magnitude 5.0, the avg_abs_llr_per_copy should be 5.0
+        assert!((quality.avg_abs_llr_per_copy - 5.0).abs() < 0.01,
+            "Expected avg_abs_llr_per_copy ≈ 5.0, got {}", quality.avg_abs_llr_per_copy);
+    }
+
+    #[test]
+    fn with_quality_noisy_signal_lower() {
+        // Verify that noisy copies produce lower avg_abs_llr_per_copy
+        // than pristine copies.
+        let rs_bits = vec![0, 1, 0, 1];
+        let r = 5;
+        let rs_bit_count = rs_bits.len();
+        let total = rs_bit_count * r;
+
+        // Pristine: all copies have LLR magnitude 3.0
+        let pristine_llrs: Vec<f64> = (0..total)
+            .map(|idx| {
+                let bit_idx = idx % rs_bit_count;
+                if rs_bits[bit_idx] == 0 { 3.0 } else { -3.0 }
+            })
+            .collect();
+
+        // Noisy: 2 out of 5 copies of bit 0 are flipped
+        let mut noisy_llrs = pristine_llrs.clone();
+        for copy in 0..2 {
+            let idx = copy * rs_bit_count + 0; // bit position 0
+            noisy_llrs[idx] = -noisy_llrs[idx]; // flip
+        }
+
+        let (_, pristine_q) = repetition_decode_soft_with_quality(&pristine_llrs, rs_bit_count);
+        let (voted, noisy_q) = repetition_decode_soft_with_quality(&noisy_llrs, rs_bit_count);
+
+        // Should still decode correctly (3 out of 5 majority)
+        assert_eq!(voted, rs_bits);
+
+        // Noisy signal should have lower avg_abs_llr_per_copy
+        assert!(noisy_q.avg_abs_llr_per_copy < pristine_q.avg_abs_llr_per_copy,
+            "Noisy signal ({}) should be weaker than pristine ({})",
+            noisy_q.avg_abs_llr_per_copy, pristine_q.avg_abs_llr_per_copy);
+    }
+
+    #[test]
+    fn with_quality_empty_input() {
+        let (voted, quality) = repetition_decode_soft_with_quality(&[], 0);
+        assert!(voted.is_empty());
+        assert_eq!(quality.avg_abs_llr_per_copy, 0.0);
     }
 }

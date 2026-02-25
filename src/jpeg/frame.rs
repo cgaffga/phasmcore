@@ -18,7 +18,7 @@ pub struct Component {
     pub quant_table_id: u8,
 }
 
-/// Frame information parsed from SOF0 marker.
+/// Frame information parsed from SOF0/SOF2 marker.
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
     /// Sample precision in bits (must be 8).
@@ -41,6 +41,8 @@ pub struct FrameInfo {
     pub mcus_wide: u16,
     /// Number of MCUs vertically.
     pub mcus_tall: u16,
+    /// Whether this is a progressive JPEG (SOF2). False for baseline (SOF0).
+    pub is_progressive: bool,
 }
 
 impl FrameInfo {
@@ -57,8 +59,14 @@ impl FrameInfo {
     }
 }
 
-/// Parse a SOF0 marker segment body (after the 2-byte length).
+/// Parse a SOF0/SOF2 marker segment body (after the 2-byte length).
+/// `progressive` should be true for SOF2 markers.
 pub fn parse_sof(data: &[u8]) -> Result<FrameInfo> {
+    parse_sof_ext(data, false)
+}
+
+/// Parse a SOF marker segment body with explicit progressive flag.
+pub fn parse_sof_ext(data: &[u8], progressive: bool) -> Result<FrameInfo> {
     if data.len() < 6 {
         return Err(JpegError::UnexpectedEof);
     }
@@ -125,6 +133,7 @@ pub fn parse_sof(data: &[u8]) -> Result<FrameInfo> {
         mcu_height,
         mcus_wide,
         mcus_tall,
+        is_progressive: progressive,
     })
 }
 

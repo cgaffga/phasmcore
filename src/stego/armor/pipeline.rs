@@ -276,6 +276,9 @@ pub struct DecodeQuality {
     pub dft_ring_capacity: u16,
     /// True if Fortress sub-mode (BA-QIM) was used for encoding.
     pub fortress_used: bool,
+    /// Signal strength from LLR analysis (0.0 = no signal, higher = stronger).
+    /// Used to compute meaningful integrity when RS errors are 0.
+    pub signal_strength: f64,
 }
 
 impl DecodeQuality {
@@ -295,6 +298,7 @@ impl DecodeQuality {
             dft_ring_used: false,
             dft_ring_capacity: 0,
             fortress_used: false,
+            signal_strength: 0.0,
         }
     }
 
@@ -304,6 +308,10 @@ impl DecodeQuality {
     }
 
     /// Create quality info from Armor RS decode stats with Phase 2 metadata.
+    ///
+    /// **Legacy constructor** — kept for backward compatibility. Uses RS-only
+    /// integrity (always 100% when RS errors are 0). Prefer
+    /// `from_rs_stats_with_signal` for LLR-based integrity scoring.
     pub fn from_rs_stats_with_phase2(
         stats: &ecc::RsDecodeStats,
         repetition_factor: u8,
@@ -329,8 +337,81 @@ impl DecodeQuality {
             dft_ring_used: false,
             dft_ring_capacity: 0,
             fortress_used: false,
+            signal_strength: 0.0,
         }
     }
+
+    /// Create quality info from Armor RS decode stats with LLR signal quality.
+    ///
+    /// Combines LLR-based signal strength (70% weight) with RS error margin
+    /// (30% weight) to produce a meaningful integrity percentage even when
+    /// RS errors are 0 (because repetition coding absorbed all damage).
+    ///
+    /// - `signal_strength`: average |LLR| per copy per bit from extraction.
+    /// - `reference_llr`: expected |LLR| for a pristine embedding (delta/2 for
+    ///   STDM, step/2 for QIM).
+    pub fn from_rs_stats_with_signal(
+        stats: &ecc::RsDecodeStats,
+        repetition_factor: u8,
+        parity_len: u16,
+        signal_strength: f64,
+        reference_llr: f64,
+    ) -> Self {
+        let integrity = compute_integrity(signal_strength, stats, reference_llr);
+        Self {
+            mode: super::super::frame::MODE_ARMOR,
+            rs_errors_corrected: stats.total_errors as u32,
+            rs_error_capacity: stats.error_capacity as u32,
+            integrity_percent: integrity,
+            repetition_factor,
+            parity_len,
+            geometry_corrected: false,
+            template_peaks_detected: 0,
+            estimated_rotation_deg: 0.0,
+            estimated_scale: 1.0,
+            dft_ring_used: false,
+            dft_ring_capacity: 0,
+            fortress_used: false,
+            signal_strength,
+        }
+    }
+}
+
+/// Compute integrity from both LLR signal strength and RS error stats.
+///
+/// - `signal_strength`: average |LLR| per copy per bit from extraction.
+/// - `rs_stats`: Reed-Solomon error correction statistics.
+/// - `reference_llr`: expected |LLR| for a pristine embedding.
+///
+/// Weighting: 70% signal quality (LLR), 30% RS error margin.
+///
+/// For pristine images: signal_strength ≈ reference → integrity ~95-100%.
+/// For recompressed images: signal_strength drops → integrity ~60-80%.
+/// For severely degraded images: signal_strength near 0 → integrity ~30-50%.
+fn compute_integrity(signal_strength: f64, rs_stats: &ecc::RsDecodeStats, reference_llr: f64) -> u8 {
+    let llr_score = if reference_llr > 0.0 {
+        (signal_strength / reference_llr).min(1.0).max(0.0)
+    } else {
+        1.0 // No reference available, assume good
+    };
+    let rs_score = if rs_stats.error_capacity == 0 {
+        1.0
+    } else {
+        let ratio = rs_stats.total_errors as f64 / rs_stats.error_capacity as f64;
+        (1.0 - ratio).max(0.0)
+    };
+    // Weight: 70% signal quality, 30% RS margin
+    let combined = 0.7 * llr_score + 0.3 * rs_score;
+    (combined * 100.0).round().max(0.0).min(100.0) as u8
+}
+
+/// Compute average |LLR| from a slice of raw LLR values (Phase 1 path).
+fn compute_avg_abs_llr(llrs: &[f64]) -> f64 {
+    if llrs.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = llrs.iter().map(|llr| llr.abs()).sum();
+    sum / llrs.len() as f64
 }
 
 /// Decode a text message from a stego JPEG using Armor mode.
@@ -502,6 +583,7 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
                     dft_ring_used: true,
                     dft_ring_capacity: ring_cap as u16,
                     fortress_used: false,
+                    signal_strength: 0.0,
                 }));
             }
         }
@@ -559,6 +641,7 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
                             dft_ring_used: true,
                             dft_ring_capacity: ring_cap as u16,
                             fortress_used: false,
+                            signal_strength: 0.0,
                         }));
                     }
                 }
@@ -633,6 +716,11 @@ fn decode_phase1_with_offset(
         all_llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
     }
 
+    // Compute signal strength from raw LLRs (before hard decision)
+    let signal_strength = compute_avg_abs_llr(&all_llrs);
+    // Reference LLR for pristine STDM embedding: delta / 2
+    let reference_llr = delta / 2.0;
+
     // Convert LLRs to hard bits
     let extracted_bits: Vec<u8> = all_llrs.iter()
         .map(|&llr| if llr >= 0.0 { 0 } else { 1 })
@@ -655,7 +743,9 @@ fn decode_phase1_with_offset(
     }
 
     let text = std::str::from_utf8(&plaintext[..len]).map_err(|_| StegoError::InvalidUtf8)?;
-    let quality = DecodeQuality::from_rs_stats(&rs_stats);
+    let quality = DecodeQuality::from_rs_stats_with_signal(
+        &rs_stats, 1, ecc::parity_len() as u16, signal_strength, reference_llr,
+    );
     Ok((text.to_string(), quality))
 }
 
@@ -696,7 +786,9 @@ fn decode_phase2_search(
                 continue;
             }
 
-            let voted_bits = repetition::repetition_decode_soft(&raw_llrs[..used_llrs], rs_bit_count);
+            let (voted_bits, rep_quality) = repetition::repetition_decode_soft_with_quality(
+                &raw_llrs[..used_llrs], rs_bit_count,
+            );
             let voted_bytes = frame::bits_to_bytes(&voted_bits);
 
             // Try RS decode with this parity
@@ -708,8 +800,11 @@ fn decode_phase2_search(
                         let len = parsed.plaintext_len as usize;
                         if len <= plaintext.len() {
                             if let Ok(text) = std::str::from_utf8(&plaintext[..len]) {
-                                let quality = DecodeQuality::from_rs_stats_with_phase2(
+                                // Reference LLR for STDM: delta / 2
+                                let reference_llr = adaptive_delta / 2.0;
+                                let quality = DecodeQuality::from_rs_stats_with_signal(
                                     &rs_stats, r as u8, parity as u16,
+                                    rep_quality.avg_abs_llr_per_copy, reference_llr,
                                 );
                                 return Ok((text.to_string(), quality));
                             }
@@ -1132,5 +1227,157 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
             img.set_quant_table(*qt_id, QuantTable::new(*new_qt));
             replaced[*qt_id] = true;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_integrity_pristine() {
+        // Pristine: signal_strength == reference, 0 RS errors
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(15.0, &stats, 15.0);
+        // 0.7 * 1.0 + 0.3 * 1.0 = 1.0 → 100
+        assert_eq!(integrity, 100);
+    }
+
+    #[test]
+    fn compute_integrity_half_signal() {
+        // Signal is half the reference, no RS errors
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(7.5, &stats, 15.0);
+        // 0.7 * 0.5 + 0.3 * 1.0 = 0.65 → 65
+        assert_eq!(integrity, 65);
+    }
+
+    #[test]
+    fn compute_integrity_zero_signal() {
+        // No signal, no RS errors
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(0.0, &stats, 15.0);
+        // 0.7 * 0.0 + 0.3 * 1.0 = 0.3 → 30
+        assert_eq!(integrity, 30);
+    }
+
+    #[test]
+    fn compute_integrity_with_rs_errors() {
+        // Full signal, half RS capacity used
+        let stats = ecc::RsDecodeStats {
+            total_errors: 16,
+            error_capacity: 32,
+            max_block_errors: 16,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(15.0, &stats, 15.0);
+        // 0.7 * 1.0 + 0.3 * 0.5 = 0.85 → 85
+        assert_eq!(integrity, 85);
+    }
+
+    #[test]
+    fn compute_integrity_both_degraded() {
+        // Half signal, half RS capacity used
+        let stats = ecc::RsDecodeStats {
+            total_errors: 16,
+            error_capacity: 32,
+            max_block_errors: 16,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(7.5, &stats, 15.0);
+        // 0.7 * 0.5 + 0.3 * 0.5 = 0.5 → 50
+        assert_eq!(integrity, 50);
+    }
+
+    #[test]
+    fn compute_integrity_signal_exceeds_reference() {
+        // Signal > reference (clamped to 1.0)
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let integrity = compute_integrity(20.0, &stats, 15.0);
+        // 0.7 * 1.0 + 0.3 * 1.0 = 1.0 → 100 (clamped)
+        assert_eq!(integrity, 100);
+    }
+
+    #[test]
+    fn compute_integrity_zero_reference() {
+        // Edge case: reference_llr = 0 → llr_score defaults to 1.0
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 0,
+            max_block_errors: 0,
+            num_blocks: 0,
+        };
+        let integrity = compute_integrity(5.0, &stats, 0.0);
+        // llr_score = 1.0 (fallback), rs_score = 1.0 (error_capacity == 0)
+        assert_eq!(integrity, 100);
+    }
+
+    #[test]
+    fn compute_avg_abs_llr_basic() {
+        let llrs = vec![5.0, -3.0, 4.0, -2.0];
+        let avg = compute_avg_abs_llr(&llrs);
+        // (5 + 3 + 4 + 2) / 4 = 3.5
+        assert!((avg - 3.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn compute_avg_abs_llr_empty() {
+        assert_eq!(compute_avg_abs_llr(&[]), 0.0);
+    }
+
+    #[test]
+    fn decode_quality_ghost_unchanged() {
+        let q = DecodeQuality::ghost();
+        assert_eq!(q.integrity_percent, 100, "Ghost always 100%");
+        assert_eq!(q.signal_strength, 0.0);
+    }
+
+    #[test]
+    fn decode_quality_from_rs_stats_with_signal_pristine() {
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let q = DecodeQuality::from_rs_stats_with_signal(&stats, 5, 64, 15.0, 15.0);
+        assert_eq!(q.integrity_percent, 100);
+        assert!((q.signal_strength - 15.0).abs() < 1e-10);
+        assert_eq!(q.repetition_factor, 5);
+        assert_eq!(q.parity_len, 64);
+    }
+
+    #[test]
+    fn decode_quality_legacy_constructor_still_works() {
+        // from_rs_stats_with_phase2 should still give 100% for 0 errors
+        let stats = ecc::RsDecodeStats {
+            total_errors: 0,
+            error_capacity: 32,
+            max_block_errors: 0,
+            num_blocks: 1,
+        };
+        let q = DecodeQuality::from_rs_stats_with_phase2(&stats, 5, 64);
+        assert_eq!(q.integrity_percent, 100);
+        assert_eq!(q.signal_strength, 0.0);
     }
 }

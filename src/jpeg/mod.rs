@@ -1,23 +1,22 @@
 //! Pure-Rust JPEG coefficient codec (zero external dependencies).
 //!
-//! Reads and writes baseline JPEG files (SOF0), providing direct access to
-//! quantized DCT coefficients without any pixel-domain processing. This is
+//! Reads and writes baseline and progressive JPEG files, providing direct access
+//! to quantized DCT coefficients without any pixel-domain processing. This is
 //! the foundation for steganographic embedding, which operates entirely in
 //! the DCT domain.
 //!
 //! Supports:
 //! - Baseline sequential DCT (SOF0), 8-bit precision
+//! - Progressive DCT (SOF2) — read-only (always writes baseline)
 //! - YCbCr, grayscale, and arbitrary component counts
 //! - Chroma subsampling: 4:2:0, 4:2:2, 4:4:4
 //! - Restart markers (DRI/RST)
-//! - Byte-for-byte round-trip for unmodified images
+//! - Byte-for-byte round-trip for unmodified baseline images
 //! - Huffman table rebuild for modified coefficients
 //!
 //! Does NOT support:
-//! - Progressive JPEG (SOF2) -- rejected at parse time
 //! - Arithmetic coding (SOF9+) -- rejected at parse time
 //! - 12-bit precision -- rejected at parse time
-//! - Multi-scan images
 
 pub mod error;
 pub mod zigzag;
@@ -34,7 +33,7 @@ use dct::DctGrid;
 use error::{JpegError, Result};
 use frame::FrameInfo;
 use huffman::encode_value;
-use marker::{MarkerSegment, iterate_markers, parse_sos, parse_dri};
+use marker::{MarkerSegment, iterate_markers, iterate_markers_all, parse_sos, parse_sos_params, parse_dri};
 use scan::ScanComponent;
 use tables::{HuffmanSpec, parse_dqt, parse_dht};
 use zigzag::NATURAL_TO_ZIGZAG;
@@ -71,7 +70,56 @@ pub struct JpegImage {
 
 impl JpegImage {
     /// Parse a JPEG file from bytes.
+    ///
+    /// Supports both baseline (SOF0) and progressive (SOF2) JPEG.
+    /// Progressive images are decoded by accumulating all scans, then the
+    /// coefficients are stored exactly as in baseline — `to_bytes()` always
+    /// writes baseline output.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        // First pass: quick check if this is progressive by scanning for SOF2
+        // We use iterate_markers_all which handles multiple SOS markers.
+        let is_progressive = Self::check_progressive(data);
+
+        if is_progressive {
+            Self::from_bytes_progressive(data)
+        } else {
+            Self::from_bytes_baseline(data)
+        }
+    }
+
+    /// Quick check: does this JPEG contain a SOF2 marker?
+    fn check_progressive(data: &[u8]) -> bool {
+        // Scan for 0xFF 0xC2 in the header area (before any SOS)
+        let mut pos = 2; // skip SOI
+        while pos + 1 < data.len() {
+            if data[pos] == 0xFF {
+                let m = data[pos + 1];
+                if m == marker::SOF2 {
+                    return true;
+                }
+                if m == marker::SOS {
+                    return false; // Reached scan data without finding SOF2
+                }
+                if m == 0x00 || m == 0xFF || (m >= 0xD0 && m <= 0xD7) || m == marker::SOI || m == marker::EOI {
+                    pos += 2;
+                    continue;
+                }
+                // Skip segment
+                if pos + 3 < data.len() {
+                    let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+                    pos += 2 + len;
+                } else {
+                    break;
+                }
+            } else {
+                pos += 1;
+            }
+        }
+        false
+    }
+
+    /// Parse a baseline (SOF0) JPEG file.
+    fn from_bytes_baseline(data: &[u8]) -> Result<Self> {
         let (entries, scan_start) = iterate_markers(data)?;
 
         let mut frame_info: Option<FrameInfo> = None;
@@ -88,12 +136,10 @@ impl JpegImage {
                 marker::SOI => {}
                 marker::EOI => {}
                 marker::DQT => {
-                    // Store raw for preservation
                     raw_segments.push(MarkerSegment {
                         marker: entry.marker,
                         data: entry.data.clone(),
                     });
-                    // Parse for decoding
                     let tables = parse_dqt(&entry.data)?;
                     for (id, qt) in tables {
                         quant_tables[id as usize] = Some(qt);
@@ -149,7 +195,6 @@ impl JpegImage {
                     }
                 }
                 _ => {
-                    // Preserve all other markers (APPn, COM, etc.) verbatim
                     raw_segments.push(MarkerSegment {
                         marker: entry.marker,
                         data: entry.data.clone(),
@@ -160,7 +205,6 @@ impl JpegImage {
 
         let fi = frame_info.ok_or(JpegError::InvalidMarkerData("no SOF marker found"))?;
 
-        // Decode the scan
         let (grids, _end_pos) = scan::decode_scan(
             data,
             scan_start,
@@ -182,6 +226,228 @@ impl JpegImage {
             raw_segments,
             sos_data,
         })
+    }
+
+    /// Parse a progressive (SOF2) JPEG file.
+    ///
+    /// Progressive JPEG files have multiple SOS markers, each contributing
+    /// partial coefficient data. We accumulate all scans into DctGrids,
+    /// then store the result as if it were a baseline image.
+    fn from_bytes_progressive(data: &[u8]) -> Result<Self> {
+        let (entries, scan_starts) = iterate_markers_all(data)?;
+
+        let mut frame_info: Option<FrameInfo> = None;
+        let mut quant_tables: [Option<dct::QuantTable>; 4] = [None, None, None, None];
+        let mut dc_huff_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+        let mut ac_huff_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+        let mut restart_interval: u16 = 0;
+        let mut raw_segments = Vec::new();
+
+        // Collect all SOS entries with their scan start positions
+        struct ScanInfo {
+            components: Vec<ScanComponent>,
+            params: marker::SosParams,
+            scan_start: usize,
+            #[allow(dead_code)]
+            sos_data: Vec<u8>,
+        }
+        let mut scans: Vec<ScanInfo> = Vec::new();
+        let mut sos_index = 0usize;
+
+        for entry in &entries {
+            match entry.marker {
+                marker::SOI => {}
+                marker::EOI => {}
+                marker::DQT => {
+                    // Only preserve DQT/DRI in raw_segments (first occurrence)
+                    raw_segments.push(MarkerSegment {
+                        marker: entry.marker,
+                        data: entry.data.clone(),
+                    });
+                    let tables = parse_dqt(&entry.data)?;
+                    for (id, qt) in tables {
+                        quant_tables[id as usize] = Some(qt);
+                    }
+                }
+                marker::DHT => {
+                    // For progressive, DHT markers can appear between scans.
+                    // We accumulate all Huffman tables (later tables override earlier ones
+                    // with the same ID, which is the correct behavior).
+                    // Don't preserve DHT in raw_segments — we'll rebuild them.
+                    let specs = parse_dht(&entry.data)?;
+                    for spec in specs {
+                        let id = spec.id as usize;
+                        if spec.class == 0 {
+                            dc_huff_specs[id] = Some(spec);
+                        } else {
+                            ac_huff_specs[id] = Some(spec);
+                        }
+                    }
+                }
+                marker::SOF2 => {
+                    raw_segments.push(MarkerSegment {
+                        // Store as SOF0 for baseline output
+                        marker: marker::SOF0,
+                        data: entry.data.clone(),
+                    });
+                    frame_info = Some(frame::parse_sof_ext(&entry.data, true)?);
+                }
+                marker::SOF0 => {
+                    raw_segments.push(MarkerSegment {
+                        marker: entry.marker,
+                        data: entry.data.clone(),
+                    });
+                    frame_info = Some(frame::parse_sof(&entry.data)?);
+                }
+                marker::DRI => {
+                    raw_segments.push(MarkerSegment {
+                        marker: entry.marker,
+                        data: entry.data.clone(),
+                    });
+                    restart_interval = parse_dri(&entry.data)?;
+                }
+                marker::SOS => {
+                    let selectors = parse_sos(&entry.data)?;
+                    let params = parse_sos_params(&entry.data)?;
+                    let fi = frame_info
+                        .as_ref()
+                        .ok_or(JpegError::InvalidMarkerData("SOS before SOF"))?;
+
+                    let mut components = Vec::new();
+                    for (comp_id, dc_id, ac_id) in selectors {
+                        let comp_idx = fi
+                            .components
+                            .iter()
+                            .position(|c| c.id == comp_id)
+                            .ok_or(JpegError::UnknownComponentId(comp_id))?;
+                        components.push(ScanComponent {
+                            comp_idx,
+                            dc_table: dc_id as usize,
+                            ac_table: ac_id as usize,
+                        });
+                    }
+
+                    if sos_index < scan_starts.len() {
+                        scans.push(ScanInfo {
+                            components,
+                            params,
+                            scan_start: scan_starts[sos_index],
+                            sos_data: entry.data.clone(),
+                        });
+                        sos_index += 1;
+                    }
+                }
+                _ => {
+                    raw_segments.push(MarkerSegment {
+                        marker: entry.marker,
+                        data: entry.data.clone(),
+                    });
+                }
+            }
+        }
+
+        let fi = frame_info.ok_or(JpegError::InvalidMarkerData("no SOF marker found"))?;
+
+        // Allocate DctGrids for all components (initialized to zero)
+        let mut grids: Vec<DctGrid> = Vec::with_capacity(fi.components.len());
+        for comp_idx in 0..fi.components.len() {
+            let bw = fi.blocks_wide(comp_idx);
+            let bt = fi.blocks_tall(comp_idx);
+            grids.push(DctGrid::new(bw, bt));
+        }
+
+        // Snapshot the Huffman specs before processing scans, since progressive
+        // JPEG can define new DHT tables between scans.
+        // We already accumulated all DHTs above, which works for most files.
+        // However, some encoders define DHT tables incrementally before each scan.
+        // To handle this correctly, we need to re-parse DHTs in scan order.
+        // Let's re-parse by walking entries again, updating specs as we go.
+        let mut scan_dc_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+        let mut scan_ac_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+        let mut scan_idx = 0usize;
+
+        for entry in &entries {
+            match entry.marker {
+                marker::DHT => {
+                    let specs = parse_dht(&entry.data)?;
+                    for spec in specs {
+                        let id = spec.id as usize;
+                        if spec.class == 0 {
+                            scan_dc_specs[id] = Some(spec);
+                        } else {
+                            scan_ac_specs[id] = Some(spec);
+                        }
+                    }
+                }
+                marker::SOS => {
+                    if scan_idx < scans.len() {
+                        let scan = &scans[scan_idx];
+                        scan::decode_progressive_scan(
+                            data,
+                            scan.scan_start,
+                            &fi,
+                            &scan.components,
+                            &scan_dc_specs,
+                            &scan_ac_specs,
+                            restart_interval,
+                            &scan.params,
+                            &mut grids,
+                        )?;
+                        scan_idx += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // For baseline output, we need to build a single SOS header.
+        // Use all components in component order, with table IDs from the
+        // frame components (standard convention: luma=table 0, chroma=table 1).
+        let mut final_scan_components = Vec::new();
+        let mut final_sos_data = Vec::new();
+        final_sos_data.push(fi.components.len() as u8);
+
+        for (comp_idx, comp) in fi.components.iter().enumerate() {
+            // Use table ID 0 for luminance (first component), 1 for chrominance
+            let table_id = if comp_idx == 0 { 0usize } else { 1usize };
+            final_scan_components.push(ScanComponent {
+                comp_idx,
+                dc_table: table_id,
+                ac_table: table_id,
+            });
+            final_sos_data.push(comp.id);
+            final_sos_data.push(((table_id as u8) << 4) | (table_id as u8));
+        }
+        // Append baseline SOS parameters: Ss=0, Se=63, Ah=0, Al=0
+        final_sos_data.push(0);  // Ss
+        final_sos_data.push(63); // Se
+        final_sos_data.push(0);  // Ah=0, Al=0
+
+        // Build a minimal but complete set of baseline Huffman tables.
+        // We set the specs to None first, then rebuild from the coefficient data.
+        // This ensures the tables match the actual coefficient values.
+        let final_dc_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+        let final_ac_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
+
+        // Create the image with placeholder Huffman tables, then rebuild them.
+        let mut img = Self {
+            frame: FrameInfo { is_progressive: false, ..fi },
+            grids,
+            quant_tables,
+            dc_huff_specs: final_dc_specs,
+            ac_huff_specs: final_ac_specs,
+            scan_components: final_scan_components,
+            restart_interval,
+            raw_segments,
+            sos_data: final_sos_data,
+        };
+
+        // Rebuild Huffman tables from the actual coefficient data so they
+        // encode correctly as baseline. This also inserts DHT segments into
+        // raw_segments.
+        img.rebuild_huffman_tables();
+
+        Ok(img)
     }
 
     /// Encode the (possibly modified) image back to JPEG bytes.
