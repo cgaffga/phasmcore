@@ -45,15 +45,15 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 /// QIM step size in pixel-level units.
-/// Block averages shift <2 levels through QF70+ recompression, so step=8 gives
-/// a 2-level margin on each side of the decision boundary — sufficient for
-/// pre-settled images (QF70 encode → QF75 WhatsApp recompression).
-const QIM_STEP: f64 = 8.0;
+/// Block averages shift <2 levels through QF70+ recompression, so step=12 gives
+/// a 4-level margin on each side of the decision boundary — improved robustness
+/// for pre-settled images (QF70 encode → QF75 WhatsApp recompression).
+const QIM_STEP: f64 = 12.0;
 
 /// Minimum repetition factor for Fortress encode.
 /// Higher minimum = earlier switchover to STDM for longer messages = better quality.
-/// At r=5, a 1200×1600 image holds ~444 chars; a 1280×720 image holds ~197 chars.
-const FORTRESS_MIN_R: usize = 5;
+/// At r=7, capacity is lower but robustness is significantly improved.
+const FORTRESS_MIN_R: usize = 7;
 
 /// Magic byte embedded in the fortress header for fast detection.
 /// Uses Watson-adaptive QIM with per-block step sizes based on AC energy.
@@ -898,9 +898,10 @@ mod tests {
         // Full encode/decode roundtrip with Watson magic.
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        // Use a real JPEG from the test vectors.
-        let test_jpeg = std::fs::read("../test-vectors/photo_640x480_q75_420.jpg")
-            .expect("test vector photo_640x480_q75_420.jpg must exist");
+        // Use a larger JPEG from the test vectors (640x480 is too small for
+        // QIM_STEP=12, FORTRESS_MIN_R=7).
+        let test_jpeg = std::fs::read("../test-vectors/progressive_whatsapp_1200x1600.jpg")
+            .expect("test vector progressive_whatsapp_1200x1600.jpg must exist");
 
         let passphrase = "test-watson-pass";
 
@@ -909,7 +910,7 @@ mod tests {
         let fort_cap = fortress_capacity(&img).unwrap();
         assert!(
             fort_cap >= 1,
-            "Fortress capacity ({fort_cap}) must be at least 1 byte for 640x480 photo"
+            "Fortress capacity ({fort_cap}) must be at least 1 byte for 1200x1600 photo"
         );
 
         // Use the shortest meaningful message that fits.
