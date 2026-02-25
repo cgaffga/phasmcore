@@ -38,21 +38,10 @@ use rand_chacha::ChaCha20Rng;
 /// pre-settled images (QF70 encode → QF75 WhatsApp recompression).
 const QIM_STEP: f64 = 8.0;
 
-/// Minimum margin from the QIM decision boundary for nudge embedding.
-/// WhatsApp shifts block averages by max ~1.375 pixel levels for QF70 pre-settled
-/// images, so a 2.0 margin provides comfortable headroom.
-const QIM_MIN_MARGIN: f64 = 2.0;
-
 /// Minimum repetition factor for Fortress encode.
 /// Higher minimum = earlier switchover to STDM for longer messages = better quality.
 /// At r=5, a 1200×1600 image holds ~444 chars; a 1280×720 image holds ~197 chars.
 const FORTRESS_MIN_R: usize = 5;
-
-/// Maximum repetition factor for Fortress encode.
-/// Caps how many copies of the RS bitstream are embedded. With uncapped r, ALL
-/// payload blocks are modified (zero-padded repetition fills everything). Capping
-/// at 11 leaves most blocks untouched, dramatically improving image quality.
-const FORTRESS_MAX_R: usize = 11;
 
 /// Magic byte embedded in the fortress header for fast detection.
 const FORTRESS_MAGIC: u8 = 0xF5;
@@ -102,44 +91,6 @@ fn qim_extract_soft(avg: f64, step: f64) -> f64 {
     dist1 - dist0
 }
 
-/// Nudge-toward-center QIM: minimize distortion while ensuring adequate margin.
-///
-/// If the block already encodes the correct bit with at least `min_margin`
-/// distance from the decision boundary, leave it untouched. Otherwise, nudge
-/// it just enough to achieve the margin. For blocks encoding the wrong bit,
-/// snap to the nearest grid center (standard QIM) for maximum robustness.
-///
-/// This dramatically reduces average distortion (~+9 dB PSNR improvement)
-/// because most natural image blocks already encode one bit or the other
-/// with sufficient margin and need no modification at all.
-fn qim_embed_avg_nudge(avg: f64, step: f64, bit: u8, min_margin: f64) -> f64 {
-    let half = step / 2.0;
-
-    // Determine which bit the block currently encodes and distance from boundary.
-    let llr = qim_extract_soft(avg, step);
-    let current_bit = if llr >= 0.0 { 0u8 } else { 1u8 };
-    let boundary_dist = llr.abs(); // distance from decision boundary
-
-    if current_bit == bit && boundary_dist >= min_margin {
-        // Already correct with sufficient margin — no change needed.
-        avg
-    } else if current_bit == bit {
-        // Correct side but insufficient margin — nudge toward grid center.
-        let offset = if bit == 0 { 0.0 } else { half };
-        let center = ((avg - offset) / step).round() * step + offset;
-        let dist_from_center = avg - center;
-        let nudge = min_margin - boundary_dist;
-        if dist_from_center >= 0.0 {
-            avg - nudge
-        } else {
-            avg + nudge
-        }
-    } else {
-        // Wrong side — snap to nearest grid center for the target bit (standard QIM).
-        qim_embed_avg(avg, step, bit)
-    }
-}
-
 // --- Block permutation ---
 
 /// Generate a permuted list of block indices using Fisher-Yates shuffle.
@@ -158,26 +109,10 @@ fn permute_blocks(total_blocks: usize, seed: &[u8; 32]) -> Vec<usize> {
 
 // --- Fortress capacity ---
 
-/// Compute the capped, odd repetition factor for fortress mode.
-///
-/// Applies `FORTRESS_MAX_R` cap and forces odd (for clean majority voting).
-fn fortress_compute_r(rs_bit_count: usize, payload_blocks: usize) -> usize {
-    let r = repetition::compute_r(rs_bit_count, payload_blocks);
-    let r = r.min(FORTRESS_MAX_R);
-    // Force odd after capping (compute_r already forces odd, but capping may
-    // have turned an odd number even if MAX_R is even — currently 11, so fine).
-    if r >= 3 && r % 2 == 0 {
-        r - 1
-    } else {
-        r
-    }
-}
-
 /// Maximum frame bytes that can be embedded in a fortress-encoded image.
 ///
 /// Returns the max frame_bytes (before RS encoding) that fits in the available
-/// blocks, accounting for header, RS parity, repetition coding (r >= MIN_R),
-/// and the MAX_R cap for sparse embedding.
+/// blocks, accounting for header, RS parity, and repetition coding (r >= 3).
 pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let total_blocks = grid.blocks_wide() * grid.blocks_tall();
@@ -187,10 +122,16 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
     }
     let payload_blocks = total_blocks - FORTRESS_HEADER_BLOCKS;
 
-    // With sparse embedding (MAX_R cap), total embedded blocks = r * rs_bits.
-    // We need: r * rs_bits <= payload_blocks AND r >= FORTRESS_MIN_R.
-    // r is capped at FORTRESS_MAX_R, so with a large image and small message,
-    // only MAX_R * rs_bits blocks are used (the rest are untouched).
+    // We need: rs_encoded_bits <= payload_blocks (1 bit per block)
+    // And r >= 3 for meaningful repetition coding
+    // So: rs_encoded_bits * 3 <= payload_blocks
+    // => rs_encoded_bytes <= payload_blocks / 3 / 8  (but we use bits not bytes for capacity)
+    //
+    // Actually: payload_blocks bits available, with repetition r >= 3:
+    //   rs_bit_count = payload_blocks / r  (where r >= 3)
+    //   rs_byte_count = rs_bit_count / 8
+    //
+    // Try each parity tier to find the best fit.
     let mut best_frame_bytes = 0usize;
 
     for &parity in &ecc::PARITY_TIERS {
@@ -205,8 +146,8 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
                 hi = mid - 1;
                 continue;
             }
-            let r = fortress_compute_r(rs_bits, payload_blocks);
-            if r >= FORTRESS_MIN_R && r * rs_bits <= payload_blocks {
+            let r = repetition::compute_r(rs_bits, payload_blocks);
+            if r >= FORTRESS_MIN_R && rs_bits <= payload_blocks {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -217,8 +158,8 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
             let rs_encoded_len = ecc::rs_encoded_len_with_parity(lo, parity);
             let rs_bits = rs_encoded_len * 8;
             if rs_bits <= payload_blocks {
-                let r = fortress_compute_r(rs_bits, payload_blocks);
-                if r >= FORTRESS_MIN_R && r * rs_bits <= payload_blocks {
+                let r = repetition::compute_r(rs_bits, payload_blocks);
+                if r >= FORTRESS_MIN_R {
                     best_frame_bytes = lo;
                 }
             }
@@ -275,8 +216,8 @@ pub fn fortress_encode(
         let rs_encoded = ecc::rs_encode_blocks_with_parity(frame_bytes, parity);
         let rs_bits_len = rs_encoded.len() * 8;
         if rs_bits_len <= payload_blocks {
-            let r = fortress_compute_r(rs_bits_len, payload_blocks);
-            if r >= FORTRESS_MIN_R && r * rs_bits_len <= payload_blocks {
+            let r = repetition::compute_r(rs_bits_len, payload_blocks);
+            if r >= FORTRESS_MIN_R {
                 chosen_parity = parity;
                 break;
             }
@@ -286,19 +227,18 @@ pub fn fortress_encode(
     let rs_encoded = ecc::rs_encode_blocks_with_parity(frame_bytes, chosen_parity);
     let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
-    let r = fortress_compute_r(rs_bits.len(), payload_blocks);
+    let r = repetition::compute_r(rs_bits.len(), payload_blocks);
     if r < FORTRESS_MIN_R {
         return Err(StegoError::MessageTooLarge);
     }
 
-    // Sparse embedding: use exact RS bit count, repeat r times.
-    // Only r * rs_bits.len() payload blocks are embedded; the rest are untouched.
-    let rs_bit_count = rs_bits.len();
-    let total_embed = r * rs_bit_count;
-    let (rep_bits, _) = repetition::repetition_encode(&rs_bits, total_embed);
+    let rs_bit_count_aligned = payload_blocks / r;
+    let mut rs_bits_padded = rs_bits;
+    rs_bits_padded.resize(rs_bit_count_aligned, 0);
+    let (rep_bits, _) = repetition::repetition_encode(&rs_bits_padded, payload_blocks);
 
-    // Build complete bit sequence: header (56 blocks) + payload (sparse)
-    let mut all_bits = Vec::with_capacity(FORTRESS_HEADER_BLOCKS + total_embed);
+    // Build complete bit sequence: header (56 blocks) + payload
+    let mut all_bits = Vec::with_capacity(total_blocks);
 
     // Header: 7 copies of magic byte
     for _ in 0..FORTRESS_HEADER_COPIES {
@@ -307,12 +247,10 @@ pub fn fortress_encode(
         }
     }
 
-    // Payload bits (only the embedded portion, not all payload_blocks)
-    all_bits.extend_from_slice(&rep_bits[..total_embed.min(rep_bits.len())]);
+    // Payload bits
+    all_bits.extend_from_slice(&rep_bits[..payload_blocks.min(rep_bits.len())]);
 
-    // Embed using nudge-toward-center BA-QIM on DC coefficients.
-    // Header blocks use standard QIM (must be exact for magic detection).
-    // Payload blocks use nudge QIM (minimize distortion).
+    // Embed using BA-QIM on DC coefficients
     let grid_mut = img.dct_grid_mut(0);
     for (bit_idx, &block_idx) in perm.iter().enumerate() {
         if bit_idx >= all_bits.len() {
@@ -322,13 +260,7 @@ pub fn fortress_encode(
         let bc = block_idx % blocks_wide;
         let dc = grid_mut.get(br, bc, 0, 0);
         let avg = dc_to_avg(dc, qt_dc);
-        let new_avg = if bit_idx < FORTRESS_HEADER_BLOCKS {
-            // Header: standard QIM for reliable magic detection
-            qim_embed_avg(avg, QIM_STEP, all_bits[bit_idx])
-        } else {
-            // Payload: nudge QIM for minimal distortion
-            qim_embed_avg_nudge(avg, QIM_STEP, all_bits[bit_idx], QIM_MIN_MARGIN)
-        };
+        let new_avg = qim_embed_avg(avg, QIM_STEP, all_bits[bit_idx]);
         let new_dc = avg_to_dc(new_avg, qt_dc);
         grid_mut.set(br, bc, 0, 0, new_dc);
     }
@@ -387,15 +319,15 @@ pub fn fortress_decode(
     let payload_llrs = &all_llrs[FORTRESS_HEADER_BLOCKS..];
     let payload_llrs = &payload_llrs[..payload_blocks.min(payload_llrs.len())];
 
-    // Brute-force search over (frame_len, parity) combinations.
-    // For each candidate, compute the exact r using the same formula as the
-    // encoder (fortress_compute_r), then vote and RS-decode.
-    // This handles both sparse embedding (MAX_R capped) and legacy images.
+    // Brute-force (r, parity) search — same pattern as STDM Phase 2.
+    // Use r >= 3 on decode (not FORTRESS_MIN_R) for backward compatibility
+    // with images encoded before the min-r increase.
     for &parity in &ecc::PARITY_TIERS {
-        let candidates = compute_fortress_decode_candidates(payload_blocks, parity);
+        let candidate_rs = compute_fortress_candidate_rs(payload_blocks, parity);
 
-        for (rs_bit_count, r) in candidates {
-            if rs_bit_count == 0 || r < 3 {
+        for r in candidate_rs {
+            let rs_bit_count = payload_blocks / r;
+            if rs_bit_count == 0 {
                 continue;
             }
             let used_llrs = rs_bit_count * r;
@@ -458,18 +390,9 @@ fn extract_magic_byte(header_llrs: &[f64]) -> u8 {
     byte
 }
 
-/// Compute distinct (rs_bit_count, r) decode candidates for fortress.
-///
-/// Iterates all possible frame lengths and computes the matching r using the
-/// same formula as the encoder (with MAX_R cap). Returns deduplicated
-/// (rs_bit_count, r) pairs — each unique pair represents a distinct repetition
-/// layout to try during decode.
-fn compute_fortress_decode_candidates(
-    payload_blocks: usize,
-    parity: usize,
-) -> Vec<(usize, usize)> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut candidates = Vec::new();
+/// Compute distinct candidate r values for fortress decode.
+fn compute_fortress_candidate_rs(payload_blocks: usize, parity: usize) -> Vec<usize> {
+    let mut rs_set = std::collections::BTreeSet::new();
 
     let min_frame = frame::FRAME_OVERHEAD;
     let max_frame = frame::MAX_FRAME_BYTES;
@@ -477,19 +400,16 @@ fn compute_fortress_decode_candidates(
     for frame_len in min_frame..=max_frame {
         let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
         let rs_bits = rs_encoded_len * 8;
-        if rs_bits == 0 || rs_bits > payload_blocks {
+        if rs_bits > payload_blocks {
             continue;
         }
-        let r = fortress_compute_r(rs_bits, payload_blocks);
-        if r >= 3 && r * rs_bits <= payload_blocks {
-            let key = (rs_bits, r);
-            if seen.insert(key) {
-                candidates.push(key);
-            }
+        let r = repetition::compute_r(rs_bits, payload_blocks);
+        if r >= 3 {
+            rs_set.insert(r);
         }
     }
 
-    candidates
+    rs_set.into_iter().collect()
 }
 
 /// Try RS decode with a specific parity — mirrors pipeline's try_rs_decode_frame_with_parity.
@@ -581,71 +501,6 @@ mod tests {
     }
 
     #[test]
-    fn qim_nudge_leaves_correct_blocks_untouched() {
-        // Block at avg=4.0 (step=8): nearest bit-0 center is 0.0, bit-1 center is 4.0.
-        // LLR = dist1 - dist0 = |4-4| - |4-0| = 0 - 4 = -4 → bit 1 with margin 4.
-        // If target bit is 1, margin 4 >= 2 → should be untouched.
-        let avg = 4.0;
-        let result = qim_embed_avg_nudge(avg, QIM_STEP, 1, QIM_MIN_MARGIN);
-        assert_eq!(result, avg, "Block already encodes correct bit with margin — should be untouched");
-
-        // Block at avg=0.5 (step=8): nearest bit-0 center is 0.0, bit-1 center is 4.0.
-        // LLR = |0.5-4| - |0.5-0| = 3.5 - 0.5 = 3.0 → bit 0 with margin 3.
-        // If target bit is 0, margin 3 >= 2 → untouched.
-        let avg2 = 0.5;
-        let result2 = qim_embed_avg_nudge(avg2, QIM_STEP, 0, QIM_MIN_MARGIN);
-        assert_eq!(result2, avg2, "Block already correct with sufficient margin");
-    }
-
-    #[test]
-    fn qim_nudge_nudges_insufficient_margin() {
-        // Block at avg=3.5 (step=8): nearest bit-0 center is 0.0, bit-1 center is 4.0.
-        // LLR = |3.5-4| - |3.5-0| = 0.5 - 3.5 = -3.0 → bit 1 with margin 3 (passes)
-        // BUT: let's pick a point with margin < 2.
-        // avg=3.0: LLR = |3-4| - |3-0| = 1 - 3 = -2 → bit 1 with margin 2 (passes at exactly 2)
-        // avg=2.9: LLR = |2.9-4| - |2.9-0| = 1.1 - 2.9 = -1.8 → bit 1 with margin 1.8 < 2
-        let avg = 2.9;
-        let result = qim_embed_avg_nudge(avg, QIM_STEP, 1, QIM_MIN_MARGIN);
-        // Should nudge toward center (4.0) just enough to get margin=2
-        // Need to move by 2.0 - 1.8 = 0.2 toward center
-        assert!(result != avg, "Should nudge when margin insufficient");
-        // Verify the result encodes bit 1
-        let llr = qim_extract_soft(result, QIM_STEP);
-        assert!(llr < 0.0, "Nudged value should still encode bit 1");
-        // Verify margin is now >= 2.0
-        assert!(llr.abs() >= QIM_MIN_MARGIN - 0.001, "Margin should be at least min_margin");
-        // Verify distortion is small (much less than standard QIM)
-        assert!((result - avg).abs() < 1.0, "Nudge should be small");
-    }
-
-    #[test]
-    fn qim_nudge_snaps_wrong_bit() {
-        // Block at avg=0.5 encodes bit 0 (LLR positive).
-        // If target is bit 1, should snap to grid center (standard QIM).
-        let avg = 0.5;
-        let result = qim_embed_avg_nudge(avg, QIM_STEP, 1, QIM_MIN_MARGIN);
-        let standard = qim_embed_avg(avg, QIM_STEP, 1);
-        assert_eq!(result, standard, "Wrong bit should snap to center (standard QIM)");
-    }
-
-    #[test]
-    fn qim_nudge_roundtrip_all_bits() {
-        // Verify all nudge-embedded values extract correctly
-        for avg_int in (-200..=200).step_by(1) {
-            let avg = avg_int as f64 * 0.1;
-            for bit in [0u8, 1] {
-                let embedded = qim_embed_avg_nudge(avg, QIM_STEP, bit, QIM_MIN_MARGIN);
-                let llr = qim_extract_soft(embedded, QIM_STEP);
-                let extracted_bit = if llr >= 0.0 { 0u8 } else { 1u8 };
-                assert_eq!(
-                    extracted_bit, bit,
-                    "Nudge roundtrip failed for avg={avg}, bit={bit}: embedded={embedded}, llr={llr}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn qim_soft_llr_sign_matches_hard() {
         for avg in [10.0, 50.0, 128.0, 250.0] {
             for bit in [0u8, 1] {
@@ -722,60 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn fortress_compute_r_caps_at_max() {
-        // With 100 RS bits and 50000 payload blocks, uncapped r would be 499 (odd).
-        // fortress_compute_r should cap at FORTRESS_MAX_R (11).
-        let r = fortress_compute_r(100, 50000);
-        assert_eq!(r, FORTRESS_MAX_R);
-        // Verify it's odd
-        assert!(r % 2 == 1, "Capped r should be odd");
-    }
-
-    #[test]
-    fn fortress_compute_r_no_cap_for_small_r() {
-        // When natural r is below MAX_R, cap doesn't change it.
-        let r = fortress_compute_r(100, 700); // natural r=7
-        assert_eq!(r, 7);
-    }
-
-    #[test]
     fn fortress_capacity_reasonable() {
         // A 1280x720 image has 160*90 = 14400 blocks
         // Payload blocks = 14400 - 56 = 14344
-        // With MAX_R=11 cap, capacity is limited by MAX_R * rs_bits <= payload_blocks
-        // So rs_bits <= 14344 / 11 = 1304 bits = 163 bytes
-        // With parity=64, that's ~99 frame bytes → ~49 chars
+        // With r=3, rs_bit_count = ~4781 bits = ~597 bytes
+        // With parity=64, frame_bytes up to ~533
+        // Plaintext = frame_bytes - 50 overhead
         let total_blocks = 14400usize;
         let payload_blocks = total_blocks - FORTRESS_HEADER_BLOCKS;
+        // Just verify our math is reasonable
         assert!(payload_blocks > 1000, "Should have many payload blocks");
-        // Verify sparse embedding with a small message leaves most blocks untouched.
-        // A short message (~20 chars) → ~70 frame bytes → RS with parity=64 → 134 bytes
-        // → 1072 RS bits. With r=11, embedded = 11 * 1072 = 11792 out of 14344 (82%).
-        // But for a very small message: ~5 chars → 55 frame bytes → RS+parity → ~119 bytes
-        // → 952 RS bits. With r=11, embedded = 10472 out of 14344 (73%).
-        // The real quality win is from nudge QIM (blocks already correct are untouched)
-        // AND from the fact that r is capped vs. the old uncapped approach where all
-        // payload_blocks were modified (including zero-padded positions).
-        let rs_bits_small = 500; // very short message RS bits
-        let r = fortress_compute_r(rs_bits_small, payload_blocks);
-        let embedded = r * rs_bits_small;
-        assert!(r == FORTRESS_MAX_R, "Small message should hit MAX_R cap");
-        assert!(
-            embedded < payload_blocks,
-            "Sparse embedding should use fewer than all blocks: embedded={embedded}, total={payload_blocks}"
-        );
-    }
-
-    #[test]
-    fn decode_candidates_include_capped_r() {
-        let payload_blocks = 14344;
-        for &parity in &ecc::PARITY_TIERS {
-            let candidates = compute_fortress_decode_candidates(payload_blocks, parity);
-            // Should have candidates with r <= MAX_R
-            for &(rs_bits, r) in &candidates {
-                assert!(r <= FORTRESS_MAX_R, "r={r} should be <= MAX_R={FORTRESS_MAX_R}");
-                assert!(r * rs_bits <= payload_blocks, "r*rs_bits should fit");
-            }
-        }
     }
 }
