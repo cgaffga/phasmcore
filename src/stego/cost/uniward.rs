@@ -82,6 +82,16 @@ struct CostMapPtr(*mut f32);
 unsafe impl Send for CostMapPtr {}
 unsafe impl Sync for CostMapPtr {}
 
+impl CostMapPtr {
+    /// Write a cost value at the given flat index.
+    ///
+    /// # Safety
+    /// Caller must ensure no aliasing writes to the same index.
+    unsafe fn write(&self, idx: usize, val: f32) {
+        *self.0.add(idx) = val;
+    }
+}
+
 /// Compute J-UNIWARD embedding costs for a single component's DCT grid.
 ///
 /// For each embeddable coefficient position, the cost measures how much
@@ -162,7 +172,7 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
                 if cost > 0.0 && cost.is_finite() {
                     // Safety: each block writes to a disjoint 64-element region.
                     let idx = (br * bw + bc) * 64 + fi * 8 + fj;
-                    unsafe { *costs_ptr.0.add(idx) = cost as f32; }
+                    unsafe { costs_ptr.write(idx, cost as f32); }
                 }
             }
         }
