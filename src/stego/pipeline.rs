@@ -12,6 +12,7 @@ use crate::stego::cost::uniward::compute_uniward;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
+use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute;
 use crate::stego::stc::{embed, extract, hhat};
 
@@ -67,8 +68,33 @@ pub fn ghost_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    // Guard against messages exceeding the u16 length field in the frame format.
-    if message.len() > u16::MAX as usize {
+    ghost_encode_impl(image_bytes, message, &[], passphrase)
+}
+
+/// Encode a text message with file attachments into a cover JPEG using Ghost mode.
+///
+/// Files are embedded alongside the text message in the payload. The entire
+/// payload (text + files) is compressed with Brotli before encryption.
+pub fn ghost_encode_with_files(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_impl(image_bytes, message, files, passphrase)
+}
+
+fn ghost_encode_impl(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    // Build the payload (text + files + compression).
+    let payload_bytes = payload::encode_payload(message, files);
+
+    // Guard against payload exceeding the u16 length field in the frame format.
+    if payload_bytes.len() > u16::MAX as usize {
         return Err(StegoError::MessageTooLarge);
     }
 
@@ -98,11 +124,11 @@ pub fn ghost_encode(
     let (w, n_used, m_max) = compute_stc_params(n)?;
     let positions = &positions[..n_used];
 
-    // 4. Encrypt message (Tier 2 key with random salt).
-    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+    // 4. Encrypt payload (Tier 2 key with random salt).
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
 
     // 5. Build payload frame and pad to m_max bits.
-    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
     let frame_bits = frame::bytes_to_bits(&frame_bytes);
     let m = frame_bits.len();
 
@@ -165,14 +191,9 @@ pub fn ghost_encode(
     Ok(stego_bytes)
 }
 
-/// Decode a text message from a stego JPEG using Ghost mode.
+/// Decode a payload from a stego JPEG using Ghost mode.
 ///
-/// # Arguments
-/// - `stego_bytes`: Raw bytes of the stego JPEG image.
-/// - `passphrase`: The passphrase used during encoding.
-///
-/// # Returns
-/// The decoded plaintext message, or an error if decoding fails.
+/// Returns the decoded text and any embedded files.
 ///
 /// # Errors
 /// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
@@ -181,7 +202,7 @@ pub fn ghost_encode(
 pub fn ghost_decode(
     stego_bytes: &[u8],
     passphrase: &str,
-) -> Result<String, StegoError> {
+) -> Result<PayloadData, StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
 
     if img.num_components() == 0 {
@@ -227,15 +248,13 @@ pub fn ghost_decode(
         &parsed.nonce,
     )?;
 
-    // 8. Truncate to declared length and validate UTF-8.
+    // 8. Truncate to declared length and decode payload (decompress + parse).
     let len = parsed.plaintext_len as usize;
     if len > plaintext.len() {
         return Err(StegoError::FrameCorrupted);
     }
-    let text = std::str::from_utf8(&plaintext[..len])
-        .map_err(|_| StegoError::InvalidUtf8)?;
 
-    Ok(text.to_string())
+    payload::decode_payload(&plaintext[..len])
 }
 
 // --- DctGrid flat access helpers ---

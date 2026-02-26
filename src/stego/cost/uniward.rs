@@ -781,7 +781,8 @@ mod tests {
         let decoded = crate::stego::ghost_decode(&stego, passphrase)
             .expect("ghost_decode should succeed");
 
-        assert_eq!(decoded, message, "round-trip mismatch");
+        assert_eq!(decoded.text, message, "round-trip mismatch");
+        assert!(decoded.files.is_empty(), "no files expected");
     }
 
     /// Performance benchmark for J-UNIWARD cost computation on a real photo.

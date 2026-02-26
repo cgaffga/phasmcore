@@ -12,7 +12,7 @@ fn ghost_roundtrip_basic() {
 
     let stego = ghost_encode(&cover, message, passphrase).unwrap();
     let decoded = ghost_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn ghost_roundtrip_empty_message() {
     let cover = load_test_image("photo_320x240_q75_420.jpg");
     let stego = ghost_encode(&cover, "", "pass").unwrap();
     let decoded = ghost_decode(&stego, "pass").unwrap();
-    assert_eq!(decoded, "");
+    assert_eq!(decoded.text, "");
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn ghost_roundtrip_various_lengths() {
         let message: String = (0..len).map(|i| (b'A' + (i % 26) as u8) as char).collect();
         let stego = ghost_encode(&cover, &message, passphrase).unwrap();
         let decoded = ghost_decode(&stego, passphrase).unwrap();
-        assert_eq!(decoded, message, "failed for message length {len}");
+        assert_eq!(decoded.text, message, "failed for message length {len}");
     }
 }
 
@@ -113,5 +113,5 @@ fn ghost_roundtrip_unicode() {
 
     let stego = ghost_encode(&cover, message, passphrase).unwrap();
     let decoded = ghost_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
 }

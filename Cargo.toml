@@ -17,3 +17,4 @@ hmac = "0.12"
 sha2 = "0.10"
 num-complex = "0.4"
 rayon = { version = "1", optional = true }
+brotli = { version = "7", default-features = false, features = ["std"] }

@@ -12,7 +12,12 @@ fn main() {
     if args[1] == "--decode" {
         let stego = fs::read(&args[2]).expect("Could not read stego image");
         match phasm_core::ghost_decode(&stego, &args[3]) {
-            Ok(msg) => println!("Decoded message: {}", msg),
+            Ok(payload) => {
+                println!("Decoded message: {}", payload.text);
+                for f in &payload.files {
+                    println!("  File: {} ({} bytes)", f.filename, f.content.len());
+                }
+            }
             Err(e) => eprintln!("Decode failed: {:?}", e),
         }
     } else {

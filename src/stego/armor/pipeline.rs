@@ -28,6 +28,7 @@ use crate::stego::armor::template;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame;
+use crate::stego::payload::{self, PayloadData};
 use crate::stego::permute;
 
 #[cfg(feature = "parallel")]
@@ -59,8 +60,11 @@ pub fn armor_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    // Guard against messages exceeding the u16 length field in the frame format.
-    if message.len() > u16::MAX as usize {
+    // Build the payload (text + compression, no files for Armor).
+    let payload_bytes = payload::encode_payload(message, &[]);
+
+    // Guard against payload exceeding the u16 length field in the frame format.
+    if payload_bytes.len() > u16::MAX as usize {
         return Err(StegoError::MessageTooLarge);
     }
 
@@ -80,15 +84,15 @@ pub fn armor_encode(
     if let Ok(max_fort) = fortress::fortress_max_frame_bytes_ext(&img, use_compact) {
         let fortress_frame = if use_compact {
             let ct = crypto::encrypt_with(
-                message.as_bytes(),
+                &payload_bytes,
                 passphrase,
                 &crypto::FORTRESS_EMPTY_SALT,
                 &crypto::FORTRESS_EMPTY_NONCE,
             );
-            frame::build_fortress_compact_frame(message.len() as u16, &ct)
+            frame::build_fortress_compact_frame(payload_bytes.len() as u16, &ct)
         } else {
-            let (ct, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
-            frame::build_frame(message.len() as u16, &salt, &nonce, &ct)
+            let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
+            frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ct)
         };
 
         if fortress_frame.len() <= max_fort {
@@ -112,8 +116,8 @@ pub fn armor_encode(
     }
 
     // Full frame for STDM path (always uses random salt + nonce).
-    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
-    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
+    let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
 
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
     embed_dft_template(&mut img, passphrase, message)?;
@@ -429,7 +433,7 @@ fn compute_avg_abs_llr(llrs: &[f64]) -> f64 {
 ///
 /// # Returns
 /// A tuple of (decoded plaintext message, decode quality info).
-pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     // Try Fortress first (fast magic-byte check on DC coefficients).
     let img = JpegImage::from_bytes(stego_bytes)?;
     if img.num_components() > 0 {
@@ -452,7 +456,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, Dec
 }
 
 /// Armor decode with delta sweep: parse image once, try multiple mean_qt candidates.
-fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
@@ -544,7 +548,7 @@ fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(String, Decode
 
 /// Phase 3 geometric recovery: detect DFT template, estimate transform, resample, retry.
 /// Also tries DFT ring payload extraction as fallback.
-fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::stego::armor::dft_payload;
 
     let img = JpegImage::from_bytes(stego_bytes)?;
@@ -568,10 +572,10 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
     // Skip if transform is essentially identity (fast path would have worked).
     if transform.rotation_rad.abs() < 0.001 && (transform.scale - 1.0).abs() < 0.001 {
         // Try DFT ring extraction directly (no geometry correction needed)
-        if let Some(plaintext) = dft_payload::extract_ring_payload(&spectrum, passphrase) {
-            if let Ok(text) = std::str::from_utf8(&plaintext) {
+        if let Some(ring_bytes) = dft_payload::extract_ring_payload(&spectrum, passphrase) {
+            if let Ok(text) = std::str::from_utf8(&ring_bytes) {
                 let ring_cap = dft_payload::ring_capacity(w, h);
-                return Ok((text.to_string(), DecodeQuality {
+                return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
                     mode: super::super::frame::MODE_ARMOR,
                     rs_errors_corrected: 0,
                     rs_error_capacity: 0,
@@ -625,10 +629,10 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
             {
                 let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img);
                 let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
-                if let Some(plaintext) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
-                    if let Ok(text) = std::str::from_utf8(&plaintext) {
+                if let Some(ring_bytes) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
+                    if let Ok(text) = std::str::from_utf8(&ring_bytes) {
                         let ring_cap = dft_payload::ring_capacity(cw, ch);
-                        return Ok((text.to_string(), DecodeQuality {
+                        return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
                             mode: super::super::frame::MODE_ARMOR,
                             rs_errors_corrected: 0,
                             rs_error_capacity: 0,
@@ -700,7 +704,7 @@ fn decode_phase1_with_offset(
     num_units: usize,
     payload_offset: usize,
     passphrase: &str,
-) -> Result<(String, DecodeQuality), StegoError> {
+) -> Result<(PayloadData, DecodeQuality), StegoError> {
     let payload_units = num_units - payload_offset;
 
     // Extract all LLRs from payload region
@@ -743,11 +747,11 @@ fn decode_phase1_with_offset(
         return Err(StegoError::FrameCorrupted);
     }
 
-    let text = std::str::from_utf8(&plaintext[..len]).map_err(|_| StegoError::InvalidUtf8)?;
+    let payload_data = payload::decode_payload(&plaintext[..len])?;
     let quality = DecodeQuality::from_rs_stats_with_signal(
         &rs_stats, 1, ecc::parity_len() as u16, signal_strength, reference_llr,
     );
-    Ok((text.to_string(), quality))
+    Ok((payload_data, quality))
 }
 
 /// Phase 2 brute-force search: try all plausible (r, parity) combinations.
@@ -763,7 +767,7 @@ fn decode_phase2_search(
     payload_units: usize,
     passphrase: &str,
     cached_llrs: &mut Vec<(f64, Vec<f64>)>,
-) -> Result<(String, DecodeQuality), StegoError> {
+) -> Result<(PayloadData, DecodeQuality), StegoError> {
     // Build all (parity, r, delta) candidates and pre-extract unique delta LLR sets
     // so the search can run in parallel without &mut cache.
     let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
@@ -795,7 +799,7 @@ fn decode_phase2_search(
         &[]
     };
 
-    let try_candidate = |&(parity, r, adaptive_delta): &(usize, usize, f64)| -> Option<(String, DecodeQuality)> {
+    let try_candidate = |&(parity, r, adaptive_delta): &(usize, usize, f64)| -> Option<(PayloadData, DecodeQuality)> {
         let raw_llrs = find_llrs(adaptive_delta);
 
         let rs_bit_count = payload_units / r;
@@ -821,13 +825,13 @@ fn decode_phase2_search(
         if len > plaintext.len() {
             return None;
         }
-        let text = std::str::from_utf8(&plaintext[..len]).ok()?;
+        let payload_data = payload::decode_payload(&plaintext[..len]).ok()?;
         let reference_llr = adaptive_delta / 2.0;
         let quality = DecodeQuality::from_rs_stats_with_signal(
             &rs_stats, r as u8, parity as u16,
             rep_quality.avg_abs_llr_per_copy, reference_llr,
         );
-        Some((text.to_string(), quality))
+        Some((payload_data, quality))
     };
 
     #[cfg(feature = "parallel")]

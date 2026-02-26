@@ -46,7 +46,7 @@ fn armor_no_recompression_baseline() {
 
         let (decoded, quality) = armor_decode(&stego, passphrase)
             .unwrap_or_else(|e| panic!("Armor decode failed for {msg_len}-char message: {e}"));
-        assert_eq!(decoded, message, "Message mismatch for {msg_len}-char message");
+        assert_eq!(decoded.text, message, "Message mismatch for {msg_len}-char message");
         assert!(quality.integrity_percent >= 85,
             "Expected high integrity without recompression for {msg_len}-char message: {}%",
             quality.integrity_percent);

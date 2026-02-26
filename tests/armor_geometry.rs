@@ -41,7 +41,7 @@ fn armor_geometry_backward_compat_no_transform() {
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
 
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert!(!quality.geometry_corrected, "should decode via fast path");
     assert_eq!(quality.estimated_scale, 1.0);
 }
@@ -83,7 +83,7 @@ fn armor_geometry_rotation_15deg() {
     let result = armor_decode(&rotated, passphrase);
     match result {
         Ok((decoded, quality)) => {
-            assert_eq!(decoded, message);
+            assert_eq!(decoded.text, message);
             assert!(quality.geometry_corrected, "should use geometric recovery");
             assert!(quality.template_peaks_detected >= 8);
             // Estimated rotation should be approximately 15°
@@ -118,7 +118,7 @@ fn armor_geometry_scale_90pct() {
     let result = armor_decode(&scaled, passphrase);
     match result {
         Ok((decoded, quality)) => {
-            assert_eq!(decoded, message);
+            assert_eq!(decoded.text, message);
             assert!(quality.geometry_corrected, "should use geometric recovery");
             assert!(
                 (quality.estimated_scale - 0.9).abs() < 0.1,
@@ -149,7 +149,7 @@ fn armor_geometry_small_rotation_5deg() {
     let result = armor_decode(&rotated, passphrase);
     match result {
         Ok((decoded, quality)) => {
-            assert_eq!(decoded, message);
+            assert_eq!(decoded.text, message);
             assert!(quality.geometry_corrected);
         }
         Err(e) => {

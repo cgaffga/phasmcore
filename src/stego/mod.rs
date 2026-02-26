@@ -21,6 +21,7 @@ pub mod crypto;
 pub mod frame;
 pub mod permute;
 pub mod capacity;
+pub mod payload;
 mod pipeline;
 pub mod armor;
 
@@ -60,11 +61,11 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     }
     Ok(())
 }
-pub use pipeline::ghost_encode;
-pub use pipeline::ghost_decode;
+pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files};
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
+pub use payload::{PayloadData, FileEntry};
 
 #[cfg(test)]
 mod dimension_tests {
@@ -114,23 +115,23 @@ mod dimension_tests {
 
 /// Unified decode: auto-detects Ghost or Armor mode from the embedded frame.
 ///
-/// Tries Ghost first, then Armor. Returns the decoded message and quality info.
+/// Tries Ghost first, then Armor. Returns the decoded payload and quality info.
 ///
 /// When the `parallel` feature is enabled, Ghost and Armor decodes run
 /// concurrently via `rayon::join`, roughly halving decode latency on
 /// multi-core devices.
-pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     smart_decode_inner(stego_bytes, passphrase)
 }
 
 /// Serial smart_decode implementation (default path and WASM).
 #[cfg(not(feature = "parallel"))]
-fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     let mut saw_decryption_failed = false;
 
     // Try Ghost first
     match ghost_decode(stego_bytes, passphrase) {
-        Ok(text) => return Ok((text, DecodeQuality::ghost())),
+        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => {
             saw_decryption_failed = true;
             // Could be wrong passphrase for Ghost — still try Armor
@@ -142,7 +143,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, D
             // Fundamental error (bad JPEG, too small, etc.) — try Armor anyway
             // in case Ghost fails for mode-specific reasons
             match armor_decode(stego_bytes, passphrase) {
-                Ok((text, quality)) => return Ok((text, quality)),
+                Ok((payload, quality)) => return Ok((payload, quality)),
                 Err(_) => return Err(e), // Return original Ghost error
             }
         }
@@ -150,7 +151,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, D
 
     // Try Armor
     match armor_decode(stego_bytes, passphrase) {
-        Ok((text, quality)) => Ok((text, quality)),
+        Ok((payload, quality)) => Ok((payload, quality)),
         Err(StegoError::DecryptionFailed) => Err(StegoError::DecryptionFailed),
         Err(e) => {
             // Only report DecryptionFailed if at least one mode actually
@@ -170,20 +171,20 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, D
 /// Both decoders parse the JPEG independently (they each call `JpegImage::from_bytes`
 /// internally), so there is no shared mutable state. The first successful result wins.
 #[cfg(feature = "parallel")]
-fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(String, DecodeQuality), StegoError> {
+fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     let (ghost_result, armor_result) = rayon::join(
         || ghost_decode(stego_bytes, passphrase),
         || armor_decode(stego_bytes, passphrase),
     );
 
     // Prefer Ghost if it succeeded.
-    if let Ok(text) = ghost_result {
-        return Ok((text, DecodeQuality::ghost()));
+    if let Ok(payload) = ghost_result {
+        return Ok((payload, DecodeQuality::ghost()));
     }
 
     // Try Armor.
-    if let Ok((text, quality)) = armor_result {
-        return Ok((text, quality));
+    if let Ok((payload, quality)) = armor_result {
+        return Ok((payload, quality));
     }
 
     // Both failed — determine the best error to report.

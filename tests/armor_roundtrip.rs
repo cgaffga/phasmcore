@@ -12,7 +12,7 @@ fn armor_roundtrip_basic() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02, "should be Armor mode");
     assert_eq!(quality.rs_errors_corrected, 0, "no recompression = no errors");
     assert!(quality.integrity_percent >= 85,
@@ -57,7 +57,7 @@ fn armor_roundtrip_unicode() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor integrity should be high: {}%", quality.integrity_percent);
 }
@@ -70,7 +70,7 @@ fn smart_decode_detects_ghost() {
 
     let stego = phasm_core::ghost_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x01, "should detect Ghost mode");
     assert_eq!(quality.integrity_percent, 100, "Ghost is always 100%");
     assert_eq!(quality.rs_errors_corrected, 0, "Ghost has no RS");
@@ -84,7 +84,7 @@ fn smart_decode_detects_armor() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02, "should detect Armor mode");
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor integrity should be high: {}%", quality.integrity_percent);
@@ -116,7 +116,7 @@ fn armor_phase2_short_message_activates_repetition() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02);
     assert!(quality.integrity_percent >= 50,
         "Integrity should be reasonable: {}%", quality.integrity_percent);
@@ -130,7 +130,7 @@ fn armor_phase2_quality_fields_present() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     // New quality fields should be populated
     assert!(quality.parity_len > 0, "parity_len should be set");
 }
@@ -152,7 +152,7 @@ fn armor_phase1_large_message_no_repetition() {
 
     let stego = armor_encode(&cover, &message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor Phase 1 integrity should be high: {}%", quality.integrity_percent);
     // Phase 1 should be used (no repetition or r=1)
@@ -172,7 +172,7 @@ fn armor_phase2_smart_decode_works() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02, "should detect Armor mode");
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor integrity should be high: {}%", quality.integrity_percent);

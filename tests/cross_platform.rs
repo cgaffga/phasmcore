@@ -161,7 +161,7 @@ fn ghost_roundtrip_cross_platform() {
 
     let stego = ghost_encode(&cover, message, passphrase).unwrap();
     let decoded = ghost_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ fn armor_roundtrip_cross_platform() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = armor_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02);
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor integrity should be high: {}%", quality.integrity_percent);
@@ -194,7 +194,7 @@ fn smart_decode_ghost_cross_platform() {
 
     let stego = ghost_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x01, "smart_decode should detect Ghost mode");
 }
 
@@ -206,7 +206,7 @@ fn smart_decode_armor_cross_platform() {
 
     let stego = armor_encode(&cover, message, passphrase).unwrap();
     let (decoded, quality) = smart_decode(&stego, passphrase).unwrap();
-    assert_eq!(decoded, message);
+    assert_eq!(decoded.text, message);
     assert_eq!(quality.mode, 0x02, "smart_decode should detect Armor mode");
     assert!(quality.integrity_percent >= 85,
         "Pristine Armor integrity should be high: {}%", quality.integrity_percent);

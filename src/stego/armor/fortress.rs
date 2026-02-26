@@ -466,7 +466,7 @@ pub fn fortress_encode(
 pub fn fortress_decode(
     img: &JpegImage,
     passphrase: &str,
-) -> Result<(String, super::pipeline::DecodeQuality), StegoError> {
+) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality), StegoError> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt_dc = img
         .quant_table(qt_id)
@@ -533,7 +533,7 @@ pub fn fortress_decode(
     }
 
     // Try each candidate with per-r Watson factors (continuous adaptive).
-    let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(String, super::pipeline::DecodeQuality)> {
+    let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality)> {
         let params = adaptive_params(r);
         let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
         let reference_llr = params.base_step / 2.0;
@@ -581,14 +581,14 @@ pub fn fortress_decode(
         if len > plaintext.len() {
             return None;
         }
-        let text = std::str::from_utf8(&plaintext[..len]).ok()?;
+        let payload_data = crate::stego::payload::decode_payload(&plaintext[..len]).ok()?;
 
         let mut q = super::pipeline::DecodeQuality::from_rs_stats_with_signal(
             &rs_stats, r as u8, parity as u16,
             rep_quality.avg_abs_llr_per_copy, reference_llr,
         );
         q.fortress_used = true;
-        Some((text.to_string(), q))
+        Some((payload_data, q))
     };
 
     #[cfg(feature = "parallel")]
@@ -856,7 +856,7 @@ mod tests {
         let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
             .expect("Adaptive fortress decode should succeed");
 
-        assert_eq!(decoded_msg, message, "Decoded message must match original");
+        assert_eq!(decoded_msg.text, message, "Decoded message must match original");
         assert!(quality.fortress_used, "Should use fortress mode");
     }
 
@@ -1046,7 +1046,7 @@ mod tests {
         let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
             .expect("Adaptive decode should succeed");
 
-        assert_eq!(decoded_msg, message, "Decoded message must match");
+        assert_eq!(decoded_msg.text, message, "Decoded message must match");
         assert!(quality.fortress_used, "Should use fortress mode");
     }
 
@@ -1072,7 +1072,7 @@ mod tests {
         let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
             .expect("Compact fortress decode should succeed");
 
-        assert_eq!(decoded_msg, message, "Decoded message must match");
+        assert_eq!(decoded_msg.text, message, "Decoded message must match");
         assert!(quality.fortress_used, "Should use fortress mode");
     }
 
@@ -1115,7 +1115,7 @@ mod tests {
         let (decoded_msg, quality) = armor_decode(&stego_bytes, passphrase)
             .expect("Non-empty passphrase fortress decode should succeed");
 
-        assert_eq!(decoded_msg, "Hi");
+        assert_eq!(decoded_msg.text, "Hi");
         assert!(quality.fortress_used, "Should use fortress mode");
     }
 
