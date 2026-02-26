@@ -30,6 +30,7 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, PayloadData};
 use crate::stego::permute;
+use crate::stego::progress;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -443,10 +444,12 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
     }
 
     // Try standard STDM decode with delta sweep (reuse already-parsed image).
+    // try_armor_decode sets progress total and tracks fortress + phase 1/2 steps.
     match try_armor_decode(&img, passphrase) {
         Ok(result) => return Ok(result),
         Err(new_err) => {
             // Try geometric recovery (Phase 3).
+            progress::advance(); // phase 3
             match try_geometric_recovery(stego_bytes, passphrase) {
                 Ok(result) => return Ok(result),
                 Err(_) => return Err(new_err),
@@ -456,7 +459,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 }
 
 /// Armor decode with delta sweep: parse image once, try multiple mean_qt candidates.
-fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
@@ -518,22 +521,29 @@ fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, D
         }
     }
 
-    // 8. LLR cache for deduplication across delta values.
-    let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
+    // Set progress total now that we know the candidate count.
+    // Steps: 1 (fortress) + N (phase1) + N (phase2) + 1 (phase3) + 1 (ghost)
+    let nc = candidates.len() as u32;
+    let total = 1 + nc + nc + 1 + 1;
+    progress::init(total);
+    progress::advance(); // fortress check already done by caller
 
-    // 9. Try each candidate.
+    // 8. Pass 1: Try Phase 1 for ALL candidates first (fast per candidate).
     for &mean_qt in &candidates {
         let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
 
-        // Try Phase 1 decode with this delta.
         if let Ok(result) = decode_phase1_with_offset(
             grid, positions, &vectors, reference_delta, num_units, HEADER_UNITS,
             passphrase,
         ) {
             return Ok(result);
         }
+        progress::advance();
+    }
 
-        // Try Phase 2: brute-force search over (r, parity) combinations.
+    // 9. Pass 2: Try Phase 2 for ALL candidates (expensive, only if all Phase 1 failed).
+    let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
+    for &mean_qt in &candidates {
         if let Ok(result) = decode_phase2_search(
             grid, positions, &vectors, mean_qt,
             num_units, payload_units, passphrase,
@@ -541,14 +551,31 @@ fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, D
         ) {
             return Ok(result);
         }
+        progress::advance();
     }
 
     Err(StegoError::FrameCorrupted)
 }
 
+/// Armor decode without Fortress: STDM delta sweep + Phase 3 geometric recovery.
+///
+/// Used by the parallel smart_decode path to run STDM and Phase 3 concurrently
+/// with Fortress (which runs on a separate thread).
+pub(crate) fn armor_decode_no_fortress(img: &JpegImage, stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    match try_armor_decode(img, passphrase) {
+        Ok(result) => Ok(result),
+        Err(_stdm_err) => {
+            match try_geometric_recovery(stego_bytes, passphrase) {
+                Ok(result) => Ok(result),
+                Err(_) => Err(_stdm_err),
+            }
+        }
+    }
+}
+
 /// Phase 3 geometric recovery: detect DFT template, estimate transform, resample, retry.
 /// Also tries DFT ring payload extraction as fallback.
-fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::stego::armor::dft_payload;
 
     let img = JpegImage::from_bytes(stego_bytes)?;

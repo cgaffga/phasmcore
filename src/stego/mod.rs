@@ -24,6 +24,7 @@ pub mod capacity;
 pub mod payload;
 mod pipeline;
 pub mod armor;
+pub mod progress;
 
 pub use error::StegoError;
 
@@ -121,42 +122,49 @@ mod dimension_tests {
 /// concurrently via `rayon::join`, roughly halving decode latency on
 /// multi-core devices.
 pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    smart_decode_inner(stego_bytes, passphrase)
+    let result = smart_decode_inner(stego_bytes, passphrase);
+    progress::finish();
+    result
 }
 
 /// Serial smart_decode implementation (default path and WASM).
+///
+/// Tries Armor first (default mode, most common), then Ghost.
+/// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) + 1 (phase3) + 1 (ghost).
+/// Actual total is set by try_armor_decode once candidate count is known.
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    progress::init(0); // reset; try_armor_decode sets real total
+
     let mut saw_decryption_failed = false;
 
-    // Try Ghost first
-    match ghost_decode(stego_bytes, passphrase) {
-        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+    // Try Armor first (default mode, most likely)
+    match armor_decode(stego_bytes, passphrase) {
+        Ok((payload, quality)) => return Ok((payload, quality)),
         Err(StegoError::DecryptionFailed) => {
             saw_decryption_failed = true;
-            // Could be wrong passphrase for Ghost — still try Armor
+            // Could be wrong passphrase for Armor — still try Ghost
         }
         Err(StegoError::FrameCorrupted) => {
-            // Likely not Ghost — try Armor
+            // Likely not Armor — try Ghost
         }
         Err(e) => {
-            // Fundamental error (bad JPEG, too small, etc.) — try Armor anyway
-            // in case Ghost fails for mode-specific reasons
-            match armor_decode(stego_bytes, passphrase) {
-                Ok((payload, quality)) => return Ok((payload, quality)),
-                Err(_) => return Err(e), // Return original Ghost error
+            // Fundamental error (bad JPEG, too small, etc.) — try Ghost anyway
+            // in case Armor fails for mode-specific reasons
+            match ghost_decode(stego_bytes, passphrase) {
+                Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+                Err(_) => return Err(e), // Return original Armor error
             }
         }
     }
 
-    // Try Armor
-    match armor_decode(stego_bytes, passphrase) {
-        Ok((payload, quality)) => Ok((payload, quality)),
+    // Try Ghost
+    let ghost_result = ghost_decode(stego_bytes, passphrase);
+    progress::advance(); // ghost done
+    match ghost_result {
+        Ok(payload) => Ok((payload, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => Err(StegoError::DecryptionFailed),
         Err(e) => {
-            // Only report DecryptionFailed if at least one mode actually
-            // reached the decryption stage. Otherwise the image likely has
-            // no hidden message at all (or is too corrupted to decode).
             if saw_decryption_failed {
                 Err(StegoError::DecryptionFailed)
             } else {
@@ -166,39 +174,57 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 }
 
-/// Parallel smart_decode: run Ghost and Armor decodes concurrently via rayon::join.
+/// Parallel smart_decode: three-way concurrent decode via rayon.
 ///
-/// Both decoders parse the JPEG independently (they each call `JpegImage::from_bytes`
-/// internally), so there is no shared mutable state. The first successful result wins.
+/// Parses the JPEG once and shares `&JpegImage` across threads.
+/// Runs Fortress, STDM+Phase3, and Ghost in parallel.
+/// Preference order: Fortress > Armor STDM > Ghost.
 #[cfg(feature = "parallel")]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    let (ghost_result, armor_result) = rayon::join(
-        || ghost_decode(stego_bytes, passphrase),
-        || armor_decode(stego_bytes, passphrase),
+    use crate::jpeg::JpegImage;
+    use crate::stego::armor::fortress;
+    use crate::stego::armor::pipeline::armor_decode_no_fortress;
+
+    let img = JpegImage::from_bytes(stego_bytes)?;
+
+    let (fortress_result, (stdm_result, ghost_result)) = rayon::join(
+        || {
+            if img.num_components() > 0 {
+                fortress::fortress_decode(&img, passphrase).ok()
+            } else {
+                None
+            }
+        },
+        || rayon::join(
+            || armor_decode_no_fortress(&img, stego_bytes, passphrase),
+            || ghost_decode(stego_bytes, passphrase),
+        ),
     );
 
-    // Prefer Ghost if it succeeded.
+    // Prefer Fortress (fastest, most robust).
+    if let Some((payload, quality)) = fortress_result {
+        return Ok((payload, quality));
+    }
+
+    // Try Armor STDM + Phase 3.
+    if let Ok((payload, quality)) = stdm_result {
+        return Ok((payload, quality));
+    }
+
+    // Try Ghost.
     if let Ok(payload) = ghost_result {
         return Ok((payload, DecodeQuality::ghost()));
     }
 
-    // Try Armor.
-    if let Ok((payload, quality)) = armor_result {
-        return Ok((payload, quality));
-    }
-
-    // Both failed — determine the best error to report.
+    // All failed — determine the best error to report.
+    let stdm_err = stdm_result.unwrap_err();
     let ghost_err = ghost_result.unwrap_err();
-    let armor_err = armor_result.unwrap_err();
 
-    // If either decoder reached the decryption stage, report DecryptionFailed
-    // (likely wrong passphrase rather than no hidden message).
-    if matches!(ghost_err, StegoError::DecryptionFailed)
-        || matches!(armor_err, StegoError::DecryptionFailed)
+    if matches!(stdm_err, StegoError::DecryptionFailed)
+        || matches!(ghost_err, StegoError::DecryptionFailed)
     {
         return Err(StegoError::DecryptionFailed);
     }
 
-    // Return the Armor error (usually more informative than Ghost's FrameCorrupted).
-    Err(armor_err)
+    Err(stdm_err)
 }

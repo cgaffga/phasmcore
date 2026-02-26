@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 parallel = ["rayon"]
+wasm = ["js-sys", "wasm-bindgen"]
 
 [dependencies]
 aes-gcm-siv = "0.11"
@@ -18,3 +19,5 @@ sha2 = "0.10"
 num-complex = "0.4"
 rayon = { version = "1", optional = true }
 brotli = { version = "7", default-features = false, features = ["std"] }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
