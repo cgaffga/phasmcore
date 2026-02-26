@@ -522,10 +522,14 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     }
 
     // Set progress total now that we know the candidate count.
-    // Steps: 1 (fortress) + N (phase1) + N (phase2) + 1 (phase3) + 1 (ghost)
+    // Doubled fortress+phase1+phase2 to account for potential second run via
+    // try_geometric_recovery, plus 1 (phase3) + 1 (ghost).
     let nc = candidates.len() as u32;
-    let total = 1 + nc + nc + 1 + 1;
-    progress::init(total);
+    // Only init on first call; geometric recovery calls us again.
+    if progress::get().1 == 0 {
+        let total = 2 * (1 + nc + nc) + 1 + 1;
+        progress::init(total);
+    }
     progress::advance(); // fortress check already done by caller
 
     // 8. Pass 1: Try Phase 1 for ALL candidates first (fast per candidate).
