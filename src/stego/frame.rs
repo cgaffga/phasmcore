@@ -31,9 +31,11 @@ pub const MODE_ARMOR: u8 = 0x02;
 /// So total frame = 34 + plaintext_len + 16(tag) = 50 + plaintext_len.
 pub const FRAME_OVERHEAD: usize = 2 + SALT_LEN + NONCE_LEN + 16 + 4; // 50
 
-/// Maximum payload frame size in bytes (supports up to ~1KB messages).
-/// 1024 (max message) + 50 (overhead) = 1074 bytes.
-pub const MAX_FRAME_BYTES: usize = 1074;
+/// Maximum payload frame size in bytes.
+/// The u16 length prefix supports up to 65,535 bytes of plaintext.
+/// 65,535 (max plaintext from u16) + 50 (overhead) = 65,585 bytes.
+/// The actual usable capacity is determined by each image's embedding capacity.
+pub const MAX_FRAME_BYTES: usize = 65_535 + FRAME_OVERHEAD; // 65,585
 
 /// Maximum payload frame size in bits.
 pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;

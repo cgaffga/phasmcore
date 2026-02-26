@@ -59,6 +59,11 @@ pub fn armor_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    // Guard against messages exceeding the u16 length field in the frame format.
+    if message.len() > u16::MAX as usize {
+        return Err(StegoError::MessageTooLarge);
+    }
+
     let mut img = JpegImage::from_bytes(image_bytes)?;
 
     // Validate dimensions before any heavy processing.
@@ -587,14 +592,23 @@ fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(Strin
         return Err(StegoError::FrameCorrupted);
     }
 
+    // P0: Drop spectrum — only needed for template detection and ring extraction above.
+    drop(spectrum);
+
     // Resample the pixel image to undo the geometric transform.
     let corrected_pixels = resample::resample_bilinear(
         &luma_pixels, w, h, &transform, w, h,
     );
 
-    // Write corrected pixels back into JPEG coefficients.
-    let mut corrected_img = img.clone();
+    // P0: Drop luma_pixels — only needed for FFT and resample.
+    drop(luma_pixels);
+
+    // P0: Move img instead of clone — img is not used after correction.
+    let mut corrected_img = img;
     pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img);
+
+    // P0: Drop corrected_pixels — written into corrected_img.
+    drop(corrected_pixels);
 
     // Retry standard decode on the corrected image (no re-encode/re-parse needed).
     match try_armor_decode(&corrected_img, passphrase) {
@@ -828,7 +842,9 @@ fn decode_phase2_search(
 pub(super) fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<usize> {
     let mut rs_set = std::collections::BTreeSet::new();
 
-    // Sweep possible frame lengths to find all distinct r values
+    // Sweep possible frame lengths to find all distinct r values.
+    // rs_encoded_len is monotonically increasing with frame_len, so once
+    // rs_bits exceeds payload_units we can stop.
     let min_frame = frame::FRAME_OVERHEAD;
     let max_frame = frame::MAX_FRAME_BYTES;
 
@@ -836,7 +852,7 @@ pub(super) fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<u
         let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
         let rs_bits = rs_encoded_len * 8;
         if rs_bits > payload_units {
-            continue;
+            break;
         }
         let r = repetition::compute_r(rs_bits, payload_units);
         if r >= 3 {
@@ -861,7 +877,7 @@ pub(super) fn compute_candidate_rs_compact(payload_units: usize, parity: usize) 
         let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_len, parity);
         let rs_bits = rs_encoded_len * 8;
         if rs_bits > payload_units {
-            continue;
+            break;
         }
         let r = repetition::compute_r(rs_bits, payload_units);
         if r >= 3 {
@@ -872,7 +888,13 @@ pub(super) fn compute_candidate_rs_compact(payload_units: usize, parity: usize) 
     rs_set.into_iter().collect()
 }
 
+/// Maximum LLR cache entries. Each entry can be ~31-65 MB for large images.
+/// P2b: Limit to 5 entries to cap memory at ~155-325 MB instead of unbounded.
+const LLR_CACHE_MAX: usize = 5;
+
 /// Get cached LLRs for a delta value, or extract them from the grid.
+///
+/// P2b: Uses LRU eviction when the cache exceeds `LLR_CACHE_MAX` entries.
 fn get_or_extract_llrs(
     cache: &mut Vec<(f64, Vec<f64>)>,
     delta: f64,
@@ -883,9 +905,14 @@ fn get_or_extract_llrs(
     payload_offset: usize,
 ) -> Vec<f64> {
     // Check cache (use approximate comparison for f64)
-    for (cached_delta, cached_llrs) in cache.iter() {
-        if (cached_delta - delta).abs() < 0.001 {
-            return cached_llrs.clone();
+    for i in 0..cache.len() {
+        if (cache[i].0 - delta).abs() < 0.001 {
+            // P2b: Move to end (most recently used) for LRU ordering
+            if i < cache.len() - 1 {
+                let entry = cache.remove(i);
+                cache.push(entry);
+            }
+            return cache.last().unwrap().1.clone();
         }
     }
 
@@ -908,6 +935,11 @@ fn get_or_extract_llrs(
     let llrs: Vec<f64> = unit_indices.par_iter().map(extract_one).collect();
     #[cfg(not(feature = "parallel"))]
     let llrs: Vec<f64> = unit_indices.iter().map(extract_one).collect();
+
+    // P2b: Evict oldest entry if cache is full
+    if cache.len() >= LLR_CACHE_MAX {
+        cache.remove(0); // Remove LRU (oldest) entry
+    }
 
     cache.push((delta, llrs.clone()));
     llrs
@@ -962,7 +994,7 @@ pub(super) fn try_rs_decode_frame_with_parity(
                 let ct_len = pt_len + 16;
                 let total_frame_len = 2 + 16 + 12 + ct_len + 4;
 
-                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
+                if total_frame_len > frame::MAX_FRAME_BYTES {
                     continue;
                 }
 
@@ -1035,7 +1067,7 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                 // Compact frame: no salt (16) or nonce (12)
                 let total_frame_len = 2 + ct_len + 4;
 
-                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
+                if total_frame_len > frame::MAX_FRAME_BYTES {
                     continue;
                 }
 
@@ -1102,7 +1134,7 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
                 let ct_len = pt_len + 16;
                 let total_frame_len = 2 + 16 + 12 + ct_len + 4;
 
-                if total_frame_len > frame::MAX_FRAME_BYTES + 1024 {
+                if total_frame_len > frame::MAX_FRAME_BYTES {
                     continue;
                 }
 
@@ -1208,7 +1240,10 @@ pub fn armor_capacity_info(jpeg_bytes: &[u8]) -> Result<ArmorCapacityInfo, Stego
 /// payload (resize-robust second layer) in the same FFT pass.
 fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> Result<(), StegoError> {
     let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(img);
+
+    // P0: Drop luma_pixels after FFT — only needed to produce the spectrum.
     let mut spectrum = fft2d::fft2d(&luma_pixels, w, h);
+    drop(luma_pixels);
 
     // Template peaks for geometry estimation
     let peaks = template::generate_template_peaks(passphrase, w, h);
@@ -1223,7 +1258,10 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
         dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase);
     }
 
+    // P0: Drop spectrum after IFFT — only needed to produce the modified pixels.
     let modified = fft2d::ifft2d(&spectrum);
+    drop(spectrum);
+
     pixels::luma_f64_to_jpeg(&modified, w, h, img);
     Ok(())
 }

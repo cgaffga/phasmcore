@@ -4,7 +4,7 @@
 //! spectrum. These peaks survive geometric transforms (rotation, scaling, crop)
 //! and allow the decoder to estimate and undo the transform.
 
-use num_complex::Complex64;
+use crate::stego::armor::fft2d::Complex32;
 use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -16,7 +16,7 @@ use crate::stego::crypto::derive_template_key;
 const K: usize = 32;
 
 /// Embedding strength: peaks are `ALPHA * local_magnitude`.
-const ALPHA: f64 = 0.4;
+const ALPHA: f32 = 0.4;
 
 /// Minimum radius factor (fraction of min dimension).
 const R_MIN_FACTOR: f64 = 0.05;
@@ -98,6 +98,8 @@ pub fn generate_template_peaks(passphrase: &str, width: usize, height: usize) ->
 /// For each peak at (u,v), adds `ALPHA * local_magnitude` along the existing
 /// phase direction. Mirrors at conjugate position (-u,-v) for Hermitian symmetry
 /// so the IFFT result remains real-valued.
+///
+/// P1b: Works with f32 spectrum data.
 pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
     let w = spectrum.width;
     let h = spectrum.height;
@@ -121,11 +123,11 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
 
         // Add along existing phase direction
         let existing = spectrum.data[idx];
-        let enorm = crate::det_math::det_hypot(existing.re, existing.im);
-        let phase = if enorm > 1e-12 {
-            existing / enorm
+        let enorm = crate::det_math::det_hypot(existing.re as f64, existing.im as f64) as f32;
+        let phase = if enorm > 1e-6 {
+            Complex32::new(existing.re / enorm, existing.im / enorm)
         } else {
-            Complex64::new(1.0, 0.0)
+            Complex32::new(1.0, 0.0)
         };
         spectrum.data[idx] += phase * add_mag;
 
@@ -136,11 +138,11 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
             let conj_idx = cv as usize * w + cu as usize;
             if conj_idx != idx {
                 let conj_existing = spectrum.data[conj_idx];
-                let cnorm = crate::det_math::det_hypot(conj_existing.re, conj_existing.im);
-                let conj_phase = if cnorm > 1e-12 {
-                    conj_existing / cnorm
+                let cnorm = crate::det_math::det_hypot(conj_existing.re as f64, conj_existing.im as f64) as f32;
+                let conj_phase = if cnorm > 1e-6 {
+                    Complex32::new(conj_existing.re / cnorm, conj_existing.im / cnorm)
                 } else {
-                    Complex64::new(1.0, 0.0)
+                    Complex32::new(1.0, 0.0)
                 };
                 spectrum.data[conj_idx] += conj_phase * add_mag;
             }
@@ -152,6 +154,8 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
 ///
 /// For each expected peak, searches a `SEARCH_RADIUS`-bin neighborhood
 /// for the maximum magnitude. Computes confidence as (peak - noise_mean) / noise_std.
+///
+/// P1b: Works with f32 magnitude spectrum, computes stats in f64 for precision.
 pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<DetectedPeak> {
     let w = spectrum.width;
     let h = spectrum.height;
@@ -185,7 +189,7 @@ pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<Det
                 if nu < 0 || nu >= w as isize || nv < 0 || nv >= h as isize {
                     continue;
                 }
-                let mag = magnitudes[nv as usize * w + nu as usize];
+                let mag = magnitudes[nv as usize * w + nu as usize] as f64;
 
                 if mag > best_mag {
                     best_mag = mag;
@@ -276,8 +280,10 @@ pub fn estimate_transform(detected: &[DetectedPeak]) -> Option<AffineTransform> 
     })
 }
 
-/// Compute mean magnitude in a 3×3 neighborhood around (u, v).
-fn local_mean_magnitude(spectrum: &Spectrum2D, u: usize, v: usize) -> f64 {
+/// Compute mean magnitude in a 3x3 neighborhood around (u, v).
+///
+/// P1b: Works with f32 spectrum data, returns f32.
+fn local_mean_magnitude(spectrum: &Spectrum2D, u: usize, v: usize) -> f32 {
     let w = spectrum.width;
     let h = spectrum.height;
     let mut sum = 0.0f64;
@@ -289,13 +295,13 @@ fn local_mean_magnitude(spectrum: &Spectrum2D, u: usize, v: usize) -> f64 {
             let nv = v as i32 + dv;
             if nu >= 0 && nu < w as i32 && nv >= 0 && nv < h as i32 {
                 let c = spectrum.data[nv as usize * w + nu as usize];
-                sum += crate::det_math::det_hypot(c.re, c.im);
+                sum += crate::det_math::det_hypot(c.re as f64, c.im as f64);
                 count += 1;
             }
         }
     }
 
-    if count > 0 { sum / count as f64 } else { 1.0 }
+    if count > 0 { (sum / count as f64) as f32 } else { 1.0 }
 }
 
 #[cfg(test)]
@@ -409,7 +415,7 @@ mod tests {
 
     #[test]
     fn transform_estimation_rotation() {
-        // Simulate 15° rotation
+        // Simulate 15 degree rotation
         let angle_deg = 15.0;
         let angle_rad = angle_deg * std::f64::consts::PI / 180.0;
         let cos_a = angle_rad.cos();
@@ -437,7 +443,7 @@ mod tests {
         let transform = estimate_transform(&detected).unwrap();
         assert!(
             (transform.rotation_rad - angle_rad).abs() < 0.01,
-            "Expected {angle_deg}° rotation, got {}°",
+            "Expected {angle_deg} deg rotation, got {} deg",
             transform.rotation_rad.to_degrees()
         );
         assert!(
@@ -471,7 +477,7 @@ mod tests {
         let transform = estimate_transform(&detected).unwrap();
         assert!(
             transform.rotation_rad.abs() < 0.01,
-            "Expected ~0 rotation, got {}°",
+            "Expected ~0 rotation, got {} deg",
             transform.rotation_rad.to_degrees()
         );
         assert!(

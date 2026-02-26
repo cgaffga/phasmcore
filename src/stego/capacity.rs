@@ -67,7 +67,8 @@ pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     }
 
     // Subtract overhead (length + salt + nonce + tag + crc) to get plaintext capacity.
-    let capacity = max_frame_bytes - FRAME_OVERHEAD;
+    // Cap at u16::MAX since the frame format uses a 2-byte length prefix.
+    let capacity = (max_frame_bytes - FRAME_OVERHEAD).min(u16::MAX as usize);
 
     Ok(capacity)
 }

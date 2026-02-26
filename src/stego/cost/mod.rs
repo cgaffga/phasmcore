@@ -14,21 +14,27 @@
 pub mod uerd;
 pub mod uniward;
 
-/// Cost assigned to coefficients that must never be modified.
+/// Cost assigned to coefficients that must never be modified (f32 version).
 /// Using infinity ensures the Viterbi STC never selects these positions for flipping.
-pub const WET_COST: f64 = f64::INFINITY;
+pub const WET_COST: f32 = f32::INFINITY;
+
+/// WET_COST as f64 for use in the STC pipeline (which operates in f64).
+pub const WET_COST_F64: f64 = f64::INFINITY;
 
 /// Per-coefficient embedding costs for one image component.
 ///
 /// Stored in the same block-raster order as `DctGrid`: block index * 64 + row * 8 + col.
 /// DC positions (index % 64 == 0) always have `WET_COST`.
+///
+/// Uses f32 storage to halve memory usage (~46 MB instead of ~93 MB for a
+/// 4032x3024 image). f32 has more than enough precision for cost ranking.
 pub struct CostMap {
     /// Number of 8×8 blocks horizontally.
     blocks_wide: usize,
     /// Number of 8×8 blocks vertically.
     blocks_tall: usize,
-    /// Flat storage: one f64 cost per coefficient position.
-    costs: Vec<f64>,
+    /// Flat storage: one f32 cost per coefficient position.
+    costs: Vec<f32>,
 }
 
 impl CostMap {
@@ -54,14 +60,24 @@ impl CostMap {
     }
 
     /// Get the cost at block (br, bc), frequency position (i, j).
-    pub fn get(&self, br: usize, bc: usize, i: usize, j: usize) -> f64 {
+    pub fn get(&self, br: usize, bc: usize, i: usize, j: usize) -> f32 {
         self.costs[self.index(br, bc, i, j)]
     }
 
     /// Set the cost at block (br, bc), frequency position (i, j).
-    pub fn set(&mut self, br: usize, bc: usize, i: usize, j: usize, val: f64) {
+    pub fn set(&mut self, br: usize, bc: usize, i: usize, j: usize, val: f32) {
         let idx = self.index(br, bc, i, j);
         self.costs[idx] = val;
+    }
+
+    /// Get a raw pointer into the cost storage for direct writes.
+    ///
+    /// # Safety
+    /// Caller must ensure no aliasing writes to the same index.
+    /// Safe when blocks write to non-overlapping regions (each block
+    /// occupies indices `[block_idx * 64 .. block_idx * 64 + 64)`).
+    pub(crate) fn costs_ptr(&mut self) -> *mut f32 {
+        self.costs.as_mut_ptr()
     }
 
     fn index(&self, br: usize, bc: usize, i: usize, j: usize) -> usize {

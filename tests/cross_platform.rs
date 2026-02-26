@@ -318,29 +318,31 @@ fn pin_idct_cosine_table() {
 // 10. FFT output — pinned for known input
 // ===========================================================================
 
-/// Pin 2x2 FFT output. Tests the full FFT pipeline (Bluestein for size 2
-/// which is power-of-2, so radix-2 path).
+/// Pin 2x2 FFT output. Tests the full FFT pipeline (radix-2 path).
+/// Spectrum uses f32 (Complex32) after Phase 3 memory optimization.
 #[test]
 fn pin_fft_2x2_output() {
     let pixels = vec![1.0, 2.0, 3.0, 4.0];
     let spectrum = fft2d::fft2d(&pixels, 2, 2);
 
-    let expected_re = [0x4024000000000000u64, 0xc000000000000000, 0xc010000000000000, 0x0000000000000000];
-    let expected_im = [0x0000000000000000u64, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000];
+    // f32 bit patterns: 10.0=0x41200000, -2.0=0xc0000000, -4.0=0xc0800000, 0.0=0x00000000
+    let expected_re = [0x41200000u32, 0xc0000000, 0xc0800000, 0x00000000];
+    let expected_im = [0x00000000u32, 0x00000000, 0x00000000, 0x00000000];
 
     for (i, c) in spectrum.data.iter().enumerate() {
         assert_eq!(
             c.re.to_bits(), expected_re[i],
-            "FFT[{i}].re bit mismatch: got {:#018x}", c.re.to_bits()
+            "FFT[{i}].re bit mismatch: got {:#010x}", c.re.to_bits()
         );
         assert_eq!(
             c.im.to_bits(), expected_im[i],
-            "FFT[{i}].im bit mismatch: got {:#018x}", c.im.to_bits()
+            "FFT[{i}].im bit mismatch: got {:#010x}", c.im.to_bits()
         );
     }
 }
 
-/// FFT roundtrip must preserve values to < 1e-10.
+/// FFT roundtrip must preserve values within f32 precision.
+/// Internal computation uses Complex32 after Phase 3 memory optimization.
 #[test]
 fn fft_roundtrip_deterministic() {
     let w = 16;
@@ -352,7 +354,7 @@ fn fft_roundtrip_deterministic() {
 
     for i in 0..pixels.len() {
         assert!(
-            (pixels[i] - recovered[i]).abs() < 1e-8,
+            (pixels[i] - recovered[i]).abs() < 0.1,
             "FFT roundtrip mismatch at [{i}]: {:.6} vs {:.6}",
             pixels[i], recovered[i]
         );

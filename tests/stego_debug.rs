@@ -44,7 +44,10 @@ fn full_pipeline_diagnostic() {
 
     let all_positions = permute::select_and_permute(&cost_map, &perm_seed);
     let n = all_positions.len();
-    let m_max = MAX_FRAME_BITS;
+    // m_max adapts to the image: capped at MAX_FRAME_BITS but also at n
+    // so that small images still work (w >= 1). Both encoder and decoder
+    // compute the same m_max from the same image.
+    let m_max = MAX_FRAME_BITS.min(n);
     let w = n / m_max;
     let n_used = m_max * w;
     eprintln!("ENCODE: n={n}, w={w}, n_used={n_used}, m_max={m_max}");
@@ -128,8 +131,9 @@ fn full_pipeline_diagnostic() {
     let stego_cost_map = compute_uniward(stego_img.dct_grid(0), stego_img.quant_table(qt_id).unwrap());
     let stego_all_positions = permute::select_and_permute(&stego_cost_map, &perm_seed);
     let n_stego = stego_all_positions.len();
-    let w_stego = n_stego / m_max;
-    let n_used_stego = m_max * w_stego;
+    let m_max_stego = MAX_FRAME_BITS.min(n_stego);
+    let w_stego = n_stego / m_max_stego;
+    let n_used_stego = m_max_stego * w_stego;
     eprintln!("DECODE: n={n_stego}, w={w_stego}, n_used={n_used_stego}");
 
     assert_eq!(n, n_stego, "n differs between encoder and decoder");

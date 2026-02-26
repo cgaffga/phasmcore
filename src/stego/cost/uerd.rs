@@ -45,7 +45,7 @@ pub fn compute_uerd(grid: &DctGrid, qt: &QuantTable) -> CostMap {
                     let freq_factor = (i + j + 1) as f64;
                     let cost = q / (energy * freq_factor + EPSILON);
 
-                    map.set(br, bc, i, j, cost);
+                    map.set(br, bc, i, j, cost as f32);
                 }
             }
         }

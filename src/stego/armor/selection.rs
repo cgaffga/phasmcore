@@ -11,7 +11,7 @@ use crate::stego::cost::CostMap;
 use super::embedding::MAX_ARMOR_ZIGZAG;
 
 /// Cost assigned to stable positions (low, uniform cost for permutation compatibility).
-const STABLE_COST: f64 = 1.0;
+const STABLE_COST: f32 = 1.0;
 
 /// Compute a stability map for the given DCT grid.
 ///

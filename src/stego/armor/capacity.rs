@@ -86,8 +86,9 @@ pub fn estimate_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
         return Ok(0);
     }
 
-    // Verify the RS-encoded size actually fits
-    let capacity = max_frame_bytes - FRAME_OVERHEAD;
+    // Verify the RS-encoded size actually fits.
+    // Cap at u16::MAX since the frame format uses a 2-byte length prefix.
+    let capacity = (max_frame_bytes - FRAME_OVERHEAD).min(u16::MAX as usize);
     let frame_len = capacity + FRAME_OVERHEAD;
     let rs_len = ecc::rs_encoded_len(frame_len);
     if rs_len > embeddable_bytes {

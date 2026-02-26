@@ -18,26 +18,32 @@ use crate::stego::stc::{embed, extract, hhat};
 /// STC constraint length for Ghost Phase 1.
 const STC_H: usize = 7;
 
-/// Compute the STC width `w` and usable cover length from the total number of
-/// AC positions. Both encoder and decoder must agree on these values.
+/// Compute the STC width `w`, usable cover length, and effective `m_max` from
+/// the total number of AC positions. Both encoder and decoder must agree on
+/// these values — they can because both see the same image and derive the
+/// same `n`.
+///
+/// `m_max` is capped at `MAX_FRAME_BITS` (the u16 protocol limit) but also
+/// capped at `n` so that small images still work (with `w = 1`).
 ///
 /// Uses `w = floor(n / m_max)` so that `n_used = m_max * w <= n` and the
 /// extraction produces exactly `m_max` bits.
 ///
 /// # Returns
-/// `(w, n_used)` where `w` is the STC submatrix width and `n_used` is the
-/// number of cover positions to use (always <= `n`).
+/// `(w, n_used, m_max)` where `w` is the STC submatrix width, `n_used` is the
+/// number of cover positions to use (always <= `n`), and `m_max` is the
+/// effective extraction size in bits.
 ///
 /// # Errors
-/// Returns [`StegoError::ImageTooSmall`] if `n < MAX_FRAME_BITS` (w would be 0).
-fn compute_stc_params(n: usize) -> Result<(usize, usize), StegoError> {
-    let m_max = MAX_FRAME_BITS;
-    let w = n / m_max; // floor division
-    if w < 1 {
+/// Returns [`StegoError::ImageTooSmall`] if `n` is 0.
+fn compute_stc_params(n: usize) -> Result<(usize, usize, usize), StegoError> {
+    let m_max = MAX_FRAME_BITS.min(n);
+    if m_max == 0 {
         return Err(StegoError::ImageTooSmall);
     }
+    let w = n / m_max; // floor division; always >= 1 since m_max <= n
     let n_used = m_max * w;
-    Ok((w, n_used))
+    Ok((w, n_used, m_max))
 }
 
 /// Encode a text message into a cover JPEG using Ghost mode.
@@ -61,6 +67,11 @@ pub fn ghost_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    // Guard against messages exceeding the u16 length field in the frame format.
+    if message.len() > u16::MAX as usize {
+        return Err(StegoError::MessageTooLarge);
+    }
+
     let mut img = JpegImage::from_bytes(image_bytes)?;
 
     // Validate dimensions before any heavy processing.
@@ -84,7 +95,7 @@ pub fn ghost_encode(
     // 3. Select and permute all AC positions, then truncate to n_used.
     let positions = permute::select_and_permute(&cost_map, &perm_seed);
     let n = positions.len();
-    let (w, n_used) = compute_stc_params(n)?;
+    let (w, n_used, m_max) = compute_stc_params(n)?;
     let positions = &positions[..n_used];
 
     // 4. Encrypt message (Tier 2 key with random salt).
@@ -95,11 +106,10 @@ pub fn ghost_encode(
     let frame_bits = frame::bytes_to_bits(&frame_bytes);
     let m = frame_bits.len();
 
-    if m > MAX_FRAME_BITS {
+    if m > m_max {
         return Err(StegoError::MessageTooLarge);
     }
 
-    let m_max = MAX_FRAME_BITS;
     let mut padded_bits = vec![0u8; m_max];
     padded_bits[..m].copy_from_slice(&frame_bits);
 
@@ -191,7 +201,7 @@ pub fn ghost_decode(
     // 3. Select and permute AC positions (portable u32 shuffle).
     let positions = permute::select_and_permute(&cost_map, &perm_seed);
     let n = positions.len();
-    let (w, n_used) = compute_stc_params(n)?;
+    let (w, n_used, m_max) = compute_stc_params(n)?;
     let positions = &positions[..n_used];
 
     // 4. Extract stego LSBs.
@@ -206,7 +216,6 @@ pub fn ghost_decode(
     let extracted_bits = extract::stc_extract(&stego_bits, &hhat_matrix, w);
 
     // 6. Convert bits to bytes and parse frame.
-    let m_max = MAX_FRAME_BITS;
     let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
     let parsed = frame::parse_frame(&frame_bytes)?;
 

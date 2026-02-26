@@ -41,12 +41,12 @@ fn collect_positions(cost_map: &CostMap) -> Vec<CoeffPos> {
                     if i == 0 && j == 0 {
                         continue; // skip DC
                     }
-                    let cost = cost_map.get(br, bc, i, j);
-                    if !cost.is_finite() {
+                    let cost_f32 = cost_map.get(br, bc, i, j);
+                    if !cost_f32.is_finite() {
                         continue; // skip zero-valued coefficients
                     }
                     let flat_idx = (br * bw + bc) * 64 + i * 8 + j;
-                    positions.push(CoeffPos { flat_idx, cost });
+                    positions.push(CoeffPos { flat_idx, cost: cost_f32 as f64 });
                 }
             }
         }

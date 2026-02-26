@@ -8,7 +8,7 @@
 //! The ring payload is a completely independent channel from the STDM
 //! payload, with its own encryption and heavy RS coding.
 
-use num_complex::Complex64;
+use crate::stego::armor::fft2d::Complex32;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -68,16 +68,15 @@ fn derive_ring_key(passphrase: &str) -> [u8; 32] {
 /// Derive the ring PRNG seed for sector assignment.
 fn derive_ring_seed(passphrase: &str) -> [u8; 32] {
     let ring_key = derive_ring_key(passphrase);
-    let domain = b"phasm-ring-sectors-v4\0\0\0\0\0\0\0\0\0\0\0";
-    let mut domain_seed = [0u8; 32];
-    for i in 0..32 {
-        domain_seed[i] = ring_key[i] ^ domain[i];
-    }
-    let mut rng = ChaCha20Rng::from_seed(domain_seed);
+    // Use HMAC-SHA256 for proper domain separation (replaces XOR with fixed string)
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = HmacSha256::new_from_slice(&ring_key).expect("HMAC accepts any key length");
+    mac.update(b"phasm-ring-sectors-v5");
+    let result = mac.finalize().into_bytes();
     let mut seed = [0u8; 32];
-    for byte in seed.iter_mut() {
-        *byte = rng.gen_range(0u32..256) as u8;
-    }
+    seed.copy_from_slice(&result);
     seed
 }
 
@@ -154,7 +153,8 @@ fn compute_sector_magnitude(
             let fv = (cy as i32 + dy).rem_euclid(h as i32) as usize;
             let idx = fv * w + fu;
             if idx < spectrum.data.len() {
-                let mag = det_hypot(spectrum.data[idx].re, spectrum.data[idx].im);
+                let c = spectrum.data[idx];
+                let mag = det_hypot(c.re as f64, c.im as f64);
                 sum += mag;
                 count += 1;
             }
@@ -208,14 +208,14 @@ fn set_sector_magnitude(
                 continue;
             }
 
-            // Set magnitude while preserving phase
+            // Set magnitude while preserving phase (f32 spectrum)
             let current = spectrum.data[idx];
-            let current_mag = det_hypot(current.re, current.im);
+            let current_mag = det_hypot(current.re as f64, current.im as f64);
             if current_mag > 1e-10 {
-                let scale = target_mag / current_mag;
-                spectrum.data[idx] = Complex64::new(current.re * scale, current.im * scale);
+                let scale = (target_mag / current_mag) as f32;
+                spectrum.data[idx] = Complex32::new(current.re * scale, current.im * scale);
             } else {
-                spectrum.data[idx] = Complex64::new(target_mag, 0.0);
+                spectrum.data[idx] = Complex32::new(target_mag as f32, 0.0);
             }
 
             // Hermitian conjugate for real-valued IFFT
@@ -224,10 +224,10 @@ fn set_sector_magnitude(
             let conj_idx = conj_fv * w + conj_fu;
             if conj_idx < spectrum.data.len() && conj_idx != idx {
                 let conj = spectrum.data[conj_idx];
-                let conj_mag = det_hypot(conj.re, conj.im);
+                let conj_mag = det_hypot(conj.re as f64, conj.im as f64);
                 if conj_mag > 1e-10 {
-                    let scale = target_mag / conj_mag;
-                    spectrum.data[conj_idx] = Complex64::new(conj.re * scale, conj.im * scale);
+                    let scale = (target_mag / conj_mag) as f32;
+                    spectrum.data[conj_idx] = Complex32::new(conj.re * scale, conj.im * scale);
                 }
             }
         }
@@ -367,12 +367,12 @@ mod tests {
     use crate::stego::armor::fft2d::Spectrum2D;
 
     fn make_test_spectrum(w: usize, h: usize) -> Spectrum2D {
-        // Create a spectrum with random-ish magnitudes
-        let mut data = vec![Complex64::new(0.0, 0.0); w * h];
+        // Create a spectrum with random-ish magnitudes (f32)
+        let mut data = vec![Complex32::new(0.0, 0.0); w * h];
         let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
         for val in data.iter_mut() {
-            let mag: f64 = 100.0 + rng.gen_range(0u32..100) as f64;
-            *val = Complex64::new(mag, 0.0);
+            let mag: f32 = 100.0 + rng.gen_range(0u32..100) as f32;
+            *val = Complex32::new(mag, 0.0);
         }
         Spectrum2D { data, width: w, height: h }
     }
