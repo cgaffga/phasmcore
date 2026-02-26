@@ -91,7 +91,7 @@ fn ghost_encode_impl(
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
     // Build the payload (text + files + compression).
-    let payload_bytes = payload::encode_payload(message, files);
+    let payload_bytes = payload::encode_payload(message, files)?;
 
     // Guard against payload exceeding the u16 length field in the frame format.
     if payload_bytes.len() > u16::MAX as usize {

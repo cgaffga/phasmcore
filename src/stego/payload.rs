@@ -63,9 +63,20 @@ pub struct PayloadData {
 /// as the "plaintext" in the frame format.
 ///
 /// Tries Brotli compression and uses it only if it produces a smaller result.
-pub fn encode_payload(text: &str, files: &[FileEntry]) -> Vec<u8> {
+///
+/// Returns an error if any file exceeds `MAX_RAW_FILE_SIZE` or has a filename
+/// longer than 255 bytes.
+pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoError> {
+    for file in files {
+        if file.content.len() > MAX_RAW_FILE_SIZE {
+            return Err(StegoError::MessageTooLarge);
+        }
+        if file.filename.as_bytes().len() > 255 {
+            return Err(StegoError::MessageTooLarge);
+        }
+    }
     let inner = serialize_inner(text, files);
-    try_compress(&inner)
+    Ok(try_compress(&inner))
 }
 
 /// Decode a payload from decrypted bytes.
@@ -82,7 +93,7 @@ pub fn decode_payload(data: &[u8]) -> Result<PayloadData, StegoError> {
     let inner = match flags & COMPRESS_MASK {
         COMPRESS_NONE => compressed_data.to_vec(),
         COMPRESS_BROTLI => decompress_brotli(compressed_data)?,
-        _ => return Err(StegoError::FrameCorrupted), // unknown compression
+        _ => return Err(StegoError::FrameCorrupted),
     };
 
     parse_inner(&inner)
@@ -223,7 +234,7 @@ mod tests {
 
     #[test]
     fn text_only_roundtrip() {
-        let encoded = encode_payload("Hello, world!", &[]);
+        let encoded = encode_payload("Hello, world!", &[]).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "Hello, world!");
         assert!(decoded.files.is_empty());
@@ -231,7 +242,7 @@ mod tests {
 
     #[test]
     fn empty_text_roundtrip() {
-        let encoded = encode_payload("", &[]);
+        let encoded = encode_payload("", &[]).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "");
         assert!(decoded.files.is_empty());
@@ -243,7 +254,7 @@ mod tests {
             filename: "test.txt".to_string(),
             content: b"file content here".to_vec(),
         }];
-        let encoded = encode_payload("hello", &files);
+        let encoded = encode_payload("hello", &files).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "hello");
         assert_eq!(decoded.files.len(), 1);
@@ -263,7 +274,7 @@ mod tests {
                 content: b"# Hello\nWorld".to_vec(),
             },
         ];
-        let encoded = encode_payload("msg", &files);
+        let encoded = encode_payload("msg", &files).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "msg");
         assert_eq!(decoded.files.len(), 2);
@@ -279,7 +290,7 @@ mod tests {
             filename: "data.bin".to_string(),
             content: vec![1, 2, 3],
         }];
-        let encoded = encode_payload("", &files);
+        let encoded = encode_payload("", &files).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "");
         assert_eq!(decoded.files.len(), 1);
@@ -287,7 +298,7 @@ mod tests {
 
     #[test]
     fn short_message_not_compressed() {
-        let encoded = encode_payload("hi", &[]);
+        let encoded = encode_payload("hi", &[]).unwrap();
         // Flags byte should be COMPRESS_NONE for short messages.
         assert_eq!(encoded[0] & COMPRESS_MASK, COMPRESS_NONE);
     }
@@ -295,7 +306,7 @@ mod tests {
     #[test]
     fn long_repetitive_text_compressed() {
         let long_text = "abcdefghij".repeat(100); // 1000 bytes of repetitive text
-        let encoded = encode_payload(&long_text, &[]);
+        let encoded = encode_payload(&long_text, &[]).unwrap();
         // Should be compressed (Brotli).
         assert_eq!(encoded[0] & COMPRESS_MASK, COMPRESS_BROTLI);
         // Compressed should be smaller than raw.
@@ -311,7 +322,7 @@ mod tests {
             filename: "big.txt".to_string(),
             content: b"Hello World! ".repeat(1000),
         }];
-        let encoded = encode_payload("", &files);
+        let encoded = encode_payload("", &files).unwrap();
         assert_eq!(encoded[0] & COMPRESS_MASK, COMPRESS_BROTLI);
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.files[0].content.len(), 13000);
@@ -328,7 +339,7 @@ mod tests {
             filename: "rand.bin".to_string(),
             content: data.clone(),
         }];
-        let encoded = encode_payload("", &files);
+        let encoded = encode_payload("", &files).unwrap();
         // May or may not compress depending on Brotli's framing overhead.
         // Either way, roundtrip must work.
         let decoded = decode_payload(&encoded).unwrap();
@@ -341,7 +352,7 @@ mod tests {
             filename: "daten-übersicht.pdf".to_string(),
             content: vec![0xFF],
         }];
-        let encoded = encode_payload("Ünïcödé 🎉", &files);
+        let encoded = encode_payload("Ünïcödé 🎉", &files).unwrap();
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "Ünïcödé 🎉");
         assert_eq!(decoded.files[0].filename, "daten-übersicht.pdf");

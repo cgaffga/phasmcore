@@ -61,7 +61,7 @@ pub fn armor_encode(
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
     // Build the payload (text + compression, no files for Armor).
-    let payload_bytes = payload::encode_payload(message, &[]);
+    let payload_bytes = payload::encode_payload(message, &[])?;
 
     // Guard against payload exceeding the u16 length field in the frame format.
     if payload_bytes.len() > u16::MAX as usize {
@@ -1257,7 +1257,14 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
     use crate::stego::armor::dft_payload;
     let ring_cap = dft_payload::ring_capacity(w, h);
     if ring_cap > 0 && !message.is_empty() {
-        let truncated_len = message.len().min(ring_cap);
+        // Truncate at a valid UTF-8 character boundary to avoid splitting
+        // multi-byte characters (e.g., emoji, CJK, accented chars).
+        let max_byte = message.len().min(ring_cap);
+        let truncated_len = message[..max_byte]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
         let truncated = &message.as_bytes()[..truncated_len];
         dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase);
     }
