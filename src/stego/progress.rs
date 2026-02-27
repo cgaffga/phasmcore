@@ -22,6 +22,14 @@ pub fn init(total: u32) {
     notify();
 }
 
+/// Set (or update) the total without resetting the current step.
+/// Used by pipeline code that discovers the real total mid-flight
+/// (e.g. after counting delta candidates).
+pub fn set_total(total: u32) {
+    TOTAL.store(total, Ordering::Relaxed);
+    notify();
+}
+
 /// Request cancellation of the current decode operation.
 ///
 /// The decode pipeline checks this flag at natural loop boundaries and
@@ -48,8 +56,20 @@ pub fn check_cancelled() -> Result<(), StegoError> {
 }
 
 /// Advance progress by one step and notify the callback (if set).
+/// Step is capped at total to avoid displaying values like "84/15".
+/// When total is 0 (indeterminate), step still advances freely so that
+/// the UI can show activity; `init()` with the real total will follow.
 pub fn advance() {
-    STEP.fetch_add(1, Ordering::Relaxed);
+    let total = TOTAL.load(Ordering::Relaxed);
+    if total == 0 {
+        // Indeterminate phase — advance freely, UI should not display X/Y yet.
+        STEP.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Cap at total-1 so the bar never hits 100% before finish().
+        let _ = STEP.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+            if s + 1 < total { Some(s + 1) } else { Some(s) }
+        });
+    }
     notify();
 }
 

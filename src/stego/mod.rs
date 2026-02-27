@@ -187,6 +187,11 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     use crate::stego::armor::fortress;
     use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
+    // In parallel mode all three branches advance the same global counter
+    // concurrently.  We init with 0 (indeterminate) — try_armor_decode will
+    // set a real total once it knows the candidate count.  The cap in
+    // advance() prevents step from ever exceeding total.
+    progress::init(0);
     progress::check_cancelled()?;
 
     let img = JpegImage::from_bytes(stego_bytes)?;
