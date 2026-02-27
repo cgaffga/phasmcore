@@ -17,6 +17,7 @@
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use aes_gcm_siv::aead::Aead;
 use argon2::Argon2;
+use zeroize::Zeroizing;
 use crate::stego::error::StegoError;
 
 /// Fixed salt for Ghost Tier-1 (structural) key derivation.
@@ -58,10 +59,10 @@ pub const FORTRESS_EMPTY_NONCE: [u8; NONCE_LEN] = *b"ph-fe-nonce\0";
 ///
 /// Returns a 64-byte buffer: first 32 bytes = perm_seed, last 32 bytes = hhat_seed.
 /// This key is deterministic given the passphrase so both encoder and decoder agree.
-pub fn derive_structural_key(passphrase: &str) -> [u8; 64] {
-    let mut output = [0u8; 64];
+pub fn derive_structural_key(passphrase: &str) -> Zeroizing<[u8; 64]> {
+    let mut output = Zeroizing::new([0u8; 64]);
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), STRUCTURAL_SALT, &mut output)
+        .hash_password_into(passphrase.as_bytes(), STRUCTURAL_SALT, &mut *output)
         .expect("Argon2 structural key derivation should not fail");
     output
 }
@@ -70,10 +71,10 @@ pub fn derive_structural_key(passphrase: &str) -> [u8; 64] {
 ///
 /// Same structure as Ghost but uses a different salt so the same passphrase
 /// produces different permutation/spreading seeds.
-pub fn derive_armor_structural_key(passphrase: &str) -> [u8; 64] {
-    let mut output = [0u8; 64];
+pub fn derive_armor_structural_key(passphrase: &str) -> Zeroizing<[u8; 64]> {
+    let mut output = Zeroizing::new([0u8; 64]);
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), ARMOR_STRUCTURAL_SALT, &mut output)
+        .hash_password_into(passphrase.as_bytes(), ARMOR_STRUCTURAL_SALT, &mut *output)
         .expect("Argon2 structural key derivation should not fail");
     output
 }
@@ -103,10 +104,10 @@ pub fn derive_fortress_structural_key(passphrase: &str) -> [u8; 32] {
 }
 
 /// Derive the AES-256 encryption key (Tier 2) from passphrase + random salt.
-pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
-    let mut key = [0u8; 32];
+pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .expect("Argon2 encryption key derivation should not fail");
     key
 }
@@ -126,7 +127,7 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> (Vec<u8>, [u8; NONCE_LEN],
     rng.fill_bytes(&mut nonce_bytes);
 
     let key = derive_encryption_key(passphrase, &salt);
-    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
+    let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
     let nonce = Nonce::from_slice(&nonce_bytes);
 
     let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
@@ -145,7 +146,7 @@ pub fn encrypt_with(
     nonce_bytes: &[u8; NONCE_LEN],
 ) -> Vec<u8> {
     let key = derive_encryption_key(passphrase, salt);
-    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
+    let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail")
@@ -162,7 +163,7 @@ pub fn decrypt(
     nonce_bytes: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, StegoError> {
     let key = derive_encryption_key(passphrase, salt);
-    let cipher = Aes256GcmSiv::new_from_slice(&key).expect("valid key length");
+    let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
     let nonce = Nonce::from_slice(nonce_bytes);
 
     cipher

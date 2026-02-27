@@ -154,8 +154,7 @@ fn gen_poly_for(parity_len: usize) -> &'static Vec<u8> {
             if parity_len == PARITY_LEN {
                 gen_poly()
             } else {
-                // Fallback: compute fresh (not cached, but should not hit this in practice)
-                Box::leak(Box::new(build_gen_poly(parity_len)))
+                panic!("unsupported parity length: {parity_len}")
             }
         }
     }
@@ -580,6 +579,7 @@ pub const fn parity_len() -> usize {
 /// # Returns
 /// A vector of `data.len() + parity_len` bytes.
 pub fn rs_encode_with_parity(data: &[u8], parity_len: usize) -> Vec<u8> {
+    if parity_len == 0 { return data.to_vec(); }
     let k_max = N_MAX - parity_len;
     assert!(
         data.len() <= k_max,

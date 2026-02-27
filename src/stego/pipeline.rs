@@ -8,16 +8,23 @@
 //!    zero for |coeff| == 1 to prevent shrinkage)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uniward::compute_uniward;
+use crate::stego::cost::uniward::{compute_uniward, compute_uniward_for_decode};
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute;
+use crate::stego::progress;
 use crate::stego::stc::{embed, extract, hhat};
 
 /// STC constraint length for Ghost Phase 1.
 const STC_H: usize = 7;
+
+/// Total number of progress steps reported by [`ghost_decode`].
+///
+/// Comprises [`UNIWARD_DECODE_STEPS`](crate::stego::cost::uniward::UNIWARD_DECODE_STEPS)
+/// (3 steps from the cost computation) plus 1 step for STC extraction and decryption.
+pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_DECODE_STEPS + 1;
 
 /// Compute the STC width `w`, usable cover length, and effective `m_max` from
 /// the total number of AC positions. Both encoder and decoder must agree on
@@ -210,9 +217,15 @@ pub fn ghost_decode(
     }
 
     // 1. Compute J-UNIWARD costs (for consistent position selection).
+    //    Reports UNIWARD_DECODE_STEPS (3) progress steps internally:
+    //      - pixel decompression
+    //      - wavelet subbands
+    //      - per-block cost computation
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uniward(img.dct_grid(0), qt);
+    let cost_map = compute_uniward_for_decode(img.dct_grid(0), qt)?;
+
+    progress::check_cancelled()?;
 
     // 2. Derive structural key.
     let structural_key = crypto::derive_structural_key(passphrase);
@@ -254,7 +267,12 @@ pub fn ghost_decode(
         return Err(StegoError::FrameCorrupted);
     }
 
-    payload::decode_payload(&plaintext[..len])
+    let result = payload::decode_payload(&plaintext[..len]);
+
+    // Step 4: STC extraction + decryption complete.
+    progress::advance();
+
+    result
 }
 
 // --- DctGrid flat access helpers ---

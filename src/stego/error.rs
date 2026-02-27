@@ -24,6 +24,8 @@ pub enum StegoError {
     InvalidUtf8,
     /// The cover image has no luminance component.
     NoLuminanceChannel,
+    /// The operation was cancelled by the user.
+    Cancelled,
 }
 
 impl fmt::Display for StegoError {
@@ -37,6 +39,7 @@ impl fmt::Display for StegoError {
             Self::DecryptionFailed => write!(f, "decryption failed (wrong passphrase?)"),
             Self::InvalidUtf8 => write!(f, "extracted text is not valid UTF-8"),
             Self::NoLuminanceChannel => write!(f, "image has no luminance channel"),
+            Self::Cancelled => write!(f, "operation cancelled by user"),
         }
     }
 }

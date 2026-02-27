@@ -57,12 +57,12 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     if width < MIN_ENCODE_DIMENSION || height < MIN_ENCODE_DIMENSION {
         return Err(StegoError::ImageTooSmall);
     }
-    if width > MAX_DIMENSION || height > MAX_DIMENSION || width * height > MAX_PIXELS {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION || width.checked_mul(height).map_or(true, |p| p > MAX_PIXELS) {
         return Err(StegoError::ImageTooLarge);
     }
     Ok(())
 }
-pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files};
+pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, GHOST_DECODE_STEPS};
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
@@ -130,11 +130,14 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 /// Serial smart_decode implementation (default path and WASM).
 ///
 /// Tries Armor first (default mode, most common), then Ghost.
-/// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) + 1 (phase3) + 1 (ghost).
+/// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) + 1 (phase3)
+///   + GHOST_DECODE_STEPS (4: pixel decomp, wavelets, block costs, STC+decrypt).
 /// Actual total is set by try_armor_decode once candidate count is known.
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     progress::init(0); // reset; try_armor_decode sets real total
+
+    progress::check_cancelled()?;
 
     let mut saw_decryption_failed = false;
 
@@ -158,9 +161,8 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         }
     }
 
-    // Try Ghost
+    // Try Ghost (advances GHOST_DECODE_STEPS internally)
     let ghost_result = ghost_decode(stego_bytes, passphrase);
-    progress::advance(); // ghost done
     match ghost_result {
         Ok(payload) => Ok((payload, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => Err(StegoError::DecryptionFailed),
@@ -185,14 +187,16 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     use crate::stego::armor::fortress;
     use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
+    progress::check_cancelled()?;
+
     let img = JpegImage::from_bytes(stego_bytes)?;
 
     let (fortress_result, (stdm_result, ghost_result)) = rayon::join(
         || {
             if img.num_components() > 0 {
-                fortress::fortress_decode(&img, passphrase).ok()
+                fortress::fortress_decode(&img, passphrase)
             } else {
-                None
+                Err(StegoError::FrameCorrupted)
             }
         },
         || rayon::join(
@@ -202,7 +206,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     );
 
     // Prefer Fortress (fastest, most robust).
-    if let Some((payload, quality)) = fortress_result {
+    if let Ok((payload, quality)) = fortress_result {
         return Ok((payload, quality));
     }
 
@@ -217,14 +221,13 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 
     // All failed — determine the best error to report.
-    let stdm_err = stdm_result.unwrap_err();
-    let ghost_err = ghost_result.unwrap_err();
+    let saw_decryption_failed = matches!(&fortress_result, Err(StegoError::DecryptionFailed))
+        || matches!(&stdm_result, Err(StegoError::DecryptionFailed))
+        || matches!(&ghost_result, Err(StegoError::DecryptionFailed));
 
-    if matches!(stdm_err, StegoError::DecryptionFailed)
-        || matches!(ghost_err, StegoError::DecryptionFailed)
-    {
+    if saw_decryption_failed {
         return Err(StegoError::DecryptionFailed);
     }
 
-    Err(stdm_err)
+    Err(stdm_result.unwrap_err())
 }

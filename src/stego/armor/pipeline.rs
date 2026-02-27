@@ -30,6 +30,7 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, PayloadData};
 use crate::stego::permute;
+use crate::stego::pipeline::GHOST_DECODE_STEPS;
 use crate::stego::progress;
 
 #[cfg(feature = "parallel")]
@@ -523,17 +524,18 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
 
     // Set progress total now that we know the candidate count.
     // Doubled fortress+phase1+phase2 to account for potential second run via
-    // try_geometric_recovery, plus 1 (phase3) + 1 (ghost).
+    // try_geometric_recovery, plus 1 (phase3) + GHOST_DECODE_STEPS (ghost).
     let nc = candidates.len() as u32;
     // Only init on first call; geometric recovery calls us again.
     if progress::get().1 == 0 {
-        let total = 2 * (1 + nc + nc) + 1 + 1;
+        let total = 2 * (1 + nc + nc) + 1 + GHOST_DECODE_STEPS;
         progress::init(total);
     }
     progress::advance(); // fortress check already done by caller
 
     // 8. Pass 1: Try Phase 1 for ALL candidates first (fast per candidate).
     for &mean_qt in &candidates {
+        progress::check_cancelled()?;
         let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
 
         if let Ok(result) = decode_phase1_with_offset(
@@ -548,6 +550,7 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     // 9. Pass 2: Try Phase 2 for ALL candidates (expensive, only if all Phase 1 failed).
     let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
     for &mean_qt in &candidates {
+        progress::check_cancelled()?;
         if let Ok(result) = decode_phase2_search(
             grid, positions, &vectors, mean_qt,
             num_units, payload_units, passphrase,
@@ -569,6 +572,7 @@ pub(crate) fn armor_decode_no_fortress(img: &JpegImage, stego_bytes: &[u8], pass
     match try_armor_decode(img, passphrase) {
         Ok(result) => Ok(result),
         Err(_stdm_err) => {
+            progress::check_cancelled()?;
             match try_geometric_recovery(stego_bytes, passphrase) {
                 Ok(result) => Ok(result),
                 Err(_) => Err(_stdm_err),

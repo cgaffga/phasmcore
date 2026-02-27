@@ -56,6 +56,8 @@ pub fn build_frame(
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Vec<u8> {
+    debug_assert_eq!(ciphertext.len(), plaintext_len as usize + 16, "ciphertext length mismatch");
+
     let mut frame = Vec::with_capacity(2 + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
 
     frame.extend_from_slice(&plaintext_len.to_be_bytes());

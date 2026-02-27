@@ -221,9 +221,10 @@ fn compress_brotli(data: &[u8]) -> Vec<u8> {
 /// Decompress Brotli data.
 fn decompress_brotli(data: &[u8]) -> Result<Vec<u8>, StegoError> {
     let mut output = Vec::new();
-    let mut decompressor = brotli::Decompressor::new(data, 4096);
-    decompressor
-        .read_to_end(&mut output)
+    let decompressor = brotli::Decompressor::new(data, 4096);
+    // Limit decompressed size to prevent decompression bombs
+    let limit = 128 * 1024; // 128 KB generous limit
+    decompressor.take(limit as u64).read_to_end(&mut output)
         .map_err(|_| StegoError::FrameCorrupted)?;
     Ok(output)
 }

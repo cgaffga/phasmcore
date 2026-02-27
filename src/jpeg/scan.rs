@@ -72,8 +72,8 @@ pub fn decode_scan(
         grids.push(DctGrid::new(bw, bt));
     }
 
-    // Initialize DC predictors
-    let mut dc_pred = vec![0i16; scan_components.len()];
+    // Initialize DC predictors (i32 to prevent overflow from accumulated diffs)
+    let mut dc_pred = vec![0i32; scan_components.len()];
 
     let mut reader = BitReader::new(data, scan_start);
     let mut mcu_count = 0usize;
@@ -113,7 +113,7 @@ pub fn decode_scan(
                             if dc_size > 0 {
                                 let dc_bits = reader.read_bits(dc_size)?;
                                 let dc_diff = extend_sign(dc_bits, dc_size);
-                                dc_pred[sci] += dc_diff;
+                                dc_pred[sci] += dc_diff as i32;
                             }
                             let mut k = 1;
                             while k < 64 {
@@ -140,9 +140,9 @@ pub fn decode_scan(
                         if dc_size > 0 {
                             let dc_bits = reader.read_bits(dc_size)?;
                             let dc_diff = extend_sign(dc_bits, dc_size);
-                            dc_pred[sci] += dc_diff;
+                            dc_pred[sci] += dc_diff as i32;
                         }
-                        zz[0] = dc_pred[sci];
+                        zz[0] = dc_pred[sci].clamp(i16::MIN as i32, i16::MAX as i32) as i16;
 
                         // Decode AC coefficients
                         let mut k = 1;
@@ -226,7 +226,7 @@ pub fn encode_scan(
     // Use a byte accumulator so we can insert restart markers between segments
     let mut output = Vec::new();
     let mut writer = BitWriter::new();
-    let mut dc_pred = vec![0i16; scan_components.len()];
+    let mut dc_pred = vec![0i32; scan_components.len()];
     let mut mcu_count = 0usize;
     let mut restart_count = 0u16;
 
@@ -269,8 +269,8 @@ pub fn encode_scan(
                         }
 
                         // Encode DC
-                        let dc_diff = zz[0] - dc_pred[sci];
-                        dc_pred[sci] = zz[0];
+                        let dc_diff = (zz[0] as i32 - dc_pred[sci]) as i16;
+                        dc_pred[sci] = zz[0] as i32;
                         let (dc_bits, dc_size) = encode_value(dc_diff);
                         let (dc_code, dc_code_len) = dc_tab.encode(dc_size)?;
                         writer.write_bits(dc_code, dc_code_len);
@@ -382,7 +382,7 @@ pub fn decode_progressive_scan(
     }
 
     let mut reader = BitReader::new(data, scan_start);
-    let mut dc_pred = vec![0i16; scan_components.len()];
+    let mut dc_pred = vec![0i32; scan_components.len()];
     let mut mcu_count = 0usize;
 
     // For AC scans, track the End-of-Band run counter
@@ -491,7 +491,7 @@ fn decode_dc_first(
     reader: &mut BitReader,
     dc_tables: &[Option<HuffmanDecodeTable>; 4],
     sc: &ScanComponent,
-    dc_pred: &mut i16,
+    dc_pred: &mut i32,
     al: u8,
     grid: &mut DctGrid,
     block_row: usize,
@@ -504,11 +504,11 @@ fn decode_dc_first(
     if dc_size > 0 {
         let dc_bits = reader.read_bits(dc_size)?;
         let dc_diff = extend_sign(dc_bits, dc_size);
-        *dc_pred += dc_diff;
+        *dc_pred += dc_diff as i32;
     }
-    // Store DC coefficient shifted left by Al (successive approximation)
+    // Store DC coefficient shifted left by Al (successive approximation), clamped to i16 range
     let block = grid.block_mut(block_row, block_col);
-    block[0] = *dc_pred << al;
+    block[0] = ((*dc_pred).clamp(i16::MIN as i32, i16::MAX as i32) as i16) << al;
     Ok(())
 }
 

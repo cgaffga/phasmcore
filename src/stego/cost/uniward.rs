@@ -24,10 +24,23 @@
 
 use crate::jpeg::dct::{DctGrid, QuantTable};
 use crate::jpeg::pixels::idct_block;
+use crate::stego::error::StegoError;
+use crate::stego::progress;
 use super::CostMap;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+/// Number of progress steps reported by [`compute_uniward_for_decode`].
+///
+/// Used by the progress total formula in `smart_decode` so that the combined
+/// Armor + Ghost total is correct.
+///
+/// Steps:
+/// 1. Pixel decompression complete
+/// 2. Wavelet subbands complete
+/// 3. Per-block cost computation complete
+pub const UNIWARD_DECODE_STEPS: u32 = 3;
 
 /// Stabilization constant. Avoids division by zero in the cost formula
 /// and controls sensitivity to image content. The original paper and
@@ -186,6 +199,88 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     (0..n_blocks).for_each(|bi| compute_block(bi));
 
     map
+}
+
+/// Compute J-UNIWARD costs with decode progress tracking.
+///
+/// Identical to [`compute_uniward`] but reports [`UNIWARD_DECODE_STEPS`]
+/// progress steps and checks for cancellation between phases. Used only
+/// by the Ghost decode path; encode and capacity use the plain version.
+///
+/// # Progress steps
+/// 1. Pixel decompression complete
+/// 2. Wavelet subbands complete
+/// 3. Per-block cost computation complete
+pub fn compute_uniward_for_decode(grid: &DctGrid, qt: &QuantTable) -> Result<CostMap, StegoError> {
+    let bw = grid.blocks_wide();
+    let bt = grid.blocks_tall();
+    let mut map = CostMap::new(bw, bt);
+
+    let img_w = bw * 8;
+    let img_h = bt * 8;
+
+    // Phase 1: Decompress to pixels.
+    let cover_pixels = decompress_to_pixels(grid, qt, bw, bt);
+    progress::advance();
+    progress::check_cancelled()?;
+
+    // Phase 2: Wavelet subbands.
+    let lpdf = lpdf();
+    let cover_wavelets = compute_three_subbands(&cover_pixels, img_w, img_h, &lpdf);
+    drop(cover_pixels);
+    progress::advance();
+    progress::check_cancelled()?;
+
+    // Phase 3: Basis functions + per-block cost computation.
+    let basis = precompute_basis_functions(qt);
+    let pad = FILT_LEN - 1;
+    let n_blocks = bt * bw;
+
+    let costs_ptr = CostMapPtr(map.costs_ptr());
+
+    let compute_block = |bi: usize| {
+        let br = bi / bw;
+        let bc = bi % bw;
+        let blk = grid.block(br, bc);
+
+        for fi in 0..8 {
+            for fj in 0..8 {
+                if fi == 0 && fj == 0 {
+                    continue;
+                }
+
+                let coeff = blk[fi * 8 + fj];
+                if coeff == 0 {
+                    continue;
+                }
+
+                let basis_block = &basis[fi][fj];
+                let cost = compute_coefficient_cost(
+                    basis_block,
+                    &cover_wavelets,
+                    br, bc,
+                    img_w, img_h,
+                    pad,
+                    &lpdf,
+                );
+
+                if cost > 0.0 && cost.is_finite() {
+                    let idx = (br * bw + bc) * 64 + fi * 8 + fj;
+                    unsafe { costs_ptr.write(idx, cost as f32); }
+                }
+            }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    (0..n_blocks).into_par_iter().for_each(|bi| compute_block(bi));
+
+    #[cfg(not(feature = "parallel"))]
+    (0..n_blocks).for_each(|bi| compute_block(bi));
+
+    progress::advance();
+
+    Ok(map)
 }
 
 /// Decompress the entire DctGrid to pixel values (f32).

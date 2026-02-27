@@ -181,9 +181,9 @@ fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
 
     let mut sorted = ac_energies.clone();
     #[cfg(feature = "parallel")]
-    sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     #[cfg(not(feature = "parallel"))]
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let median = if total_blocks == 0 {
         1.0
