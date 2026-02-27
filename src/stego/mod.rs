@@ -66,7 +66,7 @@ pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, GHOST_DE
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
-pub use payload::{PayloadData, FileEntry};
+pub use payload::{PayloadData, FileEntry, compressed_payload_size};
 
 #[cfg(test)]
 mod dimension_tests {

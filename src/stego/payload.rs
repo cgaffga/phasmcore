@@ -79,6 +79,20 @@ pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoE
     Ok(try_compress(&inner))
 }
 
+/// Compute the compressed payload size (in bytes) for the given text and files.
+///
+/// This is the exact size that `encode_payload` would produce, without actually
+/// encrypting or embedding. Useful for showing a live "used bytes" count in the
+/// UI that reflects Brotli compression savings.
+///
+/// Falls back to `text.as_bytes().len() + 1` (raw text + flags byte) if
+/// `encode_payload` fails for any reason (e.g. file too large).
+pub fn compressed_payload_size(text: &str, files: &[FileEntry]) -> usize {
+    encode_payload(text, files)
+        .map(|v| v.len())
+        .unwrap_or_else(|_| text.as_bytes().len() + 1)
+}
+
 /// Decode a payload from decrypted bytes.
 ///
 /// Input is `[flags byte][maybe_compressed_inner]` as produced by `encode_payload`.
