@@ -1,0 +1,30 @@
+[package]
+name = "phasm-core"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
+repository = "https://github.com/cgaffga/phasmcore"
+authors = ["Christoph Gaffga"]
+keywords = ["steganography", "jpeg", "encryption", "stego"]
+categories = ["multimedia::images", "cryptography"]
+
+[features]
+default = []
+parallel = ["rayon"]
+wasm = ["js-sys", "wasm-bindgen"]
+
+[dependencies]
+aes-gcm-siv = "0.11"
+argon2 = "0.5"
+rand = "0.8"
+rand_chacha = "0.3"
+crc32fast = "1.4"
+hmac = "0.12"
+sha2 = "0.10"
+num-complex = "0.4"
+rayon = { version = "1", optional = true }
+brotli = { version = "7", default-features = false, features = ["std"] }
+zeroize = "1"
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
