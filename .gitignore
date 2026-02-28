@@ -11,6 +11,9 @@ target/
 # Mutation testing
 **/mutants.out*/
 
+# Internal diagnostic tools (not distributed)
+examples/diagnose_decode.rs
+
 # Test photos (not distributed)
 tests/real_photos/*
 !tests/real_photos/.gitkeep
