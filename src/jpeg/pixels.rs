@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Pixel-domain conversion for the Y (luminance) channel.
 //!
 //! Provides IDCT (coefficient → pixel) and forward DCT (pixel → coefficient)

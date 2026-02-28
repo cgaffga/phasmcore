@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Pure-Rust JPEG coefficient codec (zero external dependencies).
 //!
 //! Reads and writes baseline and progressive JPEG files, providing direct access

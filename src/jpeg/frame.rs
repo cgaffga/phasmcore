@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! JPEG frame header (SOF0) parsing.
 //!
 //! Extracts image dimensions, component information, and sampling factors

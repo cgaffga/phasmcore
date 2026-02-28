@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! # phasm-core
 //!
 //! Pure-Rust steganography engine for hiding encrypted text messages in JPEG

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Example: encode and decode a hidden message in a JPEG image.
 use std::fs;
 

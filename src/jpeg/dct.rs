@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! DCT coefficient storage and quantization tables.
 //!
 //! Provides [`DctGrid`] for storing quantized DCT coefficients in block-raster

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! STDM (Spread Transform Dither Modulation) embedding and extraction.
 //!
 //! Embeds one message bit per embedding unit of L coefficients using

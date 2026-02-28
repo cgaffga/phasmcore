@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Error types for the steganography pipeline.
 //!
 //! [`StegoError`] covers all failure modes from JPEG parsing through

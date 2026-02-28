@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Quantization and Huffman table parsing/serialization.
 //!
 //! Handles DQT (Define Quantization Table) and DHT (Define Huffman Table)

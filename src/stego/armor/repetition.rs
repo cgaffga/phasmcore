@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Repetition coding with soft majority voting.
 //!
 //! Lays out `r` copies of RS-encoded bits sequentially across embedding

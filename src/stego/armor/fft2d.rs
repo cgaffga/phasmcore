@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Deterministic 2D FFT/IFFT using only WASM-intrinsic f64 operations.
 //!
 //! Replaces `rustfft` with an in-house implementation:

@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! Huffman coding tables for JPEG entropy decoding and encoding.
+
 use super::bitio::BitReader;
 use super::error::{JpegError, Result};
 

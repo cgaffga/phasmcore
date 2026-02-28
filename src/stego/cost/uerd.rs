@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! UERD (Uniform Embedding Revisited Distortion) cost function for steganography.
+
 use crate::jpeg::dct::{DctGrid, QuantTable};
 use super::CostMap;
 

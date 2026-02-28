@@ -1,7 +1,13 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! Round-trip integration tests for Armor mode encode/decode.
+
 use phasm_core::{armor_encode, armor_decode, armor_capacity, smart_decode, JpegImage};
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("../test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/{name}")).unwrap()
 }
 
 #[test]

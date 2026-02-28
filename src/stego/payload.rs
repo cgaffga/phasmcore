@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Payload serialization, compression, and file embedding.
 //!
 //! The payload format wraps the plaintext before encryption:

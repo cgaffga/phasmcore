@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Global decode progress tracking.
 //!
 //! Uses atomics so it is safe to call from rayon worker threads.

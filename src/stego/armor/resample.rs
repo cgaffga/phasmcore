@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Bilinear resampling for undoing geometric transforms.
 //!
 //! Inverse-maps each output pixel through the estimated affine transform

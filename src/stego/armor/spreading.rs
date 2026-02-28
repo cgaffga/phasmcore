@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Spreading vector generation for STDM embedding.
 //!
 //! Generates unit-norm pseudo-random spreading vectors from a ChaCha20 PRNG

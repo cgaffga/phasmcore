@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Ghost mode capacity estimation.
 //!
 //! Estimates the maximum plaintext message size that can be embedded in a
@@ -79,7 +83,7 @@ mod tests {
 
     #[test]
     fn capacity_reasonable_for_photo() {
-        let data = std::fs::read("../test-vectors/photo_320x240_q75_420.jpg").unwrap();
+        let data = std::fs::read("test-vectors/photo_320x240_q75_420.jpg").unwrap();
         let img = JpegImage::from_bytes(&data).unwrap();
         let cap = estimate_capacity(&img).unwrap();
         // 320×240 at 4:2:0 → 40×30=1200 Y blocks → 75,600 AC positions.

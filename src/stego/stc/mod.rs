@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Syndrome-Trellis Coding (STC) for minimal-distortion embedding.
 //!
 //! STC encodes a message into a cover sequence by finding the minimum-cost

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! JPEG marker parsing and iteration.
 //!
 //! Walks the marker segments in a JPEG byte stream, extracting headers

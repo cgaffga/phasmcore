@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! DFT template generation, embedding, detection, and transform estimation.
 //!
 //! Embeds K=32 peaks at passphrase-derived positions in the DFT magnitude

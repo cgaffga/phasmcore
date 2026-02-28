@@ -1,3 +1,9 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! Zigzag scan order mapping between JPEG coefficient order and natural order.
+
 /// Maps zigzag index (0–63) to natural row-major index (0–63).
 ///
 /// JPEG stores DCT coefficients in zigzag order. This table converts

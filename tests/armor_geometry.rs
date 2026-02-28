@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Integration tests for Armor Phase 3: Geometry Resilience.
 //!
 //! Tests that encoded messages survive geometric transforms (rotation, scaling)
@@ -11,7 +15,7 @@ use phasm_core::stego::armor::resample::resample_bilinear;
 use phasm_core::stego::armor::template::AffineTransform;
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("../test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/{name}")).unwrap()
 }
 
 /// Helper: Apply a geometric transform to a stego JPEG.

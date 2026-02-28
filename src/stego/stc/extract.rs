@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! STC message extraction via syndrome computation.
 //!
 //! Extracts the embedded message from a stego bit sequence by computing

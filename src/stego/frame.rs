@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Payload frame construction and parsing.
 //!
 //! The frame is the binary container that wraps the encrypted message before

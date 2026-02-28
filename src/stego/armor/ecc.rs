@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Reed-Solomon error correction over GF(2^8).
 //!
 //! Implements RS(255, k) with the primitive polynomial 0x11D (x^8+x^4+x^3+x^2+1).

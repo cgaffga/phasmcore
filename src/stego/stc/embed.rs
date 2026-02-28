@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Viterbi-based STC embedding.
 //!
 //! Implements the forward (Viterbi) and backward (traceback) passes of the

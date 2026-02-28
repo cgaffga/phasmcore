@@ -2,6 +2,12 @@
 name = "phasm-core"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
+description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
+repository = "https://github.com/cgaffga/phasmcore"
+authors = ["Christoph Gaffga"]
+keywords = ["steganography", "jpeg", "encryption", "stego"]
+categories = ["multimedia::images", "cryptography"]
 
 [features]
 default = []

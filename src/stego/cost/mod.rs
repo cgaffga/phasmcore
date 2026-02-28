@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Embedding cost functions for steganographic coding.
 //!
 //! Cost functions assign a distortion value to each DCT coefficient position,

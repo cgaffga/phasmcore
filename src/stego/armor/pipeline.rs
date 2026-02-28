@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Armor encode/decode pipeline.
 //!
 //! Armor embeds messages using STDM (Spread Transform Dither Modulation)

@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Recompression survival baseline test.
 //!
 //! Quick sanity test that Armor encode/decode works without recompression.
@@ -9,7 +13,7 @@ use phasm_core::{armor_encode, armor_decode, armor_capacity, JpegImage};
 const MESSAGE_LENGTHS: &[usize] = &[10, 20, 50, 80, 100, 150, 200, 500, 1000];
 
 fn load_test_vector(name: &str) -> Vec<u8> {
-    std::fs::read(format!("../test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/{name}")).unwrap()
 }
 
 /// Generate a reproducible message of exact byte length.

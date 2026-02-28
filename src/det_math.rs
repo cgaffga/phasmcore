@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Deterministic math functions for cross-platform WASM reproducibility.
 //!
 //! Provides `det_sin`, `det_cos`, `det_sincos`, `det_atan2`, and `det_hypot`

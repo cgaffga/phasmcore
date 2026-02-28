@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Cryptographic primitives for payload encryption.
 //!
 //! Implements a two-tier key derivation scheme using Argon2id:

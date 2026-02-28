@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Coefficient position selection and permutation.
 //!
 //! Selects embeddable AC coefficient positions from the cost map and applies

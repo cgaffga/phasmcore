@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! DFT ring payload: a resize-robust second payload layer.
 //!
 //! Embeds a short message in the DFT magnitude spectrum using QIM

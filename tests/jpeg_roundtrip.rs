@@ -1,10 +1,14 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! JPEG codec round-trip tests verifying byte-for-byte decode/re-encode fidelity.
+
 use phasm_core::JpegImage;
 use std::path::Path;
 
 fn read_test_image(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
         .join("test-vectors")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))

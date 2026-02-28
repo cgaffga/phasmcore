@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! H-hat submatrix generation for STC.
 //!
 //! The H-hat matrix defines the parity-check structure of the STC code.

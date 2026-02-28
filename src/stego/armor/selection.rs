@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Frequency-based coefficient selection for Armor embedding.
 //!
 //! Selects DCT coefficient positions suitable for robust STDM embedding

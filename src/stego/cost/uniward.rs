@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! J-UNIWARD (JPEG Universal Wavelet Relative Distortion) cost function.
 //!
 //! Computes embedding costs by measuring the impact of each DCT coefficient
@@ -777,7 +781,7 @@ mod tests {
 
     #[test]
     fn cost_with_real_photo() {
-        let data = match std::fs::read("../test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => return, // Skip if test vector not available.
         };
@@ -863,7 +867,7 @@ mod tests {
     /// with the full Ghost steganography pipeline.
     #[test]
     fn ghost_roundtrip_with_current_feature_set() {
-        let data = match std::fs::read("../test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => return, // Skip if test vector not available.
         };
@@ -886,7 +890,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cost_computation_benchmark() {
-        let data = match std::fs::read("../test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => {
                 eprintln!("Skipping benchmark: test vector not found");

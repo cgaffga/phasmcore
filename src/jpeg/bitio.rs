@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Bit-level I/O for JPEG entropy-coded data.
 //!
 //! Provides [`BitReader`] for decoding and [`BitWriter`] for encoding the

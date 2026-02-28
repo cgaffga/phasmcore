@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Cross-platform determinism tests.
 //!
 //! Two classes of invariants are pinned here:
@@ -21,7 +25,7 @@ use phasm_core::stego::armor::template::generate_template_peaks;
 use phasm_core::{ghost_encode, ghost_decode, armor_encode, armor_decode, smart_decode};
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("../test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/{name}")).unwrap()
 }
 
 /// Create a cost map where every AC position has finite cost (1.0).

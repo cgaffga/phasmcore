@@ -1,3 +1,7 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
 //! Ghost mode encode/decode pipeline.
 //!
 //! Ghost mode embeds encrypted messages into JPEG DCT coefficients using:
