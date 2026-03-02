@@ -373,7 +373,7 @@ fn fft_roundtrip_deterministic() {
 /// These peaks are used for DFT template embedding in Armor mode.
 #[test]
 fn pin_template_peaks() {
-    let peaks = generate_template_peaks("determinism-test", 256, 256);
+    let peaks = generate_template_peaks("determinism-test", 256, 256).unwrap();
     assert_eq!(peaks.len(), 32);
 
     let expected: &[(u64, u64)] = &[
@@ -399,8 +399,8 @@ fn pin_template_peaks() {
 /// Same passphrase + dimensions must produce identical peaks every time.
 #[test]
 fn template_peaks_deterministic() {
-    let a = generate_template_peaks("det-test-2", 512, 384);
-    let b = generate_template_peaks("det-test-2", 512, 384);
+    let a = generate_template_peaks("det-test-2", 512, 384).unwrap();
+    let b = generate_template_peaks("det-test-2", 512, 384).unwrap();
     for i in 0..a.len() {
         assert_eq!(a[i].u.to_bits(), b[i].u.to_bits(), "peak[{i}].u differs");
         assert_eq!(a[i].v.to_bits(), b[i].v.to_bits(), "peak[{i}].v differs");

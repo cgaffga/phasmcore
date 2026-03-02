@@ -94,10 +94,10 @@ pub fn armor_encode(
                 passphrase,
                 &crypto::FORTRESS_EMPTY_SALT,
                 &crypto::FORTRESS_EMPTY_NONCE,
-            );
+            )?;
             frame::build_fortress_compact_frame(payload_bytes.len() as u16, &ct)
         } else {
-            let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
+            let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
             frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ct)
         };
 
@@ -108,7 +108,7 @@ pub fn armor_encode(
             // QIM embedding nearly idempotent under Q75 recompression.
             // Platform-side quality settings vary wildly (iOS 0.65 ≈ libjpeg Q90,
             // Android Q70, Web 0.65 ≈ varies), so we normalize here in the core.
-            pre_settle_for_fortress(&mut img);
+            pre_settle_for_fortress(&mut img)?;
             fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
             let stego_bytes = match img.to_bytes() {
                 Ok(bytes) => bytes,
@@ -122,7 +122,7 @@ pub fn armor_encode(
     }
 
     // Full frame for STDM path (always uses random salt + nonce).
-    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
     let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
 
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
@@ -131,7 +131,7 @@ pub fn armor_encode(
     // Pre-clamp pass: IDCT -> clamp [0,255] -> DCT on all Y-channel blocks.
     // Settles coefficients so they already produce valid pixel values,
     // reducing systematic distortion from pixel clamping during recompression.
-    pre_clamp_y_channel(&mut img);
+    pre_clamp_y_channel(&mut img)?;
 
     // 1. Compute stability map for Y channel (frequency-restricted).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
@@ -141,7 +141,7 @@ pub fn armor_encode(
     let cost_map = compute_stability_map(img.dct_grid(0), qt);
 
     // 2. Derive structural key with Armor salt.
-    let structural_key = crypto::derive_armor_structural_key(passphrase);
+    let structural_key = crypto::derive_armor_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let spread_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
@@ -477,7 +477,7 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     let cost_map = compute_stability_map(img.dct_grid(0), qt);
 
     // 2. Derive structural key.
-    let structural_key = crypto::derive_armor_structural_key(passphrase);
+    let structural_key = crypto::derive_armor_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let spread_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
@@ -601,11 +601,12 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
     }
 
     // Convert to pixel domain and compute 2D FFT.
-    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(&img);
+    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(&img)
+        .ok_or(StegoError::NoLuminanceChannel)?;
     let spectrum = fft2d::fft2d(&luma_pixels, w, h);
 
     // Generate expected template peaks and search for them.
-    let peaks = template::generate_template_peaks(passphrase, w, h);
+    let peaks = template::generate_template_peaks(passphrase, w, h)?;
     let detected = template::detect_template(&spectrum, &peaks);
 
     // Estimate the geometric transform from detected peaks.
@@ -652,7 +653,8 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
 
     // P0: Move img instead of clone — img is not used after correction.
     let mut corrected_img = img;
-    pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img);
+    pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img)
+        .ok_or(StegoError::NoLuminanceChannel)?;
 
     // P0: Drop corrected_pixels — written into corrected_img.
     drop(corrected_pixels);
@@ -670,7 +672,8 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
             // STDM decode failed after geometry correction -- try DFT ring
             // Recompute FFT from corrected image for ring extraction
             {
-                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img);
+                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img)
+                    .ok_or(StegoError::NoLuminanceChannel)?;
                 let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
                 if let Some(ring_bytes) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
                     if let Ok(text) = std::str::from_utf8(&ring_bytes) {
@@ -997,9 +1000,10 @@ fn get_or_extract_llrs(
 /// This "settles" the cover image's coefficients so they produce valid pixel
 /// values. Without this, recompression through a pixel-domain pipeline
 /// (IDCT -> clamp -> DCT) introduces systematic distortion from clamping.
-fn pre_clamp_y_channel(img: &mut JpegImage) {
+fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt_values = img.quant_table(qt_id).expect("Y quant table must exist").values;
+    let qt_values = img.quant_table(qt_id)
+        .ok_or(StegoError::NoLuminanceChannel)?.values;
     let grid = img.dct_grid_mut(0);
 
     let process_block = |chunk: &mut [i16]| {
@@ -1016,6 +1020,7 @@ fn pre_clamp_y_channel(img: &mut JpegImage) {
     grid.coeffs_mut().par_chunks_mut(64).for_each(process_block);
     #[cfg(not(feature = "parallel"))]
     grid.coeffs_mut().chunks_mut(64).for_each(process_block);
+    Ok(())
 }
 
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
@@ -1286,14 +1291,15 @@ pub fn armor_capacity_info(jpeg_bytes: &[u8]) -> Result<ArmorCapacityInfo, Stego
 /// Embeds both template peaks (for geometry resilience) and the DFT ring
 /// payload (resize-robust second layer) in the same FFT pass.
 fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> Result<(), StegoError> {
-    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(img);
+    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(img)
+        .ok_or(StegoError::NoLuminanceChannel)?;
 
     // P0: Drop luma_pixels after FFT — only needed to produce the spectrum.
     let mut spectrum = fft2d::fft2d(&luma_pixels, w, h);
     drop(luma_pixels);
 
     // Template peaks for geometry estimation
-    let peaks = template::generate_template_peaks(passphrase, w, h);
+    let peaks = template::generate_template_peaks(passphrase, w, h)?;
     template::embed_template(&mut spectrum, &peaks);
 
     // Ring payload -- truncate message to ring capacity
@@ -1309,14 +1315,15 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
             .map(|(i, c)| i + c.len_utf8())
             .unwrap_or(0);
         let truncated = &message.as_bytes()[..truncated_len];
-        dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase);
+        dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase)?;
     }
 
     // P0: Drop spectrum after IFFT — only needed to produce the modified pixels.
     let modified = fft2d::ifft2d(&spectrum);
     drop(spectrum);
 
-    pixels::luma_f64_to_jpeg(&modified, w, h, img);
+    pixels::luma_f64_to_jpeg(&modified, w, h, img)
+        .ok_or(StegoError::NoLuminanceChannel)?;
     Ok(())
 }
 
@@ -1378,7 +1385,7 @@ fn compute_jpeg_qt(base: &[u16; 64], qf: u32) -> [u16; 64] {
 /// Without this, platform-side quality settings vary wildly (iOS 0.65 ≈ Q90,
 /// Android Q70, Web 0.65 ≈ varies), leaving coefficients on a fine grid that
 /// shifts dramatically when recompressed to Q75.
-fn pre_settle_for_fortress(img: &mut JpegImage) {
+fn pre_settle_for_fortress(img: &mut JpegImage) -> Result<(), StegoError> {
     use crate::jpeg::dct::QuantTable;
 
     let num_components = img.num_components();
@@ -1391,7 +1398,8 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
 
     for comp_idx in 0..num_components {
         let qt_id = img.frame_info().components[comp_idx].quant_table_id as usize;
-        let old_qt = img.quant_table(qt_id).expect("quant table must exist").values;
+        let old_qt = img.quant_table(qt_id)
+            .ok_or(StegoError::NoLuminanceChannel)?.values;
         let base = if comp_idx == 0 {
             &JPEG_BASE_LUMINANCE_QT
         } else {
@@ -1428,6 +1436,7 @@ fn pre_settle_for_fortress(img: &mut JpegImage) {
             replaced[*qt_id] = true;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

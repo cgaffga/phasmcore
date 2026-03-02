@@ -15,6 +15,7 @@ use rand_chacha::ChaCha20Rng;
 
 use crate::stego::armor::fft2d::Spectrum2D;
 use crate::stego::crypto::derive_template_key;
+use crate::stego::error::StegoError;
 
 /// Number of template peaks.
 const K: usize = 32;
@@ -69,8 +70,8 @@ pub struct AffineTransform {
 ///
 /// Peak positions are in the mid-frequency band (between R_MIN and R_MAX
 /// from the center) to avoid both DC and high-frequency noise.
-pub fn generate_template_peaks(passphrase: &str, width: usize, height: usize) -> Vec<TemplatePeak> {
-    let key = derive_template_key(passphrase);
+pub fn generate_template_peaks(passphrase: &str, width: usize, height: usize) -> Result<Vec<TemplatePeak>, StegoError> {
+    let key = derive_template_key(passphrase)?;
     let mut rng = ChaCha20Rng::from_seed(key);
 
     let min_dim = width.min(height) as f64;
@@ -94,7 +95,7 @@ pub fn generate_template_peaks(passphrase: &str, width: usize, height: usize) ->
         });
     }
 
-    peaks
+    Ok(peaks)
 }
 
 /// Add peaks to DFT magnitude, preserving phase + Hermitian symmetry.
@@ -315,8 +316,8 @@ mod tests {
 
     #[test]
     fn generate_deterministic() {
-        let p1 = generate_template_peaks("test_pass", 256, 256);
-        let p2 = generate_template_peaks("test_pass", 256, 256);
+        let p1 = generate_template_peaks("test_pass", 256, 256).unwrap();
+        let p2 = generate_template_peaks("test_pass", 256, 256).unwrap();
         assert_eq!(p1.len(), K);
         assert_eq!(p2.len(), K);
         for i in 0..K {
@@ -327,8 +328,8 @@ mod tests {
 
     #[test]
     fn different_passphrases_differ() {
-        let p1 = generate_template_peaks("pass1", 256, 256);
-        let p2 = generate_template_peaks("pass2", 256, 256);
+        let p1 = generate_template_peaks("pass1", 256, 256).unwrap();
+        let p2 = generate_template_peaks("pass2", 256, 256).unwrap();
         // At least some peaks should differ
         let mut all_same = true;
         for i in 0..K {
@@ -344,7 +345,7 @@ mod tests {
     fn peaks_in_mid_frequency_band() {
         let w = 256;
         let h = 256;
-        let peaks = generate_template_peaks("test", w, h);
+        let peaks = generate_template_peaks("test", w, h).unwrap();
         let min_dim = w.min(h) as f64;
         let r_min = R_MIN_FACTOR * min_dim;
         let r_max = R_MAX_FACTOR * min_dim;
@@ -372,7 +373,7 @@ mod tests {
             .collect();
 
         let mut spectrum = fft2d::fft2d(&pixels, width, height);
-        let peaks = generate_template_peaks("embed_test", width, height);
+        let peaks = generate_template_peaks("embed_test", width, height).unwrap();
         embed_template(&mut spectrum, &peaks);
 
         let detected = detect_template(&spectrum, &peaks);

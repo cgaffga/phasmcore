@@ -187,7 +187,7 @@ fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     #[cfg(feature = "parallel")]
     sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     #[cfg(not(feature = "parallel"))]
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let median = if total_blocks == 0 {
         1.0
@@ -384,7 +384,7 @@ pub fn fortress_encode(
     }
 
     // Derive fortress structural key for block permutation.
-    let fort_key = crypto::derive_fortress_structural_key(passphrase);
+    let fort_key = crypto::derive_fortress_structural_key(passphrase)?;
     let perm = permute_blocks(total_blocks, &fort_key);
 
     let header_perm = &perm[..FORTRESS_HEADER_BLOCKS];
@@ -487,7 +487,7 @@ pub fn fortress_decode(
     }
 
     // Derive key and permute blocks.
-    let fort_key = crypto::derive_fortress_structural_key(passphrase);
+    let fort_key = crypto::derive_fortress_structural_key(passphrase)?;
     let perm = permute_blocks(total_blocks, &fort_key);
 
     // Extract header LLRs with fixed step.

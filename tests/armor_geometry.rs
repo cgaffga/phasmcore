@@ -22,9 +22,9 @@ fn load_test_image(name: &str) -> Vec<u8> {
 /// Returns new JPEG bytes with the Y channel geometrically transformed.
 fn apply_geometry(stego_bytes: &[u8], transform: &AffineTransform) -> Vec<u8> {
     let mut img = JpegImage::from_bytes(stego_bytes).unwrap();
-    let (luma, w, h) = pixels::jpeg_to_luma_f64(&img);
+    let (luma, w, h) = pixels::jpeg_to_luma_f64(&img).unwrap();
     let transformed = resample_bilinear(&luma, w, h, transform, w, h);
-    pixels::luma_f64_to_jpeg(&transformed, w, h, &mut img);
+    pixels::luma_f64_to_jpeg(&transformed, w, h, &mut img).unwrap();
     match img.to_bytes() {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -58,9 +58,9 @@ fn armor_geometry_template_detectable() {
 
     let stego = armor_encode(&cover, "test", passphrase).unwrap();
     let img = JpegImage::from_bytes(&stego).unwrap();
-    let (luma, w, h) = pixels::jpeg_to_luma_f64(&img);
+    let (luma, w, h) = pixels::jpeg_to_luma_f64(&img).unwrap();
     let spectrum = fft2d::fft2d(&luma, w, h);
-    let peaks = template::generate_template_peaks(passphrase, w, h);
+    let peaks = template::generate_template_peaks(passphrase, w, h).unwrap();
     let detected = template::detect_template(&spectrum, &peaks);
 
     assert!(

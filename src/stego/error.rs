@@ -30,6 +30,8 @@ pub enum StegoError {
     NoLuminanceChannel,
     /// The operation was cancelled by the user.
     Cancelled,
+    /// Argon2 key derivation failed (invalid parameters or internal error).
+    KeyDerivationFailed,
 }
 
 impl fmt::Display for StegoError {
@@ -44,6 +46,7 @@ impl fmt::Display for StegoError {
             Self::InvalidUtf8 => write!(f, "extracted text is not valid UTF-8"),
             Self::NoLuminanceChannel => write!(f, "image has no luminance channel"),
             Self::Cancelled => write!(f, "operation cancelled by user"),
+            Self::KeyDerivationFailed => write!(f, "key derivation failed"),
         }
     }
 }

@@ -125,7 +125,7 @@ fn ghost_encode_impl(
     let cost_map = compute_uniward(img.dct_grid(0), qt);
 
     // 2. Derive structural key (Tier 1).
-    let structural_key = crypto::derive_structural_key(passphrase);
+    let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
@@ -136,7 +136,7 @@ fn ghost_encode_impl(
     let positions = &positions[..n_used];
 
     // 4. Encrypt payload (Tier 2 key with random salt).
-    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase);
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
 
     // 5. Build payload frame and pad to m_max bits.
     let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
@@ -232,7 +232,7 @@ pub fn ghost_decode(
     progress::check_cancelled()?;
 
     // 2. Derive structural key.
-    let structural_key = crypto::derive_structural_key(passphrase);
+    let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 

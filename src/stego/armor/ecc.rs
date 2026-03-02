@@ -279,7 +279,7 @@ fn berlekamp_massey(syndromes: &[u8]) -> Vec<u8> {
 
         if 2 * ell <= r {
             // Save C before updating (it becomes the new B)
-            let old_c = c.clone();
+            let old_c = c[..c_len].to_vec();
             let old_c_len = c_len;
 
             let new_len = (b_len + m).max(c_len);
@@ -328,6 +328,9 @@ fn eval_asc(poly: &[u8], x: u8) -> u8 {
 ///
 /// Returns (gf_pos, array_pos) pairs.
 fn chien_search(sigma_asc: &[u8], n: usize) -> Option<Vec<(usize, usize)>> {
+    if n == 0 {
+        return None;
+    }
     let tab = gf_tables();
     let num_errors = sigma_asc.len() - 1;
     let mut found = Vec::with_capacity(num_errors);

@@ -202,7 +202,18 @@ fn parse_inner(data: &[u8]) -> Result<PayloadData, StegoError> {
 }
 
 /// Try Brotli compression; return `[flags][data]` using whichever is smaller.
+///
+/// Skips Brotli entirely for tiny payloads (< 32 bytes) where compression
+/// overhead exceeds any possible savings.
 fn try_compress(inner: &[u8]) -> Vec<u8> {
+    // Skip Brotli for tiny payloads — the framing overhead exceeds any savings.
+    if inner.len() < 32 {
+        let mut result = Vec::with_capacity(1 + inner.len());
+        result.push(COMPRESS_NONE);
+        result.extend_from_slice(inner);
+        return result;
+    }
+
     let compressed = compress_brotli(inner);
 
     // Use compressed only if it's strictly smaller.

@@ -95,7 +95,10 @@ const IMPACT_SIZE: usize = 8 + FILT_LEN - 1;
 
 /// Wrapper to send a raw pointer across Rayon threads.
 /// Safe because each block writes to a disjoint region of the CostMap.
-struct CostMapPtr(*mut f32);
+struct CostMapPtr {
+    ptr: *mut f32,
+    total_len: usize,
+}
 unsafe impl Send for CostMapPtr {}
 unsafe impl Sync for CostMapPtr {}
 
@@ -105,7 +108,8 @@ impl CostMapPtr {
     /// # Safety
     /// Caller must ensure no aliasing writes to the same index.
     unsafe fn write(&self, idx: usize, val: f32) {
-        *self.0.add(idx) = val;
+        debug_assert!(idx < self.total_len, "CostMapPtr write out of bounds: {idx} >= {}", self.total_len);
+        unsafe { *self.ptr.add(idx) = val; }
     }
 }
 
@@ -150,7 +154,8 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     let pad = FILT_LEN - 1; // = 15
     let n_blocks = bt * bw;
 
-    let costs_ptr = CostMapPtr(map.costs_ptr());
+    let total_len = n_blocks * 64;
+    let costs_ptr = CostMapPtr { ptr: map.costs_ptr(), total_len };
 
     let compute_block = |bi: usize| {
         let br = bi / bw;
@@ -240,7 +245,8 @@ pub fn compute_uniward_for_decode(grid: &DctGrid, qt: &QuantTable) -> Result<Cos
     let pad = FILT_LEN - 1;
     let n_blocks = bt * bw;
 
-    let costs_ptr = CostMapPtr(map.costs_ptr());
+    let total_len = n_blocks * 64;
+    let costs_ptr = CostMapPtr { ptr: map.costs_ptr(), total_len };
 
     let compute_block = |bi: usize| {
         let br = bi / bw;

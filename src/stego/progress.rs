@@ -134,3 +134,32 @@ fn notify() {
 fn notify() {
     // No-op on native — iOS/Android poll via FFI.
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_flag_propagates() {
+        // Reset state
+        init(10);
+        assert!(!is_cancelled());
+        assert!(check_cancelled().is_ok());
+
+        // Request cancellation
+        cancel();
+        assert!(is_cancelled());
+
+        // check_cancelled should return Err(Cancelled)
+        let err = check_cancelled().unwrap_err();
+        assert!(
+            matches!(err, StegoError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+
+        // Reset clears the cancel flag
+        init(5);
+        assert!(!is_cancelled());
+        assert!(check_cancelled().is_ok());
+    }
+}

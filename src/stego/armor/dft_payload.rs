@@ -61,17 +61,17 @@ pub fn ring_capacity(_width: usize, _height: usize) -> usize {
 }
 
 /// Derive the ring encryption key from the passphrase.
-fn derive_ring_key(passphrase: &str) -> [u8; 32] {
+fn derive_ring_key(passphrase: &str) -> Result<[u8; 32], crate::stego::error::StegoError> {
     let mut output = [0u8; 32];
     argon2::Argon2::default()
         .hash_password_into(passphrase.as_bytes(), RING_SALT, &mut output)
-        .expect("Argon2 ring key derivation should not fail");
-    output
+        .map_err(|_| crate::stego::error::StegoError::KeyDerivationFailed)?;
+    Ok(output)
 }
 
 /// Derive the ring PRNG seed for sector assignment.
-fn derive_ring_seed(passphrase: &str) -> [u8; 32] {
-    let ring_key = derive_ring_key(passphrase);
+fn derive_ring_seed(passphrase: &str) -> Result<[u8; 32], crate::stego::error::StegoError> {
+    let ring_key = derive_ring_key(passphrase)?;
     // Use HMAC-SHA256 for proper domain separation (replaces XOR with fixed string)
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -81,7 +81,7 @@ fn derive_ring_seed(passphrase: &str) -> [u8; 32] {
     let result = mac.finalize().into_bytes();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&result);
-    seed
+    Ok(seed)
 }
 
 /// Generate a permuted sector-to-bit assignment.
@@ -89,8 +89,8 @@ fn derive_ring_seed(passphrase: &str) -> [u8; 32] {
 /// Returns a vector of length NUM_SECTORS where each element is the
 /// data bit index (0..effective_bits) that sector carries, with
 /// SPREAD_SECTORS sectors per bit.
-fn generate_sector_assignment(passphrase: &str) -> Vec<usize> {
-    let seed = derive_ring_seed(passphrase);
+fn generate_sector_assignment(passphrase: &str) -> Result<Vec<usize>, crate::stego::error::StegoError> {
+    let seed = derive_ring_seed(passphrase)?;
     let mut rng = ChaCha20Rng::from_seed(seed);
 
     let effective_bits = NUM_SECTORS / SPREAD_SECTORS;
@@ -107,7 +107,7 @@ fn generate_sector_assignment(passphrase: &str) -> Vec<usize> {
         assignment.swap(i, j);
     }
 
-    assignment
+    Ok(assignment)
 }
 
 /// Compute the mean magnitude of a sector in the annular ring.
@@ -262,7 +262,7 @@ pub fn embed_ring_payload(
     spectrum: &mut Spectrum2D,
     payload: &[u8],
     passphrase: &str,
-) {
+) -> Result<(), crate::stego::error::StegoError> {
     let w = spectrum.width;
     let h = spectrum.height;
     let min_dim = w.min(h) as f64;
@@ -270,7 +270,7 @@ pub fn embed_ring_payload(
     let r_outer = RING_R_OUTER * min_dim;
 
     // Encrypt payload
-    let (ciphertext, nonce, salt) = crypto::encrypt(payload, passphrase);
+    let (ciphertext, nonce, salt) = crypto::encrypt(payload, passphrase)?;
     let frame_bytes = frame::build_frame(payload.len() as u16, &salt, &nonce, &ciphertext);
 
     // RS encode with heavy parity
@@ -278,7 +278,7 @@ pub fn embed_ring_payload(
     let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
     // Get sector assignment
-    let assignment = generate_sector_assignment(passphrase);
+    let assignment = generate_sector_assignment(passphrase)?;
     let effective_bits = NUM_SECTORS / SPREAD_SECTORS;
 
     // Truncate RS bits to fit
@@ -295,6 +295,7 @@ pub fn embed_ring_payload(
         let target = qim_embed(mag.max(RING_DELTA), RING_DELTA, rs_bits[bit_idx]);
         set_sector_magnitude(spectrum, sector_idx, r_inner, r_outer, target);
     }
+    Ok(())
 }
 
 /// Extract a ring payload from the DFT spectrum.
@@ -310,7 +311,7 @@ pub fn extract_ring_payload(
     let r_inner = RING_R_INNER * min_dim;
     let r_outer = RING_R_OUTER * min_dim;
 
-    let assignment = generate_sector_assignment(passphrase);
+    let assignment = generate_sector_assignment(passphrase).ok()?;
     let effective_bits = NUM_SECTORS / SPREAD_SECTORS;
 
     // Extract QIM bits with soft voting across SPREAD_SECTORS sectors per bit
@@ -403,14 +404,14 @@ mod tests {
 
     #[test]
     fn sector_assignment_deterministic() {
-        let a = generate_sector_assignment("test-pass");
-        let b = generate_sector_assignment("test-pass");
+        let a = generate_sector_assignment("test-pass").unwrap();
+        let b = generate_sector_assignment("test-pass").unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn sector_assignment_covers_all_bits() {
-        let assignment = generate_sector_assignment("test-pass");
+        let assignment = generate_sector_assignment("test-pass").unwrap();
         assert_eq!(assignment.len(), NUM_SECTORS);
 
         let effective_bits = NUM_SECTORS / SPREAD_SECTORS;
@@ -433,7 +434,7 @@ mod tests {
             return;
         }
 
-        embed_ring_payload(&mut spectrum, payload, passphrase);
+        embed_ring_payload(&mut spectrum, payload, passphrase).unwrap();
         let result = extract_ring_payload(&spectrum, passphrase);
         assert!(result.is_some(), "should extract ring payload");
         assert_eq!(result.unwrap(), payload);

@@ -44,7 +44,7 @@ fn full_pipeline_diagnostic() {
     let qt = img.quant_table(qt_id).unwrap();
     let cost_map = compute_uniward(img.dct_grid(0), qt);
 
-    let structural_key = crypto::derive_structural_key(passphrase);
+    let structural_key = crypto::derive_structural_key(passphrase).unwrap();
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
@@ -68,7 +68,7 @@ fn full_pipeline_diagnostic() {
     };
 
     // Build frame
-    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase);
+    let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase).unwrap();
     let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
     let frame_bits = frame::bytes_to_bits(&frame_bytes);
     let mut padded_bits = vec![0u8; m_max];

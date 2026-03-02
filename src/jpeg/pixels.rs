@@ -133,10 +133,12 @@ pub fn dct_block(pixels: &[f64; 64], qt: &[u16; 64]) -> [i16; 64] {
 ///
 /// Returns (pixels, width_in_pixels, height_in_pixels) where dimensions
 /// are the full block-aligned size (multiples of 8).
-pub fn jpeg_to_luma_f64(img: &JpegImage) -> (Vec<f64>, usize, usize) {
+///
+/// Returns `None` if the Y-channel quantization table is missing.
+pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
     let grid = img.dct_grid(0);
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt = img.quant_table(qt_id).expect("Y quant table must exist");
+    let qt = img.quant_table(qt_id)?;
 
     let bw = grid.blocks_wide();
     let bh = grid.blocks_tall();
@@ -160,15 +162,17 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> (Vec<f64>, usize, usize) {
         }
     }
 
-    (pixels, width, height)
+    Some((pixels, width, height))
 }
 
 /// Write f64 pixel array back into Y-channel DctGrid.
 ///
 /// Performs forward DCT + quantization on each 8×8 block.
-pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut JpegImage) {
+///
+/// Returns `None` if the Y-channel quantization table is missing.
+pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut JpegImage) -> Option<()> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt_values = img.quant_table(qt_id).expect("Y quant table must exist").values;
+    let qt_values = img.quant_table(qt_id)?.values;
     let grid = img.dct_grid_mut(0);
     let bw = grid.blocks_wide();
     let bh = grid.blocks_tall();
@@ -192,6 +196,7 @@ pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut J
             block.copy_from_slice(&quantized);
         }
     }
+    Some(())
 }
 
 #[cfg(test)]

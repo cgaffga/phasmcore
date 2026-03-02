@@ -40,6 +40,10 @@ pub fn stc_embed(
     h: usize,
     w: usize,
 ) -> Option<EmbedResult> {
+    if w == 0 || h > 31 {
+        return None;
+    }
+
     let n = cover_bits.len();
     let m = message.len();
 

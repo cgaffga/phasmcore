@@ -17,6 +17,10 @@ use super::hhat;
 /// columns, then reads the bottom bit of the state as message[i] and shifts
 /// the state right by 1 to advance the syndrome window.
 pub fn stc_extract(stego_bits: &[u8], hhat: &[Vec<u32>], w: usize) -> Vec<u8> {
+    if w == 0 {
+        return Vec::new();
+    }
+
     let n = stego_bits.len();
     let m = (n + w - 1) / w; // ceil(n / w)
 
