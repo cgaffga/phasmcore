@@ -111,6 +111,9 @@ impl JpegImage {
                 // Skip segment
                 if pos + 3 < data.len() {
                     let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+                    if len < 2 || pos + 2 + len > data.len() {
+                        break; // Malformed segment length
+                    }
                     pos += 2 + len;
                 } else {
                     break;

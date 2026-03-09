@@ -24,7 +24,7 @@ pub fn compute_r(rs_bit_count: usize, num_units: usize) -> usize {
         if r_odd.checked_mul(rs_bit_count).unwrap_or(usize::MAX) <= num_units {
             r_odd
         } else {
-            // r was even, r|1 = r+1 which overflows — use r-1 (odd)
+            // r was even, r|1 = r+1 doesn't fit in available units — use r-1 (odd)
             (r - 1).max(1)
         }
     } else if r >= 2 {

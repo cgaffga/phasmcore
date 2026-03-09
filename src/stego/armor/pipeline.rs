@@ -991,8 +991,8 @@ fn get_or_extract_llrs(
         cache.remove(0); // Remove LRU (oldest) entry
     }
 
-    cache.push((delta, llrs.clone()));
-    llrs
+    cache.push((delta, llrs));
+    cache.last().unwrap().1.clone()
 }
 
 /// Pre-clamp the Y channel: IDCT -> clamp [0, 255] -> DCT for all blocks.
