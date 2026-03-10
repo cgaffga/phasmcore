@@ -2,7 +2,7 @@
 
 Pure-Rust steganography engine for hiding encrypted text messages in JPEG photos.
 
-This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm/id6742044613), Android, and the [web](https://phasm.app).
+This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm-steganography/id6759446274), Android, and the [web](https://phasm.app).
 
 ## Two Embedding Modes
 
