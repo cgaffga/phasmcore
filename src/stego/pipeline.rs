@@ -19,6 +19,7 @@ use crate::stego::frame::{self, MAX_FRAME_BITS};
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute;
 use crate::stego::progress;
+use crate::stego::side_info::{self, SideInfo};
 use crate::stego::stc::{embed, extract, hhat};
 
 /// STC constraint length for Ghost Phase 1.
@@ -79,7 +80,7 @@ pub fn ghost_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_impl(image_bytes, message, &[], passphrase)
+    ghost_encode_impl(image_bytes, message, &[], passphrase, None)
 }
 
 /// Encode a text message with file attachments into a cover JPEG using Ghost mode.
@@ -92,7 +93,72 @@ pub fn ghost_encode_with_files(
     files: &[FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_impl(image_bytes, message, files, passphrase)
+    ghost_encode_impl(image_bytes, message, files, passphrase, None)
+}
+
+/// Encode using Ghost mode with side information (SI-UNIWARD / "Deep Cover").
+///
+/// When the original uncompressed pixels are available (non-JPEG input like
+/// PNG, HEIC, or RAW), the quantization rounding errors enable more efficient
+/// embedding — roughly 1.5-2× capacity at the same detection risk.
+///
+/// The `raw_pixels_rgb` must be the ORIGINAL pixels that were JPEG-compressed
+/// to produce `image_bytes`. They must have the same dimensions.
+///
+/// # Arguments
+/// - `image_bytes`: Cover JPEG (as compressed by the platform from the raw pixels).
+/// - `raw_pixels_rgb`: Original RGB pixels, row-major, 3 bytes per pixel.
+/// - `pixel_width`, `pixel_height`: Dimensions of the raw pixel buffer.
+/// - `message`: Plaintext message to embed.
+/// - `passphrase`: Used for structural key derivation and encryption.
+pub fn ghost_encode_si(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_si_with_files(
+        image_bytes, raw_pixels_rgb, pixel_width, pixel_height,
+        message, &[], passphrase,
+    )
+}
+
+/// Encode with side information and file attachments.
+pub fn ghost_encode_si_with_files(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    // Parse image first to get the grid and QT for side info computation
+    let img = JpegImage::from_bytes(image_bytes)?;
+    let fi = img.frame_info();
+    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    let qt_id = fi.components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+
+    let si = SideInfo::compute(
+        raw_pixels_rgb,
+        pixel_width,
+        pixel_height,
+        img.dct_grid(0),
+        &qt.values,
+    );
+
+    // Drop img so ghost_encode_impl can re-parse (it needs mut access)
+    drop(img);
+
+    ghost_encode_impl(image_bytes, message, files, passphrase, Some(si))
 }
 
 fn ghost_encode_impl(
@@ -100,6 +166,7 @@ fn ghost_encode_impl(
     message: &str,
     files: &[FileEntry],
     passphrase: &str,
+    si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
     // Build the payload (text + files + compression).
     let payload_bytes = payload::encode_payload(message, files)?;
@@ -122,7 +189,12 @@ fn ghost_encode_impl(
     // 1. Compute J-UNIWARD costs for Y channel.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uniward(img.dct_grid(0), qt);
+    let mut cost_map = compute_uniward(img.dct_grid(0), qt);
+
+    // 1b. If side information is available (SI-UNIWARD), modulate costs.
+    if let Some(ref side_info) = si {
+        side_info::modulate_costs_si(&mut cost_map, side_info, img.dct_grid(0));
+    }
 
     // 2. Derive structural key (Tier 1).
     let structural_key = crypto::derive_structural_key(passphrase)?;
@@ -164,25 +236,20 @@ fn ghost_encode_impl(
         .ok_or(StegoError::MessageTooLarge)?;
 
     // 8. Apply LSB changes to DctGrid.
-    // For |coeff| > 1: move toward zero (nsF5 convention).
-    // For |coeff| == 1: move AWAY from zero (±1 → ±2) to prevent shrinkage,
-    // which would break encoder-decoder position alignment.
+    // Direction depends on whether side information is available:
+    // - SI-UNIWARD: toward pre-quantization value (rounding error direction).
+    // - Standard (nsF5): toward zero for |coeff| > 1.
+    // In both modes: |coeff| == 1 → away from zero (anti-shrinkage).
     let grid_mut = img.dct_grid_mut(0);
     for (idx, pos) in positions.iter().enumerate() {
         let old_bit = cover_bits[idx];
         let new_bit = result.stego_bits[idx];
         if old_bit != new_bit {
             let coeff = flat_get(grid_mut, pos.flat_idx);
-            let modified = if coeff == 1 {
-                2 // away from zero to prevent shrinkage
-            } else if coeff == -1 {
-                -2 // away from zero to prevent shrinkage
-            } else if coeff > 1 {
-                coeff - 1 // toward zero
-            } else if coeff < -1 {
-                coeff + 1 // toward zero
+            let modified = if let Some(ref side_info) = si {
+                side_info::si_modify_coefficient(coeff, side_info.error_at(pos.flat_idx))
             } else {
-                coeff // zero: should never happen (filtered out)
+                side_info::nsf5_modify_coefficient(coeff)
             };
             flat_set(grid_mut, pos.flat_idx, modified);
         }

@@ -129,6 +129,56 @@ pub fn dct_block(pixels: &[f64; 64], qt: &[u16; 64]) -> [i16; 64] {
     quantized
 }
 
+/// 8×8 forward DCT + divide by QT, but do NOT round.
+///
+/// Returns continuous f64 values (the "unquantized" coefficients).
+/// The rounding error for each position is:
+///   `unquantized[i] - dct_block(pixels, qt)[i] as f64`
+/// and lies in the range [-0.5, +0.5].
+///
+/// Used by SI-UNIWARD to exploit quantization rounding errors for
+/// more efficient embedding when the original pixels are available.
+pub fn dct_block_unquantized(pixels: &[f64; 64], qt: &[u16; 64]) -> [f64; 64] {
+    let cos = cosine_table();
+    let c = norm_table();
+
+    // Level shift: subtract 128
+    let mut shifted = [0.0f64; 64];
+    for i in 0..64 {
+        shifted[i] = pixels[i] - 128.0;
+    }
+
+    // Separable forward DCT: rows then columns.
+    let mut temp = [0.0f64; 64];
+    for row in 0..8 {
+        for u in 0..8 {
+            let mut sum = 0.0;
+            for x in 0..8 {
+                sum += shifted[row * 8 + x] * cos[u][x];
+            }
+            temp[row * 8 + u] = c[u] * sum;
+        }
+    }
+
+    let mut coeffs = [0.0f64; 64];
+    for col in 0..8 {
+        for v in 0..8 {
+            let mut sum = 0.0;
+            for y in 0..8 {
+                sum += temp[y * 8 + col] * cos[v][y];
+            }
+            coeffs[v * 8 + col] = c[v] * sum;
+        }
+    }
+
+    // Divide by QT but do NOT round — return continuous values.
+    let mut unquantized = [0.0f64; 64];
+    for i in 0..64 {
+        unquantized[i] = coeffs[i] / qt[i] as f64;
+    }
+    unquantized
+}
+
 /// Convert entire Y-channel DctGrid → row-major f64 pixel array.
 ///
 /// Returns (pixels, width_in_pixels, height_in_pixels) where dimensions
@@ -163,6 +213,50 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
     }
 
     Some((pixels, width, height))
+}
+
+/// Convert RGB pixel buffer to Y (luminance) 8×8 blocks.
+///
+/// Uses BT.601: `Y = 0.299*R + 0.587*G + 0.114*B`
+///
+/// Handles non-multiple-of-8 dimensions by edge-replicating the last row/column
+/// (matching typical JPEG encoder behavior).
+///
+/// # Arguments
+/// - `rgb`: Row-major RGB bytes (R,G,B,R,G,B,...), length = width * height * 3.
+/// - `width`, `height`: Image dimensions in pixels.
+///
+/// # Returns
+/// Vector of `[f64; 64]` blocks in raster order (left-to-right, top-to-bottom),
+/// with block count = `ceil(width/8) * ceil(height/8)`.
+pub fn rgb_to_luma_blocks(rgb: &[u8], width: u32, height: u32) -> Vec<[f64; 64]> {
+    let w = width as usize;
+    let h = height as usize;
+    let bw = (w + 7) / 8;
+    let bh = (h + 7) / 8;
+
+    let mut blocks = Vec::with_capacity(bw * bh);
+
+    for br in 0..bh {
+        for bc in 0..bw {
+            let mut block = [0.0f64; 64];
+            for row in 0..8 {
+                for col in 0..8 {
+                    // Edge-replicate if past the image boundary
+                    let py = (br * 8 + row).min(h - 1);
+                    let px = (bc * 8 + col).min(w - 1);
+                    let idx = (py * w + px) * 3;
+                    let r = rgb[idx] as f64;
+                    let g = rgb[idx + 1] as f64;
+                    let b = rgb[idx + 2] as f64;
+                    block[row * 8 + col] = 0.299 * r + 0.587 * g + 0.114 * b;
+                }
+            }
+            blocks.push(block);
+        }
+    }
+
+    blocks
 }
 
 /// Write f64 pixel array back into Y-channel DctGrid.
