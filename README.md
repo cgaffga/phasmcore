@@ -14,6 +14,14 @@ Use Ghost when the stego image will be stored or transmitted without recompressi
 
 Ghost mode also supports **file attachments** (Brotli-compressed, multi-file).
 
+#### SI-UNIWARD (Deep Cover)
+
+When the encoder has access to the original uncompressed pixels (e.g. PNG, HEIC, or RAW input converted to JPEG), **SI-UNIWARD** (Side-Informed UNIWARD) exploits JPEG quantization rounding errors to dramatically reduce embedding costs. Coefficients that were "close to the boundary" between two quantization levels can be flipped at near-zero cost, and the modification direction is chosen to move *toward* the pre-quantization value rather than the default nsF5 direction.
+
+The result: **~43% higher capacity** at the same detection risk, or equivalently the same capacity with significantly lower distortion. The decoder is completely unchanged — `ghost_decode` works identically on standard and SI-UNIWARD stego images.
+
+Use `ghost_encode_si` / `ghost_capacity_si` when raw pixels are available alongside the JPEG cover.
+
 ### Armor (Robust)
 
 Optimizes for **survivability**. Uses Spread Transform Dither Modulation (STDM) to embed bits into stable low-frequency DCT coefficients, protected by [adaptive Reed-Solomon ECC](https://phasm.app/blog/surviving-jpeg-recompression) with [soft-decision decoding via log-likelihood ratios](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes). A [DFT magnitude template](https://phasm.app/blog/dft-template-geometric-resilience-steganography) provides geometric synchronization against rotation, scaling, and cropping.
@@ -53,6 +61,20 @@ assert_eq!(decoded.text, "secret message");
 println!("Integrity: {:.0}%", quality.integrity_percent);
 ```
 
+```rust
+use phasm_core::{ghost_encode_si, ghost_decode};
+
+// SI-UNIWARD: when you have original uncompressed pixels + the JPEG cover
+let raw_pixels_rgb = /* RGB pixel data from PNG/HEIC/RAW */;
+let cover = std::fs::read("photo.jpg").unwrap();
+let stego = ghost_encode_si(
+    &cover, raw_pixels_rgb, width, height, "secret message", "passphrase"
+).unwrap();
+// Decode is identical — no special decoder needed
+let decoded = ghost_decode(&stego, "passphrase").unwrap();
+assert_eq!(decoded.text, "secret message");
+```
+
 ## API
 
 ```rust
@@ -61,6 +83,11 @@ ghost_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
 ghost_decode(jpeg_bytes, passphrase) -> Result<PayloadData>
 ghost_encode_with_files(jpeg_bytes, message, files, passphrase) -> Result<Vec<u8>>
 ghost_capacity(jpeg_image) -> Result<usize>
+
+// Ghost SI-UNIWARD (stealth + side-informed, ~43% more capacity)
+ghost_encode_si(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<Vec<u8>>
+ghost_encode_si_with_files(jpeg_bytes, raw_rgb, width, height, message, files, passphrase) -> Result<Vec<u8>>
+ghost_capacity_si(jpeg_image) -> Result<usize>
 
 // Armor mode (robust)
 armor_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
@@ -72,13 +99,19 @@ smart_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 
 // Capacity estimation with Brotli compression
 compressed_payload_size(text, mode) -> usize
+
+// Image dimension validation
+validate_encode_dimensions(width, height) -> Result<()>
 ```
 
 ### Types
 
 - **`PayloadData`** — decoded message text + optional file attachments
+- **`FileEntry`** — file attachment (filename + content bytes)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
+
+The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `pixel_width: u32`, `pixel_height: u32`). The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
 
 ## Cargo Features
 
@@ -138,10 +171,11 @@ All payloads are encrypted before embedding:
 1. Parse JPEG into DCT coefficients
 2. Derive structural key (Argon2id) -> permutation seed + STC seed
 3. Compute [J-UNIWARD cost map](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) (Daubechies-8 wavelet, 3 subbands)
-4. Permute coefficient order (Fisher-Yates with ChaCha20)
-5. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
-6. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion
-7. Write modified coefficients back to JPEG
+4. *(SI-UNIWARD only)* Compute rounding errors from raw pixels, modulate costs: `cost *= (1 - 2|error|)`
+5. Permute coefficient order (Fisher-Yates with ChaCha20)
+6. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
+7. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
+8. Write modified coefficients back to JPEG
 
 ### Armor Pipeline
 
@@ -170,7 +204,7 @@ src/
     frame.rs        SOF frame info (dimensions, components, subsampling)
     huffman.rs      Huffman coding tables (two-level decode, encode)
     marker.rs       JPEG marker iterator
-    pixels.rs       IDCT/DCT for pixel-domain operations
+    pixels.rs       IDCT/DCT for pixel-domain operations (forward DCT, luma extraction)
     scan.rs         Entropy-coded scan reader/writer
     tables.rs       DQT/DHT table parsing
     zigzag.rs       Zigzag scan order mapping
@@ -181,6 +215,7 @@ src/
     frame.rs        Payload framing (length, CRC, mode byte, salt, nonce)
     payload.rs      Payload serialization (Brotli, file attachments)
     permute.rs      Fisher-Yates coefficient permutation
+    side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
     capacity.rs     Ghost capacity estimation
     progress.rs     Real-time decode progress (atomics + WASM callback)
     error.rs        StegoError enum
