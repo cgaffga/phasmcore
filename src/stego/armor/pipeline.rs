@@ -254,7 +254,7 @@ pub fn armor_encode(
 
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid_mut, pos.flat_idx) as f64;
+            coeffs[k] = flat_get(grid_mut, pos.flat_idx as usize) as f64;
         }
 
         let delta = embed_delta_fn(bit_idx);
@@ -262,7 +262,7 @@ pub fn armor_encode(
 
         for (k, pos) in group.iter().enumerate() {
             let new_val = coeffs[k].round() as i16;
-            flat_set(grid_mut, pos.flat_idx, new_val);
+            flat_set(grid_mut, pos.flat_idx as usize, new_val);
         }
     }
 
@@ -736,7 +736,7 @@ fn extract_header_byte(
 
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
+            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
         }
 
         header_llrs[i] = stdm_extract_soft(&coeffs, &vectors[unit_idx], delta);
@@ -776,7 +776,7 @@ fn decode_phase1_with_offset(
 
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
+            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
         }
 
         all_llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
@@ -990,7 +990,7 @@ fn get_or_extract_llrs(
 
         let mut coeffs = [0.0f64; SPREAD_LEN];
         for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx) as f64;
+            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
         }
 
         stdm_extract_soft(&coeffs, &vectors[unit_idx], delta)

@@ -77,9 +77,9 @@ fn full_pipeline_diagnostic() {
     // Cover bits
     let grid = img.dct_grid(0);
     let cover_bits: Vec<u8> = positions.iter().map(|p| {
-        (flat_get(grid, p.flat_idx).unsigned_abs() & 1) as u8
+        (flat_get(grid, p.flat_idx as usize).unsigned_abs() & 1) as u8
     }).collect();
-    let costs: Vec<f64> = positions.iter().map(|p| p.cost).collect();
+    let costs: Vec<f32> = positions.iter().map(|p| p.cost).collect();
 
     // STC embed
     let hhat_matrix = hhat::generate_hhat(7, w, &hhat_seed);
@@ -93,8 +93,8 @@ fn full_pipeline_diagnostic() {
     let grid_mut = img.dct_grid_mut(0);
     for (idx, pos) in positions.iter().enumerate() {
         if cover_bits[idx] != result.stego_bits[idx] {
-            let bi = pos.flat_idx / 64;
-            let p = pos.flat_idx % 64;
+            let bi = pos.flat_idx as usize / 64;
+            let p = pos.flat_idx as usize % 64;
             let (br, bc, i, j) = (bi / bw, bi % bw, p / 8, p % 8);
             let coeff = grid_mut.get(br, bc, i, j);
             let modified = if coeff == 1 { 2 }
@@ -109,7 +109,7 @@ fn full_pipeline_diagnostic() {
     // Read stego LSBs from in-memory image (before JPEG write)
     let grid = img.dct_grid(0);
     let mem_stego_bits: Vec<u8> = positions.iter().map(|p| {
-        (flat_get(grid, p.flat_idx).unsigned_abs() & 1) as u8
+        (flat_get(grid, p.flat_idx as usize).unsigned_abs() & 1) as u8
     }).collect();
     assert_eq!(mem_stego_bits, result.stego_bits, "in-memory LSBs != stego_bits");
 
@@ -121,7 +121,7 @@ fn full_pipeline_diagnostic() {
     // Check coefficients survived JPEG round-trip
     let stego_grid = stego_img.dct_grid(0);
     let jpeg_stego_bits: Vec<u8> = positions.iter().map(|p| {
-        (flat_get(stego_grid, p.flat_idx).unsigned_abs() & 1) as u8
+        (flat_get(stego_grid, p.flat_idx as usize).unsigned_abs() & 1) as u8
     }).collect();
 
     let mut jpeg_mismatches = 0;
@@ -158,7 +158,7 @@ fn full_pipeline_diagnostic() {
 
     // Decoder's stego bits
     let decoder_stego_bits: Vec<u8> = stego_positions.iter().map(|p| {
-        (flat_get(stego_grid, p.flat_idx).unsigned_abs() & 1) as u8
+        (flat_get(stego_grid, p.flat_idx as usize).unsigned_abs() & 1) as u8
     }).collect();
     assert_eq!(decoder_stego_bits, jpeg_stego_bits, "decoder reads different bits");
 

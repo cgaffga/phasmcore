@@ -11,7 +11,7 @@
 //! - Frame overhead (length, salt, nonce, auth tag, CRC)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uniward::compute_uniward;
+use crate::jpeg::dct::DctGrid;
 use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::error::StegoError;
 
@@ -27,26 +27,27 @@ const MIN_CAPACITY_RATIO: f64 = 5.0;
 /// more capacity than J-UNIWARD's ratio of 5.0).
 const MIN_CAPACITY_RATIO_SI: f64 = 3.5;
 
-/// Count usable (non-WET, non-DC) AC coefficients in a cost map.
-fn count_usable_positions(cost_map: &super::cost::CostMap) -> usize {
-    let mut usable = 0usize;
-    let bt = cost_map.blocks_tall();
-    let bw = cost_map.blocks_wide();
+/// Count non-zero AC coefficients in the DctGrid (fast capacity estimation).
+///
+/// This is equivalent to counting usable positions from a CostMap, since
+/// J-UNIWARD assigns finite costs to all non-zero AC coefficients. This
+/// avoids the expensive UNIWARD cost computation, making capacity estimation
+/// instantaneous even for very large images.
+fn count_nonzero_ac(grid: &DctGrid) -> usize {
+    let bw = grid.blocks_wide();
+    let bt = grid.blocks_tall();
+    let mut count = 0usize;
     for br in 0..bt {
         for bc in 0..bw {
-            for i in 0..8 {
-                for j in 0..8 {
-                    if i == 0 && j == 0 {
-                        continue;
-                    }
-                    if cost_map.get(br, bc, i, j).is_finite() {
-                        usable += 1;
-                    }
+            let blk = grid.block(br, bc);
+            for k in 1..64 { // skip DC at index 0
+                if blk[k] != 0 {
+                    count += 1;
                 }
             }
         }
     }
-    usable
+    count
 }
 
 /// Convert usable position count + capacity ratio → plaintext byte capacity.
@@ -77,13 +78,10 @@ fn capacity_from_usable(usable: usize, ratio: f64) -> usize {
 /// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
 /// or its quantization table is missing.
 pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
-    let grid = img.dct_grid(0);
-    let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-
-    let cost_map = compute_uniward(grid, qt);
-    let usable = count_usable_positions(&cost_map);
-
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let usable = count_nonzero_ac(img.dct_grid(0));
     Ok(capacity_from_usable(usable, MIN_CAPACITY_RATIO))
 }
 
@@ -100,13 +98,10 @@ pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
 /// No raw pixels needed: the position count is identical, only the per-bit
 /// distortion budget changes.
 pub fn estimate_capacity_si(img: &JpegImage) -> Result<usize, StegoError> {
-    let grid = img.dct_grid(0);
-    let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-
-    let cost_map = compute_uniward(grid, qt);
-    let usable = count_usable_positions(&cost_map);
-
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let usable = count_nonzero_ac(img.dct_grid(0));
     Ok(capacity_from_usable(usable, MIN_CAPACITY_RATIO_SI))
 }
 

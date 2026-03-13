@@ -361,6 +361,9 @@ struct ThreeSubbands {
     hh: Vec<f32>,
     /// Width of each subband (same as image width).
     width: usize,
+    /// Absolute y-coordinate of the first row in the arrays.
+    /// 0 for full-image computation, >0 for strip-based computation.
+    y_offset: usize,
 }
 
 /// Compute three-directional wavelet subbands of the image using an
@@ -392,7 +395,7 @@ fn compute_three_subbands(
     let hh = filter_cols(&row_high, width, height, &HPDF);
     // row_high dropped at return
 
-    ThreeSubbands { lh, hl, hh, width }
+    ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
 }
 
 /// Apply a 1D filter along each row of the image (horizontal filtering).
@@ -562,7 +565,7 @@ fn compute_coefficient_cost(
             if abs_y >= 0 && abs_y < img_h as isize && abs_x >= 0 && abs_x < img_w as isize {
                 let wy = abs_y as usize;
                 let wx = abs_x as usize;
-                let idx = wy * cover_wavelets.width + wx;
+                let idx = (wy - cover_wavelets.y_offset) * cover_wavelets.width + wx;
 
                 // Cover wavelet values are f32; promote to f64 for cost computation.
                 let w_lh = cover_wavelets.lh[idx] as f64;
@@ -577,6 +580,288 @@ fn compute_coefficient_cost(
     }
 
     cost
+}
+
+// ---------------------------------------------------------------------------
+// Strip-based streaming UNIWARD: computes positions without full CostMap.
+// ---------------------------------------------------------------------------
+
+use crate::stego::permute::CoeffPos;
+use crate::stego::side_info::SideInfo;
+
+/// Strip height in block rows for streaming UNIWARD computation.
+/// 50 block rows = 400 pixel rows. Each strip uses ~170 MB peak for a 16K-wide
+/// image (pixels + row-filtered + 3 wavelet subbands + strip CostMap).
+const STRIP_BLOCK_ROWS: usize = 50;
+
+/// Minimum cost for SI-modulated coefficients (same as side_info::MIN_SI_COST).
+const MIN_SI_COST_F32: f32 = 1e-6;
+
+/// Compute UNIWARD costs strip-by-strip and collect embeddable positions directly.
+///
+/// This is the memory-optimized path for large images. Instead of materializing
+/// the full CostMap (800 MB for 200 MP), it processes the image in horizontal
+/// strips, computing wavelet subbands and costs per strip, extracting positions
+/// immediately, and freeing strip memory before the next strip.
+///
+/// Peak memory per strip: ~170 MB for a 16K-wide image (reused across strips).
+/// Output: `Vec<CoeffPos>` with the same positions as `compute_uniward` +
+/// `collect_positions`, in deterministic raster order.
+///
+/// Reports [`UNIWARD_PROGRESS_STEPS`] progress steps and checks for cancellation.
+///
+/// If `si` is `Some`, applies SI-UNIWARD cost modulation inline during position
+/// collection (no separate `modulate_costs_si` pass needed).
+pub fn compute_positions_streaming(
+    grid: &DctGrid,
+    qt: &QuantTable,
+    si: Option<(&SideInfo, &DctGrid)>,
+) -> Result<Vec<CoeffPos>, StegoError> {
+    let bw = grid.blocks_wide();
+    let bt = grid.blocks_tall();
+    let img_w = bw * 8;
+    let img_h = bt * 8;
+    let lpdf = lpdf();
+    let basis = precompute_basis_functions(qt);
+    let pad = FILT_LEN - 1; // 15
+
+    // Estimate: ~50% of AC positions are non-zero (typical JPEG).
+    let est_positions = bt * bw * 32;
+    let mut positions: Vec<CoeffPos> = Vec::with_capacity(est_positions);
+
+    // Distribute UNIWARD_PROGRESS_STEPS (3) across strips for smooth progress.
+    let num_strips = (bt + STRIP_BLOCK_ROWS - 1) / STRIP_BLOCK_ROWS;
+    let mut strip_idx = 0usize;
+    let mut steps_sent = 0u32;
+
+    for strip_start in (0..bt).step_by(STRIP_BLOCK_ROWS) {
+        let strip_end = (strip_start + STRIP_BLOCK_ROWS).min(bt);
+
+        // Wavelet rows needed for blocks in [strip_start, strip_end):
+        // Each block at row br accesses wavelet rows [br*8 - 15, br*8 + 7].
+        let wav_y_start = (strip_start * 8).saturating_sub(pad);
+        let wav_y_end = (strip_end * 8).min(img_h);
+
+        // Pixel/filter-rows needed for wavelet computation (±7 for column filter):
+        let pix_y_start = wav_y_start.saturating_sub(7);
+        let pix_y_end = (wav_y_end + 8).min(img_h);
+
+        // Block rows that contain our pixel range:
+        let pix_br_start = pix_y_start / 8;
+        let pix_br_end = ((pix_y_end + 7) / 8).min(bt);
+
+        // Step 1: Decompress pixel strip.
+        let pix_strip_h = (pix_br_end - pix_br_start) * 8;
+        let pix_strip_y0 = pix_br_start * 8; // actual start (block-aligned)
+        let pixels = decompress_strip_pixels(grid, qt, bw, pix_br_start, pix_br_end);
+
+        // Step 2: Compute wavelet subbands for the strip.
+        let strip_wavelets = compute_strip_subbands(
+            &pixels, img_w, pix_strip_h, pix_strip_y0,
+            wav_y_start, wav_y_end, img_h, &lpdf,
+        );
+        drop(pixels); // Free pixel strip
+
+        // Step 3: Compute costs for blocks in [strip_start, strip_end) and
+        // collect positions. Uses a temporary strip CostMap for parallel safety.
+        let strip_bt = strip_end - strip_start;
+        let n_strip_blocks = strip_bt * bw;
+        let mut strip_map = CostMap::new(bw, strip_bt);
+
+        let total_len = n_strip_blocks * 64;
+        let costs_ptr = CostMapPtr { ptr: strip_map.costs_ptr(), total_len };
+
+        let compute_block = |bi: usize| {
+            let br_local = bi / bw;
+            let bc = bi % bw;
+            let br = strip_start + br_local;
+            let blk = grid.block(br, bc);
+
+            for fi in 0..8 {
+                for fj in 0..8 {
+                    if fi == 0 && fj == 0 { continue; }
+                    let coeff = blk[fi * 8 + fj];
+                    if coeff == 0 { continue; }
+
+                    let basis_block = &basis[fi][fj];
+                    let cost = compute_coefficient_cost(
+                        basis_block, &strip_wavelets,
+                        br, bc, img_w, img_h, pad, &lpdf,
+                    );
+
+                    if cost > 0.0 && cost.is_finite() {
+                        let idx = br_local * bw * 64 + bc * 64 + fi * 8 + fj;
+                        unsafe { costs_ptr.write(idx, cost as f32); }
+                    }
+                }
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        (0..n_strip_blocks).into_par_iter().for_each(|bi| compute_block(bi));
+
+        #[cfg(not(feature = "parallel"))]
+        (0..n_strip_blocks).for_each(|bi| compute_block(bi));
+
+        // Scan strip CostMap and collect positions.
+        for br_local in 0..strip_bt {
+            let br = strip_start + br_local;
+            for bc in 0..bw {
+                for i in 0..8 {
+                    for j in 0..8 {
+                        if i == 0 && j == 0 { continue; }
+                        let cost_f32 = strip_map.get(br_local, bc, i, j);
+                        if !cost_f32.is_finite() { continue; }
+
+                        let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
+
+                        // Apply SI modulation inline if available.
+                        let final_cost = if let Some((side_info, cover_grid)) = si {
+                            let coeff = cover_grid.get(br, bc, i, j);
+                            if coeff.abs() == 1 {
+                                cost_f32
+                            } else {
+                                let error = side_info.error_at(flat_idx as usize);
+                                let factor = (1.0 - 2.0 * error.abs()) as f32;
+                                (cost_f32 * factor).max(MIN_SI_COST_F32)
+                            }
+                        } else {
+                            cost_f32
+                        };
+
+                        positions.push(CoeffPos { flat_idx, cost: final_cost });
+                    }
+                }
+            }
+        }
+        // strip_map and strip_wavelets freed here.
+
+        // Advance progress proportionally across strips.
+        strip_idx += 1;
+        let target_steps = (strip_idx as u32 * UNIWARD_PROGRESS_STEPS) / num_strips as u32;
+        while steps_sent < target_steps {
+            progress::advance();
+            steps_sent += 1;
+        }
+        if strip_idx % 2 == 0 {
+            progress::check_cancelled()?;
+        }
+    }
+
+    // Ensure all UNIWARD_PROGRESS_STEPS are sent.
+    while steps_sent < UNIWARD_PROGRESS_STEPS {
+        progress::advance();
+        steps_sent += 1;
+    }
+
+    Ok(positions)
+}
+
+/// Decompress a strip of block rows [br_start, br_end) to pixel values (f32).
+fn decompress_strip_pixels(
+    grid: &DctGrid,
+    qt: &QuantTable,
+    bw: usize,
+    br_start: usize,
+    br_end: usize,
+) -> Vec<f32> {
+    let img_w = bw * 8;
+    let strip_h = (br_end - br_start) * 8;
+    let mut pixels = vec![0.0f32; img_w * strip_h];
+
+    for br in br_start..br_end {
+        for bc in 0..bw {
+            let block = grid.block(br, bc);
+            let quantized: [i16; 64] = block.try_into().unwrap();
+            let block_pixels = idct_block(&quantized, &qt.values);
+
+            for row in 0..8 {
+                for col in 0..8 {
+                    let py = (br - br_start) * 8 + row;
+                    let px = bc * 8 + col;
+                    pixels[py * img_w + px] = block_pixels[row * 8 + col] as f32;
+                }
+            }
+        }
+    }
+
+    pixels
+}
+
+/// Compute wavelet subbands for a horizontal strip.
+///
+/// - `pixels`: decompressed pixel strip starting at y = `pix_y0`
+/// - `width`: full image width
+/// - `pix_h`: height of the pixel strip (block-aligned)
+/// - `pix_y0`: absolute y of the first pixel row in the strip
+/// - `wav_y_start`, `wav_y_end`: absolute y range of wavelet output
+/// - `img_h`: full image height (for mirror boundary handling)
+fn compute_strip_subbands(
+    pixels: &[f32],
+    width: usize,
+    pix_h: usize,
+    pix_y0: usize,
+    wav_y_start: usize,
+    wav_y_end: usize,
+    img_h: usize,
+    lpdf: &[f64; 16],
+) -> ThreeSubbands {
+    // Row filtering is independent per row — works on the strip directly.
+    let row_low = filter_rows(pixels, width, pix_h, lpdf);
+    let lh = filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
+    drop(row_low);
+
+    let row_high = filter_rows(pixels, width, pix_h, &HPDF);
+    let hl = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf);
+    let hh = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
+
+    ThreeSubbands {
+        lh, hl, hh, width,
+        y_offset: wav_y_start,
+    }
+}
+
+/// Apply column filter to produce output rows [out_y_start, out_y_end) from
+/// a strip of row-filtered data starting at absolute y = `input_y0`.
+///
+/// Uses `mirror_index` on the full image height for boundary handling.
+/// The input strip must contain all rows that the filter accesses (guaranteed
+/// by the ±7 row padding in `compute_positions_streaming`).
+fn filter_cols_strip(
+    input: &[f32],
+    width: usize,
+    input_h: usize,
+    input_y0: usize,
+    out_y_start: usize,
+    out_y_end: usize,
+    img_h: usize,
+    filter: &[f64; 16],
+) -> Vec<f32> {
+    let flen = FILT_LEN;
+    let half = (flen - 1) / 2; // 7
+    let out_h = out_y_end - out_y_start;
+    let mut output = vec![0.0f32; width * out_h];
+
+    for out_idx in 0..out_h {
+        let abs_y = out_y_start + out_idx;
+        for x in 0..width {
+            let mut sum = 0.0f64;
+            for k in 0..flen {
+                let sy_abs = abs_y as isize + k as isize - half as isize;
+                let sy_mirrored = mirror_index(sy_abs, img_h);
+                // Map to strip-local index. The strip must contain this row.
+                let sy_local = sy_mirrored - input_y0;
+                debug_assert!(
+                    sy_local < input_h,
+                    "strip col filter OOB: abs_y={abs_y} k={k} sy_abs={sy_abs} sy_mirrored={sy_mirrored} input_y0={input_y0} input_h={input_h}"
+                );
+                sum += input[sy_local * width + x] as f64 * filter[k];
+            }
+            output[out_idx * width + x] = sum as f32;
+        }
+    }
+
+    output
 }
 
 #[cfg(test)]

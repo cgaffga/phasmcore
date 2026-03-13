@@ -23,12 +23,16 @@ use rand::SeedableRng;
 use crate::stego::cost::CostMap;
 
 /// A coefficient position: (flat_index_in_dct_grid, cost).
+///
+/// Compact representation: `u32` flat index (supports up to ~268M blocks = 4 Gpx)
+/// and `f32` cost (sufficient for cost ranking). Total: 8 bytes per position
+/// (down from 16 bytes with `usize` + `f64`).
 #[derive(Clone)]
 pub struct CoeffPos {
     /// Flat index into the DctGrid: block_index * 64 + row * 8 + col.
-    pub flat_idx: usize,
-    /// Embedding cost at this position.
-    pub cost: f64,
+    pub flat_idx: u32,
+    /// Embedding cost at this position (f32 — sufficient for ranking).
+    pub cost: f32,
 }
 
 /// Collect embeddable AC positions from the cost map in deterministic raster order.
@@ -49,8 +53,8 @@ fn collect_positions(cost_map: &CostMap) -> Vec<CoeffPos> {
                     if !cost_f32.is_finite() {
                         continue; // skip zero-valued coefficients
                     }
-                    let flat_idx = (br * bw + bc) * 64 + i * 8 + j;
-                    positions.push(CoeffPos { flat_idx, cost: cost_f32 as f64 });
+                    let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
+                    positions.push(CoeffPos { flat_idx, cost: cost_f32 });
                 }
             }
         }
@@ -86,6 +90,13 @@ pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> 
     let mut positions = collect_positions(cost_map);
     shuffle_portable(&mut positions, seed);
     positions
+}
+
+/// Apply a portable Fisher-Yates permutation to an externally collected
+/// position vector. Used by the streaming UNIWARD path where positions are
+/// collected during strip-based cost computation (no full CostMap).
+pub fn permute_positions(positions: &mut [CoeffPos], seed: &[u8; 32]) {
+    shuffle_portable(positions, seed);
 }
 
 

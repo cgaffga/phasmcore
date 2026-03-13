@@ -35,10 +35,13 @@ pub use error::StegoError;
 
 /// Maximum pixel dimension (width or height) for encode.
 /// Images exceeding this are downsampled by the frontend before reaching Rust.
-pub const MAX_DIMENSION: u32 = 8192;
+pub const MAX_DIMENSION: u32 = 16384;
 
 /// Maximum total pixel count for encode (width × height).
-pub const MAX_PIXELS: u32 = 16_000_000;
+/// 200 MP covers all current cameras including flagship 200 MP sensors.
+/// Memory-optimized: strip-based UNIWARD (~170 MB/strip), compact positions
+/// (8 bytes each), segmented STC Viterbi. Total ~1 GB for 200 MP.
+pub const MAX_PIXELS: u32 = 200_000_000;
 
 /// Minimum pixel dimension (width or height) for encode.
 /// Images below this are rejected with an error message.
@@ -93,18 +96,18 @@ mod dimension_tests {
 
     #[test]
     fn boundary_max_dimension() {
-        assert!(validate_encode_dimensions(8192, 1000).is_ok());
-        assert!(validate_encode_dimensions(1000, 8192).is_ok());
-        assert!(validate_encode_dimensions(8193, 1000).is_err());
-        assert!(validate_encode_dimensions(1000, 8193).is_err());
+        assert!(validate_encode_dimensions(16384, 1000).is_ok());
+        assert!(validate_encode_dimensions(1000, 16384).is_ok());
+        assert!(validate_encode_dimensions(16385, 1000).is_err());
+        assert!(validate_encode_dimensions(1000, 16385).is_err());
     }
 
     #[test]
     fn too_many_pixels() {
-        // 5000 * 3201 = 16_005_000 > 16M
-        assert!(validate_encode_dimensions(5000, 3201).is_err());
-        // 4000 * 4000 = 16M exactly — OK
-        assert!(validate_encode_dimensions(4000, 4000).is_ok());
+        // 14143 * 14143 = 200_024_449 > 200M
+        assert!(validate_encode_dimensions(14143, 14143).is_err());
+        // 14142 * 14142 = 199_996_164 < 200M — OK
+        assert!(validate_encode_dimensions(14142, 14142).is_ok());
     }
 
     #[test]
@@ -113,7 +116,7 @@ mod dimension_tests {
             Err(StegoError::ImageTooSmall) => {}
             other => panic!("expected ImageTooSmall, got {other:?}"),
         }
-        match validate_encode_dimensions(9000, 1000) {
+        match validate_encode_dimensions(16385, 1000) {
             Err(StegoError::ImageTooLarge) => {}
             other => panic!("expected ImageTooLarge, got {other:?}"),
         }

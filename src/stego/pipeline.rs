@@ -12,7 +12,7 @@
 //!    zero for |coeff| == 1 to prevent shrinkage)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uniward::compute_uniward_with_progress;
+use crate::stego::cost::uniward::compute_positions_streaming;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
@@ -200,26 +200,25 @@ fn ghost_encode_impl(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute J-UNIWARD costs for Y channel (reports 3 progress sub-steps).
+    // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
+    //    Reports 3 progress sub-steps. If SI info is available, modulates costs
+    //    inline during position collection (no separate pass needed).
+    //    Memory-optimized: never materializes full CostMap or pixel/wavelet arrays.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let mut cost_map = compute_uniward_with_progress(img.dct_grid(0), qt)?;
-
-    // 1b. If side information is available (SI-UNIWARD), modulate costs.
-    if let Some(ref side_info) = si {
-        side_info::modulate_costs_si(&mut cost_map, side_info, img.dct_grid(0));
-    }
+    let si_ref = si.as_ref().map(|s| (s, img.dct_grid(0)));
+    let mut positions = compute_positions_streaming(img.dct_grid(0), qt, si_ref)?;
 
     // 2. Derive structural key (Tier 1).
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
-    // 3. Select and permute all AC positions, then truncate to n_used.
-    let positions = permute::select_and_permute(&cost_map, &perm_seed);
+    // 3. Permute positions, then truncate to n_used.
+    permute::permute_positions(&mut positions, &perm_seed);
     let n = positions.len();
     let (w, n_used, m_max) = compute_stc_params(n)?;
-    let positions = &positions[..n_used];
+    positions.truncate(n_used);
 
     // 4. Encrypt payload (Tier 2 key with random salt).
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
@@ -239,10 +238,10 @@ fn ghost_encode_impl(
     // 6. Extract cover LSBs and costs in permuted order.
     let grid = img.dct_grid(0);
     let cover_bits: Vec<u8> = positions.iter().map(|p| {
-        let coeff = flat_get(grid, p.flat_idx);
+        let coeff = flat_get(grid, p.flat_idx as usize);
         (coeff.unsigned_abs() & 1) as u8
     }).collect();
-    let costs: Vec<f64> = positions.iter().map(|p| p.cost).collect();
+    let costs: Vec<f32> = positions.iter().map(|p| p.cost).collect();
 
     // 7. Generate H-hat and embed (reports 8 progress sub-steps internally).
     let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
@@ -260,13 +259,14 @@ fn ghost_encode_impl(
         let old_bit = cover_bits[idx];
         let new_bit = result.stego_bits[idx];
         if old_bit != new_bit {
-            let coeff = flat_get(grid_mut, pos.flat_idx);
+            let fi = pos.flat_idx as usize;
+            let coeff = flat_get(grid_mut, fi);
             let modified = if let Some(ref side_info) = si {
-                side_info::si_modify_coefficient(coeff, side_info.error_at(pos.flat_idx))
+                side_info::si_modify_coefficient(coeff, side_info.error_at(fi))
             } else {
                 side_info::nsf5_modify_coefficient(coeff)
             };
-            flat_set(grid_mut, pos.flat_idx, modified);
+            flat_set(grid_mut, fi, modified);
         }
     }
 
@@ -306,14 +306,12 @@ pub fn ghost_decode(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute J-UNIWARD costs (for consistent position selection).
-    //    Reports UNIWARD_PROGRESS_STEPS (3) progress steps internally:
-    //      - pixel decompression
-    //      - wavelet subbands
-    //      - per-block cost computation
+    // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
+    //    Reports UNIWARD_PROGRESS_STEPS (3) progress steps.
+    //    Memory-optimized: never materializes full CostMap.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uniward_with_progress(img.dct_grid(0), qt)?;
+    let mut positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
 
     progress::check_cancelled()?;
 
@@ -322,16 +320,16 @@ pub fn ghost_decode(
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
-    // 3. Select and permute AC positions (portable u32 shuffle).
-    let positions = permute::select_and_permute(&cost_map, &perm_seed);
+    // 3. Permute positions, then truncate to n_used.
+    permute::permute_positions(&mut positions, &perm_seed);
     let n = positions.len();
     let (w, n_used, m_max) = compute_stc_params(n)?;
-    let positions = &positions[..n_used];
+    positions.truncate(n_used);
 
     // 4. Extract stego LSBs.
     let grid = img.dct_grid(0);
     let stego_bits: Vec<u8> = positions.iter().map(|p| {
-        let coeff = flat_get(grid, p.flat_idx);
+        let coeff = flat_get(grid, p.flat_idx as usize);
         (coeff.unsigned_abs() & 1) as u8
     }).collect();
 

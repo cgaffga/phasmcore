@@ -34,7 +34,8 @@ const SEGMENTED_THRESHOLD: usize = 1_000_000;
 /// for large inputs. Both paths produce identical output.
 ///
 /// - `cover_bits`: LSBs of the cover coefficients (length n)
-/// - `costs`: cost of flipping each cover bit (length n). Use f64::INFINITY for WET.
+/// - `costs`: cost of flipping each cover bit (length n). Use f32::INFINITY for WET.
+///   Promoted to f64 internally for accumulation precision.
 /// - `message`: message bits to embed (length m)
 /// - `hhat_matrix`: the H-hat submatrix (h rows × w columns)
 /// - `h`: constraint length (must be ≤ 7 so 2^h fits in u128)
@@ -47,7 +48,7 @@ const SEGMENTED_THRESHOLD: usize = 1_000_000;
 /// Viterbi forward pass(es).
 pub fn stc_embed(
     cover_bits: &[u8],
-    costs: &[f64],
+    costs: &[f32],
     message: &[u8],
     hhat_matrix: &[Vec<u32>],
     h: usize,
@@ -82,7 +83,7 @@ pub fn stc_embed(
 
 fn stc_embed_inline(
     cover_bits: &[u8],
-    costs: &[f64],
+    costs: &[f32],
     message: &[u8],
     hhat_matrix: &[Vec<u32>],
     h: usize,
@@ -119,7 +120,7 @@ fn stc_embed_inline(
     for j in 0..n {
         let col_idx = j % w;
         let col = columns[col_idx];
-        let flip_cost = costs[j];
+        let flip_cost = costs[j] as f64; // promote f32→f64 for accumulation
         let cover_bit = cover_bits[j] & 1;
 
         let (cost_s0, cost_s1) = if cover_bit == 0 {
@@ -209,7 +210,7 @@ fn stc_embed_inline(
 
 fn stc_embed_segmented(
     cover_bits: &[u8],
-    costs: &[f64],
+    costs: &[f32],
     message: &[u8],
     hhat_matrix: &[Vec<u32>],
     h: usize,
@@ -252,7 +253,7 @@ fn stc_embed_segmented(
     for j in 0..n {
         let col_idx = j % w;
         let col = columns[col_idx];
-        let flip_cost = costs[j];
+        let flip_cost = costs[j] as f64; // promote f32→f64
         let cover_bit = cover_bits[j] & 1;
 
         let (cost_s0, cost_s1) = if cover_bit == 0 {
@@ -324,7 +325,7 @@ fn stc_embed_segmented(
         for j in j_start..j_end {
             let col_idx = j % w;
             let col = columns[col_idx];
-            let flip_cost = costs[j];
+            let flip_cost = costs[j] as f64; // promote f32→f64
             let cover_bit = cover_bits[j] & 1;
 
             let (cost_s0, cost_s1) = if cover_bit == 0 {
@@ -438,7 +439,7 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
-        let costs: Vec<f64> = vec![1.0; n];
+        let costs: Vec<f32> = vec![1.0; n];
         let message = vec![1u8, 0, 1, 1];
 
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
@@ -458,7 +459,7 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 7 + 3) % 2) as u8).collect();
-        let costs: Vec<f64> = (0..n).map(|i| 1.0 + (i as f64) * 0.01).collect();
+        let costs: Vec<f32> = (0..n).map(|i| 1.0 + (i as f32) * 0.01).collect();
         let message: Vec<u8> = (0..m).map(|i| (i % 2) as u8).collect();
 
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
@@ -476,7 +477,7 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = vec![0; n];
-        let mut costs: Vec<f64> = vec![1.0; n];
+        let mut costs: Vec<f32> = vec![1.0; n];
         // Make positions 0, 5, 10, 15 WET
         for i in (0..n).step_by(5) {
             costs[i] = 1e13;
@@ -507,7 +508,7 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = vec![1; n];
-        let costs: Vec<f64> = vec![1.0; n];
+        let costs: Vec<f32> = vec![1.0; n];
         let message: Vec<u8> = vec![];
 
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
@@ -526,9 +527,9 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 2) as u8).collect();
-        let costs: Vec<f64> = (0..n).map(|i| {
-            let base = 0.5 + (i % 100) as f64 * 0.02;
-            if i % 500 == 0 { f64::INFINITY } else { base }
+        let costs: Vec<f32> = (0..n).map(|i| {
+            let base = 0.5 + (i % 100) as f32 * 0.02;
+            if i % 500 == 0 { f32::INFINITY } else { base }
         }).collect();
         let message: Vec<u8> = (0..m).map(|i| ((i * 13 + 7) % 2) as u8).collect();
 
@@ -557,9 +558,9 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 2) as u8).collect();
-        let costs: Vec<f64> = (0..n).map(|i| {
-            let base = 0.5 + (i % 100) as f64 * 0.02;
-            if i % 500 == 0 { f64::INFINITY } else { base }
+        let costs: Vec<f32> = (0..n).map(|i| {
+            let base = 0.5 + (i % 100) as f32 * 0.02;
+            if i % 500 == 0 { f32::INFINITY } else { base }
         }).collect();
         let message: Vec<u8> = (0..m).map(|i| ((i * 13 + 7) % 2) as u8).collect();
 
@@ -581,9 +582,9 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 37 + 11) % 2) as u8).collect();
-        let costs: Vec<f64> = (0..n).map(|i| {
-            let base = 0.3 + (i % 200) as f64 * 0.01;
-            if i % 1000 == 0 { f64::INFINITY } else { base }
+        let costs: Vec<f32> = (0..n).map(|i| {
+            let base = 0.3 + (i % 200) as f32 * 0.01;
+            if i % 1000 == 0 { f32::INFINITY } else { base }
         }).collect();
         let message: Vec<u8> = (0..m).map(|i| ((i * 19 + 3) % 2) as u8).collect();
 
@@ -605,7 +606,7 @@ mod tests {
         let hhat = generate_hhat(h, w, &seed);
 
         let cover_bits: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
-        let costs: Vec<f64> = vec![1.0; n];
+        let costs: Vec<f32> = vec![1.0; n];
         let message: Vec<u8> = vec![1, 0, 1, 1];
 
         let inline = stc_embed_inline(&cover_bits, &costs, &message, &hhat, h, w).unwrap();

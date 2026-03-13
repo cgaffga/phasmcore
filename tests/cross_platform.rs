@@ -68,11 +68,11 @@ fn pin_known_values_4x4_seed42() {
         "4x4 blocks should have 1008 AC positions"
     );
 
-    let first_20: Vec<usize> = positions.iter().take(20).map(|p| p.flat_idx).collect();
+    let first_20: Vec<u32> = positions.iter().take(20).map(|p| p.flat_idx).collect();
 
     // Pinned from the u32 Fisher-Yates shuffle on 2026-02-23.
     // These values MUST be identical on native (64-bit) and WASM (32-bit).
-    let expected: Vec<usize> = vec![
+    let expected: Vec<u32> = vec![
         258, 980, 673, 988, 76, 41, 725, 301, 438, 872, 667, 574, 867, 881, 46, 240, 965, 56,
         339, 941,
     ];
@@ -97,8 +97,8 @@ fn permutation_is_deterministic() {
     let a = select_and_permute(&map, &seed);
     let b = select_and_permute(&map, &seed);
 
-    let a_idx: Vec<usize> = a.iter().map(|p| p.flat_idx).collect();
-    let b_idx: Vec<usize> = b.iter().map(|p| p.flat_idx).collect();
+    let a_idx: Vec<u32> = a.iter().map(|p| p.flat_idx).collect();
+    let b_idx: Vec<u32> = b.iter().map(|p| p.flat_idx).collect();
     assert_eq!(a_idx, b_idx, "Same seed must produce identical permutation");
 }
 
@@ -115,8 +115,8 @@ fn different_seeds_produce_different_permutations() {
     let a = select_and_permute(&map, &seed_a);
     let b = select_and_permute(&map, &seed_b);
 
-    let a_idx: Vec<usize> = a.iter().map(|p| p.flat_idx).collect();
-    let b_idx: Vec<usize> = b.iter().map(|p| p.flat_idx).collect();
+    let a_idx: Vec<u32> = a.iter().map(|p| p.flat_idx).collect();
+    let b_idx: Vec<u32> = b.iter().map(|p| p.flat_idx).collect();
     assert_ne!(
         a_idx, b_idx,
         "Different seeds must produce different permutations"
@@ -143,7 +143,7 @@ fn u32_range_invariant_large_map() {
     assert_eq!(positions.len(), 4096 * 63);
 
     // Verify all indices are unique (no corruption from u32 cast).
-    let mut indices: Vec<usize> = positions.iter().map(|p| p.flat_idx).collect();
+    let mut indices: Vec<u32> = positions.iter().map(|p| p.flat_idx).collect();
     indices.sort();
     indices.dedup();
     assert_eq!(

@@ -155,7 +155,7 @@ cargo run -p phasm-core --example test_link -- stego.jpg
 
 - **Zero C FFI** — pure Rust from JPEG parsing to AES encryption, compiles to native and WASM
 - **Deterministic** — identical output across x86, ARM, and WASM using [FDLIBM-based math](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
-- **Memory-efficient** — 1-bit packed Viterbi back pointers (32× reduction) with automatic segmented checkpoint for large images (O(√n) memory)
+- **Memory-efficient** — strip-based wavelet computation, compact positions (8 bytes each), 1-bit packed Viterbi back pointers (32× reduction), segmented checkpoint for large images (O(√n) memory). Supports **200 MP** images under ~1 GB peak memory.
 - **Short messages** — optimized for text payloads under 1 KB
 - **Stego output is raw** — the JPEG bytes after encoding must be saved/shared without re-encoding
 
@@ -179,8 +179,8 @@ All payloads are encrypted before embedding:
 
 1. Parse JPEG into DCT coefficients
 2. Derive structural key (Argon2id) → permutation seed + STC seed
-3. Compute [J-UNIWARD cost map](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) (Daubechies-8 wavelet, 3 subbands)
-4. *(SI-UNIWARD only)* Compute rounding errors from raw pixels, modulate costs: `cost *= (1 - 2|error|)`
+3. Compute [J-UNIWARD costs](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) **strip-by-strip** (Daubechies-8 wavelet, 3 subbands) — positions collected inline, no full CostMap materialized
+4. *(SI-UNIWARD only)* Modulate costs inline using rounding errors: `cost *= (1 - 2|error|)`
 5. Permute coefficient order (Fisher-Yates with ChaCha20)
 6. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
 7. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
@@ -245,6 +245,29 @@ Both paths produce **bit-for-bit identical output** (verified by equivalence tes
 | 32 MB PNG | 5M | 80 MB | 3 MB |
 | 48 MP camera | 10M | 160 MB | 3 MB |
 | 100 MP medium format | 30M | 480 MB | 3 MB |
+| 200 MP flagship | 59M | 944 MB | 3 MB |
+
+#### Strip-Based UNIWARD & Compact Positions
+
+The J-UNIWARD cost function requires wavelet decomposition of the entire decompressed image — three directional subbands (LH, HL, HH) via Daubechies-8 filters. For a 200 MP image, storing the full pixel array + 3 wavelet subbands would need ~3.2 GB.
+
+The **strip-based streaming** approach eliminates this:
+
+1. Process the image in horizontal strips of 50 block rows (~400 pixels)
+2. Each strip decompresses its pixel rows (with ±22px padding for the 16-tap wavelet filter boundary), computes row/column-filtered wavelet subbands, and evaluates per-coefficient costs
+3. Embeddable positions are collected inline into a compact `Vec<CoeffPos>` — no full CostMap is ever materialized
+4. Strip memory is freed before the next strip begins
+
+The `CoeffPos` type uses **compact representation**: `u32` flat index + `f32` cost = 8 bytes per position (down from 16 bytes with `usize` + `f64`). The STC accepts `f32` costs directly, promoting to `f64` only for internal Viterbi accumulation.
+
+| Image | DctGrid | Positions | Strip buffers | **Total peak** |
+|-------|---------|-----------|---------------|---------------|
+| 12 MP phone | 24 MB | 48 MB | 12 MB | **84 MB** |
+| 48 MP camera | 96 MB | 190 MB | 30 MB | **316 MB** |
+| 100 MP medium format | 200 MB | 400 MB | 50 MB | **650 MB** |
+| 200 MP flagship | 400 MB | 800 MB | 170 MB | **~1 GB** |
+
+Capacity estimation is instantaneous: it counts non-zero AC coefficients directly from the DctGrid (no wavelet computation needed), since J-UNIWARD assigns finite costs to all non-zero coefficients.
 
 ### Armor Pipeline
 
