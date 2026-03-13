@@ -7,9 +7,15 @@
 //! Implements the forward (Viterbi) and backward (traceback) passes of the
 //! STC embedding algorithm. The encoder finds the minimum-cost stego bit
 //! sequence whose syndrome (under the H-hat matrix) matches the message.
+//!
+//! Two internal paths:
+//! - **Inline** (n ≤ 1M): stores all back pointers in one pass — fastest.
+//! - **Segmented** (n > 1M): checkpoint/recompute approach — O(√n) memory,
+//!   2× compute. Enables 48 MP+ images on memory-constrained devices.
 
 use super::hhat;
 use super::extract::stc_extract;
+use crate::stego::progress;
 
 /// Result of STC embedding: the stego bit sequence and its total distortion cost.
 pub struct EmbedResult {
@@ -17,21 +23,28 @@ pub struct EmbedResult {
     pub total_cost: f64,
 }
 
+/// Back-pointer memory threshold (in cover positions). Above this, the
+/// segmented path is used. 1M positions × 16 bytes/u128 = 16 MB.
+const SEGMENTED_THRESHOLD: usize = 1_000_000;
+
 /// Embed a message into cover bits using the Viterbi-based STC algorithm.
 ///
-/// The STC trellis has 2^h states representing an h-bit syndrome window.
-/// Cover elements are processed left to right. Every `w` elements, one message
-/// bit is emitted (the bottom bit of the state), and the state shifts right by 1.
+/// Automatically selects the inline path (single-pass, O(n) memory) for
+/// small inputs, or the segmented path (checkpoint/recompute, O(√n) memory)
+/// for large inputs. Both paths produce identical output.
 ///
 /// - `cover_bits`: LSBs of the cover coefficients (length n)
-/// - `costs`: cost of flipping each cover bit (length n). Use `WET_COST` (f64::INFINITY) for WET.
+/// - `costs`: cost of flipping each cover bit (length n). Use f64::INFINITY for WET.
 /// - `message`: message bits to embed (length m)
 /// - `hhat_matrix`: the H-hat submatrix (h rows × w columns)
-/// - `h`: constraint length
+/// - `h`: constraint length (must be ≤ 7 so 2^h fits in u128)
 /// - `w`: submatrix width (should be ceil(n/m))
 ///
-/// Returns the stego bit sequence that encodes the message with minimum distortion,
-/// or `None` if embedding is infeasible.
+/// Returns the stego bit sequence that encodes the message with minimum
+/// distortion, or `None` if embedding is infeasible.
+///
+/// Reports 8 progress sub-steps via [`progress::advance`] during the
+/// Viterbi forward pass(es).
 pub fn stc_embed(
     cover_bits: &[u8],
     costs: &[f64],
@@ -40,7 +53,8 @@ pub fn stc_embed(
     h: usize,
     w: usize,
 ) -> Option<EmbedResult> {
-    if w == 0 || h > 31 {
+    // h ≤ 7 required: 2^7 = 128 states fit exactly in u128.
+    if w == 0 || h > 7 {
         return None;
     }
 
@@ -54,188 +68,358 @@ pub fn stc_embed(
         });
     }
 
+    if n > SEGMENTED_THRESHOLD {
+        stc_embed_segmented(cover_bits, costs, message, hhat_matrix, h, w)
+    } else {
+        stc_embed_inline(cover_bits, costs, message, hhat_matrix, h, w)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inline path: single forward pass, stores all back pointers.
+// Best for small/medium images where O(n) memory is acceptable.
+// ---------------------------------------------------------------------------
+
+fn stc_embed_inline(
+    cover_bits: &[u8],
+    costs: &[f64],
+    message: &[u8],
+    hhat_matrix: &[Vec<u32>],
+    h: usize,
+    w: usize,
+) -> Option<EmbedResult> {
+    let n = cover_bits.len();
+    let m = message.len();
     let num_states = 1usize << h;
     let inf = f64::INFINITY;
 
-    // Forward Viterbi pass.
-    // prev_cost[s] = minimum cost to reach state s after the previous element.
+    // Pre-compute H-hat columns (avoids repeated column_packed calls).
+    let columns: Vec<usize> = (0..w)
+        .map(|c| hhat::column_packed(hhat_matrix, c) as usize)
+        .collect();
+
+    // Progress: advance every n/8 elements (8 sub-steps).
+    let progress_interval = (n / 8).max(1);
+
+    // Forward Viterbi pass with 1-bit packed back pointers.
+    // back_ptr[j] is a u128: bit s = 1 means stego_bit=1 was chosen for
+    // target state s (predecessor = s ^ col). 16 bytes per step.
+    //
+    // Pre-allocated cost buffers avoid per-iteration heap allocations.
+    // The target-state iteration writes every entry, so no fill needed
+    // for curr_cost. Only shifted_cost needs fill (sparse writes).
     let mut prev_cost = vec![inf; num_states];
-    prev_cost[0] = 0.0; // start in state 0
+    prev_cost[0] = 0.0;
+    let mut curr_cost = vec![0.0f64; num_states];
+    let mut shifted_cost = vec![inf; num_states];
 
-    // Back pointers: back_ptr[j][s] = previous state for each reachable state at step j.
-    let mut back_ptr: Vec<Vec<u32>> = Vec::with_capacity(n);
-
-    let mut msg_idx = 0; // index into message bits
+    let mut back_ptr: Vec<u128> = Vec::with_capacity(n);
+    let mut msg_idx = 0;
 
     for j in 0..n {
-        let mut curr_cost = vec![inf; num_states];
-        let mut bp = vec![0u32; num_states];
-
         let col_idx = j % w;
-        let col = hhat::column_packed(hhat_matrix, col_idx);
-
+        let col = columns[col_idx];
         let flip_cost = costs[j];
         let cover_bit = cover_bits[j] & 1;
 
-        for s_prev in 0..num_states {
-            if prev_cost[s_prev] == inf {
-                continue;
-            }
+        let (cost_s0, cost_s1) = if cover_bit == 0 {
+            (0.0, flip_cost)
+        } else {
+            (flip_cost, 0.0)
+        };
 
-            // Option 1: keep cover bit (stego_bit = cover_bit).
-            let s_keep = if cover_bit == 1 {
-                s_prev ^ (col as usize)
+        let mut packed_bp = 0u128;
+
+        for s in 0..num_states {
+            let cost_0 = prev_cost[s] + cost_s0;
+            let cost_1 = prev_cost[s ^ col] + cost_s1;
+
+            if cost_1 < cost_0 {
+                curr_cost[s] = cost_1;
+                packed_bp |= 1u128 << s;
             } else {
-                s_prev
-            };
-
-            // Option 2: flip cover bit (stego_bit = 1 - cover_bit).
-            let s_flip = if cover_bit == 0 {
-                s_prev ^ (col as usize)
-            } else {
-                s_prev
-            };
-
-            let cost_keep = prev_cost[s_prev];
-            if cost_keep < curr_cost[s_keep] {
-                curr_cost[s_keep] = cost_keep;
-                bp[s_keep] = s_prev as u32;
-            }
-
-            // Skip flip option for WET (infinite cost) positions — these
-            // coefficients must not be modified.
-            if flip_cost.is_finite() {
-                let cost_flip = prev_cost[s_prev] + flip_cost;
-                if cost_flip < curr_cost[s_flip] {
-                    curr_cost[s_flip] = cost_flip;
-                    bp[s_flip] = s_prev as u32;
-                }
+                curr_cost[s] = cost_0;
             }
         }
 
-        // At message-bit boundaries (every w elements), constrain and shift.
+        back_ptr.push(packed_bp);
+
         if col_idx == w - 1 && msg_idx < m {
             let required_bit = message[msg_idx] as usize;
-
-            // After shift, the new state will be curr_state >> 1.
-            // Before shift, bit 0 of curr_state must equal the message bit.
-            // So we prune states whose bit 0 doesn't match, then shift all surviving states.
-            let mut shifted_cost = vec![inf; num_states];
-            let mut shifted_bp = vec![0u32; num_states]; // store pre-shift state
+            shifted_cost.fill(inf);
 
             for s in 0..num_states {
-                if curr_cost[s] == inf {
-                    continue;
-                }
-                if (s & 1) != required_bit {
-                    continue; // doesn't match message bit
-                }
+                if curr_cost[s] == inf { continue; }
+                if (s & 1) != required_bit { continue; }
                 let s_shifted = s >> 1;
                 if curr_cost[s] < shifted_cost[s_shifted] {
                     shifted_cost[s_shifted] = curr_cost[s];
-                    shifted_bp[s_shifted] = s as u32; // remember pre-shift state
                 }
             }
 
-            // We need to store both: the normal back pointer for this step,
-            // and the shift mapping. We'll encode the shift into the back_ptr
-            // by storing the pre-shift state. During traceback, we'll handle
-            // shift boundaries specially.
-
-            // Store the regular bp first (for the transition within this step).
-            back_ptr.push(bp);
-
-            // Add a virtual "shift" step: back_ptr entry mapping shifted state -> pre-shift state.
-            back_ptr.push(shifted_bp);
-
-            prev_cost = shifted_cost;
+            std::mem::swap(&mut prev_cost, &mut shifted_cost);
             msg_idx += 1;
         } else {
-            back_ptr.push(bp);
-            prev_cost = curr_cost;
+            std::mem::swap(&mut prev_cost, &mut curr_cost);
+        }
+
+        if (j + 1) % progress_interval == 0 {
+            if progress::is_cancelled() { return None; }
+            progress::advance();
         }
     }
-
-    // Handle case where last block is incomplete (no shift was applied).
-    // If n is not a multiple of w, the last partial block may not have emitted
-    // a message bit. For the padded message approach (m_max), this should be fine
-    // since w = ceil(n/m) guarantees n >= (m-1)*w + 1.
 
     // Find terminal state with minimum cost.
-    let mut best_state = 0;
-    let mut best_cost = inf;
-    for s in 0..num_states {
-        if prev_cost[s] < best_cost {
-            best_cost = prev_cost[s];
-            best_state = s;
-        }
-    }
+    let (best_state, best_cost) = find_best_state(&prev_cost);
+    if best_cost == inf { return None; }
 
-    if best_cost == inf {
-        return None;
-    }
+    // Backward traceback.
+    let mut stego_bits = vec![0u8; n];
+    let mut s = best_state;
 
-    // Backward traceback through back_ptr (which includes virtual shift steps).
-    // Total entries in back_ptr = n + number_of_shifts.
-    let total_steps = back_ptr.len();
-    let mut states = vec![0usize; total_steps + 1];
-    states[total_steps] = best_state;
-
-    for step in (0..total_steps).rev() {
-        states[step] = back_ptr[step][states[step + 1]] as usize;
-    }
-
-    // Now reconstruct stego bits. We need to map back_ptr steps to cover element indices.
-    // Shift steps are virtual — they don't correspond to cover elements.
-    // Build a mapping: for each back_ptr step, is it a cover step or a shift step?
-    let mut step_is_shift = vec![false; total_steps];
-    {
-        let mut mi = 0;
-        let mut step = 0;
-        for j in 0..n {
-            step += 1; // cover step
-            let col_idx = j % w;
-            if col_idx == w - 1 && mi < m {
-                step_is_shift[step] = true;
-                step += 1; // shift step
-                mi += 1;
-            }
-        }
-    }
-
-    // Extract stego bits from state transitions (only cover steps).
-    let mut stego_bits = Vec::with_capacity(n);
-    let mut step = 0;
-    for j in 0..n {
-        let s_before = states[step];
-        let s_after = states[step + 1];
-
+    for j in (0..n).rev() {
         let col_idx = j % w;
-        let col = hhat::column_packed(hhat_matrix, col_idx) as usize;
 
-        // Determine the applied stego bit.
-        // If stego bit = 1: s_after = s_before ^ col
-        // If stego bit = 0: s_after = s_before
-        let applied_bit = if s_after == s_before ^ col { 1u8 } else { 0u8 };
-        stego_bits.push(applied_bit);
+        if col_idx == w - 1 && (j / w) < m {
+            let msg_bit = message[j / w] as usize;
+            s = ((s << 1) | msg_bit) & (num_states - 1);
+        }
 
-        step += 1;
-        // Skip virtual shift step if present.
-        if col_idx == w - 1 && step < total_steps && step_is_shift[step] {
-            step += 1;
+        let bit = ((back_ptr[j] >> s) & 1) as u8;
+        stego_bits[j] = bit;
+
+        if bit == 1 {
+            s ^= columns[col_idx];
         }
     }
 
-    // Verify correctness.
+    debug_assert_eq!(s, 0, "traceback did not return to initial state 0");
     debug_assert_eq!(
         stc_extract(&stego_bits, hhat_matrix, w)[..m],
         message[..m],
     );
 
-    Some(EmbedResult {
-        stego_bits,
-        total_cost: best_cost,
-    })
+    Some(EmbedResult { stego_bits, total_cost: best_cost })
+}
+
+// ---------------------------------------------------------------------------
+// Segmented path: checkpoint/recompute for O(√n) memory.
+// Two forward passes: one to save checkpoints, one to recompute segments.
+// ---------------------------------------------------------------------------
+
+fn stc_embed_segmented(
+    cover_bits: &[u8],
+    costs: &[f64],
+    message: &[u8],
+    hhat_matrix: &[Vec<u32>],
+    h: usize,
+    w: usize,
+) -> Option<EmbedResult> {
+    let n = cover_bits.len();
+    let m = message.len();
+    let num_states = 1usize << h;
+    let inf = f64::INFINITY;
+
+    // Pre-compute H-hat columns (avoids repeated column_packed calls
+    // across Phase A, Phase B forward, and Phase B traceback).
+    let columns: Vec<usize> = (0..w)
+        .map(|c| hhat::column_packed(hhat_matrix, c) as usize)
+        .collect();
+
+    // Checkpoint interval: K message blocks per segment.
+    // sqrt(m) balances checkpoint memory (K × 1 KB) with segment back_ptr
+    // memory (K × w × 16 bytes).
+    let k = ((m as f64).sqrt().ceil() as usize).max(1);
+    let num_segments = (m + k - 1) / k;
+
+    // --- Phase A: forward scan, save checkpoints, no back_ptr ---
+    // Reports 4 of the 8 STC progress sub-steps.
+    let progress_interval_a = (n / 4).max(1);
+
+    // Pre-allocated cost buffers reused across all iterations.
+    let mut prev_cost = vec![inf; num_states];
+    prev_cost[0] = 0.0;
+    let mut curr_cost = vec![0.0f64; num_states];
+    let mut shifted_cost = vec![inf; num_states];
+
+    // checkpoint[s] = cost array at the START of segment s (post-shift from
+    // the preceding block, or the initial state for s=0).
+    let mut checkpoints: Vec<Vec<f64>> = Vec::with_capacity(num_segments);
+    checkpoints.push(prev_cost.clone());
+
+    let mut msg_idx = 0;
+
+    for j in 0..n {
+        let col_idx = j % w;
+        let col = columns[col_idx];
+        let flip_cost = costs[j];
+        let cover_bit = cover_bits[j] & 1;
+
+        let (cost_s0, cost_s1) = if cover_bit == 0 {
+            (0.0, flip_cost)
+        } else {
+            (flip_cost, 0.0)
+        };
+
+        for s in 0..num_states {
+            let cost_0 = prev_cost[s] + cost_s0;
+            let cost_1 = prev_cost[s ^ col] + cost_s1;
+            curr_cost[s] = if cost_1 < cost_0 { cost_1 } else { cost_0 };
+        }
+
+        if col_idx == w - 1 && msg_idx < m {
+            let required_bit = message[msg_idx] as usize;
+            shifted_cost.fill(inf);
+            for s in 0..num_states {
+                if curr_cost[s] == inf { continue; }
+                if (s & 1) != required_bit { continue; }
+                let s_shifted = s >> 1;
+                if curr_cost[s] < shifted_cost[s_shifted] {
+                    shifted_cost[s_shifted] = curr_cost[s];
+                }
+            }
+            std::mem::swap(&mut prev_cost, &mut shifted_cost);
+            msg_idx += 1;
+
+            // Save checkpoint at segment boundaries.
+            if msg_idx % k == 0 && msg_idx < m {
+                checkpoints.push(prev_cost.clone());
+            }
+        } else {
+            std::mem::swap(&mut prev_cost, &mut curr_cost);
+        }
+
+        if (j + 1) % progress_interval_a == 0 {
+            if progress::is_cancelled() { return None; }
+            progress::advance();
+        }
+    }
+
+    // Find terminal state with minimum cost.
+    let (best_state, best_cost) = find_best_state(&prev_cost);
+    if best_cost == inf { return None; }
+
+    // --- Phase B: segment-by-segment recomputation + traceback ---
+    // Reports the remaining 4 progress sub-steps.
+    let progress_interval_b = (n / 4).max(1);
+    let mut progress_counter = 0usize;
+
+    let mut stego_bits = vec![0u8; n];
+    let mut entry_state = best_state;
+
+    for seg in (0..num_segments).rev() {
+        let block_start = seg * k;
+        let block_end = ((seg + 1) * k).min(m);
+        let j_start = block_start * w;
+        let j_end = block_end * w;
+        let seg_len = j_end - j_start;
+
+        // Reset prev_cost from checkpoint (reuses the same buffer).
+        prev_cost.copy_from_slice(&checkpoints[seg]);
+
+        // Recompute forward Viterbi for this segment, storing back_ptr.
+        let mut seg_back_ptr: Vec<u128> = Vec::with_capacity(seg_len);
+        let mut seg_msg_idx = block_start;
+
+        for j in j_start..j_end {
+            let col_idx = j % w;
+            let col = columns[col_idx];
+            let flip_cost = costs[j];
+            let cover_bit = cover_bits[j] & 1;
+
+            let (cost_s0, cost_s1) = if cover_bit == 0 {
+                (0.0, flip_cost)
+            } else {
+                (flip_cost, 0.0)
+            };
+
+            let mut packed_bp = 0u128;
+
+            for s in 0..num_states {
+                let cost_0 = prev_cost[s] + cost_s0;
+                let cost_1 = prev_cost[s ^ col] + cost_s1;
+                if cost_1 < cost_0 {
+                    curr_cost[s] = cost_1;
+                    packed_bp |= 1u128 << s;
+                } else {
+                    curr_cost[s] = cost_0;
+                }
+            }
+
+            seg_back_ptr.push(packed_bp);
+
+            if col_idx == w - 1 && seg_msg_idx < m {
+                let required_bit = message[seg_msg_idx] as usize;
+                shifted_cost.fill(inf);
+                for s in 0..num_states {
+                    if curr_cost[s] == inf { continue; }
+                    if (s & 1) != required_bit { continue; }
+                    let s_shifted = s >> 1;
+                    if curr_cost[s] < shifted_cost[s_shifted] {
+                        shifted_cost[s_shifted] = curr_cost[s];
+                    }
+                }
+                std::mem::swap(&mut prev_cost, &mut shifted_cost);
+                seg_msg_idx += 1;
+            } else {
+                std::mem::swap(&mut prev_cost, &mut curr_cost);
+            }
+
+            progress_counter += 1;
+            if progress_counter % progress_interval_b == 0 {
+                if progress::is_cancelled() { return None; }
+                progress::advance();
+            }
+        }
+
+        // Traceback within this segment.
+        let mut s = entry_state;
+        for local_j in (0..seg_len).rev() {
+            let j = j_start + local_j;
+            let col_idx = j % w;
+
+            if col_idx == w - 1 && (j / w) < m {
+                let msg_bit = message[j / w] as usize;
+                s = ((s << 1) | msg_bit) & (num_states - 1);
+            }
+
+            let bit = ((seg_back_ptr[local_j] >> s) & 1) as u8;
+            stego_bits[j] = bit;
+
+            if bit == 1 {
+                s ^= columns[col_idx];
+            }
+        }
+
+        // State at the start of this segment = entry state for previous segment.
+        entry_state = s;
+        // seg_back_ptr is dropped here, freeing the segment's memory.
+    }
+
+    debug_assert_eq!(entry_state, 0, "traceback did not return to initial state 0");
+    debug_assert_eq!(
+        stc_extract(&stego_bits, hhat_matrix, w)[..m],
+        message[..m],
+    );
+
+    Some(EmbedResult { stego_bits, total_cost: best_cost })
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Find the state with minimum cost. Returns (state, cost).
+fn find_best_state(costs: &[f64]) -> (usize, f64) {
+    let mut best = 0;
+    let mut best_cost = f64::INFINITY;
+    for (s, &c) in costs.iter().enumerate() {
+        if c < best_cost {
+            best_cost = c;
+            best = s;
+        }
+    }
+    (best, best_cost)
 }
 
 #[cfg(test)]
@@ -329,5 +513,105 @@ mod tests {
         let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
         assert_eq!(result.stego_bits, cover_bits);
         assert_eq!(result.total_cost, 0.0);
+    }
+
+    /// Large synthetic test to verify 1-bit packed back pointers at scale.
+    #[test]
+    fn embed_extract_roundtrip_large() {
+        let h = 7;
+        let m = 10_000;
+        let w = 10;
+        let n = m * w; // 100K cover elements
+        let seed = [77u8; 32];
+        let hhat = generate_hhat(h, w, &seed);
+
+        let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 2) as u8).collect();
+        let costs: Vec<f64> = (0..n).map(|i| {
+            let base = 0.5 + (i % 100) as f64 * 0.02;
+            if i % 500 == 0 { f64::INFINITY } else { base }
+        }).collect();
+        let message: Vec<u8> = (0..m).map(|i| ((i * 13 + 7) % 2) as u8).collect();
+
+        let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+        assert_eq!(result.stego_bits.len(), n);
+
+        let extracted = stc_extract(&result.stego_bits, &hhat, w);
+        assert_eq!(&extracted[..m], &message[..]);
+
+        for i in (0..n).step_by(500) {
+            assert_eq!(
+                result.stego_bits[i], cover_bits[i],
+                "WET position {i} was modified"
+            );
+        }
+    }
+
+    /// Verify that inline and segmented paths produce identical output.
+    #[test]
+    fn inline_segmented_equivalence() {
+        let h = 7;
+        let m = 500;
+        let w = 10;
+        let n = m * w; // 5000 cover elements
+        let seed = [99u8; 32];
+        let hhat = generate_hhat(h, w, &seed);
+
+        let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 2) as u8).collect();
+        let costs: Vec<f64> = (0..n).map(|i| {
+            let base = 0.5 + (i % 100) as f64 * 0.02;
+            if i % 500 == 0 { f64::INFINITY } else { base }
+        }).collect();
+        let message: Vec<u8> = (0..m).map(|i| ((i * 13 + 7) % 2) as u8).collect();
+
+        let inline = stc_embed_inline(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+        let segmented = stc_embed_segmented(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+
+        assert_eq!(inline.stego_bits, segmented.stego_bits, "stego bits differ");
+        assert_eq!(inline.total_cost, segmented.total_cost, "total cost differs");
+    }
+
+    /// Equivalence test with a larger input covering multiple segments.
+    #[test]
+    fn inline_segmented_equivalence_large() {
+        let h = 7;
+        let m = 10_000;
+        let w = 10;
+        let n = m * w; // 100K cover elements, K ≈ 100 → ~100 segments
+        let seed = [88u8; 32];
+        let hhat = generate_hhat(h, w, &seed);
+
+        let cover_bits: Vec<u8> = (0..n).map(|i| ((i * 37 + 11) % 2) as u8).collect();
+        let costs: Vec<f64> = (0..n).map(|i| {
+            let base = 0.3 + (i % 200) as f64 * 0.01;
+            if i % 1000 == 0 { f64::INFINITY } else { base }
+        }).collect();
+        let message: Vec<u8> = (0..m).map(|i| ((i * 19 + 3) % 2) as u8).collect();
+
+        let inline = stc_embed_inline(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+        let segmented = stc_embed_segmented(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+
+        assert_eq!(inline.stego_bits, segmented.stego_bits, "stego bits differ");
+        assert_eq!(inline.total_cost, segmented.total_cost, "total cost differs");
+    }
+
+    /// Segmented path with a single segment (m ≤ K).
+    #[test]
+    fn segmented_single_segment() {
+        let h = 7;
+        let m = 4;
+        let w = 5;
+        let n = m * w;
+        let seed = [33u8; 32];
+        let hhat = generate_hhat(h, w, &seed);
+
+        let cover_bits: Vec<u8> = (0..n).map(|i| (i % 2) as u8).collect();
+        let costs: Vec<f64> = vec![1.0; n];
+        let message: Vec<u8> = vec![1, 0, 1, 1];
+
+        let inline = stc_embed_inline(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+        let segmented = stc_embed_segmented(&cover_bits, &costs, &message, &hhat, h, w).unwrap();
+
+        assert_eq!(inline.stego_bits, segmented.stego_bits);
+        assert_eq!(inline.total_cost, segmented.total_cost);
     }
 }

@@ -12,7 +12,7 @@
 //!    zero for |coeff| == 1 to prevent shrinkage)
 
 use crate::jpeg::JpegImage;
-use crate::stego::cost::uniward::{compute_uniward, compute_uniward_for_decode};
+use crate::stego::cost::uniward::compute_uniward_with_progress;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
@@ -27,9 +27,14 @@ const STC_H: usize = 7;
 
 /// Total number of progress steps reported by [`ghost_decode`].
 ///
-/// Comprises [`UNIWARD_DECODE_STEPS`](crate::stego::cost::uniward::UNIWARD_DECODE_STEPS)
+/// Comprises [`UNIWARD_PROGRESS_STEPS`](crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS)
 /// (3 steps from the cost computation) plus 1 step for STC extraction and decryption.
-pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_DECODE_STEPS + 1;
+pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + 1;
+
+/// Total number of progress steps reported by Ghost encode.
+///
+/// 3 (UNIWARD sub-steps) + 8 (STC Viterbi sub-steps) + 1 (LSB mod + JPEG write).
+pub const GHOST_ENCODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + 8 + 1;
 
 /// Compute the STC width `w`, usable cover length, and effective `m_max` from
 /// the total number of AC positions. Both encoder and decoder must agree on
@@ -49,6 +54,8 @@ pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_DECODE_
 ///
 /// # Errors
 /// Returns [`StegoError::ImageTooSmall`] if `n` is 0.
+/// Returns [`StegoError::ImageTooLarge`] if the STC Viterbi back_ptr would
+/// exceed the memory budget (prevents OOM on very large images).
 fn compute_stc_params(n: usize) -> Result<(usize, usize, usize), StegoError> {
     let m_max = MAX_FRAME_BITS.min(n);
     if m_max == 0 {
@@ -56,6 +63,15 @@ fn compute_stc_params(n: usize) -> Result<(usize, usize, usize), StegoError> {
     }
     let w = n / m_max; // floor division; always >= 1 since m_max <= n
     let n_used = m_max * w;
+
+    // Sanity limit: reject unrealistically large images (> 500M AC positions
+    // ≈ 8 gigapixels). The STC Viterbi uses a segmented checkpoint approach
+    // for large images, so memory is O(√n) — typically a few MB.
+    const STC_POSITION_LIMIT: usize = 500_000_000;
+    if n_used > STC_POSITION_LIMIT {
+        return Err(StegoError::ImageTooLarge);
+    }
+
     Ok((w, n_used, m_max))
 }
 
@@ -168,13 +184,11 @@ fn ghost_encode_impl(
     passphrase: &str,
     si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
+    // Initialize encode progress (10 steps: 1 UNIWARD + 8 STC + 1 write).
+    progress::init(GHOST_ENCODE_STEPS);
+
     // Build the payload (text + files + compression).
     let payload_bytes = payload::encode_payload(message, files)?;
-
-    // Guard against payload exceeding the u16 length field in the frame format.
-    if payload_bytes.len() > u16::MAX as usize {
-        return Err(StegoError::MessageTooLarge);
-    }
 
     let mut img = JpegImage::from_bytes(image_bytes)?;
 
@@ -186,10 +200,10 @@ fn ghost_encode_impl(
         return Err(StegoError::NoLuminanceChannel);
     }
 
-    // 1. Compute J-UNIWARD costs for Y channel.
+    // 1. Compute J-UNIWARD costs for Y channel (reports 3 progress sub-steps).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let mut cost_map = compute_uniward(img.dct_grid(0), qt);
+    let mut cost_map = compute_uniward_with_progress(img.dct_grid(0), qt)?;
 
     // 1b. If side information is available (SI-UNIWARD), modulate costs.
     if let Some(ref side_info) = si {
@@ -211,7 +225,7 @@ fn ghost_encode_impl(
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
 
     // 5. Build payload frame and pad to m_max bits.
-    let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
     let frame_bits = frame::bytes_to_bits(&frame_bytes);
     let m = frame_bits.len();
 
@@ -230,10 +244,11 @@ fn ghost_encode_impl(
     }).collect();
     let costs: Vec<f64> = positions.iter().map(|p| p.cost).collect();
 
-    // 7. Generate H-hat and embed.
+    // 7. Generate H-hat and embed (reports 8 progress sub-steps internally).
     let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
-    let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, STC_H, w)
-        .ok_or(StegoError::MessageTooLarge)?;
+    let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, STC_H, w);
+    progress::check_cancelled()?;
+    let result = result.ok_or(StegoError::MessageTooLarge)?;
 
     // 8. Apply LSB changes to DctGrid.
     // Direction depends on whether side information is available:
@@ -266,6 +281,10 @@ fn ghost_encode_impl(
             img.to_bytes().map_err(StegoError::InvalidJpeg)?
         }
     };
+
+    // Step 10 complete: LSB modification + JPEG write.
+    progress::advance();
+
     Ok(stego_bytes)
 }
 
@@ -288,13 +307,13 @@ pub fn ghost_decode(
     }
 
     // 1. Compute J-UNIWARD costs (for consistent position selection).
-    //    Reports UNIWARD_DECODE_STEPS (3) progress steps internally:
+    //    Reports UNIWARD_PROGRESS_STEPS (3) progress steps internally:
     //      - pixel decompression
     //      - wavelet subbands
     //      - per-block cost computation
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_uniward_for_decode(img.dct_grid(0), qt)?;
+    let cost_map = compute_uniward_with_progress(img.dct_grid(0), qt)?;
 
     progress::check_cancelled()?;
 

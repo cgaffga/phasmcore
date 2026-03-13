@@ -102,6 +102,14 @@ compressed_payload_size(text, mode) -> usize
 
 // Image dimension validation
 validate_encode_dimensions(width, height) -> Result<()>
+
+// Real-time progress tracking
+progress::init(total)      // reset and set total steps
+progress::advance()        // increment step (capped at total-1)
+progress::finish()         // mark complete (step = total)
+progress::get() -> (u32, u32) // read (step, total)
+progress::cancel()         // request cancellation
+progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 ```
 
 ### Types
@@ -147,6 +155,7 @@ cargo run -p phasm-core --example test_link -- stego.jpg
 
 - **Zero C FFI** — pure Rust from JPEG parsing to AES encryption, compiles to native and WASM
 - **Deterministic** — identical output across x86, ARM, and WASM using [FDLIBM-based math](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
+- **Memory-efficient** — 1-bit packed Viterbi back pointers (32× reduction) with automatic segmented checkpoint for large images (O(√n) memory)
 - **Short messages** — optimized for text payloads under 1 KB
 - **Stego output is raw** — the JPEG bytes after encoding must be saved/shared without re-encoding
 
@@ -169,13 +178,73 @@ All payloads are encrypted before embedding:
 ### Ghost Pipeline
 
 1. Parse JPEG into DCT coefficients
-2. Derive structural key (Argon2id) -> permutation seed + STC seed
+2. Derive structural key (Argon2id) → permutation seed + STC seed
 3. Compute [J-UNIWARD cost map](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) (Daubechies-8 wavelet, 3 subbands)
 4. *(SI-UNIWARD only)* Compute rounding errors from raw pixels, modulate costs: `cost *= (1 - 2|error|)`
 5. Permute coefficient order (Fisher-Yates with ChaCha20)
 6. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
 7. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
 8. Write modified coefficients back to JPEG
+
+#### STC Viterbi Optimizer
+
+The STC encoder uses a Viterbi-style dynamic programming algorithm to find the minimum-cost modification sequence across a trellis with 2^h = 128 states. Two key memory optimizations make it practical for large images (32MP+ photos, 48MP camera sensors):
+
+**1-bit packed back pointers** — The standard Viterbi stores one predecessor state (u32) per trellis state per cover step. Since there are exactly 2 candidate predecessors per target state (stego_bit = 0 or 1), only 1 bit is needed. One `u128` (16 bytes) stores all 128 states' decisions per step, replacing a `Vec<u32>` of 128 entries (512 bytes). **32× memory reduction.**
+
+The forward pass iterates over *target states* instead of source states:
+
+```rust
+for s in 0..num_states {
+    let cost_0 = prev_cost[s]       + rho_0;  // stego=0, pred=s
+    let cost_1 = prev_cost[s ^ col] + rho_1;  // stego=1, pred=s^col
+    if cost_1 < cost_0 {
+        curr_cost[s] = cost_1;
+        packed_bp |= 1u128 << s;  // 1 bit records the choice
+    } else {
+        curr_cost[s] = cost_0;
+    }
+}
+```
+
+Traceback reconstructs predecessors from the single bit:
+
+```rust
+let bit = ((back_ptr[j] >> s) & 1) as u8;
+if bit == 1 { s ^= col; }  // undo XOR to get predecessor
+```
+
+At message-block boundaries (shift steps), the pre-shift state is fully determined from the known message bit — no storage needed:
+
+```rust
+s = ((s << 1) | message_bit) & (num_states - 1);  // invertible shift
+```
+
+**Segmented checkpoint Viterbi** — For images with >1M usable positions, even 16 bytes/step can exceed mobile memory (e.g., 100M positions × 16 bytes = 1.6 GB). The segmented approach reduces memory to O(√n):
+
+- **Phase A (forward scan)**: Run the full Viterbi without storing back pointers. Save cost array checkpoints every K = ⌈√m⌉ message blocks (~1 KB each). Total checkpoint memory: ~1.5 MB for maximum payload.
+- **Phase B (segment recomputation)**: Process segments in reverse order. For each segment, re-run the forward pass from its checkpoint storing back pointers for that segment only, then traceback and free. Peak memory: ~200 KB per segment.
+
+The dispatcher auto-selects the optimal path:
+
+```rust
+const SEGMENTED_THRESHOLD: usize = 1_000_000;
+
+if n_used <= SEGMENTED_THRESHOLD {
+    stc_embed_inline(...)   // single pass, all back_ptr in memory
+} else {
+    stc_embed_segmented(...) // checkpoint/recompute, O(√n) memory
+}
+```
+
+Both paths produce **bit-for-bit identical output** (verified by equivalence tests). The segmented path trades 2× compute time for O(√n) memory — typically ~3 MB total for any image size.
+
+| Image | n_used | Inline memory | Segmented memory |
+|-------|--------|--------------|-----------------|
+| 12 MP phone | 2M | 32 MB | 3 MB |
+| 32 MB PNG | 5M | 80 MB | 3 MB |
+| 48 MP camera | 10M | 160 MB | 3 MB |
+| 100 MP medium format | 30M | 480 MB | 3 MB |
 
 ### Armor Pipeline
 
@@ -186,6 +255,17 @@ All payloads are encrypted before embedding:
 5. For short messages: activate Fortress ([BA-QIM](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) on block averages with [Watson masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography))
 6. Embed [DFT magnitude template](https://phasm.app/blog/dft-template-geometric-resilience-steganography) for geometric resilience
 7. Decode: three-phase parallel sweep with [soft-decision concatenated codes](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes)
+
+### Progress Reporting
+
+Both encode and decode pipelines report real-time progress via global atomics (`progress::advance()`). This enables responsive UI feedback on all platforms:
+
+- **Ghost encode**: 12 steps (3 UNIWARD cost sub-steps + 8 STC Viterbi sub-steps + 1 JPEG write)
+- **Armor encode**: 6 steps (STDM path) or 3 steps (Fortress path, auto-adjusted at runtime)
+- **Ghost decode**: 4 steps (3 UNIWARD + 1 STC extraction)
+- **Armor decode**: dynamic total based on candidate count (~50 steps)
+
+Cancellation is cooperative: `progress::cancel()` sets a flag checked at natural loop boundaries via `progress::check_cancelled()`.
 
 ### FFT
 
@@ -201,6 +281,7 @@ src/
     mod.rs          JpegImage: parse, modify, serialize
     bitio.rs        Bit-level reader/writer with JPEG byte stuffing
     dct.rs          DCT coefficient grids and quantization tables
+    error.rs        JPEG parsing errors
     frame.rs        SOF frame info (dimensions, components, subsampling)
     huffman.rs      Huffman coding tables (two-level decode, encode)
     marker.rs       JPEG marker iterator
@@ -210,14 +291,14 @@ src/
     zigzag.rs       Zigzag scan order mapping
   stego/
     mod.rs          Ghost/Armor encode/decode entry points
-    pipeline.rs     Ghost mode pipeline
+    pipeline.rs     Ghost mode pipeline (J-UNIWARD + STC)
     crypto.rs       AES-256-GCM-SIV + Argon2id key derivation
     frame.rs        Payload framing (length, CRC, mode byte, salt, nonce)
     payload.rs      Payload serialization (Brotli, file attachments)
     permute.rs      Fisher-Yates coefficient permutation
     side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
     capacity.rs     Ghost capacity estimation
-    progress.rs     Real-time decode progress (atomics + WASM callback)
+    progress.rs     Real-time progress tracking (atomics + WASM callback)
     error.rs        StegoError enum
     cost/
       mod.rs        Cost function trait
@@ -225,12 +306,12 @@ src/
       uerd.rs       UERD cost function (legacy)
     stc/
       mod.rs        Syndrome-Trellis Codes
-      embed.rs      STC embedding (Viterbi forward pass)
+      embed.rs      STC Viterbi embedding (1-bit packed + segmented checkpoint)
       extract.rs    STC extraction (syndrome computation)
-      hhat.rs       H-hat submatrix generation
+      hhat.rs       H-hat submatrix generation (ChaCha20-derived)
     armor/
       mod.rs        Armor mode re-exports
-      pipeline.rs   Armor encode/decode (three-phase parallel sweep)
+      pipeline.rs   Armor encode/decode (STDM + Fortress + DFT template)
       embedding.rs  STDM embed/extract with adaptive delta
       selection.rs  Coefficient stability map
       spreading.rs  ChaCha20-derived spreading vectors

@@ -35,16 +35,16 @@ use super::CostMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Number of progress steps reported by [`compute_uniward_for_decode`].
+/// Number of progress steps reported by [`compute_uniward_with_progress`].
 ///
-/// Used by the progress total formula in `smart_decode` so that the combined
-/// Armor + Ghost total is correct.
+/// Used by the progress total formula in encode/decode so that the combined
+/// step counts are correct.
 ///
 /// Steps:
 /// 1. Pixel decompression complete
 /// 2. Wavelet subbands complete
 /// 3. Per-block cost computation complete
-pub const UNIWARD_DECODE_STEPS: u32 = 3;
+pub const UNIWARD_PROGRESS_STEPS: u32 = 3;
 
 /// Stabilization constant. Avoids division by zero in the cost formula
 /// and controls sensitivity to image content. The original paper and
@@ -210,17 +210,17 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     map
 }
 
-/// Compute J-UNIWARD costs with decode progress tracking.
+/// Compute J-UNIWARD costs with progress tracking.
 ///
-/// Identical to [`compute_uniward`] but reports [`UNIWARD_DECODE_STEPS`]
-/// progress steps and checks for cancellation between phases. Used only
-/// by the Ghost decode path; encode and capacity use the plain version.
+/// Identical to [`compute_uniward`] but reports [`UNIWARD_PROGRESS_STEPS`]
+/// progress steps and checks for cancellation between phases. Used by
+/// both Ghost encode and decode paths; capacity uses the plain version.
 ///
 /// # Progress steps
 /// 1. Pixel decompression complete
 /// 2. Wavelet subbands complete
 /// 3. Per-block cost computation complete
-pub fn compute_uniward_for_decode(grid: &DctGrid, qt: &QuantTable) -> Result<CostMap, StegoError> {
+pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<CostMap, StegoError> {
     let bw = grid.blocks_wide();
     let bt = grid.blocks_tall();
     let mut map = CostMap::new(bw, bt);

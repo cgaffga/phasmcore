@@ -271,7 +271,7 @@ pub fn embed_ring_payload(
 
     // Encrypt payload
     let (ciphertext, nonce, salt) = crypto::encrypt(payload, passphrase)?;
-    let frame_bytes = frame::build_frame(payload.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bytes = frame::build_frame(payload.len(), &salt, &nonce, &ciphertext);
 
     // RS encode with heavy parity
     let rs_encoded = ecc::rs_encode_blocks_with_parity(&frame_bytes, RING_RS_PARITY);

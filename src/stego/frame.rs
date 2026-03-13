@@ -6,7 +6,9 @@
 //!
 //! The frame is the binary container that wraps the encrypted message before
 //! embedding into DCT coefficients. Both Ghost and Armor modes use the same
-//! frame format:
+//! frame format.
+//!
+//! ## v1 frame (plaintext ≤ 65,535 bytes)
 //!
 //! ```text
 //! [2 bytes ] plaintext length (big-endian u16)
@@ -17,6 +19,22 @@
 //! ```
 //!
 //! Total frame size = 50 + plaintext_len bytes.
+//!
+//! ## v2 frame (plaintext > 65,535 bytes)
+//!
+//! When the payload exceeds the u16 range, a zero sentinel signals the
+//! extended format. Old decoders see length=0, fail gracefully on CRC/decrypt.
+//!
+//! ```text
+//! [2 bytes ] 0x0000 sentinel
+//! [4 bytes ] plaintext length (big-endian u32)
+//! [16 bytes] Argon2 salt
+//! [12 bytes] AES-GCM-SIV nonce
+//! [N bytes ] ciphertext (plaintext_len + 16 bytes for auth tag)
+//! [4 bytes ] CRC-32 of everything above
+//! ```
+//!
+//! Total frame size = 54 + plaintext_len bytes.
 //!
 //! Note: The mode byte was removed from the frame format to eliminate known
 //! plaintext and improve stealth. Mode detection is handled by trial decoding
@@ -30,41 +48,47 @@ pub const MODE_GHOST: u8 = 0x01;
 /// Armor mode identifier byte.
 pub const MODE_ARMOR: u8 = 0x02;
 
-/// Fixed overhead: length(2) + salt(16) + nonce(12) + tag(16) + crc(4) = 50 bytes.
+/// v1 fixed overhead: length(2) + salt(16) + nonce(12) + tag(16) + crc(4) = 50 bytes.
 /// Plus the ciphertext length equals plaintext length (AES-GCM stream cipher).
-/// So total frame = 34 + plaintext_len + 16(tag) = 50 + plaintext_len.
+/// So total v1 frame = 34 + plaintext_len + 16(tag) = 50 + plaintext_len.
 pub const FRAME_OVERHEAD: usize = 2 + SALT_LEN + NONCE_LEN + 16 + 4; // 50
 
+/// v2 extended overhead: sentinel(2) + length(4) + salt(16) + nonce(12) + tag(16) + crc(4) = 54.
+/// Used when plaintext exceeds 65,535 bytes (u16 range).
+pub const FRAME_OVERHEAD_EXT: usize = 2 + 4 + SALT_LEN + NONCE_LEN + 16 + 4; // 54
+
 /// Maximum payload frame size in bytes.
-/// The u16 length prefix supports up to 65,535 bytes of plaintext.
-/// 65,535 (max plaintext from u16) + 50 (overhead) = 65,585 bytes.
-/// The actual usable capacity is determined by each image's embedding capacity.
-pub const MAX_FRAME_BYTES: usize = 65_535 + FRAME_OVERHEAD; // 65,585
+/// This caps STC allocation: the Viterbi back_ptr grows with m_max (in bits).
+/// 256 KB supports payloads up to ~256 KB, far beyond typical stego use (<1 KB).
+/// Kept modest to limit STC memory on large images (back_ptr ≈ n_used * 512 bytes).
+pub const MAX_FRAME_BYTES: usize = 256 * 1024; // 256 KB
 
 /// Maximum payload frame size in bits.
 pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;
 
 /// Build a payload frame from encrypted components.
 ///
-/// Frame layout:
-/// ```text
-/// [2 bytes ] plaintext length (BE u16)
-/// [16 bytes] Argon2 salt
-/// [12 bytes] AES-GCM nonce
-/// [N bytes ] AES-GCM ciphertext (includes 16-byte auth tag)
-/// [4 bytes ] CRC-32 of everything above
-/// ```
+/// Uses v1 format (2-byte u16 length) when `plaintext_len` fits in u16,
+/// otherwise v2 format (0x0000 sentinel + 4-byte u32 length).
 pub fn build_frame(
-    plaintext_len: u16,
+    plaintext_len: usize,
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    debug_assert_eq!(ciphertext.len(), plaintext_len as usize + 16, "ciphertext length mismatch");
+    debug_assert_eq!(ciphertext.len(), plaintext_len + 16, "ciphertext length mismatch");
+    assert!(plaintext_len <= u32::MAX as usize, "plaintext exceeds u32::MAX");
 
-    let mut frame = Vec::with_capacity(2 + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
+    let is_v2 = plaintext_len > u16::MAX as usize;
+    let header_len = if is_v2 { 6 } else { 2 };
+    let mut frame = Vec::with_capacity(header_len + SALT_LEN + NONCE_LEN + ciphertext.len() + 4);
 
-    frame.extend_from_slice(&plaintext_len.to_be_bytes());
+    if is_v2 {
+        frame.extend_from_slice(&0u16.to_be_bytes()); // sentinel
+        frame.extend_from_slice(&(plaintext_len as u32).to_be_bytes());
+    } else {
+        frame.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+    }
     frame.extend_from_slice(salt);
     frame.extend_from_slice(nonce);
     frame.extend_from_slice(ciphertext);
@@ -82,7 +106,8 @@ pub fn build_frame(
 /// for key derivation/decryption, and the ciphertext (including auth tag).
 pub struct ParsedFrame {
     /// Original plaintext length in bytes (before encryption).
-    pub plaintext_len: u16,
+    /// v1 frames store this as u16; v2 frames as u32.
+    pub plaintext_len: u32,
     /// Argon2 salt for Tier-2 encryption key derivation.
     pub salt: [u8; SALT_LEN],
     /// AES-GCM-SIV nonce.
@@ -93,32 +118,39 @@ pub struct ParsedFrame {
 
 /// Parse a payload frame, verifying the CRC.
 ///
+/// Supports both v1 (u16 length) and v2 (0x0000 sentinel + u32 length) formats.
 /// The input `data` may be larger than the actual frame (e.g. zero-padded).
-/// The actual frame length is determined from the embedded `plaintext_len` field.
 ///
 /// Returns `Err(StegoError::FrameCorrupted)` if the CRC check fails or the
 /// frame is truncated.
 pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
-    // Need at least 2 bytes to read plaintext_len.
     if data.len() < 2 {
         return Err(StegoError::FrameCorrupted);
     }
 
-    // Read plaintext_len to compute the actual frame size.
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
-    let ciphertext_len = plaintext_len as usize + 16; // AES-GCM-SIV auth tag
-    let total_frame_len = 2 + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
+    // Detect v1 vs v2 format.
+    let header_u16 = u16::from_be_bytes([data[0], data[1]]);
+    let (plaintext_len, header_len): (usize, usize) = if header_u16 == 0 && data.len() >= 6 {
+        let v2_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if v2_len > u16::MAX as usize {
+            // v2: sentinel + u32 length
+            (v2_len, 6)
+        } else {
+            // v1 with plaintext_len = 0 (the bytes after are salt, not a u32 length)
+            (0, 2)
+        }
+    } else {
+        (header_u16 as usize, 2)
+    };
 
-    // Reject frames that exceed the maximum supported size.
-    if total_frame_len > MAX_FRAME_BYTES {
+    let ciphertext_len = plaintext_len + 16; // AES-GCM-SIV auth tag
+    let total_frame_len = header_len + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
+
+    if total_frame_len > MAX_FRAME_BYTES || data.len() < total_frame_len {
         return Err(StegoError::FrameCorrupted);
     }
 
-    if data.len() < total_frame_len {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    // Verify CRC at the correct position within the frame.
+    // Verify CRC.
     let payload = &data[..total_frame_len - 4];
     let crc_bytes = &data[total_frame_len - 4..total_frame_len];
     let stored_crc = u32::from_be_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
@@ -127,43 +159,50 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
         return Err(StegoError::FrameCorrupted);
     }
 
-    // Parse fields.
+    // Parse fields after the length header.
     let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&payload[2..2 + SALT_LEN]);
+    salt.copy_from_slice(&payload[header_len..header_len + SALT_LEN]);
 
     let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&payload[2 + SALT_LEN..2 + SALT_LEN + NONCE_LEN]);
+    nonce.copy_from_slice(&payload[header_len + SALT_LEN..header_len + SALT_LEN + NONCE_LEN]);
 
-    let ciphertext = payload[2 + SALT_LEN + NONCE_LEN..].to_vec();
+    let ciphertext = payload[header_len + SALT_LEN + NONCE_LEN..].to_vec();
 
     Ok(ParsedFrame {
-        plaintext_len,
+        plaintext_len: plaintext_len as u32,
         salt,
         nonce,
         ciphertext,
     })
 }
 
-/// Compact frame overhead for Fortress empty-passphrase mode.
+/// v1 compact frame overhead for Fortress empty-passphrase mode.
 /// Salt and nonce are omitted (derived from constants on both sides).
 /// Layout: length(2) + ciphertext(N+16) + crc(4) = 22 + plaintext_len.
 pub const FORTRESS_COMPACT_FRAME_OVERHEAD: usize = 2 + 16 + 4; // 22
 
+/// v2 compact frame overhead (sentinel + u32 length).
+pub const FORTRESS_COMPACT_FRAME_OVERHEAD_EXT: usize = 2 + 4 + 16 + 4; // 26
+
 /// Build a compact fortress frame (no salt, no nonce embedded).
 ///
-/// Frame layout:
-/// ```text
-/// [2 bytes ] plaintext length (BE u16)
-/// [N bytes ] AES-GCM ciphertext (includes 16-byte auth tag)
-/// [4 bytes ] CRC-32 of everything above
-/// ```
+/// Uses v1 (u16 length) or v2 (sentinel + u32) based on payload size.
 pub fn build_fortress_compact_frame(
-    plaintext_len: u16,
+    plaintext_len: usize,
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(2 + ciphertext.len() + 4);
+    assert!(plaintext_len <= u32::MAX as usize, "plaintext exceeds u32::MAX");
 
-    frame.extend_from_slice(&plaintext_len.to_be_bytes());
+    let is_v2 = plaintext_len > u16::MAX as usize;
+    let header_len = if is_v2 { 6 } else { 2 };
+    let mut frame = Vec::with_capacity(header_len + ciphertext.len() + 4);
+
+    if is_v2 {
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(plaintext_len as u32).to_be_bytes());
+    } else {
+        frame.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+    }
     frame.extend_from_slice(ciphertext);
 
     let crc = crc32fast::hash(&frame);
@@ -174,8 +213,8 @@ pub fn build_fortress_compact_frame(
 
 /// Parse a compact fortress frame, verifying the CRC.
 ///
-/// Returns a `ParsedFrame` with `salt` and `nonce` set to the known Fortress
-/// empty-passphrase constants (the caller should use them for decryption).
+/// Supports both v1 and v2 formats. Returns a `ParsedFrame` with `salt` and
+/// `nonce` set to the known Fortress empty-passphrase constants.
 pub fn parse_fortress_compact_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     use crate::stego::crypto::{FORTRESS_EMPTY_SALT, FORTRESS_EMPTY_NONCE};
 
@@ -183,15 +222,23 @@ pub fn parse_fortress_compact_frame(data: &[u8]) -> Result<ParsedFrame, StegoErr
         return Err(StegoError::FrameCorrupted);
     }
 
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
-    let ciphertext_len = plaintext_len as usize + 16;
-    let total_frame_len = 2 + ciphertext_len + 4;
+    // Detect v1 vs v2.
+    let header_u16 = u16::from_be_bytes([data[0], data[1]]);
+    let (plaintext_len, header_len): (usize, usize) = if header_u16 == 0 && data.len() >= 6 {
+        let v2_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if v2_len > u16::MAX as usize {
+            (v2_len, 6)
+        } else {
+            (0, 2)
+        }
+    } else {
+        (header_u16 as usize, 2)
+    };
 
-    if total_frame_len > MAX_FRAME_BYTES {
-        return Err(StegoError::FrameCorrupted);
-    }
+    let ciphertext_len = plaintext_len + 16;
+    let total_frame_len = header_len + ciphertext_len + 4;
 
-    if data.len() < total_frame_len {
+    if total_frame_len > MAX_FRAME_BYTES || data.len() < total_frame_len {
         return Err(StegoError::FrameCorrupted);
     }
 
@@ -203,10 +250,10 @@ pub fn parse_fortress_compact_frame(data: &[u8]) -> Result<ParsedFrame, StegoErr
         return Err(StegoError::FrameCorrupted);
     }
 
-    let ciphertext = payload[2..].to_vec();
+    let ciphertext = payload[header_len..].to_vec();
 
     Ok(ParsedFrame {
-        plaintext_len,
+        plaintext_len: plaintext_len as u32,
         salt: FORTRESS_EMPTY_SALT,
         nonce: FORTRESS_EMPTY_NONCE,
         ciphertext,
@@ -417,5 +464,66 @@ mod tests {
             28,
             "Compact frame saves exactly 28 bytes (salt + nonce)"
         );
+    }
+
+    #[test]
+    fn v2_ext_overhead_is_4_more() {
+        assert_eq!(FRAME_OVERHEAD_EXT - FRAME_OVERHEAD, 4);
+        assert_eq!(FORTRESS_COMPACT_FRAME_OVERHEAD_EXT - FORTRESS_COMPACT_FRAME_OVERHEAD, 4);
+    }
+
+    #[test]
+    fn v2_frame_build_parse_roundtrip() {
+        let salt = [5u8; SALT_LEN];
+        let nonce = [6u8; NONCE_LEN];
+        let plaintext_len = 70_000usize; // exceeds u16::MAX
+        let ciphertext = vec![0xAB; plaintext_len + 16];
+        let frame = build_frame(plaintext_len, &salt, &nonce, &ciphertext);
+
+        // v2: sentinel(2) + u32(4) + salt(16) + nonce(12) + ct + crc(4) = 54 + plaintext
+        assert_eq!(frame.len(), FRAME_OVERHEAD_EXT + plaintext_len);
+
+        // First 2 bytes are the 0x0000 sentinel.
+        assert_eq!(frame[0], 0x00);
+        assert_eq!(frame[1], 0x00);
+        // Bytes 2..6 are the u32 length.
+        assert_eq!(u32::from_be_bytes([frame[2], frame[3], frame[4], frame[5]]), 70_000);
+
+        let parsed = parse_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 70_000);
+        assert_eq!(parsed.salt, salt);
+        assert_eq!(parsed.nonce, nonce);
+        assert_eq!(parsed.ciphertext, ciphertext);
+    }
+
+    #[test]
+    fn v1_frame_still_uses_u16_header() {
+        let salt = [7u8; SALT_LEN];
+        let nonce = [8u8; NONCE_LEN];
+        let plaintext_len = 1000usize; // fits in u16
+        let ciphertext = vec![0xCD; plaintext_len + 16];
+        let frame = build_frame(plaintext_len, &salt, &nonce, &ciphertext);
+
+        // v1: 2 + salt + nonce + ct + crc = 50 + plaintext
+        assert_eq!(frame.len(), FRAME_OVERHEAD + plaintext_len);
+
+        // First 2 bytes are u16 length (not sentinel).
+        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), 1000);
+
+        let parsed = parse_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 1000);
+    }
+
+    #[test]
+    fn v2_compact_frame_roundtrip() {
+        let plaintext_len = 70_000usize;
+        let ciphertext = vec![0xEF; plaintext_len + 16];
+        let frame = build_fortress_compact_frame(plaintext_len, &ciphertext);
+
+        assert_eq!(frame.len(), FORTRESS_COMPACT_FRAME_OVERHEAD_EXT + plaintext_len);
+
+        let parsed = parse_fortress_compact_frame(&frame).unwrap();
+        assert_eq!(parsed.plaintext_len, 70_000);
+        assert_eq!(parsed.ciphertext, ciphertext);
     }
 }

@@ -69,7 +69,7 @@ fn full_pipeline_diagnostic() {
 
     // Build frame
     let (ciphertext, nonce, salt) = crypto::encrypt(message.as_bytes(), passphrase).unwrap();
-    let frame_bytes = frame::build_frame(message.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bytes = frame::build_frame(message.len(), &salt, &nonce, &ciphertext);
     let frame_bits = frame::bytes_to_bits(&frame_bytes);
     let mut padded_bits = vec![0u8; m_max];
     padded_bits[..frame_bits.len()].copy_from_slice(&frame_bits);

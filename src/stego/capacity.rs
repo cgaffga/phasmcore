@@ -12,7 +12,7 @@
 
 use crate::jpeg::JpegImage;
 use crate::stego::cost::uniward::compute_uniward;
-use crate::stego::frame::FRAME_OVERHEAD;
+use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::error::StegoError;
 
 /// Minimum ratio of usable (non-WET) AC coefficients to message bits
@@ -58,7 +58,13 @@ fn capacity_from_usable(usable: usize, ratio: f64) -> usize {
         return 0;
     }
 
-    (max_frame_bytes - FRAME_OVERHEAD).min(u16::MAX as usize)
+    let capacity = max_frame_bytes - FRAME_OVERHEAD;
+    if capacity > u16::MAX as usize {
+        // v2 frame needs 4 extra bytes for the extended length header.
+        max_frame_bytes.saturating_sub(FRAME_OVERHEAD_EXT)
+    } else {
+        capacity
+    }
 }
 
 /// Estimate Ghost mode capacity (standard J-UNIWARD).

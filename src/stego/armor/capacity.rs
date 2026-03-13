@@ -9,7 +9,7 @@ use crate::stego::armor::ecc;
 use crate::stego::armor::selection::compute_stability_map;
 use crate::stego::armor::spreading::SPREAD_LEN;
 use crate::stego::error::StegoError;
-use crate::stego::frame::FRAME_OVERHEAD;
+use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 
 /// Estimate the maximum plaintext message size (in bytes) that can be embedded
 /// in the given cover JPEG image using Armor mode.
@@ -91,9 +91,14 @@ pub fn estimate_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     }
 
     // Verify the RS-encoded size actually fits.
-    // Cap at u16::MAX since the frame format uses a 2-byte length prefix.
-    let capacity = (max_frame_bytes - FRAME_OVERHEAD).min(u16::MAX as usize);
-    let frame_len = capacity + FRAME_OVERHEAD;
+    let plaintext_cap = max_frame_bytes - FRAME_OVERHEAD;
+    let (capacity, overhead) = if plaintext_cap > u16::MAX as usize {
+        // v2 frame needs 4 extra bytes for extended length header.
+        (max_frame_bytes.saturating_sub(FRAME_OVERHEAD_EXT), FRAME_OVERHEAD_EXT)
+    } else {
+        (plaintext_cap, FRAME_OVERHEAD)
+    };
+    let frame_len = capacity + overhead;
     let rs_len = ecc::rs_encoded_len(frame_len);
     if rs_len > embeddable_bytes {
         // Reduce by 1 to ensure fit

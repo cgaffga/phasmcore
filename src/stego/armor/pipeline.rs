@@ -45,6 +45,15 @@ use rayon::prelude::*;
 const HEADER_UNITS: usize = embedding::HEADER_UNITS; // 56
 const HEADER_COPIES: usize = embedding::HEADER_COPIES; // 7
 
+/// Total progress steps for Armor encode via STDM path.
+/// 1 (DFT template) + 1 (pre-clamp) + 1 (stability map) + 1 (RS+spreading)
+/// + 1 (STDM embed) + 1 (JPEG write) = 6.
+pub const ARMOR_ENCODE_STEPS: u32 = 6;
+
+/// Total progress steps for Armor encode via Fortress path.
+/// 1 (pre-settle) + 1 (fortress encode) + 1 (JPEG write) = 3.
+const ARMOR_ENCODE_FORTRESS_STEPS: u32 = 3;
+
 /// Encode a text message into a cover JPEG using Armor mode.
 ///
 /// # Arguments
@@ -66,13 +75,11 @@ pub fn armor_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    // Initialize encode progress (STDM path assumed; adjusted if Fortress).
+    progress::init(ARMOR_ENCODE_STEPS);
+
     // Build the payload (text + compression, no files for Armor).
     let payload_bytes = payload::encode_payload(message, &[])?;
-
-    // Guard against payload exceeding the u16 length field in the frame format.
-    if payload_bytes.len() > u16::MAX as usize {
-        return Err(StegoError::MessageTooLarge);
-    }
 
     let mut img = JpegImage::from_bytes(image_bytes)?;
 
@@ -95,21 +102,23 @@ pub fn armor_encode(
                 &crypto::FORTRESS_EMPTY_SALT,
                 &crypto::FORTRESS_EMPTY_NONCE,
             )?;
-            frame::build_fortress_compact_frame(payload_bytes.len() as u16, &ct)
+            frame::build_fortress_compact_frame(payload_bytes.len(), &ct)
         } else {
             let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
-            frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ct)
+            frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct)
         };
 
         if fortress_frame.len() <= max_fort {
+            // Switch to Fortress step count (shorter path).
+            progress::set_total(ARMOR_ENCODE_FORTRESS_STEPS);
+
             // Pre-settle Y channel to QF75 QT tables before Fortress embedding.
-            // This ensures block averages are on the same quantization grid that
-            // WhatsApp (and most social media) use for recompression, making the
-            // QIM embedding nearly idempotent under Q75 recompression.
-            // Platform-side quality settings vary wildly (iOS 0.65 ≈ libjpeg Q90,
-            // Android Q70, Web 0.65 ≈ varies), so we normalize here in the core.
             pre_settle_for_fortress(&mut img)?;
+            progress::advance(); // Step 1: pre-settle
+
             fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
+            progress::advance(); // Step 2: fortress encode
+
             let stego_bytes = match img.to_bytes() {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -117,21 +126,22 @@ pub fn armor_encode(
                     img.to_bytes().map_err(StegoError::InvalidJpeg)?
                 }
             };
+            progress::advance(); // Step 3: JPEG write
             return Ok(stego_bytes);
         }
     }
 
     // Full frame for STDM path (always uses random salt + nonce).
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
-    let frame_bytes = frame::build_frame(payload_bytes.len() as u16, &salt, &nonce, &ciphertext);
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
 
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
     embed_dft_template(&mut img, passphrase, message)?;
+    progress::advance(); // Step 1: DFT template
 
     // Pre-clamp pass: IDCT -> clamp [0,255] -> DCT on all Y-channel blocks.
-    // Settles coefficients so they already produce valid pixel values,
-    // reducing systematic distortion from pixel clamping during recompression.
     pre_clamp_y_channel(&mut img)?;
+    progress::advance(); // Step 2: pre-clamp
 
     // 1. Compute stability map for Y channel (frequency-restricted).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
@@ -139,6 +149,7 @@ pub fn armor_encode(
         .quant_table(qt_id)
         .ok_or(StegoError::NoLuminanceChannel)?;
     let cost_map = compute_stability_map(img.dct_grid(0), qt);
+    progress::advance(); // Step 3: stability map
 
     // 2. Derive structural key with Armor salt.
     let structural_key = crypto::derive_armor_structural_key(passphrase)?;
@@ -233,6 +244,7 @@ pub fn armor_encode(
 
     // 9. Generate spreading vectors.
     let vectors = generate_spreading_vectors(&spread_seed, embed_count);
+    progress::advance(); // Step 4: RS encode + spreading vectors
 
     // 10. STDM embed each bit into coefficient groups.
     let grid_mut = img.dct_grid_mut(0);
@@ -254,6 +266,8 @@ pub fn armor_encode(
         }
     }
 
+    progress::advance(); // Step 5: STDM embed
+
     // 11. Write modified JPEG.
     let stego_bytes = match img.to_bytes() {
         Ok(bytes) => bytes,
@@ -263,6 +277,7 @@ pub fn armor_encode(
         }
     };
 
+    progress::advance(); // Step 6: JPEG write
     Ok(stego_bytes)
 }
 
