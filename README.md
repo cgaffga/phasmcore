@@ -348,6 +348,7 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 ### Implementation
 - [Building a Pure-Rust JPEG Coefficient Codec](https://phasm.app/blog/pure-rust-jpeg-coefficient-codec)
 - [When f64::sin() Breaks Your Crypto: Building Deterministic Math for WASM Steganography](https://phasm.app/blog/deterministic-cross-platform-math-wasm)
+- [From 480 MB to 3 MB: Fitting Viterbi Steganography on a Phone](https://phasm.app/blog/segmented-viterbi-memory-efficient-stc)
 
 ### Platform Analysis
 - [How 15 Messaging Platforms Process Your Photos](https://phasm.app/blog/how-15-platforms-process-your-photos)
