@@ -16,7 +16,7 @@ pub enum StegoError {
     InvalidJpeg(crate::jpeg::error::JpegError),
     /// The image is too small or has too few usable coefficients.
     ImageTooSmall,
-    /// The image dimensions exceed the maximum allowed (8192px / 16MP).
+    /// The image dimensions exceed the maximum allowed (16384px / 200MP).
     ImageTooLarge,
     /// The message is too large for the cover image's embedding capacity.
     MessageTooLarge,
@@ -32,6 +32,8 @@ pub enum StegoError {
     Cancelled,
     /// Argon2 key derivation failed (invalid parameters or internal error).
     KeyDerivationFailed,
+    /// Duplicate passphrase: each shadow layer must use a unique passphrase.
+    DuplicatePassphrase,
 }
 
 impl fmt::Display for StegoError {
@@ -39,7 +41,7 @@ impl fmt::Display for StegoError {
         match self {
             Self::InvalidJpeg(e) => write!(f, "invalid JPEG: {e}"),
             Self::ImageTooSmall => write!(f, "image too small for embedding"),
-            Self::ImageTooLarge => write!(f, "image too large (max 8192px / 16MP)"),
+            Self::ImageTooLarge => write!(f, "image too large (max 16384px / 200MP)"),
             Self::MessageTooLarge => write!(f, "message too large for this image"),
             Self::FrameCorrupted => write!(f, "payload frame CRC mismatch"),
             Self::DecryptionFailed => write!(f, "decryption failed (wrong passphrase?)"),
@@ -47,6 +49,7 @@ impl fmt::Display for StegoError {
             Self::NoLuminanceChannel => write!(f, "image has no luminance channel"),
             Self::Cancelled => write!(f, "operation cancelled by user"),
             Self::KeyDerivationFailed => write!(f, "key derivation failed"),
+            Self::DuplicatePassphrase => write!(f, "duplicate passphrase (each layer must use a unique passphrase)"),
         }
     }
 }

@@ -23,6 +23,12 @@ pub struct EmbedResult {
     pub total_cost: f64,
 }
 
+/// Number of progress steps reported during STC Viterbi embedding.
+///
+/// Distributed across the forward pass(es). STC is typically ~20-30% of
+/// total encode time on large images.
+pub const STC_PROGRESS_STEPS: u32 = 50;
+
 /// Back-pointer memory threshold (in cover positions). Above this, the
 /// segmented path is used. 1M positions × 16 bytes/u128 = 16 MB.
 const SEGMENTED_THRESHOLD: usize = 1_000_000;
@@ -44,8 +50,8 @@ const SEGMENTED_THRESHOLD: usize = 1_000_000;
 /// Returns the stego bit sequence that encodes the message with minimum
 /// distortion, or `None` if embedding is infeasible.
 ///
-/// Reports 8 progress sub-steps via [`progress::advance`] during the
-/// Viterbi forward pass(es).
+/// Reports [`STC_PROGRESS_STEPS`] progress sub-steps via [`progress::advance`]
+/// during the Viterbi forward pass(es).
 pub fn stc_embed(
     cover_bits: &[u8],
     costs: &[f32],
@@ -99,8 +105,8 @@ fn stc_embed_inline(
         .map(|c| hhat::column_packed(hhat_matrix, c) as usize)
         .collect();
 
-    // Progress: advance every n/8 elements (8 sub-steps).
-    let progress_interval = (n / 8).max(1);
+    // Progress: advance every n/STC_PROGRESS_STEPS elements.
+    let progress_interval = (n / STC_PROGRESS_STEPS as usize).max(1);
 
     // Forward Viterbi pass with 1-bit packed back pointers.
     // back_ptr[j] is a u128: bit s = 1 means stego_bit=1 was chosen for
@@ -234,8 +240,9 @@ fn stc_embed_segmented(
     let num_segments = (m + k - 1) / k;
 
     // --- Phase A: forward scan, save checkpoints, no back_ptr ---
-    // Reports 4 of the 8 STC progress sub-steps.
-    let progress_interval_a = (n / 4).max(1);
+    // Reports half the STC progress sub-steps.
+    let phase_a_steps = STC_PROGRESS_STEPS / 2;
+    let progress_interval_a = (n / phase_a_steps as usize).max(1);
 
     // Pre-allocated cost buffers reused across all iterations.
     let mut prev_cost = vec![inf; num_states];
@@ -301,8 +308,9 @@ fn stc_embed_segmented(
     if best_cost == inf { return None; }
 
     // --- Phase B: segment-by-segment recomputation + traceback ---
-    // Reports the remaining 4 progress sub-steps.
-    let progress_interval_b = (n / 4).max(1);
+    // Reports the remaining STC progress sub-steps.
+    let phase_b_steps = STC_PROGRESS_STEPS - phase_a_steps;
+    let progress_interval_b = (n / phase_b_steps as usize).max(1);
     let mut progress_counter = 0usize;
 
     let mut stego_bits = vec![0u8; n];

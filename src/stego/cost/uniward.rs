@@ -35,16 +35,16 @@ use super::CostMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Number of progress steps reported by [`compute_uniward_with_progress`].
+/// Number of progress steps reported by UNIWARD cost computation.
 ///
 /// Used by the progress total formula in encode/decode so that the combined
 /// step counts are correct.
 ///
-/// Steps:
-/// 1. Pixel decompression complete
-/// 2. Wavelet subbands complete
-/// 3. Per-block cost computation complete
-pub const UNIWARD_PROGRESS_STEPS: u32 = 3;
+/// Steps are distributed proportionally across strips (streaming path) or
+/// phases (non-streaming decode path) to give smooth, time-proportional
+/// progress updates. UNIWARD is typically the slowest operation (~60-80%
+/// of total encode time on large images), so it gets the largest share.
+pub const UNIWARD_PROGRESS_STEPS: u32 = 100;
 
 /// Stabilization constant. Avoids division by zero in the cost formula
 /// and controls sensitivity to image content. The original paper and
@@ -214,12 +214,13 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
 ///
 /// Identical to [`compute_uniward`] but reports [`UNIWARD_PROGRESS_STEPS`]
 /// progress steps and checks for cancellation between phases. Used by
-/// both Ghost encode and decode paths; capacity uses the plain version.
+/// the Ghost decode path; capacity uses the plain version; encode uses
+/// `compute_positions_streaming`.
 ///
-/// # Progress steps
-/// 1. Pixel decompression complete
-/// 2. Wavelet subbands complete
-/// 3. Per-block cost computation complete
+/// Progress is distributed across phases proportional to wall-clock time:
+/// - Phase 1 (pixel decompress): ~10% of steps
+/// - Phase 2 (wavelet subbands): ~30% of steps
+/// - Phase 3 (per-block costs): ~60% of steps
 pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<CostMap, StegoError> {
     let bw = grid.blocks_wide();
     let bt = grid.blocks_tall();
@@ -228,16 +229,25 @@ pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<
     let img_w = bw * 8;
     let img_h = bt * 8;
 
+    // Phase allocation: 10% + 30% + 60% of UNIWARD_PROGRESS_STEPS.
+    let phase1_steps = UNIWARD_PROGRESS_STEPS / 10;       // ~10 steps
+    let phase2_steps = (UNIWARD_PROGRESS_STEPS * 3) / 10; // ~30 steps
+    // phase3 gets the remainder
+
     // Phase 1: Decompress to pixels.
     let cover_pixels = decompress_to_pixels(grid, qt, bw, bt);
-    progress::advance();
+    for _ in 0..phase1_steps {
+        progress::advance();
+    }
     progress::check_cancelled()?;
 
     // Phase 2: Wavelet subbands.
     let lpdf = lpdf();
     let cover_wavelets = compute_three_subbands(&cover_pixels, img_w, img_h, &lpdf);
     drop(cover_pixels);
-    progress::advance();
+    for _ in 0..phase2_steps {
+        progress::advance();
+    }
     progress::check_cancelled()?;
 
     // Phase 3: Basis functions + per-block cost computation.
@@ -288,7 +298,10 @@ pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<
     #[cfg(not(feature = "parallel"))]
     (0..n_blocks).for_each(|bi| compute_block(bi));
 
-    progress::advance();
+    let phase3_steps = UNIWARD_PROGRESS_STEPS - phase1_steps - phase2_steps;
+    for _ in 0..phase3_steps {
+        progress::advance();
+    }
 
     Ok(map)
 }
@@ -629,7 +642,7 @@ pub fn compute_positions_streaming(
     let est_positions = bt * bw * 32;
     let mut positions: Vec<CoeffPos> = Vec::with_capacity(est_positions);
 
-    // Distribute UNIWARD_PROGRESS_STEPS (3) across strips for smooth progress.
+    // Distribute UNIWARD_PROGRESS_STEPS across strips for smooth progress.
     let num_strips = (bt + STRIP_BLOCK_ROWS - 1) / STRIP_BLOCK_ROWS;
     let mut strip_idx = 0usize;
     let mut steps_sent = 0u32;

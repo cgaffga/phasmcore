@@ -46,6 +46,10 @@ pub const NONCE_LEN: usize = 12;
 /// Argon2 salt length in bytes.
 pub const SALT_LEN: usize = 16;
 
+/// Fixed salt for Shadow layer structural key derivation (repetition coding).
+/// Independent from all other keys so shadow permutations are uncorrelated.
+const SHADOW_STRUCTURAL_SALT: &[u8; 16] = b"phasm-shdw-v1\0\0\0";
+
 /// Fixed salt for Fortress empty-passphrase optimization.
 /// When passphrase is empty, we use this deterministic salt so it doesn't need
 /// to be embedded in the frame (saving 16 bytes). The message is still
@@ -103,6 +107,20 @@ pub fn derive_fortress_structural_key(passphrase: &str) -> Result<[u8; 32], Steg
     let mut output = [0u8; 32];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), FORTRESS_STRUCTURAL_SALT, &mut output)
+        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    Ok(output)
+}
+
+/// Derive the Shadow structural key from a passphrase.
+///
+/// Returns a 32-byte key used as a ChaCha20 seed for generating position
+/// permutation for shadow layer repetition coding. Independent from all
+/// other structural keys. Wrapped in `Zeroizing` to prevent key material
+/// from lingering in memory after use.
+pub fn derive_shadow_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 32]>, StegoError> {
+    let mut output = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), SHADOW_STRUCTURAL_SALT, &mut *output)
         .map_err(|_| StegoError::KeyDerivationFailed)?;
     Ok(output)
 }
@@ -246,6 +264,26 @@ mod tests {
         let a = derive_fortress_structural_key("mypass").unwrap();
         let b = derive_fortress_structural_key("mypass").unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shadow_key_deterministic() {
+        let a = derive_shadow_structural_key("mypass").unwrap();
+        let b = derive_shadow_structural_key("mypass").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shadow_key_differs_from_others() {
+        let ghost = derive_structural_key("same_pass").unwrap();
+        let armor = derive_armor_structural_key("same_pass").unwrap();
+        let fortress = derive_fortress_structural_key("same_pass").unwrap();
+        let template = derive_template_key("same_pass").unwrap();
+        let shadow = derive_shadow_structural_key("same_pass").unwrap();
+        assert_ne!(&ghost[..32], &shadow[..]);
+        assert_ne!(&armor[..32], &shadow[..]);
+        assert_ne!(&fortress[..], &shadow[..]);
+        assert_ne!(&template[..], &shadow[..]);
     }
 
     #[test]

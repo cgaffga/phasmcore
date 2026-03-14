@@ -20,6 +20,7 @@ use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute;
 use crate::stego::progress;
 use crate::stego::side_info::{self, SideInfo};
+use crate::stego::shadow;
 use crate::stego::stc::{embed, extract, hhat};
 
 /// STC constraint length for Ghost Phase 1.
@@ -28,13 +29,16 @@ const STC_H: usize = 7;
 /// Total number of progress steps reported by [`ghost_decode`].
 ///
 /// Comprises [`UNIWARD_PROGRESS_STEPS`](crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS)
-/// (3 steps from the cost computation) plus 1 step for STC extraction and decryption.
-pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + 1;
+/// (100 steps from the cost computation) plus 2 steps for STC extraction and decryption.
+pub const GHOST_DECODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + 2;
 
 /// Total number of progress steps reported by Ghost encode.
 ///
-/// 3 (UNIWARD sub-steps) + 8 (STC Viterbi sub-steps) + 1 (LSB mod + JPEG write).
-pub const GHOST_ENCODE_STEPS: u32 = crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + 8 + 1;
+/// 100 (UNIWARD sub-steps) + 50 (STC Viterbi sub-steps) + 2 (permute + LSB mod/JPEG write).
+pub const GHOST_ENCODE_STEPS: u32 =
+    crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
+    + crate::stego::stc::embed::STC_PROGRESS_STEPS
+    + 2;
 
 /// Compute the STC width `w`, usable cover length, and effective `m_max` from
 /// the total number of AC positions. Both encoder and decoder must agree on
@@ -177,6 +181,208 @@ pub fn ghost_encode_si_with_files(
     ghost_encode_impl(image_bytes, message, files, passphrase, Some(si))
 }
 
+/// Shadow layer descriptor for encoding.
+pub struct ShadowLayer {
+    /// Text message for this shadow layer.
+    pub message: String,
+    /// Passphrase for this shadow layer (must be unique across all layers).
+    pub passphrase: String,
+    /// Optional file attachments for this shadow layer.
+    pub files: Vec<FileEntry>,
+}
+
+/// Total progress steps for Ghost encode with shadows.
+///
+/// 100 (UNIWARD) + 1 (shadow embedding) + 50 (STC Viterbi) + 2 (permute + write).
+pub const GHOST_ENCODE_WITH_SHADOWS_STEPS: u32 =
+    crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
+    + 1
+    + crate::stego::stc::embed::STC_PROGRESS_STEPS
+    + 2;
+
+/// Encode with Ghost mode plus shadow messages for plausible deniability.
+///
+/// Shadow layers are embedded first using repetition coding. The primary
+/// message is then embedded via STC, treating shadow modifications as
+/// part of the cover. Each passphrase must be unique.
+pub fn ghost_encode_with_shadows(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+    shadows: &[ShadowLayer],
+    si: Option<SideInfo>,
+) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si)
+}
+
+/// Encode with Ghost SI-UNIWARD plus shadow messages.
+pub fn ghost_encode_si_with_shadows(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+    shadows: &[ShadowLayer],
+) -> Result<Vec<u8>, StegoError> {
+    let img = JpegImage::from_bytes(image_bytes)?;
+    let fi = img.frame_info();
+    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    let qt_id = fi.components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+
+    let si = SideInfo::compute(
+        raw_pixels_rgb,
+        pixel_width,
+        pixel_height,
+        img.dct_grid(0),
+        &qt.values,
+    );
+
+    drop(img);
+
+    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, Some(si))
+}
+
+fn ghost_encode_with_shadows_impl(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+    shadows: &[ShadowLayer],
+    si: Option<SideInfo>,
+) -> Result<Vec<u8>, StegoError> {
+    // Initialize progress.
+    progress::init(GHOST_ENCODE_WITH_SHADOWS_STEPS);
+
+    // Validate passphrases are unique (primary + all shadows).
+    {
+        let mut all_passes: Vec<&str> = vec![passphrase];
+        for s in shadows {
+            all_passes.push(&s.passphrase);
+        }
+        for i in 0..all_passes.len() {
+            for j in (i + 1)..all_passes.len() {
+                if all_passes[i] == all_passes[j] {
+                    return Err(StegoError::DuplicatePassphrase);
+                }
+            }
+        }
+    }
+
+    // Build the primary payload.
+    let payload_bytes = payload::encode_payload(message, files)?;
+
+    let mut img = JpegImage::from_bytes(image_bytes)?;
+    let fi = img.frame_info();
+    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+
+    // 1. Compute J-UNIWARD positions (3 progress steps).
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+    let si_ref = si.as_ref().map(|s| (s, img.dct_grid(0)));
+    let mut positions = compute_positions_streaming(img.dct_grid(0), qt, si_ref)?;
+
+    // 2. Embed shadow layers in Cb+Cr chrominance channels.
+    //    Shadows use chrominance to avoid interference with primary STC on Y.
+    //    Requires color image (>= 2 components).
+    if !shadows.is_empty() {
+        if img.num_components() < 2 {
+            return Err(StegoError::ImageTooSmall);
+        }
+        let chroma_positions = shadow::collect_chroma_positions(&img);
+        for s in shadows {
+            shadow::shadow_embed(
+                &mut img,
+                &chroma_positions,
+                &s.passphrase,
+                &s.message,
+                &s.files,
+            )?;
+        }
+    }
+    progress::advance(); // shadow embedding step
+
+    // 3. Primary STC encode (same as ghost_encode_impl from here).
+    let structural_key = crypto::derive_structural_key(passphrase)?;
+    let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
+    let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
+
+    permute::permute_positions(&mut positions, &perm_seed);
+    let n = positions.len();
+    let (w, n_used, m_max) = compute_stc_params(n)?;
+    positions.truncate(n_used);
+
+    // Step: permutation complete.
+    progress::advance();
+
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
+    let frame_bits = frame::bytes_to_bits(&frame_bytes);
+    let m = frame_bits.len();
+
+    if m > m_max {
+        return Err(StegoError::MessageTooLarge);
+    }
+
+    let mut padded_bits = vec![0u8; m_max];
+    padded_bits[..m].copy_from_slice(&frame_bits);
+
+    // Read cover LSBs (now includes shadow modifications).
+    let grid = img.dct_grid(0);
+    let cover_bits: Vec<u8> = positions.iter().map(|p| {
+        let coeff = flat_get(grid, p.flat_idx as usize);
+        (coeff.unsigned_abs() & 1) as u8
+    }).collect();
+    let costs: Vec<f32> = positions.iter().map(|p| p.cost).collect();
+
+    let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+    let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, STC_H, w);
+    progress::check_cancelled()?;
+    let result = result.ok_or(StegoError::MessageTooLarge)?;
+
+    // Apply LSB changes.
+    let grid_mut = img.dct_grid_mut(0);
+    for (idx, pos) in positions.iter().enumerate() {
+        let old_bit = cover_bits[idx];
+        let new_bit = result.stego_bits[idx];
+        if old_bit != new_bit {
+            let fi = pos.flat_idx as usize;
+            let coeff = flat_get(grid_mut, fi);
+            let modified = if let Some(ref side_info) = si {
+                side_info::si_modify_coefficient(coeff, side_info.error_at(fi))
+            } else {
+                side_info::nsf5_modify_coefficient(coeff)
+            };
+            flat_set(grid_mut, fi, modified);
+        }
+    }
+
+    // Write JPEG.
+    let stego_bytes = match img.to_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            img.rebuild_huffman_tables();
+            img.to_bytes().map_err(StegoError::InvalidJpeg)?
+        }
+    };
+
+    progress::advance();
+
+    Ok(stego_bytes)
+}
+
 fn ghost_encode_impl(
     image_bytes: &[u8],
     message: &str,
@@ -184,7 +390,7 @@ fn ghost_encode_impl(
     passphrase: &str,
     si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
-    // Initialize encode progress (10 steps: 1 UNIWARD + 8 STC + 1 write).
+    // Initialize encode progress (100 UNIWARD + 50 STC + 2 misc).
     progress::init(GHOST_ENCODE_STEPS);
 
     // Build the payload (text + files + compression).
@@ -201,8 +407,8 @@ fn ghost_encode_impl(
     }
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
-    //    Reports 3 progress sub-steps. If SI info is available, modulates costs
-    //    inline during position collection (no separate pass needed).
+    //    Reports UNIWARD_PROGRESS_STEPS (100) progress sub-steps. If SI info
+    //    is available, modulates costs inline during position collection.
     //    Memory-optimized: never materializes full CostMap or pixel/wavelet arrays.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
@@ -219,6 +425,9 @@ fn ghost_encode_impl(
     let n = positions.len();
     let (w, n_used, m_max) = compute_stc_params(n)?;
     positions.truncate(n_used);
+
+    // Step: permutation + key derivation complete.
+    progress::advance();
 
     // 4. Encrypt payload (Tier 2 key with random salt).
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
@@ -243,7 +452,7 @@ fn ghost_encode_impl(
     }).collect();
     let costs: Vec<f32> = positions.iter().map(|p| p.cost).collect();
 
-    // 7. Generate H-hat and embed (reports 8 progress sub-steps internally).
+    // 7. Generate H-hat and embed (reports STC_PROGRESS_STEPS internally).
     let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
     let result = embed::stc_embed(&cover_bits, &costs, &padded_bits, &hhat_matrix, STC_H, w);
     progress::check_cancelled()?;
@@ -282,7 +491,7 @@ fn ghost_encode_impl(
         }
     };
 
-    // Step 10 complete: LSB modification + JPEG write.
+    // Final step: LSB modification + JPEG write complete.
     progress::advance();
 
     Ok(stego_bytes)
@@ -307,7 +516,7 @@ pub fn ghost_decode(
     }
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
-    //    Reports UNIWARD_PROGRESS_STEPS (3) progress steps.
+    //    Reports UNIWARD_PROGRESS_STEPS (100) progress steps.
     //    Memory-optimized: never materializes full CostMap.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
@@ -325,6 +534,9 @@ pub fn ghost_decode(
     let n = positions.len();
     let (w, n_used, m_max) = compute_stc_params(n)?;
     positions.truncate(n_used);
+
+    // Step: permutation complete.
+    progress::advance();
 
     // 4. Extract stego LSBs.
     let grid = img.dct_grid(0);
@@ -357,10 +569,37 @@ pub fn ghost_decode(
 
     let result = payload::decode_payload(&plaintext[..len]);
 
-    // Step 4: STC extraction + decryption complete.
+    // Step: STC extraction + decryption complete.
     progress::advance();
 
     result
+}
+
+/// Decode a shadow message from a stego JPEG.
+///
+/// Extracts the shadow layer from the Cb+Cr chrominance channels using
+/// repetition coding with majority vote.
+pub fn ghost_shadow_decode(
+    stego_bytes: &[u8],
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
+    let img = JpegImage::from_bytes(stego_bytes)?;
+    ghost_shadow_decode_from_image(&img, passphrase)
+}
+
+/// Decode a shadow message from an already-parsed JPEG image.
+///
+/// Used by parallel `smart_decode` to avoid re-parsing the image.
+pub fn ghost_shadow_decode_from_image(
+    img: &JpegImage,
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
+    if img.num_components() < 2 {
+        return Err(StegoError::FrameCorrupted);
+    }
+
+    let chroma_positions = shadow::collect_chroma_positions(img);
+    shadow::shadow_extract(img, &chroma_positions, passphrase)
 }
 
 // --- DctGrid flat access helpers ---
@@ -371,7 +610,7 @@ use crate::jpeg::dct::DctGrid;
 ///
 /// The flat index encodes `block_index * 64 + row * 8 + col`, where
 /// `block_index = block_row * blocks_wide + block_col`.
-fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
+pub(super) fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
     let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;
     let pos = flat_idx % 64;
@@ -383,7 +622,7 @@ fn flat_get(grid: &DctGrid, flat_idx: usize) -> i16 {
 }
 
 /// Write a coefficient into a `DctGrid` using a flat index.
-fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
+pub(super) fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     let bw = grid.blocks_wide();
     let block_idx = flat_idx / 64;
     let pos = flat_idx % 64;

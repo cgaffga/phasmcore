@@ -30,6 +30,7 @@ mod pipeline;
 pub mod armor;
 pub mod progress;
 pub mod side_info;
+pub mod shadow;
 
 pub use error::StegoError;
 
@@ -71,6 +72,9 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     Ok(())
 }
 pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
+pub use pipeline::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS};
+pub use shadow::shadow_capacity;
+pub use capacity::estimate_shadow_capacity;
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use capacity::estimate_capacity_si as ghost_capacity_si;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
@@ -140,7 +144,7 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 ///
 /// Tries Armor first (default mode, most common), then Ghost.
 /// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) + 1 (phase3)
-///   + GHOST_DECODE_STEPS (4: pixel decomp, wavelets, block costs, STC+decrypt).
+///   + GHOST_DECODE_STEPS (102: 100 UNIWARD + 2 STC/decrypt).
 /// Actual total is set by try_armor_decode once candidate count is known.
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
@@ -173,15 +177,26 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     // Try Ghost (advances GHOST_DECODE_STEPS internally)
     let ghost_result = ghost_decode(stego_bytes, passphrase);
     match ghost_result {
-        Ok(payload) => Ok((payload, DecodeQuality::ghost())),
-        Err(StegoError::DecryptionFailed) => Err(StegoError::DecryptionFailed),
-        Err(e) => {
-            if saw_decryption_failed {
-                Err(StegoError::DecryptionFailed)
-            } else {
-                Err(e)
-            }
+        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+        Err(StegoError::DecryptionFailed) => {
+            saw_decryption_failed = true;
         }
+        Err(_) => {}
+    }
+
+    // Try Ghost shadow (repetition coding)
+    match pipeline::ghost_shadow_decode(stego_bytes, passphrase) {
+        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+        Err(StegoError::DecryptionFailed) => {
+            saw_decryption_failed = true;
+        }
+        Err(_) => {}
+    }
+
+    if saw_decryption_failed {
+        Err(StegoError::DecryptionFailed)
+    } else {
+        Err(StegoError::FrameCorrupted)
     }
 }
 
@@ -205,7 +220,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let img = JpegImage::from_bytes(stego_bytes)?;
 
-    let (fortress_result, (stdm_result, ghost_result)) = rayon::join(
+    let (fortress_result, (stdm_result, (ghost_result, shadow_result))) = rayon::join(
         || {
             if img.num_components() > 0 {
                 fortress::fortress_decode(&img, passphrase)
@@ -215,7 +230,10 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         },
         || rayon::join(
             || armor_decode_no_fortress(&img, stego_bytes, passphrase),
-            || ghost_decode(stego_bytes, passphrase),
+            || rayon::join(
+                || ghost_decode(stego_bytes, passphrase),
+                || pipeline::ghost_shadow_decode_from_image(&img, passphrase),
+            ),
         ),
     );
 
@@ -234,10 +252,16 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         return Ok((payload, DecodeQuality::ghost()));
     }
 
+    // Try Ghost shadow.
+    if let Ok(payload) = shadow_result {
+        return Ok((payload, DecodeQuality::ghost()));
+    }
+
     // All failed — determine the best error to report.
     let saw_decryption_failed = matches!(&fortress_result, Err(StegoError::DecryptionFailed))
         || matches!(&stdm_result, Err(StegoError::DecryptionFailed))
-        || matches!(&ghost_result, Err(StegoError::DecryptionFailed));
+        || matches!(&ghost_result, Err(StegoError::DecryptionFailed))
+        || matches!(&shadow_result, Err(StegoError::DecryptionFailed));
 
     if saw_decryption_failed {
         return Err(StegoError::DecryptionFailed);

@@ -14,6 +14,7 @@ use crate::jpeg::JpegImage;
 use crate::jpeg::dct::DctGrid;
 use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::error::StegoError;
+use crate::stego::shadow;
 
 /// Minimum ratio of usable (non-WET) AC coefficients to message bits
 /// for standard J-UNIWARD. A ratio below this produces detectable artifacts.
@@ -103,6 +104,19 @@ pub fn estimate_capacity_si(img: &JpegImage) -> Result<usize, StegoError> {
     }
     let usable = count_nonzero_ac(img.dct_grid(0));
     Ok(capacity_from_usable(usable, MIN_CAPACITY_RATIO_SI))
+}
+
+/// Estimate shadow layer capacity for a JPEG image.
+///
+/// Shadow layers use repetition coding (R=7) in the Cb+Cr chrominance
+/// channels, which is much less efficient than primary Ghost STC.
+/// Requires color image (>= 2 components).
+pub fn estimate_shadow_capacity(img: &JpegImage) -> Result<usize, StegoError> {
+    if img.num_components() < 2 {
+        return Ok(0); // Grayscale — no chrominance for shadows
+    }
+    let positions = shadow::collect_chroma_positions(img);
+    Ok(shadow::shadow_capacity(positions.len()))
 }
 
 #[cfg(test)]

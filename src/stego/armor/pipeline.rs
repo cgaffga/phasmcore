@@ -542,10 +542,8 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     }
 
     // Set progress total now that we know the candidate count.
-    // fortress(1) + phase1(nc) + phase2(nc) + phase3(1) + ghost(4) per run.
+    // fortress(1) + phase1(nc) + phase2(nc) + phase3(1) + ghost(GHOST_DECODE_STEPS) per run.
     // Doubled fortress+phase1+phase2 for potential second run via geometric recovery.
-    // Minimum 50 so the progress bar looks meaningful even when nc is small
-    // (e.g. Ghost-encoded images where the Armor header is garbage → nc=1).
     let nc = candidates.len() as u32;
     // Only set total on first call; geometric recovery calls us again.
     if progress::get().1 == 0 {
