@@ -14,6 +14,14 @@ Use Ghost when the stego image will be stored or transmitted without recompressi
 
 Ghost mode also supports **file attachments** (Brotli-compressed, multi-file).
 
+#### Shadow Messages (Plausible Deniability)
+
+Ghost mode supports **shadow messages** — multiple messages hidden in a single image, each with a different passphrase. If coerced into revealing a passphrase, you can give the shadow passphrase instead of the primary one. The adversary decodes a decoy message and has no way to detect whether additional messages exist.
+
+Shadows use **R=7 repetition coding in chrominance channels** (Cb + Cr), which occupy a separate capacity pool from the primary message (luminance Y). Shadow encoding runs first; the primary STC then treats shadow modifications as part of the cover image.
+
+`smart_decode` automatically tries shadow decode as a fallback after primary Ghost decode.
+
 #### SI-UNIWARD (Deep Cover)
 
 When the encoder has access to the original uncompressed pixels (e.g. PNG, HEIC, or RAW input converted to JPEG), **SI-UNIWARD** (Side-Informed UNIWARD) exploits JPEG quantization rounding errors to dramatically reduce embedding costs. Coefficients that were "close to the boundary" between two quantization levels can be flipped at near-zero cost, and the modification direction is chosen to move *toward* the pre-quantization value rather than the default nsF5 direction.
@@ -38,7 +46,7 @@ Fortress survives WhatsApp recompression (QF ~62, resolution resize to 1600px). 
 
 ### Decode Auto-Detection
 
-`smart_decode` tries all modes automatically — no mode selector needed on the decode side.
+`smart_decode` tries all modes automatically — Ghost primary → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
 
 ## Quick Start
 
@@ -75,6 +83,30 @@ let decoded = ghost_decode(&stego, "passphrase").unwrap();
 assert_eq!(decoded.text, "secret message");
 ```
 
+```rust
+use phasm_core::{ghost_encode_with_shadows, ghost_decode, ghost_shadow_decode, ShadowLayer};
+
+let cover = std::fs::read("photo.jpg").unwrap();
+let shadows = vec![
+    ShadowLayer {
+        message: "decoy message".into(),
+        passphrase: "decoy_pass".into(),
+        files: vec![],
+    },
+];
+let stego = ghost_encode_with_shadows(
+    &cover, "real secret", &[], "real_pass", &shadows, None
+).unwrap();
+
+// Primary message — with the real passphrase
+let primary = ghost_decode(&stego, "real_pass").unwrap();
+assert_eq!(primary.text, "real secret");
+
+// Shadow message — with the decoy passphrase
+let shadow = ghost_shadow_decode(&stego, "decoy_pass").unwrap();
+assert_eq!(shadow.text, "decoy message");
+```
+
 ## API
 
 ```rust
@@ -83,6 +115,12 @@ ghost_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
 ghost_decode(jpeg_bytes, passphrase) -> Result<PayloadData>
 ghost_encode_with_files(jpeg_bytes, message, files, passphrase) -> Result<Vec<u8>>
 ghost_capacity(jpeg_image) -> Result<usize>
+
+// Ghost shadow messages (plausible deniability)
+ghost_encode_with_shadows(jpeg_bytes, message, files, passphrase, shadows, si) -> Result<Vec<u8>>
+ghost_encode_si_with_shadows(jpeg_bytes, raw_rgb, width, height, message, files, passphrase, shadows) -> Result<Vec<u8>>
+ghost_shadow_decode(stego_bytes, passphrase) -> Result<PayloadData>
+estimate_shadow_capacity(jpeg_image) -> Result<usize>
 
 // Ghost SI-UNIWARD (stealth + side-informed, ~43% more capacity)
 ghost_encode_si(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<Vec<u8>>
@@ -116,6 +154,7 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 
 - **`PayloadData`** — decoded message text + optional file attachments
 - **`FileEntry`** — file attachment (filename + content bytes)
+- **`ShadowLayer`** — shadow message for plausible deniability (message + passphrase + optional files)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
 
@@ -320,6 +359,7 @@ src/
     payload.rs      Payload serialization (Brotli, file attachments)
     permute.rs      Fisher-Yates coefficient permutation
     side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
+    shadow.rs       Shadow messages (R=7 repetition in chrominance, plausible deniability)
     capacity.rs     Ghost capacity estimation
     progress.rs     Real-time progress tracking (atomics + WASM callback)
     error.rs        StegoError enum
