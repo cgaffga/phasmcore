@@ -44,6 +44,26 @@ Fortress survives WhatsApp recompression (QF ~62, resolution resize to 1600px). 
 
 [Watson perceptual masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) adapts the embedding strength per-block based on local texture energy, keeping modifications invisible in textured regions while protecting smooth areas.
 
+### Cover Image Optimizer
+
+`optimize_cover` preprocesses raw pixels before JPEG compression to improve embedding quality and capacity. Each mode has a different pipeline:
+
+- **Ghost**: Texture-adaptive 4-stage pipeline (noise injection, micro-contrast, unsharp mask, smooth-region dithering). Per-pixel 5×5 variance map adapts strength to existing texture — avoids degrading pre-optimized images.
+- **Armor**: Light pipeline (block-boundary smoothing, DC stabilization) for STDM robustness.
+- **Fortress**: Minimal (block-boundary smoothing only) to stabilize DC averages for BA-QIM.
+
+**"Do no harm" guarantee**: if optimization reduces average gradient energy (a proxy for stego capacity), the original pixels are returned unchanged. Modifications are imperceptible (PSNR > 44 dB, SSIM > 0.993).
+
+```rust
+use phasm_core::{optimize_cover, OptimizerConfig, OptimizerMode};
+
+let optimized = optimize_cover(&raw_pixels_rgb, width, height, &OptimizerConfig {
+    strength: 0.85,
+    seed: [0u8; 32], // ChaCha20 seed for deterministic noise
+    mode: OptimizerMode::Ghost,
+});
+```
+
 ### Decode Auto-Detection
 
 `smart_decode` tries all modes automatically — Ghost primary → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
@@ -135,6 +155,9 @@ armor_capacity(jpeg_image) -> Result<usize>
 // Unified decode (auto-detects mode)
 smart_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 
+// Cover image optimizer (preprocessing before JPEG compression)
+optimize_cover(pixels_rgb, width, height, config) -> Vec<u8>
+
 // Capacity estimation with Brotli compression
 compressed_payload_size(text, mode) -> usize
 
@@ -157,6 +180,8 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 - **`ShadowLayer`** — shadow message for plausible deniability (message + passphrase + optional files)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
+- **`OptimizerConfig`** — optimizer settings (strength, seed, mode)
+- **`OptimizerMode`** — pipeline variant (Ghost, Armor, Fortress)
 
 The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `pixel_width: u32`, `pixel_height: u32`). The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
 
@@ -360,6 +385,7 @@ src/
     permute.rs      Fisher-Yates coefficient permutation
     side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
     shadow.rs       Shadow messages (R=7 repetition in chrominance, plausible deniability)
+    optimizer.rs    Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
     capacity.rs     Ghost capacity estimation
     progress.rs     Real-time progress tracking (atomics + WASM callback)
     error.rs        StegoError enum
