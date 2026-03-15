@@ -31,8 +31,10 @@ pub mod armor;
 pub mod progress;
 pub mod side_info;
 pub mod shadow;
+pub mod optimizer;
 
 pub use error::StegoError;
+pub use optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
 
 /// Maximum pixel dimension (width or height) for encode.
 /// Images exceeding this are downsampled by the frontend before reaching Rust.
