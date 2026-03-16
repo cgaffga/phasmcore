@@ -37,12 +37,13 @@ pub const GHOST_DECODE_STEPS: u32 = PARSE_STEPS + crate::stego::cost::uniward::U
 
 /// Total number of progress steps reported by Ghost encode.
 ///
-/// 5 (parse) + 100 (UNIWARD sub-steps) + 50 (STC Viterbi sub-steps) + 2 (permute + LSB mod/JPEG write).
+/// 5 (parse) + 100 (UNIWARD sub-steps) + 50 (STC Viterbi sub-steps) + 2 (permute + LSB mod) + 20 (JPEG write).
 pub const GHOST_ENCODE_STEPS: u32 =
     PARSE_STEPS
     + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
     + crate::stego::stc::embed::STC_PROGRESS_STEPS
-    + 2;
+    + 2
+    + crate::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Compute the STC width `w`, usable cover length, and effective `m_max` from
 /// the total number of AC positions. Both encoder and decoder must agree on
@@ -101,7 +102,7 @@ pub fn ghost_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_impl(image_bytes, message, &[], passphrase, None)
+    ghost_encode_impl(image_bytes, message, &[], passphrase, None, None)
 }
 
 /// Encode a text message with file attachments into a cover JPEG using Ghost mode.
@@ -114,7 +115,7 @@ pub fn ghost_encode_with_files(
     files: &[FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_impl(image_bytes, message, files, passphrase, None)
+    ghost_encode_impl(image_bytes, message, files, passphrase, None, None)
 }
 
 /// Encode using Ghost mode with side information (SI-UNIWARD / "Deep Cover").
@@ -176,10 +177,8 @@ pub fn ghost_encode_si_with_files(
         &qt.values,
     );
 
-    // Drop img so ghost_encode_impl can re-parse (it needs mut access)
-    drop(img);
-
-    ghost_encode_impl(image_bytes, message, files, passphrase, Some(si))
+    // Pass pre-parsed image through to avoid re-parsing in ghost_encode_impl
+    ghost_encode_impl(image_bytes, message, files, passphrase, Some(si), Some(img))
 }
 
 /// Shadow layer descriptor for encoding.
@@ -192,17 +191,19 @@ pub struct ShadowLayer {
     pub files: Vec<FileEntry>,
 }
 
-/// Base progress steps for Ghost encode with shadows (before DPC iterations).
+/// Progress steps for Ghost encode with shadows.
 ///
-/// 5 (parse) + 100 (UNIWARD) + 1 (shadow prepare).
-/// DPC adds: K shadows × up to 3 iterations × (1 embed + STC_PROGRESS_STEPS + 1 check) + 2 (verify + write).
-/// Total is set dynamically once shadow count is known.
+/// 5 (parse) + 100 (UNIWARD) + 1 (shadow prepare) + 1 (permute)
+/// + 50 (STC) + 100 (verification UNIWARD) + 20 (JPEG write).
+/// If the escalation cascade triggers, the total is bumped dynamically
+/// via `progress::set_total()` to avoid the bar stalling at 100%.
 pub const GHOST_ENCODE_WITH_SHADOWS_STEPS: u32 =
     PARSE_STEPS
     + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
-    + 1
+    + 2  // shadow prep + permute
     + crate::stego::stc::embed::STC_PROGRESS_STEPS
-    + 2;
+    + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS  // verification pass
+    + crate::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Encode with Ghost mode plus shadow messages for plausible deniability.
 ///
@@ -217,7 +218,7 @@ pub fn ghost_encode_with_shadows(
     shadows: &[ShadowLayer],
     si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si)
+    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si, None)
 }
 
 /// Encode with Ghost SI-UNIWARD plus shadow messages.
@@ -250,9 +251,7 @@ pub fn ghost_encode_si_with_shadows(
         &qt.values,
     );
 
-    drop(img);
-
-    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, Some(si))
+    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, Some(si), Some(img))
 }
 
 fn ghost_encode_with_shadows_impl(
@@ -262,6 +261,7 @@ fn ghost_encode_with_shadows_impl(
     passphrase: &str,
     shadows: &[ShadowLayer],
     si: Option<SideInfo>,
+    pre_parsed: Option<JpegImage>,
 ) -> Result<Vec<u8>, StegoError> {
     // Initialize progress.
     progress::init(GHOST_ENCODE_WITH_SHADOWS_STEPS);
@@ -331,7 +331,10 @@ fn ghost_encode_with_shadows_impl(
     // Build the primary payload.
     let payload_bytes = payload::encode_payload(eff_message, eff_files)?;
 
-    let mut img = JpegImage::from_bytes(image_bytes)?;
+    let mut img = match pre_parsed {
+        Some(img) => img,
+        None => JpegImage::from_bytes(image_bytes)?,
+    };
     progress::advance_by(PARSE_STEPS);
     let fi = img.frame_info();
     super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
@@ -341,23 +344,29 @@ fn ghost_encode_with_shadows_impl(
     }
 
     // 1. Compute J-UNIWARD positions.
+    // Overlap Argon2id structural key derivation (~200ms) with UNIWARD (1-10s).
+    #[cfg(feature = "parallel")]
+    let key_thread = {
+        let pass = eff_passphrase.to_string();
+        std::thread::spawn(move || crypto::derive_structural_key(&pass))
+    };
+
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
     let si_ref = si.as_ref().map(|s| (s, img.dct_grid(0)));
     let mut positions = compute_positions_streaming(img.dct_grid(0), qt, si_ref)?;
 
-    // Save a clone of all Y positions (pre-permutation) for shadow,
-    // sorted by cost (cheapest first) for cost-pool selection.
-    let mut shadow_positions = positions.clone();
-    shadow_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
-
     // 2. Prepare shadow layers (Y-channel direct LSB + RS).
+    // Sort positions by cost in-place for cost-pool selection (avoids cloning
+    // the entire positions vector, saving ~800 MB on 200MP images).
+    positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+
     let mut shadow_states: Vec<shadow::ShadowState> = Vec::new();
     if !eff_shadows.is_empty() {
         let initial_parity = 4;
         for s in eff_shadows.iter() {
             let state = shadow::prepare_shadow(
-                &shadow_positions,
+                &positions,
                 &s.passphrase,
                 &s.message,
                 &s.files,
@@ -368,10 +377,17 @@ fn ghost_encode_with_shadows_impl(
     }
     progress::advance(); // shadow preparation step
 
+    // Restore raster order (sort by flat_idx) for STC permutation.
+    // The raster order matches compute_positions_streaming output.
+    positions.sort_by_key(|p| p.flat_idx);
+
     // Save original Y grid for restoration before embedding.
     let original_y = img.dct_grid(0).clone();
 
     // 3. Primary STC setup.
+    #[cfg(feature = "parallel")]
+    let structural_key = key_thread.join().expect("key derivation thread")?;
+    #[cfg(not(feature = "parallel"))]
     let structural_key = crypto::derive_structural_key(eff_passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
@@ -411,16 +427,34 @@ fn ghost_encode_with_shadows_impl(
 
     // 5. Embed shadows + primary STC (always short STC: frame_bits, not padded).
     if shadow_states.is_empty() {
+        // No shadows → no verification UNIWARD pass needed. Reduce total
+        // so progress doesn't stall at ~60% waiting for steps that never come.
+        let reduced = GHOST_ENCODE_WITH_SHADOWS_STEPS
+            - crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
+        progress::set_total(reduced);
         run_stc_pass(&mut img, &original_y, &positions, &[],
                      &frame_bits, &hhat_matrix, w, &si, &None)?;
     } else {
         run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
                      &frame_bits, &hhat_matrix, w, &si, &shadow_inf_costs)?;
 
+        // Skip verification when ALL shadows use fraction=1 (100% pool).
+        // With 100% pool there's no cost-pool boundary, so decoder always
+        // selects the same positions regardless of cover vs stego costs.
+        // This saves a full UNIWARD recomputation (2-10s on large images).
+        let all_fraction_1 = shadow_states.iter().all(|s| s.cost_fraction == 1);
+        if all_fraction_1 {
+            // Skip verification — reduce progress total since UNIWARD won't run.
+            let reduced = GHOST_ENCODE_WITH_SHADOWS_STEPS
+                - crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
+            progress::set_total(reduced);
+        }
+
         // Verify shadows from the DECODER's perspective: compute UNIWARD costs
         // on the stego image (as the decoder will see it), select positions
         // using stego costs + same fraction/hash, and check RS decode + decrypt.
         // This catches cost-pool boundary disagreements between cover and stego.
+        if !all_fraction_1 {
         let qt_verify = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
         let mut stego_y_positions = compute_positions_streaming(img.dct_grid(0), qt_verify, None)?;
         stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
@@ -437,10 +471,21 @@ fn ghost_encode_with_shadows_impl(
                 (2, 64), (1, 64),
                 (1, 128),
             ];
+            // Build cost-sorted positions for cascade (only allocated when
+            // verification fails — saves ~800 MB in the happy path on large images).
+            let mut cascade_positions = positions.clone();
+            cascade_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+
             let mut verified = false;
             for &(frac, par) in CASCADE {
+                // Bump progress total for this cascade iteration (STC + UNIWARD verify).
+                let cascade_steps = crate::stego::stc::embed::STC_PROGRESS_STEPS
+                    + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
+                let (_, current_total) = progress::get();
+                progress::set_total(current_total + cascade_steps);
+
                 for state in shadow_states.iter_mut() {
-                    shadow::rebuild_shadow(state, &shadow_positions, par, frac)?;
+                    shadow::rebuild_shadow(state, &cascade_positions, par, frac)?;
                 }
                 let new_inf_costs = build_inf_cost_set(w, &shadow_states);
                 run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
@@ -460,18 +505,25 @@ fn ghost_encode_with_shadows_impl(
                 return Err(StegoError::MessageTooLarge);
             }
         }
+        } // if !all_fraction_1
     }
 
-    // Write JPEG.
-    let stego_bytes = match img.to_bytes() {
+    // Free large allocations before JPEG output to reduce peak memory.
+    drop(positions);
+    drop(original_y);
+    drop(shadow_states);
+    drop(shadow_inf_costs);
+    drop(si);
+
+    // Write JPEG (with progress reporting during scan encoding).
+    let progress_cb = || progress::advance();
+    let stego_bytes = match img.to_bytes_with_progress(Some(&progress_cb)) {
         Ok(bytes) => bytes,
         Err(_) => {
             img.rebuild_huffman_tables();
-            img.to_bytes().map_err(StegoError::InvalidJpeg)?
+            img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
         }
     };
-
-    progress::advance();
 
     Ok(stego_bytes)
 }
@@ -586,6 +638,7 @@ fn ghost_encode_impl(
     files: &[FileEntry],
     passphrase: &str,
     si: Option<SideInfo>,
+    pre_parsed: Option<JpegImage>,
 ) -> Result<Vec<u8>, StegoError> {
     // Initialize encode progress (100 UNIWARD + 50 STC + 2 misc).
     progress::init(GHOST_ENCODE_STEPS);
@@ -593,7 +646,10 @@ fn ghost_encode_impl(
     // Build the payload (text + files + compression).
     let payload_bytes = payload::encode_payload(message, files)?;
 
-    let mut img = JpegImage::from_bytes(image_bytes)?;
+    let mut img = match pre_parsed {
+        Some(img) => img,
+        None => JpegImage::from_bytes(image_bytes)?,
+    };
     progress::advance_by(PARSE_STEPS);
 
     // Validate dimensions before any heavy processing.
@@ -605,12 +661,22 @@ fn ghost_encode_impl(
     }
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
+    // Overlap Argon2id structural key derivation (~200ms) with UNIWARD (1-10s).
+    #[cfg(feature = "parallel")]
+    let key_thread = {
+        let pass = passphrase.to_string();
+        std::thread::spawn(move || crypto::derive_structural_key(&pass))
+    };
+
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
     let si_ref = si.as_ref().map(|s| (s, img.dct_grid(0)));
     let mut positions = compute_positions_streaming(img.dct_grid(0), qt, si_ref)?;
 
     // 2. Derive structural key (Tier 1).
+    #[cfg(feature = "parallel")]
+    let structural_key = key_thread.join().expect("key derivation thread")?;
+    #[cfg(not(feature = "parallel"))]
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
@@ -678,17 +744,22 @@ fn ghost_encode_impl(
         }
     }
 
-    // 10. Write modified JPEG.
-    let stego_bytes = match img.to_bytes() {
+    // Free large allocations before JPEG output to reduce peak memory.
+    drop(positions);
+    drop(cover_bits);
+    drop(costs);
+    drop(result);
+    drop(si);
+
+    // 10. Write modified JPEG (with progress reporting during scan encoding).
+    let progress_cb = || progress::advance();
+    let stego_bytes = match img.to_bytes_with_progress(Some(&progress_cb)) {
         Ok(bytes) => bytes,
         Err(_) => {
             img.rebuild_huffman_tables();
-            img.to_bytes().map_err(StegoError::InvalidJpeg)?
+            img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
         }
     };
-
-    // Final step: LSB modification + JPEG write complete.
-    progress::advance();
 
     Ok(stego_bytes)
 }
@@ -713,6 +784,13 @@ pub fn ghost_decode(
     }
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
+    // Overlap Argon2id structural key derivation (~200ms) with UNIWARD (1-10s).
+    #[cfg(feature = "parallel")]
+    let key_thread = {
+        let pass = passphrase.to_string();
+        std::thread::spawn(move || crypto::derive_structural_key(&pass))
+    };
+
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
     let mut positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
@@ -720,6 +798,9 @@ pub fn ghost_decode(
     progress::check_cancelled()?;
 
     // 2. Derive structural key.
+    #[cfg(feature = "parallel")]
+    let structural_key = key_thread.join().expect("key derivation thread")?;
+    #[cfg(not(feature = "parallel"))]
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
@@ -732,61 +813,112 @@ pub fn ghost_decode(
     progress::advance();
 
     // 4. Extract all stego LSBs (full n, reused across w candidates).
-    let grid = img.dct_grid(0);
-    let all_stego_bits: Vec<u8> = positions.iter().map(|p| {
-        let coeff = flat_get(grid, p.flat_idx as usize);
-        (coeff.unsigned_abs() & 1) as u8
-    }).collect();
+    let all_stego_bits: Vec<u8> = {
+        let grid = img.dct_grid(0);
+        positions.iter().map(|p| {
+            let coeff = flat_get(grid, p.flat_idx as usize);
+            (coeff.unsigned_abs() & 1) as u8
+        }).collect()
+    };
+    // Free positions and parsed image — no longer needed after bit extraction.
+    drop(positions);
+    drop(img);
 
     // 5. Brute-force w: try the natural w first (backward compat), then dynamic candidates.
     let w_natural = compute_stc_params(n).map(|(w, _, _)| w).unwrap_or(1);
-    let w_candidates: &[usize] = &[w_natural, 1, 2, 3, 5, 7, 10];
-    let mut saw_decrypt_fail = false;
-    let mut tried_w = 0u16; // bitmask to skip duplicates
+    let w_candidates_raw: &[usize] = &[w_natural, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-    for &w in w_candidates {
-        if w == 0 || n / w == 0 {
-            continue;
+    // Deduplicate and filter w candidates up front.
+    let mut deduped_w: Vec<usize> = Vec::with_capacity(w_candidates_raw.len());
+    {
+        let mut tried_w = 0u16;
+        for &w in w_candidates_raw {
+            if w == 0 || n / w == 0 {
+                continue;
+            }
+            if w <= 15 && (tried_w & (1 << w)) != 0 {
+                continue;
+            }
+            if w <= 15 {
+                tried_w |= 1 << w;
+            }
+            let n_used = (n / w) * w;
+            if n_used > all_stego_bits.len() {
+                continue;
+            }
+            deduped_w.push(w);
         }
-        // Dedup: skip if we've already tried this w value.
-        if w <= 15 && (tried_w & (1 << w)) != 0 {
-            continue;
-        }
-        if w <= 15 {
-            tried_w |= 1 << w;
-        }
+    }
 
-        let m_max = n / w;
-        let n_used = m_max * w;
-        if n_used > all_stego_bits.len() {
-            continue;
-        }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let result = deduped_w.par_iter().find_map_first(|&w| {
+            let m_max = n / w;
+            let n_used = m_max * w;
 
-        let stego_bits = &all_stego_bits[..n_used];
-        let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
-        let extracted_bits = extract::stc_extract(stego_bits, &hhat_matrix, w);
+            let stego_bits = &all_stego_bits[..n_used];
+            let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+            let extracted_bits = extract::stc_extract(stego_bits, &hhat_matrix, w);
 
-        let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
-        match try_parse_and_decrypt(&frame_bytes, passphrase) {
-            Ok(payload) => {
+            let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
+            match try_parse_and_decrypt(&frame_bytes, passphrase) {
+                Ok(payload) => Some(Ok(payload)),
+                Err(StegoError::DecryptionFailed) => Some(Err(StegoError::DecryptionFailed)),
+                Err(_) => None,
+            }
+        });
+        match result {
+            Some(Ok(payload)) => {
                 progress::advance();
                 return Ok(payload);
             }
-            Err(StegoError::DecryptionFailed) => {
-                saw_decrypt_fail = true;
+            Some(Err(e)) => {
+                progress::advance();
+                return Err(e);
             }
-            Err(_) => {}
+            None => {
+                // Fall through to error below.
+            }
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut saw_decrypt_fail = false;
+        for &w in &deduped_w {
+            let m_max = n / w;
+            let n_used = m_max * w;
+
+            let stego_bits = &all_stego_bits[..n_used];
+            let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+            let extracted_bits = extract::stc_extract(stego_bits, &hhat_matrix, w);
+
+            let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
+            match try_parse_and_decrypt(&frame_bytes, passphrase) {
+                Ok(payload) => {
+                    progress::advance();
+                    return Ok(payload);
+                }
+                Err(StegoError::DecryptionFailed) => {
+                    saw_decrypt_fail = true;
+                }
+                Err(_) => {}
+            }
+        }
+
+        // Step: STC extraction + decryption complete (all attempts failed).
+        progress::advance();
+
+        if saw_decrypt_fail {
+            return Err(StegoError::DecryptionFailed);
         }
     }
 
     // Step: STC extraction + decryption complete (all attempts failed).
+    #[cfg(feature = "parallel")]
     progress::advance();
 
-    if saw_decrypt_fail {
-        Err(StegoError::DecryptionFailed)
-    } else {
-        Err(StegoError::FrameCorrupted)
-    }
+    Err(StegoError::FrameCorrupted)
 }
 
 /// Helper: parse frame, decrypt, and decode payload. Used by brute-force w loop.

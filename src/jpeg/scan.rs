@@ -208,6 +208,25 @@ pub fn encode_scan(
     ac_specs: &[Option<HuffmanSpec>; 4],
     restart_interval: u16,
 ) -> Result<Vec<u8>> {
+    encode_scan_with_progress(frame, scan_components, grids, dc_specs, ac_specs, restart_interval, None)
+}
+
+/// Encode scan data with optional per-row progress callback.
+///
+/// The callback is invoked periodically during MCU row encoding (approximately
+/// `JPEG_WRITE_STEPS` times total) so callers can report progress during
+/// what would otherwise be a long blocking operation.
+pub const JPEG_WRITE_STEPS: u32 = 20;
+
+pub fn encode_scan_with_progress(
+    frame: &FrameInfo,
+    scan_components: &[ScanComponent],
+    grids: &[DctGrid],
+    dc_specs: &[Option<HuffmanSpec>; 4],
+    ac_specs: &[Option<HuffmanSpec>; 4],
+    restart_interval: u16,
+    on_progress: Option<&dyn Fn()>,
+) -> Result<Vec<u8>> {
     // Build Huffman encode tables
     let mut dc_tables: [Option<HuffmanEncodeTable>; 4] = [None, None, None, None];
     let mut ac_tables: [Option<HuffmanEncodeTable>; 4] = [None, None, None, None];
@@ -233,8 +252,15 @@ pub fn encode_scan(
     let mut dc_pred = vec![0i32; scan_components.len()];
     let mut mcu_count = 0usize;
     let mut restart_count = 0u16;
+    let mcus_tall = frame.mcus_tall as usize;
+    let row_interval = if mcus_tall > 0 { (mcus_tall / JPEG_WRITE_STEPS as usize).max(1) } else { 1 };
 
-    for mcu_row in 0..frame.mcus_tall as usize {
+    for mcu_row in 0..mcus_tall {
+        if let Some(ref cb) = on_progress {
+            if mcu_row > 0 && mcu_row % row_interval == 0 {
+                cb();
+            }
+        }
         for mcu_col in 0..frame.mcus_wide as usize {
             // Insert restart marker if needed
             if restart_interval > 0 && mcu_count > 0 && mcu_count % (restart_interval as usize) == 0 {

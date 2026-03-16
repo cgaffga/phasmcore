@@ -24,7 +24,7 @@
 //! let cover_jpeg = std::fs::read("photo.jpg").unwrap();
 //! let stego = ghost_encode(&cover_jpeg, "secret message", "passphrase").unwrap();
 //! let decoded = ghost_decode(&stego, "passphrase").unwrap();
-//! assert_eq!(decoded, "secret message");
+//! assert_eq!(decoded.text, "secret message");
 //! ```
 
 pub mod det_math;

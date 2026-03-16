@@ -302,48 +302,143 @@ pub fn shadow_extract(
     let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
 
     let grid = img.dct_grid(0);
-    let mut last_err = StegoError::FrameCorrupted;
 
     if all_y_positions_sorted.is_empty() {
         return Err(StegoError::FrameCorrupted);
     }
 
-    // 2. Brute-force: fraction × parity × fdl.
-    // For each fraction, select pool positions and extract LSBs once.
-    for &fraction in &COST_FRACTIONS {
-        let pool_size = all_y_positions_sorted.len() / fraction;
-        if pool_size == 0 {
-            continue;
-        }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
 
-        // Hash-select all pool positions (sorted by hash priority).
-        let positions = select_shadow_positions(
-            all_y_positions_sorted, fraction, pool_size, &perm_seed,
-        );
-        if positions.is_empty() {
-            continue;
-        }
-
-        // Extract LSBs once for this fraction (reused across parity/fdl).
-        let all_lsbs: Vec<u8> = positions.iter().map(|pos| {
-            let coeff = flat_get(grid, pos.flat_idx as usize);
-            (coeff.unsigned_abs() & 1) as u8
+        // Phase 1: Pre-extract LSBs for all fractions in parallel.
+        let fraction_lsbs: Vec<(usize, Vec<u8>)> = COST_FRACTIONS.par_iter().filter_map(|&fraction| {
+            let pool_size = all_y_positions_sorted.len() / fraction;
+            if pool_size == 0 {
+                return None;
+            }
+            let positions = select_shadow_positions(
+                all_y_positions_sorted, fraction, pool_size, &perm_seed,
+            );
+            if positions.is_empty() {
+                return None;
+            }
+            let lsbs: Vec<u8> = positions.iter().map(|pos| {
+                let coeff = flat_get(grid, pos.flat_idx as usize);
+                (coeff.unsigned_abs() & 1) as u8
+            }).collect();
+            Some((fraction, lsbs))
         }).collect();
 
-        // Inner brute-force: parity × fdl.
-        if let Some(result) = try_extract_with_lsbs(
-            &all_lsbs, passphrase, &mut last_err,
-        ) {
-            return result;
+        // Phase 2: Flatten all (fraction, parity, fdl) combos and try in parallel.
+        // Build combo descriptors: (fraction_idx, parity, fdl).
+        let mut combos: Vec<(usize, usize, usize)> = Vec::new();
+        for (fi, (_, lsbs)) in fraction_lsbs.iter().enumerate() {
+            for &parity_len in &SHADOW_PARITY_TIERS {
+                let k = 255usize.saturating_sub(parity_len);
+                if k == 0 {
+                    continue;
+                }
+                let max_rs_bytes = lsbs.len() / 8;
+                let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
+                    .min(MAX_SHADOW_FRAME_BYTES);
+                if SHADOW_FRAME_OVERHEAD > max_fdl {
+                    continue;
+                }
+                let scan_max = max_fdl.min(SHADOW_FRAME_OVERHEAD + MAX_FDL_SCAN);
+                for fdl in SHADOW_FRAME_OVERHEAD..=scan_max {
+                    combos.push((fi, parity_len, fdl));
+                }
+            }
+        }
+
+        let result = combos.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
+            let lsbs = &fraction_lsbs[fi].1;
+            let rs_encoded_len = ecc::rs_encoded_len_with_parity(fdl, parity_len);
+            let rs_bits_needed = rs_encoded_len * 8;
+            if rs_bits_needed > lsbs.len() {
+                return None;
+            }
+
+            let rs_bytes = frame::bits_to_bytes(&lsbs[..rs_bits_needed]);
+            let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
+                Ok((data, _stats)) => data,
+                Err(_) => return None,
+            };
+
+            let fr = match parse_shadow_frame(&decoded) {
+                Ok(f) => f,
+                Err(_) => return None,
+            };
+
+            match crypto::decrypt(
+                &fr.ciphertext,
+                passphrase,
+                &fr.salt,
+                &fr.nonce,
+            ) {
+                Ok(plaintext) => {
+                    let len = fr.plaintext_len as usize;
+                    if len > plaintext.len() {
+                        return None;
+                    }
+                    Some(payload::decode_payload(&plaintext[..len]))
+                }
+                // In shadow brute-force, DecryptionFailed is common noise:
+                // RS can decode random bytes that parse as a valid frame but
+                // fail AES-GCM authentication. Continue trying other combos.
+                Err(_) => None,
+            }
+        });
+
+        match result {
+            Some(ok_or_err) => return ok_or_err,
+            None => return Err(StegoError::FrameCorrupted),
         }
     }
 
-    Err(last_err)
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut last_err = StegoError::FrameCorrupted;
+
+        // 2. Brute-force: fraction × parity × fdl.
+        // For each fraction, select pool positions and extract LSBs once.
+        for &fraction in &COST_FRACTIONS {
+            let pool_size = all_y_positions_sorted.len() / fraction;
+            if pool_size == 0 {
+                continue;
+            }
+
+            // Hash-select all pool positions (sorted by hash priority).
+            let positions = select_shadow_positions(
+                all_y_positions_sorted, fraction, pool_size, &perm_seed,
+            );
+            if positions.is_empty() {
+                continue;
+            }
+
+            // Extract LSBs once for this fraction (reused across parity/fdl).
+            let all_lsbs: Vec<u8> = positions.iter().map(|pos| {
+                let coeff = flat_get(grid, pos.flat_idx as usize);
+                (coeff.unsigned_abs() & 1) as u8
+            }).collect();
+
+            // Inner brute-force: parity × fdl.
+            if let Some(result) = try_extract_with_lsbs(
+                &all_lsbs, passphrase, &mut last_err,
+            ) {
+                return result;
+            }
+        }
+
+        Err(last_err)
+    }
 }
 
 /// Try all (parity, fdl) combinations on a given LSB vector.
 /// Returns `Some(Ok(...))` on success, `Some(Err(...))` on fatal error,
 /// or `None` to continue to next fraction.
+#[cfg(not(feature = "parallel"))]
 fn try_extract_with_lsbs(
     all_lsbs: &[u8],
     passphrase: &str,

@@ -459,6 +459,13 @@ impl JpegImage {
 
     /// Encode the (possibly modified) image back to JPEG bytes.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.to_bytes_with_progress(None)
+    }
+
+    /// Serialize this JPEG image to bytes, with an optional progress callback
+    /// that fires approximately [`scan::JPEG_WRITE_STEPS`] times during scan
+    /// encoding.
+    pub fn to_bytes_with_progress(&self, on_progress: Option<&dyn Fn()>) -> Result<Vec<u8>> {
         let mut out = Vec::new();
 
         // SOI
@@ -484,13 +491,14 @@ impl JpegImage {
         out.extend_from_slice(&self.sos_data);
 
         // Re-encode scan data
-        let scan_bytes = scan::encode_scan(
+        let scan_bytes = scan::encode_scan_with_progress(
             &self.frame,
             &self.scan_components,
             &self.grids,
             &self.dc_huff_specs,
             &self.ac_huff_specs,
             self.restart_interval,
+            on_progress,
         )?;
         out.extend_from_slice(&scan_bytes);
 

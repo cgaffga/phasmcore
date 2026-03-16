@@ -555,6 +555,27 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     progress::advance(); // fortress check already done by caller
 
     // 8. Pass 1: Try Phase 1 for ALL candidates first (fast per candidate).
+    #[cfg(feature = "parallel")]
+    {
+        let result = candidates.par_iter().find_map_first(|&mean_qt| {
+            if progress::is_cancelled() { return Some(Err(StegoError::Cancelled)); }
+            let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
+            match decode_phase1_with_offset(
+                grid, positions, &vectors, reference_delta, num_units, HEADER_UNITS,
+                passphrase,
+            ) {
+                Ok(result) => Some(Ok(result)),
+                Err(StegoError::DecryptionFailed) => Some(Err(StegoError::DecryptionFailed)),
+                Err(_) => { progress::advance(); None }
+            }
+        });
+        match result {
+            Some(Ok(payload)) => return Ok(payload),
+            Some(Err(e)) => return Err(e),
+            None => {} // fall through to Phase 2
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
     for &mean_qt in &candidates {
         progress::check_cancelled()?;
         let reference_delta = embedding::compute_delta_from_mean_qt(mean_qt, 1);
@@ -569,17 +590,86 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     }
 
     // 9. Pass 2: Try Phase 2 for ALL candidates (expensive, only if all Phase 1 failed).
-    let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
+    // Pre-build all (parity, r, delta) candidates across ALL mean_qt values,
+    // pre-extract LLRs for all unique deltas, then search in one parallel sweep.
+    let mut all_p2_candidates: Vec<(usize, usize, f64)> = Vec::new();
     for &mean_qt in &candidates {
-        progress::check_cancelled()?;
-        if let Ok(result) = decode_phase2_search(
-            grid, positions, &vectors, mean_qt,
-            num_units, payload_units, passphrase,
-            &mut cached_llrs,
-        ) {
-            return Ok(result);
+        for &parity in &ecc::PARITY_TIERS {
+            let candidate_rs = compute_candidate_rs(payload_units, parity);
+            for r in candidate_rs {
+                let delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
+                all_p2_candidates.push((parity, r, delta));
+            }
         }
-        progress::advance();
+    }
+
+    // Pre-extract LLRs for all unique deltas (sequential; extraction itself is parallel internally).
+    let mut cached_llrs: Vec<(f64, Vec<f64>)> = Vec::new();
+    for &(_, _, delta) in &all_p2_candidates {
+        get_or_extract_llrs(
+            &mut cached_llrs, delta,
+            grid, positions, &vectors, num_units, HEADER_UNITS,
+        );
+    }
+    progress::check_cancelled()?;
+
+    // Read-only snapshot for parallel access.
+    let llr_cache: &[(f64, Vec<f64>)] = &cached_llrs;
+
+    let find_llrs = |delta: f64| -> &[f64] {
+        for (cached_delta, llrs) in llr_cache.iter() {
+            if (cached_delta - delta).abs() < 0.001 {
+                return llrs;
+            }
+        }
+        &[]
+    };
+
+    let try_p2_candidate = |&(parity, r, adaptive_delta): &(usize, usize, f64)| -> Option<Result<(PayloadData, DecodeQuality), StegoError>> {
+        if progress::is_cancelled() { return Some(Err(StegoError::Cancelled)); }
+        let raw_llrs = find_llrs(adaptive_delta);
+
+        let rs_bit_count = payload_units / r;
+        if rs_bit_count == 0 { return None; }
+        let used_llrs = rs_bit_count * r;
+        if used_llrs > raw_llrs.len() { return None; }
+
+        let (voted_bits, rep_quality) = repetition::repetition_decode_soft_with_quality(
+            &raw_llrs[..used_llrs], rs_bit_count,
+        );
+        let voted_bytes = frame::bits_to_bytes(&voted_bits);
+
+        let (decoded_frame, rs_stats) = try_rs_decode_frame_with_parity(&voted_bytes, parity)?;
+        let parsed = frame::parse_frame(&decoded_frame).ok()?;
+        match crypto::decrypt(&parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce) {
+            Ok(plaintext) => {
+                let len = parsed.plaintext_len as usize;
+                if len > plaintext.len() { return None; }
+                let payload_data = payload::decode_payload(&plaintext[..len]).ok()?;
+                let reference_llr = adaptive_delta / 2.0;
+                let quality = DecodeQuality::from_rs_stats_with_signal(
+                    &rs_stats, r as u8, parity as u16,
+                    rep_quality.avg_abs_llr_per_copy, reference_llr,
+                );
+                Some(Ok((payload_data, quality)))
+            }
+            Err(StegoError::DecryptionFailed) => Some(Err(StegoError::DecryptionFailed)),
+            Err(_) => None,
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    let p2_result = all_p2_candidates.par_iter().find_map_first(try_p2_candidate);
+    #[cfg(not(feature = "parallel"))]
+    let p2_result = all_p2_candidates.iter().find_map(try_p2_candidate);
+
+    // Advance progress for Phase 2 (bulk advance since search is now flat).
+    for _ in 0..candidates.len() { progress::advance(); }
+
+    match p2_result {
+        Some(Ok(payload)) => return Ok(payload),
+        Some(Err(e)) => return Err(e),
+        None => {}
     }
 
     Err(StegoError::FrameCorrupted)
@@ -813,93 +903,7 @@ fn decode_phase1_with_offset(
     Ok((payload_data, quality))
 }
 
-/// Phase 2 brute-force search: try all plausible (r, parity) combinations.
-///
-/// For each parity tier, sweeps possible frame lengths to find distinct r values,
-/// then attempts decode with each (r, parity, delta) combination.
-fn decode_phase2_search(
-    grid: &DctGrid,
-    positions: &[crate::stego::permute::CoeffPos],
-    vectors: &[[f64; SPREAD_LEN]],
-    mean_qt: f64,
-    num_units: usize,
-    payload_units: usize,
-    passphrase: &str,
-    cached_llrs: &mut Vec<(f64, Vec<f64>)>,
-) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    // Build all (parity, r, delta) candidates and pre-extract unique delta LLR sets
-    // so the search can run in parallel without &mut cache.
-    let mut candidates: Vec<(usize, usize, f64)> = Vec::new();
-    for &parity in &ecc::PARITY_TIERS {
-        let candidate_rs = compute_candidate_rs(payload_units, parity);
-        for r in candidate_rs {
-            let delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
-            candidates.push((parity, r, delta));
-        }
-    }
 
-    // Pre-extract LLRs for all unique deltas (populates cache sequentially)
-    for &(_, _, delta) in &candidates {
-        get_or_extract_llrs(
-            cached_llrs, delta,
-            grid, positions, vectors, num_units, HEADER_UNITS,
-        );
-    }
-
-    // Snapshot the cache for read-only parallel access
-    let llr_cache: &[(f64, Vec<f64>)] = cached_llrs;
-
-    let find_llrs = |delta: f64| -> &[f64] {
-        for (cached_delta, cached_llrs) in llr_cache.iter() {
-            if (cached_delta - delta).abs() < 0.001 {
-                return cached_llrs;
-            }
-        }
-        &[]
-    };
-
-    let try_candidate = |&(parity, r, adaptive_delta): &(usize, usize, f64)| -> Option<(PayloadData, DecodeQuality)> {
-        let raw_llrs = find_llrs(adaptive_delta);
-
-        let rs_bit_count = payload_units / r;
-        if rs_bit_count == 0 {
-            return None;
-        }
-        let used_llrs = rs_bit_count * r;
-        if used_llrs > raw_llrs.len() {
-            return None;
-        }
-
-        let (voted_bits, rep_quality) = repetition::repetition_decode_soft_with_quality(
-            &raw_llrs[..used_llrs], rs_bit_count,
-        );
-        let voted_bytes = frame::bits_to_bytes(&voted_bits);
-
-        let (decoded_frame, rs_stats) = try_rs_decode_frame_with_parity(&voted_bytes, parity)?;
-        let parsed = frame::parse_frame(&decoded_frame).ok()?;
-        let plaintext = crypto::decrypt(
-            &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
-        ).ok()?;
-        let len = parsed.plaintext_len as usize;
-        if len > plaintext.len() {
-            return None;
-        }
-        let payload_data = payload::decode_payload(&plaintext[..len]).ok()?;
-        let reference_llr = adaptive_delta / 2.0;
-        let quality = DecodeQuality::from_rs_stats_with_signal(
-            &rs_stats, r as u8, parity as u16,
-            rep_quality.avg_abs_llr_per_copy, reference_llr,
-        );
-        Some((payload_data, quality))
-    };
-
-    #[cfg(feature = "parallel")]
-    let result = candidates.par_iter().find_map_first(try_candidate);
-    #[cfg(not(feature = "parallel"))]
-    let result = candidates.iter().find_map(try_candidate);
-
-    result.ok_or(StegoError::FrameCorrupted)
-}
 
 /// Compute distinct candidate r values for a given parity tier and payload capacity.
 pub(super) fn compute_candidate_rs(payload_units: usize, parity: usize) -> Vec<usize> {
@@ -1037,6 +1041,11 @@ fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
 }
 
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
+///
+/// Optimized sweep: after the first RS block decodes successfully, the
+/// `plaintext_len` field (first 2 bytes) determines the exact total frame
+/// length. Plausibility checks on `plaintext_len` skip obviously wrong
+/// values before attempting expensive multi-block RS decode.
 pub(super) fn try_rs_decode_frame_with_parity(
     extracted_bytes: &[u8],
     parity: usize,
@@ -1056,10 +1065,23 @@ pub(super) fn try_rs_decode_frame_with_parity(
             if first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
+
+                // Plausibility: plaintext_len must be positive.
+                if pt_len == 0 {
+                    continue;
+                }
+
                 let ct_len = pt_len + 16;
                 let total_frame_len = 2 + 16 + 12 + ct_len + 4;
 
                 if total_frame_len > frame::MAX_FRAME_BYTES {
+                    continue;
+                }
+
+                // Plausibility: the RS-encoded frame must fit in extracted data.
+                let rs_encoded_len =
+                    ecc::rs_encoded_len_with_parity(total_frame_len, parity);
+                if rs_encoded_len > extracted_bytes.len() {
                     continue;
                 }
 
@@ -1086,17 +1108,15 @@ pub(super) fn try_rs_decode_frame_with_parity(
                 }
 
                 if total_frame_len > data_len {
-                    let rs_encoded_len =
-                        ecc::rs_encoded_len_with_parity(total_frame_len, parity);
-                    if rs_encoded_len <= extracted_bytes.len() {
-                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
-                            &extracted_bytes[..rs_encoded_len],
-                            total_frame_len,
-                            parity,
-                        ) {
-                            return Some((decoded, stats));
-                        }
+                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
+                        &extracted_bytes[..rs_encoded_len],
+                        total_frame_len,
+                        parity,
+                    ) {
+                        return Some((decoded, stats));
                     }
+                    // Multi-block decode failed — first-block was a false
+                    // positive. Continue sweep to try other data_len values.
                 }
             }
         }
@@ -1128,11 +1148,24 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
             if first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
+
+                // Plausibility: plaintext_len must be positive.
+                if pt_len == 0 {
+                    continue;
+                }
+
                 let ct_len = pt_len + 16;
                 // Compact frame: no salt (16) or nonce (12)
                 let total_frame_len = 2 + ct_len + 4;
 
                 if total_frame_len > frame::MAX_FRAME_BYTES {
+                    continue;
+                }
+
+                // Plausibility: the RS-encoded frame must fit in extracted data.
+                let rs_encoded_len =
+                    ecc::rs_encoded_len_with_parity(total_frame_len, parity);
+                if rs_encoded_len > extracted_bytes.len() {
                     continue;
                 }
 
@@ -1159,17 +1192,15 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                 }
 
                 if total_frame_len > data_len {
-                    let rs_encoded_len =
-                        ecc::rs_encoded_len_with_parity(total_frame_len, parity);
-                    if rs_encoded_len <= extracted_bytes.len() {
-                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
-                            &extracted_bytes[..rs_encoded_len],
-                            total_frame_len,
-                            parity,
-                        ) {
-                            return Some((decoded, stats));
-                        }
+                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
+                        &extracted_bytes[..rs_encoded_len],
+                        total_frame_len,
+                        parity,
+                    ) {
+                        return Some((decoded, stats));
                     }
+                    // Multi-block decode failed — first-block was a false
+                    // positive. Continue sweep to try other data_len values.
                 }
             }
         }
@@ -1196,10 +1227,22 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
             if first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
+
+                // Plausibility: plaintext_len must be positive.
+                if pt_len == 0 {
+                    continue;
+                }
+
                 let ct_len = pt_len + 16;
                 let total_frame_len = 2 + 16 + 12 + ct_len + 4;
 
                 if total_frame_len > frame::MAX_FRAME_BYTES {
+                    continue;
+                }
+
+                // Plausibility: the RS-encoded frame must fit in extracted data.
+                let rs_encoded_len = ecc::rs_encoded_len(total_frame_len);
+                if rs_encoded_len > extracted_bytes.len() {
                     continue;
                 }
 
@@ -1224,15 +1267,14 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
                 }
 
                 if total_frame_len > data_len {
-                    let rs_encoded_len = ecc::rs_encoded_len(total_frame_len);
-                    if rs_encoded_len <= extracted_bytes.len() {
-                        if let Ok((decoded, stats)) = ecc::rs_decode_blocks(
-                            &extracted_bytes[..rs_encoded_len],
-                            total_frame_len,
-                        ) {
-                            return Ok((decoded, stats));
-                        }
+                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks(
+                        &extracted_bytes[..rs_encoded_len],
+                        total_frame_len,
+                    ) {
+                        return Ok((decoded, stats));
                     }
+                    // Multi-block decode failed — first-block was a false
+                    // positive. Continue sweep to try other data_len values.
                 }
             }
         }

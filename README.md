@@ -16,9 +16,14 @@ Ghost mode also supports **file attachments** (Brotli-compressed, multi-file).
 
 #### Shadow Messages (Plausible Deniability)
 
-Ghost mode supports **shadow messages** — multiple messages hidden in a single image, each with a different passphrase. If coerced into revealing a passphrase, you can give the shadow passphrase instead of the primary one. The adversary decodes a decoy message and has no way to detect whether additional messages exist.
+Ghost mode supports **[shadow messages](https://phasm.app/blog/shadow-messages-plausible-deniability-steganography)** — multiple messages hidden in a single image, each with a different passphrase. If coerced into revealing a passphrase, you can give the shadow passphrase instead of the primary one. The adversary decodes a decoy message and has no way to detect whether additional messages exist.
 
-Shadows use **R=7 repetition coding in chrominance channels** (Cb + Cr), which occupy a separate capacity pool from the primary message (luminance Y). Shadow encoding runs first; the primary STC then treats shadow modifications as part of the cover image.
+Shadows use **Y-channel direct LSB embedding** with Reed-Solomon error correction. Key design properties:
+
+- **Cost-pool position selection** — shadow positions are drawn from the cheapest UNIWARD-cost regions via two-tier filtering (top-N% cost pool + keyed ChaCha20 permutation), ensuring modifications land in textured areas for maximum stealth
+- **∞-cost protection** — when the primary message uses dynamic w ≥ 2, shadow positions receive `f32::INFINITY` cost in the STC Viterbi trellis, routing the primary encoder around them with **BER ≈ 0%**
+- **Headerless brute-force decode** — no magic bytes or agreed-upon parameters. The decoder brute-forces all combinations of cost-pool fraction (5 values: 5%–100%), RS parity tier (6 values: 4–128), and frame data length (~20 block-aligned sizes) — approximately **600 attempts in ~9ms**. AES-256-GCM-SIV authentication is the only validator
+- **Stego-cost verification** — after STC embedding, the encoder re-runs UNIWARD on the stego image to verify shadow BER. If verification fails, an **escalation cascade** automatically increases RS parity (4 → 8 → 16 → … → 128) until the shadow survives or capacity is exhausted
 
 `smart_decode` automatically tries shadow decode as a fallback after primary Ghost decode.
 
@@ -166,7 +171,7 @@ validate_encode_dimensions(width, height) -> Result<()>
 
 // Real-time progress tracking
 progress::init(total)      // reset and set total steps
-progress::advance()        // increment step (capped at total-1)
+progress::advance()        // increment step (capped at total)
 progress::finish()         // mark complete (step = total)
 progress::get() -> (u32, u32) // read (step, total)
 progress::cancel()         // request cancellation
@@ -219,7 +224,7 @@ cargo run -p phasm-core --example test_link -- stego.jpg
 
 - **Zero C FFI** — pure Rust from JPEG parsing to AES encryption, compiles to native and WASM
 - **Deterministic** — identical output across x86, ARM, and WASM using [FDLIBM-based math](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
-- **Memory-efficient** — strip-based wavelet computation, compact positions (8 bytes each), 1-bit packed Viterbi back pointers (32× reduction), segmented checkpoint for large images (O(√n) memory). Supports **200 MP** images under ~1 GB peak memory.
+- **Memory-efficient** — strip-based wavelet computation, compact positions (8 bytes each), 1-bit packed Viterbi back pointers (32× reduction), segmented checkpoint for large images (O(√n) memory), `i8`-quantized SI-UNIWARD rounding errors (8× smaller than `f64`), strip-by-strip luma block computation, strategic `drop()` calls before JPEG output. Supports **200 MP** images under ~1 GB peak memory.
 - **Short messages** — optimized for text payloads under 1 KB
 - **Stego output is raw** — the JPEG bytes after encoding must be saved/shared without re-encoding
 
@@ -242,13 +247,15 @@ All payloads are encrypted before embedding:
 ### Ghost Pipeline
 
 1. Parse JPEG into DCT coefficients
-2. Derive structural key (Argon2id) → permutation seed + STC seed
-3. Compute [J-UNIWARD costs](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) **strip-by-strip** (Daubechies-8 wavelet, 3 subbands) — positions collected inline, no full CostMap materialized
-4. *(SI-UNIWARD only)* Modulate costs inline using rounding errors: `cost *= (1 - 2|error|)`
+2. Derive structural key (Argon2id, overlapped with step 3 on multi-core) → permutation seed + STC seed
+3. Compute [J-UNIWARD costs](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) **strip-by-strip** (Daubechies-8 wavelet, 3 subbands, parallel row+column filtering) — positions collected inline, no full CostMap materialized
+4. *(SI-UNIWARD only)* Modulate costs inline using quantized rounding errors (`i8`, <2% precision loss): `cost *= (1 - 2|error|)`. Luma blocks computed in strips of 50 block-rows to minimize peak memory.
 5. Permute coefficient order (Fisher-Yates with ChaCha20)
 6. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
-7. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
-8. Write modified coefficients back to JPEG
+7. **Short STC with dynamic w**: embed only the actual `m` message bits (not zero-padded to `m_max`). The encoder picks `w = min(⌊n/m⌋, 10)` — for small messages this means **2,500× fewer coefficient modifications** compared to fixed `w`. The decoder brute-forces all `w` values 1–10 in parallel (`rayon::find_map_first`); CRC32 in the frame format provides instant validation (~0 false positive rate at 2⁻³²).
+8. *(Shadow mode)* Assign `f32::INFINITY` cost to shadow positions → Viterbi routes around them
+9. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
+10. Write modified coefficients back to JPEG (with progress reporting per MCU row)
 
 #### STC Viterbi Optimizer
 
@@ -347,10 +354,11 @@ Capacity estimation is instantaneous: it counts non-zero AC coefficients directl
 
 Both encode and decode pipelines report real-time progress via global atomics (`progress::advance()`). This enables responsive UI feedback on all platforms:
 
-- **Ghost encode**: 12 steps (3 UNIWARD cost sub-steps + 8 STC Viterbi sub-steps + 1 JPEG write)
+- **Ghost encode**: 177 steps — 5 (parse) + 100 (UNIWARD sub-steps) + 50 (STC Viterbi sub-steps) + 2 (permute + key derivation) + 20 (JPEG write MCU rows)
+- **Ghost encode with shadows**: 277 steps — adds 100 (verification UNIWARD pass) for stego-cost check
+- **Ghost decode**: 107 steps — 5 (parse) + 100 (UNIWARD) + 2 (STC extraction + decrypt). Dynamic w brute-force runs in parallel.
 - **Armor encode**: 6 steps (STDM path) or 3 steps (Fortress path, auto-adjusted at runtime)
-- **Ghost decode**: 4 steps (3 UNIWARD + 1 STC extraction)
-- **Armor decode**: dynamic total based on candidate count (~50 steps)
+- **Armor decode**: dynamic total based on candidate count (~50 steps). Phase 1 delta sweep parallelized across ~21 candidates.
 
 Cancellation is cooperative: `progress::cancel()` sets a flag checked at natural loop boundaries via `progress::check_cancelled()`.
 
@@ -384,7 +392,7 @@ src/
     payload.rs      Payload serialization (Brotli, file attachments)
     permute.rs      Fisher-Yates coefficient permutation
     side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
-    shadow.rs       Shadow messages (R=7 repetition in chrominance, plausible deniability)
+    shadow.rs       Shadow messages (Y-channel direct LSB + RS ECC, plausible deniability)
     optimizer.rs    Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
     capacity.rs     Ghost capacity estimation
     progress.rs     Real-time progress tracking (atomics + WASM callback)
@@ -433,6 +441,9 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 
 ### Geometric Resilience
 - [Fourier-Domain Template Embedding: How Phasm Survives Rotation, Scaling, and Cropping](https://phasm.app/blog/dft-template-geometric-resilience-steganography)
+
+### Plausible Deniability
+- [Shadow Messages: How Phasm Hides Multiple Secrets in a Single Photo](https://phasm.app/blog/shadow-messages-plausible-deniability-steganography)
 
 ### Implementation
 - [Building a Pure-Rust JPEG Coefficient Codec](https://phasm.app/blog/pure-rust-jpeg-coefficient-codec)

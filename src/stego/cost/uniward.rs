@@ -397,18 +397,34 @@ fn compute_three_subbands(
     height: usize,
     lpdf: &[f64; 16],
 ) -> ThreeSubbands {
-    // LH subband: low-pass rows → high-pass cols
-    let row_low = filter_rows(pixels, width, height, lpdf);
-    let lh = filter_cols(&row_low, width, height, &HPDF);
-    drop(row_low); // Free before allocating row_high
-
-    // HL and HH subbands: high-pass rows → low/high-pass cols
-    let row_high = filter_rows(pixels, width, height, &HPDF);
-    let hl = filter_cols(&row_high, width, height, lpdf);
-    let hh = filter_cols(&row_high, width, height, &HPDF);
-    // row_high dropped at return
-
-    ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
+    // Parallel: compute both row filters simultaneously, then 3 column filters.
+    // +1 buffer peak (~25MB for 12MP) traded for ~2× speedup on wavelet phase.
+    #[cfg(feature = "parallel")]
+    {
+        let (row_low, row_high) = rayon::join(
+            || filter_rows(pixels, width, height, lpdf),
+            || filter_rows(pixels, width, height, &HPDF),
+        );
+        let (lh, (hl, hh)) = rayon::join(
+            || filter_cols(&row_low, width, height, &HPDF),
+            || rayon::join(
+                || filter_cols(&row_high, width, height, lpdf),
+                || filter_cols(&row_high, width, height, &HPDF),
+            ),
+        );
+        ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
+    }
+    // Sequential: drop intermediates early to minimize peak memory (WASM path).
+    #[cfg(not(feature = "parallel"))]
+    {
+        let row_low = filter_rows(pixels, width, height, lpdf);
+        let lh = filter_cols(&row_low, width, height, &HPDF);
+        drop(row_low);
+        let row_high = filter_rows(pixels, width, height, &HPDF);
+        let hl = filter_cols(&row_high, width, height, lpdf);
+        let hh = filter_cols(&row_high, width, height, &HPDF);
+        ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
+    }
 }
 
 /// Apply a 1D filter along each row of the image (horizontal filtering).
@@ -753,7 +769,7 @@ pub fn compute_positions_streaming(
                                 cost_f32
                             } else {
                                 let error = side_info.error_at(flat_idx as usize);
-                                let factor = (1.0 - 2.0 * error.abs()) as f32;
+                                let factor = 1.0f32 - 2.0 * error.abs();
                                 (cost_f32 * factor).max(MIN_SI_COST_F32)
                             }
                         } else {
@@ -837,18 +853,32 @@ fn compute_strip_subbands(
     img_h: usize,
     lpdf: &[f64; 16],
 ) -> ThreeSubbands {
-    // Row filtering is independent per row — works on the strip directly.
-    let row_low = filter_rows(pixels, width, pix_h, lpdf);
-    let lh = filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
-    drop(row_low);
-
-    let row_high = filter_rows(pixels, width, pix_h, &HPDF);
-    let hl = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf);
-    let hh = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
-
-    ThreeSubbands {
-        lh, hl, hh, width,
-        y_offset: wav_y_start,
+    // Parallel: both row filters + 3 column filters run concurrently.
+    #[cfg(feature = "parallel")]
+    {
+        let (row_low, row_high) = rayon::join(
+            || filter_rows(pixels, width, pix_h, lpdf),
+            || filter_rows(pixels, width, pix_h, &HPDF),
+        );
+        let (lh, (hl, hh)) = rayon::join(
+            || filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF),
+            || rayon::join(
+                || filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf),
+                || filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF),
+            ),
+        );
+        ThreeSubbands { lh, hl, hh, width, y_offset: wav_y_start }
+    }
+    // Sequential: drop intermediates early (WASM path).
+    #[cfg(not(feature = "parallel"))]
+    {
+        let row_low = filter_rows(pixels, width, pix_h, lpdf);
+        let lh = filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
+        drop(row_low);
+        let row_high = filter_rows(pixels, width, pix_h, &HPDF);
+        let hl = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf);
+        let hh = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
+        ThreeSubbands { lh, hl, hh, width, y_offset: wav_y_start }
     }
 }
 
