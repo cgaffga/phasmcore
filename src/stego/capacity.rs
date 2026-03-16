@@ -108,15 +108,14 @@ pub fn estimate_capacity_si(img: &JpegImage) -> Result<usize, StegoError> {
 
 /// Estimate shadow layer capacity for a JPEG image.
 ///
-/// Shadow layers use repetition coding (R=7) in the Cb+Cr chrominance
-/// channels, which is much less efficient than primary Ghost STC.
-/// Requires color image (>= 2 components).
+/// Shadow uses direct LSB embedding in the Y (luminance) channel with
+/// cost-pool position selection. Capacity is based on Y nzAC count.
 pub fn estimate_shadow_capacity(img: &JpegImage) -> Result<usize, StegoError> {
-    if img.num_components() < 2 {
-        return Ok(0); // Grayscale — no chrominance for shadows
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
     }
-    let positions = shadow::collect_chroma_positions(img);
-    Ok(shadow::shadow_capacity(positions.len()))
+    let y_nzac = count_nonzero_ac(img.dct_grid(0));
+    Ok(shadow::shadow_capacity(y_nzac))
 }
 
 #[cfg(test)]

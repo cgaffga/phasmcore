@@ -176,7 +176,11 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         }
     }
 
-    // Try Ghost (advances GHOST_DECODE_STEPS internally)
+    // Try Ghost — extend progress total instead of resetting to avoid the
+    // bar jumping back to 0%.  The bar continues smoothly from the Armor
+    // phase into the Ghost phase.
+    let (armor_done, _) = progress::get();
+    progress::set_total(armor_done + GHOST_DECODE_STEPS as u32);
     let ghost_result = ghost_decode(stego_bytes, passphrase);
     match ghost_result {
         Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
@@ -186,7 +190,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         Err(_) => {}
     }
 
-    // Try Ghost shadow (repetition coding)
+    // Try Ghost shadow (Y-channel direct LSB + RS)
     match pipeline::ghost_shadow_decode(stego_bytes, passphrase) {
         Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => {
