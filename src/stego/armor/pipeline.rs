@@ -34,7 +34,6 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, PayloadData};
 use crate::stego::permute;
-use crate::stego::pipeline::GHOST_DECODE_STEPS;
 use crate::stego::progress;
 
 #[cfg(feature = "parallel")]
@@ -542,12 +541,13 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     }
 
     // Set progress total now that we know the candidate count.
-    // fortress(1) + phase1(nc) + phase2(nc) + phase3(1) + ghost(GHOST_DECODE_STEPS) per run.
+    // fortress(1) + phase1(nc) + phase2(nc) + phase3(1) per run.
     // Doubled fortress+phase1+phase2 for potential second run via geometric recovery.
+    // Ghost decode resets progress separately (its own GHOST_DECODE_STEPS total).
     let nc = candidates.len() as u32;
     // Only set total on first call; geometric recovery calls us again.
     if progress::get().1 == 0 {
-        let total = (2 * (1 + nc + nc) + 1 + GHOST_DECODE_STEPS).max(50);
+        let total = (2 * (1 + nc + nc) + 1).max(50);
         // Use set_total (not init) to avoid resetting STEP — in parallel mode,
         // other threads may have already advanced the counter.
         progress::set_total(total);

@@ -82,6 +82,14 @@ pub fn get() -> (u32, u32) {
     (STEP.load(Ordering::Relaxed), TOTAL.load(Ordering::Relaxed))
 }
 
+/// Advance progress by `n` steps.  Convenience wrapper that calls
+/// [`advance`] in a loop.
+pub fn advance_by(n: u32) {
+    for _ in 0..n {
+        advance();
+    }
+}
+
 /// Mark progress as complete (step = total) and notify.
 pub fn finish() {
     let t = TOTAL.load(Ordering::Relaxed);

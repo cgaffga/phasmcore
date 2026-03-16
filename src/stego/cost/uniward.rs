@@ -668,12 +668,30 @@ pub fn compute_positions_streaming(
         let pix_strip_y0 = pix_br_start * 8; // actual start (block-aligned)
         let pixels = decompress_strip_pixels(grid, qt, bw, pix_br_start, pix_br_end);
 
+        // Sub-strip progress: advance after pixel decompression (~1/3 of strip work).
+        {
+            let sub_target = (strip_idx as u32 * 3 + 1) * UNIWARD_PROGRESS_STEPS / (num_strips as u32 * 3);
+            while steps_sent < sub_target {
+                progress::advance();
+                steps_sent += 1;
+            }
+        }
+
         // Step 2: Compute wavelet subbands for the strip.
         let strip_wavelets = compute_strip_subbands(
             &pixels, img_w, pix_strip_h, pix_strip_y0,
             wav_y_start, wav_y_end, img_h, &lpdf,
         );
         drop(pixels); // Free pixel strip
+
+        // Sub-strip progress: advance after wavelet computation (~2/3 of strip work).
+        {
+            let sub_target = (strip_idx as u32 * 3 + 2) * UNIWARD_PROGRESS_STEPS / (num_strips as u32 * 3);
+            while steps_sent < sub_target {
+                progress::advance();
+                steps_sent += 1;
+            }
+        }
 
         // Step 3: Compute costs for blocks in [strip_start, strip_end) and
         // collect positions. Uses a temporary strip CostMap for parallel safety.
@@ -749,7 +767,7 @@ pub fn compute_positions_streaming(
         }
         // strip_map and strip_wavelets freed here.
 
-        // Advance progress proportionally across strips.
+        // Sub-strip progress: advance after cost computation (3/3 of strip work).
         strip_idx += 1;
         let target_steps = (strip_idx as u32 * UNIWARD_PROGRESS_STEPS) / num_strips as u32;
         while steps_sent < target_steps {

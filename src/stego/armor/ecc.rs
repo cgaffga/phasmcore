@@ -143,12 +143,20 @@ fn gen_poly() -> &'static Vec<u8> {
 /// Uses OnceLock per tier to avoid recomputing.
 fn gen_poly_for(parity_len: usize) -> &'static Vec<u8> {
     use std::sync::OnceLock;
+    static GEN_4: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_8: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_16: OnceLock<Vec<u8>> = OnceLock::new();
+    static GEN_32: OnceLock<Vec<u8>> = OnceLock::new();
     static GEN_64: OnceLock<Vec<u8>> = OnceLock::new();
     static GEN_128: OnceLock<Vec<u8>> = OnceLock::new();
     static GEN_192: OnceLock<Vec<u8>> = OnceLock::new();
     static GEN_240: OnceLock<Vec<u8>> = OnceLock::new();
 
     match parity_len {
+        4 => GEN_4.get_or_init(|| build_gen_poly(4)),
+        8 => GEN_8.get_or_init(|| build_gen_poly(8)),
+        16 => GEN_16.get_or_init(|| build_gen_poly(16)),
+        32 => GEN_32.get_or_init(|| build_gen_poly(32)),
         64 => GEN_64.get_or_init(|| build_gen_poly(64)),
         128 => GEN_128.get_or_init(|| build_gen_poly(128)),
         192 => GEN_192.get_or_init(|| build_gen_poly(192)),
