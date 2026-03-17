@@ -79,6 +79,7 @@ pub use shadow::shadow_capacity;
 pub use capacity::estimate_shadow_capacity;
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use capacity::estimate_capacity_si as ghost_capacity_si;
+pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
 pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 pub use payload::{PayloadData, FileEntry, compressed_payload_size};

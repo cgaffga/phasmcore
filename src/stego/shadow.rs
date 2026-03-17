@@ -83,9 +83,74 @@ const COST_FRACTIONS: [usize; 5] = [20, 10, 5, 2, 1];
 /// Maximum RS-encoded frame bytes to prevent unreasonable allocations.
 const MAX_SHADOW_FRAME_BYTES: usize = 256 * 1024;
 
-/// Maximum fdl scan range during brute-force decode (bytes above FRAME_OVERHEAD).
-/// Covers shadow messages up to ~2KB plaintext. Keeps decode time bounded.
-const MAX_FDL_SCAN: usize = 2048;
+/// Try a single (lsbs, fdl, parity, passphrase) combination.
+/// Returns `Some(Ok(payload))` on success, `None` on failure.
+fn try_single_fdl(
+    lsbs: &[u8],
+    fdl: usize,
+    parity_len: usize,
+    passphrase: &str,
+) -> Option<Result<PayloadData, StegoError>> {
+    let rs_encoded_len = ecc::rs_encoded_len_with_parity(fdl, parity_len);
+    let rs_bits_needed = rs_encoded_len * 8;
+    if rs_bits_needed > lsbs.len() {
+        return None;
+    }
+
+    let rs_bytes = frame::bits_to_bytes(&lsbs[..rs_bits_needed]);
+    let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
+        Ok((data, _stats)) => data,
+        Err(_) => return None,
+    };
+
+    let fr = match parse_shadow_frame(&decoded) {
+        Ok(f) => f,
+        Err(_) => return None,
+    };
+
+    match crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce) {
+        Ok(plaintext) => {
+            let len = fr.plaintext_len as usize;
+            if len > plaintext.len() {
+                return None;
+            }
+            Some(payload::decode_payload(&plaintext[..len]))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Peek at the first RS block to read `plaintext_len` and derive the exact fdl.
+/// Returns the candidate fdl if the first block decodes and the resulting fdl
+/// is plausible (>= k, within pool capacity).
+fn peek_fdl_from_first_block(
+    lsbs: &[u8],
+    parity_len: usize,
+    max_fdl: usize,
+) -> Option<usize> {
+    let k = 255usize.saturating_sub(parity_len);
+    if k < 2 || lsbs.len() < 255 * 8 {
+        return None;
+    }
+
+    // Decode the first 255 RS bytes as one full block (k data bytes).
+    let first_block_bytes = frame::bits_to_bytes(&lsbs[..255 * 8]);
+    let (data, _) = ecc::rs_decode_blocks_with_parity(&first_block_bytes, k, parity_len).ok()?;
+
+    if data.len() < 2 {
+        return None;
+    }
+    let plaintext_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let fdl = SHADOW_FRAME_OVERHEAD + plaintext_len;
+
+    // Only valid if fdl >= k (multi-block, so first block IS a full 255-byte block)
+    // and within pool capacity.
+    if fdl >= k && fdl <= max_fdl {
+        Some(fdl)
+    } else {
+        None
+    }
+}
 
 /// State for a single shadow layer during encoding.
 #[derive(Clone)]
@@ -330,23 +395,41 @@ pub fn shadow_extract(
             Some((fraction, lsbs))
         }).collect();
 
-        // Phase 2: Flatten all (fraction, parity, fdl) combos and try in parallel.
-        // Build combo descriptors: (fraction_idx, parity, fdl).
+        // Phase 2a: First-block peek — decode first RS block to read plaintext_len
+        // and derive the exact fdl. Handles messages where fdl >= k (most cases).
+        // This is O(30) RS block decodes — very fast.
+        for (_, (_, lsbs)) in fraction_lsbs.iter().enumerate() {
+            for &parity_len in &SHADOW_PARITY_TIERS {
+                let k = 255usize.saturating_sub(parity_len);
+                if k == 0 { continue; }
+                let max_rs_bytes = lsbs.len() / 8;
+                let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
+                    .min(MAX_SHADOW_FRAME_BYTES);
+                if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
+
+                if let Some(fdl) = peek_fdl_from_first_block(lsbs, parity_len, max_fdl) {
+                    if let Some(result) = try_single_fdl(lsbs, fdl, parity_len, passphrase) {
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Phase 2b: Small-fdl fallback — for tiny messages where fdl < k (single
+        // partial RS block). Scan fdl from SHADOW_FRAME_OVERHEAD to min(k-1, max_fdl).
+        // Typically ~200 values per (fraction, parity) → ~6K combos total.
         let mut combos: Vec<(usize, usize, usize)> = Vec::new();
         for (fi, (_, lsbs)) in fraction_lsbs.iter().enumerate() {
             for &parity_len in &SHADOW_PARITY_TIERS {
                 let k = 255usize.saturating_sub(parity_len);
-                if k == 0 {
-                    continue;
-                }
+                if k < 2 { continue; }
                 let max_rs_bytes = lsbs.len() / 8;
                 let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
                     .min(MAX_SHADOW_FRAME_BYTES);
-                if SHADOW_FRAME_OVERHEAD > max_fdl {
-                    continue;
-                }
-                let scan_max = max_fdl.min(SHADOW_FRAME_OVERHEAD + MAX_FDL_SCAN);
-                for fdl in SHADOW_FRAME_OVERHEAD..=scan_max {
+                // Only scan fdl < k (partial block range); peek handled fdl >= k.
+                let small_max = (k - 1).min(max_fdl);
+                if SHADOW_FRAME_OVERHEAD > small_max { continue; }
+                for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
                     combos.push((fi, parity_len, fdl));
                 }
             }
@@ -354,41 +437,7 @@ pub fn shadow_extract(
 
         let result = combos.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
             let lsbs = &fraction_lsbs[fi].1;
-            let rs_encoded_len = ecc::rs_encoded_len_with_parity(fdl, parity_len);
-            let rs_bits_needed = rs_encoded_len * 8;
-            if rs_bits_needed > lsbs.len() {
-                return None;
-            }
-
-            let rs_bytes = frame::bits_to_bytes(&lsbs[..rs_bits_needed]);
-            let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
-                Ok((data, _stats)) => data,
-                Err(_) => return None,
-            };
-
-            let fr = match parse_shadow_frame(&decoded) {
-                Ok(f) => f,
-                Err(_) => return None,
-            };
-
-            match crypto::decrypt(
-                &fr.ciphertext,
-                passphrase,
-                &fr.salt,
-                &fr.nonce,
-            ) {
-                Ok(plaintext) => {
-                    let len = fr.plaintext_len as usize;
-                    if len > plaintext.len() {
-                        return None;
-                    }
-                    Some(payload::decode_payload(&plaintext[..len]))
-                }
-                // In shadow brute-force, DecryptionFailed is common noise:
-                // RS can decode random bytes that parse as a valid frame but
-                // fail AES-GCM authentication. Continue trying other combos.
-                Err(_) => None,
-            }
+            try_single_fdl(lsbs, fdl, parity_len, passphrase)
         });
 
         match result {
@@ -435,77 +484,38 @@ pub fn shadow_extract(
     }
 }
 
-/// Try all (parity, fdl) combinations on a given LSB vector.
-/// Returns `Some(Ok(...))` on success, `Some(Err(...))` on fatal error,
-/// or `None` to continue to next fraction.
+/// Try all (parity, fdl) combinations on a given LSB vector using
+/// first-block peek + small-fdl fallback.
+/// Returns `Some(Ok(...))` on success or `None` to continue to next fraction.
 #[cfg(not(feature = "parallel"))]
 fn try_extract_with_lsbs(
     all_lsbs: &[u8],
     passphrase: &str,
-    last_err: &mut StegoError,
+    _last_err: &mut StegoError,
 ) -> Option<Result<PayloadData, StegoError>> {
     for &parity_len in &SHADOW_PARITY_TIERS {
         let k = 255usize.saturating_sub(parity_len);
-        if k == 0 {
-            continue;
-        }
+        if k < 2 { continue; }
 
         let max_rs_bytes = all_lsbs.len() / 8;
         let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
             .min(MAX_SHADOW_FRAME_BYTES);
+        if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
 
-        if SHADOW_FRAME_OVERHEAD > max_fdl {
-            continue;
+        // First-block peek: derive exact fdl from first RS block.
+        if let Some(fdl) = peek_fdl_from_first_block(all_lsbs, parity_len, max_fdl) {
+            if let Some(result) = try_single_fdl(all_lsbs, fdl, parity_len, passphrase) {
+                return Some(result);
+            }
         }
 
-        let scan_max = max_fdl.min(SHADOW_FRAME_OVERHEAD + MAX_FDL_SCAN);
-        for fdl in SHADOW_FRAME_OVERHEAD..=scan_max {
-            let rs_encoded_len = ecc::rs_encoded_len_with_parity(fdl, parity_len);
-            let rs_bits_needed = rs_encoded_len * 8;
-
-            if rs_bits_needed > all_lsbs.len() {
-                break;
+        // Small-fdl fallback: scan partial-block range (fdl < k).
+        let small_max = (k - 1).min(max_fdl);
+        if SHADOW_FRAME_OVERHEAD > small_max { continue; }
+        for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
+            if let Some(result) = try_single_fdl(all_lsbs, fdl, parity_len, passphrase) {
+                return Some(result);
             }
-
-            let rs_bytes = frame::bits_to_bytes(&all_lsbs[..rs_bits_needed]);
-
-            let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
-                Ok((data, _stats)) => data,
-                Err(_) => continue,
-            };
-
-            let fr = match parse_shadow_frame(&decoded) {
-                Ok(f) => f,
-                Err(e) => {
-                    *last_err = e;
-                    continue;
-                }
-            };
-
-            let plaintext = match crypto::decrypt(
-                &fr.ciphertext,
-                passphrase,
-                &fr.salt,
-                &fr.nonce,
-            ) {
-                Ok(p) => p,
-                Err(StegoError::DecryptionFailed) => {
-                    *last_err = StegoError::DecryptionFailed;
-                    continue;
-                }
-                Err(e) => {
-                    *last_err = e;
-                    continue;
-                }
-            };
-
-            let len = fr.plaintext_len as usize;
-            if len > plaintext.len() {
-                *last_err = StegoError::FrameCorrupted;
-                continue;
-            }
-
-            return Some(payload::decode_payload(&plaintext[..len]));
         }
     }
 

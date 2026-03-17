@@ -118,6 +118,39 @@ pub fn estimate_shadow_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     Ok(shadow::shadow_capacity(y_nzac))
 }
 
+/// Estimate Ghost primary capacity accounting for shadow position overhead.
+///
+/// Subtracts shadow positions from usable Y NZAC before computing primary
+/// capacity. Uses conservative RS parity (16) for the estimate since the
+/// escalation cascade frequently bumps parity above the initial 4.
+pub fn estimate_capacity_with_shadows(
+    img: &JpegImage,
+    shadow_count: usize,
+    shadow_total_bytes: usize,
+    is_si: bool,
+) -> Result<usize, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let y_nzac = count_nonzero_ac(img.dct_grid(0));
+    let ratio = if is_si { MIN_CAPACITY_RATIO_SI } else { MIN_CAPACITY_RATIO };
+
+    // Conservative RS parity for capacity estimate (cascade often escalates)
+    let parity = 16usize;
+    // Compute RS-encoded shadow bytes (per shadow: frame_overhead + payload, RS-encoded)
+    let shadow_frame_overhead = 46usize; // plaintext_len(2) + salt(16) + nonce(12) + tag(16)
+    let total_shadow_frame_bytes = shadow_count * shadow_frame_overhead + shadow_total_bytes;
+    // RS encoding expands data: for each 255-byte block, parity bytes added
+    let k = 255 - parity; // 239 data bytes per block
+    let full_blocks = (total_shadow_frame_bytes + k - 1) / k;
+    let shadow_rs_bytes = full_blocks * 255;
+    let shadow_bits = shadow_rs_bytes * 8;
+
+    // Subtract shadow positions from available pool
+    let effective_nzac = y_nzac.saturating_sub(shadow_bits);
+    Ok(capacity_from_usable(effective_nzac, ratio))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

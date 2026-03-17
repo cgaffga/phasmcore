@@ -205,6 +205,26 @@ pub const GHOST_ENCODE_WITH_SHADOWS_STEPS: u32 =
     + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS  // verification pass
     + crate::jpeg::scan::JPEG_WRITE_STEPS;
 
+/// Escalation cascade for shadow verification.
+///
+/// Tries fraction=1 (100% pool) first — eliminates boundary disagreement
+/// entirely. If fraction=1 fails, tighter fractions won't help at the same
+/// parity. Then tries tighter fractions with higher proven parity for stealth.
+const CASCADE: &[(usize, usize)] = &[
+    // Try 100% pool first — eliminates boundary disagreement entirely.
+    // If this fails, tighter fractions won't help.
+    (1, 4),
+    (1, 8),
+    (1, 16),
+    (1, 32),
+    (1, 64),
+    (1, 128),
+    // Then try tighter fractions with proven-working parity for better stealth.
+    (2, 16), (5, 16), (10, 16),
+    (2, 32), (5, 32),
+    (2, 64),
+];
+
 /// Encode with Ghost mode plus shadow messages for plausible deniability.
 ///
 /// Shadow layers are embedded first using repetition coding. The primary
@@ -263,8 +283,13 @@ fn ghost_encode_with_shadows_impl(
     si: Option<SideInfo>,
     pre_parsed: Option<JpegImage>,
 ) -> Result<Vec<u8>, StegoError> {
-    // Initialize progress.
-    progress::init(GHOST_ENCODE_WITH_SHADOWS_STEPS);
+    // Initialize progress with worst-case cascade budget so the bar moves
+    // smoothly without dynamic set_total() jumps.
+    let cascade_budget = CASCADE.len() as u32 * (
+        crate::stego::stc::embed::STC_PROGRESS_STEPS
+        + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
+    );
+    progress::init(GHOST_ENCODE_WITH_SHADOWS_STEPS + cascade_budget);
 
     // Validate passphrases are unique (primary + all shadows).
     {
@@ -412,6 +437,12 @@ fn ghost_encode_with_shadows_impl(
         return Err(StegoError::MessageTooLarge);
     }
 
+    // Upfront w check: w=1 means no STC slack — ∞-cost protection disabled,
+    // shadow BER ≈ 50%. Fail fast instead of a 10-minute cascade.
+    if w < 2 && !shadow_states.is_empty() {
+        return Err(StegoError::MessageTooLarge);
+    }
+
     const STC_POSITION_LIMIT: usize = 500_000_000;
     if n_used > STC_POSITION_LIMIT {
         return Err(StegoError::ImageTooLarge);
@@ -427,11 +458,7 @@ fn ghost_encode_with_shadows_impl(
 
     // 5. Embed shadows + primary STC (always short STC: frame_bits, not padded).
     if shadow_states.is_empty() {
-        // No shadows → no verification UNIWARD pass needed. Reduce total
-        // so progress doesn't stall at ~60% waiting for steps that never come.
-        let reduced = GHOST_ENCODE_WITH_SHADOWS_STEPS
-            - crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
-        progress::set_total(reduced);
+        // No shadows → no verification UNIWARD pass needed.
         run_stc_pass(&mut img, &original_y, &positions, &[],
                      &frame_bits, &hhat_matrix, w, &si, &None)?;
     } else {
@@ -443,68 +470,158 @@ fn ghost_encode_with_shadows_impl(
         // selects the same positions regardless of cover vs stego costs.
         // This saves a full UNIWARD recomputation (2-10s on large images).
         let all_fraction_1 = shadow_states.iter().all(|s| s.cost_fraction == 1);
-        if all_fraction_1 {
-            // Skip verification — reduce progress total since UNIWARD won't run.
-            let reduced = GHOST_ENCODE_WITH_SHADOWS_STEPS
-                - crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
-            progress::set_total(reduced);
-        }
 
         // Verify shadows from the DECODER's perspective: compute UNIWARD costs
         // on the stego image (as the decoder will see it), select positions
         // using stego costs + same fraction/hash, and check RS decode + decrypt.
         // This catches cost-pool boundary disagreements between cover and stego.
         if !all_fraction_1 {
-        let qt_verify = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-        let mut stego_y_positions = compute_positions_streaming(img.dct_grid(0), qt_verify, None)?;
-        stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+            let qt_verify = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+            let mut stego_y_positions = compute_positions_streaming(img.dct_grid(0), qt_verify, None)?;
+            stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-        if !verify_all_shadows_decoder_side(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
-            // Escalate: try progressively larger fractions (more positions,
-            // lower BER) and higher parities (more error correction).
-            // Ordered by stealth preference: aggressive combos first.
-            const CASCADE: &[(usize, usize)] = &[
-                // (fraction_denom, parity): smaller denom = bigger pool = less BER
-                (10, 4), (5, 4), (2, 4), (1, 4),
-                (10, 16), (5, 16), (2, 16), (1, 16),
-                (5, 32), (2, 32), (1, 32),
-                (2, 64), (1, 64),
-                (1, 128),
-            ];
-            // Build cost-sorted positions for cascade (only allocated when
-            // verification fails — saves ~800 MB in the happy path on large images).
-            let mut cascade_positions = positions.clone();
-            cascade_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+            if !verify_all_shadows_decoder_side(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
+                // Escalate: try progressively larger fractions (more positions,
+                // lower BER) and higher parities (more error correction).
+                // CASCADE is ordered: fraction=1 first (eliminates boundary
+                // disagreement), then tighter fractions with higher parity.
 
-            let mut verified = false;
-            for &(frac, par) in CASCADE {
-                // Bump progress total for this cascade iteration (STC + UNIWARD verify).
-                let cascade_steps = crate::stego::stc::embed::STC_PROGRESS_STEPS
-                    + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS;
-                let (_, current_total) = progress::get();
-                progress::set_total(current_total + cascade_steps);
+                // Build cost-sorted positions for cascade (only allocated when
+                // verification fails — saves ~800 MB in the happy path on large images).
+                let mut cascade_positions = positions.clone();
+                cascade_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-                for state in shadow_states.iter_mut() {
-                    shadow::rebuild_shadow(state, &cascade_positions, par, frac)?;
+                let mut verified = false;
+
+                #[cfg(feature = "parallel")]
+                {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    use rayon::prelude::*;
+
+                    // Group CASCADE by parity, try all fractions for each parity in parallel.
+                    // Within each parity tier, find the BEST (largest) fraction that verifies.
+                    // Larger fraction = fewer positions = tighter pool = more stealth.
+                    let best_fraction = AtomicUsize::new(0);
+
+                    for &parity in &[4, 8, 16, 32, 64, 128] {
+                        let fractions_for_parity: Vec<usize> = CASCADE.iter()
+                            .filter(|&&(_, p)| p == parity)
+                            .map(|&(f, _)| f)
+                            .collect();
+                        if fractions_for_parity.is_empty() { continue; }
+
+                        let has_fraction_1 = fractions_for_parity.contains(&1);
+
+                        let successes: Vec<(usize, crate::jpeg::JpegImage, Vec<shadow::ShadowState>)> =
+                            fractions_for_parity.par_iter().filter_map(|&fraction| {
+                            // Checkpoint: skip if a better (larger) fraction already verified.
+                            if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
+
+                            // Rebuild shadows with this (fraction, parity).
+                            let mut local_states = shadow_states.clone();
+                            let local_cascade_positions = cascade_positions.clone();
+                            for state in local_states.iter_mut() {
+                                if shadow::rebuild_shadow(state, &local_cascade_positions, parity, fraction).is_err() {
+                                    return None;
+                                }
+                            }
+
+                            // Checkpoint before STC (expensive).
+                            if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
+
+                            let mut local_img = img.clone();
+                            let new_inf_costs = build_inf_cost_set(w, &local_states);
+                            if run_stc_pass(&mut local_img, &original_y, &positions, &local_states,
+                                         &frame_bits, &hhat_matrix, w, &si, &new_inf_costs).is_err() {
+                                return None;
+                            }
+
+                            // Checkpoint before UNIWARD recomputation (expensive).
+                            if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
+
+                            let qt_re = match local_img.quant_table(qt_id) {
+                                Some(qt) => qt,
+                                None => return None,
+                            };
+                            let mut local_stego_positions = match compute_positions_streaming(local_img.dct_grid(0), qt_re, None) {
+                                Ok(p) => p,
+                                Err(_) => return None,
+                            };
+                            local_stego_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+
+                            if verify_all_shadows_decoder_side(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
+                                // Publish: this fraction verified successfully.
+                                best_fraction.fetch_max(fraction, Ordering::Relaxed);
+                                Some((fraction, local_img, local_states))
+                            } else {
+                                None
+                            }
+                        }).collect();
+
+                        if !successes.is_empty() {
+                            // Pick the best (largest fraction = tightest pool = most stealth).
+                            let best = successes.into_iter().max_by_key(|(f, _, _)| *f).unwrap();
+                            img = best.1;
+                            shadow_states = best.2;
+                            verified = true;
+                            break;
+                        }
+
+                        // fraction=1 early bailout: if 100% pool fails at this parity,
+                        // tighter fractions at higher parity won't fix boundary issues.
+                        if has_fraction_1 && parity == 128 {
+                            break;
+                        }
+                    }
                 }
-                let new_inf_costs = build_inf_cost_set(w, &shadow_states);
-                run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
-                             &frame_bits, &hhat_matrix, w, &si, &new_inf_costs)?;
 
-                // Recompute stego costs after re-encoding.
-                let qt_re = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-                stego_y_positions = compute_positions_streaming(img.dct_grid(0), qt_re, None)?;
-                stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+                #[cfg(not(feature = "parallel"))]
+                {
+                    let mut last_fraction_1_failed_parity: Option<usize> = None;
+                    for &(frac, par) in CASCADE {
+                        // Early termination: if fraction=1 failed at a parity,
+                        // tighter fractions at that same parity will also fail.
+                        if frac > 1 {
+                            if let Some(failed_par) = last_fraction_1_failed_parity {
+                                if par <= failed_par {
+                                    continue;
+                                }
+                            }
+                        }
 
-                if verify_all_shadows_decoder_side(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
-                    verified = true;
-                    break;
+                        for state in shadow_states.iter_mut() {
+                            shadow::rebuild_shadow(state, &cascade_positions, par, frac)?;
+                        }
+                        let new_inf_costs = build_inf_cost_set(w, &shadow_states);
+                        run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
+                                     &frame_bits, &hhat_matrix, w, &si, &new_inf_costs)?;
+
+                        // Recompute stego costs after re-encoding.
+                        let qt_re = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+                        stego_y_positions = compute_positions_streaming(img.dct_grid(0), qt_re, None)?;
+                        stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+
+                        if verify_all_shadows_decoder_side(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
+                            verified = true;
+                            break;
+                        }
+
+                        // Track fraction=1 failures for early termination.
+                        if frac == 1 {
+                            last_fraction_1_failed_parity = Some(par);
+                        }
+
+                        // fraction=1 at max parity failed — nothing will work
+                        if frac == 1 && par == 128 {
+                            break;
+                        }
+                    }
+                }
+
+                if !verified {
+                    return Err(StegoError::MessageTooLarge);
                 }
             }
-            if !verified {
-                return Err(StegoError::MessageTooLarge);
-            }
-        }
         } // if !all_fraction_1
     }
 
