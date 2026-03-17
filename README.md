@@ -22,7 +22,7 @@ Shadows use **Y-channel direct LSB embedding** with Reed-Solomon error correctio
 
 - **Cost-pool position selection** — shadow positions are drawn from the cheapest UNIWARD-cost regions via two-tier filtering (top-N% cost pool + keyed ChaCha20 permutation), ensuring modifications land in textured areas for maximum stealth
 - **∞-cost protection** — when the primary message uses dynamic w ≥ 2, shadow positions receive `f32::INFINITY` cost in the STC Viterbi trellis, routing the primary encoder around them with **BER ≈ 0%**
-- **Headerless brute-force decode** — no magic bytes or agreed-upon parameters. The decoder brute-forces all combinations of cost-pool fraction (5 values: 5%–100%), RS parity tier (6 values: 4–128), and frame data length (~20 block-aligned sizes) — approximately **600 attempts in ~9ms**. AES-256-GCM-SIV authentication is the only validator
+- **Headerless brute-force decode** — no magic bytes or agreed-upon parameters. A "first-block peek" decodes just the first RS block for each (fraction, parity) combination to read `plaintext_len` and derive the exact frame data length — **~30 RS block decodes** instead of scanning thousands of FDL values. A small-FDL fallback handles tiny messages (single partial RS block). AES-256-GCM-SIV authentication is the only validator
 - **Stego-cost verification** — after STC embedding, the encoder re-runs UNIWARD on the stego image to verify shadow BER. If verification fails, an **escalation cascade** automatically increases RS parity (4 → 8 → 16 → … → 128) until the shadow survives or capacity is exhausted
 
 `smart_decode` automatically tries shadow decode as a fallback after primary Ghost decode.
