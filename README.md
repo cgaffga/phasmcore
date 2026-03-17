@@ -164,7 +164,7 @@ smart_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 optimize_cover(pixels_rgb, width, height, config) -> Vec<u8>
 
 // Capacity estimation with Brotli compression
-compressed_payload_size(text, mode) -> usize
+compressed_payload_size(text, files) -> usize
 
 // Image dimension validation
 validate_encode_dimensions(width, height) -> Result<()>
