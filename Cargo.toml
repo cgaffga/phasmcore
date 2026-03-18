@@ -1,3 +1,6 @@
+[workspace]
+members = ["cli"]
+
 [package]
 name = "phasm-core"
 version = "0.1.0"
@@ -28,3 +31,8 @@ brotli = { version = "7", default-features = false, features = ["std"] }
 zeroize = "1"
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
