@@ -21,10 +21,16 @@ use crate::stego::permute;
 use crate::stego::progress;
 use crate::stego::side_info::{self, SideInfo};
 use crate::stego::shadow;
+use crate::stego::quality::{self, EncodeQuality, GhostMetrics};
 use crate::stego::stc::{embed, extract, hhat};
 
 /// STC constraint length for Ghost Phase 1.
 const STC_H: usize = 7;
+
+/// Maximum number of STC cover positions before OOM protection kicks in.
+/// 500M positions × 16 bytes/u128 = 8 GB back pointer memory (segmented
+/// path uses O(sqrt(n)) but the coefficient vectors are still O(n)).
+const STC_POSITION_LIMIT: usize = 500_000_000;
 
 /// Progress steps allocated to JPEG parsing.  Reported immediately after
 /// `JpegImage::from_bytes` returns so the bar moves off 0% right away.
@@ -73,7 +79,6 @@ fn compute_stc_params(n: usize) -> Result<(usize, usize, usize), StegoError> {
     let w = n / m_max; // floor division
     let n_used = m_max * w;
 
-    const STC_POSITION_LIMIT: usize = 500_000_000;
     if n_used > STC_POSITION_LIMIT {
         return Err(StegoError::ImageTooLarge);
     }
@@ -103,6 +108,16 @@ pub fn ghost_encode(
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
     ghost_encode_impl(image_bytes, message, &[], passphrase, None, None)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Encode with Ghost mode and return the encode quality score.
+pub fn ghost_encode_with_quality(
+    image_bytes: &[u8],
+    message: &str,
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
+    ghost_encode_impl(image_bytes, message, &[], passphrase, None, None)
 }
 
 /// Encode a text message with file attachments into a cover JPEG using Ghost mode.
@@ -115,6 +130,17 @@ pub fn ghost_encode_with_files(
     files: &[FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_impl(image_bytes, message, files, passphrase, None, None)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Encode with Ghost mode + files and return the encode quality score.
+pub fn ghost_encode_with_files_quality(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     ghost_encode_impl(image_bytes, message, files, passphrase, None, None)
 }
 
@@ -147,6 +173,21 @@ pub fn ghost_encode_si(
     )
 }
 
+/// Encode with SI-UNIWARD and return the encode quality score.
+pub fn ghost_encode_si_with_quality(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
+    ghost_encode_si_with_files_quality(
+        image_bytes, raw_pixels_rgb, pixel_width, pixel_height,
+        message, &[], passphrase,
+    )
+}
+
 /// Encode with side information and file attachments.
 pub fn ghost_encode_si_with_files(
     image_bytes: &[u8],
@@ -157,6 +198,22 @@ pub fn ghost_encode_si_with_files(
     files: &[FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_si_with_files_quality(
+        image_bytes, raw_pixels_rgb, pixel_width, pixel_height,
+        message, files, passphrase,
+    ).map(|(bytes, _)| bytes)
+}
+
+/// Encode with SI-UNIWARD + files and return the encode quality score.
+pub fn ghost_encode_si_with_files_quality(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     // Parse image first to get the grid and QT for side info computation
     let img = JpegImage::from_bytes(image_bytes)?;
     let fi = img.frame_info();
@@ -239,6 +296,19 @@ pub fn ghost_encode_with_shadows(
     si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
     ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si, None)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Encode with Ghost mode + shadows and return the encode quality score.
+pub fn ghost_encode_with_shadows_quality(
+    image_bytes: &[u8],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+    shadows: &[ShadowLayer],
+    si: Option<SideInfo>,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
+    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si, None)
 }
 
 /// Encode with Ghost SI-UNIWARD plus shadow messages.
@@ -252,6 +322,23 @@ pub fn ghost_encode_si_with_shadows(
     passphrase: &str,
     shadows: &[ShadowLayer],
 ) -> Result<Vec<u8>, StegoError> {
+    ghost_encode_si_with_shadows_quality(
+        image_bytes, raw_pixels_rgb, pixel_width, pixel_height,
+        message, files, passphrase, shadows,
+    ).map(|(bytes, _)| bytes)
+}
+
+/// Encode with SI-UNIWARD + shadows and return the encode quality score.
+pub fn ghost_encode_si_with_shadows_quality(
+    image_bytes: &[u8],
+    raw_pixels_rgb: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+    shadows: &[ShadowLayer],
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let img = JpegImage::from_bytes(image_bytes)?;
     let fi = img.frame_info();
     super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
@@ -282,7 +369,7 @@ fn ghost_encode_with_shadows_impl(
     shadows: &[ShadowLayer],
     si: Option<SideInfo>,
     pre_parsed: Option<JpegImage>,
-) -> Result<Vec<u8>, StegoError> {
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     // Initialize progress with worst-case cascade budget so the bar moves
     // smoothly without dynamic set_total() jumps.
     let cascade_budget = CASCADE.len() as u32 * (
@@ -443,7 +530,6 @@ fn ghost_encode_with_shadows_impl(
         return Err(StegoError::MessageTooLarge);
     }
 
-    const STC_POSITION_LIMIT: usize = 500_000_000;
     if n_used > STC_POSITION_LIMIT {
         return Err(StegoError::ImageTooLarge);
     }
@@ -456,14 +542,46 @@ fn ghost_encode_with_shadows_impl(
     // achieving BER ~ 0% on shadows without any RS correction needed.
     let shadow_inf_costs = build_inf_cost_set(w, &shadow_states);
 
+    // Compute median cost before STC for quality scoring.
+    let median_cost = {
+        let mut finite_costs: Vec<f32> = positions.iter()
+            .map(|p| p.cost)
+            .filter(|c| c.is_finite())
+            .collect();
+        if finite_costs.is_empty() {
+            0.0f32
+        } else {
+            let mid = finite_costs.len() / 2;
+            finite_costs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            finite_costs[mid]
+        }
+    };
+    let is_si = si.is_some();
+    let grid_ref = img.dct_grid(0);
+    let total_coefficients = grid_ref.blocks_wide() * grid_ref.blocks_tall() * 64;
+
+    // Count total shadow embedding positions for quality scoring.
+    // Use n_total (actual RS-encoded bit count) rather than positions.len()
+    // (the pool size), since only n_total positions are written by embed_shadow_lsb.
+    let shadow_modifications: usize = shadow_states.iter()
+        .map(|s| s.n_total)
+        .sum();
+
     // 5. Embed shadows + primary STC (always short STC: frame_bits, not padded).
+    let mut stc_total_cost: f64 = 0.0;
+    let mut stc_num_modifications: usize = 0;
+
     if shadow_states.is_empty() {
         // No shadows → no verification UNIWARD pass needed.
-        run_stc_pass(&mut img, &original_y, &positions, &[],
+        let (tc, nm) = run_stc_pass(&mut img, &original_y, &positions, &[],
                      &frame_bits, &hhat_matrix, w, &si, &None)?;
+        stc_total_cost = tc;
+        stc_num_modifications = nm;
     } else {
-        run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
+        let (tc, nm) = run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
                      &frame_bits, &hhat_matrix, w, &si, &shadow_inf_costs)?;
+        stc_total_cost = tc;
+        stc_num_modifications = nm;
 
         // Skip verification when ALL shadows use fraction=1 (100% pool).
         // With 100% pool there's no cost-pool boundary, so decoder always
@@ -512,7 +630,7 @@ fn ghost_encode_with_shadows_impl(
 
                         let has_fraction_1 = fractions_for_parity.contains(&1);
 
-                        let successes: Vec<(usize, crate::jpeg::JpegImage, Vec<shadow::ShadowState>)> =
+                        let successes: Vec<(usize, crate::jpeg::JpegImage, Vec<shadow::ShadowState>, f64, usize)> =
                             fractions_for_parity.par_iter().filter_map(|&fraction| {
                             // Checkpoint: skip if a better (larger) fraction already verified.
                             if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
@@ -531,10 +649,11 @@ fn ghost_encode_with_shadows_impl(
 
                             let mut local_img = img.clone();
                             let new_inf_costs = build_inf_cost_set(w, &local_states);
-                            if run_stc_pass(&mut local_img, &original_y, &positions, &local_states,
-                                         &frame_bits, &hhat_matrix, w, &si, &new_inf_costs).is_err() {
-                                return None;
-                            }
+                            let (local_tc, local_nm) = match run_stc_pass(&mut local_img, &original_y, &positions, &local_states,
+                                         &frame_bits, &hhat_matrix, w, &si, &new_inf_costs) {
+                                Ok(v) => v,
+                                Err(_) => return None,
+                            };
 
                             // Checkpoint before UNIWARD recomputation (expensive).
                             if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
@@ -552,7 +671,7 @@ fn ghost_encode_with_shadows_impl(
                             if verify_all_shadows_decoder_side(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
                                 // Publish: this fraction verified successfully.
                                 best_fraction.fetch_max(fraction, Ordering::Relaxed);
-                                Some((fraction, local_img, local_states))
+                                Some((fraction, local_img, local_states, local_tc, local_nm))
                             } else {
                                 None
                             }
@@ -560,9 +679,11 @@ fn ghost_encode_with_shadows_impl(
 
                         if !successes.is_empty() {
                             // Pick the best (largest fraction = tightest pool = most stealth).
-                            let best = successes.into_iter().max_by_key(|(f, _, _)| *f).unwrap();
+                            let best = successes.into_iter().max_by_key(|(f, _, _, _, _)| *f).unwrap();
                             img = best.1;
                             shadow_states = best.2;
+                            stc_total_cost = best.3;
+                            stc_num_modifications = best.4;
                             verified = true;
                             break;
                         }
@@ -593,8 +714,10 @@ fn ghost_encode_with_shadows_impl(
                             shadow::rebuild_shadow(state, &cascade_positions, par, frac)?;
                         }
                         let new_inf_costs = build_inf_cost_set(w, &shadow_states);
-                        run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
+                        let (tc, nm) = run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
                                      &frame_bits, &hhat_matrix, w, &si, &new_inf_costs)?;
+                        stc_total_cost = tc;
+                        stc_num_modifications = nm;
 
                         // Recompute stego costs after re-encoding.
                         let qt_re = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
@@ -625,6 +748,18 @@ fn ghost_encode_with_shadows_impl(
         } // if !all_fraction_1
     }
 
+    // Compute quality score with shadow penalty.
+    let encode_quality = quality::ghost_stealth_score(&GhostMetrics {
+        num_modifications: stc_num_modifications,
+        n_used,
+        w,
+        total_cost: stc_total_cost,
+        median_cost,
+        is_si,
+        shadow_modifications,
+        total_coefficients,
+    });
+
     // Free large allocations before JPEG output to reduce peak memory.
     drop(positions);
     drop(original_y);
@@ -642,10 +777,12 @@ fn ghost_encode_with_shadows_impl(
         }
     };
 
-    Ok(stego_bytes)
+    Ok((stego_bytes, encode_quality))
 }
 
 /// Run a single STC pass: restore Y grid, embed shadows, then run STC with optional ∞-cost.
+///
+/// Returns `(total_cost, num_modifications)` from STC embedding.
 fn run_stc_pass(
     img: &mut JpegImage,
     original_y: &crate::jpeg::dct::DctGrid,
@@ -656,7 +793,7 @@ fn run_stc_pass(
     w: usize,
     si: &Option<SideInfo>,
     shadow_inf_costs: &Option<std::collections::HashSet<u32>>,
-) -> Result<(), StegoError> {
+) -> Result<(f64, usize), StegoError> {
     *img.dct_grid_mut(0) = original_y.clone();
 
     for state in shadow_states {
@@ -686,9 +823,12 @@ fn run_stc_pass(
     progress::check_cancelled()?;
     let result = result.ok_or(StegoError::MessageTooLarge)?;
 
+    let total_cost = result.total_cost;
+    let num_modifications = result.num_modifications;
+
     apply_stc_changes(img, positions, &cover_bits, &result.stego_bits, si);
 
-    Ok(())
+    Ok((total_cost, num_modifications))
 }
 
 /// Apply STC LSB changes to the DctGrid.
@@ -756,7 +896,7 @@ fn ghost_encode_impl(
     passphrase: &str,
     si: Option<SideInfo>,
     pre_parsed: Option<JpegImage>,
-) -> Result<Vec<u8>, StegoError> {
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     // Initialize encode progress (100 UNIWARD + 50 STC + 2 misc).
     progress::init(GHOST_ENCODE_STEPS);
 
@@ -823,7 +963,6 @@ fn ghost_encode_impl(
     }
 
     // Memory budget check (same as compute_stc_params).
-    const STC_POSITION_LIMIT: usize = 500_000_000;
     if n_used > STC_POSITION_LIMIT {
         return Err(StegoError::ImageTooLarge);
     }
@@ -838,13 +977,42 @@ fn ghost_encode_impl(
     }).collect();
     let costs: Vec<f32> = positions.iter().map(|p| p.cost).collect();
 
-    // 8. Generate H-hat and embed with short STC (actual m bits, not padded).
+    // 8. Compute median cost (for quality score) before STC.
+    let median_cost = {
+        let mut finite_costs: Vec<f32> = costs.iter().copied().filter(|c| c.is_finite()).collect();
+        if finite_costs.is_empty() {
+            0.0f32
+        } else {
+            let mid = finite_costs.len() / 2;
+            finite_costs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            finite_costs[mid]
+        }
+    };
+    let is_si = si.is_some();
+
+    // Total Y-channel coefficients for quality scoring.
+    let grid_ref = img.dct_grid(0);
+    let total_coefficients = grid_ref.blocks_wide() * grid_ref.blocks_tall() * 64;
+
+    // 9. Generate H-hat and embed with short STC (actual m bits, not padded).
     let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
     let result = embed::stc_embed(&cover_bits, &costs, &frame_bits, &hhat_matrix, STC_H, w);
     progress::check_cancelled()?;
     let result = result.ok_or(StegoError::MessageTooLarge)?;
 
-    // 9. Apply LSB changes to DctGrid.
+    // 10. Compute encode quality score.
+    let encode_quality = quality::ghost_stealth_score(&GhostMetrics {
+        num_modifications: result.num_modifications,
+        n_used,
+        w,
+        total_cost: result.total_cost,
+        median_cost,
+        is_si,
+        shadow_modifications: 0,
+        total_coefficients,
+    });
+
+    // 11. Apply LSB changes to DctGrid.
     let grid_mut = img.dct_grid_mut(0);
     for (idx, pos) in positions.iter().enumerate() {
         let old_bit = cover_bits[idx];
@@ -868,7 +1036,7 @@ fn ghost_encode_impl(
     drop(result);
     drop(si);
 
-    // 10. Write modified JPEG (with progress reporting during scan encoding).
+    // 12. Write modified JPEG (with progress reporting during scan encoding).
     let progress_cb = || progress::advance();
     let stego_bytes = match img.to_bytes_with_progress(Some(&progress_cb)) {
         Ok(bytes) => bytes,
@@ -878,7 +1046,7 @@ fn ghost_encode_impl(
         }
     };
 
-    Ok(stego_bytes)
+    Ok((stego_bytes, encode_quality))
 }
 
 /// Decode a payload from a stego JPEG using Ghost mode.

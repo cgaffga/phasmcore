@@ -97,7 +97,8 @@ pub fn optimize_cover(
 /// Returns `(noise_factor, contrast_factor, sharpen_factor, dither_factor)`,
 /// each in [0.0, 1.0]. A factor of 0.0 means "skip this stage entirely"
 /// (image already has plenty of that characteristic). 1.0 means "apply fully".
-fn analyze_texture(luma: &[f64], variance: &[f64], _pixels: &[u8], w: usize, h: usize) -> (f64, f64, f64, f64) {
+#[cfg(test)]
+fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, f64, f64, f64) {
     let n = w * h;
     if n == 0 {
         return (1.0, 1.0, 1.0, 1.0);
@@ -565,7 +566,7 @@ fn smooth_block_boundaries(pixels: &mut [u8], w: usize, h: usize, strength: f32)
 
     // Vertical block edges (columns at multiples of 8)
     for col in (8..w).step_by(8) {
-        if col == 0 || col >= w {
+        if col >= w {
             continue;
         }
         for y in 0..h {
@@ -824,7 +825,7 @@ mod tests {
         let pixels = vec![128u8; w * h * 3]; // perfectly flat
         let luma = extract_luma(&pixels, w, h);
         let variance = local_variance_5x5(&luma, w, h);
-        let (noise, contrast, sharpen, dither) = analyze_texture(&luma, &variance, &pixels, w, h);
+        let (noise, contrast, sharpen, dither) = analyze_texture(&luma, &variance, w, h);
         // Flat image should get maximum treatment on all stages
         assert!(noise > 0.9, "flat image should get full noise: {noise}");
         assert!(contrast > 0.9, "flat image should get full contrast: {contrast}");
@@ -843,7 +844,7 @@ mod tests {
         }
         let luma = extract_luma(&pixels, w, h);
         let variance = local_variance_5x5(&luma, w, h);
-        let (noise, contrast, sharpen, dither) = analyze_texture(&luma, &variance, &pixels, w, h);
+        let (noise, contrast, sharpen, dither) = analyze_texture(&luma, &variance, w, h);
         // Already-textured image should get minimal treatment
         assert!(noise < 0.3, "textured image should get little noise: {noise}");
         assert!(dither < 0.3, "textured image should get little dither: {dither}");

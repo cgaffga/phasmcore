@@ -398,7 +398,7 @@ pub fn shadow_extract(
         // Phase 2a: First-block peek — decode first RS block to read plaintext_len
         // and derive the exact fdl. Handles messages where fdl >= k (most cases).
         // This is O(30) RS block decodes — very fast.
-        for (_, (_, lsbs)) in fraction_lsbs.iter().enumerate() {
+        for (_, lsbs) in &fraction_lsbs {
             for &parity_len in &SHADOW_PARITY_TIERS {
                 let k = 255usize.saturating_sub(parity_len);
                 if k == 0 { continue; }

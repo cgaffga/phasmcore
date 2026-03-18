@@ -276,12 +276,11 @@ pub fn fortress_max_frame_bytes(img: &JpegImage) -> Result<usize, StegoError> {
     fortress_max_frame_bytes_ext(img, false)
 }
 
-/// Maximum frame bytes with optional compact frame support.
+/// Maximum frame bytes (format-agnostic binary search).
 ///
-/// When `compact` is true, uses the smaller compact frame overhead (22 bytes)
-/// for Fortress empty-passphrase mode, enabling larger messages.
-/// The `compact` flag is used by `fortress_capacity_compact` to know which
-/// overhead to subtract; the binary search itself is format-agnostic.
+/// The binary search finds the maximum frame byte count that fits the available
+/// blocks with r >= FORTRESS_MIN_R. Callers subtract the appropriate overhead
+/// (full frame: 50 bytes, compact frame: 22 bytes) to get plaintext capacity.
 pub fn fortress_max_frame_bytes_ext(img: &JpegImage, _compact: bool) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let total_blocks = grid.blocks_wide() * grid.blocks_tall();
@@ -363,11 +362,19 @@ pub fn fortress_capacity_compact(img: &JpegImage) -> Result<usize, StegoError> {
 /// This function embeds the magic header and the RS+repetition encoded
 /// payload into permuted Y-channel block DCs with per-block adaptive QIM
 /// step sizes (Watson energy-based scaling).
+/// Encode parameters returned from `fortress_encode` for quality scoring.
+pub struct FortressEncodeResult {
+    /// Actual repetition factor used.
+    pub repetition_factor: usize,
+    /// Actual RS parity symbols used.
+    pub parity_symbols: usize,
+}
+
 pub fn fortress_encode(
     img: &mut JpegImage,
     frame_bytes: &[u8],
     passphrase: &str,
-) -> Result<(), StegoError> {
+) -> Result<FortressEncodeResult, StegoError> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt_dc = img
         .quant_table(qt_id)
@@ -391,11 +398,12 @@ pub fn fortress_encode(
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
     let payload_blocks = remaining_perm.len();
 
-    // RS-encode with best parity tier (smallest parity where r >= FORTRESS_MIN_R).
+    // Find best parity tier (smallest parity where r >= FORTRESS_MIN_R).
+    // Use rs_encoded_len_with_parity for the search to avoid redundant RS encoding.
     let mut chosen_parity = ecc::PARITY_TIERS[0];
     for &parity in &ecc::PARITY_TIERS {
-        let rs_encoded = ecc::rs_encode_blocks_with_parity(frame_bytes, parity);
-        let rs_bits_len = rs_encoded.len() * 8;
+        let rs_encoded_len = ecc::rs_encoded_len_with_parity(frame_bytes.len(), parity);
+        let rs_bits_len = rs_encoded_len * 8;
         if rs_bits_len <= payload_blocks {
             let r = repetition::compute_r(rs_bits_len, payload_blocks);
             if r >= FORTRESS_MIN_R {
@@ -458,7 +466,10 @@ pub fn fortress_encode(
         grid_mut.set(br, bc, 0, 0, new_dc);
     }
 
-    Ok(())
+    Ok(FortressEncodeResult {
+        repetition_factor: r,
+        parity_symbols: chosen_parity,
+    })
 }
 
 // --- Fortress decode ---

@@ -39,6 +39,8 @@ use crate::stego::progress;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+use crate::stego::quality::{self, EncodeQuality, ArmorMetrics};
+
 /// Number of embedding units for the header.
 /// 1 byte x 8 bits x 7 copies = 56 units.
 const HEADER_UNITS: usize = embedding::HEADER_UNITS; // 56
@@ -74,6 +76,24 @@ pub fn armor_encode(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    armor_encode_impl(image_bytes, message, passphrase)
+        .map(|(bytes, _)| bytes)
+}
+
+/// Encode with Armor mode and return the encode quality score.
+pub fn armor_encode_with_quality(
+    image_bytes: &[u8],
+    message: &str,
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
+    armor_encode_impl(image_bytes, message, passphrase)
+}
+
+fn armor_encode_impl(
+    image_bytes: &[u8],
+    message: &str,
+    passphrase: &str,
+) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     // Initialize encode progress (STDM path assumed; adjusted if Fortress).
     progress::init(ARMOR_ENCODE_STEPS);
 
@@ -115,7 +135,7 @@ pub fn armor_encode(
             pre_settle_for_fortress(&mut img)?;
             progress::advance(); // Step 1: pre-settle
 
-            fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
+            let fort_result = fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
             progress::advance(); // Step 2: fortress encode
 
             let stego_bytes = match img.to_bytes() {
@@ -126,7 +146,23 @@ pub fn armor_encode(
                 }
             };
             progress::advance(); // Step 3: JPEG write
-            return Ok(stego_bytes);
+
+            // Fortress quality: use actual r and parity from encode, pre-settled to QF75.
+            let fill_ratio = fortress_frame.len() as f64 / max_fort as f64;
+            // After pre-settle, compute mean_qt from the settled QT.
+            let fort_qt_id = img.frame_info().components[0].quant_table_id as usize;
+            let fort_mean_qt = img.quant_table(fort_qt_id)
+                .map(|qt| embedding::compute_mean_qt(&qt.values))
+                .unwrap_or(10.0);
+            let encode_quality = quality::armor_robustness_score(&ArmorMetrics {
+                repetition_factor: fort_result.repetition_factor,
+                parity_symbols: fort_result.parity_symbols,
+                fortress: true,
+                mean_qt: fort_mean_qt,
+                fill_ratio,
+                delta: 12.0,
+            });
+            return Ok((stego_bytes, encode_quality));
         }
     }
 
@@ -204,7 +240,10 @@ pub fn armor_encode(
         found
     };
 
-    let embed_delta_fn: Box<dyn Fn(usize) -> f64> = if let Some((_chosen_parity, rs_encoded)) = phase2_result {
+    // Track metrics for quality score.
+    let (armor_r, armor_parity, armor_delta);
+
+    let embed_delta_fn: Box<dyn Fn(usize) -> f64> = if let Some((chosen_parity, rs_encoded)) = phase2_result {
         // --- Phase 2 encode: use cached RS result ---
         let rs_bits = frame::bytes_to_bits(&rs_encoded);
 
@@ -215,6 +254,10 @@ pub fn armor_encode(
         let (rep_bits, _) = repetition::repetition_encode(&rs_bits_padded, payload_units);
 
         let adaptive_delta = embedding::compute_delta_from_mean_qt(mean_qt, r);
+
+        armor_r = r;
+        armor_parity = chosen_parity;
+        armor_delta = adaptive_delta;
 
         all_bits.extend_from_slice(&rep_bits[..payload_units.min(rep_bits.len())]);
 
@@ -229,6 +272,10 @@ pub fn armor_encode(
         if rs_bits.len() > payload_units {
             return Err(StegoError::MessageTooLarge);
         }
+
+        armor_r = 1;
+        armor_parity = 64;
+        armor_delta = reference_delta;
 
         let mut payload_bits = rs_bits;
         payload_bits.resize(payload_units, 0);
@@ -277,7 +324,19 @@ pub fn armor_encode(
     };
 
     progress::advance(); // Step 6: JPEG write
-    Ok(stego_bytes)
+
+    // Compute quality score for STDM path.
+    let fill_ratio = frame_bytes.len() as f64 / (payload_units / 8).max(1) as f64;
+    let encode_quality = quality::armor_robustness_score(&ArmorMetrics {
+        repetition_factor: armor_r,
+        parity_symbols: armor_parity,
+        fortress: false,
+        mean_qt,
+        fill_ratio,
+        delta: armor_delta,
+    });
+
+    Ok((stego_bytes, encode_quality))
 }
 
 /// Quality information from a successful decode.
@@ -324,40 +383,6 @@ impl DecodeQuality {
             integrity_percent: 100,
             repetition_factor: 0,
             parity_len: 0,
-            geometry_corrected: false,
-            template_peaks_detected: 0,
-            estimated_rotation_deg: 0.0,
-            estimated_scale: 1.0,
-            dft_ring_used: false,
-            dft_ring_capacity: 0,
-            fortress_used: false,
-            signal_strength: 0.0,
-        }
-    }
-
-    /// Create quality info from Armor RS decode stats with Phase 2 metadata.
-    ///
-    /// **Legacy constructor** — kept for backward compatibility. Uses RS-only
-    /// integrity (always 100% when RS errors are 0). Prefer
-    /// `from_rs_stats_with_signal` for LLR-based integrity scoring.
-    pub fn from_rs_stats_with_phase2(
-        stats: &ecc::RsDecodeStats,
-        repetition_factor: u8,
-        parity_len: u16,
-    ) -> Self {
-        let integrity = if stats.error_capacity == 0 {
-            100
-        } else {
-            let ratio = stats.total_errors as f64 / stats.error_capacity as f64;
-            ((1.0 - ratio) * 100.0).round().max(0.0).min(100.0) as u8
-        };
-        Self {
-            mode: super::super::frame::MODE_ARMOR,
-            rs_errors_corrected: stats.total_errors as u32,
-            rs_error_capacity: stats.error_capacity as u32,
-            integrity_percent: integrity,
-            repetition_factor,
-            parity_len,
             geometry_corrected: false,
             template_peaks_detected: 0,
             estimated_rotation_deg: 0.0,
@@ -959,9 +984,10 @@ pub(super) fn compute_candidate_rs_compact(payload_units: usize, parity: usize) 
 /// P2b: Limit to 5 entries to cap memory at ~155-325 MB instead of unbounded.
 const LLR_CACHE_MAX: usize = 5;
 
-/// Get cached LLRs for a delta value, or extract them from the grid.
+/// Ensure cached LLRs exist for a delta value, extracting from the grid if needed.
 ///
 /// P2b: Uses LRU eviction when the cache exceeds `LLR_CACHE_MAX` entries.
+/// The caller reads from the cache snapshot later; no return value needed.
 fn get_or_extract_llrs(
     cache: &mut Vec<(f64, Vec<f64>)>,
     delta: f64,
@@ -970,7 +996,7 @@ fn get_or_extract_llrs(
     vectors: &[[f64; SPREAD_LEN]],
     num_units: usize,
     payload_offset: usize,
-) -> Vec<f64> {
+) {
     // Check cache (use approximate comparison for f64)
     for i in 0..cache.len() {
         if (cache[i].0 - delta).abs() < 0.001 {
@@ -979,7 +1005,7 @@ fn get_or_extract_llrs(
                 let entry = cache.remove(i);
                 cache.push(entry);
             }
-            return cache.last().unwrap().1.clone();
+            return;
         }
     }
 
@@ -1009,7 +1035,6 @@ fn get_or_extract_llrs(
     }
 
     cache.push((delta, llrs));
-    cache.last().unwrap().1.clone()
 }
 
 /// Pre-clamp the Y channel: IDCT -> clamp [0, 255] -> DCT for all blocks.
@@ -1246,16 +1271,6 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
                     continue;
                 }
 
-                if total_frame_len == data_len {
-                    let stats = ecc::RsDecodeStats {
-                        total_errors: first_errors,
-                        error_capacity: ecc::T_MAX,
-                        max_block_errors: first_errors,
-                        num_blocks: 1,
-                    };
-                    return Ok((first_block_data, stats));
-                }
-
                 if total_frame_len <= data_len {
                     let stats = ecc::RsDecodeStats {
                         total_errors: first_errors,
@@ -1263,19 +1278,24 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
                         max_block_errors: first_errors,
                         num_blocks: 1,
                     };
-                    return Ok((first_block_data[..total_frame_len].to_vec(), stats));
+                    // Single block: truncate to exact frame length if needed.
+                    let frame_data = if total_frame_len == data_len {
+                        first_block_data
+                    } else {
+                        first_block_data[..total_frame_len].to_vec()
+                    };
+                    return Ok((frame_data, stats));
                 }
 
-                if total_frame_len > data_len {
-                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks(
-                        &extracted_bytes[..rs_encoded_len],
-                        total_frame_len,
-                    ) {
-                        return Ok((decoded, stats));
-                    }
-                    // Multi-block decode failed — first-block was a false
-                    // positive. Continue sweep to try other data_len values.
+                // total_frame_len > data_len: multi-block RS decode
+                if let Ok((decoded, stats)) = ecc::rs_decode_blocks(
+                    &extracted_bytes[..rs_encoded_len],
+                    total_frame_len,
+                ) {
+                    return Ok((decoded, stats));
                 }
+                // Multi-block decode failed — first-block was a false
+                // positive. Continue sweep to try other data_len values.
             }
         }
     }
@@ -1631,17 +1651,4 @@ mod tests {
         assert_eq!(q.parity_len, 64);
     }
 
-    #[test]
-    fn decode_quality_legacy_constructor_still_works() {
-        // from_rs_stats_with_phase2 should still give 100% for 0 errors
-        let stats = ecc::RsDecodeStats {
-            total_errors: 0,
-            error_capacity: 32,
-            max_block_errors: 0,
-            num_blocks: 1,
-        };
-        let q = DecodeQuality::from_rs_stats_with_phase2(&stats, 5, 64);
-        assert_eq!(q.integrity_percent, 100);
-        assert_eq!(q.signal_strength, 0.0);
-    }
 }

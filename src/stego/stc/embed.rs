@@ -21,6 +21,8 @@ use crate::stego::progress;
 pub struct EmbedResult {
     pub stego_bits: Vec<u8>,
     pub total_cost: f64,
+    /// Number of positions where cover bit != stego bit.
+    pub num_modifications: usize,
 }
 
 /// Number of progress steps reported during STC Viterbi embedding.
@@ -72,6 +74,7 @@ pub fn stc_embed(
         return Some(EmbedResult {
             stego_bits: cover_bits.to_vec(),
             total_cost: 0.0,
+            num_modifications: 0,
         });
     }
 
@@ -206,7 +209,10 @@ fn stc_embed_inline(
         message[..m],
     );
 
-    Some(EmbedResult { stego_bits, total_cost: best_cost })
+    let num_modifications = stego_bits.iter().zip(cover_bits.iter())
+        .filter(|(s, c)| s != c).count();
+
+    Some(EmbedResult { stego_bits, total_cost: best_cost, num_modifications })
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +417,10 @@ fn stc_embed_segmented(
         message[..m],
     );
 
-    Some(EmbedResult { stego_bits, total_cost: best_cost })
+    let num_modifications = stego_bits.iter().zip(cover_bits.iter())
+        .filter(|(s, c)| s != c).count();
+
+    Some(EmbedResult { stego_bits, total_cost: best_cost, num_modifications })
 }
 
 // ---------------------------------------------------------------------------

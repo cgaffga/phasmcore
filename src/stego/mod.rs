@@ -32,8 +32,10 @@ pub mod progress;
 pub mod side_info;
 pub mod shadow;
 pub mod optimizer;
+pub mod quality;
 
 pub use error::StegoError;
+pub use quality::EncodeQuality;
 pub use optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
 
 /// Maximum pixel dimension (width or height) for encode.
@@ -74,13 +76,15 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     Ok(())
 }
 pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
+pub use pipeline::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
 pub use pipeline::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS};
+pub use pipeline::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
 pub use shadow::shadow_capacity;
 pub use capacity::estimate_shadow_capacity;
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use capacity::estimate_capacity_si as ghost_capacity_si;
 pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
-pub use armor::pipeline::{armor_encode, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
+pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 pub use payload::{PayloadData, FileEntry, compressed_payload_size};
 
