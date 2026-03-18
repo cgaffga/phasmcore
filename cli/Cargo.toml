@@ -1,0 +1,19 @@
+[package]
+name = "phasm-cli"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "CLI for phasm-core steganography"
+repository = "https://github.com/cgaffga/phasmcore"
+authors = ["Christoph Gaffga"]
+
+[[bin]]
+name = "phasm"
+path = "src/main.rs"
+
+[dependencies]
+phasm-core = { path = "..", features = ["parallel"] }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
+indicatif = "0.17"
+rpassword = "7"

@@ -137,23 +137,32 @@ assert_eq!(shadow.text, "decoy message");
 ```rust
 // Ghost mode (stealth)
 ghost_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
+ghost_encode_with_quality(jpeg_bytes, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_decode(jpeg_bytes, passphrase) -> Result<PayloadData>
 ghost_encode_with_files(jpeg_bytes, message, files, passphrase) -> Result<Vec<u8>>
+ghost_encode_with_files_quality(jpeg_bytes, message, files, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_capacity(jpeg_image) -> Result<usize>
 
 // Ghost shadow messages (plausible deniability)
 ghost_encode_with_shadows(jpeg_bytes, message, files, passphrase, shadows, si) -> Result<Vec<u8>>
+ghost_encode_with_shadows_quality(jpeg_bytes, message, files, passphrase, shadows, si) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_encode_si_with_shadows(jpeg_bytes, raw_rgb, width, height, message, files, passphrase, shadows) -> Result<Vec<u8>>
+ghost_encode_si_with_shadows_quality(jpeg_bytes, raw_rgb, width, height, message, files, passphrase, shadows) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_shadow_decode(stego_bytes, passphrase) -> Result<PayloadData>
+shadow_capacity(jpeg_bytes) -> Result<usize>
 estimate_shadow_capacity(jpeg_image) -> Result<usize>
+ghost_capacity_with_shadows(jpeg_bytes, shadows) -> Result<usize>
 
 // Ghost SI-UNIWARD (stealth + side-informed, ~43% more capacity)
 ghost_encode_si(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<Vec<u8>>
+ghost_encode_si_with_quality(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_encode_si_with_files(jpeg_bytes, raw_rgb, width, height, message, files, passphrase) -> Result<Vec<u8>>
+ghost_encode_si_with_files_quality(jpeg_bytes, raw_rgb, width, height, message, files, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_capacity_si(jpeg_image) -> Result<usize>
 
 // Armor mode (robust)
 armor_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
+armor_encode_with_quality(jpeg_bytes, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 armor_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 armor_capacity(jpeg_image) -> Result<usize>
 
@@ -183,6 +192,7 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 - **`PayloadData`** — decoded message text + optional file attachments
 - **`FileEntry`** — file attachment (filename + content bytes)
 - **`ShadowLayer`** — shadow message for plausible deniability (message + passphrase + optional files)
+- **`EncodeQuality`** — encode-time score (0-100), contextual hint key, mode (stealth for Ghost, robustness for Armor)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
 - **`OptimizerConfig`** — optimizer settings (strength, seed, mode)
@@ -196,6 +206,48 @@ The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accep
 |---------|-------------|
 | `parallel` | Enables [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD cost computation, STC embedding, and Armor decode sweeps. Recommended for native builds. |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
+
+## CLI
+
+A command-line interface is available in the `cli/` directory:
+
+```bash
+# Install
+cargo install --path cli
+
+# Encode (Armor mode, default)
+phasm encode photo.jpg -m "secret message" -p "passphrase"
+
+# Encode (Ghost mode)
+phasm encode photo.jpg --mode ghost -m "secret" -p "pass" -o secret.jpg
+
+# PNG input → auto Deep Cover (SI-UNIWARD)
+phasm encode photo.png --mode ghost -m "hello" -p "pass"
+
+# Shadow messages (plausible deniability)
+phasm encode photo.jpg --mode ghost -m "real" -p "main" --m2 "decoy" --p2 "shadow"
+
+# File attachments
+phasm encode photo.jpg --mode ghost -m "see attached" -p "pass" --attach plans.pdf
+
+# Decode (auto-detects mode)
+phasm decode stego.jpg -p "passphrase"
+
+# Extract file attachments
+phasm decode stego.jpg -p "pass" --extract ./output/
+
+# Show capacity
+phasm capacity photo.jpg
+
+# Pipe message from stdin
+echo "hello" | phasm encode photo.jpg -p "pass"
+
+# Machine-readable output
+phasm encode photo.jpg -m "hello" -p "pass" --json
+phasm decode stego.jpg -p "pass" --quiet
+```
+
+See `phasm encode --help`, `phasm decode --help`, `phasm capacity --help` for all options.
 
 ## Building & Testing
 
@@ -394,6 +446,7 @@ src/
     side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
     shadow.rs       Shadow messages (Y-channel direct LSB + RS ECC, plausible deniability)
     optimizer.rs    Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
+    quality.rs      Encode quality scoring (stealth for Ghost, robustness for Armor)
     capacity.rs     Ghost capacity estimation
     progress.rs     Real-time progress tracking (atomics + WASM callback)
     error.rs        StegoError enum
@@ -420,6 +473,7 @@ src/
       dft_payload.rs DFT ring-based payload embedding
       fft2d.rs      2D FFT (Cooley-Tukey + Bluestein)
       resample.rs   Bilinear resampling for geometric correction
+cli/                Command-line interface (phasm binary)
 test-vectors/       Synthetic JPEG test images
 tests/              Integration tests (round-trip, cross-platform, geometry)
 examples/           CLI tools (encode/decode, timing, diagnostics)
