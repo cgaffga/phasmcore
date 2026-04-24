@@ -27,14 +27,17 @@
 //! assert_eq!(decoded.text, "secret message");
 //! ```
 
+pub mod codec;
 pub mod det_math;
-pub mod jpeg;
 pub mod stego;
 
-pub use jpeg::error::{JpegError, Result as JpegResult};
-pub use jpeg::dct::{DctGrid, QuantTable};
-pub use jpeg::frame::FrameInfo;
-pub use jpeg::JpegImage;
+// Backward-compatible re-exports: `phasm_core::jpeg::*` still works
+pub use codec::jpeg as jpeg;
+
+pub use codec::jpeg::error::{JpegError, Result as JpegResult};
+pub use codec::jpeg::dct::{DctGrid, QuantTable};
+pub use codec::jpeg::frame::FrameInfo;
+pub use codec::jpeg::JpegImage;
 pub use stego::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, ghost_capacity, ghost_capacity_si, StegoError, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
 pub use stego::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
 pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, ghost_capacity_with_shadows};
@@ -45,3 +48,55 @@ pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCOD
 pub use stego::{PayloadData, FileEntry, compressed_payload_size};
 pub use stego::progress;
 pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
+
+// H.264 (production) re-exports.
+#[cfg(feature = "video")]
+pub use stego::video::{
+    h264_ghost_encode, h264_ghost_encode_inplace,
+    h264_ghost_decode, h264_ghost_capacity,
+    h264_ghost_encode_path, h264_ghost_decode_path, h264_ghost_capacity_path,
+    is_mp4,
+};
+
+// HEVC (archived) re-exports — only available with the `hevc-archive` feature.
+
+/// Detected video codec inside an MP4 container.
+///
+/// The `Hevc` variant is still reported even when the HEVC pipeline is
+/// archived — detection only needs MP4-level codec bytes, not the full
+/// HEVC parser. Callers should check for `VideoCodec::H264` as the only
+/// supported stego target.
+#[cfg(feature = "video")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoCodec {
+    /// H.264/AVC — uses CAVLC-based encoding (Baseline/Main CAVLC).
+    H264,
+    /// HEVC/H.265. Detected but not supported for stego in current builds;
+    /// the pipeline is archived behind the `hevc-archive` feature flag.
+    Hevc,
+    /// MP4 but no recognised H.264 or HEVC track.
+    Unknown,
+}
+
+/// Detect the video codec of an MP4 byte buffer. Returns `Unknown` if the
+/// input is not an MP4 or has no recognised video track.
+#[cfg(feature = "video")]
+pub fn detect_video_codec(mp4_bytes: &[u8]) -> VideoCodec {
+    if !is_mp4(mp4_bytes) {
+        return VideoCodec::Unknown;
+    }
+    let Ok(file) = codec::mp4::demux::demux(mp4_bytes) else {
+        return VideoCodec::Unknown;
+    };
+    let Some(idx) = file.video_track_idx else {
+        return VideoCodec::Unknown;
+    };
+    let track = &file.tracks[idx];
+    if track.is_h264() {
+        VideoCodec::H264
+    } else if track.is_hevc() {
+        VideoCodec::Hevc
+    } else {
+        VideoCodec::Unknown
+    }
+}

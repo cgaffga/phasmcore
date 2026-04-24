@@ -26,8 +26,8 @@
 //! This implementation follows the corrected version (fixing the off-by-one
 //! error described in arXiv:2305.19776).
 
-use crate::jpeg::dct::{DctGrid, QuantTable};
-use crate::jpeg::pixels::idct_block;
+use crate::codec::jpeg::dct::{DctGrid, QuantTable};
+use crate::codec::jpeg::pixels::idct_block;
 use crate::stego::error::StegoError;
 use crate::stego::progress;
 use super::CostMap;
@@ -1133,11 +1133,11 @@ mod tests {
 
     #[test]
     fn cost_with_real_photo() {
-        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => return, // Skip if test vector not available.
         };
-        let img = crate::jpeg::JpegImage::from_bytes(&data).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();
         let grid = img.dct_grid(0);
         let qt_id = img.frame_info().components[0].quant_table_id as usize;
         let qt = img.quant_table(qt_id).unwrap();
@@ -1219,7 +1219,7 @@ mod tests {
     /// with the full Ghost steganography pipeline.
     #[test]
     fn ghost_roundtrip_with_current_feature_set() {
-        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => return, // Skip if test vector not available.
         };
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     #[ignore]
     fn cost_computation_benchmark() {
-        let data = match std::fs::read("test-vectors/photo_320x240_q75_420.jpg") {
+        let data = match std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
             Err(_) => {
                 eprintln!("Skipping benchmark: test vector not found");
@@ -1250,7 +1250,7 @@ mod tests {
             }
         };
 
-        let img = crate::jpeg::JpegImage::from_bytes(&data).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();
         let grid = img.dct_grid(0);
         let qt_id = img.frame_info().components[0].quant_table_id as usize;
         let qt = img.quant_table(qt_id).unwrap();

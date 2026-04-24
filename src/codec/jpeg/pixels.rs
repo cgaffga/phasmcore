@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 
-use crate::jpeg::JpegImage;
+use crate::codec::jpeg::JpegImage;
 
 /// Pre-computed 8×8 cosine table for IDCT/DCT.
 /// `COSINE[u][x] = cos((2*x + 1) * u * PI / 16)`

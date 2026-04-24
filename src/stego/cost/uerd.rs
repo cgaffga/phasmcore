@@ -4,7 +4,7 @@
 
 //! UERD (Uniform Embedding Revisited Distortion) cost function for steganography.
 
-use crate::jpeg::dct::{DctGrid, QuantTable};
+use crate::codec::jpeg::dct::{DctGrid, QuantTable};
 use super::CostMap;
 
 const EPSILON: f64 = 1e-10;

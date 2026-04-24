@@ -9,7 +9,7 @@
 //! step `delta` controls robustness vs. distortion.
 
 use super::spreading::SPREAD_LEN;
-use crate::jpeg::zigzag::NATURAL_TO_ZIGZAG;
+use crate::codec::jpeg::zigzag::NATURAL_TO_ZIGZAG;
 
 /// Fixed bootstrap delta for the header region.
 ///

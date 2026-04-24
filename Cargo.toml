@@ -15,6 +15,20 @@ categories = ["multimedia::images", "cryptography"]
 [features]
 default = []
 parallel = ["rayon"]
+# `video` enables the active H.264 Baseline CAVLC pipeline (production).
+# Pulls in memmap2 for the path-based streaming API used by the iOS +
+# Android bridges to avoid loading entire videos into heap.
+video = ["memmap2"]
+# `h264-encoder` enables the Phase 6 pure-Rust H.264 encoder (under
+# core/src/codec/h264/encoder/) plus its CABAC entropy-coder companion
+# (core/src/codec/h264/cabac/). OFF by default so the GitHub-release
+# CLI binary distribution NEVER bundles an H.264 encoder (Via LA AVC
+# patent-pool obligations — see docs/design/h264-video-steganography.md
+# §"Patent licensing — distribution plan"). Mobile bridges
+# (ios-bridge, android-bridge) enable this feature explicitly. CLI
+# users wanting video stego must build from source with
+# `cargo install phasm-cli --features h264-encoder`.
+h264-encoder = ["video"]
 wasm = ["js-sys", "wasm-bindgen"]
 
 [dependencies]
@@ -29,6 +43,7 @@ num-complex = "0.4"
 rayon = { version = "1", optional = true }
 brotli = { version = "7", default-features = false, features = ["std"] }
 zeroize = "1"
+memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 

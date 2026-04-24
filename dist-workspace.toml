@@ -16,3 +16,19 @@ hosting = "github"
 # Allow CI file to be in a different location (we keep it in core/.github/
 # so it survives the git subtree split to the phasmcore open-source repo)
 allow-dirty = ["ci"]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DO NOT set `features = ["h264-encoder"]` here, and do NOT add the encoder to
+# phasm-cli's default features (see core/cli/Cargo.toml). The CLI binaries
+# distributed through GitHub Releases via cargo-dist must NEVER bundle the
+# pure-Rust H.264 encoder.
+#
+# Reason: the Via LA AVC patent pool requires a license for encoders shipped
+# to end users, above a small free-tier threshold. phasm's mobile apps
+# (iOS/Android) handle their own licensing posture; the open-source source
+# distribution does not distribute executable encoder code. Users who want
+# CLI video stego must opt in at source-build time:
+#     cargo install phasm-cli --features h264-encoder
+# See docs/design/h264-video-steganography.md § "Patent licensing —
+# distribution plan".
+# ═════════════════════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@
 
 //! Armor mode capacity estimation.
 
-use crate::jpeg::JpegImage;
+use crate::codec::jpeg::JpegImage;
 use crate::stego::armor::ecc;
 use crate::stego::armor::selection::compute_stability_map;
 use crate::stego::armor::spreading::SPREAD_LEN;

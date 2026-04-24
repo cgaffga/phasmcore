@@ -18,25 +18,32 @@
 //! and key derivation (Argon2id two-tier). The `smart_decode` function
 //! auto-detects which mode was used.
 
+// --- Media-agnostic modules (shared by image and video pipelines) ---
 pub mod error;
-pub mod cost;
 pub mod stc;
 pub mod crypto;
 pub mod frame;
 pub mod permute;
-pub mod capacity;
 pub mod payload;
-mod pipeline;
-pub mod armor;
 pub mod progress;
-pub mod side_info;
-pub mod shadow;
-pub mod optimizer;
-pub mod quality;
+
+// --- Steganographic algorithms ---
+pub mod cost;
+pub(crate) mod ghost;
+pub mod armor;
+#[cfg(feature = "video")]
+pub mod video;
 
 pub use error::StegoError;
-pub use quality::EncodeQuality;
-pub use optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
+pub use ghost::quality;
+pub use ghost::quality::EncodeQuality;
+pub use ghost::optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
+
+// Backward-compatible re-exports at original paths
+pub use ghost::capacity;
+pub use ghost::side_info;
+pub use ghost::shadow;
+pub use ghost::optimizer;
 
 /// Maximum pixel dimension (width or height) for encode.
 /// Images exceeding this are downsampled by the frontend before reaching Rust.
@@ -75,10 +82,10 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     }
     Ok(())
 }
-pub use pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
-pub use pipeline::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
-pub use pipeline::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS};
-pub use pipeline::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
+pub use ghost::pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
+pub use ghost::pipeline::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
+pub use ghost::pipeline::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS};
+pub use ghost::pipeline::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
 pub use shadow::shadow_capacity;
 pub use capacity::estimate_shadow_capacity;
 pub use capacity::estimate_capacity as ghost_capacity;
@@ -196,7 +203,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 
     // Try Ghost shadow (Y-channel direct LSB + RS)
-    match pipeline::ghost_shadow_decode(stego_bytes, passphrase) {
+    match ghost::pipeline::ghost_shadow_decode(stego_bytes, passphrase) {
         Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
         Err(StegoError::DecryptionFailed) => {
             saw_decryption_failed = true;
@@ -218,7 +225,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 /// Preference order: Fortress > Armor STDM > Ghost.
 #[cfg(feature = "parallel")]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    use crate::jpeg::JpegImage;
+    use crate::codec::jpeg::JpegImage;
     use crate::stego::armor::fortress;
     use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
@@ -243,7 +250,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
             || armor_decode_no_fortress(&img, stego_bytes, passphrase),
             || rayon::join(
                 || ghost_decode(stego_bytes, passphrase),
-                || pipeline::ghost_shadow_decode_from_image(&img, passphrase),
+                || ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase),
             ),
         ),
     );

@@ -39,8 +39,8 @@
 //! ALL blocks are used for embedding (no skip tier). On decode, r is brute-forced
 //! per candidate, so the adaptive step is implicitly known.
 
-use crate::jpeg::dct::DctGrid;
-use crate::jpeg::JpegImage;
+use crate::codec::jpeg::dct::DctGrid;
+use crate::codec::jpeg::JpegImage;
 use crate::stego::armor::ecc;
 use crate::stego::armor::repetition;
 use crate::stego::crypto;
@@ -639,7 +639,7 @@ fn extract_magic_byte(header_llrs: &[f64]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jpeg::dct::DctGrid;
+    use crate::codec::jpeg::dct::DctGrid;
 
     #[test]
     fn qim_embed_extract_roundtrip() {
@@ -855,13 +855,13 @@ mod tests {
     fn adaptive_fortress_encode_decode_roundtrip() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };
 
         let passphrase = "test-adaptive-pass";
-        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
         let fort_cap = fortress_capacity(&img).unwrap();
         assert!(fort_cap >= 1, "Fortress capacity ({fort_cap}) must be >= 1");
 
@@ -1047,13 +1047,13 @@ mod tests {
     fn adaptive_encode_decode_roundtrip() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };
 
         let passphrase = "adaptive-watson-test";
-        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
         let fort_cap = fortress_capacity(&img).unwrap();
         assert!(fort_cap >= 1, "Fortress capacity must be >= 1");
 
@@ -1075,13 +1075,13 @@ mod tests {
     fn fortress_compact_encode_decode_roundtrip() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };
 
         let passphrase = ""; // empty passphrase triggers compact frame
-        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
         let fort_cap = fortress_capacity_compact(&img).unwrap();
         assert!(fort_cap >= 1, "Fortress compact capacity ({fort_cap}) must be >= 1");
 
@@ -1099,12 +1099,12 @@ mod tests {
 
     #[test]
     fn fortress_compact_capacity_larger_than_full() {
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };
 
-        let img = crate::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
+        let img = crate::codec::jpeg::JpegImage::from_bytes(&test_jpeg).unwrap();
         let full_cap = fortress_capacity(&img).unwrap();
         let compact_cap = fortress_capacity_compact(&img).unwrap();
 
@@ -1127,7 +1127,7 @@ mod tests {
     fn fortress_nonempty_passphrase_still_uses_full_frame() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };
@@ -1148,7 +1148,7 @@ mod tests {
     fn fortress_compact_wrong_passphrase_fails() {
         use crate::stego::armor::pipeline::{armor_encode, armor_decode};
 
-        let test_jpeg = match std::fs::read("test-vectors/progressive_whatsapp_1200x1600.jpg") {
+        let test_jpeg = match std::fs::read("test-vectors/image/progressive_whatsapp_1200x1600.jpg") {
                 Ok(d) => d,
                 Err(_) => { eprintln!("skipped: test vector not found"); return; }
             };

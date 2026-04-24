@@ -50,6 +50,12 @@ pub const SALT_LEN: usize = 16;
 /// Independent from all other keys so shadow permutations are uncorrelated.
 const SHADOW_STRUCTURAL_SALT: &[u8; 16] = b"phasm-shdw-v1\0\0\0";
 
+/// Fixed salt for H.264 Phase 3c MVD-domain structural key. Independent from
+/// the Ghost structural salt so the MVD-domain permutation + STC matrix do
+/// not correlate with the coefficient-domain ones, keeping the two
+/// cross-domain flip sets statistically uncorrelated.
+const H264_MVD_STRUCTURAL_SALT: &[u8; 16] = b"phasm-h264mvd-v1";
+
 /// Fixed salt for Fortress empty-passphrase optimization.
 /// When passphrase is empty, we use this deterministic salt so it doesn't need
 /// to be embedded in the frame (saving 16 bytes). The message is still
@@ -71,6 +77,22 @@ pub fn derive_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64]>, St
     let mut output = Zeroizing::new([0u8; 64]);
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), STRUCTURAL_SALT, &mut *output)
+        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    Ok(output)
+}
+
+/// Derive the H.264 Phase 3c MVD-domain structural key.
+///
+/// Independent from `derive_structural_key` so Phase 3c's two cross-domain
+/// STC runs use uncorrelated permutations and HHat matrices. Same 64-byte
+/// layout as the main structural key: first 32 = perm_seed, last 32 =
+/// hhat_seed.
+pub fn derive_h264_mvd_structural_key(
+    passphrase: &str,
+) -> Result<Zeroizing<[u8; 64]>, StegoError> {
+    let mut output = Zeroizing::new([0u8; 64]);
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), H264_MVD_STRUCTURAL_SALT, &mut *output)
         .map_err(|_| StegoError::KeyDerivationFailed)?;
     Ok(output)
 }

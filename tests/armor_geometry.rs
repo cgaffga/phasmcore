@@ -15,7 +15,7 @@ use phasm_core::stego::armor::resample::resample_bilinear;
 use phasm_core::stego::armor::template::AffineTransform;
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/image/{name}")).unwrap()
 }
 
 /// Helper: Apply a geometric transform to a stego JPEG.

@@ -10,8 +10,8 @@
 //! - Minimum capacity ratio to ensure reliable STC embedding
 //! - Frame overhead (length, salt, nonce, auth tag, CRC)
 
-use crate::jpeg::JpegImage;
-use crate::jpeg::dct::DctGrid;
+use crate::codec::jpeg::JpegImage;
+use crate::codec::jpeg::dct::DctGrid;
 use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::error::StegoError;
 use crate::stego::shadow;
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn capacity_reasonable_for_photo() {
-        let data = std::fs::read("test-vectors/photo_320x240_q75_420.jpg").unwrap();
+        let data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
         let img = JpegImage::from_bytes(&data).unwrap();
         let cap = estimate_capacity(&img).unwrap();
         // 320×240 at 4:2:0 → 40×30=1200 Y blocks → 75,600 AC positions.
@@ -169,7 +169,7 @@ mod tests {
 
     #[test]
     fn si_capacity_higher_than_standard() {
-        let data = std::fs::read("test-vectors/photo_320x240_q75_420.jpg").unwrap();
+        let data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
         let img = JpegImage::from_bytes(&data).unwrap();
         let cap_j = estimate_capacity(&img).unwrap();
         let cap_si = estimate_capacity_si(&img).unwrap();

@@ -17,7 +17,7 @@ use phasm_core::{ghost_capacity, ghost_capacity_si, JpegImage};
 use phasm_core::jpeg::pixels::{jpeg_to_luma_f64, luma_f64_to_jpeg};
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/image/{name}")).unwrap()
 }
 
 /// Compute local variance in a 3×3 neighborhood around (y, x).

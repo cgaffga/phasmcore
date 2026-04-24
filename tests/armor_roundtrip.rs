@@ -7,7 +7,7 @@
 use phasm_core::{armor_encode, armor_decode, armor_capacity, smart_decode, JpegImage};
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/image/{name}")).unwrap()
 }
 
 #[test]

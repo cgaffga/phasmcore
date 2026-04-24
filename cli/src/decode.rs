@@ -6,7 +6,9 @@ use crate::error::CliError;
 use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
-use phasm_core::smart_decode;
+use phasm_core::{
+    detect_video_codec, h264_ghost_decode, is_mp4, smart_decode, DecodeQuality, VideoCodec,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -14,7 +16,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 pub struct DecodeArgs {
-    /// Stego image file
+    /// Stego image or video file
     pub image: PathBuf,
 
     /// Passphrase (interactive prompt if omitted)
@@ -43,7 +45,7 @@ pub struct DecodeArgs {
 }
 
 pub fn run(args: DecodeArgs) -> Result<(), CliError> {
-    let image_bytes = std::fs::read(&args.image)?;
+    let file_bytes = std::fs::read(&args.image)?;
     let passphrase = get_passphrase(args.passphrase.as_deref(), "Passphrase", false)?;
 
     let progress_handle = if args.progress {
@@ -53,7 +55,34 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     };
 
     let start = Instant::now();
-    let (payload, quality) = smart_decode(&image_bytes, &passphrase)?;
+
+    // Auto-detect format: H.264 MP4 vs JPEG image. HEVC is archived behind
+    // `hevc-archive`. Phase 4b note: we deliberately do NOT auto-transcode
+    // stego videos on decode — transcoding re-encodes pixels which destroys
+    // the embedded message. The stego must already be Baseline CAVLC
+    // (which it would be, since it was produced by `phasm video-encode`).
+    let (payload, quality) = if is_mp4(&file_bytes) {
+        let payload = match detect_video_codec(&file_bytes) {
+            VideoCodec::H264 => h264_ghost_decode(&file_bytes, &passphrase)?,
+            VideoCodec::Hevc => {
+                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                    "HEVC/H.265 decode is not supported. This file was encoded outside \
+                     Phasm's H.264 pipeline — no hidden message will be recoverable."
+                        .into(),
+                )));
+            }
+            VideoCodec::Unknown => {
+                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                    "unsupported or unrecognised video codec (expected H.264 Baseline CAVLC)"
+                        .into(),
+                )));
+            }
+        };
+        (payload, DecodeQuality::ghost())
+    } else {
+        smart_decode(&file_bytes, &passphrase)?
+    };
+
     let elapsed = start.elapsed();
 
     if let Some(handle) = progress_handle {

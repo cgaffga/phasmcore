@@ -17,9 +17,9 @@
 //! - Brute-force (r, parity) search on decode -- no fragile r-header
 //! - DFT ring payload: resize-robust second layer in frequency domain
 
-use crate::jpeg::JpegImage;
-use crate::jpeg::dct::DctGrid;
-use crate::jpeg::pixels;
+use crate::codec::jpeg::JpegImage;
+use crate::codec::jpeg::dct::DctGrid;
+use crate::codec::jpeg::pixels;
 use crate::stego::armor::ecc;
 use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract_soft};
 use crate::stego::armor::fft2d;
@@ -377,7 +377,7 @@ impl DecodeQuality {
     /// Create quality info for a Ghost decode (binary: always 100% if successful).
     pub fn ghost() -> Self {
         Self {
-            mode: super::super::frame::MODE_GHOST,
+            mode: crate::stego::frame::MODE_GHOST,
             rs_errors_corrected: 0,
             rs_error_capacity: 0,
             integrity_percent: 100,
@@ -412,7 +412,7 @@ impl DecodeQuality {
     ) -> Self {
         let integrity = compute_integrity(signal_strength, stats, reference_llr);
         Self {
-            mode: super::super::frame::MODE_ARMOR,
+            mode: crate::stego::frame::MODE_ARMOR,
             rs_errors_corrected: stats.total_errors as u32,
             rs_error_capacity: stats.error_capacity as u32,
             integrity_percent: integrity,
@@ -748,7 +748,7 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
             if let Ok(text) = std::str::from_utf8(&ring_bytes) {
                 let ring_cap = dft_payload::ring_capacity(w, h);
                 return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
-                    mode: super::super::frame::MODE_ARMOR,
+                    mode: crate::stego::frame::MODE_ARMOR,
                     rs_errors_corrected: 0,
                     rs_error_capacity: 0,
                     integrity_percent: 50, // truncated message
@@ -807,7 +807,7 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
                     if let Ok(text) = std::str::from_utf8(&ring_bytes) {
                         let ring_cap = dft_payload::ring_capacity(cw, ch);
                         return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
-                            mode: super::super::frame::MODE_ARMOR,
+                            mode: crate::stego::frame::MODE_ARMOR,
                             rs_errors_corrected: 0,
                             rs_error_capacity: 0,
                             integrity_percent: 50,
@@ -1238,7 +1238,7 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
 fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecodeStats), StegoError> {
     let parity = ecc::parity_len();
 
-    let min_data = super::super::frame::FRAME_OVERHEAD;
+    let min_data = crate::stego::frame::FRAME_OVERHEAD;
     let max_first_block_data = 191usize; // K_DEFAULT
 
     for data_len in min_data..=max_first_block_data.min(extracted_bytes.len().saturating_sub(parity))
@@ -1461,7 +1461,7 @@ fn compute_jpeg_qt(base: &[u16; 64], qf: u32) -> [u16; 64] {
 /// Android Q70, Web 0.65 ≈ varies), leaving coefficients on a fine grid that
 /// shifts dramatically when recompressed to Q75.
 fn pre_settle_for_fortress(img: &mut JpegImage) -> Result<(), StegoError> {
-    use crate::jpeg::dct::QuantTable;
+    use crate::codec::jpeg::dct::QuantTable;
 
     let num_components = img.num_components();
     let target_qf = 75u32;

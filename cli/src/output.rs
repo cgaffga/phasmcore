@@ -3,6 +3,18 @@
 // https://github.com/cgaffga/phasmcore
 
 use phasm_core::{DecodeQuality, EncodeQuality, PayloadData};
+
+/// Minimal CLI-side capacity report. Replaces the old
+/// `phasm_core::VideoCapacity` which was HEVC-specific and is now archived
+/// behind `hevc-archive`. Phase 4b will replace this with the H.264
+/// position-count report once the CLI is rewritten.
+#[derive(Debug, Clone)]
+pub struct CliVideoCapacityInfo {
+    pub num_i_frames: usize,
+    pub total_positions: usize,
+    pub capacity_bytes: usize,
+    pub frame_positions: Vec<usize>,
+}
 use std::time::Duration;
 
 /// Output mode determined by CLI flags.
@@ -176,6 +188,61 @@ pub fn print_capacity(
             println!("Ghost:   {ghost} bytes (Deep Cover: {ghost_si} bytes)");
             println!("Armor:   {armor} bytes (Fortress: {fortress} bytes)");
             println!("Shadows: {shadow} bytes per layer");
+        }
+    }
+}
+
+// ── Video encode output ──
+
+pub fn print_video_encode_result(
+    output_path: &str,
+    elapsed: Duration,
+    mode: OutputMode,
+) {
+    match mode {
+        OutputMode::Quiet => println!("{output_path}"),
+        OutputMode::Json => {
+            println!(
+                "{{\"output\":\"{}\",\"mode\":\"Ghost (Video)\"}}",
+                json_escape(output_path),
+            );
+        }
+        OutputMode::Verbose => {
+            println!("Encoded: {output_path}");
+            println!("Mode: Ghost (Video)");
+            println!("Time: {:.1}s", elapsed.as_secs_f64());
+        }
+        OutputMode::Default => {
+            println!("Encoded: {output_path}");
+            println!("Mode: Ghost (Video)");
+        }
+    }
+}
+
+// ── Video capacity output ──
+
+pub fn print_video_capacity(info: &CliVideoCapacityInfo, json: bool) {
+    if json {
+        let frames_json: Vec<String> = info
+            .frame_positions
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        println!(
+            "{{\"iFrames\":{},\"totalPositions\":{},\"capacityBytes\":{},\"framePositions\":[{}]}}",
+            info.num_i_frames,
+            info.total_positions,
+            info.capacity_bytes,
+            frames_json.join(","),
+        );
+        return;
+    }
+    println!("I-frames:   {}", info.num_i_frames);
+    println!("Positions:  {}", info.total_positions);
+    println!("Capacity:   {} bytes", info.capacity_bytes);
+    if info.frame_positions.len() > 1 {
+        for (i, count) in info.frame_positions.iter().enumerate() {
+            println!("  Frame {i}: {count} positions");
         }
     }
 }

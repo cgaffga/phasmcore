@@ -15,7 +15,7 @@ use phasm_core::{
 };
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/image/{name}")).unwrap()
 }
 
 /// Use the larger test image for shadow tests.

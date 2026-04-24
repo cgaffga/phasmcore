@@ -14,7 +14,7 @@ use phasm_core::{
 };
 
 fn load_test_image(name: &str) -> Option<Vec<u8>> {
-    std::fs::read(format!("test-vectors/{name}")).ok()
+    std::fs::read(format!("test-vectors/image/{name}")).ok()
 }
 
 /// Optimize luma pixels and produce a new JPEG.

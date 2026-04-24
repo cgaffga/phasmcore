@@ -22,8 +22,8 @@
 //! The decoder is completely unchanged — it reads LSBs regardless of which
 //! direction the modification went.
 
-use crate::jpeg::dct::DctGrid;
-use crate::jpeg::pixels::dct_block_unquantized;
+use crate::codec::jpeg::dct::DctGrid;
+use crate::codec::jpeg::pixels::dct_block_unquantized;
 
 /// Per-coefficient rounding errors from quantization.
 ///
@@ -206,7 +206,7 @@ fn rgb_to_luma_blocks_strip(
 /// - |coeff| = 1 positions: cost is NOT modulated (anti-shrinkage forces
 ///   the direction, so the rounding error doesn't help choose direction)
 pub fn modulate_costs_si(
-    cost_map: &mut super::cost::CostMap,
+    cost_map: &mut crate::stego::cost::CostMap,
     side_info: &SideInfo,
     cover_grid: &DctGrid,
 ) {
@@ -295,7 +295,7 @@ pub fn nsf5_modify_coefficient(coeff: i16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jpeg::pixels::dct_block;
+    use crate::codec::jpeg::pixels::dct_block;
 
     // --- T1: dct_block_unquantized matches dct_block ---
 
@@ -497,7 +497,7 @@ mod tests {
 
     #[test]
     fn t8_strip_luma_matches_full() {
-        use crate::jpeg::pixels::rgb_to_luma_blocks;
+        use crate::codec::jpeg::pixels::rgb_to_luma_blocks;
 
         // Create a small test image (24x16 = 3x2 blocks)
         let width = 24u32;

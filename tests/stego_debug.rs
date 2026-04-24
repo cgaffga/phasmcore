@@ -13,7 +13,7 @@ use phasm_core::stego::stc::{embed, extract, hhat};
 
 #[test]
 fn rebuild_huffman_lossless() {
-    let data = std::fs::read("test-vectors/photo_320x240_q75_420.jpg").unwrap();
+    let data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
     let mut img = JpegImage::from_bytes(&data).unwrap();
     let grid_before = img.dct_grid(0).clone();
     img.rebuild_huffman_tables();
@@ -34,7 +34,7 @@ fn rebuild_huffman_lossless() {
 /// Full round-trip diagnostic: manually trace encode and decode.
 #[test]
 fn full_pipeline_diagnostic() {
-    let cover_data = std::fs::read("test-vectors/photo_320x240_q75_420.jpg").unwrap();
+    let cover_data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
     let passphrase = "test-pass";
     let message = "Hello!";
 

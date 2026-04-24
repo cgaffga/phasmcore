@@ -1,0 +1,138 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! JPEG-specific coefficient position collection.
+//!
+//! Collects embeddable AC coefficient positions from the JPEG `CostMap`
+//! (8×8 block layout) and applies a Fisher-Yates shuffle for pseudo-random
+//! embedding order.
+
+use crate::stego::cost::CostMap;
+use crate::stego::permute::{CoeffPos, permute_positions};
+
+/// Collect embeddable AC positions from the cost map in deterministic raster order.
+fn collect_positions(cost_map: &CostMap) -> Vec<CoeffPos> {
+    let total_blocks = cost_map.total_blocks();
+    let bt = cost_map.blocks_tall();
+    let bw = cost_map.blocks_wide();
+
+    let mut positions: Vec<CoeffPos> = Vec::with_capacity(total_blocks * 63);
+    for br in 0..bt {
+        for bc in 0..bw {
+            for i in 0..8 {
+                for j in 0..8 {
+                    if i == 0 && j == 0 {
+                        continue; // skip DC
+                    }
+                    let cost_f32 = cost_map.get(br, bc, i, j);
+                    if !cost_f32.is_finite() {
+                        continue; // skip zero-valued coefficients
+                    }
+                    let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
+                    positions.push(CoeffPos { flat_idx, cost: cost_f32 });
+                }
+            }
+        }
+    }
+    positions
+}
+
+/// Select embeddable AC coefficient positions and apply a portable Fisher-Yates
+/// permutation.
+///
+/// Uses `u32` for the random range to ensure identical shuffles on native (64-bit)
+/// and WASM (32-bit) platforms.
+///
+/// # Arguments
+/// - `cost_map`: Embedding costs for each coefficient position.
+/// - `seed`: 32-byte seed (derived from the passphrase) for the PRNG.
+///
+/// # Returns
+/// A vector of [`CoeffPos`] in pseudo-random order. DC positions and zero-valued
+/// coefficients (which have infinite/WET cost) are excluded.
+pub fn select_and_permute(cost_map: &CostMap, seed: &[u8; 32]) -> Vec<CoeffPos> {
+    let mut positions = collect_positions(cost_map);
+    permute_positions(&mut positions, seed);
+    positions
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stego::cost::CostMap;
+
+    /// Create a cost map with all AC positions having finite cost.
+    fn all_finite_map(bw: usize, bt: usize) -> CostMap {
+        let mut map = CostMap::new(bw, bt);
+        for br in 0..bt {
+            for bc in 0..bw {
+                for i in 0..8 {
+                    for j in 0..8 {
+                        if i == 0 && j == 0 {
+                            continue;
+                        }
+                        map.set(br, bc, i, j, 1.0);
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn deterministic() {
+        let map = all_finite_map(2, 2);
+        let seed = [42u8; 32];
+        let a = select_and_permute(&map, &seed);
+        let b = select_and_permute(&map, &seed);
+        let a_idx: Vec<_> = a.iter().map(|p| p.flat_idx).collect();
+        let b_idx: Vec<_> = b.iter().map(|p| p.flat_idx).collect();
+        assert_eq!(a_idx, b_idx);
+    }
+
+    #[test]
+    fn all_finite_entries_preserved() {
+        let map = all_finite_map(2, 2);
+        let positions = select_and_permute(&map, &[0u8; 32]);
+        // 4 blocks × 63 AC positions = 252
+        assert_eq!(positions.len(), 252);
+        let mut indices: Vec<_> = positions.iter().map(|p| p.flat_idx).collect();
+        indices.sort();
+        indices.dedup();
+        assert_eq!(indices.len(), 252);
+    }
+
+    #[test]
+    fn wet_positions_excluded() {
+        // Default CostMap has all WET (infinity) costs.
+        let map = CostMap::new(2, 2);
+        let positions = select_and_permute(&map, &[0u8; 32]);
+        assert_eq!(positions.len(), 0, "WET positions should be excluded");
+    }
+
+    #[test]
+    fn different_seeds_differ() {
+        let map = all_finite_map(4, 4);
+        let a = select_and_permute(&map, &[1u8; 32]);
+        let b = select_and_permute(&map, &[2u8; 32]);
+        let a_idx: Vec<_> = a.iter().map(|p| p.flat_idx).collect();
+        let b_idx: Vec<_> = b.iter().map(|p| p.flat_idx).collect();
+        assert_ne!(a_idx, b_idx);
+    }
+
+    #[test]
+    fn no_dc_positions() {
+        let map = all_finite_map(3, 3);
+        let positions = select_and_permute(&map, &[99u8; 32]);
+        for p in &positions {
+            assert_ne!(
+                p.flat_idx % 64,
+                0,
+                "DC position included: flat_idx={}",
+                p.flat_idx
+            );
+        }
+    }
+}

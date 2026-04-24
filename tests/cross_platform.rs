@@ -25,7 +25,7 @@ use phasm_core::stego::armor::template::generate_template_peaks;
 use phasm_core::{ghost_encode, ghost_decode, armor_encode, armor_decode, smart_decode};
 
 fn load_test_image(name: &str) -> Vec<u8> {
-    std::fs::read(format!("test-vectors/{name}")).unwrap()
+    std::fs::read(format!("test-vectors/image/{name}")).unwrap()
 }
 
 /// Create a cost map where every AC position has finite cost (1.0).

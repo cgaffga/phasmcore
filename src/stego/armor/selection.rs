@@ -9,8 +9,8 @@
 //! (zigzag 1..=MAX_ARMOR_ZIGZAG) are selected; DC and high-frequency
 //! positions are excluded.
 
-use crate::jpeg::dct::DctGrid;
-use crate::jpeg::zigzag::NATURAL_TO_ZIGZAG;
+use crate::codec::jpeg::dct::DctGrid;
+use crate::codec::jpeg::zigzag::NATURAL_TO_ZIGZAG;
 use crate::stego::cost::CostMap;
 use super::embedding::MAX_ARMOR_ZIGZAG;
 
@@ -22,7 +22,7 @@ const STABLE_COST: f32 = 1.0;
 /// Includes all AC coefficient positions with zigzag index 1..=MAX_ARMOR_ZIGZAG.
 /// Returns a `CostMap` where selected positions have `STABLE_COST` and
 /// DC/high-frequency positions have `WET_COST`.
-pub fn compute_stability_map(grid: &DctGrid, _qt: &crate::jpeg::dct::QuantTable) -> CostMap {
+pub fn compute_stability_map(grid: &DctGrid, _qt: &crate::codec::jpeg::dct::QuantTable) -> CostMap {
     compute_stability_map_freq_only(grid)
 }
 
@@ -53,7 +53,7 @@ fn compute_stability_map_freq_only(grid: &DctGrid) -> CostMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jpeg::dct::{DctGrid, QuantTable};
+    use crate::codec::jpeg::dct::{DctGrid, QuantTable};
     use crate::stego::cost::WET_COST;
 
     #[test]

@@ -13,14 +13,14 @@ use std::path::Path;
 
 fn read_test_image(name: &str) -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-vectors")
+        .join("test-vectors/image")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 fn try_read_test_image(name: &str) -> Option<Vec<u8>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("test-vectors")
+        .join("test-vectors/image")
         .join(name);
     std::fs::read(&path).ok()
 }

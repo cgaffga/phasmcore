@@ -1,5 +1,9 @@
 # phasm-core
 
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android%20%7C%20Web%20%7C%20CLI-green.svg)](https://phasm.app)
+
 Pure-Rust steganography engine for hiding encrypted text messages in JPEG photos.
 
 This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm-steganography/id6759446274), Android, and the [web](https://phasm.app).
@@ -72,6 +76,22 @@ let optimized = optimize_cover(&raw_pixels_rgb, width, height, &OptimizerConfig 
 ### Decode Auto-Detection
 
 `smart_decode` tries all modes automatically — Ghost primary → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
+
+### Which Mode Should I Use?
+
+| | Ghost | Armor | Fortress |
+|---|---|---|---|
+| **Goal** | Undetectable | Survives recompression | Survives WhatsApp |
+| **Algorithm** | J-UNIWARD + STC | STDM + Reed-Solomon | BA-QIM + Watson masking |
+| **Best for** | Direct sharing, AirDrop, email, "send as file" | Social media, cloud storage, cross-platform | WhatsApp, messaging apps with aggressive compression |
+| **Capacity** | High (~1 KB per 12 MP) | Medium | Low (short messages only) |
+| **Resists detection** | Yes (steganalysis-resistant) | Moderate | Moderate |
+| **Resists recompression** | No | Yes (>95% at mild QF drop) | Yes (survives QF ~62) |
+| **Plausible deniability** | Yes (shadow messages) | No | No |
+| **File attachments** | Yes (up to 2 MB) | No | No |
+| **Activation** | `--mode ghost` | Default | Auto (short messages in Armor) |
+
+**Rule of thumb:** If the image stays intact → Ghost. If it gets recompressed → Armor. If it goes through WhatsApp → Fortress auto-activates.
 
 ## Quick Start
 
@@ -200,6 +220,28 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 
 The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `pixel_width: u32`, `pixel_height: u32`). The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
 
+## Video steganography (in development)
+
+Early implementation of H.264 video steganography lives in this crate.
+`stego/video/h264_pipeline.rs` embeds encrypted messages in CAVLC-coded
+Baseline H.264 streams across four domains (trailing-one signs,
+level-suffix magnitude LSBs, level-suffix sign LSBs, motion-vector
+difference LSBs). The pure-Rust H.264 encoder and its CABAC entropy
+coder are clean-room — no ffmpeg/x264 code derivation; numeric tables
+are transcribed from ITU-T H.264 or cited to published academic
+sources.
+
+The encoder is gated behind the `h264-encoder` feature (OFF by
+default). GitHub Release CLI binaries do NOT bundle the encoder —
+consumers wanting CLI video stego build from source with
+`cargo install phasm-cli --features h264-encoder`. This posture
+accommodates the Via LA AVC patent-pool licensing for distributed
+encoder binaries.
+
+Not yet shipped in any phasm CLI or mobile-app build. The API and
+default feature set will change. Published here for transparency
+and review; production use is not recommended at this stage.
+
 ## Cargo Features
 
 | Feature | Description |
@@ -209,11 +251,24 @@ The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accep
 
 ## CLI
 
-A command-line interface is available in the `cli/` directory:
+A command-line interface is available in the `cli/` directory.
+
+### Install
 
 ```bash
-# Install
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cgaffga/phasmcore/releases/latest/download/phasm-cli-installer.sh | sh
+
+# Windows PowerShell
+powershell -c "irm https://github.com/cgaffga/phasmcore/releases/latest/download/phasm-cli-installer.ps1 | iex"
+
+# Or build from source
 cargo install --path cli
+```
+
+### Usage
+
+```bash
 
 # Encode (Armor mode, default)
 phasm encode photo.jpg -m "secret message" -p "passphrase"
@@ -506,6 +561,52 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 
 ### Platform Analysis
 - [How 15 Messaging Platforms Process Your Photos](https://phasm.app/blog/how-15-platforms-process-your-photos)
+
+## How Does Phasm Compare?
+
+| Feature | Phasm | OpenStego | Steghide | F5 |
+|---------|-------|-----------|----------|----|
+| **Status** | Active (2025–present) | Unmaintained | Unmaintained (2003) | Unmaintained |
+| **Language** | Rust (native + WASM) | Java | C++ | Java |
+| **Encryption** | AES-256-GCM-SIV + Argon2id | DES | Blowfish / AES | None |
+| **Embedding** | J-UNIWARD + STC (h=7) | LSB | LSB-adjacent | DCT histogram shift |
+| **Steganalysis resistance** | High (resists SRNet, XedroudjNet) | Low | Low | Moderate |
+| **Survives recompression** | Yes (Armor / Fortress) | No | No | No |
+| **Survives WhatsApp** | Yes (Fortress, short messages) | No | No | No |
+| **Plausible deniability** | Yes (shadow messages) | No | No | No |
+| **Side-informed mode** | Yes (SI-UNIWARD, +43% capacity) | No | No | No |
+| **File attachments** | Yes (Ghost, up to 2 MB) | No | Yes | No |
+| **Geometric resilience** | Yes (DFT template) | No | No | No |
+| **Platforms** | iOS, Android, Web (WASM), CLI | Desktop (Java) | Linux / Windows CLI | Java |
+| **Web (no install)** | Yes (WebAssembly) | No | No | No |
+| **Image format** | JPEG (any input auto-converted) | PNG, BMP | JPEG, BMP, WAV, AU | JPEG |
+| **Open source** | GPL-3.0 | GPL-2.0 | GPL-2.0 | MIT |
+
+## FAQ
+
+**Does Phasm work with WhatsApp?**
+Yes. Fortress sub-mode (auto-activates for short messages in Armor mode) survives WhatsApp's default recompression pipeline. For longer messages, send the image as a document/file to bypass compression entirely.
+
+**How detectable is Ghost mode?**
+At typical embedding rates (0.4 bpnzAC), even deep-learning steganalysis detectors like SRNet perform near random chance against J-UNIWARD-embedded images. SI-UNIWARD (auto-activated for non-JPEG inputs) further reduces detection risk.
+
+**What image sizes are supported?**
+Minimum 200×200 pixels, maximum 8192×8192 / 16 megapixels. Oversized images are automatically downsampled. The engine handles images up to 200 MP internally with ~3 MB peak memory for STC embedding.
+
+**Is the output JPEG or PNG?**
+Always JPEG. Input can be any common format (JPEG, PNG, WebP, HEIC) — non-JPEG inputs are auto-converted and enable SI-UNIWARD Deep Cover in Ghost mode.
+
+**Can I hide files, not just text?**
+Yes, in Ghost mode. File attachments up to 2 MB per file are supported alongside text messages. Files are Brotli-compressed before embedding.
+
+**What happens if I lose my passphrase?**
+The message cannot be recovered. Phasm uses AES-256-GCM-SIV with Argon2id key derivation — no backdoor, no recovery mechanism. Only the correct passphrase can decrypt the message.
+
+**Can someone prove a message exists without the passphrase?**
+Ghost mode is designed to resist this. Shadow messages add plausible deniability — you can reveal a decoy passphrase that decodes a harmless message, with no way to prove additional messages exist.
+
+**Does Phasm work offline?**
+Yes. All processing happens on-device. The web version runs entirely in WebAssembly — no server communication, no account required.
 
 ## License
 

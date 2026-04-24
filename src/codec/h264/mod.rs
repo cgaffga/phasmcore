@@ -1,0 +1,186 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! H.264/AVC bitstream parsing.
+//!
+//! Parses NAL units, parameter sets (SPS/PPS), slice headers, and CAVLC-coded
+//! macroblock residual data. Designed for steganography: tracks exact bit
+//! positions of embeddable trailing-one sign bits in the raw byte stream.
+
+pub mod bitstream;
+pub mod tables;
+pub mod sps;
+pub mod slice;
+pub mod cavlc;
+#[cfg(feature = "h264-encoder")]
+pub mod cavlc_writer;
+#[cfg(feature = "h264-encoder")]
+pub mod cavlc_size;
+pub mod macroblock;
+pub mod transform;
+pub mod intra_pred;
+pub mod intra_pred_8x8;
+pub mod reconstruct;
+pub mod mv;
+pub mod fingerprint;
+
+// Phase 6 — pure-Rust H.264 encoder + its dedicated CABAC entropy coder.
+// Gated behind the `h264-encoder` Cargo feature (OFF by default) so the
+// GitHub-release CLI binary never accidentally bundles an encoder
+// subject to Via LA AVC patent obligations. Mobile bridges enable the
+// feature explicitly. See
+// `docs/design/h264-video-steganography.md` § Phase 6.
+#[cfg(feature = "h264-encoder")]
+pub mod cabac;
+#[cfg(feature = "h264-encoder")]
+pub mod encoder;
+
+use std::fmt;
+
+/// H.264/AVC parsing error.
+#[derive(Debug, Clone)]
+pub enum H264Error {
+    /// Unexpected end of bitstream data.
+    UnexpectedEof,
+    /// Invalid NAL unit header.
+    InvalidNalHeader,
+    /// Invalid or malformed parameter set.
+    InvalidParameterSet(String),
+    /// H.264 feature not supported for steganography.
+    Unsupported(String),
+    /// CAVLC decoding failure.
+    CavlcError(String),
+}
+
+impl fmt::Display for H264Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedEof => write!(f, "unexpected end of H.264 data"),
+            Self::InvalidNalHeader => write!(f, "invalid NAL unit header"),
+            Self::InvalidParameterSet(s) => write!(f, "invalid parameter set: {s}"),
+            Self::Unsupported(s) => write!(f, "unsupported H.264 feature: {s}"),
+            Self::CavlcError(s) => write!(f, "CAVLC decode error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for H264Error {}
+
+/// H.264 NAL unit type (ITU-T H.264 Table 7-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NalType(pub u8);
+
+impl NalType {
+    /// Coded slice of a non-IDR picture.
+    pub const SLICE: Self = Self(1);
+    /// Coded slice data partition A.
+    pub const SLICE_DPA: Self = Self(2);
+    /// Coded slice data partition B.
+    pub const SLICE_DPB: Self = Self(3);
+    /// Coded slice data partition C.
+    pub const SLICE_DPC: Self = Self(4);
+    /// Coded slice of an IDR picture.
+    pub const SLICE_IDR: Self = Self(5);
+    /// Supplemental enhancement information.
+    pub const SEI: Self = Self(6);
+    /// Sequence parameter set.
+    pub const SPS: Self = Self(7);
+    /// Picture parameter set.
+    pub const PPS: Self = Self(8);
+    /// Access unit delimiter.
+    pub const AUD: Self = Self(9);
+    /// End of sequence.
+    pub const END_SEQ: Self = Self(10);
+    /// End of stream.
+    pub const END_STREAM: Self = Self(11);
+    /// Filler data.
+    pub const FILLER: Self = Self(12);
+    /// SPS extension.
+    pub const SPS_EXT: Self = Self(13);
+
+    /// True for VCL NAL types (contain coded slice data).
+    pub fn is_vcl(self) -> bool {
+        self.0 >= 1 && self.0 <= 5
+    }
+
+    /// True for IDR (Instantaneous Decoder Refresh) slices.
+    pub fn is_idr(self) -> bool {
+        self.0 == 5
+    }
+
+    /// True for any slice type (non-IDR or IDR).
+    pub fn is_slice(self) -> bool {
+        self.0 >= 1 && self.0 <= 5
+    }
+}
+
+impl fmt::Display for NalType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self.0 {
+            1 => "SLICE",
+            2 => "SLICE_DPA",
+            3 => "SLICE_DPB",
+            4 => "SLICE_DPC",
+            5 => "IDR",
+            6 => "SEI",
+            7 => "SPS",
+            8 => "PPS",
+            9 => "AUD",
+            10 => "END_SEQ",
+            11 => "END_STREAM",
+            12 => "FILLER",
+            13 => "SPS_EXT",
+            n => return write!(f, "NAL({n})"),
+        };
+        write!(f, "{name}")
+    }
+}
+
+/// Parsed H.264 NAL unit.
+#[derive(Debug, Clone)]
+pub struct NalUnit {
+    /// NAL unit type.
+    pub nal_type: NalType,
+    /// nal_ref_idc: 0 = non-reference, 1-3 = reference priority.
+    pub nal_ref_idc: u8,
+    /// Raw Byte Sequence Payload (emulation prevention bytes removed).
+    pub rbsp: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nal_type_is_vcl() {
+        assert!(!NalType(0).is_vcl());
+        assert!(NalType::SLICE.is_vcl());
+        assert!(NalType::SLICE_IDR.is_vcl());
+        assert!(!NalType::SPS.is_vcl());
+        assert!(!NalType::PPS.is_vcl());
+        assert!(!NalType::SEI.is_vcl());
+    }
+
+    #[test]
+    fn nal_type_is_idr() {
+        assert!(NalType::SLICE_IDR.is_idr());
+        assert!(!NalType::SLICE.is_idr());
+        assert!(!NalType::SPS.is_idr());
+    }
+
+    #[test]
+    fn nal_type_display() {
+        assert_eq!(format!("{}", NalType::SPS), "SPS");
+        assert_eq!(format!("{}", NalType::SLICE_IDR), "IDR");
+        assert_eq!(format!("{}", NalType(99)), "NAL(99)");
+    }
+
+    #[test]
+    fn error_display() {
+        let e = H264Error::UnexpectedEof;
+        assert!(format!("{e}").contains("unexpected"));
+        let e = H264Error::CavlcError("bad block".into());
+        assert!(format!("{e}").contains("bad block"));
+    }
+}

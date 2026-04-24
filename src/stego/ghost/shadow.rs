@@ -57,14 +57,14 @@
 //! use nsf5, the Y nzAC set is identical at encoder and decoder, guaranteeing
 //! position agreement.
 
-use crate::jpeg::JpegImage;
+use crate::codec::jpeg::JpegImage;
 use crate::stego::armor::ecc;
 use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute::CoeffPos;
-use crate::stego::pipeline::{flat_get, flat_set};
+use super::pipeline::{flat_get, flat_set};
 use crate::stego::side_info::nsf5_modify_coefficient;
 
 /// Frame overhead inside the RS-encoded payload:

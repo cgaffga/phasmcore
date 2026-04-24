@@ -18,6 +18,18 @@
 pub mod uerd;
 pub mod uniward;
 
+// HEVC-specific cost modules — archived behind `hevc-archive` feature.
+
+// H.264 (production) cost modules.
+#[cfg(feature = "video")]
+pub mod h264_cost;
+#[cfg(feature = "video")]
+pub mod h264_uniward;
+#[cfg(feature = "video")]
+pub mod h264_ddca;
+#[cfg(feature = "video")]
+pub mod h264_mvd_cost;
+
 /// Cost assigned to coefficients that must never be modified (f32 version).
 /// Using infinity ensures the Viterbi STC never selects these positions for flipping.
 pub const WET_COST: f32 = f32::INFINITY;

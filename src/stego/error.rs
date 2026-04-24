@@ -34,6 +34,8 @@ pub enum StegoError {
     KeyDerivationFailed,
     /// Duplicate passphrase: each shadow layer must use a unique passphrase.
     DuplicatePassphrase,
+    /// The video file is invalid or uses unsupported features.
+    InvalidVideo(String),
 }
 
 impl fmt::Display for StegoError {
@@ -50,6 +52,7 @@ impl fmt::Display for StegoError {
             Self::Cancelled => write!(f, "operation cancelled by user"),
             Self::KeyDerivationFailed => write!(f, "key derivation failed"),
             Self::DuplicatePassphrase => write!(f, "duplicate passphrase (each layer must use a unique passphrase)"),
+            Self::InvalidVideo(s) => write!(f, "invalid video: {s}"),
         }
     }
 }
@@ -66,5 +69,19 @@ impl std::error::Error for StegoError {
 impl From<crate::jpeg::error::JpegError> for StegoError {
     fn from(e: crate::jpeg::error::JpegError) -> Self {
         Self::InvalidJpeg(e)
+    }
+}
+
+#[cfg(feature = "video")]
+impl From<crate::codec::h264::H264Error> for StegoError {
+    fn from(e: crate::codec::h264::H264Error) -> Self {
+        Self::InvalidVideo(e.to_string())
+    }
+}
+
+#[cfg(feature = "video")]
+impl From<crate::codec::mp4::Mp4Error> for StegoError {
+    fn from(e: crate::codec::mp4::Mp4Error) -> Self {
+        Self::InvalidVideo(e.to_string())
     }
 }

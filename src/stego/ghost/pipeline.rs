@@ -11,7 +11,7 @@
 //! 4. nsF5-style LSB modification (toward zero for |coeff| > 1, away from
 //!    zero for |coeff| == 1 to prevent shrinkage)
 
-use crate::jpeg::JpegImage;
+use crate::codec::jpeg::JpegImage;
 use crate::stego::cost::uniward::compute_positions_streaming;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
@@ -49,7 +49,7 @@ pub const GHOST_ENCODE_STEPS: u32 =
     + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS
     + crate::stego::stc::embed::STC_PROGRESS_STEPS
     + 2
-    + crate::jpeg::scan::JPEG_WRITE_STEPS;
+    + crate::codec::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Compute the STC width `w`, usable cover length, and effective `m_max` from
 /// the total number of AC positions. Both encoder and decoder must agree on
@@ -217,7 +217,7 @@ pub fn ghost_encode_si_with_files_quality(
     // Parse image first to get the grid and QT for side info computation
     let img = JpegImage::from_bytes(image_bytes)?;
     let fi = img.frame_info();
-    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+    crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
 
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
@@ -260,7 +260,7 @@ pub const GHOST_ENCODE_WITH_SHADOWS_STEPS: u32 =
     + 2  // shadow prep + permute
     + crate::stego::stc::embed::STC_PROGRESS_STEPS
     + crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS  // verification pass
-    + crate::jpeg::scan::JPEG_WRITE_STEPS;
+    + crate::codec::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Escalation cascade for shadow verification.
 ///
@@ -341,7 +341,7 @@ pub fn ghost_encode_si_with_shadows_quality(
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let img = JpegImage::from_bytes(image_bytes)?;
     let fi = img.frame_info();
-    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+    crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
 
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
@@ -449,7 +449,7 @@ fn ghost_encode_with_shadows_impl(
     };
     progress::advance_by(PARSE_STEPS);
     let fi = img.frame_info();
-    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+    crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
 
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
@@ -630,7 +630,7 @@ fn ghost_encode_with_shadows_impl(
 
                         let has_fraction_1 = fractions_for_parity.contains(&1);
 
-                        let successes: Vec<(usize, crate::jpeg::JpegImage, Vec<shadow::ShadowState>, f64, usize)> =
+                        let successes: Vec<(usize, crate::codec::jpeg::JpegImage, Vec<shadow::ShadowState>, f64, usize)> =
                             fractions_for_parity.par_iter().filter_map(|&fraction| {
                             // Checkpoint: skip if a better (larger) fraction already verified.
                             if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
@@ -785,7 +785,7 @@ fn ghost_encode_with_shadows_impl(
 /// Returns `(total_cost, num_modifications)` from STC embedding.
 fn run_stc_pass(
     img: &mut JpegImage,
-    original_y: &crate::jpeg::dct::DctGrid,
+    original_y: &crate::codec::jpeg::dct::DctGrid,
     positions: &[permute::CoeffPos],
     shadow_states: &[shadow::ShadowState],
     message_bits: &[u8],
@@ -911,7 +911,7 @@ fn ghost_encode_impl(
 
     // Validate dimensions before any heavy processing.
     let fi = img.frame_info();
-    super::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
+    crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
 
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
@@ -1262,7 +1262,7 @@ pub fn ghost_shadow_decode_from_image(
 
 // --- DctGrid flat access helpers ---
 
-use crate::jpeg::dct::DctGrid;
+use crate::codec::jpeg::dct::DctGrid;
 
 /// Read a coefficient from a `DctGrid` using a flat index.
 ///
