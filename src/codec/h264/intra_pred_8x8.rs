@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
 
 //! H.264 Intra_8×8 prediction — spec § 8.3.2.
 //!
@@ -619,7 +620,7 @@ mod tests {
             }
         }
         // With flat neighbors of value 75, DC should be ~75.
-        assert!(v0 >= 74 && v0 <= 76);
+        assert!((74..=76).contains(&v0));
     }
 
     #[test]

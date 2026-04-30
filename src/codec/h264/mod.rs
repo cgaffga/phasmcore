@@ -35,6 +35,21 @@ pub mod fingerprint;
 pub mod cabac;
 #[cfg(feature = "h264-encoder")]
 pub mod encoder;
+// Phase 6F.1 — encode-time stego primitives previously lived under
+// `encoder/stego`. The decoder's bin walker also consumes them
+// (`crate::codec::h264::stego::hook::PositionKey` etc.), and the
+// encoder struct embeds an `Option<Box<dyn StegoMbHook>>` field
+// for hook plumbing — so this module must compile whenever the
+// `h264-encoder` feature is on. The PUBLIC stego API in `lib.rs`
+// stays gated by `cabac-stego` (consumer-facing intent unchanged).
+//
+// Phase 6F.4 (cross-platform smoke 2026-04-30) — gate widened from
+// `cabac-stego` to `h264-encoder` after iOS/Android bridges
+// (`features = ["parallel", "video", "h264-encoder"]`) failed to
+// compile post-6F.1 because the bin_decoder + encoder.rs reference
+// `stego::*` types unconditionally.
+#[cfg(feature = "h264-encoder")]
+pub mod stego;
 
 use std::fmt;
 

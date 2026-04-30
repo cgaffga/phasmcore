@@ -194,7 +194,7 @@ fn filter_luma_bs4(p: [i32; 4], q: [i32; 4], alpha: i32, beta: i32) -> ([i32; 3]
 fn filter_luma_bs_lt4(
     p: [i32; 4],
     q: [i32; 4],
-    alpha: i32,
+    _alpha: i32,
     beta: i32,
     tc0: i32,
 ) -> ([i32; 3], [i32; 3]) {
@@ -212,7 +212,7 @@ fn filter_luma_bs_lt4(
     let delta = clip3(
         -tc,
         tc,
-        ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3),
+        (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3,
     );
     new_p[0] = clip1_y(p0 + delta) as i32;
     new_q[0] = clip1_y(q0 - delta) as i32;
@@ -247,7 +247,7 @@ fn filter_chroma_bs_lt4(p: [i32; 2], q: [i32; 2], tc0: i32) -> (i32, i32) {
     let delta = clip3(
         -tc,
         tc,
-        ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3),
+        (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3,
     );
     let new_p0 = clip1_y(p0 + delta) as i32;
     let new_q0 = clip1_y(q0 - delta) as i32;
@@ -430,8 +430,7 @@ fn filter_mb_edges(
     // MB-boundary (edge = 0) and 8-pixel-grid internal (edge = 8)
     // edges are always filtered per spec § 8.7.2.1.
     let cur_t8 = transform_8x8_grid
-        .map(|g| g[cur_idx])
-        .unwrap_or(false);
+        .is_some_and(|g| g[cur_idx]);
 
     // ── Vertical edges: x = 0 (cross-MB), 4, 8, 12 (internal) ──
     for edge_x in [0usize, 4, 8, 12] {

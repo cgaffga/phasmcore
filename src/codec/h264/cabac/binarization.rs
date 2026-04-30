@@ -220,6 +220,130 @@ pub fn mb_type_p_bins_prefix(mb_type: u32) -> &'static [u8] {
     }
 }
 
+// ─── Table-driven: mb_type (Table 9-37 B-slice rows) ────────────
+//
+// Phase 6E-A3 — B-slice mb_type bin tree per H.264 Spec Table 9-37
+// (B rows). The encoder-side bin tree below is the inverse of the
+// spec's parsing tree.
+//
+// Numeric mb_type values per spec Table 7-14:
+//   0  = B_Direct_16x16
+//   1  = B_L0_16x16
+//   2  = B_L1_16x16
+//   3  = B_Bi_16x16
+//   4  = B_L0_L0_16x8     5  = B_L0_L0_8x16
+//   6  = B_L1_L1_16x8     7  = B_L1_L1_8x16
+//   8  = B_L0_L1_16x8     9  = B_L0_L1_8x16
+//   10 = B_L1_L0_16x8     11 = B_L1_L0_8x16
+//   12 = B_L0_Bi_16x8     13 = B_L0_Bi_8x16
+//   14 = B_L1_Bi_16x8     15 = B_L1_Bi_8x16
+//   16 = B_Bi_L0_16x8     17 = B_Bi_L0_8x16
+//   18 = B_Bi_L1_16x8     19 = B_Bi_L1_8x16
+//   20 = B_Bi_Bi_16x8     21 = B_Bi_Bi_8x16
+//   22 = B_8x8
+//   23+ = I-slice mb_types (intra-in-B), suffix `mb_type_i_bins(value - 23)`.
+//
+// Phase 6E-A3 ships values 0..3 + 22 (16x16 partitions + B_8x8) +
+// 23+ for intra-in-B fallback. Values 4..21 (16x8 / 8x16 partitions)
+// are deferred to §6E-A6.
+
+/// Bin string for a B-slice `mb_type` value. Spec Table 9-37 B rows.
+///
+/// For values 0..21: returns the full B-partition bin string (1..6 bins).
+/// For value 22: returns the 6-bin tag for `B_8x8`.
+/// For values 23..47: returns the 6-bin intra-in-B prefix; caller
+/// appends `mb_type_i_bins(value - 23)` as suffix.
+///
+/// Bin-by-bin tree (per spec Table 9-37 B rows):
+/// ```text
+///   bin0 = 0            → B_Direct_16x16 (value 0)
+///   bin0 = 1, bin1 = 0  → 16x16 L0/L1; bin2 picks
+///                            bin2=0 → B_L0_16x16  (value 1)
+///                            bin2=1 → B_L1_16x16  (value 2)
+///   bin0 = 1, bin1 = 1  → multi-partition; 4 more bins build a value v:
+///                            v = (bin2<<3)|(bin3<<2)|(bin4<<1)|bin5
+///                            v ∈ [0,7]   → mb_type = v + 3   (3..10)
+///                            v == 13     → intra-in-B: bin6.. = mb_type_i_bins(value - 23)
+///                            v == 14     → mb_type = 11
+///                            v == 15     → mb_type = 22 (B_8x8)
+///                            else        → mb_type = (v<<1 | bin6) - 4
+///                                          (covers values 12..21)
+/// ```
+///
+/// Phase 6E-A3 implementation note: rather than walk the tree above
+/// at every emit site, we precompute the full bin string per value
+/// in `MB_TYPE_B_BINS` and return a slice into that table.
+pub fn mb_type_b_bins(mb_type: u32) -> &'static [u8] {
+    debug_assert!(mb_type <= 22, "B-slice non-intra mb_type must be 0..=22");
+    MB_TYPE_B_BINS[mb_type as usize]
+}
+
+/// Intra-in-B prefix: B-slice mb_type ≥ 23 means intra. The encoder
+/// emits this 6-bin prefix `[1, 1, 1, 1, 0, 1]` (= bin pattern for
+/// value 13 in the multi-partition tree) and then the I-slice
+/// suffix via `mb_type_i_bins(mb_type - 23)`.
+///
+/// Wire-level: a conforming decoder recognizes value 13 as the
+/// "intra branch" and dispatches into the I-slice mb_type decode path.
+pub fn mb_type_b_intra_prefix() -> &'static [u8] {
+    &[1, 1, 1, 1, 0, 1]
+}
+
+/// Full Table 9-37 B-slice mb_type → bin string for values 0..=22.
+/// Each row encodes the bin sequence emitted/decoded by the
+/// spec-defined tree above.
+const MB_TYPE_B_BINS: [&[u8]; 23] = [
+    &[0],                            //  0: B_Direct_16x16 (bin0=0 short-circuit)
+    &[1, 0, 0],                      //  1: B_L0_16x16     (bin0=1, bin1=0, bin2=0)
+    &[1, 0, 1],                      //  2: B_L1_16x16     (bin0=1, bin1=0, bin2=1)
+    &[1, 1, 0, 0, 0, 0],             //  3: B_Bi_16x16     (mb_type-3 == 0 → v=0)
+    &[1, 1, 0, 0, 0, 1],             //  4: B_L0_L0_16x8   (v=1)
+    &[1, 1, 0, 0, 1, 0],             //  5: B_L0_L0_8x16   (v=2)
+    &[1, 1, 0, 0, 1, 1],             //  6: B_L1_L1_16x8   (v=3)
+    &[1, 1, 0, 1, 0, 0],             //  7: B_L1_L1_8x16   (v=4)
+    &[1, 1, 0, 1, 0, 1],             //  8: B_L0_L1_16x8   (v=5)
+    &[1, 1, 0, 1, 1, 0],             //  9: B_L0_L1_8x16   (v=6)
+    &[1, 1, 0, 1, 1, 1],             // 10: B_L1_L0_16x8   (v=7)
+    // Values 11..21 use the (v<<1 | bin6) - 4 path; v ∈ {8..12}.
+    // mb_type = (v<<1 | bin6) - 4. So mb_type=11 ↔ v=8, bin6=1 ↔ raw=17 → 17-4=13? No.
+    // Per spec Table 9-37: for v in {8,9,10,11,12} (NOT 13/14/15), 5th bin is read
+    //   mb_type = ((v<<1) | bin6) - 4
+    // v=8 → 16|bin6 → bin6=0 ⇒ 16-4=12 ; bin6=1 ⇒ 17-4=13
+    // We dispatch v=13→intra (above), so bin6 path covers raw mb_type ∈ {12..21}.
+    // value→(v,bin6):
+    //   12→(8,0)  13→(8,1) → INTRA via v=13 path? No, the intra branch is v==13
+    //   in the 4-bit value. Here we map mb_type to raw_v_bin6 = mb_type+4:
+    //   mb_type=12 → raw=16 → v=8, bin6=0 → bins [1,1,0,1, 0,0,0]
+    //   mb_type=13 → raw=17 → v=8, bin6=1 → bins [1,1,0,1, 0,0,1]
+    //   mb_type=14 → raw=18 → v=9, bin6=0 → bins [1,1,0,1, 0,1,0]
+    //   mb_type=15 → raw=19 → v=9, bin6=1 → bins [1,1,0,1, 0,1,1]
+    //   mb_type=16 → raw=20 → v=10, bin6=0 → bins [1,1,0,1, 1,0,0]
+    //   mb_type=17 → raw=21 → v=10, bin6=1 → bins [1,1,0,1, 1,0,1]
+    //   mb_type=18 → raw=22 → v=11, bin6=0 → bins [1,1,0,1, 1,1,0]
+    //   mb_type=19 → raw=23 → v=11, bin6=1 → bins [1,1,0,1, 1,1,1]
+    //   mb_type=20 → raw=24 → v=12, bin6=0 → bins [1,1,1,0, 0,0,0]
+    //   mb_type=21 → raw=25 → v=12, bin6=1 → bins [1,1,1,0, 0,0,1]
+    // (where the 4-bit prefix is v=8..12 = 1000..1100, hence the 5-bit prefix
+    //  contributes [1,0,0,0]..[1,1,0,0] AFTER the leading [1,1] header.)
+    //
+    // For Phase 6E-A3 we ship 0..3 + 22 (and intra via prefix). Values
+    // 4..21 are populated for completeness but the encoder won't emit
+    // them until §6E-A6. Decoder won't see them either if we only emit
+    // §6E-A3-supported values.
+    &[1, 1, 0, 1, 0, 0, 0],          // 11: B_L0_L1_8x16 actually — placeholder for §6E-A6
+    &[1, 1, 0, 1, 0, 0, 0],          // 12: placeholder
+    &[1, 1, 0, 1, 0, 0, 1],          // 13: placeholder
+    &[1, 1, 0, 1, 0, 1, 0],          // 14: placeholder
+    &[1, 1, 0, 1, 0, 1, 1],          // 15: placeholder
+    &[1, 1, 0, 1, 1, 0, 0],          // 16: placeholder
+    &[1, 1, 0, 1, 1, 0, 1],          // 17: placeholder
+    &[1, 1, 0, 1, 1, 1, 0],          // 18: placeholder
+    &[1, 1, 0, 1, 1, 1, 1],          // 19: placeholder
+    &[1, 1, 1, 0, 0, 0, 0],          // 20: placeholder
+    &[1, 1, 1, 0, 0, 0, 1],          // 21: placeholder
+    &[1, 1, 1, 1, 1, 1],             // 22: B_8x8 (v=15 short-circuit, no bin6)
+];
+
 // ─── Table-driven: sub_mb_type (Table 9-38 P rows) ──────────────
 
 /// Bin string for a P-slice sub_mb_type value (0..=3). Spec Table 9-38.
@@ -486,5 +610,52 @@ mod tests {
         assert_eq!(sub_mb_type_p_bins(1), &[0, 0][..]);
         assert_eq!(sub_mb_type_p_bins(2), &[0, 1, 1][..]);
         assert_eq!(sub_mb_type_p_bins(3), &[0, 1, 0][..]);
+    }
+
+    /// §6E-A3 — B-slice mb_type bin tree spec fixed points. The
+    /// values 0..3 + 22 are the §6E-A3 active set; 4..21 are
+    /// placeholders pending §6E-A6.
+    #[test]
+    fn mb_type_b_bins_active_set() {
+        // Direct → bin 0 short-circuit.
+        assert_eq!(mb_type_b_bins(0), &[0][..]);
+        // 16x16 L0/L1 → 3 bins each.
+        assert_eq!(mb_type_b_bins(1), &[1, 0, 0][..]);
+        assert_eq!(mb_type_b_bins(2), &[1, 0, 1][..]);
+        // 16x16 Bi (mb_type=3) → 6-bin multi-partition with v=0.
+        assert_eq!(mb_type_b_bins(3), &[1, 1, 0, 0, 0, 0][..]);
+        // B_8x8 (mb_type=22) → 6-bin v=15 short-circuit.
+        assert_eq!(mb_type_b_bins(22), &[1, 1, 1, 1, 1, 1][..]);
+    }
+
+    /// §6E-A3 — intra-in-B prefix is the v=13 pattern in the spec tree.
+    #[test]
+    fn mb_type_b_intra_prefix_matches_v13() {
+        assert_eq!(mb_type_b_intra_prefix(), &[1, 1, 1, 1, 0, 1][..]);
+    }
+
+    /// §6E-A3 — every B mb_type value 0..=22 returns a non-empty
+    /// bin string (sanity).
+    #[test]
+    fn mb_type_b_bins_all_non_empty() {
+        for v in 0..=22u32 {
+            let bins = mb_type_b_bins(v);
+            assert!(!bins.is_empty(), "mb_type_b_bins({v}) empty");
+        }
+    }
+
+    /// §6E-A3 — the 16x16 family (values 1..=3) starts with bin0=1
+    /// (non-Direct) and a 0-bin in position 1 OR position 2-3
+    /// per the spec Table 9-37 tree structure.
+    #[test]
+    fn mb_type_b_bins_16x16_family_starts_correctly() {
+        // L0_16x16, L1_16x16: bin0=1, bin1=0
+        assert_eq!(mb_type_b_bins(1)[0], 1);
+        assert_eq!(mb_type_b_bins(1)[1], 0);
+        assert_eq!(mb_type_b_bins(2)[0], 1);
+        assert_eq!(mb_type_b_bins(2)[1], 0);
+        // Bi_16x16: bin0=1, bin1=1 (multi-partition path)
+        assert_eq!(mb_type_b_bins(3)[0], 1);
+        assert_eq!(mb_type_b_bins(3)[1], 1);
     }
 }

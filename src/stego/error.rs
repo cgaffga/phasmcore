@@ -34,6 +34,12 @@ pub enum StegoError {
     KeyDerivationFailed,
     /// Duplicate passphrase: each shadow layer must use a unique passphrase.
     DuplicatePassphrase,
+    /// Shadow embedding failed cascade — encoder verification couldn't
+    /// recover the shadow message after escalating through all parity
+    /// tiers `[4, 8, 16, 32, 64, 128]`. Caller can retry with a smaller
+    /// primary message (less propagation), different `gop_size`/quality,
+    /// or a different shadow passphrase.
+    ShadowEmbedFailed,
     /// The video file is invalid or uses unsupported features.
     InvalidVideo(String),
 }
@@ -52,6 +58,7 @@ impl fmt::Display for StegoError {
             Self::Cancelled => write!(f, "operation cancelled by user"),
             Self::KeyDerivationFailed => write!(f, "key derivation failed"),
             Self::DuplicatePassphrase => write!(f, "duplicate passphrase (each layer must use a unique passphrase)"),
+            Self::ShadowEmbedFailed => write!(f, "shadow embed failed: cascade exhausted at parity tier 128 — try a smaller primary message, different gop_size/quality, or different shadow passphrase"),
             Self::InvalidVideo(s) => write!(f, "invalid video: {s}"),
         }
     }

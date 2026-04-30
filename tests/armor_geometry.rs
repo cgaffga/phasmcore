@@ -25,12 +25,9 @@ fn apply_geometry(stego_bytes: &[u8], transform: &AffineTransform) -> Vec<u8> {
     let (luma, w, h) = pixels::jpeg_to_luma_f64(&img).unwrap();
     let transformed = resample_bilinear(&luma, w, h, transform, w, h);
     pixels::luma_f64_to_jpeg(&transformed, w, h, &mut img).unwrap();
-    match img.to_bytes() {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            img.rebuild_huffman_tables();
-            img.to_bytes().unwrap()
-        }
+    if let Ok(bytes) = img.to_bytes() { bytes } else {
+        img.rebuild_huffman_tables();
+        img.to_bytes().unwrap()
     }
 }
 

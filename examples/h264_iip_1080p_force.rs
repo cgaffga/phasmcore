@@ -33,7 +33,7 @@ fn main() {
     let yuv_path = std::env::var("YUV").unwrap_or_else(|_| format!("/tmp/img4138_1080p_f{}.yuv", n_frames));
     let frame_size = (w * h * 3 / 2) as usize;
     let y_size = (w * h) as usize;
-    let c_size = y_size / 4;
+    let _c_size = y_size / 4;
     let pixels = std::fs::read(&yuv_path).expect("yuv missing");
 
     let q: u8 = std::env::var("Q").ok().and_then(|s| s.parse().ok()).unwrap_or(80);

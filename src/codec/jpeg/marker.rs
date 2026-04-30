@@ -84,7 +84,7 @@ pub fn iterate_markers(data: &[u8]) -> Result<(Vec<MarkerEntry>, usize)> {
         }
 
         // Standalone markers (no length field)
-        if marker == EOI || (marker >= 0xD0 && marker <= 0xD7) {
+        if marker == EOI || (0xD0..=0xD7).contains(&marker) {
             entries.push(MarkerEntry {
                 marker,
                 data: Vec::new(),
@@ -214,7 +214,7 @@ pub fn skip_scan_data(data: &[u8], mut pos: usize) -> Result<usize> {
             pos += 2;
             continue;
         }
-        if next >= 0xD0 && next <= 0xD7 {
+        if (0xD0..=0xD7).contains(&next) {
             // Restart marker — skip it
             pos += 2;
             continue;
@@ -278,7 +278,7 @@ pub fn iterate_markers_all(data: &[u8]) -> Result<(Vec<MarkerEntry>, Vec<usize>)
         }
 
         // Standalone markers (no length field)
-        if marker == EOI || (marker >= 0xD0 && marker <= 0xD7) {
+        if marker == EOI || (0xD0..=0xD7).contains(&marker) {
             entries.push(MarkerEntry {
                 marker,
                 data: Vec::new(),

@@ -306,7 +306,7 @@ fn collect_neighbors_8x8_from_recon(
     origin_x: u32,
     origin_y: u32,
     mb_x: usize,
-    mb_y: usize,
+    _mb_y: usize,
     blk_idx: usize,
 ) -> Neighbors8x8 {
     let stride = recon.width as usize;

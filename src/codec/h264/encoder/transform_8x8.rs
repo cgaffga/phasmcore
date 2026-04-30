@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
 
 //! H.264 8×8 integer transform — forward + inverse + quant/dequant.
 //! Implemented from H.264 spec (Rec. ITU-T H.264 (03/2010)) § 8.5.13

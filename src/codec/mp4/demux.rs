@@ -40,7 +40,7 @@ pub fn demux(data: &[u8]) -> Result<Mp4File, Mp4Error> {
             break;
         }
         let box_end = pos + header.size as usize;
-        let content_start = pos + header.header_len as usize;
+        let _content_start = pos + header.header_len as usize;
 
         match &header.box_type {
             b"ftyp" => {
@@ -570,9 +570,7 @@ fn build_samples(
 
     if stsc_entries.is_empty() {
         // Fallback: assume 1 sample per chunk
-        for spc in &mut samples_per_chunk {
-            *spc = 1;
-        }
+        samples_per_chunk.fill(1);
     } else {
         for (i, entry) in stsc_entries.iter().enumerate() {
             let first_chunk = entry.0 as usize; // 1-based
@@ -754,7 +752,7 @@ fn recover_from_annexb(
         }
 
         let is_vcl = nal_type_val <= 31;
-        let is_irap = nal_type_val >= 16 && nal_type_val <= 23;
+        let is_irap = (16..=23).contains(&nal_type_val);
         let is_first_slice = if is_vcl && nal_data.len() >= 3 {
             (nal_data[2] >> 7) & 1 == 1
         } else {
@@ -816,7 +814,7 @@ fn recover_from_length_prefixed(
     mdat_start: usize,
     length_size: u8,
 ) -> Result<Mp4File, Mp4Error> {
-    let ls = length_size as usize;
+    let _ls = length_size as usize;
 
     // Walk NAL units, collect parameter sets and build access units
     let mut vps_nalus: Vec<Vec<u8>> = Vec::new();
@@ -917,7 +915,7 @@ fn recover_from_length_prefixed(
                     true // Single-slice assumption
                 };
 
-                let is_irap = nal_type_val >= 16 && nal_type_val <= 23;
+                let is_irap = (16..=23).contains(&nal_type_val);
 
                 if is_first_slice {
                     // This starts a new picture. If we had an AU accumulating, flush it.
@@ -955,8 +953,8 @@ fn recover_from_length_prefixed(
             // Non-VCL, non-parameter-set NAL units (AUD, SEI, filler, etc.)
             _ => {
                 // AUD (35) signals an access unit boundary
-                if nal_type_val == 35 {
-                    if au_start.is_some() && au_size > 0 {
+                if nal_type_val == 35
+                    && au_start.is_some() && au_size > 0 {
                         let prev_has_vcl = samples_has_vcl_data(
                             mdat_data, au_start.unwrap(), au_size, ls,
                         );
@@ -970,7 +968,6 @@ fn recover_from_length_prefixed(
                             au_is_irap = false;
                         }
                     }
-                }
                 if au_start.is_none() {
                     au_start = Some(pos);
                 }
@@ -982,11 +979,10 @@ fn recover_from_length_prefixed(
     }
 
     // Flush final access unit
-    if let Some(start) = au_start {
-        if au_size > 0 && samples_has_vcl_data(mdat_data, start, au_size, ls) {
+    if let Some(start) = au_start
+        && au_size > 0 && samples_has_vcl_data(mdat_data, start, au_size, ls) {
             flush_access_unit(&mut samples, mdat_start, start, au_size, au_is_irap, mdat_data);
         }
-    }
 
     build_recovered_mp4(ftyp, vps_nalus, sps_nalus, pps_nalus, samples, length_size)
 }
@@ -1291,7 +1287,7 @@ pub fn demux_streaming<R: Read + Seek>(reader: &mut R) -> Result<Mp4File, Mp4Err
             break;
         }
 
-        let content_size = (box_size - header_len) as usize;
+        let _content_size = (box_size - header_len) as usize;
         match &box_type {
             b"ftyp" => {
                 // Read the whole ftyp box (header + content)
@@ -1419,9 +1415,7 @@ fn build_samples_metadata(
     let mut samples_per_chunk = vec![0u32; num_chunks];
 
     if stsc_entries.is_empty() {
-        for spc in &mut samples_per_chunk {
-            *spc = 1;
-        }
+        samples_per_chunk.fill(1);
     } else {
         for (i, entry) in stsc_entries.iter().enumerate() {
             let first_chunk = entry.0 as usize;
@@ -1780,7 +1774,7 @@ mod tests {
         hvcc_content.extend_from_slice(&[0, 0]); // avg_frame_rate
         hvcc_content.push(0x0F); // length_size=4 (3+1)
         hvcc_content.push(1); // numOfArrays (VPS only for simplicity)
-        hvcc_content.push(0x20 | 32); // VPS
+        hvcc_content.push(0x20); // array_completeness=0, nal_unit_type=32 (VPS)
         hvcc_content.extend_from_slice(&1u16.to_be_bytes()); // 1 NAL
         let vps = [0x40, 0x01, 0x0C];
         hvcc_content.extend_from_slice(&(vps.len() as u16).to_be_bytes());
@@ -1953,7 +1947,7 @@ mod tests {
         let mp4 = demux(&mp4_data).unwrap();
 
         // Check ftyp
-        assert!(mp4.ftyp.len() > 0);
+        assert!(!mp4.ftyp.is_empty());
 
         // Check video track found
         assert!(mp4.video_track_idx.is_some());
@@ -2028,10 +2022,7 @@ mod tests {
     #[ignore] // requires real DJI file
     fn test_debug_dji_structure() {
         let path = "/Users/cgaffga/Desktop/HEVC-H.265-samples/hevc_4k60P_main_dji_mavic3.mov";
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
-            Err(_) => { eprintln!("[SKIP] file not found"); return; }
-        };
+        let data = if let Ok(d) = std::fs::read(path) { d } else { eprintln!("[SKIP] file not found"); return; };
         eprintln!("File size: {} bytes ({:.1} MB)", data.len(), data.len() as f64 / 1048576.0);
 
         // Scan top-level boxes

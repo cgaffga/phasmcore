@@ -26,6 +26,7 @@ pub mod frame;
 pub mod permute;
 pub mod payload;
 pub mod progress;
+pub mod shadow_layer;
 
 // --- Steganographic algorithms ---
 pub mod cost;
@@ -77,7 +78,7 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     if width < MIN_ENCODE_DIMENSION || height < MIN_ENCODE_DIMENSION {
         return Err(StegoError::ImageTooSmall);
     }
-    if width > MAX_DIMENSION || height > MAX_DIMENSION || width.checked_mul(height).map_or(true, |p| p > MAX_PIXELS) {
+    if width > MAX_DIMENSION || height > MAX_DIMENSION || width.checked_mul(height).is_none_or(|p| p > MAX_PIXELS) {
         return Err(StegoError::ImageTooLarge);
     }
     Ok(())

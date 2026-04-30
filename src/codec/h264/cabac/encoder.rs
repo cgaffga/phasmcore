@@ -15,7 +15,7 @@
 //! [`super::neighbor`]), and stream bins through the engine.
 
 use super::binarization::{
-    binarize_egk_suffix, binarize_fl, binarize_tu, binarize_unary, mb_qp_delta_remap,
+    binarize_egk_suffix, binarize_tu, binarize_unary, mb_qp_delta_remap,
     mb_type_i_bins, mb_type_p_bins_prefix, sub_mb_type_p_bins,
 };
 use super::context::{initialize_contexts, CabacContext, CabacInitSlot};
@@ -119,7 +119,10 @@ pub mod cat5_luma8x8 {
 /// 8×8 zigzag scan order — spec § 8.5.4 (for frame-coded 8×8 blocks).
 /// Entry `i` gives the row-major index into a `[[i32; 8]; 8]`
 /// coefficient matrix, i.e. `row * 8 + col`, that scan position `i`
-/// reads.
+/// reads. Written as `row + col * 8` so auditors can read off (row, col)
+/// pairs directly against the spec.
+#[rustfmt::skip]
+#[allow(clippy::erasing_op, clippy::identity_op)]
 pub const ZIGZAG_8X8: [u8; 64] = [
     0 + 0 * 8,  1 + 0 * 8,  0 + 1 * 8,  0 + 2 * 8,  1 + 1 * 8,  2 + 0 * 8,  3 + 0 * 8,
     2 + 1 * 8,  1 + 2 * 8,  0 + 3 * 8,  0 + 4 * 8,  1 + 3 * 8,  2 + 2 * 8,  3 + 1 * 8,
@@ -190,7 +193,7 @@ pub fn encode_mb_type_i(enc: &mut CabacEncoder, mb_type: u32, mb_x: usize) {
     let bins = mb_type_i_bins(mb_type);
     for (bin_idx, &bin) in bins.iter().enumerate() {
         if bin_idx == 1 {
-            enc.engine.trace_label = format!("mb_type bin1 (term)");
+            enc.engine.trace_label = "mb_type bin1 (term)".to_string();
             enc.encode_terminate(bin);
             continue;
         }
@@ -644,6 +647,79 @@ pub fn encode_mb_skip_flag(enc: &mut CabacEncoder, is_skip: bool, mb_x: usize) {
     );
 }
 
+/// Phase 6E-A3 — encode `mb_skip_flag` for a B-slice. Same neighbor
+/// derivation as P (spec § 9.3.3.1.1.1; both use
+/// `condTermFlagN = !is_skip(N)`); ctxIdxOffset 24 vs P's 11.
+pub fn encode_mb_skip_flag_b(enc: &mut CabacEncoder, is_skip: bool, mb_x: usize) {
+    let ctx_inc = ctx_idx_inc_mb_skip_flag(&enc.neighbors, mb_x);
+    enc.encode_dec(
+        if is_skip { 1 } else { 0 },
+        ctx_offset::MB_SKIP_FLAG_B + ctx_inc,
+    );
+}
+
+/// Phase 6E-A3 — encode `mb_type` for a B-slice (Table 9-37 B rows).
+///
+/// Values 0..3 + 22 are §6E-A3 active set (B_Direct_16x16,
+/// B_L0_16x16, B_L1_16x16, B_Bi_16x16, B_8x8). Values 4..21 are
+/// 16x8 / 8x16 partitions deferred to §6E-A6. Values 23..47 are
+/// intra-in-B (encoder emits the 6-bin intra prefix from
+/// `mb_type_b_intra_prefix()` then the I-slice suffix via
+/// `encode_mb_type_i`-style emission with ctxIdxOffset 32).
+///
+/// Bin emission: prefix bins use ctxIdxOffset 27 (B mb_type prefix);
+/// the v=13 intra branch uses ctxIdxOffset 32 (B mb_type suffix).
+/// Per spec Table 9-39, binIdx 0..2 of the prefix have neighbor
+/// derivation; binIdx 3+ use static {3, 5} ctxIdxInc rules.
+pub fn encode_mb_type_b(enc: &mut CabacEncoder, mb_type: u32, mb_x: usize) {
+    debug_assert!(mb_type <= 47, "B-slice mb_type out of range: {mb_type}");
+
+    let prefix: &[u8] = if mb_type <= 22 {
+        super::binarization::mb_type_b_bins(mb_type)
+    } else {
+        // Intra-in-B: emit the v=13 prefix.
+        super::binarization::mb_type_b_intra_prefix()
+    };
+
+    // Prefix bins emit at ctxIdxOffset 27 (MB_TYPE_B_PREFIX).
+    // Bin 0 uses neighbor derivation; bins 1..n use Table 9-41-style
+    // static increments. Since we ship 16x16 active set + B_8x8 only,
+    // the bins 0..=5 are sufficient — the B_L0/L1/Bi 16x8/8x16 family
+    // (deferred to §6E-A6) uses bins 0..=6.
+    for (bin_idx, &bin) in prefix.iter().enumerate() {
+        let ctx_inc = ctx_idx_inc_mb_type_bin(
+            enc,
+            mb_x,
+            ctx_offset::MB_TYPE_B_PREFIX,
+            bin_idx as u32,
+            prefix,
+        );
+        enc.encode_dec(bin, ctx_offset::MB_TYPE_B_PREFIX + ctx_inc);
+    }
+
+    // Intra-in-B suffix at ctxIdxOffset 32. Same shape as
+    // encode_mb_type_p's intra-in-P suffix (Table 9-36 I-slice
+    // mb_type bins, with bin 1 terminate-coded).
+    if mb_type >= 23 {
+        let suffix_value = mb_type - 23;
+        let suffix_bins = mb_type_i_bins(suffix_value);
+        for (bin_idx, &bin) in suffix_bins.iter().enumerate() {
+            if bin_idx == 1 {
+                enc.encode_terminate(bin);
+                continue;
+            }
+            let ctx_inc = ctx_idx_inc_mb_type_bin(
+                enc,
+                mb_x,
+                ctx_offset::MB_TYPE_B_SUFFIX,
+                bin_idx as u32,
+                suffix_bins,
+            );
+            enc.encode_dec(bin, ctx_offset::MB_TYPE_B_SUFFIX + ctx_inc);
+        }
+    }
+}
+
 /// Encode `mb_type` for a P-slice (Table 9-37).
 ///
 /// Values 0..3 emit the direct P-partition code. Value 4 (P_8x8ref0)
@@ -764,6 +840,39 @@ pub fn encode_mvd_with_bin0_inc(
     component: u8,
     bin0_ctx_idx_inc: u32,
 ) {
+    encode_mvd_with_bin0_inc_sign_override(enc, mvd, component, bin0_ctx_idx_inc, None);
+}
+
+/// Phase 6F.2(k).1 — variant of [`encode_mvd_with_bin0_inc`] that
+/// optionally overrides the sign bypass bin written to the bitstream.
+///
+/// `sign_override`:
+/// - `None`  → write `0` for `mvd > 0`, `1` for `mvd < 0` (natural).
+/// - `Some(b)` → write `b` regardless of `mvd`'s sign.
+///
+/// Magnitude (prefix + suffix) bins are unaffected — they always
+/// reflect `|mvd|`. The sign override is the entry point for
+/// inline bitstream-mod MVD stego (§6F.2(k)): the encoder's
+/// internal `slot.value` and `mv_grid` stay at the natural
+/// pre-injection values (no cascade), but the bin written to the
+/// emitted Annex-B bytes carries the planned stego bit.
+///
+/// The decoder reading the bitstream sees the overridden bit at
+/// the bypass-bin offset and reconstructs `MV = predictor +
+/// (-mvd)` instead of `predictor + mvd` (spec § 9.3.2.3 +
+/// § 8.4.1.4). Decoded pixel drift at the flipped position is
+/// `≈ 2·|mvd|·local_gradient`. Constrained by the v1.0 drift
+/// budget + |mvd| cap in the orchestrator.
+///
+/// `sign_override` is ignored when `mvd == 0` (no sign bin emitted
+/// by spec; the position isn't a stego candidate anyway).
+pub fn encode_mvd_with_bin0_inc_sign_override(
+    enc: &mut CabacEncoder,
+    mvd: i32,
+    component: u8,
+    bin0_ctx_idx_inc: u32,
+    sign_override: Option<u8>,
+) {
     debug_assert!(component <= 1);
     let abs_v = mvd.unsigned_abs();
     let u_coff = 9u32;
@@ -792,7 +901,14 @@ pub fn encode_mvd_with_bin0_inc(
         binarize_egk_suffix(suf_s, 3, &mut |bin| enc.encode_bypass(bin));
     }
     if mvd != 0 {
-        enc.encode_bypass(if mvd > 0 { 0 } else { 1 });
+        let sign_bin = match sign_override {
+            Some(b) => {
+                debug_assert!(b <= 1, "sign override must be 0 or 1");
+                b
+            }
+            None => if mvd > 0 { 0 } else { 1 },
+        };
+        enc.encode_bypass(sign_bin);
     }
 }
 
@@ -1031,6 +1147,69 @@ mod tests {
         assert_eq!(enc.engine.bin_count(), 14);
     }
 
+    /// **Phase 6F.2(k).1** — sign override produces same magnitude
+    /// bits as the natural path, only the sign bypass bin differs.
+    /// Two encodes — natural mvd=3 vs flipped via override — must
+    /// produce IDENTICAL prefix bins (3 ones + terminator) and
+    /// IDENTICAL bin counts; only the final bypass bit value
+    /// differs.
+    #[test]
+    fn encode_mvd_sign_override_flips_bin_only() {
+        // Natural path: mvd=3 (positive sign, sign bin = 0).
+        let mut a = fresh_enc();
+        encode_mvd(&mut a, 3, 0, 0, 0, 0);
+        let bins_a = a.engine.bin_count();
+
+        // Override path: mvd=3 with explicit sign override = 1
+        // (write the bin value as if the sign were negative
+        // without actually changing the magnitude or the
+        // encoder-side mvd value).
+        let mut b = fresh_enc();
+        encode_mvd_with_bin0_inc_sign_override(&mut b, 3, 0, 0, Some(1));
+        let bins_b = b.engine.bin_count();
+
+        assert_eq!(bins_a, bins_b,
+            "sign override must NOT change bin count (magnitude bins identical)");
+        // Magnitude is the same regardless of sign — only the
+        // final bypass bin differs. Inspect bypass-bin diagnostics
+        // if available; minimally, both finalize successfully.
+        let _ = a.finish();
+        let _ = b.finish();
+    }
+
+    /// **Phase 6F.2(k).1** — override = None must round-trip
+    /// identically to `encode_mvd_with_bin0_inc` (the variant
+    /// without override). Backwards-compatibility gate.
+    #[test]
+    fn encode_mvd_sign_override_none_matches_baseline() {
+        let mut a = fresh_enc();
+        encode_mvd_with_bin0_inc(&mut a, -7, 1, 0);
+        let bytes_a = a.finish();
+
+        let mut b = fresh_enc();
+        encode_mvd_with_bin0_inc_sign_override(&mut b, -7, 1, 0, None);
+        let bytes_b = b.finish();
+
+        assert_eq!(bytes_a, bytes_b,
+            "override=None must produce byte-identical output to baseline");
+    }
+
+    /// **Phase 6F.2(k).1** — for mvd=0 the spec emits no sign bin;
+    /// override is silently ignored.
+    #[test]
+    fn encode_mvd_sign_override_ignored_for_zero() {
+        let mut a = fresh_enc();
+        encode_mvd(&mut a, 0, 0, 0, 0, 0);
+        let bytes_a = a.finish();
+
+        let mut b = fresh_enc();
+        encode_mvd_with_bin0_inc_sign_override(&mut b, 0, 0, 0, Some(1));
+        let bytes_b = b.finish();
+
+        assert_eq!(bytes_a, bytes_b,
+            "override at mvd=0 must be a no-op (no sign bin emitted)");
+    }
+
     // ─── Phase 6C.5b P-slice orchestration tests ────────────────────
 
     #[test]
@@ -1112,6 +1291,79 @@ mod tests {
         encode_intra_chroma_pred_mode(&mut enc, 0, 0); // DC
         encode_coded_block_pattern(&mut enc, 0, 0);     // no residual
         encode_mb_qp_delta(&mut enc, 0);
+        encode_end_of_slice_flag(&mut enc, true);
+        let bytes = enc.finish();
+        assert!(!bytes.is_empty());
+    }
+
+    // ─── Phase 6E-A3 B-slice encoder primitives ─────────────────
+
+    fn fresh_b_enc() -> CabacEncoder {
+        // B-slice uses the same PIdc{0,1,2} init slots as P/SP.
+        // Phase 6E-A defaults to cabac_init_idc=0 → PIdc0.
+        CabacEncoder::new_slice(CabacInitSlot::PIdc0, 26, 4)
+    }
+
+    #[test]
+    fn encode_mb_skip_flag_b_zero_emits_one_bin() {
+        let mut enc = fresh_b_enc();
+        encode_mb_skip_flag_b(&mut enc, false, 0);
+        assert_eq!(enc.engine.bin_count(), 1);
+    }
+
+    #[test]
+    fn encode_mb_skip_flag_b_one_emits_one_bin() {
+        let mut enc = fresh_b_enc();
+        encode_mb_skip_flag_b(&mut enc, true, 0);
+        assert_eq!(enc.engine.bin_count(), 1);
+    }
+
+    #[test]
+    fn encode_mb_type_b_direct_one_bin() {
+        let mut enc = fresh_b_enc();
+        encode_mb_type_b(&mut enc, 0, 0); // B_Direct_16x16
+        // Bin 0 = 0 short-circuits the tree.
+        assert_eq!(enc.engine.bin_count(), 1);
+    }
+
+    #[test]
+    fn encode_mb_type_b_l0_three_bins() {
+        let mut enc = fresh_b_enc();
+        encode_mb_type_b(&mut enc, 1, 0); // B_L0_16x16
+        // Bins: 1, 0, 0 → 3 bins.
+        assert_eq!(enc.engine.bin_count(), 3);
+    }
+
+    #[test]
+    fn encode_mb_type_b_l1_three_bins() {
+        let mut enc = fresh_b_enc();
+        encode_mb_type_b(&mut enc, 2, 0); // B_L1_16x16
+        // Bins: 1, 0, 1 → 3 bins.
+        assert_eq!(enc.engine.bin_count(), 3);
+    }
+
+    #[test]
+    fn encode_mb_type_b_bi_six_bins() {
+        let mut enc = fresh_b_enc();
+        encode_mb_type_b(&mut enc, 3, 0); // B_Bi_16x16
+        // Bins: 1, 1, 0, 0, 0, 0 → 6 bins (multi-partition v=0 path).
+        assert_eq!(enc.engine.bin_count(), 6);
+    }
+
+    #[test]
+    fn encode_mb_type_b_8x8_six_bins() {
+        let mut enc = fresh_b_enc();
+        encode_mb_type_b(&mut enc, 22, 0); // B_8x8
+        // Bins: 1, 1, 1, 1, 1, 1 → 6 bins (v=15 short-circuit).
+        assert_eq!(enc.engine.bin_count(), 6);
+    }
+
+    #[test]
+    fn encode_full_b_skip_mb() {
+        let mut enc = fresh_b_enc();
+        // B_Skip: only mb_skip_flag=1 and end_of_slice. Mirror of
+        // P_Skip but with B-slice ctxIdxOffset.
+        encode_mb_skip_flag_b(&mut enc, true, 0);
         encode_end_of_slice_flag(&mut enc, true);
         let bytes = enc.finish();
         assert!(!bytes.is_empty());

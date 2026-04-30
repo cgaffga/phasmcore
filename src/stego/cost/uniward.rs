@@ -202,7 +202,7 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
 
     // Use parallel iteration when the `parallel` feature is enabled.
     #[cfg(feature = "parallel")]
-    (0..n_blocks).into_par_iter().for_each(|bi| compute_block(bi));
+    (0..n_blocks).into_par_iter().for_each(compute_block);
 
     #[cfg(not(feature = "parallel"))]
     (0..n_blocks).for_each(|bi| compute_block(bi));
@@ -293,7 +293,7 @@ pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<
     };
 
     #[cfg(feature = "parallel")]
-    (0..n_blocks).into_par_iter().for_each(|bi| compute_block(bi));
+    (0..n_blocks).into_par_iter().for_each(compute_block);
 
     #[cfg(not(feature = "parallel"))]
     (0..n_blocks).for_each(|bi| compute_block(bi));
@@ -546,7 +546,7 @@ fn compute_coefficient_cost(
             let mut sum_high = 0.0;
             for k in 0..FILT_LEN {
                 let src_col = out_c as isize - 14 + k as isize;
-                if src_col >= 0 && src_col < 8 {
+                if (0..8).contains(&src_col) {
                     let val = basis_block[r * 8 + src_col as usize];
                     sum_low += lpdf[k] * val;
                     sum_high += HPDF[k] * val;
@@ -574,7 +574,7 @@ fn compute_coefficient_cost(
 
             for k in 0..FILT_LEN {
                 let src_row = out_r as isize - 14 + k as isize;
-                if src_row >= 0 && src_row < 8 {
+                if (0..8).contains(&src_row) {
                     let r = src_row as usize;
                     let low_val = row_low[r][out_c];
                     let high_val = row_high[r][out_c];
@@ -659,7 +659,7 @@ pub fn compute_positions_streaming(
     let mut positions: Vec<CoeffPos> = Vec::with_capacity(est_positions);
 
     // Distribute UNIWARD_PROGRESS_STEPS across strips for smooth progress.
-    let num_strips = (bt + STRIP_BLOCK_ROWS - 1) / STRIP_BLOCK_ROWS;
+    let num_strips = bt.div_ceil(STRIP_BLOCK_ROWS);
     let mut strip_idx = 0usize;
     let mut steps_sent = 0u32;
 
@@ -677,7 +677,7 @@ pub fn compute_positions_streaming(
 
         // Block rows that contain our pixel range:
         let pix_br_start = pix_y_start / 8;
-        let pix_br_end = ((pix_y_end + 7) / 8).min(bt);
+        let pix_br_end = pix_y_end.div_ceil(8).min(bt);
 
         // Step 1: Decompress pixel strip.
         let pix_strip_h = (pix_br_end - pix_br_start) * 8;
@@ -745,7 +745,7 @@ pub fn compute_positions_streaming(
         };
 
         #[cfg(feature = "parallel")]
-        (0..n_strip_blocks).into_par_iter().for_each(|bi| compute_block(bi));
+        (0..n_strip_blocks).into_par_iter().for_each(compute_block);
 
         #[cfg(not(feature = "parallel"))]
         (0..n_strip_blocks).for_each(|bi| compute_block(bi));
@@ -790,7 +790,7 @@ pub fn compute_positions_streaming(
             progress::advance();
             steps_sent += 1;
         }
-        if strip_idx % 2 == 0 {
+        if strip_idx.is_multiple_of(2) {
             progress::check_cancelled()?;
         }
     }
@@ -1242,12 +1242,9 @@ mod tests {
     #[test]
     #[ignore]
     fn cost_computation_benchmark() {
-        let data = match std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("Skipping benchmark: test vector not found");
-                return;
-            }
+        let data = if let Ok(d) = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") { d } else {
+            eprintln!("Skipping benchmark: test vector not found");
+            return;
         };
 
         let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();

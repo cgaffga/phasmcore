@@ -13,13 +13,13 @@
 //! separate 4×4 Hadamard block — Intra_4x4 keeps all 16 coefficients
 //! (including DC) in the per-sub-block CAVLC emit.
 
-use crate::codec::h264::intra_pred::{predict_4x4, Intra4x4Mode, Neighbors4x4};
+use crate::codec::h264::intra_pred::Neighbors4x4;
 use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::transform::{dequant_4x4, inverse_4x4_integer};
 
 use super::intra_predictor::choose_intra_4x4_mode_psy;
 use super::quantization::{
-    forward_quantize_4x4, trellis_lambda_for_qp, trellis_quantize_4x4, QuantParams, QuantSlice,
+    forward_quantize_4x4, trellis_quantize_4x4, QuantParams, QuantSlice,
 };
 use super::reconstruction::ReconBuffer;
 use super::transform::forward_dct_4x4;
@@ -96,7 +96,7 @@ pub fn encode_i4x4_mb(
             }
         }
         let coeffs = forward_dct_4x4(&residual);
-        let levels = trellis_quantize_4x4(&coeffs, params, trellis_lambda_for_qp(qp))
+        let levels = trellis_quantize_4x4(&coeffs, params, true)
             .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, params));
         ac_levels[blk_idx] = levels;
 

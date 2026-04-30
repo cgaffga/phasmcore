@@ -232,8 +232,8 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
 pub fn rgb_to_luma_blocks(rgb: &[u8], width: u32, height: u32) -> Vec<[f64; 64]> {
     let w = width as usize;
     let h = height as usize;
-    let bw = (w + 7) / 8;
-    let bh = (h + 7) / 8;
+    let bw = w.div_ceil(8);
+    let bh = h.div_ceil(8);
 
     let mut blocks = Vec::with_capacity(bw * bh);
 

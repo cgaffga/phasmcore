@@ -5,7 +5,7 @@
 use crate::error::CliError;
 use crate::output::{self, CliVideoCapacityInfo};
 use crate::transcode;
-use phasm_core::{detect_video_codec, h264_ghost_capacity, VideoCodec};
+use phasm_core::{detect_video_codec, h264_ghost_capacity, h264_ghost_capacity_max, VideoCodec};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -18,6 +18,14 @@ pub struct VideoCapacityArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+
+    /// Report the maximum capacity (STC `w = 1`, less stealth) instead
+    /// of the conservative default (STC `w = 5`, default stealth).
+    /// Useful for power users who want the absolute upper bound on
+    /// what the encoder can fit. The default value is what the mobile
+    /// apps display.
+    #[arg(long)]
+    pub max: bool,
 }
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
@@ -29,9 +37,14 @@ pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
     // because the capacity of the eventual stego file depends on what
     // Baseline positions land after re-encoding.
     let mut transcode_tempfile: Option<std::path::PathBuf> = None;
+    let cap_fn: fn(&[u8]) -> Result<usize, phasm_core::StegoError> = if args.max {
+        h264_ghost_capacity_max
+    } else {
+        h264_ghost_capacity
+    };
     let info = match detect_video_codec(&mp4_bytes) {
         VideoCodec::H264 => {
-            let cap = match h264_ghost_capacity(&mp4_bytes) {
+            let cap = match cap_fn(&mp4_bytes) {
                 Ok(c) => c,
                 Err(e) if transcode::is_non_baseline_error(&e) => {
                     transcode::ensure_ffmpeg_available()?;
@@ -42,7 +55,7 @@ pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
                     transcode::transcode_to_baseline(&args.video, &temp)?;
                     transcode_tempfile = Some(temp.clone());
                     let transcoded = std::fs::read(&temp)?;
-                    h264_ghost_capacity(&transcoded)?
+                    cap_fn(&transcoded)?
                 }
                 Err(e) => return Err(CliError::from(e)),
             };

@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
 
+#![allow(clippy::field_reassign_with_default)]
+
 //! Minimal spec-direct CABAC decoder for encoder debugging.
 //!
 //! Implements H.264 § 9.3.3.2 DecodeDecision / DecodeBypass /
@@ -36,9 +38,6 @@ use phasm_core::codec::h264::cabac::{
         CabacNeighborContext, CabacNeighborMB, CurrentMbCbf, MbTypeClass,
     },
     tables::RANGE_TAB_LPS,
-};
-use phasm_core::codec::h264::transform::{
-    dequant_4x4, inverse_16x16_dc_hadamard, inverse_4x4_integer,
 };
 use phasm_core::codec::h264::slice::parse_slice_header;
 use phasm_core::codec::h264::sps::{parse_pps, parse_sps};
@@ -748,7 +747,7 @@ fn decode_i16x16_mb(
     nb.mb_type = MbTypeClass::I16x16;
     nb.intra_chroma_pred_mode = chroma_mode as u8;
     nb.cbp_luma = if cbp_luma != 0 { 0x0F } else { 0 };
-    nb.cbp_chroma = cbp_chroma_code as u8;
+    nb.cbp_chroma = cbp_chroma_code;
     nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
 
     (if qp_delta_nonzero_this_mb { 1 } else { 0 }, nb)

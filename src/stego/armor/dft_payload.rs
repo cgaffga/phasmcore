@@ -349,9 +349,9 @@ pub fn extract_ring_payload(
         }
         if let Ok((decoded, _stats)) = ecc::rs_decode_blocks_with_parity(
             &rs_bytes[..rs_encoded_len], total_frame, RING_RS_PARITY
-        ) {
-            if let Ok(parsed) = frame::parse_frame(&decoded) {
-                if let Ok(plaintext) = crypto::decrypt(
+        )
+            && let Ok(parsed) = frame::parse_frame(&decoded)
+                && let Ok(plaintext) = crypto::decrypt(
                     &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
                 ) {
                     let len = parsed.plaintext_len as usize;
@@ -359,8 +359,6 @@ pub fn extract_ring_payload(
                         return Some(plaintext[..len].to_vec());
                     }
                 }
-            }
-        }
     }
 
     None

@@ -32,7 +32,7 @@ fn encode_range(
     let mut bytes = Vec::new();
     for f in start..end {
         let s = f * frame_size;
-        let is_idr = f == start || (f - start) % gop == 0;
+        let is_idr = f == start || (f - start).is_multiple_of(gop);
         if is_idr {
             bytes.extend_from_slice(&enc.encode_i_frame(&pixels[s..s + frame_size]).expect("i"));
         } else {

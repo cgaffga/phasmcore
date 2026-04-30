@@ -180,8 +180,29 @@ impl MotionEstimator {
 
 /// SAD (Sum of Absolute Differences) between a source rectangle and
 /// a predicted rectangle (both `block_w × block_h`, with matching
-/// stride conventions).
+/// stride conventions). Dispatches to NEON when the `simd` feature
+/// is on (aarch64); falls through to the scalar reference otherwise.
 fn sad_block(
+    source: &[u8],
+    source_stride: usize,
+    pred: &[u8],
+    pred_stride: usize,
+    block_w: u32,
+    block_h: u32,
+) -> u32 {
+    super::simd::sad_block_dispatch(
+        source,
+        source_stride,
+        pred,
+        pred_stride,
+        block_w,
+        block_h,
+        || sad_block_scalar(source, source_stride, pred, pred_stride, block_w, block_h),
+    )
+}
+
+#[inline]
+fn sad_block_scalar(
     source: &[u8],
     source_stride: usize,
     pred: &[u8],
@@ -202,7 +223,8 @@ fn sad_block(
 /// SATD (Hadamard-transformed SAD) across a `block_w × block_h`
 /// rectangle, summed as `(block_w / 4) × (block_h / 4)` 4×4
 /// Hadamard-tiled SATDs. Requires 4-aligned sizes — all H.264
-/// partition sizes satisfy this.
+/// partition sizes satisfy this. Dispatches to NEON when the `simd`
+/// feature is on (aarch64); falls through to the scalar reference.
 fn satd_block(
     source: &[u8],
     source_stride: usize,
@@ -211,7 +233,27 @@ fn satd_block(
     block_w: u32,
     block_h: u32,
 ) -> u32 {
-    debug_assert!(block_w % 4 == 0 && block_h % 4 == 0);
+    debug_assert!(block_w.is_multiple_of(4) && block_h.is_multiple_of(4));
+    super::simd::satd_block_dispatch(
+        source,
+        source_stride,
+        pred,
+        pred_stride,
+        block_w,
+        block_h,
+        || satd_block_scalar(source, source_stride, pred, pred_stride, block_w, block_h),
+    )
+}
+
+#[inline]
+fn satd_block_scalar(
+    source: &[u8],
+    source_stride: usize,
+    pred: &[u8],
+    pred_stride: usize,
+    block_w: u32,
+    block_h: u32,
+) -> u32 {
     let mut total: u32 = 0;
     let tiles_y = (block_h / 4) as usize;
     let tiles_x = (block_w / 4) as usize;
@@ -314,8 +356,7 @@ fn me_lambda() -> u32 {
     std::env::var("PHASM_ME_LAMBDA")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .map(|v| v.clamp(1, 32))
-        .unwrap_or(LAMBDA_MOTION_DEFAULT)
+        .map_or(LAMBDA_MOTION_DEFAULT, |v| v.clamp(1, 32))
 }
 
 /// se(v) codeword length for signed Exp-Golomb, approximating the
@@ -427,8 +468,7 @@ fn multi_hex_search(
 fn umh_enabled() -> bool {
     std::env::var("PHASM_ME_UMH")
         .ok()
-        .map(|v| v != "0")
-        .unwrap_or(true)
+        .is_none_or(|v| v != "0")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -541,6 +581,11 @@ fn refine_5point(
 }
 
 /// Compute SAD between source and a freshly-MC'd predicted block at `mv`.
+///
+/// Uses a stack-allocated 256-byte scratch buffer (max H.264 partition is
+/// 16×16 = 256). This eliminates 1-2M `Vec<u8>` allocations per 1080p frame
+/// in the ME hot path (the `[u8; 256]` array is dead-stack memory; the
+/// allocator is not involved).
 #[allow(clippy::too_many_arguments)]
 fn sad_at_mv(
     source: &[u8],
@@ -552,7 +597,9 @@ fn sad_at_mv(
     block_h: u32,
     mv: MotionVector,
 ) -> u32 {
-    let mut pred = vec![0u8; (block_w * block_h) as usize];
+    let used = (block_w * block_h) as usize;
+    let mut pred_storage = [0u8; 256];
+    let pred = &mut pred_storage[..used];
     apply_luma_mv_block(
         reference,
         block_x,
@@ -560,13 +607,15 @@ fn sad_at_mv(
         block_w,
         block_h,
         mv,
-        &mut pred,
+        pred,
         block_w as usize,
     );
-    sad_block(source, source_stride, &pred, block_w as usize, block_w, block_h)
+    sad_block(source, source_stride, pred, block_w as usize, block_w, block_h)
 }
 
 /// Compute SATD between source and a freshly-MC'd predicted block at `mv`.
+///
+/// Uses a stack-allocated 256-byte scratch buffer (see `sad_at_mv` doc).
 #[allow(clippy::too_many_arguments)]
 fn satd_at_mv(
     source: &[u8],
@@ -578,7 +627,9 @@ fn satd_at_mv(
     block_h: u32,
     mv: MotionVector,
 ) -> u32 {
-    let mut pred = vec![0u8; (block_w * block_h) as usize];
+    let used = (block_w * block_h) as usize;
+    let mut pred_storage = [0u8; 256];
+    let pred = &mut pred_storage[..used];
     apply_luma_mv_block(
         reference,
         block_x,
@@ -586,10 +637,10 @@ fn satd_at_mv(
         block_w,
         block_h,
         mv,
-        &mut pred,
+        pred,
         block_w as usize,
     );
-    satd_block(source, source_stride, &pred, block_w as usize, block_w, block_h)
+    satd_block(source, source_stride, pred, block_w as usize, block_w, block_h)
 }
 
 /// Clip `mv` (qpel) so the referenced `block_w × block_h` window

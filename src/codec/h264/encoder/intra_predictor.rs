@@ -645,12 +645,7 @@ mod tests {
             left_available: false,
             top_left_available: false,
         };
-        let mut source = [[0u8; 16]; 16];
-        for y in 0..16 {
-            for x in 0..16 {
-                source[y][x] = top[x];
-            }
-        }
+        let source = [top; 16];
         let d = choose_intra_16x16_mode(&n, &source);
         assert_eq!(d.mode, Intra16x16Mode::Vertical);
         assert_eq!(d.satd, 0);
@@ -702,12 +697,7 @@ mod tests {
             left_available: false,
             top_left_available: false,
         };
-        let mut source = [[0u8; 8]; 8];
-        for y in 0..8 {
-            for x in 0..8 {
-                source[y][x] = top[x];
-            }
-        }
+        let source = [top; 8];
         let d = choose_intra_chroma_mode(&n, &source);
         assert_eq!(d.mode, IntraChroma8x8Mode::Vertical);
         assert_eq!(d.satd, 0);

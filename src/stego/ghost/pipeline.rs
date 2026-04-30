@@ -516,7 +516,7 @@ fn ghost_encode_with_shadows_impl(
     let m = frame_bits.len();
 
     // Dynamic w: pick highest that fits the actual primary message.
-    let w = (n / m).min(10).max(1);
+    let w = (n / m).clamp(1, 10);
     let m_max = n / w;
     let n_used = m_max * w;
 
@@ -552,7 +552,7 @@ fn ghost_encode_with_shadows_impl(
             0.0f32
         } else {
             let mid = finite_costs.len() / 2;
-            finite_costs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            finite_costs.select_nth_unstable_by(mid, f32::total_cmp);
             finite_costs[mid]
         }
     };
@@ -769,12 +769,9 @@ fn ghost_encode_with_shadows_impl(
 
     // Write JPEG (with progress reporting during scan encoding).
     let progress_cb = || progress::advance();
-    let stego_bytes = match img.to_bytes_with_progress(Some(&progress_cb)) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            img.rebuild_huffman_tables();
-            img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
-        }
+    let stego_bytes = if let Ok(bytes) = img.to_bytes_with_progress(Some(&progress_cb)) { bytes } else {
+        img.rebuild_huffman_tables();
+        img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
     };
 
     Ok((stego_bytes, encode_quality))
@@ -954,7 +951,7 @@ fn ghost_encode_impl(
     let m = frame_bits.len();
 
     // 6. Dynamic w: pick highest that fits the actual message (short STC).
-    let w = (n / m).min(10).max(1);
+    let w = (n / m).clamp(1, 10);
     let m_max = n / w;
     let n_used = m_max * w;
 
@@ -984,7 +981,7 @@ fn ghost_encode_impl(
             0.0f32
         } else {
             let mid = finite_costs.len() / 2;
-            finite_costs.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+            finite_costs.select_nth_unstable_by(mid, f32::total_cmp);
             finite_costs[mid]
         }
     };
@@ -1038,12 +1035,9 @@ fn ghost_encode_impl(
 
     // 12. Write modified JPEG (with progress reporting during scan encoding).
     let progress_cb = || progress::advance();
-    let stego_bytes = match img.to_bytes_with_progress(Some(&progress_cb)) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            img.rebuild_huffman_tables();
-            img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
-        }
+    let stego_bytes = if let Ok(bytes) = img.to_bytes_with_progress(Some(&progress_cb)) { bytes } else {
+        img.rebuild_huffman_tables();
+        img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
     };
 
     Ok((stego_bytes, encode_quality))

@@ -53,9 +53,52 @@ pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
 #[cfg(feature = "video")]
 pub use stego::video::{
     h264_ghost_encode, h264_ghost_encode_inplace,
-    h264_ghost_decode, h264_ghost_capacity,
-    h264_ghost_encode_path, h264_ghost_decode_path, h264_ghost_capacity_path,
+    h264_ghost_decode, h264_ghost_capacity, h264_ghost_capacity_max,
+    h264_ghost_encode_path, h264_ghost_decode_path,
+    h264_ghost_capacity_path, h264_ghost_capacity_max_path,
     is_mp4,
+};
+
+// H.264 phase-6 encoder transcoder (#77) — replaces VideoToolbox /
+// MediaCodec on mobile for the input-video → Baseline-CAVLC step.
+// `StreamingEncoder` is the per-frame stateful API used by the mobile
+// bridges; `transcode_yuv_to_baseline_cavlc_h264` is the one-shot
+// convenience wrapper for tests / CLI / batch contexts.
+#[cfg(feature = "h264-encoder")]
+pub use codec::h264::encoder::baseline_transcode::{
+    BaselineTranscodeConfig, StreamingEncoder, transcode_yuv_to_baseline_cavlc_h264,
+};
+
+// Phase 6D.8 chunk 5 — encode-time CABAC stego public API. UTF-8
+// string message + passphrase + raw I420 YUV → Annex-B byte stream.
+// I-frame-only single-GOP scope until §30 MVD wiring lands.
+// Mobile bridges + CLI route through this once chunk 7 atomic-swaps
+// the legacy CAVLC pipeline gates.
+#[cfg(feature = "cabac-stego")]
+pub use codec::h264::stego::encode_pixels::{
+    h264_stego_encode_i_frames_only, h264_stego_encode_i_then_p_frames,
+    h264_stego_encode_i_then_p_frames_4domain,
+    h264_stego_encode_i_then_p_frames_4domain_multigop,
+    h264_stego_encode_yuv_string, h264_stego_encode_yuv_string_4domain,
+    h264_stego_encode_yuv_string_4domain_multigop,
+    h264_stego_encode_yuv_string_4domain_multigop_with_pattern,
+    h264_stego_encode_yuv_string_i_then_p,
+    h264_stego_encode_yuv_string_with_n_shadows,
+    h264_stego_encode_yuv_string_with_shadow,
+    h264_stego_shadow_capacity, H264ShadowCapacityInfo,
+};
+#[cfg(feature = "cabac-stego")]
+pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
+
+// Phase 6D.8 chunk 6G + §30D-C — decode entry points. Walks the
+// encoded Annex-B + passphrase → recovered UTF-8 string. The
+// `_4domain` variant pairs with §30D-C's 3-pass encoder + uses
+// fill-MVD-first allocation; the basic variant pairs with chunk
+// 5 / §30C residual-only encoders.
+#[cfg(feature = "cabac-stego")]
+pub use codec::h264::stego::decode_pixels::{
+    h264_stego_decode_yuv_string, h264_stego_decode_yuv_string_4domain,
+    h264_stego_shadow_decode, h264_stego_smart_decode_video,
 };
 
 // HEVC (archived) re-exports — only available with the `hevc-archive` feature.

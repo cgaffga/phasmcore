@@ -59,7 +59,7 @@ fn capture_mvd_position(
         return None;
     }
     let len = bits_after.saturating_sub(bits_before);
-    if len < 3 || len % 2 == 0 {
+    if len < 3 || len.is_multiple_of(2) {
         // Sanity: codeword length must be 2·lz + 1 with lz ≥ 1.
         return None;
     }
@@ -139,20 +139,12 @@ impl PSubPartition {
 ///
 /// When a partition spans multiple 4×4 blocks (e.g. P_16x16 covers all 16),
 /// every block in the partition gets the same MV and ref_idx.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MvField {
     pub mvs: [MotionVector; 16],
     pub ref_idx: [i8; 16],
 }
 
-impl Default for MvField {
-    fn default() -> Self {
-        Self {
-            mvs: [MotionVector::default(); 16],
-            ref_idx: [0; 16],
-        }
-    }
-}
 
 /// Frame-wide 4×4-granular motion vector grid. Used by the median predictor
 /// to look up neighbour MVs across MB boundaries.
@@ -239,32 +231,24 @@ pub fn amvp_predict(
     if part_w_4x4 == 4 && part_h_4x4 == 2 {
         // P_16x8: top partition uses top, bottom partition uses left.
         if mb_part_idx == 0 {
-            if let Some((mv, r)) = top {
-                if r == current_ref_idx {
+            if let Some((mv, r)) = top
+                && r == current_ref_idx {
                     return mv;
                 }
-            }
-        } else {
-            if let Some((mv, r)) = left {
-                if r == current_ref_idx {
-                    return mv;
-                }
-            }
+        } else if let Some((mv, r)) = left
+        && r == current_ref_idx {
+            return mv;
         }
     } else if part_w_4x4 == 2 && part_h_4x4 == 4 {
         // P_8x16: left partition uses left, right partition uses top-right.
         if mb_part_idx == 0 {
-            if let Some((mv, r)) = left {
-                if r == current_ref_idx {
+            if let Some((mv, r)) = left
+                && r == current_ref_idx {
                     return mv;
                 }
-            }
-        } else {
-            if let Some((mv, r)) = top_right {
-                if r == current_ref_idx {
-                    return mv;
-                }
-            }
+        } else if let Some((mv, r)) = top_right
+        && r == current_ref_idx {
+            return mv;
         }
     }
     median_mv(left, top, top_right, current_ref_idx)
@@ -293,11 +277,10 @@ pub fn median_mv(
     // at all, that one is the predictor (spec 8.4.1.3).
     let availability = [left.is_some(), top.is_some(), top_right.is_some()];
     let avail_count: u8 = availability.iter().map(|&b| b as u8).sum();
-    if avail_count == 1 {
-        if let Some((mv, _)) = left.or(top).or(top_right) {
+    if avail_count == 1
+        && let Some((mv, _)) = left.or(top).or(top_right) {
             return mv;
         }
-    }
 
     // Single-matching-ref special case.
     let matching: Vec<Option<MotionVector>> = [left, top, top_right]
@@ -313,13 +296,10 @@ pub fn median_mv(
         })
         .collect();
     let match_count: usize = matching.iter().filter(|m| m.is_some()).count();
-    if match_count == 1 {
-        for m in &matching {
-            if let Some(mv) = m {
-                return *mv;
-            }
+    if match_count == 1
+        && let Some(mv) = matching.iter().flatten().next() {
+            return *mv;
         }
-    }
 
     // General case: componentwise median over the three neighbour MVs
     // (unavailable ones contribute zero per the spec's handling).

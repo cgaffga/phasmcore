@@ -243,7 +243,7 @@ fn stc_embed_segmented(
     // sqrt(m) balances checkpoint memory (K × 1 KB) with segment back_ptr
     // memory (K × w × 16 bytes).
     let k = ((m as f64).sqrt().ceil() as usize).max(1);
-    let num_segments = (m + k - 1) / k;
+    let num_segments = m.div_ceil(k);
 
     // --- Phase A: forward scan, save checkpoints, no back_ptr ---
     // Reports half the STC progress sub-steps.
@@ -381,7 +381,7 @@ fn stc_embed_segmented(
             }
 
             progress_counter += 1;
-            if progress_counter % progress_interval_b == 0 {
+            if progress_counter.is_multiple_of(progress_interval_b) {
                 if progress::is_cancelled() { return None; }
                 progress::advance();
             }
@@ -449,9 +449,9 @@ mod tests {
     #[test]
     fn embed_extract_roundtrip_tiny() {
         let h = 3;
-        let n = 20;
-        let m = 4;
-        let w = (n + m - 1) / m; // ceil(20/4) = 5
+        let n: usize = 20;
+        let m: usize = 4;
+        let w = n.div_ceil(m); // ceil(20/4) = 5
         let seed = [42u8; 32];
         let hhat = generate_hhat(h, w, &seed);
 
@@ -469,9 +469,9 @@ mod tests {
     #[test]
     fn embed_extract_roundtrip_h7() {
         let h = 7;
-        let n = 500;
-        let m = 50;
-        let w = (n + m - 1) / m;
+        let n: usize = 500;
+        let m: usize = 50;
+        let w = n.div_ceil(m);
         let seed = [13u8; 32];
         let hhat = generate_hhat(h, w, &seed);
 
@@ -487,9 +487,9 @@ mod tests {
     #[test]
     fn wet_coefficients_not_modified() {
         let h = 3;
-        let n = 20;
-        let m = 4;
-        let w = (n + m - 1) / m;
+        let n: usize = 20;
+        let m: usize = 4;
+        let w = n.div_ceil(m);
         let seed = [55u8; 32];
         let hhat = generate_hhat(h, w, &seed);
 

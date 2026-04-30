@@ -21,7 +21,7 @@ pub fn compute_r(rs_bit_count: usize, num_units: usize) -> usize {
     if r >= 3 {
         // Force odd, but don't exceed what fits
         let r_odd = r | 1;
-        if r_odd.checked_mul(rs_bit_count).unwrap_or(usize::MAX) <= num_units {
+        if r_odd.saturating_mul(rs_bit_count) <= num_units {
             r_odd
         } else {
             // r was even, r|1 = r+1 doesn't fit in available units — use r-1 (odd)
@@ -29,7 +29,7 @@ pub fn compute_r(rs_bit_count: usize, num_units: usize) -> usize {
         }
     } else if r >= 2 {
         // r=2: can't force odd to 3 if it doesn't fit, use as-is
-        if 3usize.checked_mul(rs_bit_count).unwrap_or(usize::MAX) <= num_units { 3 } else { 1 }
+        if 3usize.saturating_mul(rs_bit_count) <= num_units { 3 } else { 1 }
     } else {
         1
     }
@@ -287,7 +287,7 @@ mod tests {
         // Noisy: 2 out of 5 copies of bit 0 are flipped
         let mut noisy_llrs = pristine_llrs.clone();
         for copy in 0..2 {
-            let idx = copy * rs_bit_count + 0; // bit position 0
+            let idx = copy * rs_bit_count; // bit position 0 within copy
             noisy_llrs[idx] = -noisy_llrs[idx]; // flip
         }
 

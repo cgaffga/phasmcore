@@ -9,6 +9,8 @@
 //! message is. The score is displayed in the mobile app HUD and encode
 //! success screen.
 
+use crate::det_math::det_exp;
+
 /// Encode quality result returned alongside stego bytes.
 #[derive(Debug, Clone)]
 pub struct EncodeQuality {
@@ -104,7 +106,7 @@ pub fn ghost_stealth_score(m: &GhostMetrics) -> EncodeQuality {
         0.0
     };
 
-    let stealth = (base_stealth - shadow_penalty).max(0.0).min(100.0);
+    let stealth = (base_stealth - shadow_penalty).clamp(0.0, 100.0);
     let score = stealth.round() as u8;
 
     // Pick hint based on weakest factor.
@@ -122,8 +124,7 @@ pub fn ghost_stealth_score(m: &GhostMetrics) -> EncodeQuality {
         // Pick the weakest factor.
         factors.iter()
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, key)| *key)
-            .unwrap_or("hint_high_rate")
+            .map_or("hint_high_rate", |(_, key)| *key)
     };
 
     EncodeQuality {
@@ -203,7 +204,7 @@ pub fn armor_robustness_score(m: &ArmorMetrics) -> EncodeQuality {
             + (0.10 / 0.85) * delta_score
     };
 
-    let score = robustness.round().min(100.0).max(0.0) as u8;
+    let score = robustness.round().clamp(0.0, 100.0) as u8;
 
     // Pick hint based on dominant/weakest factor.
     let hint_key = if m.fortress {
@@ -219,8 +220,7 @@ pub fn armor_robustness_score(m: &ArmorMetrics) -> EncodeQuality {
         // Pick the weakest factor.
         factors.iter()
             .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(_, key)| *key)
-            .unwrap_or("hint_low_repetition")
+            .map_or("hint_low_repetition", |(_, key)| *key)
     };
 
     EncodeQuality {
@@ -230,12 +230,16 @@ pub fn armor_robustness_score(m: &ArmorMetrics) -> EncodeQuality {
     }
 }
 
-/// Deterministic tanh approximation (avoids f64::tanh which may not be
-/// deterministic in WASM). Uses the identity tanh(x) = (e^2x - 1)/(e^2x + 1).
+/// Deterministic tanh approximation (avoids f64::tanh which is not
+/// deterministic on WASM). Uses the identity tanh(x) = (e^2x - 1)/(e^2x + 1)
+/// with det_math::det_exp for the exponential.
 fn det_tanh(x: f64) -> f64 {
     if x > 10.0 { return 1.0; }
     if x < -10.0 { return -1.0; }
-    let e2x = (2.0 * x).exp(); // f64::exp is deterministic (IEEE 754)
+    // f64::exp is NOT IEEE 754 mandated to be correctly-rounded — it lowers to
+    // libm / Math.exp on WASM, breaking cross-platform reproducibility. Use
+    // det_exp for bit-exact behaviour across iOS / Android / x86_64 / WASM.
+    let e2x = det_exp(2.0 * x);
     (e2x - 1.0) / (e2x + 1.0)
 }
 

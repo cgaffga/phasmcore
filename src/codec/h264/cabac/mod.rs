@@ -38,6 +38,7 @@
 //! See `docs/design/h264-encoder-algorithms/cabac-engine.md` (and
 //! sibling notes) for the per-module algorithm notes.
 
+pub mod bin_decoder;
 pub mod binarization;
 pub mod context;
 pub mod encoder;
@@ -46,6 +47,7 @@ pub mod neighbor;
 pub mod slice;
 pub mod tables;
 
+pub use bin_decoder::{CabacDecodeEngine, DecodeError};
 pub use context::CabacContext;
 pub use encoder::CabacEncoder;
 pub use engine::CabacEngine;

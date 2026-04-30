@@ -7,7 +7,7 @@ use phasm_core::codec::h264::encoder::encoder::Encoder;
 fn main() {
     let w: u32 = 1920;
     let h: u32 = 1072;
-    let n: usize = 2;
+    let _n: usize = 2;
     let frame_size = (w * h * 3 / 2) as usize;
     let y_size = (w*h) as usize;
     let c_size = (w*h/4) as usize;

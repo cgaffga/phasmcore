@@ -142,7 +142,7 @@ pub fn estimate_capacity_with_shadows(
     let total_shadow_frame_bytes = shadow_count * shadow_frame_overhead + shadow_total_bytes;
     // RS encoding expands data: for each 255-byte block, parity bytes added
     let k = 255 - parity; // 239 data bytes per block
-    let full_blocks = (total_shadow_frame_bytes + k - 1) / k;
+    let full_blocks = total_shadow_frame_bytes.div_ceil(k);
     let shadow_rs_bytes = full_blocks * 255;
     let shadow_bits = shadow_rs_bytes * 8;
 

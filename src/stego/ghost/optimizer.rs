@@ -29,6 +29,8 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
+use crate::det_math::det_exp;
+
 /// Configuration for the cover image optimizer.
 pub struct OptimizerConfig {
     /// Strength multiplier (0.0–1.0). Default: 0.85.
@@ -273,7 +275,19 @@ fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -
             let scaled_sigma = sigma * strength * local_need;
 
             if scaled_sigma > 0.05 {
-                let gauss = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                // Irwin-Hall(2) noise: u1+u2 has triangular distribution on
+                // [0, 2] with mean 1, variance 1/6. Center to mean 0 and
+                // scale by √6 so variance matches N(0,1).
+                //
+                // Replaces Box-Muller `(-2*ln(u1)).sqrt() * cos(2π·u2)` —
+                // f64::ln + f64::cos lower to non-deterministic libm /
+                // Math.* on WASM, breaking cross-platform reproducibility of
+                // the optimized cover. Triangular noise is a coarser Gaussian
+                // approximation but adequate for the small-amplitude texture
+                // injection done here. RNG consumption is unchanged
+                // (still 2 uniform draws per pixel).
+                const SQRT_6: f64 = 2.449489742783178;
+                let gauss = (u1 + u2 - 1.0) * SQRT_6;
                 let noise = gauss * scaled_sigma;
 
                 let idx = (y * w + x) * 3;
@@ -514,7 +528,10 @@ fn gaussian_blur_separable(pixels: &[u8], w: usize, h: usize, sigma: f64) -> Vec
     let mut sum = 0.0f64;
     for i in 0..kernel_size {
         let x = i as f64 - radius as f64;
-        let val = (-x * x / (2.0 * sigma * sigma)).exp();
+        // det_exp instead of f64::exp — f64::exp lowers to non-deterministic
+        // libm / Math.exp on WASM, breaking cross-platform bit-exactness of
+        // the optimized cover.
+        let val = det_exp(-x * x / (2.0 * sigma * sigma));
         kernel[i] = val;
         sum += val;
     }
@@ -608,8 +625,8 @@ fn smooth_block_boundaries(pixels: &mut [u8], w: usize, h: usize, strength: f32)
 /// of block-average brightness, helping STDM embedding stability.
 fn dc_stabilize(pixels: &mut [u8], w: usize, h: usize, strength: f32) {
     let alpha = 0.1 * strength as f64;
-    let blocks_x = (w + 7) / 8;
-    let blocks_y = (h + 7) / 8;
+    let blocks_x = w.div_ceil(8);
+    let blocks_y = h.div_ceil(8);
 
     for by in 0..blocks_y {
         for bx in 0..blocks_x {
@@ -844,7 +861,7 @@ mod tests {
         }
         let luma = extract_luma(&pixels, w, h);
         let variance = local_variance_5x5(&luma, w, h);
-        let (noise, contrast, sharpen, dither) = analyze_texture(&luma, &variance, w, h);
+        let (noise, _contrast, _sharpen, dither) = analyze_texture(&luma, &variance, w, h);
         // Already-textured image should get minimal treatment
         assert!(noise < 0.3, "textured image should get little noise: {noise}");
         assert!(dither < 0.3, "textured image should get little dither: {dither}");

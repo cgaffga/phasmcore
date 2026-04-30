@@ -47,6 +47,7 @@
 //! returns a `EncoderError::NotImplemented` or panics with `todo!()`.
 //! Real implementations land in Phase 6A through 6E.
 
+pub mod baseline_transcode;
 pub mod bitstream_writer;
 pub mod deblocking_filter;
 pub mod encoder;
@@ -58,11 +59,19 @@ pub mod motion_compensation;
 pub mod motion_estimation;
 pub mod partition_decision;
 pub mod partition_state;
+pub mod poc;
 pub mod quantization;
 pub mod rate_control;
 pub mod rdo;
 pub mod reconstruction;
 pub mod reference_buffer;
+pub mod reorder;
+pub mod simd;
+// Phase 6F.1 — `stego` was relocated to `h264::stego`
+// (peer of encoder/) so the bin-decoder doesn't need to import
+// from encoder::*. Module declaration moved to
+// `core/src/codec/h264/mod.rs`. This empty marker line preserves
+// commit history readability.
 pub mod transform;
 pub mod transform_8x8;
 // CAVLC writer lives next door at `core/src/codec/h264/cavlc_writer.rs`

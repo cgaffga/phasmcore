@@ -123,8 +123,8 @@ pub fn parse_sof_ext(data: &[u8], progressive: bool) -> Result<FrameInfo> {
 
     let mcu_width = (max_h as u16) * 8;
     let mcu_height = (max_v as u16) * 8;
-    let mcus_wide = (width + mcu_width - 1) / mcu_width;
-    let mcus_tall = (height + mcu_height - 1) / mcu_height;
+    let mcus_wide = width.div_ceil(mcu_width);
+    let mcus_tall = height.div_ceil(mcu_height);
 
     Ok(FrameInfo {
         precision,

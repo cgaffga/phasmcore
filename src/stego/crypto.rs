@@ -97,6 +97,35 @@ pub fn derive_h264_mvd_structural_key(
     Ok(output)
 }
 
+/// H.264 Phase I.0.5: derive a per-GOP seed by mixing a master 32-byte seed
+/// with `gop_idx` and a domain label using SHA-256.
+///
+/// The master seed is already passphrase-derived via `derive_structural_key`
+/// or `derive_h264_mvd_structural_key` (each Argon2-expensive but only run
+/// once per encode/decode), so this per-GOP derivation can be a fast SHA-256
+/// pass — the key material is already secret. Deterministic: same master +
+/// `gop_idx` + label → same output across iOS / Android / x86_64 / WASM.
+///
+/// `label` should be a short distinguishing tag (e.g. `b"coeff-perm"`,
+/// `b"coeff-hhat"`) so the four per-GOP seeds (perm + hhat × coeff + MVD)
+/// are mutually uncorrelated even when they share a master.
+pub fn derive_per_gop_seed_from_master(
+    master_seed: &[u8; 32],
+    gop_idx: u32,
+    label: &[u8],
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"phasm-h264-gop-v1");
+    hasher.update(master_seed);
+    hasher.update(label);
+    hasher.update(gop_idx.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// Derive the Armor structural key (Tier 1) from a passphrase.
 ///
 /// Same structure as Ghost but uses a different salt so the same passphrase

@@ -274,7 +274,7 @@ pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
 /// Convert a bit vector (MSB first) back to bytes.
 /// Pads the last byte with zero bits if `bits.len()` is not a multiple of 8.
 pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity((bits.len() + 7) / 8);
+    let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
     for chunk in bits.chunks(8) {
         let mut byte = 0u8;
         for (i, &bit) in chunk.iter().enumerate() {

@@ -192,7 +192,7 @@ impl<'a> RbspReader<'a> {
         if ue == 0 {
             Ok(0)
         } else if ue & 1 != 0 {
-            Ok(((ue + 1) / 2) as i32)
+            Ok(ue.div_ceil(2) as i32)
         } else {
             Ok(-((ue / 2) as i32))
         }
@@ -374,9 +374,9 @@ pub fn parse_nal_units_annexb(data: &[u8]) -> Result<Vec<NalUnit>, H264Error> {
 
     let mut nal_start = i;
     while i < data.len() {
-        if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0 {
-            if data[i + 2] == 1
-                || (i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1)
+        if i + 2 < data.len() && data[i] == 0 && data[i + 1] == 0
+            && (data[i + 2] == 1
+                || (i + 3 < data.len() && data[i + 2] == 0 && data[i + 3] == 1))
             {
                 let mut end = i;
                 while end > nal_start && data[end - 1] == 0 {
@@ -393,7 +393,6 @@ pub fn parse_nal_units_annexb(data: &[u8]) -> Result<Vec<NalUnit>, H264Error> {
                 nal_start = i;
                 continue;
             }
-        }
         i += 1;
     }
 

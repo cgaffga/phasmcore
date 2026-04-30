@@ -11,7 +11,7 @@ use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/phasm_shared.jpg");
+    let path = args.get(1).map_or("/tmp/phasm_shared.jpg", |s| s.as_str());
     let img = std::fs::read(path).unwrap_or_else(|e| {
         eprintln!("Error reading {path}: {e}");
         std::process::exit(1);

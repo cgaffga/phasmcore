@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
+#![allow(clippy::field_reassign_with_default)]
+// CabacNeighborMB state is built up field-by-field after a default so
+// each assignment carries an inline spec reference; a single struct
+// literal with ..Default::default() would fold those back into opaque
+// field order. Deliberate code-style choice.
+
 //! Top-level H.264 encoder driver.
 //!
 //! Phase 6A.8 shipped `encode_i_frame_pcm` (I_PCM macroblocks,
@@ -23,13 +29,16 @@
 use super::bitstream_writer::{
     build_aud_rbsp, build_pps_cabac, build_pps_cabac_high, build_pps_cavlc, build_sps_baseline,
     build_sps_high, build_sps_main,
-    continue_slice_header_i, continue_slice_header_p, wrap_rbsp_as_nal, BitWriter,
-    ISliceHeaderParams, PSliceHeaderParams, PpsParams, PrimaryPicType, SpsParams,
+    continue_slice_header_b, continue_slice_header_i, continue_slice_header_p,
+    wrap_rbsp_as_nal, BitWriter,
+    BSliceHeaderParams, ISliceHeaderParams, PSliceHeaderParams, PpsParams,
+    PrimaryPicType, SpsParams,
 };
 use crate::codec::h264::cabac::context::CabacInitSlot;
 use crate::codec::h264::cabac::encoder::{
-    encode_end_of_slice_flag, encode_intra_chroma_pred_mode, encode_mb_qp_delta, encode_mb_type_i,
-    encode_residual_block_cabac, CabacEncoder,
+    encode_coded_block_pattern, encode_end_of_slice_flag,
+    encode_intra_chroma_pred_mode, encode_mb_qp_delta,
+    encode_mb_skip_flag_b, encode_mb_type_b, encode_mb_type_i, CabacEncoder,
 };
 use crate::codec::h264::cabac::neighbor::{CabacNeighborMB, MbTypeClass};
 use crate::codec::h264::cabac::slice::{append_cabac_zero_words, assemble_cabac_slice_rbsp};
@@ -39,7 +48,7 @@ use super::intra_predictor::{choose_intra_16x16_mode_psy, choose_intra_chroma_mo
 use super::motion_compensation::{apply_chroma_mv_block, apply_luma_mv_block};
 use super::motion_estimation::{MotionEstimator, MotionVector};
 use super::partition_decision::{
-    decide_p_mb, decide_p_mb_with_cost, PMbChoice, SubMbChoice, SUB_MB_ORIGINS_4X4,
+    decide_p_mb_with_cost, PMbChoice, SubMbChoice, SUB_MB_ORIGINS_4X4,
     SUB_MB_ORIGINS_PX,
 };
 use super::partition_state::{
@@ -47,7 +56,7 @@ use super::partition_state::{
 };
 use super::quantization::{
     forward_quantize_4x4, forward_quantize_dc_chroma, forward_quantize_dc_luma,
-    trellis_lambda_for_qp, trellis_quantize_4x4, QuantParams, QuantSlice,
+    trellis_quantize_4x4, QuantParams, QuantSlice,
 };
 use super::rate_control::{FrameType, RateController};
 use super::reconstruction::{raster_to_scan_levels, ReconBuffer};
@@ -79,6 +88,14 @@ pub struct Encoder {
     pub width: u32,
     pub height: u32,
     pub frame_num: u8,
+    /// Stego-only logical frame counter. Unlike `frame_num` (spec
+    /// § 7.4.3 — resets to 0 at every IDR), this counter increments
+    /// monotonically across IDR boundaries so the encode-time stego
+    /// hook produces unique `PositionKey`s per residual block. The
+    /// decoder's slice walker mirrors with `frame_idx` ++ per VCL
+    /// NAL. Without this separation, multi-frame stego would collide
+    /// keys in `PlanInjector::HashMap` and apply the wrong plan bits.
+    pub stego_frame_idx: u32,
     pub rc: RateController,
     pub recon: ReconBuffer,
     pub sps_params: SpsParams,
@@ -100,6 +117,26 @@ pub struct Encoder {
     /// Phase 100-E starts emitting `transform_size_8x8_flag` per MB so
     /// the bitstream becomes valid High-profile output.
     pub enable_transform_8x8: bool,
+    /// Phase 6E-A4 — when true, the SPS uses `pic_order_cnt_type = 0`
+    /// + `log2_max_pic_order_cnt_lsb_minus4 = 4` +
+    /// `max_num_ref_frames = 3` (M=2 IBPBP DPB shape), enabling
+    /// `encode_b_frame` to emit valid B-slices that decoders can
+    /// reorder via `pic_order_cnt_lsb`. Caller must set this BEFORE
+    /// the first frame is encoded — toggling mid-stream produces an
+    /// invalid bitstream (SPS already emitted).
+    ///
+    /// Default `false` keeps Phase 6B I+P-only behavior bit-identical.
+    pub enable_b_frames: bool,
+    /// Phase 6E-A1 POC tracker — resets on IDR; used for B-frame
+    /// `pic_order_cnt_lsb` emission. Always present in `Encoder` (
+    /// cheap), but only consulted when `enable_b_frames = true`.
+    pub poc_tracker: super::poc::PocTracker,
+    /// Phase 6E-A4 — display index of the most recently encoded
+    /// I or P frame (the "anchor"). Used to derive POC LSBs for
+    /// the next P (anchor + m_factor) and the next B (anchor - 1
+    /// in M=2 IBPBP encode order). 0 after the IDR; advances with
+    /// each encode. Only consulted when `enable_b_frames = true`.
+    pub display_idx_of_prev_anchor: u32,
     /// Single-slot DPB holding the previous encoded frame's recon.
     /// Used as P-frame motion-compensation reference (Phase 6B).
     pub dpb: ReferenceBuffer,
@@ -182,6 +219,29 @@ pub struct Encoder {
     /// informational — drives task #124 RDO design without touching
     /// any production path.
     mode_stats: [u32; 9],
+    /// Phase 6D.8: optional stego hook called between quantize and
+    /// entropy emit on every residual block + MVD slot. When `None`
+    /// the encoder behaves byte-identically to pre-6D.8. When `Some`
+    /// the hook may either count positions (Pass 1) or apply
+    /// overrides (Pass 3) per the encode-time CABAC stego flow.
+    /// See `core/src/codec/h264/stego/encoder_hook.rs`.
+    pub stego_hook: Option<Box<dyn super::super::stego::encoder_hook::StegoMbHook>>,
+    /// Phase 6D.8 §30D-A: gates the **pre-MC MVD hook fire site**
+    /// in `write_p_macroblock_cabac`. When false (default) the
+    /// encoder behaves identically to chunk-5/§30C — MVD positions
+    /// are never logged or modified, so chunk-5/§30C decode
+    /// pipelines stay byte-identity-correct. When true, the
+    /// stego hook fires for every P-MB MVD between mode decision
+    /// and MC, allowing logger/injector to observe/modify per-axis
+    /// MVD values. The encoder updates the partition's MV from the
+    /// (possibly modified) MVD + neighbor predictor, so MC + recon
+    /// run with the FINAL MV — no enc/dec drift.
+    ///
+    /// **§30D-A scaffolding only**: full multi-domain stego (mvd_*
+    /// + coeff_*) needs a 3-pass orchestrator (§30D-C) since Pass 3
+    /// MVD modifications make residuals diverge from Pass 1's
+    /// logged residuals.
+    pub enable_mvd_stego_hook: bool,
 }
 
 /// Indices into `Encoder::mode_stats`.
@@ -199,12 +259,35 @@ pub const MODE_STAT_INTRA_IN_P: usize = 6;
 pub const MODE_STAT_INTRA_IN_P_I4X4: usize = 7;
 pub const MODE_STAT_INTRA_IN_P_I16X16: usize = 8;
 
+/// §6E-A4(c)-lite — pick B_Skip vs B_Direct_16x16 for a B-frame MB
+/// based on a deterministic hash of `(frame_num, mb_addr)`. Returns
+/// `true` for B_Direct_16x16, `false` for B_Skip.
+///
+/// Both modes use the spatial direct predictor at decode time, so
+/// this choice doesn't affect visual quality — only the
+/// MB-mode-distribution fingerprint on the wire. The 50/50 split
+/// approximates real-encoder mode distributions in B-frames better
+/// than all-B_Skip would. §6E-A4(c)-full will replace this with a
+/// real RDO-based mode decision.
+///
+/// Hash: FxHash-style mixing of the inputs into a single bit.
+/// Determinism is required so encoder and decoder see the same
+/// mode distribution; deterministic-from-state means both sides
+/// agree on the bit-stream layout.
+fn mb_skip_or_direct_decision(frame_num: u32, mb_addr: u32) -> bool {
+    let mut x = (frame_num as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x = x.wrapping_add(mb_addr as u64);
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 30;
+    (x & 1) == 1
+}
+
 impl Encoder {
     /// Construct an encoder for the given dimensions + optional
     /// quality target. Dimensions must be 16-aligned; pad your input
     /// if necessary.
     pub fn new(width: u32, height: u32, quality: Option<u8>) -> Result<Self, EncoderError> {
-        if width % 16 != 0 || height % 16 != 0 {
+        if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
             return Err(EncoderError::InvalidInput(format!(
                 "dimensions must be 16-aligned, got {width}×{height}"
             )));
@@ -213,7 +296,23 @@ impl Encoder {
             width_pixels: width,
             height_pixels: height,
             sps_id: 0,
-            max_num_ref_frames: 1,
+            // §6E-B(a) — bumped from 1 → 2 for SPS-level
+            // fingerprint match with real-world commercial encoders
+            // (mobile MediaCodec / iPhone H.264 capture pipelines
+            // universally advertise num_ref_frames ≥ 2). Slice-level
+            // behavior unchanged: encoder still emits
+            // num_ref_idx_l0_active_minus1=0 (no per-partition
+            // ref_idx_l0 field), so on-the-wire pixel reconstruction
+            // is byte-identical to single-ref output. The wire field
+            // change is just the SPS byte. §6E-B(b) v1.1 follow-on
+            // will add real multi-ref ME + per-partition ref_idx_l0
+            // emission for full ref_idx-distribution fingerprint
+            // match.
+            max_num_ref_frames: 2,
+            // Default: pic_order_cnt_type=2 (frame_num→POC).
+            // §6E-A4 enable_b_frames=true bumps to 0 + ref count 3.
+            pic_order_cnt_type: 2,
+            log2_max_pic_order_cnt_lsb_minus4: 4,
         };
         let pps_params = PpsParams {
             pps_id: 0,
@@ -227,6 +326,8 @@ impl Encoder {
             width,
             height,
             frame_num: 0,
+            stego_frame_idx: 0,
+            enable_mvd_stego_hook: false,
             rc: RateController::new(quality),
             recon: ReconBuffer::new(width, height)?,
             sps_params,
@@ -234,6 +335,9 @@ impl Encoder {
             params_emitted: false,
             entropy_mode: EntropyMode::Cabac,
             enable_transform_8x8: false,
+            enable_b_frames: false,
+            poc_tracker: super::poc::PocTracker::new(),
+            display_idx_of_prev_anchor: 0,
             dpb: ReferenceBuffer::new(),
             gop_position: 0,
             gop_length: 30,
@@ -256,7 +360,354 @@ impl Encoder {
             cabac_trace_enabled: false,
             cabac_trace_buffer: Vec::new(),
             mode_stats: [0; 9],
+            stego_hook: None,
         })
+    }
+
+    /// Phase 6D.8: install a stego hook. Encoder calls into it
+    /// post-quantize / pre-entropy on every residual block + MVD
+    /// emit. With `None` (default) the encoder behaves byte-
+    /// identically to pre-6D.8.
+    ///
+    /// See [`super::super::stego::encoder_hook::StegoMbHook`].
+    pub fn set_stego_hook(
+        &mut self,
+        hook: Option<Box<dyn super::super::stego::encoder_hook::StegoMbHook>>,
+    ) {
+        self.stego_hook = hook;
+    }
+
+    /// Phase 6D.8: drain the stego hook (typically at end of GOP).
+    /// Returns the boxed hook so the caller can `downcast` or call
+    /// hook-specific finalizers (e.g. `PositionLoggerHook::take_cover()`).
+    pub fn take_stego_hook(
+        &mut self,
+    ) -> Option<Box<dyn super::super::stego::encoder_hook::StegoMbHook>> {
+        self.stego_hook.take()
+    }
+
+    /// Phase 6D.8 internal helper: invoke the stego hook for a
+    /// residual block emit point. Computes the encoder-wide MB
+    /// address from `(mb_x, mb_y)`, reads `frame_num` into a local
+    /// (Copy) so the mutable borrow of `stego_hook` doesn't
+    /// conflict, then dispatches to the hook if any.
+    ///
+    /// **Insertion rule**: must be called AFTER quantize and
+    /// BEFORE the entropy emit + reconstruction. This guarantees
+    /// recon and entropy see the same (possibly modified)
+    /// coefficients.
+    #[inline]
+    fn invoke_stego_residual_hook(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        scan_coeffs: &mut [i32],
+        start_idx: usize,
+        end_idx: usize,
+        path_kind: super::super::stego::orchestrate::ResidualPathKind,
+    ) {
+        let mb_w = (self.width / 16) as usize;
+        let mb_addr = (mb_y * mb_w + mb_x) as u32;
+        let frame = self.stego_frame_idx;
+        if let Some(hook) = self.stego_hook.as_mut() {
+            hook.on_residual_block(
+                frame, mb_addr, scan_coeffs, start_idx, end_idx, path_kind,
+            );
+        }
+    }
+
+    /// Phase 6D.8 internal helper: invoke the stego hook for an
+    /// MVD slot. Same constraints as
+    /// [`Self::invoke_stego_residual_hook`].
+    #[inline]
+    fn invoke_stego_mvd_hook(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        slot: &mut super::super::stego::inject::MvdSlot,
+    ) {
+        let mb_w = (self.width / 16) as usize;
+        let mb_addr = (mb_y * mb_w + mb_x) as u32;
+        let frame = self.stego_frame_idx;
+        if let Some(hook) = self.stego_hook.as_mut() {
+            hook.on_mvd_slot(frame, mb_addr, slot);
+        }
+    }
+
+    /// Phase 6F.2 — open a per-MB MVD position savepoint on the
+    /// stego hook. Pair with `commit_mvd_for_mb` (when the MB
+    /// emits MVDs in the bitstream) or `rollback_mvd_for_mb` (when
+    /// the MB ends up as P_SKIP / intra-in-P, no MVDs in
+    /// bitstream). No-op when no hook is installed.
+    #[inline]
+    fn begin_mvd_for_mb(&mut self) {
+        if let Some(hook) = self.stego_hook.as_mut() {
+            hook.begin_mvd_for_mb();
+        }
+    }
+
+    /// Phase 6F.2 — commit the per-MB MVD positions logged since
+    /// the matching `begin_mvd_for_mb`. Encoder calls this after a
+    /// successful inter MB emission (where the MVDs landed in the
+    /// bitstream).
+    #[inline]
+    fn commit_mvd_for_mb(&mut self) {
+        if let Some(hook) = self.stego_hook.as_mut() {
+            hook.commit_mvd_for_mb();
+        }
+    }
+
+    /// Phase 6F.2 — discard the per-MB MVD positions logged since
+    /// the matching `begin_mvd_for_mb`. Encoder calls this on
+    /// P_SKIP and intra-in-P emit paths, where the MB has no
+    /// MVDs in the actual bitstream so any logged positions were
+    /// phantoms (deferred-items.md §37).
+    #[inline]
+    fn rollback_mvd_for_mb(&mut self) {
+        if let Some(hook) = self.stego_hook.as_mut() {
+            hook.rollback_mvd_for_mb();
+        }
+    }
+
+    /// Phase 6F.2(k).2 — query the planned MVD sign-bit overrides
+    /// for one partition's (X, Y) MVD pair. Returns `(ox, oy)`
+    /// where each is `Some(b)` if the position has a stego plan
+    /// flip, else `None`. The encoder writes `b` to the bypass
+    /// sign bin instead of the natural sign bit.
+    ///
+    /// `mvd_x` / `mvd_y` are the encoder's NATURAL pre-injection
+    /// MVD values — used to compute the slot's PositionKey but
+    /// NOT modified. The encoder's `mv_grid` + MC + neighbor
+    /// predictors all see the original MV → no cascade.
+    #[inline]
+    fn mvd_sign_overrides_for_partition(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        partition: u8,
+        mvd_x: i32,
+        mvd_y: i32,
+    ) -> (Option<u8>, Option<u8>) {
+        let mb_w = (self.width / 16) as usize;
+        let mb_addr = (mb_y * mb_w + mb_x) as u32;
+        let frame = self.stego_frame_idx;
+        if let Some(hook) = self.stego_hook.as_mut() {
+            use super::super::stego::inject::MvdSlot;
+            use super::super::stego::Axis;
+            let slot_x = MvdSlot { list: 0, partition, axis: Axis::X, value: mvd_x };
+            let slot_y = MvdSlot { list: 0, partition, axis: Axis::Y, value: mvd_y };
+            let ox = hook.mvd_sign_override(frame, mb_addr, &slot_x);
+            let oy = hook.mvd_sign_override(frame, mb_addr, &slot_y);
+            (ox, oy)
+        } else {
+            (None, None)
+        }
+    }
+
+    /// Phase 6D.8 §30D-A/A2: fire MVD stego hook for each partition's
+    /// (x, y) MVDs BEFORE motion compensation. Updates `choice` in
+    /// place if the hook modified MVD values, recomputing per-
+    /// partition MVs as `pred + new_mvd` so subsequent MC + recon
+    /// run with the FINAL MVs (no enc/dec drift).
+    ///
+    /// **Scope**: P_L0_16x16 (§30D-A), P_L0_16x8 + P_L0_8x16
+    /// (§30D-A2). P_8x8 + sub_mb_types remain in §30D-A3.
+    ///
+    /// **mv_grid pre-fill**: for multi-partition MBs, partition-N's
+    /// pred lookup needs to see partition-(N-1)'s MV. We pre-fill
+    /// the grid as we walk partitions; the entropy-time fill in
+    /// emit_p_mvds_cabac re-writes the same value, idempotent.
+    fn apply_mvd_hook_to_choice(
+        &mut self,
+        choice: &mut super::partition_decision::PMbChoice,
+        mb_x: usize,
+        mb_y: usize,
+    ) {
+        use super::partition_decision::PMbChoice;
+
+        if !self.enable_mvd_stego_hook || self.stego_hook.is_none() {
+            return;
+        }
+
+        let base_bx = mb_x * 4;
+        let base_by = mb_y * 4;
+
+        match choice {
+            PMbChoice::P16x16 { mv } => {
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, base_bx, base_by, 4, 4,
+                    /* mb_part_idx */ None, /* partition */ 0, mv,
+                );
+                self.mv_grid.fill(base_bx, base_by, 4, 4, *mv, 0);
+            }
+            PMbChoice::P16x8 { mvs } => {
+                // Partition 0 (top): (base_bx, base_by, 4, 2).
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, base_bx, base_by, 4, 2,
+                    Some(0), 0, &mut mvs[0],
+                );
+                self.mv_grid.fill(base_bx, base_by, 4, 2, mvs[0], 0);
+                // Partition 1 (bottom): (base_bx, base_by+2, 4, 2).
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, base_bx, base_by + 2, 4, 2,
+                    Some(1), 1, &mut mvs[1],
+                );
+                self.mv_grid.fill(base_bx, base_by + 2, 4, 2, mvs[1], 0);
+            }
+            PMbChoice::P8x16 { mvs } => {
+                // Partition 0 (left): (base_bx, base_by, 2, 4).
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, base_bx, base_by, 2, 4,
+                    Some(0), 0, &mut mvs[0],
+                );
+                self.mv_grid.fill(base_bx, base_by, 2, 4, mvs[0], 0);
+                // Partition 1 (right): (base_bx+2, base_by, 2, 4).
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, base_bx + 2, base_by, 2, 4,
+                    Some(1), 1, &mut mvs[1],
+                );
+                self.mv_grid.fill(base_bx + 2, base_by, 2, 4, mvs[1], 0);
+            }
+            PMbChoice::P8x8 { sub } => {
+                use super::partition_decision::SUB_MB_ORIGINS_4X4;
+                for (i, sub_choice) in sub.iter_mut().enumerate() {
+                    let (off_x_4x4, off_y_4x4) = SUB_MB_ORIGINS_4X4[i];
+                    let sub_bx_abs = base_bx + off_x_4x4;
+                    let sub_by_abs = base_by + off_y_4x4;
+                    self.apply_mvd_hook_to_sub_mb(
+                        mb_x, mb_y, sub_bx_abs, sub_by_abs,
+                        i as u8, sub_choice,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Phase 6D.8 §30D-A3: fire MVD hook for one 8×8 sub-MB inside
+    /// a P_8x8 MB. Mirrors `emit_sub_mb_mvds_cabac` structure
+    /// (encoder.rs:1979). Sub-MB partitions use the median
+    /// predictor (`predict_mv_for_partition`); the directional
+    /// shortcuts in `predict_mv_for_mb_partition` apply only to
+    /// MB-level P_16x8 / P_8x16.
+    ///
+    /// `partition` convention: `sub_mb_idx * 4 + sub_part_idx`,
+    /// matching the decoder's `decode_sub_mb_mvds`. Gives 16
+    /// unique partition slots across 4 sub-MBs × up to 4 partitions
+    /// (P_4x4).
+    fn apply_mvd_hook_to_sub_mb(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        sub_bx_abs: usize,
+        sub_by_abs: usize,
+        sub_mb_idx: u8,
+        sub_choice: &mut super::partition_decision::SubMbChoice,
+    ) {
+        use super::partition_decision::SubMbChoice;
+
+        let p = |sub_part_idx: u8| sub_mb_idx * 4 + sub_part_idx;
+
+        match sub_choice {
+            SubMbChoice::P8x8 { mv } => {
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, sub_bx_abs, sub_by_abs, 2, 2,
+                    None, p(0), mv,
+                );
+                self.mv_grid.fill(sub_bx_abs, sub_by_abs, 2, 2, *mv, 0);
+            }
+            SubMbChoice::P8x4 { mvs } => {
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, sub_bx_abs, sub_by_abs, 2, 1,
+                    None, p(0), &mut mvs[0],
+                );
+                self.mv_grid.fill(sub_bx_abs, sub_by_abs, 2, 1, mvs[0], 0);
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, sub_bx_abs, sub_by_abs + 1, 2, 1,
+                    None, p(1), &mut mvs[1],
+                );
+                self.mv_grid.fill(sub_bx_abs, sub_by_abs + 1, 2, 1, mvs[1], 0);
+            }
+            SubMbChoice::P4x8 { mvs } => {
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, sub_bx_abs, sub_by_abs, 1, 2,
+                    None, p(0), &mut mvs[0],
+                );
+                self.mv_grid.fill(sub_bx_abs, sub_by_abs, 1, 2, mvs[0], 0);
+                self.fire_mvd_hook_one_partition(
+                    mb_x, mb_y, sub_bx_abs + 1, sub_by_abs, 1, 2,
+                    None, p(1), &mut mvs[1],
+                );
+                self.mv_grid.fill(sub_bx_abs + 1, sub_by_abs, 1, 2, mvs[1], 0);
+            }
+            SubMbChoice::P4x4 { mvs } => {
+                // Encoder iterates with i = ox + 2*oy, i.e., raster
+                // within the sub-MB: (0,0), (1,0), (0,1), (1,1).
+                // Decoder mirror in `decode_sub_mb_mvds` matches.
+                for (i, mv) in mvs.iter_mut().enumerate() {
+                    let ox = i % 2;
+                    let oy = i / 2;
+                    self.fire_mvd_hook_one_partition(
+                        mb_x, mb_y,
+                        sub_bx_abs + ox, sub_by_abs + oy, 1, 1,
+                        None, p(i as u8), mv,
+                    );
+                    self.mv_grid.fill(
+                        sub_bx_abs + ox, sub_by_abs + oy, 1, 1, *mv, 0,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fire the MVD hook for a single partition. Computes pred_mv
+    /// (using `mb_part_idx` for P16x8/P8x16 directional shortcuts
+    /// per § 8.4.1.3.1, otherwise the general median predictor),
+    /// derives original MVD = mv - pred, fires hook for X + Y
+    /// axes, reads back possibly-modified slot values, updates
+    /// `*mv = pred + final_mvd`. Caller pre-fills mv_grid after
+    /// this returns.
+    #[allow(clippy::too_many_arguments)]
+    fn fire_mvd_hook_one_partition(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        tl_bx: usize,
+        tl_by: usize,
+        part_w_4x4: usize,
+        part_h_4x4: usize,
+        mb_part_idx: Option<u8>,
+        partition: u8,
+        mv: &mut super::motion_estimation::MotionVector,
+    ) {
+        use super::motion_estimation::MotionVector;
+        use super::partition_state::{
+            predict_mv_for_mb_partition, predict_mv_for_partition,
+        };
+        use super::super::stego::inject::MvdSlot;
+        use super::super::stego::Axis;
+
+        let pred = match mb_part_idx {
+            Some(idx) => predict_mv_for_mb_partition(
+                &self.mv_grid, tl_bx, tl_by, part_w_4x4, part_h_4x4, idx, 0,
+            ),
+            None => predict_mv_for_partition(
+                &self.mv_grid, tl_bx, tl_by, part_w_4x4, 0,
+            ),
+        };
+        let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
+        let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
+        let mut sx = MvdSlot {
+            list: 0, partition, axis: Axis::X, value: mvd_x,
+        };
+        let mut sy = MvdSlot {
+            list: 0, partition, axis: Axis::Y, value: mvd_y,
+        };
+        self.invoke_stego_mvd_hook(mb_x, mb_y, &mut sx);
+        self.invoke_stego_mvd_hook(mb_x, mb_y, &mut sy);
+        *mv = MotionVector {
+            mv_x: (pred.mv_x as i32 + sx.value) as i16,
+            mv_y: (pred.mv_y as i32 + sy.value) as i16,
+        };
     }
 
     /// Override the default GOP length of 30. The next IDR fires at
@@ -377,6 +828,10 @@ impl Encoder {
         // (I-frames look right, P-frames drift).
         self.frame_num = 0;
         self.dpb.reset();
+        // §6E-A4 — IDR resets the POC anchor + display index. POC=0
+        // for IDR by definition.
+        self.poc_tracker.reset_at_idr(0);
+        self.display_idx_of_prev_anchor = 0;
         // AUD (Access Unit Delimiter) — spec § 7.3.2.4. I-only frame.
         let aud_rbsp = build_aud_rbsp(PrimaryPicType::IOnly);
         let aud_nal = wrap_rbsp_as_nal(&aud_rbsp, NalType::AUD, 0);
@@ -393,6 +848,7 @@ impl Encoder {
         // by the next P-frame.
         self.dpb.promote(&self.recon, self.frame_num);
         self.frame_num = (self.frame_num + 1) & 0xF;
+        self.stego_frame_idx = self.stego_frame_idx.wrapping_add(1);
         self.gop_position = 1; // after the IDR, next frame is position 1
         Ok(out)
     }
@@ -509,12 +965,204 @@ impl Encoder {
 
         // Advance counters.
         self.frame_num = (self.frame_num + 1) & 0xF;
+        // Phase 6F.2(e) fix to deferred-items §37 (coeff-sign half):
+        // stego_frame_idx must advance per encoded frame so per-MB
+        // stego positions encode the correct frame number into their
+        // PositionKey. Previously only encode_i_frame incremented this
+        // counter, so all P-frames in the same GOP reused the IDR's
+        // post-increment value (= 1) — the encoder logged every P-MB
+        // position under frame_idx=1 while the walker correctly
+        // distributed them across frames 1..N. Caused the
+        // FrameCorrupted bug surfaced by parity_real_world_64x48_5f_diagnostic.
+        self.stego_frame_idx = self.stego_frame_idx.wrapping_add(1);
         self.gop_position += 1;
         if self.gop_position >= self.gop_length {
             self.gop_position = 0;
         }
+        // §6E-A4 — advance the POC anchor. With B-frames enabled
+        // (M=2 IBPBP), each P advances by 2 display-index units to
+        // leave a slot for the B that will be encoded next.
+        // Without B-frames, advance by 1 (legacy behavior, but
+        // unused since enable_b_frames=false skips POC).
+        if self.enable_b_frames {
+            self.display_idx_of_prev_anchor += 2;
+        }
 
         Ok(out)
+    }
+
+    /// §6E-A4 — encode a B-frame as all-B_Skip. Pixels currently
+    /// unused (the decoder reconstructs B_Skip MBs via the spatial
+    /// direct predictor on neighbors, so the encoder doesn't write
+    /// any residual or MVD bits). §6E-A4(b/c) lands real ME for
+    /// B-frames; this is the minimum-viable wiring that proves the
+    /// IBPBP encode path produces parseable bytes.
+    ///
+    /// Caller responsibilities:
+    /// - `enable_b_frames` must be `true` BEFORE the first frame
+    ///   is encoded (otherwise SPS uses pic_order_cnt_type=2 and
+    ///   the B-frame's POC LSB field would be a parse mismatch).
+    /// - Call AFTER `encode_p_frame` (the P that will be the
+    ///   B's L1 reference must be in the DPB). The B's display
+    ///   index is implied by the encoder state:
+    ///   `display_idx_of_prev_anchor - 1` for M=2 IBPBP.
+    /// - The previous anchor (I or P) at `display_idx - 2` (i.e.
+    ///   `display_idx_of_prev_anchor - 2`) must also still be in
+    ///   the DPB as the L0 reference. With single-slot DPB this
+    ///   is automatically false; full B-slice ME is §6E-A4(b)
+    ///   which moves to MultiSlotDpb. The all-B_Skip path here
+    ///   doesn't actually consume the references for prediction
+    ///   (no MVDs emitted), so single-slot DPB is fine for now.
+    pub fn encode_b_frame(&mut self, pixels: &[u8]) -> Result<Vec<u8>, EncoderError> {
+        if !self.enable_b_frames {
+            return Err(EncoderError::InvalidInput(
+                "encode_b_frame called with enable_b_frames=false".into(),
+            ));
+        }
+        if !self.dpb.has_reference() {
+            return Err(EncoderError::InvalidInput(
+                "encode_b_frame called without a reference in the DPB; \
+                 encode an I-frame + at least one P-frame first"
+                    .into(),
+            ));
+        }
+        let expected_len = self.frame_size_bytes();
+        if pixels.len() != expected_len {
+            return Err(EncoderError::InvalidInput(format!(
+                "expected {expected_len} yuv420p bytes, got {}",
+                pixels.len()
+            )));
+        }
+
+        let mut out = Vec::new();
+        self.emit_params_if_needed(&mut out);
+
+        // AUD with PrimaryPicType::IPB to advertise B-frame presence.
+        let aud_rbsp = build_aud_rbsp(PrimaryPicType::IPB);
+        let aud_nal = wrap_rbsp_as_nal(&aud_rbsp, NalType::AUD, 0);
+        out.extend_from_slice(&ANNEX_B_START_CODE);
+        out.extend_from_slice(&aud_nal);
+
+        // Build the B-slice RBSP.
+        let slice_rbsp = self.build_b_slice_rbsp_cabac()?;
+        // B-frames are non-reference (nal_ref_idc=0) by Phase 6E-A
+        // convention — they don't enter the DPB.
+        let slice_nal = wrap_rbsp_as_nal(&slice_rbsp, NalType::SLICE, 0);
+        out.extend_from_slice(&ANNEX_B_START_CODE);
+        out.extend_from_slice(&slice_nal);
+
+        // §6E-A4 — frame_num for non-reference B-frames does NOT
+        // advance per spec § 7.4.3 (frame_num only increments for
+        // reference frames; B has nal_ref_idc=0).
+        // gop_position advances (B counts toward GOP length).
+        self.gop_position += 1;
+        if self.gop_position >= self.gop_length {
+            self.gop_position = 0;
+        }
+        // Phase 6F.2(e): stego_frame_idx advances per ENCODED frame,
+        // not per reference frame. The bin walker visits B-frames in
+        // bitstream (decode) order and assigns them sequential
+        // frame_idx values, so the encoder must do the same. Distinct
+        // from frame_num (spec) which only counts reference frames.
+        self.stego_frame_idx = self.stego_frame_idx.wrapping_add(1);
+        // display_idx_of_prev_anchor stays put — the next encode
+        // (P or I) will advance it. The B fills the gap at
+        // (anchor - 1).
+
+        Ok(out)
+    }
+
+    /// §6E-A4 — build a B-slice RBSP with all-B_Skip MBs (every
+    /// MB has mb_skip_flag=1, no other syntax). Test scaffolding
+    /// for the IBPBP encode path before §6E-A4(b) ME lands.
+    fn build_b_slice_rbsp_cabac(&mut self) -> Result<Vec<u8>, EncoderError> {
+        use crate::codec::h264::cabac::neighbor::{CabacNeighborMB, MbTypeClass};
+
+        let mut w = BitWriter::with_capacity(self.frame_size_bytes().max(512));
+        let qp = self.rc.base_qp_for_frame_type(FrameType::P);
+        let pic_init_qp = self.pps_params.pic_init_qp as i32;
+
+        // Compute B-frame display index: previous anchor minus 1
+        // (M=2 IBPBP convention). Then derive POC LSB.
+        let b_display_index = self.display_idx_of_prev_anchor.saturating_sub(1);
+        let pic_order_cnt_lsb = self.poc_tracker.poc_lsb_for(b_display_index);
+
+        let hdr = BSliceHeaderParams {
+            pps_id: 0,
+            frame_num: self.frame_num,
+            pic_order_cnt_lsb,
+            direct_spatial_mv_pred_flag: true,
+            slice_qp_delta: qp as i32 - pic_init_qp,
+            disable_deblocking: false,
+            num_ref_idx_active_override: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            cabac_init_idc: Some(0),
+            log2_max_pic_order_cnt_lsb_minus4: self.sps_params.log2_max_pic_order_cnt_lsb_minus4,
+            log2_max_frame_num_minus4: 0,
+        };
+        continue_slice_header_b(&mut w, &hdr);
+
+        // CABAC engine init for B-slice with cabac_init_idc=0 → PIdc0.
+        let mb_w = (self.width / 16) as usize;
+        let mb_h = (self.height / 16) as usize;
+        let mb_count = mb_w * mb_h;
+        let mut cabac = CabacEncoder::new_slice(CabacInitSlot::PIdc0, qp as i32, mb_w);
+
+        // §6E-A4(c)-lite — emit a hash-based mix of B_Skip and
+        // B_Direct_16x16. Both modes use the spatial direct
+        // predictor at decode time, so visual quality is identical
+        // to all-B_Skip; the mode-distribution variation on the wire
+        // matches real-encoder output better than all-skip and
+        // narrows the L3 fingerprint gap. CBP=0 always — residual
+        // emission lands in §6E-A4(c)-full.
+        for mb_addr in 0..mb_count {
+            let mb_x = mb_addr % mb_w;
+            let mb_y = mb_addr / mb_w;
+            if mb_y > 0 && mb_x == 0 {
+                cabac.neighbors.new_row();
+            }
+            // Pick B_Skip vs B_Direct_16x16 from a deterministic
+            // hash of (frame_num, mb_addr). 50/50 split keeps the
+            // mode distribution non-pathological without needing a
+            // real cost model. Visual quality unchanged.
+            let mode_is_direct = mb_skip_or_direct_decision(
+                self.frame_num as u32, mb_addr as u32,
+            );
+
+            if mode_is_direct {
+                // B_Direct_16x16: mb_skip_flag=0 + mb_type=0 + CBP=0,
+                // then end_of_slice. No mb_qp_delta when CBP=0.
+                encode_mb_skip_flag_b(&mut cabac, false, mb_x);
+                encode_mb_type_b(&mut cabac, 0, mb_x);
+                encode_coded_block_pattern(&mut cabac, /* cbp_value */ 0, mb_x);
+                let nb = CabacNeighborMB {
+                    mb_type: MbTypeClass::BSkipOrDirect,
+                    mb_skip_flag: false,
+                    cbp_luma: 0,
+                    cbp_chroma: 0,
+                    ..CabacNeighborMB::default()
+                };
+                cabac.neighbors.commit(mb_x, nb);
+            } else {
+                // B_Skip: mb_skip_flag=1, no further syntax.
+                encode_mb_skip_flag_b(&mut cabac, true, mb_x);
+                let nb = CabacNeighborMB {
+                    mb_type: MbTypeClass::BSkipOrDirect,
+                    mb_skip_flag: true,
+                    ..CabacNeighborMB::default()
+                };
+                cabac.neighbors.commit(mb_x, nb);
+            }
+            // end_of_slice_flag bin emitted at every MB.
+            let is_last = mb_addr == mb_count - 1;
+            encode_end_of_slice_flag(&mut cabac, is_last);
+        }
+
+        // Finish CABAC, append to slice writer.
+        let cabac_bytes = cabac.finish();
+        // Slice byte alignment + cabac_zero_word stuffing per spec.
+        Ok(assemble_cabac_slice_rbsp(w, &cabac_bytes))
     }
 
     fn build_p_slice_rbsp(&mut self, pixels: &[u8]) -> Result<Vec<u8>, EncoderError> {
@@ -527,6 +1175,8 @@ impl Encoder {
         let hdr = PSliceHeaderParams {
             pps_id: 0,
             frame_num: self.frame_num,
+            pic_order_cnt_lsb: self.maybe_p_poc_lsb(),
+            log2_max_pic_order_cnt_lsb_minus4: self.sps_params.log2_max_pic_order_cnt_lsb_minus4,
             slice_qp_delta: qp as i32 - pic_init_qp,
             disable_deblocking: disable_deblock,
             num_ref_idx_active_override: false,
@@ -669,6 +1319,8 @@ impl Encoder {
         let hdr = PSliceHeaderParams {
             pps_id: 0,
             frame_num: self.frame_num,
+            pic_order_cnt_lsb: self.maybe_p_poc_lsb(),
+            log2_max_pic_order_cnt_lsb_minus4: self.sps_params.log2_max_pic_order_cnt_lsb_minus4,
             slice_qp_delta: qp as i32 - pic_init_qp,
             disable_deblocking: false,
             num_ref_idx_active_override: false,
@@ -819,7 +1471,7 @@ impl Encoder {
         cr_plane: &[u8],
         c_stride: usize,
         qp: u8,
-        qp_c: u8,
+        _qp_c: u8,
         is_last_mb: bool,
     ) -> Result<(), EncoderError> {
         use crate::codec::h264::cabac::encoder::{
@@ -953,7 +1605,7 @@ impl Encoder {
                     }
                 }
                 let coeffs = forward_dct_4x4(&sub_res);
-                let levels = trellis_quantize_4x4(&coeffs, inter, trellis_lambda_for_qp(mb_qp))
+                let levels = trellis_quantize_4x4(&coeffs, inter, true)
                     .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, inter));
                 if levels.iter().any(|r| r.iter().any(|&v| v != 0)) {
                     any_luma_nonzero = true;
@@ -997,8 +1649,34 @@ impl Encoder {
 
         // Partition choice.
         let decision = decide_p_mb_with_cost(&src_y, reference, &mut self.me, &mut self.mv_grid, mb_x, mb_y);
-        let choice = decision.best;
+        let mut choice = decision.best;
         let inter_cost = decision.best_cost;
+
+        // Phase 6D.8 §30D-A: pre-MC MVD stego hook. Fires for each
+        // partition's (x, y) MVDs; may modify values; encoder
+        // updates choice's MVs from (pred + final_mvd) so MC + recon
+        // run with the FINAL MV (no drift). When
+        // `enable_mvd_stego_hook=false` (default) this is a no-op.
+        //
+        // Phase 6F.2: open per-MB MVD savepoint. Any MVD positions
+        // logged by `apply_mvd_hook_to_choice` get retracted later
+        // if this MB ends up emitting as P_SKIP / intra-in-P (no
+        // MVDs in bitstream). See deferred-items.md §37.
+        //
+        // Phase 6F.2(e) — mv_grid snapshot/restore around the hook:
+        // apply_mvd_hook_to_choice fills mv_grid sub-MB by sub-MB to
+        // chain median predictors. By the time the hook completes,
+        // the WHOLE MB's grid is filled. emit_p_mvds_cabac then runs
+        // and re-fills incrementally, but its predictor sees the
+        // hook's fills for *later* sub-MBs as already-decoded — so
+        // its C-neighbor decoded-state differs from what the hook
+        // saw. Snapshot before hook + restore after → emit starts
+        // from the same pre-hook grid state and re-fills
+        // incrementally identically to the hook.
+        let mb_mv_grid_snapshot = self.mv_grid.snapshot_mb(mb_x, mb_y);
+        self.begin_mvd_for_mb();
+        self.apply_mvd_hook_to_choice(&mut choice, mb_x, mb_y);
+        self.mv_grid.restore_mb(&mb_mv_grid_snapshot);
 
         // Phase D.0 intra-in-P emit gate.
         //   - `PHASM_TRACE_WOULD_BE_INTRA=1`: count MBs where intra
@@ -1013,8 +1691,7 @@ impl Encoder {
         let trace_would_be_intra = std::env::var_os("PHASM_TRACE_WOULD_BE_INTRA").is_some();
         let intra_in_p_enabled = std::env::var("PHASM_CABAC_INTRA_IN_P")
             .ok()
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .is_none_or(|v| v != "0");
         // FORCE_MB semantics: when set, intra-in-P fires ONLY on the
         // specified MB (suppresses natural firings elsewhere). Lets us
         // isolate parity bugs to a single MB emit for bin-by-bin
@@ -1024,15 +1701,14 @@ impl Encoder {
         let force_intra_here = intra_in_p_enabled
             && force_mb_setting
                 .as_deref()
-                .map(|s| {
+                .is_some_and(|s| {
                     s.split(';').any(|pair| {
                         let mut it = pair.split(',');
                         let x: Option<usize> = it.next().and_then(|p| p.trim().parse().ok());
                         let y: Option<usize> = it.next().and_then(|p| p.trim().parse().ok());
                         matches!((x, y), (Some(px), Some(py)) if px == mb_x && py == mb_y)
                     })
-                })
-                .unwrap_or(false);
+                });
         if trace_would_be_intra || intra_in_p_enabled {
             let neighbors_y = self.build_luma_neighbors_16x16(mb_x, mb_y);
             let i16_decision =
@@ -1064,8 +1740,7 @@ impl Encoder {
             // of the RDO gate via `PHASM_INTRA_RDO=0`.
             let intra_rdo_enabled = std::env::var("PHASM_INTRA_RDO")
                 .ok()
-                .map(|v| v != "0")
-                .unwrap_or(true);
+                .is_none_or(|v| v != "0");
             let intra_rdo_wins = if intra_rdo_enabled && !satd_fast_out && !force_mb_active {
                 let frame_w4 = (self.width / 4) as usize;
                 let chroma_mode = std::env::var("PHASM_INTRA_CHROMA_MODE")
@@ -1077,8 +1752,7 @@ impl Encoder {
                 // via `PHASM_CHROMA_RDO=0` to keep luma-only cost.
                 let chroma_rdo_enabled = std::env::var("PHASM_CHROMA_RDO")
                     .ok()
-                    .map(|v| v != "0")
-                    .unwrap_or(true);
+                    .is_none_or(|v| v != "0");
                 let (src_cb, src_cr) = if chroma_rdo_enabled {
                     let cy0 = mb_y * 8;
                     let cx0 = mb_x * 8;
@@ -1204,8 +1878,7 @@ impl Encoder {
                     // ±5 pp on both clips.
                     let i4x4_allow = std::env::var("PHASM_INTRA_IN_P_ALLOW_I4X4")
                         .ok()
-                        .map(|v| v != "0")
-                        .unwrap_or(true);
+                        .is_none_or(|v| v != "0");
                     // Phase D.4 fast-intra gate (task #51). I_4x4
                     // exploration runs 9 modes × 16 blocks = 144 SATDs
                     // per MB — skip it unless inter clearly loses to
@@ -1265,6 +1938,10 @@ impl Encoder {
                     );
                     self.commit_mb_state(mb_x, mb_y, mb_qp, true);
 
+                    // Phase 6F.2: intra-in-P wins → emit as I-MB, no
+                    // MVDs in bitstream. Retract any phantom MVD
+                    // positions logged by apply_mvd_hook_to_choice.
+                    self.rollback_mvd_for_mb();
                     if let Some(i4x4_result) = use_i4x4 {
                         self.mode_stats[MODE_STAT_INTRA_IN_P_I4X4] += 1;
                         return self.commit_i4x4_macroblock_cabac(
@@ -1320,7 +1997,7 @@ impl Encoder {
                 }
             }
             let coeffs = forward_dct_4x4(&sub_res);
-            let levels = trellis_quantize_4x4(&coeffs, inter, trellis_lambda_for_qp(qp))
+            let levels = trellis_quantize_4x4(&coeffs, inter, true)
                 .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, inter));
             luma_ac_levels[k] = levels;
             luma_nonzero[k] = levels.iter().any(|r| r.iter().any(|&v| v != 0));
@@ -1446,7 +2123,23 @@ impl Encoder {
         // if the mode decision picked P_L0_16x16, cbp is zero, and the
         // chosen MV matches the spec's P_Skip MV derivation, we can
         // signal P_Skip with just a single mb_skip_flag = 1 bin.
-        let is_skip = if cbp_value == 0 {
+        //
+        // Phase 6F.2(f) — gate post-ME P_SKIP off whenever the MVD
+        // stego hook is active. Reason: the hook may modify MVD
+        // signs (e.g. Pass 3 InjectionHook applies the STC plan).
+        // The modified MV produces different residuals → potentially
+        // different cbp → P_SKIP decision flips between Pass 1 (where
+        // the cover was logged with original MV) and Pass 3 (where
+        // bytes are emitted with injected MV). When P_SKIP flips
+        // between passes, the bitstream cover length differs from
+        // the planned cover length — STC reverse on the walked
+        // bitstream fails, causing FrameCorrupted on real-world
+        // round trips. Disabling post-ME P_SKIP under stego costs
+        // ~5–15% bitrate on low-motion content but stabilises the
+        // mode decision across passes. See deferred-items.md §37.
+        let is_skip = if self.enable_mvd_stego_hook {
+            false
+        } else if cbp_value == 0 {
             if let PMbChoice::P16x16 { mv } = choice {
                 let p_skip_mv = super::partition_state::predict_p_skip_mv(
                     &self.mv_grid,
@@ -1504,6 +2197,11 @@ impl Encoder {
             nb.mb_skip_flag = true;
             cabac.neighbors.commit(mb_x, nb);
             self.mode_stats[MODE_STAT_P_SKIP_POST_ME] += 1;
+            // Phase 6F.2: P_SKIP emit → no MVDs in bitstream.
+            // Retract any phantom MVD positions logged by
+            // apply_mvd_hook_to_choice. Pairs with begin_mvd_for_mb
+            // earlier in this fn. See deferred-items.md §37.
+            self.rollback_mvd_for_mb();
             return Ok(());
         }
 
@@ -1524,7 +2222,7 @@ impl Encoder {
         // 3. sub_mb_type — only for P_8x8.
         if let PMbChoice::P8x8 { ref sub } = choice {
             for s in sub.iter() {
-                encode_sub_mb_type_p(cabac, s.sub_mb_type_codenum() as u32);
+                encode_sub_mb_type_p(cabac, s.sub_mb_type_codenum());
             }
         }
 
@@ -1586,6 +2284,13 @@ impl Encoder {
                         let pos = ZIGZAG_8X8[i] as usize;
                         scan[i] = levels_8x8[k][pos / 8][pos % 8] as i32;
                     }
+                    // Phase 6D.8: stego hook for P-frame 8×8 luma residual.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut scan, 0, 63,
+                        super::super::stego::orchestrate::ResidualPathKind::Luma8x8 {
+                            block_idx: k as u8,
+                        },
+                    );
                     encode_residual_block_cabac_8x8(cabac, &scan);
                 }
             }
@@ -1609,7 +2314,14 @@ impl Encoder {
             for k in 0..16 {
                 let (bx, by) = BLOCK_INDEX_TO_POS[k];
                 if cbp_luma_8x8 & (1 << (k / 4)) != 0 {
-                    let scan = raster_to_scan_levels(&luma_ac_levels[k]);
+                    let mut scan = raster_to_scan_levels(&luma_ac_levels[k]);
+                    // Phase 6D.8: stego hook for P-frame 4×4 luma residual.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut scan, 0, 15,
+                        super::super::stego::orchestrate::ResidualPathKind::Luma4x4 {
+                            block_idx: k as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_luma_4x4(
                         &current_cbf,
                         &cabac.neighbors,
@@ -1643,7 +2355,14 @@ impl Encoder {
         }
         if cbp_chroma >= 1 {
             for (plane, dc) in [&cb_dc, &cr_dc].iter().enumerate() {
-                let dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                let mut dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                // Phase 6D.8: stego hook for P-frame Chroma DC.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut dc_flat, 0, 3,
+                    super::super::stego::orchestrate::ResidualPathKind::ChromaDc {
+                        plane: plane as u8,
+                    },
+                );
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -1657,7 +2376,15 @@ impl Encoder {
                 for sub in 0..4 {
                     let bx = (sub % 2) as u8;
                     let by = (sub / 2) as u8;
-                    let ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    let mut ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    // Phase 6D.8: stego hook for P-frame Chroma AC.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut ac_scan, 0, 14,
+                        super::super::stego::orchestrate::ResidualPathKind::ChromaAc {
+                            plane: plane as u8,
+                            block_idx: sub as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -1737,6 +2464,11 @@ impl Encoder {
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
 
+        // Phase 6F.2: inter MB committed; the MVDs logged earlier
+        // by apply_mvd_hook_to_choice are now real bitstream
+        // positions. Pairs with begin_mvd_for_mb. See
+        // deferred-items.md §37.
+        self.commit_mvd_for_mb();
         Ok(())
     }
 
@@ -1751,19 +2483,26 @@ impl Encoder {
         mb_y: usize,
         choice: &PMbChoice,
     ) {
-        use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+        
         use crate::codec::h264::cabac::neighbor::compute_mvd_ctx_idx_inc_bin0;
 
         let base_bx = mb_x * 4;
         let base_by = mb_y * 4;
-        let mut emit = |cabac_: &mut CabacEncoder,
+        // Phase 6F.2(k).2 — closure now takes optional sign
+        // overrides (ox, oy) for the X / Y MVD bypass sign bins.
+        // Magnitude bins are always natural; only the sign bit
+        // gets overridden when stego plan dictates.
+        let emit = |cabac_: &mut CabacEncoder,
                         current: &mut super::super::cabac::neighbor::CurrentMbMvdAbs,
                         part_bx_in_mb: u8,
                         part_by_in_mb: u8,
                         part_w4: u8,
                         part_h4: u8,
                         mv: MotionVector,
-                        pred: MotionVector| {
+                        pred: MotionVector,
+                        ox: Option<u8>,
+                        oy: Option<u8>| {
+            use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_sign_override;
             let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
             let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
             let inc_x = compute_mvd_ctx_idx_inc_bin0(
@@ -1774,7 +2513,7 @@ impl Encoder {
                 part_by_in_mb,
                 0,
             );
-            encode_mvd_with_bin0_inc(cabac_, mvd_x, 0, inc_x);
+            encode_mvd_with_bin0_inc_sign_override(cabac_, mvd_x, 0, inc_x, ox);
             let inc_y = compute_mvd_ctx_idx_inc_bin0(
                 current,
                 &cabac_.neighbors,
@@ -1783,7 +2522,7 @@ impl Encoder {
                 part_by_in_mb,
                 1,
             );
-            encode_mvd_with_bin0_inc(cabac_, mvd_y, 1, inc_y);
+            encode_mvd_with_bin0_inc_sign_override(cabac_, mvd_y, 1, inc_y, oy);
             current.fill_region(
                 part_bx_in_mb,
                 part_by_in_mb,
@@ -1796,14 +2535,24 @@ impl Encoder {
         match *choice {
             PMbChoice::P16x16 { mv } => {
                 let pred = predict_mv_for_partition(&self.mv_grid, base_bx, base_by, 4, 0);
-                emit(cabac, current_mvd, 0, 0, 4, 4, mv, pred);
+                let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
+                let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
+                let (ox, oy) = self.mvd_sign_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd_x, mvd_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 4, 4, mv, pred, ox, oy);
                 self.mv_grid.fill(base_bx, base_by, 4, 4, mv, 0);
             }
             PMbChoice::P16x8 { mvs } => {
                 let pred0 = predict_mv_for_mb_partition(
                     &self.mv_grid, base_bx, base_by, 4, 2, 0, 0,
                 );
-                emit(cabac, current_mvd, 0, 0, 4, 2, mvs[0], pred0);
+                let mvd0_x = mvs[0].mv_x as i32 - pred0.mv_x as i32;
+                let mvd0_y = mvs[0].mv_y as i32 - pred0.mv_y as i32;
+                let (ox0, oy0) = self.mvd_sign_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 4, 2, mvs[0], pred0, ox0, oy0);
                 self.mv_grid.fill(base_bx, base_by, 4, 2, mvs[0], 0);
                 let pred1 = predict_mv_for_mb_partition(
                     &self.mv_grid,
@@ -1814,14 +2563,24 @@ impl Encoder {
                     1,
                     0,
                 );
-                emit(cabac, current_mvd, 0, 2, 4, 2, mvs[1], pred1);
+                let mvd1_x = mvs[1].mv_x as i32 - pred1.mv_x as i32;
+                let mvd1_y = mvs[1].mv_y as i32 - pred1.mv_y as i32;
+                let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 1, mvd1_x, mvd1_y,
+                );
+                emit(cabac, current_mvd, 0, 2, 4, 2, mvs[1], pred1, ox1, oy1);
                 self.mv_grid.fill(base_bx, base_by + 2, 4, 2, mvs[1], 0);
             }
             PMbChoice::P8x16 { mvs } => {
                 let pred0 = predict_mv_for_mb_partition(
                     &self.mv_grid, base_bx, base_by, 2, 4, 0, 0,
                 );
-                emit(cabac, current_mvd, 0, 0, 2, 4, mvs[0], pred0);
+                let mvd0_x = mvs[0].mv_x as i32 - pred0.mv_x as i32;
+                let mvd0_y = mvs[0].mv_y as i32 - pred0.mv_y as i32;
+                let (ox0, oy0) = self.mvd_sign_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 2, 4, mvs[0], pred0, ox0, oy0);
                 self.mv_grid.fill(base_bx, base_by, 2, 4, mvs[0], 0);
                 let pred1 = predict_mv_for_mb_partition(
                     &self.mv_grid,
@@ -1832,7 +2591,12 @@ impl Encoder {
                     1,
                     0,
                 );
-                emit(cabac, current_mvd, 2, 0, 2, 4, mvs[1], pred1);
+                let mvd1_x = mvs[1].mv_x as i32 - pred1.mv_x as i32;
+                let mvd1_y = mvs[1].mv_y as i32 - pred1.mv_y as i32;
+                let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 1, mvd1_x, mvd1_y,
+                );
+                emit(cabac, current_mvd, 2, 0, 2, 4, mvs[1], pred1, ox1, oy1);
                 self.mv_grid.fill(base_bx + 2, base_by, 2, 4, mvs[1], 0);
             }
             PMbChoice::P8x8 { sub } => {
@@ -1846,6 +2610,8 @@ impl Encoder {
                         cabac,
                         current_mvd,
                         mb_x,
+                        mb_y,
+                        i as u8, // sub_mb_idx
                         sub_bx_abs,
                         sub_by_abs,
                         sub_bx_in_mb,
@@ -1864,18 +2630,27 @@ impl Encoder {
         cabac: &mut CabacEncoder,
         current_mvd: &mut super::super::cabac::neighbor::CurrentMbMvdAbs,
         mb_x: usize,
+        mb_y: usize,
+        sub_mb_idx: u8,
         sub_bx_abs: usize,
         sub_by_abs: usize,
         sub_bx_in_mb: u8,
         sub_by_in_mb: u8,
         sub_choice: &SubMbChoice,
     ) {
+        // Phase 6F.2(k).2 — partition encoding follows the
+        // PositionKey convention: `sub_mb_idx * 4 + sub_part_idx`.
+        // For P_L0_8x8 sub-MB (single partition), sub_part_idx=0.
+        // For sub-MB-internal multi-partitions, sub_part_idx
+        // indexes the sub-MB's own partitions in raster order.
+        let p = |sub_part_idx: u8| sub_mb_idx * 4 + sub_part_idx;
         match *sub_choice {
             SubMbChoice::P8x8 { mv } => {
                 let pred =
                     predict_mv_for_partition(&self.mv_grid, sub_bx_abs, sub_by_abs, 2, 0);
                 self.emit_one_mvd_pair_cabac(
-                    cabac, current_mvd, mb_x, sub_bx_in_mb, sub_by_in_mb, 2, 2, mv, pred,
+                    cabac, current_mvd, mb_x, mb_y, p(0),
+                    sub_bx_in_mb, sub_by_in_mb, 2, 2, mv, pred,
                 );
                 self.mv_grid.fill(sub_bx_abs, sub_by_abs, 2, 2, mv, 0);
             }
@@ -1883,7 +2658,8 @@ impl Encoder {
                 let pred_top =
                     predict_mv_for_partition(&self.mv_grid, sub_bx_abs, sub_by_abs, 2, 0);
                 self.emit_one_mvd_pair_cabac(
-                    cabac, current_mvd, mb_x, sub_bx_in_mb, sub_by_in_mb, 2, 1, mvs[0], pred_top,
+                    cabac, current_mvd, mb_x, mb_y, p(0),
+                    sub_bx_in_mb, sub_by_in_mb, 2, 1, mvs[0], pred_top,
                 );
                 self.mv_grid.fill(sub_bx_abs, sub_by_abs, 2, 1, mvs[0], 0);
                 let pred_bot = predict_mv_for_partition(
@@ -1897,6 +2673,8 @@ impl Encoder {
                     cabac,
                     current_mvd,
                     mb_x,
+                    mb_y,
+                    p(1),
                     sub_bx_in_mb,
                     sub_by_in_mb + 1,
                     2,
@@ -1911,7 +2689,8 @@ impl Encoder {
                 let pred_left =
                     predict_mv_for_partition(&self.mv_grid, sub_bx_abs, sub_by_abs, 1, 0);
                 self.emit_one_mvd_pair_cabac(
-                    cabac, current_mvd, mb_x, sub_bx_in_mb, sub_by_in_mb, 1, 2, mvs[0], pred_left,
+                    cabac, current_mvd, mb_x, mb_y, p(0),
+                    sub_bx_in_mb, sub_by_in_mb, 1, 2, mvs[0], pred_left,
                 );
                 self.mv_grid.fill(sub_bx_abs, sub_by_abs, 1, 2, mvs[0], 0);
                 let pred_right = predict_mv_for_partition(
@@ -1925,6 +2704,8 @@ impl Encoder {
                     cabac,
                     current_mvd,
                     mb_x,
+                    mb_y,
+                    p(1),
                     sub_bx_in_mb + 1,
                     sub_by_in_mb,
                     1,
@@ -1937,8 +2718,8 @@ impl Encoder {
             }
             SubMbChoice::P4x4 { mvs } => {
                 for (i, mv) in mvs.iter().enumerate() {
-                    let ox = (i % 2) as usize;
-                    let oy = (i / 2) as usize;
+                    let ox = i % 2;
+                    let oy = i / 2;
                     let pred = predict_mv_for_partition(
                         &self.mv_grid,
                         sub_bx_abs + ox,
@@ -1950,6 +2731,8 @@ impl Encoder {
                         cabac,
                         current_mvd,
                         mb_x,
+                        mb_y,
+                        p(i as u8),
                         sub_bx_in_mb + ox as u8,
                         sub_by_in_mb + oy as u8,
                         1,
@@ -1967,12 +2750,21 @@ impl Encoder {
     /// Emit one MVD pair (x + y) via CABAC and update the current-MB
     /// abs_mvd tracking for subsequent same-MB partition neighbor
     /// lookups. Does NOT touch `self.mv_grid` — caller handles that.
+    ///
+    /// Phase 6F.2(k).2 — Now takes `&mut self` (was `&self`) so it
+    /// can query `self.stego_hook.mvd_sign_override(...)` for the
+    /// planned bypass-bin overrides at this partition's
+    /// (frame_idx, mb_addr, partition, axis) coordinates. The
+    /// `partition` parameter encodes the position-key partition
+    /// field (`sub_mb_idx * 4 + sub_part_idx` for sub-MB callers).
     #[allow(clippy::too_many_arguments)]
     fn emit_one_mvd_pair_cabac(
-        &self,
+        &mut self,
         cabac: &mut CabacEncoder,
         current_mvd: &mut super::super::cabac::neighbor::CurrentMbMvdAbs,
         mb_x: usize,
+        mb_y: usize,
+        partition: u8,
         part_bx_in_mb: u8,
         part_by_in_mb: u8,
         part_w4: u8,
@@ -1980,10 +2772,13 @@ impl Encoder {
         mv: MotionVector,
         pred: MotionVector,
     ) {
-        use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+        use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_sign_override;
         use crate::codec::h264::cabac::neighbor::compute_mvd_ctx_idx_inc_bin0;
         let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
         let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
+        let (ox, oy) = self.mvd_sign_overrides_for_partition(
+            mb_x, mb_y, partition, mvd_x, mvd_y,
+        );
         let inc_x = compute_mvd_ctx_idx_inc_bin0(
             current_mvd,
             &cabac.neighbors,
@@ -1992,7 +2787,7 @@ impl Encoder {
             part_by_in_mb,
             0,
         );
-        encode_mvd_with_bin0_inc(cabac, mvd_x, 0, inc_x);
+        encode_mvd_with_bin0_inc_sign_override(cabac, mvd_x, 0, inc_x, ox);
         let inc_y = compute_mvd_ctx_idx_inc_bin0(
             current_mvd,
             &cabac.neighbors,
@@ -2001,7 +2796,7 @@ impl Encoder {
             part_by_in_mb,
             1,
         );
-        encode_mvd_with_bin0_inc(cabac, mvd_y, 1, inc_y);
+        encode_mvd_with_bin0_inc_sign_override(cabac, mvd_y, 1, inc_y, oy);
         current_mvd.fill_region(
             part_bx_in_mb,
             part_by_in_mb,
@@ -2026,7 +2821,7 @@ impl Encoder {
         cr_plane: &[u8],
         c_stride: usize,
         qp: u8,
-        qp_c: u8,
+        _qp_c: u8,
         skip_run: &mut u32,
     ) -> Result<(), EncoderError> {
         let _ = mb_w;
@@ -2052,7 +2847,7 @@ impl Encoder {
 
         // Task #154 tracer: log entry state so we see every MB even if
         // later branches take an early return.
-        let trace_mb = std::env::var("PHASM_DUMP_MB").ok().map_or(false, |s| {
+        let trace_mb = std::env::var("PHASM_DUMP_MB").ok().is_some_and(|s| {
             s.split(';').any(|pair| {
                 let mut parts = pair.split(',');
                 let x: Option<usize> = parts.next().and_then(|p| p.trim().parse().ok());
@@ -2155,7 +2950,7 @@ impl Encoder {
                     }
                 }
                 let coeffs = forward_dct_4x4(&sub_res);
-                let levels = trellis_quantize_4x4(&coeffs, inter, trellis_lambda_for_qp(mb_qp))
+                let levels = trellis_quantize_4x4(&coeffs, inter, true)
                     .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, inter));
                 if levels.iter().any(|r| r.iter().any(|&v| v != 0)) {
                     any_luma_nonzero = true;
@@ -2292,7 +3087,7 @@ impl Encoder {
         // "5,3;6,3;7,3" to force intra on three MBs at once.
         let force_intra = std::env::var("PHASM_FORCE_INTRA_IN_P_MB")
             .ok()
-            .map_or(false, |s| {
+            .is_some_and(|s| {
                 s.split(';').any(|pair| {
                     let mut parts = pair.split(',');
                     let x: Option<usize> = parts.next().and_then(|p| p.trim().parse().ok());
@@ -2368,7 +3163,7 @@ impl Encoder {
                 }
             }
             let coeffs = forward_dct_4x4(&sub_res);
-            let levels = trellis_quantize_4x4(&coeffs, intra, trellis_lambda_for_qp(mb_qp))
+            let levels = trellis_quantize_4x4(&coeffs, intra, true)
                 .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, intra));
             luma_ac_levels[k] = levels;
             luma_nonzero[k] = levels.iter().any(|row| row.iter().any(|&v| v != 0));
@@ -2447,7 +3242,7 @@ impl Encoder {
         // as the encoder emits. Pair with a conformant external decoder's
         // MB-level debug output to find the first MB where the two
         // disagree.
-        let dump_this_mb = std::env::var("PHASM_DUMP_MB").ok().map_or(false, |s| {
+        let dump_this_mb = std::env::var("PHASM_DUMP_MB").ok().is_some_and(|s| {
             s.split(';').any(|pair| {
                 let mut parts = pair.split(',');
                 let x: Option<usize> = parts.next().and_then(|p| p.trim().parse().ok());
@@ -2626,6 +3421,20 @@ impl Encoder {
         if self.params_emitted {
             return;
         }
+        // §6E-A4 — sync SPS to enable_b_frames BEFORE emit. When
+        // enabled, SPS must use pic_order_cnt_type=0 (so decoders
+        // can reorder display vs encode order via pic_order_cnt_lsb)
+        // and bump max_num_ref_frames to at least 3 (M=2 IBPBP DPB
+        // shape). Caller must set enable_b_frames BEFORE the first
+        // encode call; toggling mid-stream produces an invalid
+        // bitstream because SPS is emitted only once.
+        if self.enable_b_frames {
+            self.sps_params.pic_order_cnt_type = 0;
+            self.sps_params.log2_max_pic_order_cnt_lsb_minus4 = 4;
+            if self.sps_params.max_num_ref_frames < 3 {
+                self.sps_params.max_num_ref_frames = 3;
+            }
+        }
         // Select SPS/PPS profile based on entropy mode and the 8×8
         // transform opt-in. CAVLC always stays Baseline. CABAC picks
         // High when `enable_transform_8x8` is set, else Main.
@@ -2770,7 +3579,7 @@ impl Encoder {
         cr_plane: &[u8],
         c_stride: usize,
         qp: u8,
-        qp_c: u8,
+        _qp_c: u8,
         is_last_mb: bool,
     ) -> Result<(), EncoderError> {
         let y0 = mb_y * 16;
@@ -2992,7 +3801,14 @@ impl Encoder {
             for k in 0..16 {
                 let (bx, by) = BLOCK_INDEX_TO_POS[k];
                 if cbp_luma & (1 << (k / 4)) != 0 {
-                    let scan = raster_to_scan_levels(&i4x4.ac_levels[k]);
+                    let mut scan = raster_to_scan_levels(&i4x4.ac_levels[k]);
+                    // Phase 6D.8: stego hook for I_4x4 luma residual.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut scan, 0, 15,
+                        super::super::stego::orchestrate::ResidualPathKind::Luma4x4 {
+                            block_idx: k as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_luma_4x4(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3032,7 +3848,14 @@ impl Encoder {
         // Chroma DC / AC (same structure as I_16x16 CABAC path).
         if cbp_chroma >= 1 {
             for (plane, dc) in [&cb_dc_levels, &cr_dc_levels].iter().enumerate() {
-                let dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                let mut dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                // Phase 6D.8: stego hook for I_4x4 Chroma DC.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut dc_flat, 0, 3,
+                    super::super::stego::orchestrate::ResidualPathKind::ChromaDc {
+                        plane: plane as u8,
+                    },
+                );
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -3048,7 +3871,15 @@ impl Encoder {
                 for sub in 0..4 {
                     let bx = (sub % 2) as u8;
                     let by = (sub / 2) as u8;
-                    let ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    let mut ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    // Phase 6D.8: stego hook for I_4x4 Chroma AC.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut ac_scan, 0, 14,
+                        super::super::stego::orchestrate::ResidualPathKind::ChromaAc {
+                            plane: plane as u8,
+                            block_idx: sub as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3245,6 +4076,13 @@ impl Encoder {
                     let col = pos % 8;
                     scan_coeffs[i] = levels_rm[row][col] as i32;
                 }
+                // Phase 6D.8: stego hook for I_8x8 luma residual.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut scan_coeffs, 0, 63,
+                    super::super::stego::orchestrate::ResidualPathKind::Luma8x8 {
+                        block_idx: k as u8,
+                    },
+                );
                 encode_residual_block_cabac_8x8(cabac, &scan_coeffs);
             }
         }
@@ -3267,7 +4105,14 @@ impl Encoder {
         // Chroma DC / AC (same structure as I_4x4 / I_16x16 CABAC path).
         if cbp_chroma >= 1 {
             for (plane, dc) in [&cb_dc_levels, &cr_dc_levels].iter().enumerate() {
-                let dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                let mut dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                // Phase 6D.8: stego hook for I_8x8 Chroma DC.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut dc_flat, 0, 3,
+                    super::super::stego::orchestrate::ResidualPathKind::ChromaDc {
+                        plane: plane as u8,
+                    },
+                );
                 let inc = compute_cbf_ctx_idx_inc_chroma_dc(
                     &cabac.neighbors,
                     mb_x,
@@ -3285,7 +4130,15 @@ impl Encoder {
                 for sub in 0..4 {
                     let bx = (sub % 2) as u8;
                     let by = (sub / 2) as u8;
-                    let ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    let mut ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    // Phase 6D.8: stego hook for I_8x8 Chroma AC.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut ac_scan, 0, 14,
+                        super::super::stego::orchestrate::ResidualPathKind::ChromaAc {
+                            plane: plane as u8,
+                            block_idx: sub as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3462,7 +4315,7 @@ impl Encoder {
     ) -> Result<(), EncoderError> {
         use crate::codec::h264::cabac::encoder::{encode_mb_type_p, encode_residual_block_cabac_with_cbf_inc};
         use crate::codec::h264::cabac::neighbor::{
-            block_pos_to_chroma_ac_idx, block_pos_to_luma_idx,
+            block_pos_to_chroma_ac_idx,
             compute_cbf_ctx_idx_inc_chroma_ac, compute_cbf_ctx_idx_inc_chroma_dc,
             compute_cbf_ctx_idx_inc_luma_ac, compute_cbf_ctx_idx_inc_luma_dc, CurrentMbCbf,
         };
@@ -3532,7 +4385,7 @@ impl Encoder {
             // {4,5,2,3} — decoder reads wrong DCs for those slots.
             dc_grid[by as usize][bx as usize] = coeffs[0][0];
             coeffs[0][0] = 0;
-            ac_levels[k] = trellis_quantize_4x4(&coeffs, intra, trellis_lambda_for_qp(qp))
+            ac_levels[k] = trellis_quantize_4x4(&coeffs, intra, true)
                 .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, intra));
         }
         let dc_hadamard = forward_hadamard_4x4(&dc_grid);
@@ -3600,7 +4453,14 @@ impl Encoder {
         let current_is_intra = true;
 
         // 6a. Intra16x16DCLevel — always emitted, single block (cat 0).
-        let dc_scan = raster_to_scan_levels(&dc_levels);
+        let mut dc_scan = raster_to_scan_levels(&dc_levels);
+        // Phase 6D.8: stego hook may modify dc_scan in place. Both
+        // entropy emit (below) and reconstruction (later) see the
+        // modified buffer → no enc/dec drift.
+        self.invoke_stego_residual_hook(
+            mb_x, mb_y, &mut dc_scan, 0, 15,
+            super::super::stego::orchestrate::ResidualPathKind::LumaDcIntra16x16,
+        );
         if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
             eprintln!("ENC IIP@({},{}) DC scan: {:?}", mb_x, mb_y, dc_scan);
         }
@@ -3615,7 +4475,14 @@ impl Encoder {
         if cbp_luma_flag != 0 {
             for k in 0..16 {
                 let (bx, by) = BLOCK_INDEX_TO_POS[k];
-                let ac_scan = ac_scan_order_15(&ac_levels[k]);
+                let mut ac_scan = ac_scan_order_15(&ac_levels[k]);
+                // Phase 6D.8: stego hook for Intra_16x16 AC residual.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut ac_scan, 0, 14,
+                    super::super::stego::orchestrate::ResidualPathKind::Luma4x4 {
+                        block_idx: k as u8,
+                    },
+                );
                 if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
                     eprintln!("ENC IIP AC k={} bx={} by={} scan: {:?}", k, bx, by, ac_scan);
                 }
@@ -3638,7 +4505,14 @@ impl Encoder {
         //     Flat 4-element zigzag (the 2×2 Hadamard grid in raster).
         if cbp_chroma >= 1 {
             for (plane, dc) in [&cb_dc_levels, &cr_dc_levels].iter().enumerate() {
-                let dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                let mut dc_flat: [i32; 4] = [dc[0][0], dc[0][1], dc[1][0], dc[1][1]];
+                // Phase 6D.8: stego hook for Chroma DC residual.
+                self.invoke_stego_residual_hook(
+                    mb_x, mb_y, &mut dc_flat, 0, 3,
+                    super::super::stego::orchestrate::ResidualPathKind::ChromaDc {
+                        plane: plane as u8,
+                    },
+                );
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -3658,7 +4532,15 @@ impl Encoder {
                 for sub in 0..4 {
                     let bx = (sub % 2) as u8;
                     let by = (sub / 2) as u8;
-                    let ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    let mut ac_scan = ac_scan_order_15(&ac_blocks[sub]);
+                    // Phase 6D.8: stego hook for Chroma AC residual.
+                    self.invoke_stego_residual_hook(
+                        mb_x, mb_y, &mut ac_scan, 0, 14,
+                        super::super::stego::orchestrate::ResidualPathKind::ChromaAc {
+                            plane: plane as u8,
+                            block_idx: sub as u8,
+                        },
+                    );
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3886,7 +4768,31 @@ impl Encoder {
             idr_pic_id: 0,
             slice_qp_delta: slice_qp - pic_init_qp,
             disable_deblocking,
+            // §6E-A4 — IDR's POC is always 0 by definition. When
+            // SPS uses pic_order_cnt_type=0, slice header MUST
+            // emit pic_order_cnt_lsb. When SPS uses type=2 (legacy
+            // I+P-only), this field is omitted (None).
+            pic_order_cnt_lsb: if self.enable_b_frames { Some(0) } else { None },
+            log2_max_pic_order_cnt_lsb_minus4: self.sps_params.log2_max_pic_order_cnt_lsb_minus4,
         }
+    }
+
+    /// §6E-A4(c)-lite — compute `pic_order_cnt_lsb` for a P-frame slice
+    /// header, based on the encoder's tracked anchor display index.
+    /// Returns `None` when `enable_b_frames=false` (SPS uses type
+    /// 2, no POC LSB field). Returns `Some(lsb)` when type=0.
+    fn maybe_p_poc_lsb(&self) -> Option<u32> {
+        if !self.enable_b_frames {
+            return None;
+        }
+        // The P-frame being encoded advances the anchor by m_factor
+        // (= 2 for IBPBP). At this point in the encode flow,
+        // self.display_idx_of_prev_anchor still holds the PREVIOUS
+        // anchor; the new P's display index is prev_anchor + 2.
+        // (For the first P after IDR, prev_anchor=0 so display=2.)
+        // The IDR resets the anchor to 0 inside encode_i_frame.
+        let display_index = self.display_idx_of_prev_anchor + 2;
+        Some(self.poc_tracker.poc_lsb_for(display_index))
     }
 
     // ─── I_PCM macroblock ─────────────────────────────────────────
@@ -4506,7 +5412,7 @@ impl Encoder {
             // see the CAVLC counterpart for the full rationale.
             dc_grid[by as usize][bx as usize] = coeffs[0][0];
             coeffs[0][0] = 0;
-            ac_levels[k] = trellis_quantize_4x4(&coeffs, intra, trellis_lambda_for_qp(qp))
+            ac_levels[k] = trellis_quantize_4x4(&coeffs, intra, true)
                 .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, intra));
         }
         let dc_hadamard = forward_hadamard_4x4(&dc_grid);
@@ -4850,7 +5756,7 @@ impl Encoder {
                 dc_grid[sby][sbx] = coeffs[0][0];
                 coeffs[0][0] = 0;
                 ac_levels[sby * 2 + sbx] =
-                    trellis_quantize_4x4(&coeffs, qp, trellis_lambda_for_qp(qp.qp))
+                    trellis_quantize_4x4(&coeffs, qp, true)
                         .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, qp));
             }
         }
@@ -5418,13 +6324,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op, clippy::identity_op)]
     fn i16x16_mb_type_dc_no_coeffs_eq_3() {
         // Formula: mb_type = 1 + pred_mode + 4*CBP_chroma + 12*CBP_luma_flag
-        // DC mode (2), no coeffs: 1 + 2 + 0 + 0 = 3.
+        // DC mode (2), no coeffs: 1 + 2 + 0 + 0 = 3. Spec-formula literal.
         assert_eq!(1 + 2 + 4 * 0 + 12 * 0, 3);
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn i16x16_mb_type_dc_all_nonzero_eq_23() {
         // DC mode, luma nonzero, chroma full (AC+DC): 1 + 2 + 4*2 + 12*1 = 23.
         assert_eq!(1 + 2 + 4 * 2 + 12 * 1, 23);
@@ -5465,5 +6373,278 @@ mod tests {
         assert_eq!(enc.gop_length, 30);
         enc.set_gop_length(10);
         assert_eq!(enc.gop_length, 10);
+    }
+
+    // ─── §6E-A4 B-frame encoder driver tests ─────────────────────
+
+    /// §6E-A4 — encode_b_frame rejects calls without enable_b_frames.
+    #[test]
+    fn encode_b_frame_rejects_without_enable_flag() {
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        assert!(!enc.enable_b_frames);
+        let pixels = make_yuv420p(32, 32);
+        let r = enc.encode_b_frame(&pixels);
+        assert!(matches!(r, Err(EncoderError::InvalidInput(_))));
+    }
+
+    /// §6E-A4 — encode_b_frame rejects calls without a DPB reference
+    /// (caller must encode I + P first).
+    #[test]
+    fn encode_b_frame_rejects_without_dpb_reference() {
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(32, 32);
+        let r = enc.encode_b_frame(&pixels);
+        assert!(matches!(r, Err(EncoderError::InvalidInput(_))));
+    }
+
+    /// §6E-A4(a) — minimum-viable IBPBP encode. Encoder produces
+    /// I + P + B Annex-B bytes; the bytes are non-empty and contain
+    /// the expected NAL types in encode order.
+    #[test]
+    fn encode_ibpbp_emits_expected_nal_types() {
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(32, 32);
+
+        // Encode order for M=2 IBPBP: I, P, B, P, B, ...
+        // First frame (display=0): I/IDR.
+        let i_bytes = enc.encode_i_frame(&pixels).unwrap();
+        assert!(!i_bytes.is_empty());
+        // Display=2 P (encoded second).
+        let p_bytes = enc.encode_p_frame(&pixels).unwrap();
+        assert!(!p_bytes.is_empty());
+        // Display=1 B (encoded third, between I and P).
+        let b_bytes = enc.encode_b_frame(&pixels).unwrap();
+        assert!(!b_bytes.is_empty());
+
+        // Combined stream parses into NALs.
+        let mut all = Vec::new();
+        all.extend_from_slice(&i_bytes);
+        all.extend_from_slice(&p_bytes);
+        all.extend_from_slice(&b_bytes);
+        let nalus = parse_nal_units_annexb(&all).expect("parse NALs");
+
+        // Should contain at least: SPS, PPS, AUD, IDR, AUD, P, AUD, B.
+        let mut idr_count = 0;
+        let mut p_or_b_count = 0;
+        let mut sps_count = 0;
+        let mut pps_count = 0;
+        for n in &nalus {
+            if n.nal_type.is_idr() { idr_count += 1; }
+            else if n.nal_type.is_vcl() { p_or_b_count += 1; }
+            if matches!(n.nal_type, crate::codec::h264::NalType::SPS) {
+                sps_count += 1;
+            }
+            if matches!(n.nal_type, crate::codec::h264::NalType::PPS) {
+                pps_count += 1;
+            }
+        }
+        assert_eq!(idr_count, 1, "exactly 1 IDR expected");
+        assert_eq!(p_or_b_count, 2, "exactly 2 non-IDR VCL slices (P + B) expected");
+        assert_eq!(sps_count, 1, "exactly 1 SPS expected");
+        assert_eq!(pps_count, 1, "exactly 1 PPS expected");
+    }
+
+    /// §6E-A4(a) — encoder output IBPBP round-trips through the §6E-A3
+    /// bin-decoder walker. Walker accepts SliceType::B and processes
+    /// each B-MB through the all-B_Skip path. End-to-end gate that the
+    /// encoder + walker pair are mutually consistent.
+    #[test]
+    fn encode_ibpbp_walker_round_trip() {
+        use crate::codec::h264::cabac::bin_decoder::walk_annex_b_for_cover_with_options;
+        use crate::codec::h264::cabac::bin_decoder::WalkOptions;
+
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(32, 32);
+
+        let mut all = Vec::new();
+        all.extend_from_slice(&enc.encode_i_frame(&pixels).unwrap());
+        all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
+        all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
+
+        // Walker reads it. The cover capture is meaningful only for
+        // the I/P slices (B_Skip emits zero bypass-bins per MB).
+        let opts = WalkOptions { record_mvd: true };
+        let walk = walk_annex_b_for_cover_with_options(&all, opts)
+            .expect("walker accepts IBPBP stream");
+        assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
+    }
+
+    /// §6E-A4(c)-lite — verify the mode-decision helper produces
+    /// both Skip and Direct outputs across a range of inputs (i.e.
+    /// the hash isn't a constant function). Important for the
+    /// L3-fingerprint property: encoder must produce mode variety.
+    #[test]
+    fn b_mb_mode_decision_produces_mix() {
+        let mut skip_count = 0;
+        let mut direct_count = 0;
+        for mb_addr in 0..256u32 {
+            if mb_skip_or_direct_decision(0, mb_addr) {
+                direct_count += 1;
+            } else {
+                skip_count += 1;
+            }
+        }
+        // 50/50 ± reasonable noise: both classes should be at least
+        // 25% of samples.
+        assert!(skip_count >= 64,
+            "Skip count {skip_count} too low (mode mix biased to Direct)");
+        assert!(direct_count >= 64,
+            "Direct count {direct_count} too low (mode mix biased to Skip)");
+    }
+
+    /// §6E-A4(c)-lite — encoder + walker round-trip with the mode
+    /// mix active. Larger frame (more MBs) so the hash exercises
+    /// both Skip and Direct paths in the same B-slice.
+    #[test]
+    fn encode_ibpbp_with_mode_mix_walker_roundtrip() {
+        use crate::codec::h264::cabac::bin_decoder::walk_annex_b_for_cover_with_options;
+        use crate::codec::h264::cabac::bin_decoder::WalkOptions;
+
+        let mut enc = Encoder::new(64, 64, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(64, 64);
+
+        // 64×64 = 16 MBs per frame. With the hash mix, the B-frame
+        // will contain both Skip and Direct MBs.
+        let mut all = Vec::new();
+        all.extend_from_slice(&enc.encode_i_frame(&pixels).unwrap());
+        all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
+        all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
+
+        let opts = WalkOptions { record_mvd: true };
+        let walk = walk_annex_b_for_cover_with_options(&all, opts)
+            .expect("walker accepts mixed-mode B-slice");
+        assert_eq!(walk.n_slices, 3);
+    }
+
+    /// §6E-A4(a) — when enable_b_frames=true, the SPS must use
+    /// pic_order_cnt_type=0 (so decoders can reorder display order).
+    #[test]
+    fn enable_b_frames_bumps_sps_to_pic_order_cnt_type_0() {
+        use crate::codec::h264::sps::parse_sps;
+
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(32, 32);
+        let i_bytes = enc.encode_i_frame(&pixels).unwrap();
+        let nalus = parse_nal_units_annexb(&i_bytes).expect("parse NALs");
+        let sps_nal = nalus.iter()
+            .find(|n| matches!(n.nal_type, crate::codec::h264::NalType::SPS))
+            .expect("SPS NAL emitted");
+        let sps = parse_sps(&sps_nal.rbsp).expect("SPS parses");
+        assert_eq!(sps.pic_order_cnt_type, 0,
+            "B-frame mode requires pic_order_cnt_type=0");
+        assert!(sps.max_num_ref_frames >= 3,
+            "B-frame mode requires max_num_ref_frames>=3 (M=2 IBPBP DPB)");
+    }
+
+    /// §6E-B(a) — confirm SPS emits `max_num_ref_frames=2` per the
+    /// fingerprint-match bump. The default Encoder (no
+    /// enable_b_frames) should now advertise 2 refs in SPS, even
+    /// though the encoder still uses single-ref ME internally.
+    #[test]
+    fn default_sps_advertises_two_refs() {
+        use crate::codec::h264::sps::parse_sps;
+
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        // Note: NOT setting enable_b_frames; this is the default
+        // Phase 6B I+P-only path. The §6E-B(a) bump applies even
+        // without B-frames.
+        let pixels = make_yuv420p(32, 32);
+        let i_bytes = enc.encode_i_frame(&pixels).unwrap();
+        let nalus = parse_nal_units_annexb(&i_bytes).expect("parse NALs");
+        let sps_nal = nalus.iter()
+            .find(|n| matches!(n.nal_type, crate::codec::h264::NalType::SPS))
+            .expect("SPS NAL emitted");
+        let sps = parse_sps(&sps_nal.rbsp).expect("SPS parses");
+        assert_eq!(sps.max_num_ref_frames, 2,
+            "§6E-B(a) bumps max_num_ref_frames from 1 to 2 for SPS-level \
+             fingerprint match with commercial encoders");
+    }
+
+    /// §6E-B(a) — when enable_b_frames=true, SPS bumps to 3 refs
+    /// (M=2 IBPBP DPB shape) — overrides §6E-B(a)'s default of 2.
+    #[test]
+    fn enable_b_frames_overrides_to_three_refs() {
+        use crate::codec::h264::sps::parse_sps;
+
+        let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(32, 32);
+        let i_bytes = enc.encode_i_frame(&pixels).unwrap();
+        let nalus = parse_nal_units_annexb(&i_bytes).expect("parse NALs");
+        let sps_nal = nalus.iter()
+            .find(|n| matches!(n.nal_type, crate::codec::h264::NalType::SPS))
+            .expect("SPS NAL emitted");
+        let sps = parse_sps(&sps_nal.rbsp).expect("SPS parses");
+        assert_eq!(sps.max_num_ref_frames, 3,
+            "B-frame mode requires max_num_ref_frames>=3 (M=2 IBPBP DPB)");
+    }
+
+    /// §6E-A5 ffmpeg compliance gate — phasm's IBPBP output decodes
+    /// through the ffmpeg reference decoder without errors. Marked
+    /// `#[ignore]` because it shells out to ffmpeg (external CI
+    /// dependency); run with `cargo test -- --ignored` or in CI when
+    /// ffmpeg is available.
+    ///
+    /// Test gate: write a 7-frame IBPBP stream to /tmp, run
+    /// `ffmpeg -i ... -f null -`, expect exit code 0 + stderr clean
+    /// of "Error", "Invalid", "concealing".
+    #[test]
+    #[ignore = "requires ffmpeg in PATH; run with --ignored"]
+    fn ffmpeg_decodes_ibpbp_without_errors() {
+        use std::process::Command;
+
+        let mut enc = Encoder::new(64, 64, Some(75)).unwrap();
+        enc.entropy_mode = EntropyMode::Cabac;
+        enc.enable_b_frames = true;
+        let pixels = make_yuv420p(64, 64);
+
+        let mut all = Vec::new();
+        all.extend_from_slice(&enc.encode_i_frame(&pixels).unwrap());
+        // 3 (P, B) pairs = 7 frames total in IBPBP shape.
+        for _ in 0..3 {
+            all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
+            all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
+        }
+
+        let path = std::env::temp_dir().join("phasm_6ea5_ffmpeg_compliance.h264");
+        std::fs::write(&path, &all).expect("write temp h264");
+
+        let out = Command::new("ffmpeg")
+            .args([
+                "-loglevel", "error",
+                "-i", path.to_str().unwrap(),
+                "-f", "null", "-",
+            ])
+            .output()
+            .expect("ffmpeg in PATH");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert!(
+            out.status.success(),
+            "ffmpeg failed: status={:?} stderr={}",
+            out.status, stderr,
+        );
+        // ffmpeg's stderr at -loglevel error reports decode issues
+        // including warnings about concealment, missing references,
+        // etc. Empty stderr means clean decode.
+        assert!(
+            stderr.trim().is_empty(),
+            "ffmpeg flagged decode issues: {stderr}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

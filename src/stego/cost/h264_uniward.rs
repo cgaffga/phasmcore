@@ -22,6 +22,22 @@ use crate::codec::h264::cavlc::{EmbedDomain, EmbeddablePosition};
 use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::tables::ZIGZAG_4X4;
 
+/// 2^(q_bits - 4) for q_bits ∈ [0, 8] (i.e. exponent ∈ [-4, 4]).
+/// Powers of 2 are exact f64 — bit-identical across iOS / Android /
+/// x86_64 / WASM. Replaces `2f64.powi(q_bits - 4)` which lowers to
+/// `@llvm.powi.f64` on WASM (non-deterministic).
+const POW2_QBITS_MINUS_4: [f64; 9] = [
+    0.0625, // q_bits = 0 → 2^-4
+    0.125,  // q_bits = 1 → 2^-3
+    0.25,   // q_bits = 2 → 2^-2
+    0.5,    // q_bits = 3 → 2^-1
+    1.0,    // q_bits = 4 → 2^0
+    2.0,    // q_bits = 5 → 2^1
+    4.0,    // q_bits = 6 → 2^2
+    8.0,    // q_bits = 7 → 2^3
+    16.0,   // q_bits = 8 → 2^4
+];
+
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
@@ -104,7 +120,7 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
             let mut sum_low = 0.0f64;
             let mut sum_high = 0.0f64;
             for k in 0..FILT_LEN {
-                let src_x = out_x as isize + k as isize - (2 * pad as isize) + pad as isize;
+                let _src_x = out_x as isize + k as isize - (2 * pad as isize) + pad as isize;
                 // src_x = out_x - pad + k  (simplified)
                 let src_x = out_x as isize - pad as isize + k as isize;
                 let clamped = symmetric_reflect(src_x, width as isize);
@@ -260,7 +276,8 @@ fn pixel_scale(qp: i32, u: usize, v: usize) -> f64 {
     // output; dequant multiplies by `s * 2^(q_bits - 4)`. The final residual
     // was `(butterfly + 32) >> 6`, which we approximate by dividing by 64
     // in the basis pre-compute, so the net scale here is just the dequant.
-    s * 2f64.powi(q_bits - 4)
+    // Lookup is bit-exact across platforms (powers of 2 are exact f64).
+    s * POW2_QBITS_MINUS_4[q_bits as usize]
 }
 
 /// Compute J-UNIWARD cost for a single candidate flip in an I-frame.

@@ -15,13 +15,14 @@
 //! 4. Apply bit flips to the original byte stream
 //! 5. Output: copy-and-patch (original bytes + flipped bits)
 
-use crate::codec::h264::bitstream::{self, EpByteMap};
+use crate::codec::h264::bitstream::{self};
 use crate::codec::h264::cavlc::{EmbedDomain, EmbeddablePosition};
 use crate::codec::h264::macroblock::{self, Macroblock, NeighborContext};
 use crate::codec::h264::slice::{self, SliceType};
 use crate::codec::h264::sps::{self, Pps, Sps};
 use crate::codec::h264::NalType;
 use crate::codec::mp4;
+use crate::det_math::det_powi_f64;
 use crate::stego::cost::{h264_cost, h264_uniward};
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
@@ -30,8 +31,49 @@ use crate::stego::payload;
 use crate::stego::permute::{self, CoeffPos};
 use crate::stego::stc::{embed as stc_embed_mod, extract as stc_extract_mod, hhat};
 
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
 /// STC constraint height (same as image Ghost).
 const STC_H: usize = 7;
+
+/// Default max in-flight GOPs for the Phase I.1 GOP-parallel encoder.
+///
+/// Per-GOP scan transient is ~150 MB at 1080p / 30-frame GOP; the
+/// product N_threads × per_gop_mb sets peak working set. Default 4
+/// targets a 600 MB working set — fine on desktop and 8 GB iPhone Pro
+/// devices, but tight on 4 GB phones (~300 MB jetsam ceiling). Mobile
+/// bridges should override via the `PHASM_H264_PARALLEL_GOPS` env var
+/// (recommended: 2 on 4 GB phones, 8-12 on desktop).
+///
+/// Compiles to a no-op (always 1) when the `parallel` Cargo feature is
+/// disabled — WASM and feature-off CLI builds.
+const MAX_PARALLEL_GOPS_DEFAULT: usize = 4;
+
+/// Resolve the runtime cap on parallel GOP encodes.
+fn max_parallel_gops() -> usize {
+    #[cfg(not(feature = "parallel"))]
+    {
+        return 1;
+    }
+    #[cfg(feature = "parallel")]
+    {
+        std::env::var("PHASM_H264_PARALLEL_GOPS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(MAX_PARALLEL_GOPS_DEFAULT)
+    }
+}
+
+/// One bit-flip to apply to the output mp4 bytes. Computed in the
+/// parallel encode phase, applied serially after the chunk join (with
+/// EP-byte safety check at apply time).
+#[derive(Debug, Clone, Copy)]
+struct FlipOp {
+    abs_offset: usize,
+    mask: u8,
+}
 
 /// Phase 3c: built per-domain STC inputs (permuted cover bits, costs, and a
 /// reverse index from permuted-position to the original `all_positions`
@@ -97,26 +139,6 @@ fn build_domain_stc(
     }
 }
 
-/// Phase 3c split: allocate message bits to coefficient vs MVD domain in
-/// proportion to their cover pool sizes. The formula is the same on encode
-/// and decode so both sides reconstruct the identical split without any
-/// side-channel info.
-///
-/// `m_total` — total message bits. `n_coeff`, `n_mvd` — cover pool sizes.
-/// Returns `(m_coeff, m_mvd)` with `m_coeff + m_mvd == m_total`.
-fn split_message_bits(m_total: usize, n_coeff: usize, n_mvd: usize) -> (usize, usize) {
-    if n_mvd == 0 {
-        return (m_total, 0);
-    }
-    if n_coeff == 0 {
-        return (0, m_total);
-    }
-    let total_pool = n_coeff + n_mvd;
-    let m_coeff = m_total.saturating_mul(n_coeff) / total_pool;
-    let m_mvd = m_total - m_coeff;
-    (m_coeff, m_mvd)
-}
-
 /// Embed a message into an H.264 CAVLC MP4 file.
 ///
 /// Returns the stego MP4 bytes (same size as input — zero bitrate change).
@@ -158,17 +180,29 @@ pub fn h264_ghost_encode_inplace(
         .ok_or(StegoError::InvalidVideo("no video track".into()))?;
     let track = &mp4_file.tracks[track_idx];
 
-    // 2. Scan all frames: collect embeddable positions + costs
-    let (all_positions, block_ac_energies, uniward_costs) =
-        scan_all_frames(track, &sps, &pps, length_size, &*mp4_bytes)?;
-
-    if all_positions.is_empty() {
+    // 2. Phase 1 — capacity scan (per-GOP, lightweight on metadata).
+    //
+    // Phase I.0.5/68: per-GOP streaming. The whole-clip scan-and-accumulate
+    // pattern OOMs on long video (~500 GB metadata for a 90-min 1080p movie).
+    // Per-GOP streaming caps peak working set at ~150 MB on 1080p / 30-frame
+    // GOP videos. Multi-GOP message-spread is the #68 enhancement: capacity
+    // scales with video length, and the message spreads across all GOPs for
+    // stealth. See docs/design/h264-encoder-memory-analysis.md.
+    let capacities = scan_gop_capacities(track, &sps, &pps, length_size, &*mp4_bytes)?;
+    if capacities.is_empty() {
+        return Err(StegoError::InvalidVideo(
+            "no GOPs found in video track".into(),
+        ));
+    }
+    let total_n_coeff: usize = capacities.iter().map(|c| c.n_coeff).sum();
+    let total_n_mvd: usize = capacities.iter().map(|c| c.n_mvd).sum();
+    if total_n_coeff == 0 && total_n_mvd == 0 {
         return Err(StegoError::InvalidVideo(
             "no embeddable positions found in video".into(),
         ));
     }
 
-    // 3. Prepare payload
+    // 3. Prepare payload (encrypted + framed).
     let payload_bytes = payload::encode_payload(message, &[])?;
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
     let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
@@ -176,155 +210,142 @@ pub fn h264_ghost_encode_inplace(
         .iter()
         .flat_map(|&byte| (0..8).rev().map(move |i| (byte >> i) & 1))
         .collect();
+    let m_total = frame_bits.len();
 
-    // Check capacity
-    // Filter to Phase 1a domain (T1Sign only) and non-WET positions
-    let usable: Vec<_> = all_positions
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| {
-            // Phase 2: T1 sign bits + magnitude LSBs + level-suffix sign bits.
-            // UNIWARD scales level-sign flips by 2*|coeff| so STC naturally
-            // avoids high-magnitude signs while still gaining the capacity.
-            //
-            // NOTE: ep_conflict is NOT filtered here. It's a function of the
-            // surrounding raw bytes — which differ between cover and stego after
-            // any flip — so filtering on it would produce divergent position
-            // lists in encode vs decode. EP conflicts are instead handled via
-            // infinite cost in the cost function (WET), so STC naturally avoids
-            // them when picking which bits to flip.
-            // Phase 3a: MVD positions are cross-domain (not coefficients),
-            // use their own sentinel `block_idx`, and have `scan_pos == 0`
-            // by convention — they bypass the coeff-domain `scan_pos > 0`
-            // gate.
-            let is_coeff = matches!(
-                p.domain,
-                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
-            );
-            (is_coeff && p.scan_pos > 0) || p.domain == EmbedDomain::MvdLsb
-        })
-        .collect();
-
-    if usable.len() < frame_bits.len() * 2 {
+    if m_total > total_n_coeff + total_n_mvd {
         return Err(StegoError::MessageTooLarge);
     }
 
-    // 4. Phase 3c: split usable into coefficient + MVD domains, build per-domain
-    //    STC inputs, and run two independent STC embeddings with uncorrelated
-    //    permutation + HHat seeds. The cost filter still runs once (shared
-    //    `compute_all_costs` output) so each domain's filtered-usable count
-    //    matches on decode.
-    let costs = compute_all_costs(&all_positions, &block_ac_energies, &uniward_costs, track);
+    // 4. Compute per-GOP message bit allocation. Both encoder and decoder
+    //    run `compute_per_gop_message_split(capacities, m_total, …)` with
+    //    the same inputs so they agree on the split.
+    let (gop_m_coeff, gop_m_mvd) =
+        compute_per_gop_message_split(&capacities, m_total, total_n_coeff, total_n_mvd);
 
-    let (coeff_usable, mvd_usable): (Vec<_>, Vec<_>) = usable
-        .iter()
-        .partition(|(_, p)| p.domain != EmbedDomain::MvdLsb);
+    // 5. Pick the largest shared `w` such that every GOP fits its allocated
+    //    bits. Larger `w` = better stealth (fewer flips); smallest needed
+    //    `w` is 1. We try from 10 down to 1 and pick the highest that fits
+    //    all GOPs. Decoder mirrors: try 1..=10 ascending and accept the
+    //    first that decodes (encoder picks the highest, so by symmetry the
+    //    decoder finds the right one).
+    let mut w_chosen: Option<usize> = None;
+    for w_try in (1..=10usize).rev() {
+        let mut ok = true;
+        for (i, cap) in capacities.iter().enumerate() {
+            if gop_m_coeff[i] * w_try > cap.n_coeff || gop_m_mvd[i] * w_try > cap.n_mvd {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            w_chosen = Some(w_try);
+            break;
+        }
+    }
+    let w = w_chosen.ok_or(StegoError::MessageTooLarge)?;
 
-    let coeff_key = crypto::derive_structural_key(passphrase)?;
-    let coeff_perm_seed: [u8; 32] = coeff_key[..32].try_into().unwrap();
-    let coeff_hhat_seed: [u8; 32] = coeff_key[32..].try_into().unwrap();
+    // 6. Master Argon2 keys — derived once per encode. Per-GOP keys mixed
+    //    cheaply via SHA-256 inside the loop below.
+    let coeff_master = crypto::derive_structural_key(passphrase)?;
+    let coeff_master_perm: [u8; 32] = coeff_master[..32].try_into().unwrap();
+    let coeff_master_hhat: [u8; 32] = coeff_master[32..].try_into().unwrap();
+    let mvd_master = crypto::derive_h264_mvd_structural_key(passphrase)?;
+    let mvd_master_perm: [u8; 32] = mvd_master[..32].try_into().unwrap();
+    let mvd_master_hhat: [u8; 32] = mvd_master[32..].try_into().unwrap();
 
-    let mvd_key = crypto::derive_h264_mvd_structural_key(passphrase)?;
-    let mvd_perm_seed: [u8; 32] = mvd_key[..32].try_into().unwrap();
-    let mvd_hhat_seed: [u8; 32] = mvd_key[32..].try_into().unwrap();
-
-    let coeff_build = build_domain_stc(
-        &coeff_usable,
-        &all_positions,
-        &costs,
-        &coeff_perm_seed,
-        track,
-        mp4_bytes,
-    );
-    let mvd_build = build_domain_stc(
-        &mvd_usable,
-        &all_positions,
-        &costs,
-        &mvd_perm_seed,
-        track,
-        mp4_bytes,
-    );
-
-    if coeff_build.cover_bits.is_empty() && mvd_build.cover_bits.is_empty() {
-        return Err(StegoError::InvalidVideo(
-            "no usable positions after cost filtering".into(),
-        ));
+    // Pre-compute per-GOP frame_bits offsets so each GOP knows its slice
+    // independently of the others (decouples sequential dependency for MT).
+    let mut gop_frame_offsets: Vec<usize> = Vec::with_capacity(capacities.len());
+    {
+        let mut acc = 0usize;
+        for i in 0..capacities.len() {
+            gop_frame_offsets.push(acc);
+            acc += gop_m_coeff[i] + gop_m_mvd[i];
+        }
     }
 
-    let n_c = coeff_build.cover_bits.len();
-    let n_m = mvd_build.cover_bits.len();
-    let m = frame_bits.len();
-
-    // Proportional split: each domain holds a share of the message proportional
-    // to its cover pool size. Identical formula at encode + decode.
-    let (m_c, m_m) = split_message_bits(m, n_c, n_m);
-
-    // Both domains share the same STC `w` to keep decode bounded to a single
-    // 1..=10 scan (instead of a 100-way cartesian over w_c × w_m). The shared
-    // `w` is the minimum supported by either non-empty domain.
-    let w_coeff_max = if m_c > 0 { (n_c / m_c).clamp(1, 10) } else { 10 };
-    let w_mvd_max = if m_m > 0 { (n_m / m_m).clamp(1, 10) } else { 10 };
-    let w = w_coeff_max.min(w_mvd_max);
-
-    if m_c * w > n_c || m_m * w > n_m {
-        return Err(StegoError::MessageTooLarge);
-    }
-
-    // Streaming: mutate `mp4_bytes` in place. Position lookups during
-    // embedding reference `coeff_build` / `mvd_build` (which captured the
-    // cover bit values during `build_domain_stc`), so we can safely drop the
-    // immutable borrow of `mp4_bytes` here and take a mutable one.
+    // 7. Phase 2 — per-GOP scan + STC, batched across `max_parallel_gops`
+    //    workers. Each worker COLLECTS its flip ops into a Vec<FlipOp>
+    //    rather than mutating mp4_bytes directly, so multiple workers can
+    //    read the (immutable) mp4_bytes in parallel without aliasing on
+    //    the mutable side. After each chunk, the main thread serially
+    //    applies the collected flips (with EP-byte safety check).
+    //
+    //    Per-batch peak working set: max_parallel_gops × ~150 MB scan
+    //    transient. Default 4 = 600 MB on 1080p, fine on desktop, tight
+    //    on 4 GB phones — `PHASM_H264_PARALLEL_GOPS=2` env override
+    //    recommended for low-memory devices.
+    let max_parallel = max_parallel_gops();
     let mut num_flips = 0usize;
     let mut num_ep_skipped = 0usize;
 
-    // 5a. Embed coefficient domain (if non-empty).
-    if m_c > 0 {
-        let n_used_c = m_c * w;
-        let hhat_c = hhat::generate_hhat(STC_H, w, &coeff_hhat_seed);
-        let embed_c = stc_embed_mod::stc_embed(
-            &coeff_build.cover_bits[..n_used_c],
-            &coeff_build.stc_costs[..n_used_c],
-            &frame_bits[..m_c],
-            &hhat_c,
-            STC_H,
-            w,
-        )
-        .ok_or(StegoError::MessageTooLarge)?;
+    for chunk in capacities.chunks(max_parallel) {
+        // Re-borrow mp4_bytes as &[u8] for the parallel scan section.
+        // The reborrow ends at the end of this block; mp4_bytes returns
+        // to mutable status for the apply phase below.
+        let mp4_immut: &[u8] = &*mp4_bytes;
 
-        apply_domain_flips(
-            mp4_bytes,
-            &embed_c.stego_bits,
-            &coeff_build,
-            &all_positions,
-            track,
-            &mut num_flips,
-            &mut num_ep_skipped,
-        );
-    }
+        // Process each GOP in the chunk: scan + STC + collect FlipOps.
+        // Returns Result<Vec<FlipOp>> per GOP; first error short-circuits.
+        let chunk_offset = chunk.as_ptr() as usize - capacities.as_ptr() as usize;
+        let chunk_start_idx = chunk_offset / std::mem::size_of::<GopCapacity>();
 
-    // 5b. Embed MVD domain (if non-empty).
-    if m_m > 0 {
-        let n_used_m = m_m * w;
-        let hhat_m = hhat::generate_hhat(STC_H, w, &mvd_hhat_seed);
-        let embed_m = stc_embed_mod::stc_embed(
-            &mvd_build.cover_bits[..n_used_m],
-            &mvd_build.stc_costs[..n_used_m],
-            &frame_bits[m_c..],
-            &hhat_m,
-            STC_H,
-            w,
-        )
-        .ok_or(StegoError::MessageTooLarge)?;
+        let work = |idx_in_chunk: usize, cap: &GopCapacity| -> Result<Vec<FlipOp>, StegoError> {
+            let i = chunk_start_idx + idx_in_chunk;
+            compute_gop_flips(
+                track,
+                &sps,
+                &pps,
+                length_size,
+                mp4_immut,
+                cap,
+                gop_frame_offsets[i],
+                gop_m_coeff[i],
+                gop_m_mvd[i],
+                w,
+                &frame_bits,
+                &coeff_master_perm,
+                &coeff_master_hhat,
+                &mvd_master_perm,
+                &mvd_master_hhat,
+            )
+        };
 
-        apply_domain_flips(
-            mp4_bytes,
-            &embed_m.stego_bits,
-            &mvd_build,
-            &all_positions,
-            track,
-            &mut num_flips,
-            &mut num_ep_skipped,
-        );
+        #[cfg(feature = "parallel")]
+        let chunk_flips: Result<Vec<Vec<FlipOp>>, StegoError> = chunk
+            .par_iter()
+            .enumerate()
+            .map(|(idx_in_chunk, cap)| work(idx_in_chunk, cap))
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let chunk_flips: Result<Vec<Vec<FlipOp>>, StegoError> = chunk
+            .iter()
+            .enumerate()
+            .map(|(idx_in_chunk, cap)| work(idx_in_chunk, cap))
+            .collect();
+
+        // Reborrow ends; we can use mp4_bytes mutably again.
+        let chunk_flips = chunk_flips?;
+
+        // 7c. Apply all chunk flips serially with EP-byte safety check.
+        //     EP check reads adjacent bytes in mp4_bytes — must be
+        //     serial w.r.t. flips, since adjacent bytes may have been
+        //     just-flipped by a prior op in the same chunk.
+        for flips in chunk_flips {
+            for op in flips {
+                if op.abs_offset >= mp4_bytes.len() {
+                    continue;
+                }
+                if would_change_ep_pattern(mp4_bytes, op.abs_offset, op.mask) {
+                    num_ep_skipped += 1;
+                    continue;
+                }
+                mp4_bytes[op.abs_offset] ^= op.mask;
+                num_flips += 1;
+            }
+        }
+        // chunk's per-GOP scan transients have all been dropped; ready for
+        // the next chunk.
     }
 
     // If we skipped any flips, the STC syndrome is broken by that many bits —
@@ -498,8 +519,20 @@ pub fn h264_ghost_decode(
     let (sps, pps, length_size) = extract_h264_params(&mp4_file)?;
 
     if pps.entropy_coding_mode_flag {
+        // Phase 6D.8 chunk 7 — cabac-stego cfg-gated route.
+        // Under the cabac-stego feature, CABAC inputs route through
+        // the new chunk-6G decoder (walk_nalus + STC reverse +
+        // frame unwrap). Without the feature, fall back to the
+        // legacy "not supported" error to keep CAVLC-only builds
+        // honest about scope.
+        #[cfg(feature = "cabac-stego")]
+        {
+            return decode_cabac_via_chunk_6g(&mp4_file, length_size, passphrase);
+        }
+        #[cfg(not(feature = "cabac-stego"))]
         return Err(StegoError::InvalidVideo(
-            "H.264 CABAC not supported for decode".into(),
+            "H.264 CABAC not supported for decode \
+             (build with --features cabac-stego to enable)".into(),
         ));
     }
 
@@ -508,145 +541,188 @@ pub fn h264_ghost_decode(
         .ok_or(StegoError::InvalidVideo("no video track".into()))?;
     let track = &mp4_file.tracks[track_idx];
 
-    // 2. Scan all frames (identical to encode)
-    let (all_positions, block_ac_energies, uniward_costs) =
-        scan_all_frames(track, &sps, &pps, length_size, mp4_bytes)?;
-
-    if all_positions.is_empty() {
+    // 2. Phase 1 — capacity scan (per-GOP).
+    let capacities = scan_gop_capacities(track, &sps, &pps, length_size, mp4_bytes)?;
+    if capacities.is_empty() {
+        return Err(StegoError::InvalidVideo("no GOPs found".into()));
+    }
+    let total_n_coeff: usize = capacities.iter().map(|c| c.n_coeff).sum();
+    let total_n_mvd: usize = capacities.iter().map(|c| c.n_mvd).sum();
+    let total_n = total_n_coeff + total_n_mvd;
+    if total_n == 0 {
         return Err(StegoError::InvalidVideo("no embeddable positions".into()));
     }
 
-    // 3. Filter to T1Sign, build CoeffPos, permute (same as encode)
-    let usable: Vec<_> = all_positions
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| {
-            // Phase 2: T1 sign bits + magnitude LSBs + level-suffix sign bits.
-            // UNIWARD scales level-sign flips by 2*|coeff| so STC naturally
-            // avoids high-magnitude signs while still gaining the capacity.
-            //
-            // NOTE: ep_conflict is NOT filtered here. It's a function of the
-            // surrounding raw bytes — which differ between cover and stego after
-            // any flip — so filtering on it would produce divergent position
-            // lists in encode vs decode. EP conflicts are instead handled via
-            // infinite cost in the cost function (WET), so STC naturally avoids
-            // them when picking which bits to flip.
-            // Phase 3a: MVD positions are cross-domain (not coefficients),
-            // use their own sentinel `block_idx`, and have `scan_pos == 0`
-            // by convention — they bypass the coeff-domain `scan_pos > 0`
-            // gate.
-            let is_coeff = matches!(
-                p.domain,
-                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
-            );
-            (is_coeff && p.scan_pos > 0) || p.domain == EmbedDomain::MvdLsb
-        })
-        .collect();
+    // 3. Master keys (shared with encode-side).
+    let coeff_master = crypto::derive_structural_key(passphrase)?;
+    let coeff_master_perm: [u8; 32] = coeff_master[..32].try_into().unwrap();
+    let coeff_master_hhat: [u8; 32] = coeff_master[32..].try_into().unwrap();
+    let mvd_master = crypto::derive_h264_mvd_structural_key(passphrase)?;
+    let mvd_master_perm: [u8; 32] = mvd_master[..32].try_into().unwrap();
+    let mvd_master_hhat: [u8; 32] = mvd_master[32..].try_into().unwrap();
 
-    // Mirror the encode-side cost filter — positions with infinite cost are
-    // dropped from the STC position list, so decode must apply the same
-    // filter to reconstruct the identical position sequence.
-    let costs = compute_all_costs(&all_positions, &block_ac_energies, &uniward_costs, track);
-
-    // Phase 3c: same domain partition + dual-seed derivation as encode.
-    let (coeff_usable, mvd_usable): (Vec<_>, Vec<_>) = usable
-        .iter()
-        .partition(|(_, p)| p.domain != EmbedDomain::MvdLsb);
-
-    let coeff_key = crypto::derive_structural_key(passphrase)?;
-    let coeff_perm_seed: [u8; 32] = coeff_key[..32].try_into().unwrap();
-    let coeff_hhat_seed: [u8; 32] = coeff_key[32..].try_into().unwrap();
-
-    let mvd_key = crypto::derive_h264_mvd_structural_key(passphrase)?;
-    let mvd_perm_seed: [u8; 32] = mvd_key[..32].try_into().unwrap();
-    let mvd_hhat_seed: [u8; 32] = mvd_key[32..].try_into().unwrap();
-
-    let coeff_build = build_domain_stc(
-        &coeff_usable,
-        &all_positions,
-        &costs,
-        &coeff_perm_seed,
+    // 4. Phase 2a — scan GOP 0 once, cache its STC builds for cheap w-loop.
+    //
+    // #69 design: instead of rescanning every GOP per w iteration (~10×N
+    // total work), we cache GOP 0's covers once (~10 KB), iterate w cheaply
+    // on those cached covers, and only stream subsequent GOPs once we find
+    // the right w. Average decode work drops from ~11N to ~2N scans.
+    //
+    // Memory bound: Phase 2a leaves the GOP 0 build alive for the duration
+    // of decode (~1 MB at 1080p). Phase 2c per-GOP transient (~150 MB) only
+    // exists for one GOP at a time, dropped between iterations.
+    let gop0_builds = scan_and_build_gop_stc(
         track,
+        &sps,
+        &pps,
+        length_size,
         mp4_bytes,
-    );
-    let mvd_build = build_domain_stc(
-        &mvd_usable,
-        &all_positions,
-        &costs,
-        &mvd_perm_seed,
-        track,
-        mp4_bytes,
-    );
+        &capacities[0],
+        &coeff_master_perm,
+        &coeff_master_hhat,
+        &mvd_master_perm,
+        &mvd_master_hhat,
+    )?;
 
-    let n_c = coeff_build.cover_bits.len();
-    let n_m = mvd_build.cover_bits.len();
-
-    // Try STC extract with multiple w values. Because both domains share the
-    // same `w` at encode, decode only needs a single 1..=10 scan — not a 100
-    // pair cartesian. For each `w`, extract the full cover from each domain,
-    // compute the proportional split `(m_c, m_m)` for each candidate total
-    // message size, and try to parse the concatenated `coeff[..m_c] ++
-    // mvd[..m_m]`.
-    for w in 1..=10 {
-        let m_c_max = n_c / w;
-        let m_m_max = n_m / w;
-        if m_c_max + m_m_max == 0 {
-            continue;
+    // 5. Phase 2b — try each w ∈ [10..1] descending. For each, do a cheap
+    //    extract from the cached GOP 0 build, validate, then Phase 2c
+    //    streams remaining GOPs.
+    'w_loop: for w in (1..=10usize).rev() {
+        let n_c0 = gop0_builds.coeff.cover_bits.len();
+        let n_m0 = gop0_builds.mvd.cover_bits.len();
+        let m_c0_max = n_c0 / w;
+        let m_m0_max = n_m0 / w;
+        if m_c0_max == 0 && m_m0_max == 0 {
+            continue 'w_loop;
         }
 
-        let coeff_extract = if m_c_max > 0 {
-            let hhat_c = hhat::generate_hhat(STC_H, w, &coeff_hhat_seed);
+        let coeff_extract_0 = if m_c0_max > 0 {
+            let hhat_c = hhat::generate_hhat(STC_H, w, &gop0_builds.coeff_hhat_seed);
             stc_extract_mod::stc_extract(
-                &coeff_build.cover_bits[..m_c_max * w],
+                &gop0_builds.coeff.cover_bits[..m_c0_max * w],
                 &hhat_c,
                 w,
             )
         } else {
             Vec::new()
         };
-        let mvd_extract = if m_m_max > 0 {
-            let hhat_m = hhat::generate_hhat(STC_H, w, &mvd_hhat_seed);
-            stc_extract_mod::stc_extract(&mvd_build.cover_bits[..m_m_max * w], &hhat_m, w)
+        let mvd_extract_0 = if m_m0_max > 0 {
+            let hhat_m = hhat::generate_hhat(STC_H, w, &gop0_builds.mvd_hhat_seed);
+            stc_extract_mod::stc_extract(
+                &gop0_builds.mvd.cover_bits[..m_m0_max * w],
+                &hhat_m,
+                w,
+            )
         } else {
             Vec::new()
         };
 
-        // Read the frame length prefix from the start of `coeff_extract` so we
-        // can compute the exact split once (instead of scanning every
-        // candidate total). Requires at least 16 bits from `coeff_extract`
-        // — which holds unless the proportional split sends almost all of
-        // the payload to the MVD domain, which never happens on realistic
-        // videos (coeff pool dominates MVD by ~10×).
-        if coeff_extract.len() < 16 {
-            continue;
+        // 5a. Peek frame length from GOP 0's coefficient extract head.
+        if coeff_extract_0.len() < 16 {
+            continue 'w_loop;
         }
-        let length_prefix = read_u16_be_from_bits(&coeff_extract[0..16]);
+        let length_prefix = read_u16_be_from_bits(&coeff_extract_0[0..16]);
         let (total_payload_bytes, frame_overhead) = if length_prefix != 0 {
             (length_prefix as usize, frame::FRAME_OVERHEAD)
         } else {
-            // v2 extended frame — read the u32 at bits 16..48.
-            if coeff_extract.len() < 48 {
-                continue;
+            if coeff_extract_0.len() < 48 {
+                continue 'w_loop;
             }
-            let ext_len = read_u32_be_from_bits(&coeff_extract[16..48]);
+            let ext_len = read_u32_be_from_bits(&coeff_extract_0[16..48]);
             (ext_len as usize, frame::FRAME_OVERHEAD_EXT)
         };
-        let total_frame_bytes = frame_overhead + total_payload_bytes;
-        let total_bits = total_frame_bytes * 8;
-        let max_total = m_c_max + m_m_max;
-        if total_bits > max_total {
-            continue;
+        let m_total = (frame_overhead + total_payload_bytes) * 8;
+        // Plausibility filter: a wrong w gives random bits → m_total often
+        // exceeds the total cover capacity. Bail without streaming the
+        // remaining GOPs in that case.
+        if m_total == 0 || m_total > total_n {
+            continue 'w_loop;
         }
 
-        let (m_c, m_m) = split_message_bits(total_bits, n_c, n_m);
-        if m_c > coeff_extract.len() || m_m > mvd_extract.len() {
-            continue;
+        // 5b. Reconstruct the per-GOP split (same formula encoder used).
+        let (gop_m_c, gop_m_m) =
+            compute_per_gop_message_split(&capacities, m_total, total_n_coeff, total_n_mvd);
+
+        // 5c. Validate this w fits the implied split for ALL GOPs, given the
+        //     Pass-1 capacity counts.
+        let mut fits = true;
+        for (i, cap) in capacities.iter().enumerate() {
+            if gop_m_c[i] * w > cap.n_coeff || gop_m_m[i] * w > cap.n_mvd {
+                fits = false;
+                break;
+            }
+        }
+        if !fits {
+            continue 'w_loop;
+        }
+        if gop_m_c[0] > coeff_extract_0.len() || gop_m_m[0] > mvd_extract_0.len() {
+            continue 'w_loop;
         }
 
-        let mut message_bits = Vec::with_capacity(total_bits);
-        message_bits.extend_from_slice(&coeff_extract[..m_c]);
-        message_bits.extend_from_slice(&mvd_extract[..m_m]);
+        // 5d. Phase 2c — stream remaining GOPs at this w. Each GOP's
+        //     metadata transient (~150 MB) drops before the next.
+        let mut message_bits = Vec::with_capacity(m_total);
+        message_bits.extend_from_slice(&coeff_extract_0[..gop_m_c[0]]);
+        message_bits.extend_from_slice(&mvd_extract_0[..gop_m_m[0]]);
 
+        let mut gop_failed = false;
+        for (i, cap) in capacities.iter().enumerate().skip(1) {
+            if gop_m_c[i] == 0 && gop_m_m[i] == 0 {
+                continue;
+            }
+            let builds = match scan_and_build_gop_stc(
+                track,
+                &sps,
+                &pps,
+                length_size,
+                mp4_bytes,
+                cap,
+                &coeff_master_perm,
+                &coeff_master_hhat,
+                &mvd_master_perm,
+                &mvd_master_hhat,
+            ) {
+                Ok(b) => b,
+                Err(_) => {
+                    gop_failed = true;
+                    break;
+                }
+            };
+            let n_c = builds.coeff.cover_bits.len();
+            let n_m = builds.mvd.cover_bits.len();
+            if gop_m_c[i] * w > n_c || gop_m_m[i] * w > n_m {
+                // Pass-2 cover smaller than Pass-1 capacity — shouldn't
+                // happen since both apply the same filter chain. Bail.
+                gop_failed = true;
+                break;
+            }
+            let m_c_max = n_c / w;
+            let m_m_max = n_m / w;
+            let coeff_extract = if m_c_max > 0 {
+                let hhat_c = hhat::generate_hhat(STC_H, w, &builds.coeff_hhat_seed);
+                stc_extract_mod::stc_extract(&builds.coeff.cover_bits[..m_c_max * w], &hhat_c, w)
+            } else {
+                Vec::new()
+            };
+            let mvd_extract = if m_m_max > 0 {
+                let hhat_m = hhat::generate_hhat(STC_H, w, &builds.mvd_hhat_seed);
+                stc_extract_mod::stc_extract(&builds.mvd.cover_bits[..m_m_max * w], &hhat_m, w)
+            } else {
+                Vec::new()
+            };
+            if gop_m_c[i] > coeff_extract.len() || gop_m_m[i] > mvd_extract.len() {
+                gop_failed = true;
+                break;
+            }
+            message_bits.extend_from_slice(&coeff_extract[..gop_m_c[i]]);
+            message_bits.extend_from_slice(&mvd_extract[..gop_m_m[i]]);
+            // builds drops here, freeing this GOP's ~150 MB transient.
+        }
+        if gop_failed {
+            continue 'w_loop;
+        }
+
+        // 5e. Parse + decrypt + decode payload.
         let message_bytes: Vec<u8> = message_bits
             .chunks(8)
             .map(|chunk| {
@@ -658,18 +734,258 @@ pub fn h264_ghost_decode(
             })
             .collect();
 
-        if let Ok(parsed) = frame::parse_frame(&message_bytes) {
-            if let Ok(plaintext) =
+        if let Ok(parsed) = frame::parse_frame(&message_bytes)
+            && let Ok(plaintext) =
                 crypto::decrypt(&parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce)
-            {
-                if let Ok(payload_data) = payload::decode_payload(&plaintext) {
-                    return Ok(payload_data);
-                }
-            }
+            && let Ok(payload_data) = payload::decode_payload(&plaintext)
+        {
+            return Ok(payload_data);
         }
     }
 
     Err(StegoError::DecryptionFailed)
+}
+
+/// Compute the STC flip operations for a single GOP without mutating
+/// `mp4_bytes`. Used by the GOP-parallel encode loop (Phase I.1) — the
+/// outer loop collects per-GOP `Vec<FlipOp>` from N workers in parallel,
+/// then serially applies them after the chunk join.
+///
+/// All the same per-GOP work as the previous serial path
+/// (`scan_frame_range` -> `compute_all_costs` -> filter usable
+/// -> per-GOP keys -> `build_domain_stc` -> `stc_embed`) but the final
+/// step COLLECTS flips into a `Vec<FlipOp>` instead of XOR'ing
+/// `mp4_bytes` directly. The EP-byte safety check is deferred to the
+/// serial apply phase.
+#[allow(clippy::too_many_arguments)]
+fn compute_gop_flips(
+    track: &mp4::Track,
+    sps: &Sps,
+    pps: &Pps,
+    length_size: u8,
+    mp4_bytes: &[u8],
+    cap: &GopCapacity,
+    frame_offset: usize,
+    m_g_c: usize,
+    m_g_m: usize,
+    w: usize,
+    frame_bits: &[u8],
+    coeff_master_perm: &[u8; 32],
+    coeff_master_hhat: &[u8; 32],
+    mvd_master_perm: &[u8; 32],
+    mvd_master_hhat: &[u8; 32],
+) -> Result<Vec<FlipOp>, StegoError> {
+    if m_g_c == 0 && m_g_m == 0 {
+        return Ok(Vec::new());
+    }
+
+    let (positions, ac_energies, uniward_costs) = scan_frame_range(
+        track,
+        sps,
+        pps,
+        length_size,
+        mp4_bytes,
+        cap.range.first,
+        cap.range.last,
+    )?;
+    let costs = compute_all_costs(&positions, &ac_energies, &uniward_costs, track);
+
+    let usable: Vec<_> = positions
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            let is_coeff = matches!(
+                p.domain,
+                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
+            );
+            (is_coeff && p.scan_pos > 0) || p.domain == EmbedDomain::MvdLsb
+        })
+        .collect();
+    let (coeff_usable, mvd_usable): (Vec<_>, Vec<_>) = usable
+        .iter()
+        .partition(|(_, p)| p.domain != EmbedDomain::MvdLsb);
+
+    let gop_id = cap.range.gop_idx;
+    let coeff_perm_seed =
+        crypto::derive_per_gop_seed_from_master(coeff_master_perm, gop_id, b"coeff-perm");
+    let coeff_hhat_seed =
+        crypto::derive_per_gop_seed_from_master(coeff_master_hhat, gop_id, b"coeff-hhat");
+    let mvd_perm_seed =
+        crypto::derive_per_gop_seed_from_master(mvd_master_perm, gop_id, b"mvd-perm");
+    let mvd_hhat_seed =
+        crypto::derive_per_gop_seed_from_master(mvd_master_hhat, gop_id, b"mvd-hhat");
+
+    let coeff_build = build_domain_stc(
+        &coeff_usable,
+        &positions,
+        &costs,
+        &coeff_perm_seed,
+        track,
+        mp4_bytes,
+    );
+    let mvd_build = build_domain_stc(
+        &mvd_usable,
+        &positions,
+        &costs,
+        &mvd_perm_seed,
+        track,
+        mp4_bytes,
+    );
+
+    let mut flips = Vec::new();
+
+    if m_g_c > 0 {
+        let n_used_c = m_g_c * w;
+        if coeff_build.cover_bits.len() < n_used_c {
+            return Err(StegoError::MessageTooLarge);
+        }
+        let hhat_c = hhat::generate_hhat(STC_H, w, &coeff_hhat_seed);
+        let embed_c = stc_embed_mod::stc_embed(
+            &coeff_build.cover_bits[..n_used_c],
+            &coeff_build.stc_costs[..n_used_c],
+            &frame_bits[frame_offset..frame_offset + m_g_c],
+            &hhat_c,
+            STC_H,
+            w,
+        )
+        .ok_or(StegoError::MessageTooLarge)?;
+        collect_domain_flips(&embed_c.stego_bits, &coeff_build, &positions, track, &mut flips);
+    }
+
+    if m_g_m > 0 {
+        let n_used_m = m_g_m * w;
+        if mvd_build.cover_bits.len() < n_used_m {
+            return Err(StegoError::MessageTooLarge);
+        }
+        let hhat_m = hhat::generate_hhat(STC_H, w, &mvd_hhat_seed);
+        let embed_m = stc_embed_mod::stc_embed(
+            &mvd_build.cover_bits[..n_used_m],
+            &mvd_build.stc_costs[..n_used_m],
+            &frame_bits[frame_offset + m_g_c..frame_offset + m_g_c + m_g_m],
+            &hhat_m,
+            STC_H,
+            w,
+        )
+        .ok_or(StegoError::MessageTooLarge)?;
+        collect_domain_flips(&embed_m.stego_bits, &mvd_build, &positions, track, &mut flips);
+    }
+
+    Ok(flips)
+}
+
+/// Append flip ops for one domain's STC embed result to `flips`. Pure
+/// — no mp4 mutation. Mirrors `apply_domain_flips` shape but pushes to
+/// a Vec instead of XOR'ing. EP-byte safety check is deferred to the
+/// serial apply phase in the encoder.
+fn collect_domain_flips(
+    stego_bits: &[u8],
+    build: &DomainStcBuild,
+    all_positions: &[EmbeddablePosition],
+    track: &mp4::Track,
+    flips: &mut Vec<FlipOp>,
+) {
+    for (perm_idx, &stego_bit) in stego_bits.iter().enumerate() {
+        if stego_bit == build.cover_bits[perm_idx] {
+            continue;
+        }
+        let orig_idx = build.permuted_to_orig[perm_idx];
+        let epos = &all_positions[orig_idx];
+        let sample = &track.samples[epos.frame_idx as usize];
+        let abs_offset = sample.offset as usize + epos.raw_byte_offset;
+        let mask = 1u8 << (7 - epos.bit_offset);
+        flips.push(FlipOp { abs_offset, mask });
+    }
+}
+
+/// All the per-GOP STC infrastructure needed to extract message bits.
+/// Built once per GOP (decode side); cached for GOP 0 across all w iterations.
+struct GopStcBuilds {
+    coeff: DomainStcBuild,
+    mvd: DomainStcBuild,
+    coeff_hhat_seed: [u8; 32],
+    mvd_hhat_seed: [u8; 32],
+}
+
+/// Scan one GOP and build its per-domain STC inputs. Used by both encode
+/// (drops the result after STC + apply_flips) and decode (caches GOP 0,
+/// streams the rest).
+///
+/// Memory: holds positions + ac_energies + uniward_costs + costs + both
+/// `DomainStcBuild`s during the call. Peak ~150 MB at 1080p / 30-frame
+/// GOP. The returned `GopStcBuilds` keeps only the two builds (~1 MB).
+fn scan_and_build_gop_stc(
+    track: &mp4::Track,
+    sps: &Sps,
+    pps: &Pps,
+    length_size: u8,
+    mp4_bytes: &[u8],
+    cap: &GopCapacity,
+    coeff_master_perm: &[u8; 32],
+    coeff_master_hhat: &[u8; 32],
+    mvd_master_perm: &[u8; 32],
+    mvd_master_hhat: &[u8; 32],
+) -> Result<GopStcBuilds, StegoError> {
+    let (positions, ac_energies, uniward_costs) = scan_frame_range(
+        track,
+        sps,
+        pps,
+        length_size,
+        mp4_bytes,
+        cap.range.first,
+        cap.range.last,
+    )?;
+    let costs = compute_all_costs(&positions, &ac_energies, &uniward_costs, track);
+
+    let usable: Vec<_> = positions
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| {
+            let is_coeff = matches!(
+                p.domain,
+                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
+            );
+            (is_coeff && p.scan_pos > 0) || p.domain == EmbedDomain::MvdLsb
+        })
+        .collect();
+    let (coeff_usable, mvd_usable): (Vec<_>, Vec<_>) = usable
+        .iter()
+        .partition(|(_, p)| p.domain != EmbedDomain::MvdLsb);
+
+    let gop_id = cap.range.gop_idx;
+    let coeff_perm_seed =
+        crypto::derive_per_gop_seed_from_master(coeff_master_perm, gop_id, b"coeff-perm");
+    let coeff_hhat_seed =
+        crypto::derive_per_gop_seed_from_master(coeff_master_hhat, gop_id, b"coeff-hhat");
+    let mvd_perm_seed =
+        crypto::derive_per_gop_seed_from_master(mvd_master_perm, gop_id, b"mvd-perm");
+    let mvd_hhat_seed =
+        crypto::derive_per_gop_seed_from_master(mvd_master_hhat, gop_id, b"mvd-hhat");
+
+    let coeff = build_domain_stc(
+        &coeff_usable,
+        &positions,
+        &costs,
+        &coeff_perm_seed,
+        track,
+        mp4_bytes,
+    );
+    let mvd = build_domain_stc(
+        &mvd_usable,
+        &positions,
+        &costs,
+        &mvd_perm_seed,
+        track,
+        mp4_bytes,
+    );
+
+    Ok(GopStcBuilds {
+        coeff,
+        mvd,
+        coeff_hhat_seed,
+        mvd_hhat_seed,
+    })
+    // positions / ac_energies / uniward_costs / costs / usable / *_usable
+    // / *_perm_seed all drop here.
 }
 
 /// Estimate the embedding capacity of an H.264 CAVLC MP4 file.
@@ -688,35 +1004,79 @@ pub fn h264_ghost_capacity(mp4_bytes: &[u8]) -> Result<usize, StegoError> {
         .ok_or(StegoError::InvalidVideo("no video track".into()))?;
     let track = &mp4_file.tracks[track_idx];
 
-    let (all_positions, _, _) = scan_all_frames(track, &sps, &pps, length_size, mp4_bytes)?;
-
-    let usable_count = all_positions
+    // Phase I.0.5/68: capacity sums over all GOPs (matching the multi-GOP
+    // encode/decode that walks per-GOP).
+    let capacities = scan_gop_capacities(track, &sps, &pps, length_size, mp4_bytes)?;
+    let usable_count: usize = capacities
         .iter()
-        .filter(|p| {
-            // Phase 2: T1 sign bits + magnitude LSBs + level-suffix sign bits.
-            // UNIWARD scales level-sign flips by 2*|coeff| so STC naturally
-            // avoids high-magnitude signs while still gaining the capacity.
-            //
-            // NOTE: ep_conflict is NOT filtered here. It's a function of the
-            // surrounding raw bytes — which differ between cover and stego after
-            // any flip — so filtering on it would produce divergent position
-            // lists in encode vs decode. EP conflicts are instead handled via
-            // infinite cost in the cost function (WET), so STC naturally avoids
-            // them when picking which bits to flip.
-            // Phase 3a: MVD positions bypass the coeff scan_pos gate.
-            let is_coeff = matches!(
-                p.domain,
-                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
-            );
-            (is_coeff && p.scan_pos > 0) || p.domain == EmbedDomain::MvdLsb
-        })
-        .count();
+        .map(|c| c.n_coeff + c.n_mvd)
+        .sum();
 
-    // At STC h=7, roughly 1 message bit per 7-10 cover positions (depending on w)
-    // Conservative estimate: w=5 → ~usable/5 message bits → /8 bytes - frame overhead
+    // STC h=7: 1 message bit per `w` cover positions, `w ∈ [1, 10]`.
+    // The multi-GOP encoder picks the largest `w` that fits all GOPs
+    // (see compute_per_gop_message_split). Conservative default
+    // assumes `w = 5` — true capacity is up to 2× this for short
+    // messages on long videos (typical case picks w=10). Power users
+    // can call `h264_ghost_capacity_max` for the optimistic bound.
     let message_bits = usable_count / 5;
     let payload_bytes = message_bits.saturating_sub(frame::FRAME_OVERHEAD * 8) / 8;
     Ok(payload_bytes)
+}
+
+/// Maximum embedding capacity: the largest message the encoder can
+/// possibly fit, at STC `w = 1` (no stealth amplification, 1 message
+/// bit per cover position). This is **5× the default
+/// `h264_ghost_capacity`** which assumes the conservative `w = 5`.
+///
+/// STC relationship: each message bit consumes `w` cover positions.
+/// Lower `w` = MORE message bits per cover (max capacity, min
+/// stealth). Higher `w` = FEWER message bits per cover (max stealth,
+/// fewer flips). The encoder picks the LARGEST `w ∈ [1, 10]` that
+/// still fits the message — so a small message gets `w = 10` (max
+/// stealth) while a max-sized message lands at `w = 1`. Capacity at
+/// `w = 1` is therefore the upper bound on what the encoder can
+/// embed at all.
+///
+/// Useful for power-user tooling (CLI) that wants to display the
+/// "real" maximum rather than the UX-safe pessimistic default.
+///
+/// Mobile UX should keep using `h264_ghost_capacity` (the pessimistic
+/// `usable / 5`) — under-promising and over-delivering is the safer
+/// gate. If the user types a message between the two values the
+/// encoder will succeed, just at a lower `w` (= less stealth).
+pub fn h264_ghost_capacity_max(mp4_bytes: &[u8]) -> Result<usize, StegoError> {
+    let mp4_file = mp4::demux::demux(mp4_bytes)?;
+    let (sps, pps, length_size) = extract_h264_params(&mp4_file)?;
+
+    if pps.entropy_coding_mode_flag {
+        return Err(StegoError::InvalidVideo("CABAC not supported".into()));
+    }
+
+    let track_idx = mp4_file
+        .video_track_idx
+        .ok_or(StegoError::InvalidVideo("no video track".into()))?;
+    let track = &mp4_file.tracks[track_idx];
+
+    let capacities = scan_gop_capacities(track, &sps, &pps, length_size, mp4_bytes)?;
+    let usable_count: usize = capacities
+        .iter()
+        .map(|c| c.n_coeff + c.n_mvd)
+        .sum();
+
+    // Max: w = 1 → 1 message bit per cover position.
+    let message_bits = usable_count;
+    let payload_bytes = message_bits.saturating_sub(frame::FRAME_OVERHEAD * 8) / 8;
+    Ok(payload_bytes)
+}
+
+/// Path-based wrapper for `h264_ghost_capacity_max` — mirrors the
+/// `h264_ghost_capacity_path` streaming API.
+pub fn h264_ghost_capacity_max_path(path: &std::path::Path) -> Result<usize, StegoError> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| StegoError::InvalidVideo(format!("open failed: {e}")))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| StegoError::InvalidVideo(format!("mmap failed: {e}")))?;
+    h264_ghost_capacity_max(&mmap)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +1084,69 @@ pub fn h264_ghost_capacity(mp4_bytes: &[u8]) -> Result<usize, StegoError> {
 // ---------------------------------------------------------------------------
 
 /// Extract SPS, PPS, and NAL length size from an H.264 MP4 file.
+/// Phase 6D.8 chunk 7 — route CABAC MP4 inputs through the
+/// chunk-6G decoder. Demux → extract SPS+PPS NALs from avcC →
+/// gather per-sample length-prefixed NAL bytes → assemble a
+/// flat `Vec<NalUnit>` → call `h264_stego_decode_nalus_string`
+/// → wrap result as `PayloadData` for legacy-API parity.
+///
+/// Decoupled from the legacy CAVLC pipeline: the cabac-stego
+/// route does not share scan/STC code with the bitstream-mod
+/// pipeline. Two different stego modes living side-by-side.
+#[cfg(feature = "cabac-stego")]
+fn decode_cabac_via_chunk_6g(
+    mp4_file: &mp4::Mp4File,
+    length_size: u8,
+    passphrase: &str,
+) -> Result<crate::stego::payload::PayloadData, StegoError> {
+    use crate::codec::h264::bitstream::{parse_nal_unit, parse_nal_units_mp4};
+    use crate::codec::h264::stego::decode_pixels::
+        h264_stego_decode_nalus_string;
+
+    let track_idx = mp4_file
+        .video_track_idx
+        .ok_or(StegoError::InvalidVideo("no video track".into()))?;
+    let track = &mp4_file.tracks[track_idx];
+    let avcc = track.avcc_data.as_ref().ok_or(
+        StegoError::InvalidVideo("no avcC configuration".into())
+    )?;
+
+    // Build a NalUnit list: SPS + PPS from avcC, then sample NALs.
+    let mut nalus: Vec<crate::codec::h264::NalUnit> = Vec::new();
+    for sps_bytes in &avcc.sps_nalus {
+        if sps_bytes.is_empty() {
+            continue;
+        }
+        let nu = parse_nal_unit(sps_bytes)
+            .map_err(|e| StegoError::InvalidVideo(format!("avcC SPS: {e}")))?;
+        nalus.push(nu);
+    }
+    for pps_bytes in &avcc.pps_nalus {
+        if pps_bytes.is_empty() {
+            continue;
+        }
+        let nu = parse_nal_unit(pps_bytes)
+            .map_err(|e| StegoError::InvalidVideo(format!("avcC PPS: {e}")))?;
+        nalus.push(nu);
+    }
+    for sample in &track.samples {
+        if sample.data.is_empty() {
+            continue;
+        }
+        let sample_nalus = parse_nal_units_mp4(&sample.data, length_size)
+            .map_err(|e| StegoError::InvalidVideo(
+                format!("sample NAL parse: {e}")
+            ))?;
+        nalus.extend(sample_nalus);
+    }
+
+    let text = h264_stego_decode_nalus_string(&nalus, passphrase)?;
+    Ok(crate::stego::payload::PayloadData {
+        text,
+        files: Vec::new(),
+    })
+}
+
 fn extract_h264_params(mp4_file: &mp4::Mp4File) -> Result<(Sps, Pps, u8), StegoError> {
     let track_idx = mp4_file
         .video_track_idx
@@ -773,14 +1196,6 @@ fn extract_h264_params(mp4_file: &mp4::Mp4File) -> Result<(Sps, Pps, u8), StegoE
     Ok((sps_parsed, pps_parsed, length_size))
 }
 
-/// Frame scan result: positions found in one frame.
-struct FrameScanResult {
-    positions: Vec<EmbeddablePosition>,
-    ac_energies: Vec<f32>,
-    slice_type: SliceType,
-    gop_position: u32,
-}
-
 /// Scan all frames in the video track, collecting embeddable positions.
 ///
 /// Returns `(positions, ac_energies, uniward_costs)` where `uniward_costs[i]`
@@ -804,7 +1219,9 @@ struct PendingIFrameDrift {
 /// Exposes `scan_all_frames` + everything needed to re-run the same filter that
 /// `h264_ghost_encode`/`decode` apply, so external tools (e.g. the
 /// `h264_stealth_retrospective` example) can inspect the cover position pool
-/// without duplicating the whole pipeline. Remove when no longer needed.
+/// without duplicating the whole pipeline. Scans the WHOLE video (last frame
+/// inclusive) — the production encode/decode in Phase I.0.5 only scans the
+/// first GOP, but this analysis tool deliberately retains the full-video view.
 pub fn scan_frames_for_stealth_analysis(
     mp4_bytes: &[u8],
 ) -> Result<(Vec<EmbeddablePosition>, Vec<f32>, Vec<Option<f32>>), StegoError> {
@@ -819,15 +1236,187 @@ pub fn scan_frames_for_stealth_analysis(
         .video_track_idx
         .ok_or(StegoError::InvalidVideo("no video track".into()))?;
     let track = &mp4_file.tracks[track_idx];
-    scan_all_frames(track, &sps, &pps, length_size, mp4_bytes)
+    let last_frame = track.samples.len().saturating_sub(1);
+    scan_frame_range(track, &sps, &pps, length_size, mp4_bytes, 0, last_frame)
 }
 
-fn scan_all_frames(
+/// Phase I.0.5/68 — multi-GOP support.
+///
+/// One GOP's coordinates within `track.samples`: `[first..=last]` inclusive.
+/// `gop_idx` is the position of the GOP within the track (0 for the first
+/// GOP, 1 for the second, …).
+#[derive(Debug, Clone, Copy)]
+struct GopRange {
+    gop_idx: u32,
+    first: usize,
+    last: usize, // inclusive
+}
+
+/// Walk `track.samples` and partition it into GOPs by IDR boundaries.
+///
+/// A GOP starts at a sync (IDR) frame and includes all subsequent non-sync
+/// frames until the next sync frame (or end of video). If the first sample
+/// is not sync (rare / malformed), the function still treats `[0..]` as the
+/// first GOP for safety.
+fn discover_gops(track: &mp4::Track) -> Vec<GopRange> {
+    let n = track.samples.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut gops = Vec::new();
+    let mut current_first = 0usize;
+    let mut next_idx = 0u32;
+    for i in 1..n {
+        if track.samples[i].is_sync {
+            gops.push(GopRange {
+                gop_idx: next_idx,
+                first: current_first,
+                last: i - 1,
+            });
+            next_idx += 1;
+            current_first = i;
+        }
+    }
+    gops.push(GopRange {
+        gop_idx: next_idx,
+        first: current_first,
+        last: n - 1,
+    });
+    gops
+}
+
+/// Per-GOP usable-position counts (after the encode-side filter:
+/// coeff scan_pos > 0 OR MvdLsb).
+#[derive(Debug, Clone, Copy)]
+struct GopCapacity {
+    range: GopRange,
+    n_coeff: usize,
+    n_mvd: usize,
+}
+
+/// Phase 1 of the per-GOP streaming pipeline: count usable positions per GOP.
+///
+/// Calls `scan_frame_range` for each GOP individually, then drops the
+/// per-GOP metadata before moving to the next. Peak working set during this
+/// pass equals one GOP's worth of metadata (~150 MB at 1080p / 30-frame GOP).
+///
+/// Counts apply the SAME filter chain as `build_domain_stc`: scan_pos > 0
+/// for coeff domain (or `MvdLsb`), AND finite cost from `compute_all_costs`.
+/// This ensures `n_g_c` and `n_g_m` here match the actual cover-bits count
+/// the encoder will see in Phase 2 (`build_domain_stc` drops infinite-cost
+/// positions). Without the cost filter the counts overestimate and the
+/// encoder allocates message bits that overflow the actual cover.
+///
+/// We pay for a full scan here (including UNIWARD + DDCA + cost computation)
+/// even though Phase 2 re-scans each GOP again. Empirically the wasted cost
+/// is small relative to the encode-on-mobile budget. Optimize if profiling
+/// later shows this dominates wall time.
+fn scan_gop_capacities(
     track: &mp4::Track,
     sps: &Sps,
     pps: &Pps,
     length_size: u8,
     mp4_bytes: &[u8],
+) -> Result<Vec<GopCapacity>, StegoError> {
+    let gops = discover_gops(track);
+    let mut caps = Vec::with_capacity(gops.len());
+    for range in gops {
+        let (positions, ac_energies, uniward_costs) = scan_frame_range(
+            track,
+            sps,
+            pps,
+            length_size,
+            mp4_bytes,
+            range.first,
+            range.last,
+        )?;
+        let costs = compute_all_costs(&positions, &ac_energies, &uniward_costs, track);
+        let mut n_coeff = 0usize;
+        let mut n_mvd = 0usize;
+        for (i, p) in positions.iter().enumerate() {
+            // Mirror `build_domain_stc`'s filter chain: scan_pos > 0 for
+            // coeff (or MvdLsb), AND finite cost (`build_domain_stc` drops
+            // infinite-cost positions before STC).
+            if !costs[i].is_finite() {
+                continue;
+            }
+            let is_coeff = matches!(
+                p.domain,
+                EmbedDomain::T1Sign | EmbedDomain::LevelSuffixMag | EmbedDomain::LevelSuffixSign
+            );
+            if is_coeff && p.scan_pos > 0 {
+                n_coeff += 1;
+            } else if p.domain == EmbedDomain::MvdLsb {
+                n_mvd += 1;
+            }
+        }
+        caps.push(GopCapacity {
+            range,
+            n_coeff,
+            n_mvd,
+        });
+        // positions / energies / costs drop here.
+    }
+    Ok(caps)
+}
+
+/// Compute per-GOP message bit allocation given total capacities + a target
+/// total message length `m_total`. Returns `(gop_m_coeff, gop_m_mvd)` —
+/// per-GOP coefficient + MVD bit counts. Uses proportional split:
+/// `m_g_c = m_c_total * n_g_c / sum(n_g_c)`. Rounding remainder is absorbed
+/// by the last GOP. Both encoder and decoder run this with the same
+/// `(capacities, m_total)` so they agree on the split.
+fn compute_per_gop_message_split(
+    capacities: &[GopCapacity],
+    m_total: usize,
+    total_n_coeff: usize,
+    total_n_mvd: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let total_n = total_n_coeff + total_n_mvd;
+    let m_c_total = if total_n > 0 {
+        m_total * total_n_coeff / total_n
+    } else {
+        0
+    };
+    let m_m_total = m_total.saturating_sub(m_c_total);
+    let mut gop_m_c = Vec::with_capacity(capacities.len());
+    let mut gop_m_m = Vec::with_capacity(capacities.len());
+    let mut allocated_m_c = 0usize;
+    let mut allocated_m_m = 0usize;
+    for cap in capacities {
+        let m_g_c = if total_n_coeff > 0 {
+            m_c_total * cap.n_coeff / total_n_coeff
+        } else {
+            0
+        };
+        let m_g_m = if total_n_mvd > 0 {
+            m_m_total * cap.n_mvd / total_n_mvd
+        } else {
+            0
+        };
+        gop_m_c.push(m_g_c);
+        gop_m_m.push(m_g_m);
+        allocated_m_c += m_g_c;
+        allocated_m_m += m_g_m;
+    }
+    // Absorb rounding remainder into the last GOP that has the relevant pool.
+    if let Some(idx) = capacities.iter().rposition(|c| c.n_coeff > 0) {
+        gop_m_c[idx] += m_c_total.saturating_sub(allocated_m_c);
+    }
+    if let Some(idx) = capacities.iter().rposition(|c| c.n_mvd > 0) {
+        gop_m_m[idx] += m_m_total.saturating_sub(allocated_m_m);
+    }
+    (gop_m_c, gop_m_m)
+}
+
+fn scan_frame_range(
+    track: &mp4::Track,
+    sps: &Sps,
+    pps: &Pps,
+    length_size: u8,
+    _mp4_bytes: &[u8],
+    first_frame_inclusive: usize,
+    last_frame_inclusive: usize,
 ) -> Result<(Vec<EmbeddablePosition>, Vec<f32>, Vec<Option<f32>>), StegoError> {
     let mut all_positions = Vec::new();
     let mut all_ac_energies = Vec::new();
@@ -844,7 +1433,16 @@ fn scan_all_frames(
         sps.pic_height_in_map_units * 2
     };
 
-    for (frame_idx, sample) in track.samples.iter().enumerate() {
+    let n_frames = last_frame_inclusive
+        .saturating_add(1)
+        .saturating_sub(first_frame_inclusive);
+    for (frame_idx, sample) in track
+        .samples
+        .iter()
+        .enumerate()
+        .skip(first_frame_inclusive)
+        .take(n_frames)
+    {
         if sample.data.is_empty() {
             continue;
         }
@@ -894,8 +1492,8 @@ fn scan_all_frames(
                     })?;
 
             // Parse macroblocks
-            let data_byte = slice_hdr.data_bit_offset / 8;
-            let data_bit = (slice_hdr.data_bit_offset % 8) as u8;
+            let _data_byte = slice_hdr.data_bit_offset / 8;
+            let _data_bit = (slice_hdr.data_bit_offset % 8) as u8;
 
             let mut reader = bitstream::RbspReader::new(&rbsp);
             // Skip to data_bit_offset
@@ -973,11 +1571,9 @@ fn scan_all_frames(
                             neighbor_ctx.set_luma_tc(bx, by, 0);
                         }
                         // 26 slots per MB: 16 luma + 2 chroma DC + 4 Cb AC + 4 Cr AC.
-                        // Skip MBs contribute zero energy; push 26 zero entries so the
-                        // energy array stays aligned with global_block_idx indexing.
-                        for _ in 0..26 {
-                            all_ac_energies.push(0.0);
-                        }
+                        // Skip MBs contribute zero energy; append 26 zero entries so
+                        // the energy array stays aligned with global_block_idx.
+                        all_ac_energies.extend([0.0; 26]);
                         global_block_idx += 26;
                         mb_idx += 1;
                         _parse_skip_count += 1;
@@ -1054,16 +1650,9 @@ fn scan_all_frames(
 
                         let pos_start = all_positions.len();
 
-                        // Add positions with frame/block indices.
-                        // Adjust raw_byte_offset to be relative to sample start:
-                        // sample data: [length_prefix][NAL_header_byte][payload...]
-                        // raw_byte_offset is relative to payload start
-                        // → absolute from sample start = ls + 1 + raw_byte_offset
-                        let nal_payload_offset_in_sample = nal_data_start - (sample.offset as usize - sample.offset as usize) + ls + 1;
-                        // Actually: nal_data_start is relative to sample.data start.
                         // Position in sample.data = nal_data_start + 1 (NAL header) + raw_byte_offset
-                        let positions_moved: Vec<_> = mb.positions.iter().cloned().collect();
-                        let mb_idx_val = (global_block_idx / 26) as u32;
+                        let positions_moved: Vec<_> = mb.positions.to_vec();
+                        let mb_idx_val = global_block_idx / 26;
                         for mut pos in positions_moved {
                             pos.frame_idx = frame_idx as u16;
                             pos.mb_idx = mb_idx_val;
@@ -1074,10 +1663,10 @@ fn scan_all_frames(
                             if pos.block_idx != u32::MAX
                                 && pos.block_idx != crate::codec::h264::mv::MVD_BLOCK_IDX_SENTINEL
                             {
-                                pos.block_idx = global_block_idx + pos.block_idx;
+                                pos.block_idx += global_block_idx;
                             }
                             // Adjust to absolute position within sample data
-                            pos.raw_byte_offset = nal_data_start + 1 + pos.raw_byte_offset;
+                            pos.raw_byte_offset += nal_data_start + 1;
                             all_positions.push(pos);
                             uniward_costs.push(None);
                         }
@@ -1098,7 +1687,11 @@ fn scan_all_frames(
                             // always when we're in this branch).
                             if let Some(mv_field) = mb.mv_field.as_ref() {
                                 let hops = frame_idx.saturating_sub(pending.i_frame_idx + 1) as i32;
-                                let decay = ddca_params.inter_frame_decay.powi(hops);
+                                // det_powi_f64 instead of f32::powi — the latter lowers to
+                                // @llvm.powi.f64 with implementation-defined rounding on WASM.
+                                // det_powi_f64 uses bit-exact IEEE 754 multiply (exp-by-squaring).
+                                let decay =
+                                    det_powi_f64(ddca_params.inter_frame_decay as f64, hops) as f32;
                                 let mb_x_usize =
                                     (mb_idx % sps.pic_width_in_mbs) as usize;
                                 let mb_y_usize =
@@ -1158,8 +1751,7 @@ fn scan_all_frames(
                     let (qp_cb, qp_cr) = frame_mbs
                         .get(mb_idx_in_frame)
                         .and_then(|mb| mb.recon.as_ref())
-                        .map(|r| (r.qp_cb, r.qp_cr))
-                        .unwrap_or((26, 26));
+                        .map_or((26, 26), |r| (r.qp_cb, r.qp_cr));
                     for global_pos_idx in pos_start..pos_end {
                         let pos = &all_positions[global_pos_idx];
                         // within_mb_block_idx = pos.block_idx mod 26 under the
@@ -1331,11 +1923,10 @@ fn compute_all_costs(
             // with reconstructed pixels). Fall back to the Phase 1a CSF cost
             // for P-frame positions and as a safety net when reconstruction
             // data is missing.
-            if let Some(uw) = uniward_costs.get(i).copied().flatten() {
-                if uw.is_finite() && uw > 0.0 {
+            if let Some(uw) = uniward_costs.get(i).copied().flatten()
+                && uw.is_finite() && uw > 0.0 {
                     return uw;
                 }
-            }
 
             let frame_idx = pos.frame_idx as usize;
             let is_sync = frame_idx < track.samples.len() && track.samples[frame_idx].is_sync;

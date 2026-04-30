@@ -4,12 +4,17 @@
 
 //! Deterministic math functions for cross-platform WASM reproducibility.
 //!
-//! Provides `det_sin`, `det_cos`, `det_sincos`, `det_atan2`, and `det_hypot`
-//! using only IEEE 754 operations that map to WASM intrinsics (add, sub, mul,
-//! div, floor, sqrt, abs, copysign). No calls to `Math.sin`, `Math.cos`, etc.
+//! Provides `det_sin`, `det_cos`, `det_sincos`, `det_atan2`, `det_hypot`,
+//! `det_exp`, and `det_powi_f64` using only IEEE 754 operations that map
+//! to WASM intrinsics (add, sub, mul, div, floor, sqrt, abs, copysign,
+//! bit-pattern manipulation). No calls to `Math.sin`, `Math.cos`,
+//! `Math.exp`, etc.
 //!
-//! Algorithms and coefficients from FDLIBM (Freely Distributable LIBM),
-//! which guarantees < 1 ULP error for all functions.
+//! Algorithms and coefficients are classical polynomial approximations of
+//! IEEE 754 transcendentals (Cody-Waite range reduction + minimax
+//! polynomials evaluated by Horner's scheme), guaranteeing < 1 ULP error
+//! for all functions. `det_powi_f64` is exponentiation-by-squaring on
+//! bit-exact IEEE 754 multiply — exact by construction.
 
 use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
@@ -22,7 +27,7 @@ const PIO2_HI: f64 = f64::from_bits(0x3FF921FB54442D18); // 1.5707963267948966
 const PIO2_LO: f64 = f64::from_bits(0x3C91A62633145C07); // 6.123233995736766e-17
 
 // ──────────────────────────────────────────────────────────────────────────
-// Sin kernel coefficients (FDLIBM k_sin.c).
+// Sin kernel coefficients — classical minimax polynomial on [-π/4, π/4].
 // sin(x) ≈ x + x³·(S1 + x²·(S2 + x²·(S3 + x²·(S4 + x²·(S5 + x²·S6)))))
 // for |x| ≤ π/4.
 // ──────────────────────────────────────────────────────────────────────────
@@ -35,7 +40,7 @@ const S5: f64 = f64::from_bits(0xBE5AE5E68A2B9CEB); // -2.50507602534068634195e-
 const S6: f64 = f64::from_bits(0x3DE5D93A5ACFD57C); //  1.58969099521155010221e-10
 
 // ──────────────────────────────────────────────────────────────────────────
-// Cos kernel coefficients (FDLIBM k_cos.c).
+// Cos kernel coefficients — classical minimax polynomial on [-π/4, π/4].
 // cos(x) ≈ 1 - x²/2 + x⁴·(C1 + x²·(C2 + …))
 // Uses Kahan trick for precision: w = 1-hz, return w + ((1-w)-hz+r).
 // ──────────────────────────────────────────────────────────────────────────
@@ -48,7 +53,8 @@ const C5: f64 = f64::from_bits(0x3E21EE9EBDB4B1C4); //  2.08757232129817482790e-
 const C6: f64 = f64::from_bits(0xBDA8FAE9BE8838D4); // -1.13596475577881948265e-11
 
 // ──────────────────────────────────────────────────────────────────────────
-// Atan coefficients and constants (FDLIBM s_atan.c).
+// Atan coefficients and constants — classical 11-term polynomial with
+// 5-range argument reduction.
 // ──────────────────────────────────────────────────────────────────────────
 
 const AT: [f64; 11] = [
@@ -70,15 +76,35 @@ const AT: [f64; 11] = [
 const ATAN_REF: [f64; 4] = [
     4.636476090008061e-01,   // atan(0.5)
     FRAC_PI_4,               // atan(1.0) = π/4
-    9.827937232473290e-01,   // atan(1.5)
+    9.827_937_232_473_29e-1,   // atan(1.5)
     FRAC_PI_2,               // atan(∞) = π/2
 ];
+
+// ──────────────────────────────────────────────────────────────────────────
+// Exp coefficients and constants — classical exp polynomial with
+// Cody-Waite ln(2) range reduction.
+// exp(x) = 2^k · exp(r), where x = k·ln(2) + r, |r| ≤ 0.5·ln(2).
+// exp(r) ≈ 1 + 2·c / (2 - c), c = r - r²·(P1 + r²·(P2 + r²·(P3 + r²·(P4 + r²·P5))))
+// ──────────────────────────────────────────────────────────────────────────
+
+const EXP_O_THRESHOLD: f64 = f64::from_bits(0x40862E42FEFA39EF); //  7.09782712893383973096e+02
+const EXP_U_THRESHOLD: f64 = f64::from_bits(0xC0874910D52D3051); // -7.45133219101941108420e+02
+const EXP_LN2HI: f64 = f64::from_bits(0x3FE62E42FEE00000);       //  6.93147180369123816490e-01
+const EXP_LN2LO: f64 = f64::from_bits(0x3DEA39EF35793C76);       //  1.90821492927058770002e-10
+const EXP_INVLN2: f64 = f64::from_bits(0x3FF71547652B82FE);      //  1.44269504088896338700e+00
+const EXP_TWOM1000: f64 = f64::from_bits(0x0170000000000000);    //  9.33263618503218878990e-302 = 2^-1000
+
+const EXP_P1: f64 = f64::from_bits(0x3FC555555555553E); //  1.66666666666666019037e-01
+const EXP_P2: f64 = f64::from_bits(0xBF66C16C16BEBD93); // -2.77777777770155933842e-03
+const EXP_P3: f64 = f64::from_bits(0x3F11566AAF25DE2C); //  6.61375632143793436117e-05
+const EXP_P4: f64 = f64::from_bits(0xBEBBBD41C5D26BF1); // -1.65339022054652515390e-07
+const EXP_P5: f64 = f64::from_bits(0x3E66376972BEA4D0); //  4.13813679705723846039e-10
 
 // ──────────────────────────────────────────────────────────────────────────
 // Core polynomial evaluations on reduced range [-π/4, π/4].
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Evaluate sin polynomial for |x| ≤ π/4 (FDLIBM __kernel_sin).
+/// Evaluate sin polynomial for |x| ≤ π/4 (classical sine kernel on the reduced range).
 #[inline]
 fn sin_kern(x: f64) -> f64 {
     let z = x * x;
@@ -87,14 +113,14 @@ fn sin_kern(x: f64) -> f64 {
     x + v * (S1 + z * r)
 }
 
-/// Evaluate cos polynomial for |x| ≤ π/4 (FDLIBM __kernel_cos).
+/// Evaluate cos polynomial for |x| ≤ π/4 (classical cosine kernel on the reduced range).
 /// cos(x) ≈ 1 - z/2 + z²·(C1 + z·C2 + …) where z = x².
 #[inline]
 fn cos_kern(x: f64) -> f64 {
     let z = x * x;
     let r = z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))));
     let hz = 0.5 * z;
-    // FDLIBM: return 1 - (hz - z*r), where z*r = z²·(C1 + z·C2 + …)
+    // Return 1 - (hz - z*r), where z*r = z²·(C1 + z·C2 + …)
     1.0 - (hz - z * r)
 }
 
@@ -161,10 +187,10 @@ pub fn det_sincos(x: f64) -> (f64, f64) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// atan / atan2 (FDLIBM s_atan.c algorithm)
+// atan / atan2 — classical 5-range argument reduction + polynomial.
 // ──────────────────────────────────────────────────────────────────────────
 
-/// Deterministic atan(x) using FDLIBM argument reduction + polynomial.
+/// Deterministic atan(x) using 5-range argument reduction + 11-term polynomial.
 fn det_atan(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
@@ -237,9 +263,7 @@ pub fn det_atan2(y: f64, x: f64) -> f64 {
         if x.is_infinite() {
             return if x > 0.0 {
                 if y > 0.0 { FRAC_PI_4 } else { -FRAC_PI_4 }
-            } else {
-                if y > 0.0 { 3.0 * FRAC_PI_4 } else { -3.0 * FRAC_PI_4 }
-            };
+            } else if y > 0.0 { 3.0 * FRAC_PI_4 } else { -3.0 * FRAC_PI_4 };
         }
         return if y > 0.0 { FRAC_PI_2 } else { -FRAC_PI_2 };
     }
@@ -247,9 +271,7 @@ pub fn det_atan2(y: f64, x: f64) -> f64 {
     if x.is_infinite() {
         return if x > 0.0 {
             if y.is_sign_negative() { -0.0 } else { 0.0 }
-        } else {
-            if y.is_sign_negative() { -PI } else { PI }
-        };
+        } else if y.is_sign_negative() { -PI } else { PI };
     }
 
     // General case
@@ -257,9 +279,7 @@ pub fn det_atan2(y: f64, x: f64) -> f64 {
 
     if x > 0.0 {
         if y >= 0.0 { a } else { -a }
-    } else {
-        if y >= 0.0 { PI - a } else { -(PI - a) }
-    }
+    } else if y >= 0.0 { PI - a } else { -(PI - a) }
 }
 
 /// Deterministic hypot(x, y) = sqrt(x² + y²).
@@ -275,6 +295,120 @@ pub fn det_hypot(x: f64, y: f64) -> f64 {
     }
     let ratio = small / big;
     big * (1.0 + ratio * ratio).sqrt()
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// exp / powi
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Deterministic exp(x) — classical exp polynomial with Cody-Waite ln(2)
+/// range reduction.
+///
+/// Strategy: argument-reduce to `x = k·ln(2) + r` with `|r| ≤ 0.5·ln(2)`,
+/// evaluate `exp(r)` via a 5-term polynomial in `r²`, then scale by `2^k`
+/// using direct exponent-bit manipulation. All operations are pure
+/// IEEE 754 arithmetic + bit cast — bit-exact across iOS / Android /
+/// x86_64 / WASM.
+pub fn det_exp(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    if x > EXP_O_THRESHOLD {
+        return f64::INFINITY; // overflow
+    }
+    if x < EXP_U_THRESHOLD {
+        return 0.0; // underflow
+    }
+
+    // High 32 bits of |x| (sign bit cleared); used for branch thresholds
+    // via the standard GET_HIGH_WORD bit-extraction pattern.
+    let hx_abs = (x.abs().to_bits() >> 32) as u32;
+
+    // Argument reduction: x = k·ln(2) + r, |r| ≤ 0.5·ln(2)
+    let (hi, lo, k): (f64, f64, i32) = if hx_abs > 0x3fd62e42 {
+        // |x| > 0.5·ln(2) ≈ 0.347
+        if hx_abs < 0x3FF0A2B2 {
+            // |x| < 1.5·ln(2) ≈ 1.04 — single-step k = ±1
+            if x.is_sign_negative() {
+                (x + EXP_LN2HI, -EXP_LN2LO, -1)
+            } else {
+                (x - EXP_LN2HI, EXP_LN2LO, 1)
+            }
+        } else {
+            // General case: k = round-toward-zero(x · 1/ln(2) + ±0.5)
+            let half = if x.is_sign_negative() { -0.5 } else { 0.5 };
+            let k_int = (EXP_INVLN2 * x + half) as i32;
+            let t = k_int as f64;
+            (x - t * EXP_LN2HI, t * EXP_LN2LO, k_int)
+        }
+    } else if hx_abs < 0x3e300000 {
+        // |x| < 2^-28 — exp(x) ≈ 1 + x
+        return 1.0 + x;
+    } else {
+        // |x| in [2^-28, 0.5·ln(2)] — no reduction needed
+        (x, 0.0, 0)
+    };
+
+    let r = hi - lo;
+    let z = r * r;
+    let c = r - z * (EXP_P1 + z * (EXP_P2 + z * (EXP_P3 + z * (EXP_P4 + z * EXP_P5))));
+
+    let y = if k == 0 {
+        1.0 - ((r * c) / (c - 2.0) - r)
+    } else {
+        1.0 - ((lo - (r * c) / (2.0 - c)) - hi)
+    };
+
+    if k == 0 {
+        return y;
+    }
+
+    // Scale by 2^k via direct exponent-bit add. After reduction, y ∈ ~[0.5, 2],
+    // so its biased exponent is 1022, 1023, or 1024 — adding k stays in the
+    // valid normal range as long as k ≥ -1021. Below that we scale via 2^-1000.
+    if k >= -1021 {
+        let bits = y.to_bits().wrapping_add(((k as i64) << 52) as u64);
+        f64::from_bits(bits)
+    } else {
+        let bits = y.to_bits().wrapping_add((((k + 1000) as i64) << 52) as u64);
+        f64::from_bits(bits) * EXP_TWOM1000
+    }
+}
+
+/// Deterministic integer-exponent power: `base^n` for `n: i32`.
+///
+/// Uses exponentiation-by-squaring with bit-exact IEEE 754 multiply.
+/// For our codec / stego use cases (`n` typically in `[-32, 64]`) the
+/// log₂(|n|) ≤ 6 steps means at most ~12 multiplications, each
+/// deterministic per IEEE 754. Negative `n` inverts the result via a
+/// single deterministic divide.
+///
+/// Behaviour matches `f64::powi` semantically but is bit-exact across
+/// iOS / Android / x86_64 / WASM (whereas `f64::powi` lowers to
+/// `@llvm.powi.f64` which has implementation-defined rounding).
+pub fn det_powi_f64(base: f64, n: i32) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    if base == 1.0 {
+        return 1.0;
+    }
+    let mut e: u64 = (n as i64).unsigned_abs();
+    let mut b = base;
+    let mut result = 1.0;
+    while e > 0 {
+        if e & 1 == 1 {
+            result *= b;
+        }
+        e >>= 1;
+        if e > 0 {
+            b *= b;
+        }
+    }
+    if n < 0 { 1.0 / result } else { result }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -419,6 +553,129 @@ mod tests {
             let sc = x.cos();
             assert!((dc - sc).abs() < 5e-13,
                 "det_cos({x})={dc} vs std cos={sc}, diff={}", (dc - sc).abs());
+        }
+    }
+
+    #[test]
+    fn exp_exact_values() {
+        let tol = 1e-15;
+        assert_eq!(det_exp(0.0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(det_exp(-0.0).to_bits(), 1.0_f64.to_bits());
+        assert!(approx_eq(det_exp(1.0), std::f64::consts::E, tol));
+        assert!(approx_eq(det_exp(-1.0), 1.0 / std::f64::consts::E, tol));
+        assert!(approx_eq(det_exp(2.0), std::f64::consts::E.powi(2), 1e-14));
+        assert!(approx_eq(det_exp(-3.0), 0.049787068367863944, 1e-15));
+        assert!(approx_eq(det_exp(0.5), 1.6487212707001282, tol));
+    }
+
+    #[test]
+    fn exp_special_values() {
+        assert!(det_exp(f64::NAN).is_nan());
+        assert_eq!(det_exp(f64::INFINITY), f64::INFINITY);
+        assert_eq!(det_exp(f64::NEG_INFINITY), 0.0);
+        // Overflow / underflow saturate.
+        assert_eq!(det_exp(800.0), f64::INFINITY);
+        assert_eq!(det_exp(-800.0), 0.0);
+    }
+
+    #[test]
+    fn exp_tiny_arguments() {
+        // For |x| < 2^-28 the algorithm short-circuits to 1+x.
+        let tiny = 1e-12;
+        let res = det_exp(tiny);
+        assert!((res - (1.0 + tiny)).abs() < 1e-24);
+        let neg_tiny = -1e-12;
+        let res = det_exp(neg_tiny);
+        assert!((res - (1.0 + neg_tiny)).abs() < 1e-24);
+    }
+
+    #[test]
+    fn exp_matches_std_closely() {
+        // Match std f64::exp within a tight tolerance for typical input ranges.
+        for i in 0..200 {
+            let x = (i as f64 - 100.0) * 0.07;
+            let de = det_exp(x);
+            let se = x.exp();
+            let rel = if se != 0.0 { ((de - se) / se).abs() } else { (de - se).abs() };
+            assert!(rel < 5e-15,
+                "det_exp({x})={de} vs std exp={se}, rel={rel}");
+        }
+    }
+
+    #[test]
+    fn exp_deterministic_across_calls() {
+        for i in 0..100 {
+            let x = (i as f64) * 0.0731 - 3.5;
+            assert_eq!(det_exp(x).to_bits(), det_exp(x).to_bits());
+        }
+    }
+
+    #[test]
+    fn powi_zero_exponent() {
+        // x^0 = 1 for any non-NaN x (matches f64::powi).
+        assert_eq!(det_powi_f64(0.0, 0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(det_powi_f64(1.0, 0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(det_powi_f64(-3.5, 0).to_bits(), 1.0_f64.to_bits());
+        assert_eq!(det_powi_f64(1e300, 0).to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn powi_one_exponent() {
+        for &b in &[0.0, 1.0, -1.0, 2.5, -7.3, 1e-10, 1e10] {
+            assert_eq!(det_powi_f64(b, 1).to_bits(), b.to_bits(),
+                "powi({b}, 1) should equal {b}");
+        }
+    }
+
+    #[test]
+    fn powi_basic() {
+        assert_eq!(det_powi_f64(2.0, 10), 1024.0);
+        assert_eq!(det_powi_f64(2.0, 16), 65536.0);
+        assert_eq!(det_powi_f64(0.5, 3), 0.125);
+        assert_eq!(det_powi_f64(0.75, 4), 0.31640625);
+        assert_eq!(det_powi_f64(-1.0, 2), 1.0);
+        assert_eq!(det_powi_f64(-1.0, 3), -1.0);
+        assert_eq!(det_powi_f64(-2.0, 4), 16.0);
+    }
+
+    #[test]
+    fn powi_negative_exponent() {
+        assert_eq!(det_powi_f64(2.0, -1), 0.5);
+        assert_eq!(det_powi_f64(2.0, -10), 1.0 / 1024.0);
+        assert_eq!(det_powi_f64(0.5, -3), 8.0);
+        // Powers of 2 are exact f64 — bit-exact equality.
+        assert_eq!(det_powi_f64(2.0, -8).to_bits(), (1.0_f64 / 256.0).to_bits());
+    }
+
+    #[test]
+    fn powi_matches_std_closely() {
+        // For powers of 2 the result is exactly representable; should be
+        // bit-exact even compared to std.
+        for k in -10..=10 {
+            let d = det_powi_f64(2.0, k);
+            let s = 2.0_f64.powi(k);
+            assert_eq!(d.to_bits(), s.to_bits(),
+                "powi(2.0, {k}): det={d} vs std={s}");
+        }
+        // For non-powers-of-2 we should match within a few ULPs.
+        for &b in &[0.75, 1.5, 0.9, 1.1, 3.7] {
+            for k in 0..=12 {
+                let d = det_powi_f64(b, k);
+                let s = b.powi(k);
+                let rel = ((d - s) / s).abs();
+                assert!(rel < 5e-15,
+                    "powi({b}, {k}): det={d} vs std={s}, rel={rel}");
+            }
+        }
+    }
+
+    #[test]
+    fn powi_deterministic_across_calls() {
+        for k in -20..=20 {
+            for &b in &[0.5, 0.75, 1.5, 2.0, 3.0] {
+                assert_eq!(det_powi_f64(b, k).to_bits(),
+                           det_powi_f64(b, k).to_bits());
+            }
         }
     }
 }

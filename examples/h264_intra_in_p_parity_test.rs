@@ -31,13 +31,13 @@ fn main() {
 
     // Build two frames: flat-grey I, tiny-textured P. Keeps inter cost
     // low most places but forces our diagnostic MB into intra.
-    let mut frame0 = vec![128u8; frame_size];
+    let frame0 = vec![128u8; frame_size];
     let mut frame1 = vec![128u8; frame_size];
     // Add a gradient to Y in frame 1 so some MBs see actual motion.
     for yy in 0..h as usize {
         for xx in 0..w as usize {
             frame1[yy * w as usize + xx] =
-                (128 + ((xx as i32 - 64).abs().min(30) as u8)) as u8;
+                128 + ((xx as i32 - 64).abs().min(30) as u8);
         }
     }
 

@@ -115,7 +115,7 @@ impl ReconBuffer {
     /// input frame; partial-MB cropping is signaled via
     /// `frame_crop_*` in the SPS (Phase 6A.5).
     pub fn new(width: u32, height: u32) -> Result<Self, EncoderError> {
-        if width % 16 != 0 || height % 16 != 0 {
+        if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
             return Err(EncoderError::InvalidInput(format!(
                 "frame dimensions must be 16-aligned, got {width}×{height}"
             )));
@@ -197,12 +197,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn recon_clipped_at_255() {
         // Huge positive residual via level*scale should be clipped.
         let pred = [[200u8; 4]; 4];
         // Use a big level at DC — the inverse transform will propagate
         // a big positive offset to every pixel. Clipping should hold
-        // the result at 255.
+        // the result at 255. (v <= 255 is tautological on u8; kept as
+        // documentation of the declared invariant.)
         let mut levels = [[0i32; 4]; 4];
         levels[0][0] = 10_000;
         let recon = reconstruct_4x4_block(&levels, &pred, 22);

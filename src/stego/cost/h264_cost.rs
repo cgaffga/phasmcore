@@ -14,6 +14,7 @@
 
 use crate::codec::h264::cavlc::{EmbedDomain, EmbeddablePosition};
 use crate::codec::h264::slice::SliceType;
+use crate::det_math::det_exp;
 use crate::stego::cost::h264_mvd_cost::{
     compute_mvd_cost, mb_luma_residual_energy, MvdCostParams,
 };
@@ -77,8 +78,11 @@ pub fn compute_h264_costs(
     // `gop_length` is kept in the signature for API stability but no
     // longer affects the weight directly (the decay is purely a function
     // of distance from the anchor I-frame).
-    const TEMPORAL_DECAY_ALPHA: f32 = 0.3;
-    let temporal_weight = (-TEMPORAL_DECAY_ALPHA * gop_position as f32).exp();
+    const TEMPORAL_DECAY_ALPHA: f64 = 0.3;
+    // det_exp instead of f32::exp — f32::exp lowers to non-deterministic
+    // libm/Math.exp on WASM, breaking cross-platform bit-exactness of the
+    // STC selection. Promote to f64 for the call, narrow back to f32.
+    let temporal_weight = det_exp(-TEMPORAL_DECAY_ALPHA * gop_position as f64) as f32;
     let _ = gop_length; // retained for backward-compat callers
 
     let i_frame_mult = if slice_type.is_intra() {
@@ -309,7 +313,7 @@ mod tests {
         // I-frame at GOP position 0 (highest temporal cost)
         let cost_i = compute_h264_costs(&[pos.clone()], &ac, SliceType::I, 0, 30)[0];
         // P-frame at GOP position 29 (lowest temporal cost)
-        let cost_p = compute_h264_costs(&[pos.clone()], &ac, SliceType::P, 29, 30)[0];
+        let cost_p = compute_h264_costs(&[pos], &ac, SliceType::P, 29, 30)[0];
 
         // I-frame should have higher cost due to temporal weight + I-frame penalty
         assert!(cost_i > cost_p, "I-frame cost {cost_i} should be > P-frame cost {cost_p}");
@@ -331,7 +335,7 @@ mod tests {
 
         // Low texture (AC=2) should have higher cost than high texture (AC=50)
         let cost_low = compute_h264_costs(&[pos.clone()], &[2.0], SliceType::P, 1, 30)[0];
-        let cost_high = compute_h264_costs(&[pos.clone()], &[50.0], SliceType::P, 1, 30)[0];
+        let cost_high = compute_h264_costs(&[pos], &[50.0], SliceType::P, 1, 30)[0];
         assert!(cost_low > cost_high, "low-texture cost {cost_low} should be > high-texture cost {cost_high}");
     }
 

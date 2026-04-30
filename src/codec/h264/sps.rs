@@ -245,11 +245,6 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps, H264Error> {
     let mut r = RbspReader::new(rbsp);
 
     let pps_id = r.read_ue()? as u8;
-    if pps_id > 255 {
-        return Err(H264Error::InvalidParameterSet(format!(
-            "pps_id {pps_id} > 255"
-        )));
-    }
     let sps_id = r.read_ue()? as u8;
     let entropy_coding_mode_flag = r.read_bit()?;
     let bottom_field_pic_order_in_frame_present_flag = r.read_bit()?;
@@ -415,7 +410,7 @@ fn skip_hrd_parameters(r: &mut RbspReader<'_>) -> Result<(), H264Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::h264::bitstream::remove_emulation_prevention;
+    
 
     /// Build a minimal Baseline SPS RBSP for testing.
     /// Profile=66 (Baseline), Level=30, 320x240, poc_type=0, log2_max_poc_lsb=6

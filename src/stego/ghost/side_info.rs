@@ -91,8 +91,8 @@ impl SideInfo {
         let total_coeffs = bw * bh * 64;
         let mut errors = vec![0i8; total_coeffs];
 
-        let luma_bw = ((pixel_width as usize) + 7) / 8;
-        let luma_bh = ((pixel_height as usize) + 7) / 8;
+        let luma_bw = (pixel_width as usize).div_ceil(8);
+        let luma_bh = (pixel_height as usize).div_ceil(8);
 
         // Process luma blocks in strips to limit transient memory.
         // Each strip holds at most STRIP_ROWS block-rows of luma data.
@@ -164,11 +164,11 @@ fn rgb_to_luma_blocks_strip(
 ) -> Vec<[f64; 64]> {
     let w = width as usize;
     let h = height as usize;
-    let luma_bw = (w + 7) / 8;
-    let luma_bh = (h + 7) / 8;
+    let luma_bw = w.div_ceil(8);
+    let luma_bh = h.div_ceil(8);
 
     let strip_br_end = br_end.min(luma_bh);
-    let strip_rows = if strip_br_end > br_start { strip_br_end - br_start } else { 0 };
+    let strip_rows = strip_br_end.saturating_sub(br_start);
 
     let mut blocks = Vec::with_capacity(strip_rows * luma_bw);
 
@@ -368,7 +368,7 @@ mod tests {
             for i in 0..64 {
                 let error = unquantized[i] - quantized[i] as f64;
                 assert!(
-                    error >= -0.50001 && error <= 0.50001,
+                    (-0.50001..=0.50001).contains(&error),
                     "seed={seed}, index={i}: error={error}"
                 );
             }
@@ -508,7 +508,7 @@ mod tests {
         }
 
         let full_blocks = rgb_to_luma_blocks(&rgb, width, height);
-        let luma_bw = ((width as usize) + 7) / 8; // 3
+        let luma_bw = (width as usize).div_ceil(8); // 3
 
         // Get strip for all rows at once
         let strip_all = rgb_to_luma_blocks_strip(&rgb, width, height, 0, 2);

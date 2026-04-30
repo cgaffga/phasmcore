@@ -46,8 +46,8 @@ fn main() {
     };
     let output = &args[7];
 
-    assert!(width % 16 == 0, "width must be 16-aligned");
-    assert!(height % 16 == 0, "height must be 16-aligned");
+    assert!(width.is_multiple_of(16), "width must be 16-aligned");
+    assert!(height.is_multiple_of(16), "height must be 16-aligned");
 
     let frame_size = (width as usize) * (height as usize) * 3 / 2;
     let mut reader = File::open(input).expect("open input yuv");

@@ -13,7 +13,7 @@ fn main() {
     let yuv_path = std::env::var("YUV").unwrap_or_else(|_| format!("/tmp/img4138_1080p_f{n_frames}.yuv"));
     let frame_size = (w * h * 3 / 2) as usize;
     let y_size = (w * h) as usize;
-    let c_size = (w * h / 4) as usize;
+    let _c_size = (w * h / 4) as usize;
     let pixels = std::fs::read(&yuv_path).expect("yuv missing");
     assert!(pixels.len() >= n_frames * frame_size, "yuv too short: {} vs need {}", pixels.len(), n_frames * frame_size);
 

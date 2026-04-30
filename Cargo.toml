@@ -15,6 +15,13 @@ categories = ["multimedia::images", "cryptography"]
 [features]
 default = []
 parallel = ["rayon"]
+# `simd` enables hand-vectorised SIMD kernels in the H.264 encoder
+# (NEON on aarch64, AVX2 on x86_64, SIMD128 on wasm32). Falls back to
+# scalar paths when off OR on architectures without a kernel. All
+# SIMD kernels are integer-only + FMA-free → bit-exact across iOS /
+# Android / x86_64 / WASM. Set `PHASM_H264_DISABLE_SIMD=1` env var to
+# force scalar even when this feature is compiled in (debug / A-B).
+simd = []
 # `video` enables the active H.264 Baseline CAVLC pipeline (production).
 # Pulls in memmap2 for the path-based streaming API used by the iOS +
 # Android bridges to avoid loading entire videos into heap.
@@ -29,6 +36,18 @@ video = ["memmap2"]
 # users wanting video stego must build from source with
 # `cargo install phasm-cli --features h264-encoder`.
 h264-encoder = ["video"]
+# `cabac-stego` enables the encode-time CABAC stego pipeline at
+# H.264 High Profile + CABAC (Phase 6D). Implies `h264-encoder`.
+# When OFF, the Rust core's video stego routes through the
+# transitional CAVLC bitstream-mod pipeline (today's #77 production
+# path). When ON, `h264_ghost_encode_pixels` becomes the production
+# encoder-level entry point (Phase 6D.8 atomic swap target).
+#
+# Mobile bridges + CLI both consume this once 6D.10 lands. For now
+# (6D.7-shipped + 6D.8-in-progress) this gates the cross-domain
+# orchestration framework so the legacy CAVLC pipeline is never
+# accidentally bypassed.
+cabac-stego = ["h264-encoder"]
 wasm = ["js-sys", "wasm-bindgen"]
 
 [dependencies]
@@ -51,3 +70,17 @@ wasm-bindgen = { version = "0.2", optional = true }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Clippy lint policy. Codec code ships spec-idiomatic patterns that clippy
+# flags but we deliberately keep — index-based loops over spec-indexed
+# coefficient/pixel arrays, many-param fns matching spec signatures,
+# single-char names (u, v, x, y, i, j, k) that match H.264/HEVC/JPEG
+# specs. Rewriting these to satisfy clippy would actively hurt
+# auditability. SIMD / MT work (Phase I.1, I.2) inherits zero warnings
+# from these decisions.
+[lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+many_single_char_names = "allow"
+doc_lazy_continuation = "allow"
+type_complexity = "allow"

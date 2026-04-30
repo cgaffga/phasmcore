@@ -246,6 +246,18 @@ pub struct SpsParams {
     pub height_pixels: u32,
     pub sps_id: u8,
     pub max_num_ref_frames: u8,
+    /// `pic_order_cnt_type` per spec § 7.4.2.1. Default `2`
+    /// (frame_num → POC) is fine for I+P-only streams. For B-frame
+    /// support set to `0` (LSB-based POC) so the decoder can
+    /// reorder display vs encode order. Phase 6E-A1 + §6E-A4 use
+    /// `0` when emitting B-slices. Phase 6B I/P-only paths keep
+    /// `2`.
+    pub pic_order_cnt_type: u8,
+    /// Only emitted when `pic_order_cnt_type == 0`. Width of the
+    /// `pic_order_cnt_lsb` field is `log2_max_pic_order_cnt_lsb_minus4
+    /// + 4` bits. Phase 6E-A1 default = 4 → 8-bit POC LSB
+    /// (range 0..255).
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
 }
 
 impl Default for SpsParams {
@@ -255,6 +267,8 @@ impl Default for SpsParams {
             height_pixels: 720,
             sps_id: 0,
             max_num_ref_frames: 1,
+            pic_order_cnt_type: 2,
+            log2_max_pic_order_cnt_lsb_minus4: 4,
         }
     }
 }
@@ -322,8 +336,13 @@ fn build_sps_inner(p: &SpsParams, profile_idc: u32, constraint_byte: u32) -> Vec
     w.write_ue(p.sps_id as u32);
     // log2_max_frame_num_minus4 = 0 → 4-bit frame_num (0..15).
     w.write_ue(0);
-    // pic_order_cnt_type = 2 (frame_num → POC)
-    w.write_ue(2);
+    // pic_order_cnt_type — § 6E-A4 honors the SpsParams field.
+    // Default `2` keeps backwards compat (Phase 6B I+P-only).
+    // `0` enables LSB-based POC for B-frame reordering.
+    w.write_ue(p.pic_order_cnt_type as u32);
+    if p.pic_order_cnt_type == 0 {
+        w.write_ue(p.log2_max_pic_order_cnt_lsb_minus4 as u32);
+    }
     // max_num_ref_frames
     w.write_ue(p.max_num_ref_frames as u32);
     // gaps_in_frame_num_value_allowed_flag = 0
@@ -367,7 +386,10 @@ fn build_sps_inner_high(p: &SpsParams) -> Vec<u8> {
     // ── Resume the base SPS body (same as build_sps_inner from
     //    log2_max_frame_num_minus4 onward).
     w.write_ue(0); // log2_max_frame_num_minus4
-    w.write_ue(2); // pic_order_cnt_type
+    w.write_ue(p.pic_order_cnt_type as u32);
+    if p.pic_order_cnt_type == 0 {
+        w.write_ue(p.log2_max_pic_order_cnt_lsb_minus4 as u32);
+    }
     w.write_ue(p.max_num_ref_frames as u32);
     w.write_bit(false); // gaps_in_frame_num_value_allowed_flag
     w.write_ue((p.width_pixels / 16) - 1);
@@ -495,6 +517,15 @@ pub struct ISliceHeaderParams {
     /// Requires the PPS's `deblocking_filter_control_present` to be set.
     /// Ignored otherwise.
     pub disable_deblocking: bool,
+    /// Phase 6E-A4 — when `Some(lsb)`, emit `pic_order_cnt_lsb` per
+    /// spec § 7.3.3 (required when SPS uses `pic_order_cnt_type = 0`).
+    /// `None` skips the field (Phase 6B I+P-only path,
+    /// `pic_order_cnt_type = 2`).
+    pub pic_order_cnt_lsb: Option<u32>,
+    /// Phase 6E-A4 — width of the `pic_order_cnt_lsb` field in bits,
+    /// = `log2_max_pic_order_cnt_lsb_minus4 + 4`. Only consulted when
+    /// `pic_order_cnt_lsb` is `Some`.
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
 }
 
 impl Default for ISliceHeaderParams {
@@ -506,6 +537,8 @@ impl Default for ISliceHeaderParams {
             idr_pic_id: 0,
             slice_qp_delta: 0,
             disable_deblocking: false,
+            pic_order_cnt_lsb: None,
+            log2_max_pic_order_cnt_lsb_minus4: 4,
         }
     }
 }
@@ -532,7 +565,13 @@ pub fn build_slice_header_i(p: &ISliceHeaderParams) -> Vec<u8> {
     if p.is_idr {
         w.write_ue(p.idr_pic_id as u32);
     }
-    // pic_order_cnt_type = 2 in our SPS → no POC fields here.
+    // pic_order_cnt_type — § 6E-A4 emits pic_order_cnt_lsb when SPS
+    // uses type 0. Phase 6B I+P-only SPS uses type 2 (no field).
+    if let Some(lsb) = p.pic_order_cnt_lsb {
+        let bits: u8 = p.log2_max_pic_order_cnt_lsb_minus4 + 4;
+        let mask = (1u32 << bits as u32) - 1;
+        w.write_bits(lsb & mask, bits);
+    }
 
     // For I-slice (slice_type = 7, == 2 mod 5), no ref_pic_list_modification
     // loops apply. For IDR, write no_output_of_prior_pics_flag = 0 and
@@ -579,6 +618,12 @@ pub fn continue_slice_header_i(w: &mut BitWriter, p: &ISliceHeaderParams) {
     if p.is_idr {
         w.write_ue(p.idr_pic_id as u32);
     }
+    // Phase 6E-A4 — emit pic_order_cnt_lsb when SPS uses type 0.
+    if let Some(lsb) = p.pic_order_cnt_lsb {
+        let bits: u8 = p.log2_max_pic_order_cnt_lsb_minus4 + 4;
+        let mask = (1u32 << bits as u32) - 1;
+        w.write_bits(lsb & mask, bits);
+    }
     if p.is_idr {
         w.write_bit(false);
         w.write_bit(false);
@@ -597,10 +642,17 @@ pub fn continue_slice_header_i(w: &mut BitWriter, p: &ISliceHeaderParams) {
 
 /// Parameters for a P-slice header (Phase 6B).
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct PSliceHeaderParams {
     pub pps_id: u8,
     /// Frame counter (wraps at `1 << log2_max_frame_num`).
     pub frame_num: u8,
+    /// Phase 6E-A4 — when `Some(lsb)`, emit `pic_order_cnt_lsb`
+    /// (required when SPS uses `pic_order_cnt_type = 0`).
+    pub pic_order_cnt_lsb: Option<u32>,
+    /// Phase 6E-A4 — width of `pic_order_cnt_lsb` field. Only
+    /// consulted when `pic_order_cnt_lsb` is `Some`.
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
     /// QP delta from `pic_init_qp`.
     pub slice_qp_delta: i32,
     /// Phase 6A.7 stopgap — emit `disable_deblocking_filter_idc = 1`.
@@ -617,19 +669,6 @@ pub struct PSliceHeaderParams {
     pub cabac_init_idc: Option<u8>,
 }
 
-impl Default for PSliceHeaderParams {
-    fn default() -> Self {
-        Self {
-            pps_id: 0,
-            frame_num: 0,
-            slice_qp_delta: 0,
-            disable_deblocking: false,
-            num_ref_idx_active_override: false,
-            num_ref_idx_l0_active_minus1: 0,
-            cabac_init_idc: None,
-        }
-    }
-}
 
 /// Stream-mode P-slice header writer. Mirrors
 /// `continue_slice_header_i` but for slice_type = P.
@@ -645,7 +684,13 @@ pub fn continue_slice_header_p(w: &mut BitWriter, p: &PSliceHeaderParams) {
     // Non-IDR P slice does NOT emit idr_pic_id, no_output_of_prior_pics,
     // or long_term_reference_flag.
     //
-    // pic_order_cnt_type = 2 in our SPS → no POC fields.
+    // Phase 6E-A4 — emit pic_order_cnt_lsb when SPS uses type 0.
+    // Phase 6B I+P-only SPS uses type 2 (no field).
+    if let Some(lsb) = p.pic_order_cnt_lsb {
+        let bits: u8 = p.log2_max_pic_order_cnt_lsb_minus4 + 4;
+        let mask = (1u32 << bits as u32) - 1;
+        w.write_bits(lsb & mask, bits);
+    }
     //
     // num_ref_idx_active_override_flag
     w.write_bit(p.num_ref_idx_active_override);
@@ -667,6 +712,108 @@ pub fn continue_slice_header_p(w: &mut BitWriter, p: &PSliceHeaderParams) {
     // slice_qp_delta
     w.write_se(p.slice_qp_delta);
     // disable_deblocking_filter_idc (optional, controlled by PPS flag)
+    if p.disable_deblocking {
+        w.write_ue(1);
+    } else {
+        w.write_ue(0);
+        w.write_se(0);
+        w.write_se(0);
+    }
+}
+
+// ─── B-slice header (Phase 6E-A3) ────────────────────────────────
+
+/// Parameters for a B-slice header (Phase 6E-A).
+///
+/// Mirrors `PSliceHeaderParams` with the B-specific additions:
+/// `direct_spatial_mv_pred_flag` (always `true` for Phase 6E-A
+/// per the architecture lock-in) and `num_ref_idx_l1_active_minus1`.
+/// Encoders should use `pic_order_cnt_type = 0` SPS when emitting
+/// B-slices so decoders can reorder display vs encode order via
+/// `pic_order_cnt_lsb`.
+#[derive(Debug, Clone, Copy)]
+#[derive(Default)]
+pub struct BSliceHeaderParams {
+    pub pps_id: u8,
+    pub frame_num: u8,
+    /// `pic_order_cnt_lsb` for this B-frame. Computed by the
+    /// encoder driver from the §6E-A1 `PocTracker`. Wraps mod
+    /// `1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)`.
+    pub pic_order_cnt_lsb: u32,
+    /// Phase 6E-A locks this to `true` (spatial direct mode —
+    /// matches mobile encoder defaults). Plumbed through for
+    /// completeness.
+    pub direct_spatial_mv_pred_flag: bool,
+    pub slice_qp_delta: i32,
+    pub disable_deblocking: bool,
+    /// `num_ref_idx_active_override_flag`. When `false`, both L0
+    /// and L1 active counts come from the PPS defaults.
+    pub num_ref_idx_active_override: bool,
+    /// Only emitted when `num_ref_idx_active_override` is true.
+    pub num_ref_idx_l0_active_minus1: u8,
+    /// Only emitted when `num_ref_idx_active_override` is true
+    /// AND slice_type is B.
+    pub num_ref_idx_l1_active_minus1: u8,
+    /// CABAC initialization IDC (spec § 7.3.3, Table 9-31).
+    /// `Some(idc)` emits `cabac_init_idc`. Phase 6E-A defaults to
+    /// `Some(0)` (PIdc0) to mimic mobile encoder defaults.
+    pub cabac_init_idc: Option<u8>,
+    /// `log2_max_pic_order_cnt_lsb_minus4` from SPS — width of
+    /// the `pic_order_cnt_lsb` field. Phase 6E-A defaults to 4
+    /// (LSB range 0..255).
+    pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    /// `log2_max_frame_num_minus4` from SPS — width of the
+    /// `frame_num` field. Phase 6E-A defaults to 0 (4-bit
+    /// frame_num) for consistency with the existing P-slice
+    /// header path.
+    pub log2_max_frame_num_minus4: u8,
+}
+
+/// Phase 6E-A3 — stream-mode B-slice header writer. Mirrors
+/// `continue_slice_header_p` with B-specific additions per spec
+/// § 7.3.3.
+pub fn continue_slice_header_b(w: &mut BitWriter, p: &BSliceHeaderParams) {
+    let frame_num_bits: u8 = p.log2_max_frame_num_minus4 + 4;
+    let poc_lsb_bits: u8 = p.log2_max_pic_order_cnt_lsb_minus4 + 4;
+
+    // first_mb_in_slice = 0 (single-slice-per-frame).
+    w.write_ue(0);
+    // slice_type = 6 ("B, all MBs are B") per Table 7-6.
+    w.write_ue(6);
+    // pic_parameter_set_id
+    w.write_ue(p.pps_id as u32);
+    // frame_num u(log2_max_frame_num)
+    let frame_num_mask = (1u32 << frame_num_bits as u32) - 1;
+    w.write_bits(p.frame_num as u32 & frame_num_mask, frame_num_bits);
+    // Non-IDR B slice does NOT emit idr_pic_id.
+    // pic_order_cnt_type = 0 path: emit pic_order_cnt_lsb.
+    let poc_mask = (1u32 << poc_lsb_bits as u32) - 1;
+    w.write_bits(p.pic_order_cnt_lsb & poc_mask, poc_lsb_bits);
+    // direct_spatial_mv_pred_flag
+    w.write_bit(p.direct_spatial_mv_pred_flag);
+    // num_ref_idx_active_override_flag
+    w.write_bit(p.num_ref_idx_active_override);
+    if p.num_ref_idx_active_override {
+        w.write_ue(p.num_ref_idx_l0_active_minus1 as u32);
+        w.write_ue(p.num_ref_idx_l1_active_minus1 as u32);
+    }
+    // ref_pic_list_modification: B has BOTH L0 and L1 flags. We
+    // emit no modifications (default ordering by POC).
+    w.write_bit(false); // ref_pic_list_modification_flag_l0
+    w.write_bit(false); // ref_pic_list_modification_flag_l1
+    // dec_ref_pic_marking: B-frames are non-reference (nal_ref_idc=0)
+    // by Phase 6E-A convention, so the slice header SKIPS
+    // dec_ref_pic_marking entirely (spec § 7.3.3.1 gates on
+    // nal_ref_idc != 0). The caller wraps the NAL with
+    // `wrap_rbsp_as_nal(.., NalType::SLICE, /* nal_ref_idc */ 0)`.
+    // cabac_init_idc
+    if let Some(idc) = p.cabac_init_idc {
+        debug_assert!(idc <= 2);
+        w.write_ue(idc as u32);
+    }
+    // slice_qp_delta
+    w.write_se(p.slice_qp_delta);
+    // disable_deblocking_filter_idc
     if p.disable_deblocking {
         w.write_ue(1);
     } else {
@@ -801,6 +948,7 @@ mod tests {
             height_pixels: 240,
             sps_id: 0,
             max_num_ref_frames: 1,
+            ..SpsParams::default()
         };
         let rbsp = build_sps_baseline(&p);
         let sps = parse_sps(&rbsp).expect("parse_sps should accept our SPS");
@@ -862,6 +1010,7 @@ mod tests {
             height_pixels: 240,
             sps_id: 0,
             max_num_ref_frames: 1,
+            ..SpsParams::default()
         };
         let rbsp = build_sps_main(&p);
         let sps = parse_sps(&rbsp).expect("parse_sps should accept our Main SPS");
@@ -1014,6 +1163,7 @@ mod tests {
             height_pixels: 240,
             sps_id: 0,
             max_num_ref_frames: 1,
+            ..SpsParams::default()
         };
         let rbsp = build_sps_high(&p);
         let sps = parse_sps(&rbsp).expect("parse_sps should accept our High SPS");
@@ -1080,6 +1230,80 @@ mod tests {
             "High PPS ({}) shouldn't be shorter than CABAC Main ({})",
             rb_high.len(),
             rb_main.len(),
+        );
+    }
+
+    /// §6E-A3 — B-slice header writer produces non-empty output and
+    /// the bytes are sensible (slice_type bits land in the right
+    /// position). Full round-trip through the parser happens at the
+    /// §6E-A4 end-to-end IBPBP encode test, where the encoder driver
+    /// + walker exercise the writer in production.
+    #[test]
+    fn b_slice_header_writer_emits_bytes() {
+        let mut w = BitWriter::new();
+        let p = BSliceHeaderParams {
+            pps_id: 0,
+            frame_num: 3,
+            pic_order_cnt_lsb: 6,
+            direct_spatial_mv_pred_flag: true,
+            slice_qp_delta: 2,
+            disable_deblocking: false,
+            num_ref_idx_active_override: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            cabac_init_idc: Some(0),
+            log2_max_pic_order_cnt_lsb_minus4: 4,
+            log2_max_frame_num_minus4: 0,
+        };
+        continue_slice_header_b(&mut w, &p);
+        let bytes = w.finish();
+        assert!(!bytes.is_empty(), "B-slice header produced no bytes");
+
+        // First byte starts with first_mb_in_slice=0 (1 bit "1" via
+        // ue(0)) followed by slice_type=6 (ue(6) = "00111").
+        // Combined leading bits: 1 00111 = 0b100111... → high nibble
+        // is 0x9 (1001).
+        assert_eq!(
+            bytes[0] >> 4, 0x9,
+            "first nibble should encode first_mb_in_slice=0 + slice_type=6 prefix; got {:08b}",
+            bytes[0],
+        );
+    }
+
+    /// §6E-A3 — B-slice header writer with override + cabac_init_idc
+    /// produces longer output than the no-override case (sanity that
+    /// the override path emits the additional fields).
+    #[test]
+    fn b_slice_header_writer_override_extends_output() {
+        let base_params = BSliceHeaderParams {
+            pps_id: 0,
+            frame_num: 0,
+            pic_order_cnt_lsb: 0,
+            direct_spatial_mv_pred_flag: true,
+            slice_qp_delta: 0,
+            disable_deblocking: false,
+            num_ref_idx_active_override: false,
+            num_ref_idx_l0_active_minus1: 0,
+            num_ref_idx_l1_active_minus1: 0,
+            cabac_init_idc: Some(0),
+            log2_max_pic_order_cnt_lsb_minus4: 4,
+            log2_max_frame_num_minus4: 0,
+        };
+        let mut w_no_override = BitWriter::new();
+        continue_slice_header_b(&mut w_no_override, &base_params);
+        let no_override = w_no_override.finish();
+
+        let mut w_override = BitWriter::new();
+        let mut p = base_params;
+        p.num_ref_idx_active_override = true;
+        p.num_ref_idx_l0_active_minus1 = 1;
+        p.num_ref_idx_l1_active_minus1 = 1;
+        continue_slice_header_b(&mut w_override, &p);
+        let with_override = w_override.finish();
+
+        assert!(
+            with_override.len() >= no_override.len(),
+            "override path should not produce shorter output"
         );
     }
 }

@@ -184,8 +184,9 @@ use super::reconstruction::raster_to_scan_levels;
 use super::reference_buffer::ReconFrame;
 use super::transform::{forward_dct_4x4, forward_hadamard_2x2};
 use super::inter_mode::{cbp_to_codenum_inter, luma_8x8_cbp_mask, pack_cbp};
-use super::quantization::{forward_quantize_dc_chroma, trellis_lambda_for_qp};
-use crate::codec::h264::cavlc_writer::{encode_cavlc_block, CavlcBlockType};
+use super::quantization::forward_quantize_dc_chroma;
+#[allow(unused_imports)]
+use crate::codec::h264::cavlc_writer::{encode_cavlc_block, CavlcBlockType};  // encode_cavlc_block used only in tests
 use crate::codec::h264::transform::{dequant_4x4, inverse_4x4_integer, inverse_chroma_dc_2x2_hadamard};
 
 /// Bit count of encoding one 4×4 CAVLC residual block. Drives the
@@ -278,8 +279,8 @@ pub fn p_mb_total_bits_cavlc(
             ));
         }
     }
-    if cbp_chroma != 0 {
-        if let Some(chroma) = chroma {
+    if cbp_chroma != 0
+        && let Some(chroma) = chroma {
             // Cb + Cr DC (always present when cbp_chroma ≥ 1).
             bits = bits.saturating_add(residual_block_bits_cavlc(
                 &chroma.cb_dc_scan,
@@ -306,7 +307,6 @@ pub fn p_mb_total_bits_cavlc(
                 }
             }
         }
-    }
     bits
 }
 
@@ -381,7 +381,7 @@ fn chroma_component_rdo(
     qp_c: u8,
 ) -> (u64, u32) {
     let qp = QuantParams { qp: qp_c, slice: QuantSlice::Inter };
-    let trellis_lambda = trellis_lambda_for_qp(qp_c);
+    let trellis_enable = true;
     let mut ac_levels = [[[0i32; 4]; 4]; 4];
     let mut dc_grid = [[0i32; 2]; 2];
     // Forward: per-subblock DCT + quant (same structure as encoder).
@@ -398,7 +398,7 @@ fn chroma_component_rdo(
             dc_grid[sby][sbx] = coeffs[0][0];
             coeffs[0][0] = 0;
             ac_levels[sby * 2 + sbx] =
-                trellis_quantize_4x4(&coeffs, qp, trellis_lambda)
+                trellis_quantize_4x4(&coeffs, qp, trellis_enable)
                     .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, qp));
         }
     }
@@ -447,9 +447,7 @@ fn chroma_component_rdo(
         // Chroma AC skips the DC position — 15-coefficient scan.
         let ac_only: [i32; 15] = {
             let mut a = [0i32; 15];
-            for i in 0..15 {
-                a[i] = scan[i + 1];
-            }
+            a.copy_from_slice(&scan[1..16]);
             a
         };
         r_bits = r_bits.saturating_add(
@@ -574,7 +572,7 @@ pub fn evaluate_p_mb_rdo(
 
     // Luma residual pipeline per 4×4 block.
     let inter_qp = QuantParams { qp: mb_qp, slice: QuantSlice::Inter };
-    let trellis_lambda = trellis_lambda_for_qp(mb_qp);
+    let trellis_enable = true;
     let mut luma_ac_levels = [[[0i32; 4]; 4]; 16];
     let mut luma_nonzero = [false; 16];
     let mut recon_y = [[0u8; 16]; 16];
@@ -590,7 +588,7 @@ pub fn evaluate_p_mb_rdo(
             }
         }
         let coeffs = forward_dct_4x4(&sub_res);
-        let levels = trellis_quantize_4x4(&coeffs, inter_qp, trellis_lambda)
+        let levels = trellis_quantize_4x4(&coeffs, inter_qp, trellis_enable)
             .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, inter_qp));
         luma_ac_levels[k] = levels;
         luma_nonzero[k] = levels.iter().any(|row| row.iter().any(|&v| v != 0));
@@ -844,7 +842,7 @@ pub fn evaluate_intra_in_p_rdo(
 
     // Luma residual roundtrip.
     let inter_qp = QuantParams { qp: mb_qp, slice: QuantSlice::Inter };
-    let trellis_lambda = trellis_lambda_for_qp(mb_qp);
+    let trellis_enable = true;
     let mut luma_ac_levels = [[[0i32; 4]; 4]; 16];
     let mut luma_nonzero = [false; 16];
     let mut recon_y = [[0u8; 16]; 16];
@@ -860,7 +858,7 @@ pub fn evaluate_intra_in_p_rdo(
             }
         }
         let coeffs = forward_dct_4x4(&sub_res);
-        let levels = trellis_quantize_4x4(&coeffs, inter_qp, trellis_lambda)
+        let levels = trellis_quantize_4x4(&coeffs, inter_qp, trellis_enable)
             .unwrap_or_else(|_| forward_quantize_4x4(&coeffs, inter_qp));
         luma_ac_levels[k] = levels;
         luma_nonzero[k] = levels.iter().any(|row| row.iter().any(|&v| v != 0));
@@ -896,7 +894,7 @@ pub fn evaluate_intra_in_p_rdo(
     // CBP based on whether any luma AC level is nonzero (→ cbp=15)
     // and leave chroma=0 in the MVP (same scope as Phase C).
     let any_luma_nonzero = luma_nonzero.iter().any(|&b| b);
-    let cbp_luma_flag: u32 = if any_luma_nonzero { 15 } else { 0 };
+    let _cbp_luma_flag: u32 = if any_luma_nonzero { 15 } else { 0 };
     let cbp_chroma: u32 = 0;
     // I_16x16 mb_type encoding folds CBP into the codenum (codenum 6
     // is DC/no-CBP, +12 for luma=15, +4 per chroma level). For R

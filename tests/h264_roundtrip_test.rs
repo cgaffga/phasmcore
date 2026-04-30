@@ -13,12 +13,9 @@ mod h264_tests {
     const TEST_320: &str = "test-vectors/video/h264/test_baseline_320x240.mp4";
 
     fn skip_if_missing(path: &str) -> Option<Vec<u8>> {
-        match std::fs::read(path) {
-            Ok(data) => Some(data),
-            Err(_) => {
-                eprintln!("SKIP: test vector not found: {path}");
-                None
-            }
+        if let Ok(data) = std::fs::read(path) { Some(data) } else {
+            eprintln!("SKIP: test vector not found: {path}");
+            None
         }
     }
 
@@ -45,7 +42,7 @@ mod h264_tests {
         assert_eq!(avcc.length_size_minus1, 3); // 4-byte length prefix
 
         // Should have samples (frames)
-        assert!(track.samples.len() > 0, "no samples");
+        assert!(!track.samples.is_empty(), "no samples");
         assert!(track.samples[0].is_sync, "first sample should be sync/IDR");
     }
 
@@ -163,21 +160,18 @@ mod h264_tests {
             .args(["-f", "null", "-"])
             .output();
 
-        match ffmpeg_result {
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if !stderr.is_empty() {
-                    eprintln!("ffmpeg decode warnings/errors:\n{stderr}");
-                }
-                assert!(
-                    output.status.success(),
-                    "ffmpeg must decode stego video without fatal errors"
-                );
+        if let Ok(output) = ffmpeg_result {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.is_empty() {
+                eprintln!("ffmpeg decode warnings/errors:\n{stderr}");
             }
-            Err(_) => {
-                eprintln!("SKIP: ffmpeg not available for visual test");
-                return;
-            }
+            assert!(
+                output.status.success(),
+                "ffmpeg must decode stego video without fatal errors"
+            );
+        } else {
+            eprintln!("SKIP: ffmpeg not available for visual test");
+            return;
         }
 
         // Compute PSNR via ffmpeg

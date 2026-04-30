@@ -22,8 +22,7 @@ use super::reference_buffer::ReconFrame;
 fn multi_pred_enabled() -> bool {
     std::env::var("PHASM_ME_MULTI_PRED")
         .ok()
-        .map(|v| v != "0")
-        .unwrap_or(true)
+        .is_none_or(|v| v != "0")
 }
 
 /// Build the multi-predictor candidate list for an ME call at

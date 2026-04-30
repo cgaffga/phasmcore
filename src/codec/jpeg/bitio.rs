@@ -39,7 +39,7 @@ impl<'a> BitReader<'a> {
 
     /// Read `count` bits (1–16) and return them right-aligned.
     pub fn read_bits(&mut self, count: u8) -> Result<u16> {
-        debug_assert!(count >= 1 && count <= 16);
+        debug_assert!((1..=16).contains(&count));
         while self.bits_left < count {
             self.fill_byte()?;
         }
@@ -50,7 +50,7 @@ impl<'a> BitReader<'a> {
 
     /// Peek at the top `count` bits without consuming them.
     pub fn peek_bits(&mut self, count: u8) -> Result<u16> {
-        debug_assert!(count >= 1 && count <= 16);
+        debug_assert!((1..=16).contains(&count));
         while self.bits_left < count {
             self.fill_byte()?;
         }
@@ -88,12 +88,11 @@ impl<'a> BitReader<'a> {
         self.byte_align();
 
         // Case 1: fill_byte already consumed a RST marker during Huffman decoding
-        if let Some(m) = self.marker_found {
-            if (m & 0xF8) == 0xD0 {
+        if let Some(m) = self.marker_found
+            && (m & 0xF8) == 0xD0 {
                 self.marker_found = None;
                 return Ok(Some(m & 0x07));
             }
-        }
 
         // Case 2: RST marker is at the current position in the stream
         // Also skip any fill 0xFF bytes before the marker
@@ -156,6 +155,12 @@ pub struct BitWriter {
     bits_used: u8,
 }
 
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BitWriter {
     pub fn new() -> Self {
         Self {
@@ -167,7 +172,7 @@ impl BitWriter {
 
     /// Write `count` bits (1–16) from the low bits of `value`.
     pub fn write_bits(&mut self, value: u16, count: u8) {
-        debug_assert!(count >= 1 && count <= 16);
+        debug_assert!((1..=16).contains(&count));
         // Write bits MSB-first
         for i in (0..count).rev() {
             let bit = (value >> i) & 1;

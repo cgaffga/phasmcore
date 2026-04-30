@@ -138,12 +138,9 @@ fn armor_encode_impl(
             let fort_result = fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
             progress::advance(); // Step 2: fortress encode
 
-            let stego_bytes = match img.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    img.rebuild_huffman_tables();
-                    img.to_bytes().map_err(StegoError::InvalidJpeg)?
-                }
+            let stego_bytes = if let Ok(bytes) = img.to_bytes() { bytes } else {
+                img.rebuild_huffman_tables();
+                img.to_bytes().map_err(StegoError::InvalidJpeg)?
             };
             progress::advance(); // Step 3: JPEG write
 
@@ -152,8 +149,7 @@ fn armor_encode_impl(
             // After pre-settle, compute mean_qt from the settled QT.
             let fort_qt_id = img.frame_info().components[0].quant_table_id as usize;
             let fort_mean_qt = img.quant_table(fort_qt_id)
-                .map(|qt| embedding::compute_mean_qt(&qt.values))
-                .unwrap_or(10.0);
+                .map_or(10.0, |qt| embedding::compute_mean_qt(&qt.values));
             let encode_quality = quality::armor_robustness_score(&ArmorMetrics {
                 repetition_factor: fort_result.repetition_factor,
                 parity_symbols: fort_result.parity_symbols,
@@ -315,12 +311,9 @@ fn armor_encode_impl(
     progress::advance(); // Step 5: STDM embed
 
     // 11. Write modified JPEG.
-    let stego_bytes = match img.to_bytes() {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            img.rebuild_huffman_tables();
-            img.to_bytes().map_err(StegoError::InvalidJpeg)?
-        }
+    let stego_bytes = if let Ok(bytes) = img.to_bytes() { bytes } else {
+        img.rebuild_huffman_tables();
+        img.to_bytes().map_err(StegoError::InvalidJpeg)?
     };
 
     progress::advance(); // Step 6: JPEG write
@@ -443,7 +436,7 @@ impl DecodeQuality {
 /// For severely degraded images: signal_strength near 0 → integrity ~30-50%.
 fn compute_integrity(signal_strength: f64, rs_stats: &ecc::RsDecodeStats, reference_llr: f64) -> u8 {
     let llr_score = if reference_llr > 0.0 {
-        (signal_strength / reference_llr).min(1.0).max(0.0)
+        (signal_strength / reference_llr).clamp(0.0, 1.0)
     } else {
         1.0 // No reference available, assume good
     };
@@ -455,7 +448,7 @@ fn compute_integrity(signal_strength: f64, rs_stats: &ecc::RsDecodeStats, refere
     };
     // Weight: 70% signal quality, 30% RS margin
     let combined = 0.7 * llr_score + 0.3 * rs_score;
-    (combined * 100.0).round().max(0.0).min(100.0) as u8
+    (combined * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
 /// Compute average |LLR| from a slice of raw LLR values (Phase 1 path).
@@ -481,22 +474,21 @@ fn compute_avg_abs_llr(llrs: &[f64]) -> f64 {
 pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     // Try Fortress first (fast magic-byte check on DC coefficients).
     let img = JpegImage::from_bytes(stego_bytes)?;
-    if img.num_components() > 0 {
-        if let Ok(result) = fortress::fortress_decode(&img, passphrase) {
+    if img.num_components() > 0
+        && let Ok(result) = fortress::fortress_decode(&img, passphrase) {
             return Ok(result);
         }
-    }
 
     // Try standard STDM decode with delta sweep (reuse already-parsed image).
     // try_armor_decode sets progress total and tracks fortress + phase 1/2 steps.
     match try_armor_decode(&img, passphrase) {
-        Ok(result) => return Ok(result),
+        Ok(result) => Ok(result),
         Err(new_err) => {
             // Try geometric recovery (Phase 3).
             progress::advance(); // phase 3
             match try_geometric_recovery(stego_bytes, passphrase) {
-                Ok(result) => return Ok(result),
-                Err(_) => return Err(new_err),
+                Ok(result) => Ok(result),
+                Err(_) => Err(new_err),
             }
         }
     }
@@ -744,8 +736,8 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
     // Skip if transform is essentially identity (fast path would have worked).
     if transform.rotation_rad.abs() < 0.001 && (transform.scale - 1.0).abs() < 0.001 {
         // Try DFT ring extraction directly (no geometry correction needed)
-        if let Some(ring_bytes) = dft_payload::extract_ring_payload(&spectrum, passphrase) {
-            if let Ok(text) = std::str::from_utf8(&ring_bytes) {
+        if let Some(ring_bytes) = dft_payload::extract_ring_payload(&spectrum, passphrase)
+            && let Ok(text) = std::str::from_utf8(&ring_bytes) {
                 let ring_cap = dft_payload::ring_capacity(w, h);
                 return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
                     mode: crate::stego::frame::MODE_ARMOR,
@@ -764,7 +756,6 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
                     signal_strength: 0.0,
                 }));
             }
-        }
         return Err(StegoError::FrameCorrupted);
     }
 
@@ -803,8 +794,8 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
                 let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img)
                     .ok_or(StegoError::NoLuminanceChannel)?;
                 let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
-                if let Some(ring_bytes) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase) {
-                    if let Ok(text) = std::str::from_utf8(&ring_bytes) {
+                if let Some(ring_bytes) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase)
+                    && let Ok(text) = std::str::from_utf8(&ring_bytes) {
                         let ring_cap = dft_payload::ring_capacity(cw, ch);
                         return Ok((PayloadData { text: text.to_string(), files: vec![] }, DecodeQuality {
                             mode: crate::stego::frame::MODE_ARMOR,
@@ -823,7 +814,6 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
                             signal_strength: 0.0,
                         }));
                     }
-                }
             }
         }
     }
@@ -1086,8 +1076,7 @@ pub(super) fn try_rs_decode_frame_with_parity(
 
         if let Ok((first_block_data, first_errors)) =
             ecc::rs_decode_with_parity(&extracted_bytes[..block_len], data_len, parity)
-        {
-            if first_block_data.len() >= 2 {
+            && first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
 
@@ -1132,8 +1121,8 @@ pub(super) fn try_rs_decode_frame_with_parity(
                     return Some((first_block_data[..total_frame_len].to_vec(), stats));
                 }
 
-                if total_frame_len > data_len {
-                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
+                if total_frame_len > data_len
+                    && let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
                         &extracted_bytes[..rs_encoded_len],
                         total_frame_len,
                         parity,
@@ -1142,9 +1131,7 @@ pub(super) fn try_rs_decode_frame_with_parity(
                     }
                     // Multi-block decode failed — first-block was a false
                     // positive. Continue sweep to try other data_len values.
-                }
             }
-        }
     }
 
     None
@@ -1169,8 +1156,7 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
 
         if let Ok((first_block_data, first_errors)) =
             ecc::rs_decode_with_parity(&extracted_bytes[..block_len], data_len, parity)
-        {
-            if first_block_data.len() >= 2 {
+            && first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
 
@@ -1216,8 +1202,8 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                     return Some((first_block_data[..total_frame_len].to_vec(), stats));
                 }
 
-                if total_frame_len > data_len {
-                    if let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
+                if total_frame_len > data_len
+                    && let Ok((decoded, stats)) = ecc::rs_decode_blocks_with_parity(
                         &extracted_bytes[..rs_encoded_len],
                         total_frame_len,
                         parity,
@@ -1226,9 +1212,7 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                     }
                     // Multi-block decode failed — first-block was a false
                     // positive. Continue sweep to try other data_len values.
-                }
             }
-        }
     }
 
     None
@@ -1248,8 +1232,8 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
             break;
         }
 
-        if let Ok((first_block_data, first_errors)) = ecc::rs_decode(&extracted_bytes[..block_len], data_len) {
-            if first_block_data.len() >= 2 {
+        if let Ok((first_block_data, first_errors)) = ecc::rs_decode(&extracted_bytes[..block_len], data_len)
+            && first_block_data.len() >= 2 {
                 let pt_len =
                     u16::from_be_bytes([first_block_data[0], first_block_data[1]]) as usize;
 
@@ -1297,7 +1281,6 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
                 // Multi-block decode failed — first-block was a false
                 // positive. Continue sweep to try other data_len values.
             }
-        }
     }
 
     Err(StegoError::FrameCorrupted)
@@ -1387,8 +1370,7 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
         let truncated_len = message[..max_byte]
             .char_indices()
             .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
+            .map_or(0, |(i, c)| i + c.len_utf8());
         let truncated = &message.as_bytes()[..truncated_len];
         dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase)?;
     }

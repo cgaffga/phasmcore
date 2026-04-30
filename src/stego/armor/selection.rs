@@ -39,7 +39,7 @@ fn compute_stability_map_freq_only(grid: &DctGrid) -> CostMap {
                     if i == 0 && j == 0 { continue; }
                     let freq_idx = i * 8 + j;
                     let zz = NATURAL_TO_ZIGZAG[freq_idx];
-                    if zz >= 1 && zz <= MAX_ARMOR_ZIGZAG {
+                    if (1..=MAX_ARMOR_ZIGZAG).contains(&zz) {
                         cost_map.set(br, bc, i, j, STABLE_COST);
                     }
                 }

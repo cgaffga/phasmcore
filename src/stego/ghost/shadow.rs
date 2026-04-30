@@ -407,11 +407,10 @@ pub fn shadow_extract(
                     .min(MAX_SHADOW_FRAME_BYTES);
                 if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
 
-                if let Some(fdl) = peek_fdl_from_first_block(lsbs, parity_len, max_fdl) {
-                    if let Some(result) = try_single_fdl(lsbs, fdl, parity_len, passphrase) {
+                if let Some(fdl) = peek_fdl_from_first_block(lsbs, parity_len, max_fdl)
+                    && let Some(result) = try_single_fdl(lsbs, fdl, parity_len, passphrase) {
                         return result;
                     }
-                }
             }
         }
 
@@ -441,8 +440,8 @@ pub fn shadow_extract(
         });
 
         match result {
-            Some(ok_or_err) => return ok_or_err,
-            None => return Err(StegoError::FrameCorrupted),
+            Some(ok_or_err) => ok_or_err,
+            None => Err(StegoError::FrameCorrupted),
         }
     }
 

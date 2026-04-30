@@ -1,0 +1,341 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! Phase 6F.2(j) — cascade-safe MVD subset analysis.
+//!
+//! Computes which MVD-sign positions in cover_p1 can be flipped
+//! by the STC plan WITHOUT shifting any downstream MVD across
+//! zero (= no cover-shape change between Pass 1 and Pass 3) AND
+//! without having any other safe flip shift this position's own
+//! magnitude (= magnitude invariant under all selected flips).
+//!
+//! ## Why
+//!
+//! Residual-only stego routing concentrates 100% of bypass-bin
+//! modifications in a single domain. A steganalysis tool comparing
+//! per-domain bypass-bin entropy vs a clean reference sees pristine
+//! MVD bins next to perturbed residual bins — that asymmetry is
+//! itself a fingerprint, irrespective of per-coefficient
+//! detectability. Real H.264 encoders distribute bypass-bin output
+//! across all four domains, so a clip with ZERO MVD modifications
+//! is suspicious.
+//!
+//! Restoring some MVD injection (even at modest 13–15% of
+//! cover_p1.mvd) breaks the single-domain anomaly. The capacity
+//! gain is small; the per-domain modification spread is the
+//! load-bearing motivation.
+//!
+//! ## Criterion C (chicken-and-egg-free)
+//!
+//! Greedy raster-order selection. At step i, position P_i is
+//! added to the safe set IFF:
+//!
+//! - **Predicate (a)**: no previously-selected P_j has its flip
+//!   touching mv_grid cells that P_i's predictor reads. This
+//!   guarantees `m_P_i` is invariant under all selected flips,
+//!   so the encoder's planning view of `|m_P_i|` equals the
+//!   walker's post-cascade view of `|m_P_i|`.
+//!
+//! - **Predicate (b)**: for every position Q that's later in
+//!   raster order AND whose predictor reads any cell P_i would
+//!   touch on flip, the cumulative shift bound at Q (= Σ over
+//!   already-selected P_k that affect Q of `|2·m_P_k|`, plus the
+//!   new contribution from P_i) is strictly less than `|m_Q|`.
+//!   This guarantees Q stays nonzero (no cover-shape change).
+//!
+//! Both predicates depend ONLY on:
+//! - position structure (frame_idx, mb_addr, partition, axis) —
+//!   sign-flip invariant.
+//! - `|m_P|` magnitudes — sign-flip invariant.
+//!
+//! Walker on Pass 3 bytes captures the same `(position, |m_P|)`
+//! tuples (the §6F.2(j).1 magnitude-capture parity gate
+//! confirms byte-identity on real-world content). Walker runs
+//! identical greedy → identical safe set. No iteration.
+//!
+//! ## MV-grid propagation pattern
+//!
+//! Per H.264 spec § 8.4.1.3 (median-of-A/B/C predictor):
+//! - A neighbour: cell (tl_bx-1, tl_by) — strictly to the LEFT
+//!   of the partition's top-left.
+//! - B neighbour: cell (tl_bx, tl_by-1) — strictly ABOVE.
+//! - C neighbour: cell (tl_bx + part_w_4x4, tl_by-1) — top-right.
+//! - D fallback when C unavailable: (tl_bx-1, tl_by-1).
+//!
+//! For analysis, we use a CONSERVATIVE MB-level model: an MB
+//! propagates to MBs to its right, below, bottom-left, and
+//! bottom-right. This may classify a few positions as unsafe
+//! that are actually safe (e.g., when the median actually picks
+//! a neighbour OTHER than P) but never classifies an unsafe
+//! position as safe. Conservative under-approximation is sound:
+//! decoder agrees with encoder.
+//!
+//! ## Output
+//!
+//! `analyze_safe_mvd_subset(meta, mb_w, mb_h)` returns a
+//! `Vec<bool>` aligned with `meta`. `true` at index i means
+//! `meta[i]` is safe to flip under the criterion above.
+
+use super::encoder_hook::MvdPositionMeta;
+
+/// Phase 6F.2(j) — analyze which MVD positions are cascade-safe
+/// to flip.
+///
+/// Inputs:
+/// - `meta`: per-MVD-position metadata, in cover-emission order
+///   (= raster MB scan order, partition order within MB). Element
+///   i corresponds to `cover.mvd_sign_bypass.positions[i]`.
+/// - `mb_w`, `mb_h`: frame dimensions in macroblocks.
+///
+/// Output: `Vec<bool>` aligned with `meta`. `true` ⇒ position is
+/// in the cascade-safe subset (criterion C).
+///
+/// Determinism: pure function of inputs, no hidden state, no I/O.
+/// Walker calls with identical `meta` → identical `Vec<bool>`.
+pub fn analyze_safe_mvd_subset(
+    meta: &[MvdPositionMeta],
+    mb_w: u32,
+    mb_h: u32,
+) -> Vec<bool> {
+    let n = meta.len();
+    let mut safe = vec![false; n];
+    if n == 0 || mb_w == 0 || mb_h == 0 {
+        return safe;
+    }
+
+    // Per-position cumulative-shift accumulator. `shift_bound[i]` is
+    // an UPPER BOUND on |m_meta[i]^post − m_meta[i]^pre|, given the
+    // safe selections we've made so far. Updated as we add positions
+    // to the safe set.
+    let mut shift_bound: Vec<u32> = vec![0; n];
+
+    // Iterate in raster order. `meta` is already in this order
+    // (encoder pushes per-MVD as the encoder visits MBs in raster).
+    // Defensive: re-sort by (frame_idx, mb_addr, partition, axis)
+    // to handle any future change in capture order.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| {
+        (meta[i].frame_idx, meta[i].mb_addr, meta[i].partition, meta[i].axis)
+    });
+
+    for &i in &order {
+        let p = &meta[i];
+
+        // Predicate (a): no previously-selected P' has its flip
+        // touching mv_grid cells that P's predictor reads. We
+        // overapproximate "P's predictor reads from MB X" by
+        // checking if P's MB has X as a propagation-source neighbour
+        // — equivalently, X propagates TO P's MB.
+        let p_mx = p.mb_addr % mb_w;
+        let p_my = p.mb_addr / mb_w;
+        let mut pred_a = true;
+        for &j in &order {
+            if j == i { break; }  // raster-order processing — only earlier positions checked
+            if !safe[j] { continue; }
+            let q = &meta[j];
+            // Same-frame restriction: cross-frame predictor reads
+            // are limited to reference frame DPB which doesn't carry
+            // current-frame MVDs. Different frames are independent.
+            if q.frame_idx != p.frame_idx { continue; }
+            let q_mx = q.mb_addr % mb_w;
+            let q_my = q.mb_addr / mb_w;
+            if mb_propagates(q_mx, q_my, p_mx, p_my) {
+                pred_a = false;
+                break;
+            }
+        }
+        if !pred_a {
+            continue;
+        }
+
+        // Predicate (b): for every Q later in raster order that P
+        // would propagate to, the cumulative shift bound at Q
+        // (PLUS this new flip's contribution) is strictly less than
+        // |m_Q|. Tentatively propose adding P; check; commit only
+        // if all Qs survive.
+        let two_m_p = 2u32.saturating_mul(p.magnitude);
+        let mut pred_b = true;
+        let mut tentative_updates: Vec<usize> = Vec::new();
+
+        for &j in &order {
+            if j == i { continue; }
+            let q = &meta[j];
+            if q.frame_idx != p.frame_idx { continue; }
+            let q_mx = q.mb_addr % mb_w;
+            let q_my = q.mb_addr / mb_w;
+            // Only Qs LATER in raster matter for downstream cascade.
+            if !mb_strictly_later(p_mx, p_my, q_mx, q_my) { continue; }
+            if !mb_propagates(p_mx, p_my, q_mx, q_my) { continue; }
+            // Cumulative shift at Q = existing bound + this flip's
+            // contribution. Must be strictly less than |m_Q|.
+            let new_bound = shift_bound[j].saturating_add(two_m_p);
+            if new_bound >= q.magnitude {
+                pred_b = false;
+                break;
+            }
+            tentative_updates.push(j);
+        }
+
+        if pred_b {
+            safe[i] = true;
+            for j in tentative_updates {
+                shift_bound[j] = shift_bound[j].saturating_add(two_m_p);
+            }
+        }
+    }
+
+    safe
+}
+
+/// Returns `true` iff a flip in MB (sx, sy) can affect any
+/// predictor read by an MB at (qx, qy). Per H.264 spec § 8.4.1.3,
+/// MB (qx, qy)'s partitions' predictors read from neighbours at
+/// positions (qx-1, qy), (qx, qy-1), (qx+1, qy-1), and via
+/// D-fallback (qx-1, qy-1). Equivalently:
+///
+/// - (sx, sy) propagates to (sx+1, sy)        — right neighbour
+/// - (sx, sy) propagates to (sx, sy+1)        — below
+/// - (sx, sy) propagates to (sx-1, sy+1)      — bottom-left (its
+///   top-right reads (sx, sy))
+/// - (sx, sy) propagates to (sx+1, sy+1)      — bottom-right (its
+///   top-left D-fallback reads (sx, sy))
+///
+/// Conservative: an MB-level affirmative may overcount within-MB
+/// granularity, but never under-counts (a true propagation at
+/// 4×4-cell granularity always implies MB-level propagation).
+#[inline]
+pub fn mb_propagates(sx: u32, sy: u32, qx: u32, qy: u32) -> bool {
+    // Right: (sx+1, sy)
+    if qx == sx.saturating_add(1) && qy == sy { return true; }
+    // Below: (sx, sy+1)
+    if qx == sx && qy == sy.saturating_add(1) { return true; }
+    // Bottom-left: (sx-1, sy+1) — only when sx > 0
+    if sx > 0 && qx == sx - 1 && qy == sy.saturating_add(1) { return true; }
+    // Bottom-right: (sx+1, sy+1)
+    if qx == sx.saturating_add(1) && qy == sy.saturating_add(1) { return true; }
+    false
+}
+
+/// Strict raster ordering: returns `true` iff (qx, qy) is later
+/// than (sx, sy) in MB raster scan order.
+#[inline]
+fn mb_strictly_later(sx: u32, sy: u32, qx: u32, qy: u32) -> bool {
+    qy > sy || (qy == sy && qx > sx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(frame_idx: u32, mb_addr: u32, partition: u8, axis: u8, magnitude: u32) -> MvdPositionMeta {
+        MvdPositionMeta { frame_idx, mb_addr, partition, axis, magnitude }
+    }
+
+    #[test]
+    fn empty_input_yields_empty_safe_set() {
+        let r = analyze_safe_mvd_subset(&[], 4, 3);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn single_position_in_last_mb_is_safe() {
+        // Frame is 4×3 MBs; last MB is (3, 2) ⇒ mb_addr = 11.
+        let m = vec![meta(0, 11, 0, 0, 1)];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r, vec![true]);
+    }
+
+    #[test]
+    fn cascade_blocks_when_downstream_magnitude_is_small() {
+        // P at MB(0,0) magnitude 5 → 2·5 = 10. Q at MB(1,0)
+        // magnitude 3. Flipping P would shift Q's predictor by up to
+        // 10, exceeding |m_Q|=3 → P unsafe.
+        let m = vec![
+            meta(0, 0, 0, 0, 5),  // P at (0,0)
+            meta(0, 1, 0, 0, 3),  // Q at (1,0) — propagation target
+        ];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r[0], false, "P should be unsafe (cascade exceeds Q's magnitude)");
+        // Q is checked after P; P wasn't selected so no constraint
+        // on Q. Q has no successors in this 1-MB-deep test (Q is at
+        // (1,0); successors at (2,0), (0,1), (1,1), (2,1) — none of
+        // those have MVDs in this fixture). So Q is safe.
+        assert_eq!(r[1], true);
+    }
+
+    #[test]
+    fn cascade_safe_upstream_blocks_downstream_via_predicate_a() {
+        // P at MB(0,0) magnitude 1 → 2·1 = 2. Q at MB(1,0)
+        // magnitude 5. 2 < 5, so P passes predicate (b).
+        // P is upstream of Q → P selected.
+        // Q would be safe under (b) (it has no propagation
+        // targets in this fixture), BUT P (already selected)
+        // propagates to Q → Q's predictor is shifted → Q's
+        // magnitude not invariant → predicate (a) fails.
+        // → r = [true, false].
+        let m = vec![
+            meta(0, 0, 0, 0, 1),
+            meta(0, 1, 0, 0, 5),
+        ];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r, vec![true, false]);
+    }
+
+    #[test]
+    fn non_propagating_pair_both_safe() {
+        // P at MB(0,0) magnitude 1; Q at MB(2,2) magnitude 1.
+        // (0,0) propagates to (1,0), (0,1), (1,1) — NOT to (2,2).
+        // Q is independent of P. Both safe.
+        let m = vec![
+            meta(0, 0, 0, 0, 1),         // (0,0)
+            meta(0, 2 + 2 * 4, 0, 0, 1), // (2,2) ⇒ mb_addr = 10
+        ];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r, vec![true, true]);
+    }
+
+    #[test]
+    fn cumulative_shift_predicate_b_blocks_p0_when_p1_magnitude_low() {
+        // P0 at (0,0) mag 1 → 2·1 = 2 shift on downstream MBs.
+        // P1 at (0,1) mag 2 — (0,0) propagates to (0,1) below.
+        // 2·m_P0 = 2 vs |m_P1| = 2. predicate (b): need
+        // shift_bound[P1] < |m_P1|, i.e. 2 < 2 — FALSE
+        // (strict). P0 rejected because its flip would push
+        // P1's magnitude to zero.
+        let m = vec![
+            meta(0, 0, 0, 0, 1),
+            meta(0, 4, 0, 0, 2), // (0,1) ⇒ mb_addr = 4
+        ];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r[0], false, "P0's flip would zero-cross P1");
+    }
+
+    #[test]
+    fn different_frames_are_independent() {
+        // Same MB position but different frame_idx → no
+        // cross-frame propagation (each frame has its own
+        // mv_grid). Both safe.
+        let m = vec![
+            meta(0, 0, 0, 0, 1),
+            meta(1, 0, 0, 0, 1),
+        ];
+        let r = analyze_safe_mvd_subset(&m, 4, 3);
+        assert_eq!(r, vec![true, true]);
+    }
+
+    #[test]
+    fn mb_propagates_exhaustive_grid() {
+        // Spot-check the four propagation patterns.
+        assert!(mb_propagates(1, 1, 2, 1));  // right
+        assert!(mb_propagates(1, 1, 1, 2));  // below
+        assert!(mb_propagates(1, 1, 0, 2));  // bottom-left
+        assert!(mb_propagates(1, 1, 2, 2));  // bottom-right
+        // Non-propagation cases.
+        assert!(!mb_propagates(1, 1, 1, 1));  // self
+        assert!(!mb_propagates(1, 1, 0, 1));  // left (upstream, not down)
+        assert!(!mb_propagates(1, 1, 1, 0));  // above
+        assert!(!mb_propagates(1, 1, 3, 1));  // 2 right
+        assert!(!mb_propagates(1, 1, 0, 0));  // top-left (upstream)
+    }
+}

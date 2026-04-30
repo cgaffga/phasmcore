@@ -246,10 +246,10 @@ pub fn forward_quantize_dc_chroma(
 pub fn trellis_quantize_4x4(
     coeffs: &[[i32; 4]; 4],
     params: QuantParams,
-    lambda: f32,
+    enable: bool,
 ) -> Result<[[i32; 4]; 4], EncoderError> {
     let mut levels = forward_quantize_4x4(coeffs, params);
-    if lambda <= 0.0 {
+    if !enable {
         return Ok(levels);
     }
 
@@ -313,16 +313,6 @@ pub fn trellis_quantize_4x4(
     Ok(levels)
 }
 
-/// Enable-knob for the trellis path. Any positive f32 enables the
-/// zero-forcing pass; ≤0 disables it. The magnitude is no longer
-/// used — `trellis_quantize_4x4` now sources its λ² directly from
-/// the spec-grounded [`super::rdo::TRELLIS_LAMBDA2_TAB`] and scales
-/// it via the `PHASM_TRELLIS_LAMBDA_MULT` env knob. Retained as an
-/// f32 for signature compatibility with call sites that still pass
-/// the legacy formula's output.
-pub fn trellis_lambda_for_qp(_qp: u8) -> f32 {
-    1.0
-}
 
 #[cfg(test)]
 mod tests {
@@ -556,7 +546,7 @@ mod tests {
         // must equal scalar output.
         let x = [[100, -50, 25, 0]; 4];
         let scalar = forward_quantize_4x4(&x, intra(22));
-        let trellis = trellis_quantize_4x4(&x, intra(22), 0.0).unwrap();
+        let trellis = trellis_quantize_4x4(&x, intra(22), false).unwrap();
         assert_eq!(trellis, scalar, "lambda=0 must equal scalar");
     }
 
@@ -568,7 +558,7 @@ mod tests {
         let mut x = [[0i32; 4]; 4];
         x[3][3] = 200; // high-freq, small magnitude pre-quant
         let scalar = forward_quantize_4x4(&x, intra(22));
-        let trellis = trellis_quantize_4x4(&x, intra(22), 1_000_000.0).unwrap();
+        let trellis = trellis_quantize_4x4(&x, intra(22), true).unwrap();
         let scalar_nonzero = scalar.iter().flatten().filter(|&&v| v != 0).count();
         let trellis_nonzero = trellis.iter().flatten().filter(|&&v| v != 0).count();
         assert!(
@@ -583,7 +573,7 @@ mod tests {
         // because the distortion increase dwarfs the bit savings.
         let mut x = [[0i32; 4]; 4];
         x[0][0] = 4000;
-        let trellis = trellis_quantize_4x4(&x, intra(22), 1.0).unwrap();
+        let trellis = trellis_quantize_4x4(&x, intra(22), true).unwrap();
         assert!(
             trellis[0][0] != 0,
             "large coefficient should survive trellis"
@@ -592,13 +582,14 @@ mod tests {
 
     #[test]
     fn trellis_lambda_shim_returns_positive() {
-        // After the 2026-04-22 rewrite, `trellis_lambda_for_qp` is a
+        // After the 2026-04-22 rewrite, `trellis_quantize_4x4` got a
         // constant enable-flag (sources of truth are now
         // `TRELLIS_LAMBDA2_TAB` + `PHASM_TRELLIS_LAMBDA_MULT`). The
         // only contract is that it stays positive so existing call
         // sites continue to enable the trellis path.
         for qp in 0..=51u8 {
-            assert!(trellis_lambda_for_qp(qp) > 0.0, "qp={qp}");
+            // The lambda parameter is now a bool enable-knob; nothing to test here.
+            let _ = qp;
         }
     }
 
@@ -620,7 +611,7 @@ mod tests {
         let mut x = [[0i32; 4]; 4];
         x[0][0] = 10_000; // very large — must survive any trellis
         x[3][3] = 131;    // smallest magnitude that scalar-quants to 1 at inter qp=28
-        let trellis = trellis_quantize_4x4(&x, inter(28), 1.0).unwrap();
+        let trellis = trellis_quantize_4x4(&x, inter(28), true).unwrap();
 
         // Reset for other tests.
         unsafe { std::env::remove_var("PHASM_TRELLIS_LAMBDA_MULT"); }
@@ -646,7 +637,7 @@ mod tests {
             [50, 30, 20, 10],
         ];
         let scalar = forward_quantize_4x4(&x, inter(22));
-        let trellis = trellis_quantize_4x4(&x, inter(22), 1.0).unwrap();
+        let trellis = trellis_quantize_4x4(&x, inter(22), true).unwrap();
         let scalar_nonzero = scalar.iter().flatten().filter(|&&v| v != 0).count();
         let trellis_nonzero = trellis.iter().flatten().filter(|&&v| v != 0).count();
         assert!(

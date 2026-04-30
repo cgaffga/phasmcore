@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
+#![allow(clippy::field_reassign_with_default)]
+// Same reasoning as in encoder.rs: step-by-step CabacNeighborMB
+// construction annotated per-field with spec references.
+
 //! CABAC neighbor context + `ctxIdxInc` derivation (spec § 9.3.3.1.1).
 //!
 //! Each CABAC syntax element computes its own `ctxIdxInc` based on
@@ -280,12 +284,10 @@ pub fn ctx_idx_inc_mvd_bin0(
 ) -> u32 {
     let abs_a = ctx
         .neighbor_a(mb_x)
-        .map(|n| n.abs_mvd_comp[component as usize][block_idx_in_mb_a].unsigned_abs() as u32)
-        .unwrap_or(0);
+        .map_or(0, |n| n.abs_mvd_comp[component as usize][block_idx_in_mb_a].unsigned_abs() as u32);
     let abs_b = ctx
         .neighbor_b(mb_x)
-        .map(|n| n.abs_mvd_comp[component as usize][block_idx_in_mb_b].unsigned_abs() as u32)
-        .unwrap_or(0);
+        .map_or(0, |n| n.abs_mvd_comp[component as usize][block_idx_in_mb_b].unsigned_abs() as u32);
     let sum = abs_a + abs_b;
     if sum < 3 {
         0
@@ -469,9 +471,7 @@ pub fn ctx_idx_inc_cbp_chroma(
                 // binIdx 0: any chroma coded at all? binIdx 1: chroma AC coded?
                 if bin_idx == 0 {
                     if mb.cbp_chroma != 0 { 1 } else { 0 }
-                } else {
-                    if mb.cbp_chroma == 2 { 1 } else { 0 }
-                }
+                } else if mb.cbp_chroma == 2 { 1 } else { 0 }
             }
         }
     };

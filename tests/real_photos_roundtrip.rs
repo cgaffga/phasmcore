@@ -18,7 +18,7 @@ fn discover_photos() -> Vec<std::path::PathBuf> {
     }
     let mut photos: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| {
             matches!(

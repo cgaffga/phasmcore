@@ -85,15 +85,13 @@ pub fn decode_scan(
     for mcu_row in 0..frame.mcus_tall as usize {
         for mcu_col in 0..frame.mcus_wide as usize {
             // Check for restart
-            if restart_interval > 0 && mcu_count > 0 && mcu_count % (restart_interval as usize) == 0 {
+            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
                 reader.byte_align();
                 // Look for RST marker — accept any RST without strict sequence
                 // validation, matching libjpeg/libjpeg-turbo behavior.
                 let _rst = reader.check_restart_marker()?;
                 // Reset DC predictors
-                for pred in &mut dc_pred {
-                    *pred = 0;
-                }
+                dc_pred.fill(0);
             }
 
             // Decode blocks for each component in this MCU
@@ -256,16 +254,15 @@ pub fn encode_scan_with_progress(
     let row_interval = if mcus_tall > 0 { (mcus_tall / JPEG_WRITE_STEPS as usize).max(1) } else { 1 };
 
     for mcu_row in 0..mcus_tall {
-        if let Some(ref cb) = on_progress {
-            if mcu_row > 0 && mcu_row % row_interval == 0 {
+        if let Some(ref cb) = on_progress
+            && mcu_row > 0 && mcu_row % row_interval == 0 {
                 cb();
             }
-        }
         for mcu_col in 0..frame.mcus_wide as usize {
             // Insert restart marker if needed
-            if restart_interval > 0 && mcu_count > 0 && mcu_count % (restart_interval as usize) == 0 {
+            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
                 // Flush current segment
-                let segment = std::mem::replace(&mut writer, BitWriter::new()).flush();
+                let segment = std::mem::take(&mut writer).flush();
                 output.extend_from_slice(&segment);
 
                 // Write RST marker (not byte-stuffed — markers are outside entropy data)
@@ -275,9 +272,7 @@ pub fn encode_scan_with_progress(
                 restart_count += 1;
 
                 // Reset DC predictors
-                for pred in &mut dc_pred {
-                    *pred = 0;
-                }
+                dc_pred.fill(0);
             }
 
             // Encode blocks for each component in this MCU
@@ -435,7 +430,7 @@ pub fn decode_progressive_scan(
         for block_row in 0..bt {
             for block_col in 0..bw {
                 // Handle restart markers
-                if restart_interval > 0 && block_count > 0 && block_count % (restart_interval as usize) == 0 {
+                if restart_interval > 0 && block_count > 0 && block_count.is_multiple_of(restart_interval as usize) {
                     reader.byte_align();
                     let _rst = reader.check_restart_marker()?;
                     dc_pred[0] = 0;
@@ -476,12 +471,10 @@ pub fn decode_progressive_scan(
         for mcu_row in 0..frame.mcus_tall as usize {
             for mcu_col in 0..frame.mcus_wide as usize {
                 // Handle restart markers
-                if restart_interval > 0 && mcu_count > 0 && mcu_count % (restart_interval as usize) == 0 {
+                if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
                     reader.byte_align();
                     let _rst = reader.check_restart_marker()?;
-                    for pred in &mut dc_pred {
-                        *pred = 0;
-                    }
+                    dc_pred.fill(0);
                     eob_run = 0;
                 }
 

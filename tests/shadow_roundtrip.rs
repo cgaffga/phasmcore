@@ -297,8 +297,8 @@ fn shadow_capacity_estimate() {
     // Grayscale: still has Y channel, so V2 should have capacity.
     let gray = load_test_image("gray_64x64_q75.jpg");
     let gray_img = JpegImage::from_bytes(&gray).unwrap();
-    let gray_cap = estimate_shadow_capacity(&gray_img).unwrap();
-    assert!(gray_cap >= 0, "grayscale capacity should be non-negative");
+    // usize is always >=0; just confirm the call succeeded (unwrap above).
+    let _gray_cap = estimate_shadow_capacity(&gray_img).unwrap();
 }
 
 #[test]

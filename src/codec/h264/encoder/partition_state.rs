@@ -233,28 +233,24 @@ pub fn predict_mv_for_mb_partition(
     // Directional shortcuts — only P_16x8 (4×2) and P_8x16 (2×4).
     if part_w_4x4 == 4 && part_h_4x4 == 2 {
         if mb_part_idx == 0 {
-            if let Some((mv, r)) = b {
-                if r == current_ref_idx {
+            if let Some((mv, r)) = b
+                && r == current_ref_idx {
                     return mv;
                 }
-            }
-        } else if let Some((mv, r)) = a {
-            if r == current_ref_idx {
+        } else if let Some((mv, r)) = a
+            && r == current_ref_idx {
                 return mv;
             }
-        }
     } else if part_w_4x4 == 2 && part_h_4x4 == 4 {
         if mb_part_idx == 0 {
-            if let Some((mv, r)) = a {
-                if r == current_ref_idx {
+            if let Some((mv, r)) = a
+                && r == current_ref_idx {
                     return mv;
                 }
-            }
-        } else if let Some((mv, r)) = c {
-            if r == current_ref_idx {
+        } else if let Some((mv, r)) = c
+            && r == current_ref_idx {
                 return mv;
             }
-        }
     }
 
     predict_mv_for_partition(grid, tl_bx, tl_by, part_w_4x4, current_ref_idx)
@@ -298,11 +294,10 @@ pub fn predict_mv_for_partition(
     // the predictor.
     let availability = [a.is_some(), b.is_some(), c.is_some()];
     let avail_count: u8 = availability.iter().map(|&v| v as u8).sum();
-    if avail_count == 1 {
-        if let Some((mv, _)) = a.or(b).or(c) {
+    if avail_count == 1
+        && let Some((mv, _)) = a.or(b).or(c) {
             return mv;
         }
-    }
 
     // Single-matching-ref_idx special case.
     let matches: [Option<MotionVector>; 3] = [
@@ -311,13 +306,10 @@ pub fn predict_mv_for_partition(
         c.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
     ];
     let match_count = matches.iter().filter(|m| m.is_some()).count();
-    if match_count == 1 {
-        for m in &matches {
-            if let Some(mv) = m {
-                return *mv;
-            }
+    if match_count == 1
+        && let Some(mv) = matches.iter().flatten().next() {
+            return *mv;
         }
-    }
 
     // General case: componentwise median; unavailable = zero.
     let la = a.map(|(m, _)| m).unwrap_or_default();
@@ -366,16 +358,14 @@ pub fn predict_p_skip_mv(grid: &EncoderMvGrid, tl_bx: usize, tl_by: usize) -> Mo
     // intentionally falls through to the median below.
     let a = grid.get(x - 1, y);
     let b = grid.get(x, y - 1);
-    if let Some((mv_a, ref_a)) = a {
-        if ref_a == 0 && mv_a.mv_x == 0 && mv_a.mv_y == 0 {
+    if let Some((mv_a, ref_a)) = a
+        && ref_a == 0 && mv_a.mv_x == 0 && mv_a.mv_y == 0 {
             return MotionVector { mv_x: 0, mv_y: 0 };
         }
-    }
-    if let Some((mv_b, ref_b)) = b {
-        if ref_b == 0 && mv_b.mv_x == 0 && mv_b.mv_y == 0 {
+    if let Some((mv_b, ref_b)) = b
+        && ref_b == 0 && mv_b.mv_x == 0 && mv_b.mv_y == 0 {
             return MotionVector { mv_x: 0, mv_y: 0 };
         }
-    }
     // Fall through to standard AMVP median. Intra neighbors contribute
     // mv=(0,0) at that layer per § 8.4.1.3.
     predict_mv_for_partition(grid, tl_bx, tl_by, 4, 0)

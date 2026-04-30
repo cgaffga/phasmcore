@@ -22,7 +22,7 @@ pub fn stc_extract(stego_bits: &[u8], hhat: &[Vec<u32>], w: usize) -> Vec<u8> {
     }
 
     let n = stego_bits.len();
-    let m = (n + w - 1) / w; // ceil(n / w)
+    let m = n.div_ceil(w); // ceil(n / w)
 
     let mut message = Vec::with_capacity(m);
     let mut state = 0u32;

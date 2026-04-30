@@ -110,7 +110,7 @@ pub fn decode_via_ffmpeg_with_format(
             "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1",
         ]
         .iter()
-        .map(|s| s.to_string()),
+        .map(std::string::ToString::to_string),
     );
     let mut child = Command::new("ffmpeg")
         .args(&args)

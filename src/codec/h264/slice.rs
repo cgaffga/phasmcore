@@ -83,6 +83,21 @@ pub struct SliceHeader {
     pub num_ref_idx_l0_active: u8,
     /// Active number of L1 reference indices (B-slices only).
     pub num_ref_idx_l1_active: u8,
+    /// Direct mode predictor selection for B-slices (spec § 7.4.3).
+    /// `true`  → spatial direct (mobile encoder default).
+    /// `false` → temporal direct.
+    /// Phase 6E-A locks `true`; the decoder needs the parsed value
+    /// for compliance with arbitrary B-slice streams. Always
+    /// `false` for non-B slices.
+    pub direct_spatial_mv_pred_flag: bool,
+    /// `cabac_init_idc` from the slice header (spec § 7.4.3) — selects
+    /// which P/B context-init column to use (slot 1, 2, or 3 in the
+    /// internal `CabacInitSlot::PIdc{0,1,2}` enum). 0 for I/SI slices.
+    /// Phase 6E-A captures this so B-slice CABAC contexts initialize
+    /// correctly; the encoder side already emits a fixed value (we
+    /// continue to use idc=0 by default for stealth-via-mimicry of
+    /// mobile encoder defaults).
+    pub cabac_init_idc: u8,
     /// Slice QP delta (relative to PPS init_qp).
     pub slice_qp_delta: i32,
     /// Deblocking filter control.
@@ -156,10 +171,14 @@ pub fn parse_slice_header(
         let _redundant_pic_cnt = r.read_ue()?;
     }
 
-    // Slice type-dependent header fields
-    if slice_type == SliceType::B {
-        r.skip_bits(1)?; // direct_spatial_mv_pred_flag
-    }
+    // Slice type-dependent header fields. § 6E-A2 captures
+    // direct_spatial_mv_pred_flag (was read+discarded). False for
+    // non-B slices.
+    let direct_spatial_mv_pred_flag = if slice_type == SliceType::B {
+        r.read_bit()?
+    } else {
+        false
+    };
 
     // num_ref_idx_active_override: defaults from PPS, overridden in slice header.
     let mut num_ref_idx_l0_active = pps.num_ref_idx_l0_default;
@@ -214,12 +233,15 @@ pub fn parse_slice_header(
         }
     }
 
-    // CABAC init (only if CABAC, which we reject in PPS, but parse for robustness)
+    // CABAC init — § 6E-A2 captures cabac_init_idc (was discarded).
+    // Selects which of the three P/B context-init columns to use
+    // (CabacInitSlot::PIdc{0,1,2}).
+    let mut cabac_init_idc = 0u8;
     if pps.entropy_coding_mode_flag
         && slice_type != SliceType::I
         && slice_type != SliceType::SI
     {
-        let _cabac_init_idc = r.read_ue()?;
+        cabac_init_idc = r.read_ue()? as u8;
     }
 
     let slice_qp_delta = r.read_se()?;
@@ -263,6 +285,8 @@ pub fn parse_slice_header(
         pic_order_cnt_lsb,
         num_ref_idx_l0_active,
         num_ref_idx_l1_active,
+        direct_spatial_mv_pred_flag,
+        cabac_init_idc,
         slice_qp_delta,
         disable_deblocking_filter_idc,
         slice_alpha_c0_offset_div2,
@@ -481,5 +505,85 @@ mod tests {
         assert!(!SliceType::I.is_inter());
         assert!(!SliceType::P.is_intra());
         assert!(SliceType::P.is_inter());
+    }
+
+    /// §6E-A2 — B-slice header parsing captures direct_spatial_mv_pred_flag
+    /// + cabac_init_idc + num_ref_idx_l1_active.
+    #[test]
+    fn parse_b_slice_header_captures_b_specific_fields() {
+        let sps = make_test_sps();
+        let mut pps = make_test_pps();
+        pps.entropy_coding_mode_flag = true; // CABAC for cabac_init_idc
+
+        let mut bits = BitWriter::new();
+        bits.write_ue(0); // first_mb_in_slice
+        bits.write_ue(6); // slice_type = 6 → B (all MBs)
+        bits.write_ue(0); // pps_id
+        bits.write_bits(2, 4); // frame_num = 2
+        bits.write_bits(4, 6); // pic_order_cnt_lsb = 4
+        // direct_spatial_mv_pred_flag = 1 (Phase 6E-A default)
+        bits.write_bit(true);
+        // num_ref_idx_active_override = 0 (use PPS defaults)
+        bits.write_bit(false);
+        // ref_pic_list_modification: B-slice has both L0 + L1 flags
+        bits.write_bit(false); // ref_pic_list_modification_flag_l0
+        bits.write_bit(false); // ref_pic_list_modification_flag_l1
+        // dec_ref_pic_marking — nal_ref_idc=0 (B is non-reference) so
+        // skip
+        // cabac_init_idc = 1
+        bits.write_ue(1);
+        // slice_qp_delta
+        bits.write_se(0);
+        // deblocking
+        bits.write_ue(0);
+        bits.write_se(0);
+        bits.write_se(0);
+        bits.align();
+
+        let hdr = parse_slice_header(
+            &bits.data, &sps, &pps,
+            NalType::SLICE,
+            /* nal_ref_idc */ 0,
+        ).unwrap();
+        assert_eq!(hdr.slice_type, SliceType::B);
+        assert!(hdr.direct_spatial_mv_pred_flag);
+        assert_eq!(hdr.cabac_init_idc, 1);
+        assert_eq!(hdr.num_ref_idx_l0_active, pps.num_ref_idx_l0_default);
+        assert_eq!(hdr.num_ref_idx_l1_active, pps.num_ref_idx_l1_default);
+        assert_eq!(hdr.frame_num, 2);
+        assert_eq!(hdr.pic_order_cnt_lsb, 4);
+    }
+
+    /// §6E-A2 — non-B slices have direct_spatial_mv_pred_flag = false
+    /// (the field is meaningless for them; we set it to false to avoid
+    /// any surprise).
+    #[test]
+    fn non_b_slice_has_direct_spatial_false() {
+        let sps = make_test_sps();
+        let pps = make_test_pps();
+
+        let mut bits = BitWriter::new();
+        bits.write_ue(0);
+        bits.write_ue(7); // I (all MBs)
+        bits.write_ue(0);
+        bits.write_bits(0, 4);
+        bits.write_ue(0);
+        bits.write_bits(0, 6);
+        bits.write_bit(false);
+        bits.write_bit(false);
+        bits.write_se(0);
+        bits.write_ue(0);
+        bits.write_se(0);
+        bits.write_se(0);
+        bits.align();
+
+        let hdr = parse_slice_header(
+            &bits.data, &sps, &pps,
+            NalType::SLICE_IDR, 3,
+        ).unwrap();
+        assert_eq!(hdr.slice_type, SliceType::I);
+        assert!(!hdr.direct_spatial_mv_pred_flag);
+        // I-slice has no cabac_init_idc field; defaults to 0.
+        assert_eq!(hdr.cabac_init_idc, 0);
     }
 }

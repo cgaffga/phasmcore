@@ -67,6 +67,28 @@ pub fn apply_luma_mv_block(
     out: &mut [u8],
     out_stride: usize,
 ) {
+    if super::simd::apply_luma_mv_block_dispatch(
+        &reference.y, reference.width, reference.height,
+        block_x, block_y, block_w, block_h,
+        mv.mv_x, mv.mv_y,
+        out, out_stride,
+    ) {
+        return;
+    }
+    apply_luma_mv_block_scalar(reference, block_x, block_y, block_w, block_h, mv, out, out_stride);
+}
+
+#[inline]
+fn apply_luma_mv_block_scalar(
+    reference: &ReconFrame,
+    block_x: u32,
+    block_y: u32,
+    block_w: u32,
+    block_h: u32,
+    mv: MotionVector,
+    out: &mut [u8],
+    out_stride: usize,
+) {
     for yl in 0..block_h {
         for xl in 0..block_w {
             let x_int = block_x as i32 + (mv.mv_x as i32 >> 2) + xl as i32;
@@ -130,7 +152,15 @@ fn sample_luma_frac(
     // For a row at vertical offset dy, b1 at horizontal int offset (0) is:
     //   b1 = E − 5F + 20G + 20H − 5I + J
     //   where E..J are at (-2, dy), (-1, dy), (0, dy), (1, dy), (2, dy), (3, dy).
-    let b1 = |dy: i32| -> i32 {
+    //
+    // Bound: each ref_g sample ∈ [0, 255]. Worst-case magnitude is
+    // |b1| ≤ (1 + 5 + 20 + 20 + 5 + 1) · 255 = 13260 → fits i16 (max 32767)
+    // with margin. Returning i16 here doubles NEON `int16x8_t` lane density
+    // (8 lanes/128-bit reg) over the i32 alternative (4 lanes), the only
+    // reason this isn't just `i32`. Vertical-pass `j1` reads multiple b1's
+    // and CAN'T fit in i16 (worst case 6×13260·sum-abs ≈ 689k → must stay
+    // i32) so consumers cast back to i32.
+    let b1 = |dy: i32| -> i16 {
         filter6([
             ref_g(-2, dy),
             ref_g(-1, dy),
@@ -138,12 +168,13 @@ fn sample_luma_frac(
             ref_g(1, dy),
             ref_g(2, dy),
             ref_g(3, dy),
-        ])
+        ]) as i16
     };
     // Vertical half-pel intermediate `h1` at integer column dx:
     //   h1 = A − 5C + 20G + 20M − 5R + T
     //   where A..T are at (dx, -2), (dx, -1), (dx, 0), (dx, 1), (dx, 2), (dx, 3).
-    let h1 = |dx: i32| -> i32 {
+    // Same i16 bound as b1.
+    let h1 = |dx: i32| -> i16 {
         filter6([
             ref_g(dx, -2),
             ref_g(dx, -1),
@@ -151,18 +182,26 @@ fn sample_luma_frac(
             ref_g(dx, 1),
             ref_g(dx, 2),
             ref_g(dx, 3),
-        ])
+        ]) as i16
     };
-    // Final half-pel values (post-clip).
-    let b = |dy: i32| clip1y((b1(dy) + 16) >> 5) as i32;
-    let h = |dx: i32| clip1y((h1(dx) + 16) >> 5) as i32;
+    // Final half-pel values (post-clip). Cast back to i32 for arithmetic.
+    let b = |dy: i32| clip1y((b1(dy) as i32 + 16) >> 5) as i32;
+    let h = |dx: i32| clip1y((h1(dx) as i32 + 16) >> 5) as i32;
     // `j` is the center quarter-pel: apply 6-tap filter vertically to
     // a column of horizontally-pre-filtered `b1` values. Per
     // Eq. 8-248: j1 = aa − 5bb + 20·b1 + 20·s1 − 5·gg + hh.
     // where aa, bb, gg, s1, hh are b1 at dy = -2, -1, 1, 2, 3 relative
-    // to the target row (dy=0).
+    // to the target row (dy=0). j1 needs i32 — sum of 6 i16 b1 values
+    // weighted by sum-abs 52 exceeds i16 range.
     let j = || {
-        let j1 = filter6([b1(-2), b1(-1), b1(0), b1(1), b1(2), b1(3)]);
+        let j1 = filter6([
+            b1(-2) as i32,
+            b1(-1) as i32,
+            b1(0) as i32,
+            b1(1) as i32,
+            b1(2) as i32,
+            b1(3) as i32,
+        ]);
         clip1y((j1 + 512) >> 10) as i32
     };
 
@@ -378,7 +417,7 @@ mod tests {
 
     #[test]
     fn chroma_integer_mv_returns_ref_unchanged() {
-        let reference = make_reference(64, 48, |_, _| 128);
+        let _reference = make_reference(64, 48, |_, _| 128);
         // Custom chroma: Cb = some pattern.
         let mut rb = ReconBuffer::new(64, 48).unwrap();
         for y in 0..24 {

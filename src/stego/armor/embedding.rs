@@ -29,7 +29,7 @@ pub fn compute_mean_qt(qt_values: &[u16; 64]) -> f64 {
     let mut count = 0usize;
     for nat_idx in 0..64 {
         let zz = NATURAL_TO_ZIGZAG[nat_idx];
-        if zz >= 1 && zz <= MAX_ARMOR_ZIGZAG {
+        if (1..=MAX_ARMOR_ZIGZAG).contains(&zz) {
             sum += qt_values[nat_idx] as f64;
             count += 1;
         }

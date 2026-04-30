@@ -320,7 +320,7 @@ fn i_then_p_shifted_square_decodes_cleanly() {
     let c_size = ((w / 2) * (h / 2)) as usize;
     for y in 0..h {
         for x in 0..w {
-            let is_sq = x >= 8 && x < 24 && y >= 8 && y < 24;
+            let is_sq = (8..24).contains(&x) && (8..24).contains(&y);
             frame1[(y * w + x) as usize] = if is_sq { 180 } else { 100 };
         }
     }
@@ -330,7 +330,7 @@ fn i_then_p_shifted_square_decodes_cleanly() {
     let mut frame2 = vec![0u8; (w * h * 3 / 2) as usize];
     for y in 0..h {
         for x in 0..w {
-            let is_sq = x >= 12 && x < 28 && y >= 8 && y < 24;
+            let is_sq = (12..28).contains(&x) && (8..24).contains(&y);
             frame2[(y * w + x) as usize] = if is_sq { 180 } else { 100 };
         }
     }
@@ -366,7 +366,7 @@ fn i_then_p_horizontal_stripe_motion_decodes_cleanly() {
     let mut frame1 = vec![128u8; (w * h * 3 / 2) as usize];
     for y in 0..h {
         for x in 0..w {
-            frame1[(y * w + x) as usize] = ((x as u32 * 7 + y as u32 * 5) & 0xFF) as u8;
+            frame1[(y * w + x) as usize] = ((x * 7 + y * 5) & 0xFF) as u8;
         }
     }
     for i in 0..2 * c_size {
@@ -415,7 +415,7 @@ fn i4x4_mixed_content_decodes_cleanly() {
     let mut frame = vec![128u8; (w * h * 3 / 2) as usize];
     for y in 0..h {
         for x in 0..w {
-            let base = (x as u32 * 11 + y as u32 * 7) & 0xFF;
+            let base = (x * 11 + y * 7) & 0xFF;
             let noise = if ((x / 4) + (y / 4)) & 1 == 0 { 20 } else { 0 };
             frame[(y * w + x) as usize] = (base + noise).min(255) as u8;
         }
@@ -453,7 +453,7 @@ fn i_then_p_fine_grained_motion_decodes_cleanly() {
             // Busy 4-pixel-period pattern so fine partitions have
             // enough SATD structure to differentiate.
             frame1[(y * w + x) as usize] =
-                (((x as u32 / 2) * 31 + (y as u32 / 2) * 17) & 0xFF) as u8;
+                (((x / 2) * 31 + (y / 2) * 17) & 0xFF) as u8;
         }
     }
     for i in 0..2 * c_size {
@@ -509,7 +509,7 @@ fn i_then_p_quadrant_motion_decodes_cleanly() {
     let mut frame1 = vec![128u8; (w * h * 3 / 2) as usize];
     for y in 0..h {
         for x in 0..w {
-            frame1[(y * w + x) as usize] = ((x as u32 * 13 + y as u32 * 9) & 0xFF) as u8;
+            frame1[(y * w + x) as usize] = ((x * 13 + y * 9) & 0xFF) as u8;
         }
     }
     for i in 0..2 * c_size {
@@ -560,7 +560,7 @@ fn i_then_p_vertical_stripe_motion_decodes_cleanly() {
     let mut frame1 = vec![128u8; (w * h * 3 / 2) as usize];
     for y in 0..h {
         for x in 0..w {
-            frame1[(y * w + x) as usize] = ((x as u32 * 5 + y as u32 * 7) & 0xFF) as u8;
+            frame1[(y * w + x) as usize] = ((x * 5 + y * 7) & 0xFF) as u8;
         }
     }
     for i in 0..2 * c_size {

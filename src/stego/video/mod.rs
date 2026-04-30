@@ -16,8 +16,9 @@ pub mod h264_pipeline;
 // H.264 (production) re-exports.
 pub use h264_pipeline::{
     h264_ghost_encode, h264_ghost_encode_inplace,
-    h264_ghost_decode, h264_ghost_capacity,
-    h264_ghost_encode_path, h264_ghost_decode_path, h264_ghost_capacity_path,
+    h264_ghost_decode, h264_ghost_capacity, h264_ghost_capacity_max,
+    h264_ghost_encode_path, h264_ghost_decode_path,
+    h264_ghost_capacity_path, h264_ghost_capacity_max_path,
 };
 pub use crate::codec::mp4::is_mp4;
 

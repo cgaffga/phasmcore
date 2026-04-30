@@ -11,7 +11,7 @@
 //! Reference: ITU-T H.264 Sections 7.3.5 (macroblock layer) and 7.4.5.
 
 use super::bitstream::{EpByteMap, RbspReader};
-use super::cavlc::{decode_cavlc_block, CavlcBlock, EmbeddablePosition};
+use super::cavlc::{decode_cavlc_block, EmbeddablePosition};
 use super::slice::SliceType;
 use super::sps::{Pps, Sps};
 use super::H264Error;
@@ -434,12 +434,8 @@ pub fn parse_macroblock_with_recon(
         let pcm_bytes = 256 + 2 * 64; // 4:2:0
         reader.skip_bits(pcm_bytes * 8)?;
         // All TotalCoeffs = 16 for I_PCM (per spec)
-        for tc in &mut luma_total_coeffs {
-            *tc = 16;
-        }
-        for tc in &mut chroma_total_coeffs {
-            *tc = 16;
-        }
+        luma_total_coeffs.fill(16);
+        chroma_total_coeffs.fill(16);
         update_neighbor_tc(ctx, mb_x, mb_y, &luma_total_coeffs, &chroma_total_coeffs);
         return Ok(Macroblock {
             mb_type,
@@ -486,22 +482,19 @@ pub fn parse_macroblock_with_recon(
     )?;
 
     // Parse coded_block_pattern (except I_16x16 where it's in mb_type)
-    let coded_block_pattern = match mb_type {
-        MbType::I16x16(_, cbp_luma, cbp_chroma) => {
-            (cbp_chroma as u32) << 4 | cbp_luma as u32
+    let coded_block_pattern = if let MbType::I16x16(_, cbp_luma, cbp_chroma) = mb_type {
+        (cbp_chroma as u32) << 4 | cbp_luma as u32
+    } else {
+        let cbp_code = reader.read_ue()?;
+        if cbp_code >= 48 {
+            return Err(H264Error::CavlcError(format!(
+                "cbp code_num {cbp_code} >= 48"
+            )));
         }
-        _ => {
-            let cbp_code = reader.read_ue()?;
-            if cbp_code >= 48 {
-                return Err(H264Error::CavlcError(format!(
-                    "cbp code_num {cbp_code} >= 48"
-                )));
-            }
-            if mb_type.is_intra() {
-                CBP_INTRA_TABLE[cbp_code as usize]
-            } else {
-                CBP_INTER_TABLE[cbp_code as usize]
-            }
+        if mb_type.is_intra() {
+            CBP_INTRA_TABLE[cbp_code as usize]
+        } else {
+            CBP_INTER_TABLE[cbp_code as usize]
         }
     };
 
@@ -771,9 +764,7 @@ fn parse_mb_type(
                 ))),
             }
         }
-        _ => Err(H264Error::Unsupported(format!(
-            "B/SI slice mb_type parsing not implemented"
-        ))),
+        _ => Err(H264Error::Unsupported("B/SI slice mb_type parsing not implemented".to_string())),
     }
 }
 
@@ -869,7 +860,7 @@ fn parse_prediction_info(
         }
         MbType::I16x16(_, _, _) => {
             let chroma_mode = reader.read_ue()? as u8; // intra_chroma_pred_mode
-            if let Some(r) = recon.as_deref_mut() {
+            if let Some(r) = recon {
                 r.intra_chroma_pred_mode = chroma_mode;
             }
         }
@@ -878,7 +869,7 @@ fn parse_prediction_info(
             // properly. Otherwise fall back to the old discard-the-bits
             // behaviour so Phase 1a callers keep working.
             if let Some(mv_ctx) = mv_ctx {
-                return Ok(super::mv::parse_mv_field(
+                return super::mv::parse_mv_field(
                     reader,
                     mb_type,
                     mb_x,
@@ -888,7 +879,7 @@ fn parse_prediction_info(
                     ep_map,
                     raw_data,
                     mvd_positions,
-                )?);
+                );
             }
             // No mv_ctx: consume the bits so the stream stays in sync but
             // discard the values (same as pre-Phase-2 behaviour).

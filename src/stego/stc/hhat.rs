@@ -28,7 +28,7 @@ pub fn generate_hhat(h: usize, w: usize, seed: &[u8; 32]) -> Vec<Vec<u32>> {
     for _ in 0..w {
         let mut val = rng.r#gen::<u32>() & mask;
         // Ensure odd Hamming weight so every column contributes to the syndrome.
-        if val.count_ones() % 2 == 0 {
+        if val.count_ones().is_multiple_of(2) {
             val ^= 1; // flip lowest bit
         }
         cols.push(val);

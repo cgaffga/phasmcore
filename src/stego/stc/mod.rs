@@ -19,3 +19,5 @@
 pub mod hhat;
 pub mod embed;
 pub mod extract;
+pub mod streaming;
+pub mod streaming_segmented;

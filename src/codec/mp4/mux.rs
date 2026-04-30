@@ -348,12 +348,11 @@ pub fn mux_streaming<R: Read + Seek, W: Write>(
     // Write mdat content: stream samples from reader or modified data
     let mut buf = Vec::new();
     for sr in &all_samples {
-        if sr.track_idx == video_idx {
-            if let Some(new_data) = mods.get(&sr.sample_idx) {
+        if sr.track_idx == video_idx
+            && let Some(new_data) = mods.get(&sr.sample_idx) {
                 writer.write_all(new_data).map_err(|_| Mp4Error::InvalidBox("write failed".into()))?;
                 continue;
             }
-        }
 
         // Read original sample data from reader via seek
         let size = sr.original_size as usize;
@@ -482,9 +481,7 @@ fn compute_chunk_first_samples(
     // Expand stsc → samples_per_chunk for every chunk (same logic as demux)
     let mut samples_per_chunk = vec![0u32; num_chunks];
     if stsc_entries.is_empty() {
-        for spc in &mut samples_per_chunk {
-            *spc = 1;
-        }
+        samples_per_chunk.fill(1);
     } else {
         for (i, entry) in stsc_entries.iter().enumerate() {
             let first_chunk = entry.0 as usize; // 1-based
@@ -659,11 +656,10 @@ fn find_trak_range(moov_data: &[u8], target_track_id: u32) -> Result<(usize, usi
                 let trak_end = trak_start + header.size as usize;
 
                 // Look for tkhd inside this trak to get the track_id
-                if let Some(track_id) = extract_track_id(moov_data, content_start, trak_end) {
-                    if track_id == target_track_id {
+                if let Some(track_id) = extract_track_id(moov_data, content_start, trak_end)
+                    && track_id == target_track_id {
                         found = Some((trak_start, trak_end));
                     }
-                }
             }
             Ok(())
         },
@@ -816,7 +812,7 @@ mod tests {
         hvcc_content.extend_from_slice(&[0, 0]);
         hvcc_content.push(0x0F);
         hvcc_content.push(1);
-        hvcc_content.push(0x20 | 32);
+        hvcc_content.push(0x20);
         hvcc_content.extend_from_slice(&1u16.to_be_bytes());
         let vps = [0x40, 0x01, 0x0C];
         hvcc_content.extend_from_slice(&(vps.len() as u16).to_be_bytes());

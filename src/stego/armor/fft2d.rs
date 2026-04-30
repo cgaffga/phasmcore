@@ -87,7 +87,7 @@ impl BluesteinPlan {
         // Convolve: A = FFT(a), C = IFFT(A * B_hat)
         fft_radix2_f32(&mut a, -1.0);
         for i in 0..self.m {
-            a[i] = a[i] * self.b_hat[i];
+            a[i] *= self.b_hat[i];
         }
         fft_radix2_f32(&mut a, 1.0);
 
@@ -138,17 +138,32 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
         }
     }
 
+    // Pre-allocate the twiddle buffer once; largest stage needs n/2 entries.
+    let mut twiddles: Vec<Complex32> = Vec::with_capacity(n / 2);
+
     // Butterfly stages
     let mut len = 2;
     while len <= n {
         let half = len / 2;
         let angle_step = sign * PI / half as f64;
+
+        // Pre-compute twiddles for this stage. The previous code recomputed
+        // (s, c) for every (start, k) pair, but the values depend only on
+        // (half, k) — within a stage of width `len`, each twiddle was being
+        // recomputed `n / len` times. With this cache, det_sincos is called
+        // `half` times per stage instead of `(n / len) * half = n / 2`. Total
+        // det_sincos calls across all stages drop from `~(n / 2) · log2(n)`
+        // to `~n` — a `log2(n)` reduction (≈12× on 4096-point row FFTs).
+        twiddles.clear();
+        twiddles.extend((0..half).map(|k| {
+            let angle = angle_step * k as f64;
+            let (s, c) = det_sincos(angle);
+            Complex32::new(c as f32, s as f32)
+        }));
+
         for start in (0..n).step_by(len) {
             for k in 0..half {
-                let angle = angle_step * k as f64;
-                // Use f64 det_sincos for twiddle factor precision, cast to f32
-                let (s, c) = det_sincos(angle);
-                let w = Complex32::new(c as f32, s as f32);
+                let w = twiddles[k];
                 let u = data[start + k];
                 let v = data[start + k + half] * w;
                 data[start + k] = u + v;

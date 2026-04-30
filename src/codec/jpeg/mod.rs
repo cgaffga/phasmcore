@@ -104,7 +104,7 @@ impl JpegImage {
                 if m == marker::SOS {
                     return false; // Reached scan data without finding SOF2
                 }
-                if m == 0x00 || m == 0xFF || (m >= 0xD0 && m <= 0xD7) || m == marker::SOI || m == marker::EOI {
+                if m == 0x00 || m == 0xFF || (0xD0..=0xD7).contains(&m) || m == marker::SOI || m == marker::EOI {
                     pos += 2;
                     continue;
                 }
@@ -564,11 +564,9 @@ impl JpegImage {
                 // Reset DC predictors at restart boundaries (must match encode_scan)
                 if self.restart_interval > 0
                     && mcu_count > 0
-                    && mcu_count % (self.restart_interval as usize) == 0
+                    && mcu_count.is_multiple_of(self.restart_interval as usize)
                 {
-                    for pred in &mut dc_pred {
-                        *pred = 0;
-                    }
+                    dc_pred.fill(0);
                 }
 
                 for (sci, sc) in self.scan_components.iter().enumerate() {

@@ -21,7 +21,8 @@
 //! block variants (luma 4×4, I_16x16 luma AC, chroma AC, chroma DC)
 //! via the `max_coeffs` argument.
 
-use super::encoder::bitstream_writer::{BitSink, BitWriter};
+#[allow(unused_imports)]
+use super::encoder::bitstream_writer::{BitSink, BitWriter};  // BitWriter used only in tests
 use super::tables::{encode_coeff_token, encode_run_before, encode_total_zeros};
 use super::H264Error;
 
@@ -142,7 +143,7 @@ pub fn encode_cavlc_block<S: BitSink>(
         if suffix_length == 0 {
             suffix_length = 1;
         }
-        if suffix_length < 6 && abs_level > thresholds[(suffix_length as usize - 1)] {
+        if suffix_length < 6 && abs_level > thresholds[suffix_length as usize - 1] {
             suffix_length += 1;
         }
     }
@@ -387,7 +388,7 @@ mod tests {
     fn check_round_trip(coeffs: &[i32], nc: i8, bt: CavlcBlockType) {
         let bytes = encode_to_bytes(coeffs, nc, bt);
         // Pad tail so decoder can always read a trailing-zero run_before.
-        let mut padded = bytes.clone();
+        let mut padded = bytes;
         padded.extend_from_slice(&[0u8; 4]);
         let ep_map = identity_ep_map(padded.len());
         let mut reader = RbspReader::new(&padded);

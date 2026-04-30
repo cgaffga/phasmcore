@@ -227,20 +227,39 @@ Early implementation of H.264 video steganography lives in this crate.
 Baseline H.264 streams across four domains (trailing-one signs,
 level-suffix magnitude LSBs, level-suffix sign LSBs, motion-vector
 difference LSBs). The pure-Rust H.264 encoder and its CABAC entropy
-coder are clean-room — no ffmpeg/x264 code derivation; numeric tables
-are transcribed from ITU-T H.264 or cited to published academic
+coder are clean-room — no ffmpeg/x264/OpenH264 code derivation; numeric
+tables are transcribed from ITU-T H.264 or cited to published academic
 sources.
 
-The encoder is gated behind the `h264-encoder` feature (OFF by
-default). GitHub Release CLI binaries do NOT bundle the encoder —
-consumers wanting CLI video stego build from source with
-`cargo install phasm-cli --features h264-encoder`. This posture
-accommodates the Via LA AVC patent-pool licensing for distributed
-encoder binaries.
+### Source-only distribution (patent-pool posture)
 
-Not yet shipped in any phasm CLI or mobile-app build. The API and
-default feature set will change. Published here for transparency
-and review; production use is not recommended at this stage.
+The encoder is gated behind the `h264-encoder` Cargo feature, which is
+**OFF by default**. Pre-built binaries published to GitHub Releases (the
+`phasm` CLI installer at the bottom of this README) do **NOT** bundle
+the H.264 encoder — they ship JPEG steganography only. Consumers who
+want CLI video stego must rebuild from source themselves:
+
+```bash
+cargo install phasm-cli --features h264-encoder
+```
+
+This posture accommodates [Via LA's AVC patent-pool](https://www.via-la.com/licensing-2/avc-h-264/)
+licensing for distributed H.264 encoder binaries. Source-only
+distribution is permitted royalty-free; binary distribution above the
+free-tier (100,000 units/year as of 2026) is not. Mobile-app builds
+include the encoder and are subject to the patent-pool terms applicable
+to those distribution channels — not to source consumers of this
+crate.
+
+The `core/cli/Cargo.toml` and `core/Cargo.toml` make this gating
+explicit; do not enable `h264-encoder` for any binary you intend to
+publish through GitHub Releases or other free-tier-blind channels
+without first reviewing the Via LA AVC license terms.
+
+Not yet shipped in any phasm CLI or mobile-app build at production
+quality. The API and default feature set will change. Published here
+for transparency and review; production use is not recommended at this
+stage.
 
 ## Cargo Features
 
@@ -330,7 +349,7 @@ cargo run -p phasm-core --example test_link -- stego.jpg
 ### Design Principles
 
 - **Zero C FFI** — pure Rust from JPEG parsing to AES encryption, compiles to native and WASM
-- **Deterministic** — identical output across x86, ARM, and WASM using [FDLIBM-based math](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
+- **Deterministic** — identical output across x86, ARM, and WASM using a [pure-IEEE 754 polynomial math module](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
 - **Memory-efficient** — strip-based wavelet computation, compact positions (8 bytes each), 1-bit packed Viterbi back pointers (32× reduction), segmented checkpoint for large images (O(√n) memory), `i8`-quantized SI-UNIWARD rounding errors (8× smaller than `f64`), strip-by-strip luma block computation, strategic `drop()` calls before JPEG output. Supports **200 MP** images under ~1 GB peak memory.
 - **Short messages** — optimized for text payloads under 1 KB
 - **Stego output is raw** — the JPEG bytes after encoding must be saved/shared without re-encoding
@@ -478,7 +497,7 @@ In-house Cooley-Tukey + Bluestein FFT implementation using deterministic twiddle
 ```
 src/
   lib.rs            Public API re-exports
-  det_math.rs       Deterministic math (FDLIBM sin/cos/atan2/hypot)
+  det_math.rs       Deterministic math (sin/cos/atan2/hypot/exp/powi)
   jpeg/
     mod.rs          JpegImage: parse, modify, serialize
     bitio.rs        Bit-level reader/writer with JPEG byte stuffing

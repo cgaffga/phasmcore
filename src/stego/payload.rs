@@ -75,7 +75,7 @@ pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoE
         if file.content.len() > MAX_RAW_FILE_SIZE {
             return Err(StegoError::MessageTooLarge);
         }
-        if file.filename.as_bytes().len() > 255 {
+        if file.filename.len() > 255 {
             return Err(StegoError::MessageTooLarge);
         }
     }
@@ -92,9 +92,7 @@ pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoE
 /// Falls back to `text.as_bytes().len() + 1` (raw text + flags byte) if
 /// `encode_payload` fails for any reason (e.g. file too large).
 pub fn compressed_payload_size(text: &str, files: &[FileEntry]) -> usize {
-    encode_payload(text, files)
-        .map(|v| v.len())
-        .unwrap_or_else(|_| text.as_bytes().len() + 1)
+    encode_payload(text, files).map_or_else(|_| text.len() + 1, |v| v.len())
 }
 
 /// Decode a payload from decrypted bytes.

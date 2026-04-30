@@ -192,7 +192,7 @@ pub fn decode_cavlc_block(
 
             // Record level suffix positions for future phases
             if suffix_length >= 1 && suffix_start_byte < ep_map.rbsp_to_raw.len() {
-                let raw_byte = ep_map.rbsp_to_raw[suffix_start_byte];
+                let _raw_byte = ep_map.rbsp_to_raw[suffix_start_byte];
 
                 // Suffix bit 0 = sign (LevelSuffixSign, Phase 2)
                 // This is the LSB of the suffix field
@@ -246,7 +246,7 @@ pub fn decode_cavlc_block(
         // The conformant behavior is prefix>=15 for the +15 offset and prefix>=16
         // for the escape extension, which gives a monotonic non-overlapping range.
         let mut level_code =
-            ((level_prefix.min(15) as u32) << suffix_length) + level_suffix;
+            (level_prefix.min(15) << suffix_length) + level_suffix;
         if level_prefix >= 15 && suffix_length == 0 {
             level_code += 15;
         }
@@ -458,7 +458,7 @@ pub(crate) fn check_ep_conflict(raw_data: &[u8], byte_offset: usize, bit_offset:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::h264::bitstream::{remove_emulation_prevention_with_map, EpByteMap};
+    use crate::codec::h264::bitstream::EpByteMap;
 
     /// BitWriter for constructing test bitstreams.
     struct BitWriter {

@@ -1,52 +1,127 @@
-This file lists the licenses of third-party dependencies used by phasm-core.
+This file lists the licenses of third-party Rust crate dependencies of
+phasm-core (and its companion phasm-cli). The list reflects the
+transitive dependency tree built with the full feature set
+(`--features parallel,video,h264-encoder,cabac-stego`) — the minimal
+default-feature build pulls fewer crates but no different licenses.
+
+All listed licenses are compatible with the phasm-core GPL-3.0-only
+umbrella. No GPL/AGPL/LGPL transitive dependencies exist; permissive
+upstream crates remain re-distributable under their own terms.
+
+Crates are grouped by license family. Within each family, crates that
+require explicit notice retention (BSD, Apache-2.0-only) are spelled
+out individually with their copyright lines and full license text;
+crates available under permissive multi-licenses where MIT is one of
+the choices are summarized.
 
 ===============================================================================
+GROUP 1 — MIT OR Apache-2.0 (used under the MIT license)
+
+The following 101 crates are dual-licensed MIT OR Apache-2.0 (or
+equivalent variants like "Apache-2.0 OR MIT", "MIT/Apache-2.0", or
+MIT-only). Used here under the MIT license. See
+https://opensource.org/licenses/MIT for the canonical MIT text.
+
+aead, aes, aes-gcm-siv, anstream, anstyle, anstyle-parse, anstyle-query,
+anstyle-wincon, argon2, autocfg, base64ct, bitflags, blake2,
+block-buffer, bumpalo, cfg-if, cipher, clap, clap_builder, clap_derive,
+clap_lex, color_quant, colorchoice, console, cpufeatures, crc32fast,
+crossbeam-deque, crossbeam-epoch, crossbeam-utils, crunchy,
+crypto-common, ctr, digest, either, encode_unicode, fax, fax_derive,
+fdeflate, flate2, generic-array, getrandom, gif, half, heck, hmac,
+image, image-webp, indicatif, inout, is_terminal_polyfill, js-sys,
+libc, memmap2, num-complex, num-traits, number_prefix, once_cell,
+once_cell_polyfill, opaque-debug, password-hash, png, polyval,
+portable-atomic, ppv-lite86, proc-macro2, quick-error, quote, rand,
+rand_chacha, rand_core, rayon, rayon-core, rustversion, sha2,
+simd-adler32, strsim, syn, tiff, typenum, unicode-width,
+universal-hash, utf8parse, version_check, wasm-bindgen,
+wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
+web-time, weezl, windows-link, windows-sys, windows-targets,
+windows_aarch64_gnullvm, windows_aarch64_msvc, windows_i686_gnu,
+windows_i686_gnullvm, windows_i686_msvc, windows_x86_64_gnu,
+windows_x86_64_gnullvm, windows_x86_64_msvc, zeroize.
+
+===============================================================================
+GROUP 2 — MIT OR Apache-2.0 OR Zlib
+
+bytemuck 1.25.0 (Zlib OR Apache-2.0 OR MIT) — used under MIT.
+miniz_oxide 0.8.9 (MIT OR Zlib OR Apache-2.0) — used under MIT.
+zune-core 0.5.1 (MIT OR Apache-2.0 OR Zlib) — used under MIT.
+zune-jpeg 0.5.13 (MIT OR Apache-2.0 OR Zlib) — used under MIT.
+
+===============================================================================
+GROUP 3 — Multi-license including MIT (used under MIT)
+
+adler2 2.0.1 — 0BSD OR MIT OR Apache-2.0.
+byteorder-lite 0.1.0 — Unlicense OR MIT.
+unicode-ident 1.0.24 — (MIT OR Apache-2.0) AND Unicode-3.0. The
+    Unicode-3.0 component covers the Unicode Character Database tables
+    bundled with the crate; see https://www.unicode.org/license.txt
+    for the Unicode license text. The crate's Rust source is used
+    under MIT.
+wasi 0.11.1+wasi-snapshot-preview1 — Apache-2.0 WITH LLVM-exception
+    OR Apache-2.0 OR MIT. Used under MIT.
+
+===============================================================================
+GROUP 4 — Apache-2.0 only (no MIT alternative)
+
+rpassword 7.4.0
+https://github.com/conradkleinespel/rpassword
+rtoolbox 0.0.3
+https://github.com/conradkleinespel/rtoolbox
+License: Apache-2.0
+
+Both crates are licensed under the Apache License, Version 2.0. See
+https://www.apache.org/licenses/LICENSE-2.0 for the full license text.
+Required notices and the Apache-2.0 NOTICE redistribution clauses
+apply when these crates are redistributed in source or compiled form
+as part of phasm-cli.
+
+===============================================================================
+GROUP 5 — BSD-2-Clause / BSD-3-Clause (multi-licensed; notice required)
+
+The following crates are multi-licensed under a BSD variant alongside
+MIT and/or Apache-2.0. The BSD-2/3-Clause license requires retention
+of the copyright notice and disclaimer in both source and binary
+redistributions. The full license text appears once below; per-crate
+copyright lines follow.
+
+zerocopy 0.8.39, zerocopy-derive 0.8.39
+https://github.com/google/zerocopy
+License: BSD-2-Clause OR Apache-2.0 OR MIT
+Copyright (c) 2023 Google LLC.
+
+moxcms 0.8.1
+https://github.com/awxkee/moxcms
+License: BSD-3-Clause OR Apache-2.0
+Copyright (c) 2024 Radzivon Bartoshyk.
+
+pxfm 0.1.28
+https://github.com/awxkee/pxfm
+License: BSD-3-Clause OR Apache-2.0
+Copyright (c) 2024 Radzivon Bartoshyk.
+
+===============================================================================
+GROUP 6 — BSD-3-Clause / BSD-3-Clause AND MIT (notice required)
+
 brotli 7.0.0, brotli-decompressor 4.0.3
 https://github.com/dropbox/rust-brotli
 License: BSD-3-Clause AND MIT
-
 Copyright (c) 2016 Dropbox, Inc.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-1. Redistributions of source code must retain the above copyright notice,
-   this list of conditions and the following disclaimer.
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
-3. Neither the name of the copyright holder nor the names of its
-   contributors may be used to endorse or promote products derived from
-   this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-POSSIBILITY OF SUCH DAMAGE.
-
-===============================================================================
 alloc-no-stdlib 2.0.4, alloc-stdlib 0.2.2
 https://github.com/dropbox/rust-alloc-no-stdlib
 License: BSD-3-Clause
-
 Copyright (c) 2016 Dropbox, Inc.
 
-(Same BSD-3-Clause terms as above.)
-
-===============================================================================
 subtle 2.6.1
 https://github.com/dalek-cryptography/subtle
 License: BSD-3-Clause
-
 Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence.
-All rights reserved.
+
+===============================================================================
+BSD-2-Clause / BSD-3-Clause license text (applies to GROUP 5 and GROUP 6)
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -59,6 +134,7 @@ modification, are permitted provided that the following conditions are met:
 3. Neither the name of the copyright holder nor the names of its
    contributors may be used to endorse or promote products derived from
    this software without specific prior written permission.
+   (BSD-3-Clause only — BSD-2-Clause omits this third clause.)
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -73,7 +149,12 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
 
 ===============================================================================
-All other dependencies (39 crates)
-License: MIT OR Apache-2.0
+H.264 / AVC patent-pool note (not a software license)
 
-Used under the MIT license. See https://opensource.org/licenses/MIT
+The pure-Rust H.264 encoder under the `h264-encoder` Cargo feature
+is gated OFF by default. Distribution of compiled binaries that
+include the encoder is subject to Via LA Licensing's AVC patent-pool
+terms; see https://www.via-la.com/licensing-2/avc-h-264/. The
+phasm-cli pre-built binaries published on GitHub Releases do NOT
+bundle the encoder. This patent-pool obligation is not a software
+license and is listed here for transparency only.
