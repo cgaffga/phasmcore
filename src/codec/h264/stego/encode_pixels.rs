@@ -648,6 +648,803 @@ pub fn h264_stego_encode_i_then_p_frames_4domain(
     )
 }
 
+/// §long-form-stego Phase 5 — streaming-cover orchestrator.
+///
+/// Public API for long-form video stego (5+ min clips at 1080p).
+/// Bypasses the in-memory orchestrator's full Pass 1 cover
+/// materialization (which would OOM at 5+ min × 1080p × 4 domains)
+/// by replaying Pass 1 per-GOP at STC plan time (Phase 4
+/// `H264GopReplayCover`) and per-GOP at Pass 3 inject time (Phase 3
+/// `pass1_capture_4domain_for_gop_range`).
+///
+/// Memory bound for 5-min 1080p:
+/// - Phase 1-counts: O(num_gops) ~ a few KB.
+/// - Per-domain DomainPlan from streaming-Viterbi: O(n_d) — kept
+///   resident through Pass 3. ~1.2 GB for 5-min 1080p × 4 domains.
+/// - Streaming-Viterbi internal: O(sqrt n_d).
+/// - Per-GOP injector + encoder working set: ~few MB transient.
+/// - Total peak: ~1.5 GB at 5-min 1080p (vs ~8 GB in-memory path).
+///
+/// At 15-min 1080p the plan side becomes the binding cost (~3.5 GB).
+/// Plan-side streaming for mobile-15-min support is v1.1+ work.
+///
+/// Behaviorally identical to
+/// [`h264_stego_encode_yuv_string_4domain_multigop`] except for
+/// re-emitted SPS+PPS NALs at each GOP's IDR (per-GOP fresh
+/// encoder; spec-allowed; decoder handles transparently). Cover
+/// positions, STC plan, and stego bit positions are bit-exact
+/// equivalent — round-trip decode succeeds with the standard
+/// `h264_stego_decode_yuv_string_4domain`.
+pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    message: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::{crypto, frame, payload};
+    use crate::stego::stc::streaming_segmented::{
+        stc_embed_streaming_segmented,
+    };
+    use super::cover_replay::H264GopReplayCover;
+    use super::hook::EmbedDomain;
+    use super::inject::DomainCover;
+    use super::orchestrate::{
+        stealth_weighted_allocation, split_message_per_domain, DomainPlan,
+        PlanInjector, StealthAllocator,
+    };
+    use super::encoder_hook::InjectionHook;
+    use super::keys::CabacStegoMasterKeys;
+    use super::gop_pattern::GopPattern;
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}",
+            yuv.len(),
+            frame_size * n_frames,
+        )));
+    }
+    if gop_size == 0 || gop_size > n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_size {gop_size} must be in 1..={n_frames}"
+        )));
+    }
+
+    let b_count = 1usize; // §6E-A.deploy.3 default IBPBP M=2
+    let h = 4usize;
+    let quality = Some(26u8);
+
+    // Encrypt + frame the message.
+    let payload_bytes = payload::encode_payload(message, &[])?;
+    let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
+    let frame_bits: Vec<u8> = frame_bytes
+        .iter()
+        .flat_map(|&byte| (0..8).rev().map(move |i| (byte >> i) & 1))
+        .collect();
+    let m_total = frame_bits.len();
+
+    let keys = CabacStegoMasterKeys::derive(passphrase)?;
+
+    // ── Pass 1 (counting only) — per-GOP per-domain counts. ──
+    // Memory: O(num_gops × 4 × usize). No cover materialization.
+    let per_gop_counts = pass1_count_per_gop_4domain(
+        yuv, width, height, n_frames, gop_size, b_count, quality,
+    )?;
+    let mut totals = [0usize; 4];
+    for row in per_gop_counts.iter() {
+        for d in 0..4 {
+            totals[d] += row[d];
+        }
+    }
+    let cap_p1 = GopCapacity {
+        coeff_sign_bypass: totals[0],
+        coeff_suffix_lsb: totals[1],
+        mvd_sign_bypass: totals[2],
+        mvd_suffix_lsb: totals[3],
+    };
+
+    // ── Stealth-weighted allocation (mvd_suffix forced 0). ──
+    let allocator = StealthAllocator::v1_default();
+    let cap_for_alloc = GopCapacity {
+        coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+        coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+        mvd_sign_bypass: cap_p1.mvd_sign_bypass,
+        mvd_suffix_lsb: 0,
+    };
+    let (m_cs, m_cl, m_ms, _m_ml) =
+        stealth_weighted_allocation(m_total, &cap_for_alloc, &allocator)
+            .ok_or(StegoError::MessageTooLarge)?;
+    let m_mvd = m_ms;
+    let m_residual = m_cs + m_cl;
+
+    // ── Pass 2 — per-domain streaming-Viterbi via H264GopReplayCover. ──
+    //
+    // For each non-empty domain we build a H264GopReplayCover (no
+    // additional Pass 1 — uses the per_gop_counts we already
+    // computed above) and stream through stc_embed_streaming_segmented.
+    let mut plan_a = DomainPlan::default();
+    let mut plan_b = DomainPlan::default();
+
+    // Pass 2A: MVD-sign domain.
+    if m_mvd > 0 {
+        let cap_mvd_only = GopCapacity {
+            coeff_sign_bypass: 0,
+            coeff_suffix_lsb: 0,
+            mvd_sign_bypass: cap_p1.mvd_sign_bypass,
+            mvd_suffix_lsb: 0,
+        };
+        let messages_a = split_message_per_domain(&frame_bits[..m_mvd], &cap_mvd_only)
+            .ok_or_else(|| StegoError::InvalidVideo(
+                "Pass 2A streaming: MVD split failed".into()
+            ))?;
+        let m_dom = messages_a.mvd_sign_bypass.len();
+        let n_dom = cap_p1.mvd_sign_bypass;
+        if m_dom > 0 && n_dom > 0 {
+            let w = n_dom / m_dom.max(1);
+            if w > 0 {
+                let k = ((m_dom as f64).sqrt().ceil() as usize).max(1);
+                let mut cover = H264GopReplayCover::from_counts(
+                    yuv, width, height, n_frames, gop_size, b_count, quality,
+                    EmbedDomain::MvdSignBypass,
+                    &per_gop_counts, m_dom, w, k,
+                )?;
+                let seed = keys.per_gop_seeds(EmbedDomain::MvdSignBypass, 0).hhat_seed;
+                let hhat = crate::stego::stc::hhat::generate_hhat(h, w, &seed);
+                let result = stc_embed_streaming_segmented(
+                    &mut cover, &messages_a.mvd_sign_bypass, &hhat, h, w,
+                ).map_err(|e| StegoError::InvalidVideo(format!(
+                    "Pass 2A streaming-Viterbi: {e}"
+                )))?;
+                plan_a.mvd_sign_bypass = result.stego_bits;
+                plan_a.total_modifications += result.num_modifications;
+                plan_a.total_cost += result.total_cost;
+            }
+        }
+    }
+
+    // Pass 2B: residual domains (coeff_sign + coeff_suffix).
+    if m_residual > 0 {
+        let cap_coeff_only = GopCapacity {
+            coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+            coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+            mvd_sign_bypass: 0,
+            mvd_suffix_lsb: 0,
+        };
+        let messages_b = split_message_per_domain(&frame_bits[m_mvd..], &cap_coeff_only)
+            .ok_or_else(|| StegoError::InvalidVideo(
+                "Pass 2B streaming: residual split failed".into()
+            ))?;
+        for (domain, msg, n_dom, plan_slot) in [
+            (EmbedDomain::CoeffSignBypass, &messages_b.coeff_sign_bypass,
+             cap_p1.coeff_sign_bypass, &mut plan_b.coeff_sign_bypass),
+            (EmbedDomain::CoeffSuffixLsb, &messages_b.coeff_suffix_lsb,
+             cap_p1.coeff_suffix_lsb, &mut plan_b.coeff_suffix_lsb),
+        ] {
+            let m_dom = msg.len();
+            if m_dom == 0 || n_dom == 0 {
+                continue;
+            }
+            let w = n_dom / m_dom.max(1);
+            if w == 0 {
+                continue;
+            }
+            let k = ((m_dom as f64).sqrt().ceil() as usize).max(1);
+            let mut cover = H264GopReplayCover::from_counts(
+                yuv, width, height, n_frames, gop_size, b_count, quality,
+                domain, &per_gop_counts, m_dom, w, k,
+            )?;
+            let seed = keys.per_gop_seeds(domain, 0).hhat_seed;
+            let hhat = crate::stego::stc::hhat::generate_hhat(h, w, &seed);
+            let result = stc_embed_streaming_segmented(
+                &mut cover, msg, &hhat, h, w,
+            ).map_err(|e| StegoError::InvalidVideo(format!(
+                "Pass 2B streaming-Viterbi ({domain:?}): {e}"
+            )))?;
+            *plan_slot = result.stego_bits;
+            plan_b.total_modifications += result.num_modifications;
+            plan_b.total_cost += result.total_cost;
+        }
+    }
+
+    // Combined per-domain plans.
+    let combined_plan = DomainPlan {
+        coeff_sign_bypass: plan_b.coeff_sign_bypass.clone(),
+        coeff_suffix_lsb: plan_b.coeff_suffix_lsb.clone(),
+        mvd_sign_bypass: plan_a.mvd_sign_bypass.clone(),
+        mvd_suffix_lsb: Vec::new(),
+        total_modifications: plan_a.total_modifications + plan_b.total_modifications,
+        total_cost: plan_a.total_cost + plan_b.total_cost,
+    };
+
+
+    // Cumulative per-GOP counts per domain (for plan slicing in Pass 3).
+    let cum: [Vec<usize>; 4] = std::array::from_fn(|d| {
+        let mut v = Vec::with_capacity(per_gop_counts.len() + 1);
+        v.push(0);
+        for row in per_gop_counts.iter() {
+            v.push(*v.last().unwrap() + row[d]);
+        }
+        v
+    });
+
+    // ── Pass 3 (per-GOP) — fresh encoder per GOP, per-GOP
+    //     PlanInjector built from per-GOP cover replay + plan slices.
+    //     Memory: ~one GOP's encoder working set + per-GOP injector. ──
+    let pattern = GopPattern::Ibpbp { gop: gop_size, b_count };
+    let num_gops = per_gop_counts.len();
+    let mut out = Vec::new();
+    for g in 0..num_gops {
+        let gop_cover = pass1_capture_4domain_for_gop_range(
+            yuv, width, height, n_frames, gop_size, b_count, quality, g, g + 1,
+        )?;
+
+        // Slice each domain plan to this GOP's range.
+        let mut gop_plan = DomainPlan::default();
+        for d in 0..4 {
+            let lo = cum[d][g];
+            let hi = cum[d][g + 1];
+            let src = match d {
+                0 => &combined_plan.coeff_sign_bypass,
+                1 => &combined_plan.coeff_suffix_lsb,
+                2 => &combined_plan.mvd_sign_bypass,
+                _ => &combined_plan.mvd_suffix_lsb,
+            };
+            let dst = match d {
+                0 => &mut gop_plan.coeff_sign_bypass,
+                1 => &mut gop_plan.coeff_suffix_lsb,
+                2 => &mut gop_plan.mvd_sign_bypass,
+                _ => &mut gop_plan.mvd_suffix_lsb,
+            };
+            if src.is_empty() {
+                continue;
+            }
+            let lo = lo.min(src.len());
+            let hi = hi.min(src.len());
+            *dst = src[lo..hi].to_vec();
+        }
+
+        // Build per-GOP PlanInjector + encode.
+        let mut gop_cover_only = DomainCover::default();
+        gop_cover_only.coeff_sign_bypass = gop_cover.cover.coeff_sign_bypass.clone();
+        gop_cover_only.coeff_suffix_lsb = gop_cover.cover.coeff_suffix_lsb.clone();
+        gop_cover_only.mvd_sign_bypass = gop_cover.cover.mvd_sign_bypass.clone();
+        gop_cover_only.mvd_suffix_lsb = gop_cover.cover.mvd_suffix_lsb.clone();
+        let injector = PlanInjector::from_plan(&gop_cover_only, &gop_plan);
+
+        let mut enc = build_encoder(width, height, quality)?;
+        enc.enable_mvd_stego_hook = true;
+        enc.enable_b_frames = pattern.has_b_frames();
+        enc.set_stego_hook(Some(Box::new(InjectionHook::new(injector))));
+
+        // Iterate the full schedule, encode only frames whose
+        // gop_idx matches `g`. First in-range frame primes
+        // stego_frame_idx (Phase 1 contract).
+        let mut primed = false;
+        for (meta, frame) in iter_frames_in_encode_order(
+            yuv, frame_size, n_frames, pattern,
+        ) {
+            if (meta.gop_idx as usize) != g {
+                if (meta.gop_idx as usize) > g {
+                    break;
+                }
+                continue;
+            }
+            if !primed {
+                enc.stego_frame_idx = meta.encode_idx;
+                primed = true;
+            }
+            let bytes = encode_one_frame(&mut enc, frame, meta.frame_type)
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "Pass 3 streaming GOP {g} frame {}: {e}",
+                    meta.encode_idx,
+                )))?;
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// §long-form-stego Phase 6.3 — interleaved Phase B orchestrator.
+///
+/// Public API for long-form video stego at mobile-scale memory
+/// bounds (15-min 1080p target). Same pipeline as Phase 5's
+/// `h264_stego_encode_yuv_string_4domain_multigop_streaming`, with
+/// two key differences:
+///
+/// 1. The per-domain `StreamingViterbiPhaseB` drivers run in
+///    **round-robin lockstep** — after each Phase B segment
+///    emission, the orchestrator picks the driver whose highest
+///    pending GOP is largest, keeping all 4 drivers in approximate
+///    GOP-sync.
+/// 2. Per-GOP Pass 3 fires **incrementally** — as soon as a GOP's
+///    plan is fully populated by all active domains, that GOP's
+///    encoder Pass 3 runs and the plan buffer is dropped.
+///
+/// Memory bound (15-min 1080p):
+/// - Per-GOP plan buffers (in flight): ~tens of MB (a handful of
+///   GOPs at any time vs all `num_gops` in Phase 5).
+/// - Per-domain Phase A checkpoints: O(√n) per domain ≈ 33 MB × 4.
+/// - Per-segment Phase B back-pointers: O(K·w) ≈ few MB transient.
+/// - Encoder Pass 3 working set: ~100 MB transient.
+/// - Phase 4 cover replay: ~10 MB transient.
+/// - **Total peak**: ~250-400 MB plans+state, plus the encoded
+///   output buffer the function returns (~1 GB at 15-min 1080p).
+///
+/// CPU cost: equivalent to Phase 5 (refactor of plan storage only,
+/// no added encoder work).
+///
+/// Bit-exact equivalent output to Phase 5 is the design goal —
+/// the difference is only WHEN bytes are emitted, not WHAT.
+/// Verified by Phase 6.4's equivalence test.
+pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    message: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::{crypto, frame, payload};
+    use crate::stego::stc::streaming_segmented::StreamingViterbiPhaseB;
+    use super::cover_replay::H264GopReplayCover;
+    use super::hook::EmbedDomain;
+    use super::inject::DomainCover;
+    use super::orchestrate::{
+        stealth_weighted_allocation, split_message_per_domain, DomainPlan,
+        PlanInjector, StealthAllocator,
+    };
+    use super::encoder_hook::InjectionHook;
+    use super::keys::CabacStegoMasterKeys;
+    use super::gop_pattern::GopPattern;
+    use super::per_gop_plan::PerGopPlanBuilder;
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}",
+            yuv.len(),
+            frame_size * n_frames,
+        )));
+    }
+    if gop_size == 0 || gop_size > n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_size {gop_size} must be in 1..={n_frames}"
+        )));
+    }
+
+    let b_count = 1usize;
+    let h = 4usize;
+    let quality = Some(26u8);
+
+    let payload_bytes = payload::encode_payload(message, &[])?;
+    let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
+    let frame_bits: Vec<u8> = frame_bytes
+        .iter()
+        .flat_map(|&byte| (0..8).rev().map(move |i| (byte >> i) & 1))
+        .collect();
+    let m_total = frame_bits.len();
+    let keys = CabacStegoMasterKeys::derive(passphrase)?;
+
+    // ── Pass 1 (counting only) ──
+    let per_gop_counts = pass1_count_per_gop_4domain(
+        yuv, width, height, n_frames, gop_size, b_count, quality,
+    )?;
+    let mut totals = [0usize; 4];
+    for row in per_gop_counts.iter() {
+        for d in 0..4 {
+            totals[d] += row[d];
+        }
+    }
+    let cap_p1 = GopCapacity {
+        coeff_sign_bypass: totals[0],
+        coeff_suffix_lsb: totals[1],
+        mvd_sign_bypass: totals[2],
+        mvd_suffix_lsb: totals[3],
+    };
+
+    // ── Stealth allocation ──
+    let allocator = StealthAllocator::v1_default();
+    let cap_for_alloc = GopCapacity {
+        coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+        coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+        mvd_sign_bypass: cap_p1.mvd_sign_bypass,
+        mvd_suffix_lsb: 0,
+    };
+    let (m_cs, m_cl, m_ms, _m_ml) =
+        stealth_weighted_allocation(m_total, &cap_for_alloc, &allocator)
+            .ok_or(StegoError::MessageTooLarge)?;
+    let m_mvd = m_ms;
+    let m_residual = m_cs + m_cl;
+
+    // ── Per-domain (m, w, k, message) — only for active domains ──
+    let messages_a = if m_mvd > 0 {
+        let cap_mvd_only = GopCapacity {
+            coeff_sign_bypass: 0,
+            coeff_suffix_lsb: 0,
+            mvd_sign_bypass: cap_p1.mvd_sign_bypass,
+            mvd_suffix_lsb: 0,
+        };
+        Some(
+            split_message_per_domain(&frame_bits[..m_mvd], &cap_mvd_only)
+                .ok_or_else(|| {
+                    StegoError::InvalidVideo("v2: MVD split failed".into())
+                })?,
+        )
+    } else {
+        None
+    };
+    let messages_b = if m_residual > 0 {
+        let cap_coeff_only = GopCapacity {
+            coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+            coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+            mvd_sign_bypass: 0,
+            mvd_suffix_lsb: 0,
+        };
+        Some(
+            split_message_per_domain(&frame_bits[m_mvd..], &cap_coeff_only)
+                .ok_or_else(|| {
+                    StegoError::InvalidVideo("v2: residual split failed".into())
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // Per-domain owned (message, w, k, hhat) tuples — must outlive
+    // the drivers. We also need stable storage for the
+    // H264GopReplayCovers since the drivers borrow them mutably.
+    struct DomainOwned {
+        domain: EmbedDomain,
+        message: Vec<u8>,
+        w: usize,
+        hhat: Vec<Vec<u32>>,
+    }
+    let mut owned: [Option<DomainOwned>; 4] = [None, None, None, None];
+    let mut k_per_domain: [usize; 4] = [0; 4];
+
+    let domain_table: [(EmbedDomain, usize, Option<&Vec<u8>>); 4] = [
+        (
+            EmbedDomain::CoeffSignBypass,
+            cap_p1.coeff_sign_bypass,
+            messages_b.as_ref().map(|mb| &mb.coeff_sign_bypass),
+        ),
+        (
+            EmbedDomain::CoeffSuffixLsb,
+            cap_p1.coeff_suffix_lsb,
+            messages_b.as_ref().map(|mb| &mb.coeff_suffix_lsb),
+        ),
+        (
+            EmbedDomain::MvdSignBypass,
+            cap_p1.mvd_sign_bypass,
+            messages_a.as_ref().map(|ma| &ma.mvd_sign_bypass),
+        ),
+        (EmbedDomain::MvdSuffixLsb, 0, None),
+    ];
+
+    for (d, (domain, n_dom, msg_opt)) in domain_table.iter().enumerate() {
+        let Some(msg) = msg_opt else {
+            continue;
+        };
+        let m_dom = msg.len();
+        if m_dom == 0 || *n_dom == 0 {
+            continue;
+        }
+        let w = *n_dom / m_dom.max(1);
+        if w == 0 {
+            continue;
+        }
+        let k = ((m_dom as f64).sqrt().ceil() as usize).max(1);
+        let seed = keys.per_gop_seeds(*domain, 0).hhat_seed;
+        let hhat = crate::stego::stc::hhat::generate_hhat(h, w, &seed);
+        owned[d] = Some(DomainOwned {
+            domain: *domain,
+            message: (*msg).clone(),
+            w,
+            hhat,
+        });
+        k_per_domain[d] = k;
+    }
+    let active_domains: [bool; 4] = [
+        owned[0].is_some(),
+        owned[1].is_some(),
+        owned[2].is_some(),
+        owned[3].is_some(),
+    ];
+
+    // ── Construct H264GopReplayCovers + StreamingViterbiPhaseB drivers ──
+    //
+    // Each cover borrows yuv immutably; each driver borrows ONE
+    // cover mutably + owned[d].message + owned[d].hhat. Storing in
+    // 4 separate locals lets the borrow checker track them
+    // independently.
+    let mut cover0: Option<H264GopReplayCover> = None;
+    let mut cover1: Option<H264GopReplayCover> = None;
+    let mut cover2: Option<H264GopReplayCover> = None;
+    // domain 3 always inactive — no cover needed.
+
+    if let Some(o) = &owned[0] {
+        cover0 = Some(H264GopReplayCover::from_counts(
+            yuv, width, height, n_frames, gop_size, b_count, quality,
+            o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[0],
+        )?);
+    }
+    if let Some(o) = &owned[1] {
+        cover1 = Some(H264GopReplayCover::from_counts(
+            yuv, width, height, n_frames, gop_size, b_count, quality,
+            o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[1],
+        )?);
+    }
+    if let Some(o) = &owned[2] {
+        cover2 = Some(H264GopReplayCover::from_counts(
+            yuv, width, height, n_frames, gop_size, b_count, quality,
+            o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[2],
+        )?);
+    }
+
+    let mut driver0: Option<StreamingViterbiPhaseB> = None;
+    let mut driver1: Option<StreamingViterbiPhaseB> = None;
+    let mut driver2: Option<StreamingViterbiPhaseB> = None;
+
+    if let (Some(o), Some(c)) = (&owned[0], cover0.as_mut()) {
+        driver0 = Some(
+            StreamingViterbiPhaseB::new(c, &o.message, &o.hhat, h, o.w)
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase A driver[0]: {e}"
+                )))?,
+        );
+    }
+    if let (Some(o), Some(c)) = (&owned[1], cover1.as_mut()) {
+        driver1 = Some(
+            StreamingViterbiPhaseB::new(c, &o.message, &o.hhat, h, o.w)
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase A driver[1]: {e}"
+                )))?,
+        );
+    }
+    if let (Some(o), Some(c)) = (&owned[2], cover2.as_mut()) {
+        driver2 = Some(
+            StreamingViterbiPhaseB::new(c, &o.message, &o.hhat, h, o.w)
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase A driver[2]: {e}"
+                )))?,
+        );
+    }
+
+    // ── PerGopPlanBuilder ──
+    //
+    // Each driver emits m*w bits per domain, NOT the full raw cover
+    // capacity. Phase 5's per-GOP plan slicing clips at m*w (via
+    // `lo.min(src.len())` / `hi.min(src.len())`), dropping any
+    // trailing raw-capacity positions [m*w .. total) without emission.
+    // Mirror that here by pre-computing **effective** per-GOP sizes:
+    // the per-domain bit count for GOP `g` is `m*w` minus the bits
+    // already consumed by GOPs `[0..g)`, clipped to GOP `g`'s raw
+    // capacity. Without this clip, the last GOP's buffer never fills
+    // and `take_ready_gops` deadlocks.
+    let num_gops = per_gop_counts.len();
+    let cum_raw: [Vec<usize>; 4] = std::array::from_fn(|d| {
+        let mut v = Vec::with_capacity(num_gops + 1);
+        v.push(0);
+        for row in per_gop_counts.iter() {
+            v.push(*v.last().unwrap() + row[d]);
+        }
+        v
+    });
+    let m_w_per_domain: [usize; 4] = [
+        owned[0].as_ref().map(|o| o.message.len() * o.w).unwrap_or(0),
+        owned[1].as_ref().map(|o| o.message.len() * o.w).unwrap_or(0),
+        owned[2].as_ref().map(|o| o.message.len() * o.w).unwrap_or(0),
+        0,
+    ];
+    let effective_counts: Vec<[usize; 4]> = (0..num_gops)
+        .map(|g| {
+            std::array::from_fn(|d| {
+                if !active_domains[d] {
+                    return 0;
+                }
+                let lo = cum_raw[d][g].min(m_w_per_domain[d]);
+                let hi = cum_raw[d][g + 1].min(m_w_per_domain[d]);
+                hi - lo
+            })
+        })
+        .collect();
+
+    let mut builder = PerGopPlanBuilder::new(&effective_counts, active_domains);
+    debug_assert_eq!(builder.num_gops(), num_gops);
+    let pattern = GopPattern::Ibpbp { gop: gop_size, b_count };
+
+    // Per-GOP encoded bytes, filled out-of-order as GOPs fire;
+    // assembled into the final stream in temporal order at the end.
+    let mut gop_bytes: Vec<Option<Vec<u8>>> = vec![None; num_gops];
+
+    // ── Lockstep emission + per-GOP Pass 3 ──
+    loop {
+        // Helper: existence check for each driver slot.
+        let alive = [
+            driver0.is_some(),
+            driver1.is_some(),
+            driver2.is_some(),
+            false,
+        ];
+        if !alive.iter().any(|&a| a) {
+            break;
+        }
+
+        // Pick the driver to step: argmax(highest_pending_gop) over
+        // alive drivers; tie-break by lowest d. If all alive
+        // drivers have completed their GOP-side reporting (e.g.,
+        // empty trailing segments), step the lowest-d alive driver
+        // anyway to drain.
+        let mut best_d: Option<usize> = None;
+        let mut best_g: Option<usize> = None;
+        let mut fallback_d: Option<usize> = None;
+        for d in 0..4 {
+            if !alive[d] {
+                continue;
+            }
+            fallback_d.get_or_insert(d);
+            if let Some(g) = builder.highest_pending_gop(d) {
+                match best_g {
+                    None => {
+                        best_g = Some(g);
+                        best_d = Some(d);
+                    }
+                    Some(cur) if g > cur => {
+                        best_g = Some(g);
+                        best_d = Some(d);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let step_d = best_d.or(fallback_d).expect("alive checked above");
+
+        let emission = match step_d {
+            0 => driver0
+                .as_mut()
+                .unwrap()
+                .step()
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase B driver[0]: {e}"
+                )))?,
+            1 => driver1
+                .as_mut()
+                .unwrap()
+                .step()
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase B driver[1]: {e}"
+                )))?,
+            2 => driver2
+                .as_mut()
+                .unwrap()
+                .step()
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v2 Phase B driver[2]: {e}"
+                )))?,
+            _ => unreachable!("step_d in 0..3 (domain 3 always inactive)"),
+        };
+
+        match emission {
+            Some(em) => {
+                builder
+                    .accept_emission(step_d, em.j_start, &em.stego_bits)
+                    .map_err(|e| StegoError::InvalidVideo(format!(
+                        "v2 accept_emission[{step_d}]: {e}"
+                    )))?;
+                builder.add_modifications(em.num_modifications);
+            }
+            None => {
+                match step_d {
+                    0 => driver0 = None,
+                    1 => driver1 = None,
+                    2 => driver2 = None,
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        // Fire ready GOPs incrementally (per-GOP Pass 3). After
+        // Pass 3, the per-GOP plan buffer is dropped — that's the
+        // memory saving.
+        for ready in builder.take_ready_gops() {
+            let g = ready.gop_idx;
+            let gop_cover = pass1_capture_4domain_for_gop_range(
+                yuv, width, height, n_frames, gop_size, b_count, quality,
+                g, g + 1,
+            )?;
+
+            let mut gop_cover_only = DomainCover::default();
+            gop_cover_only.coeff_sign_bypass =
+                gop_cover.cover.coeff_sign_bypass.clone();
+            gop_cover_only.coeff_suffix_lsb =
+                gop_cover.cover.coeff_suffix_lsb.clone();
+            gop_cover_only.mvd_sign_bypass =
+                gop_cover.cover.mvd_sign_bypass.clone();
+            gop_cover_only.mvd_suffix_lsb =
+                gop_cover.cover.mvd_suffix_lsb.clone();
+
+            let gop_plan = DomainPlan {
+                coeff_sign_bypass: ready.plans[0].clone(),
+                coeff_suffix_lsb: ready.plans[1].clone(),
+                mvd_sign_bypass: ready.plans[2].clone(),
+                mvd_suffix_lsb: ready.plans[3].clone(),
+                total_modifications: 0,
+                total_cost: 0.0,
+            };
+
+            let injector = PlanInjector::from_plan(&gop_cover_only, &gop_plan);
+
+            let mut enc = build_encoder(width, height, quality)?;
+            enc.enable_mvd_stego_hook = true;
+            enc.enable_b_frames = pattern.has_b_frames();
+            enc.set_stego_hook(Some(Box::new(InjectionHook::new(injector))));
+
+            let mut primed = false;
+            let mut bytes = Vec::new();
+            for (meta, frame) in iter_frames_in_encode_order(
+                yuv, frame_size, n_frames, pattern,
+            ) {
+                if (meta.gop_idx as usize) != g {
+                    if (meta.gop_idx as usize) > g {
+                        break;
+                    }
+                    continue;
+                }
+                if !primed {
+                    enc.stego_frame_idx = meta.encode_idx;
+                    primed = true;
+                }
+                let frame_bytes =
+                    encode_one_frame(&mut enc, frame, meta.frame_type)
+                        .map_err(|e| StegoError::InvalidVideo(format!(
+                            "v2 Pass 3 GOP {g} frame {}: {e}",
+                            meta.encode_idx,
+                        )))?;
+                bytes.extend_from_slice(&frame_bytes);
+            }
+            gop_bytes[g] = Some(bytes);
+        }
+    }
+
+    // All drivers exhausted — every GOP must have fired.
+    if !builder.all_fired() {
+        return Err(StegoError::InvalidVideo(format!(
+            "v2: {} GOPs not fired after lockstep loop",
+            num_gops - gop_bytes.iter().filter(|b| b.is_some()).count(),
+        )));
+    }
+
+    // Concatenate output bytes in temporal (encode) order.
+    let mut out = Vec::new();
+    for g in 0..num_gops {
+        match gop_bytes[g].take() {
+            Some(b) => out.extend_from_slice(&b),
+            None => {
+                return Err(StegoError::InvalidVideo(format!(
+                    "v2: GOP {g} did not fire"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Phase 6E-C1a — multi-IDR variant of
 /// `h264_stego_encode_i_then_p_frames_4domain`. See
 /// [`h264_stego_encode_yuv_string_4domain_multigop`] for the
@@ -1533,6 +2330,243 @@ fn iter_frames_in_encode_order<'a>(
         let frame = &yuv[d * frame_size..(d + 1) * frame_size];
         (meta, frame)
     })
+}
+
+/// §long-form-stego Phase 2 — counting-only Pass 1 producing
+/// per-GOP per-domain position counts.
+///
+/// Returns `Vec<[usize; 4]>` indexed by GOP index, each row giving
+/// `[coeff_sign, coeff_suffix, mvd_sign, mvd_suffix]` position
+/// counts for that GOP. Memory: O(num_gops × 4 × usize) — minimal
+/// vs the O(n) materialization that `pass1_count_4domain` does.
+///
+/// Used by the §long-form-stego per-GOP-replay adapter (Phase 4)
+/// to map seg_idx → GOP range without materializing the whole
+/// cover. Bit-counts match `pass1_count_4domain`'s drained
+/// `GopCover` per-domain counts when sliced by gop_idx (verified
+/// in Phase 2's integration test).
+pub fn pass1_count_per_gop_4domain(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    b_count: usize,
+    quality: Option<u8>,
+) -> Result<Vec<[usize; 4]>, StegoError> {
+    use super::encoder_hook::PositionCountingHook;
+
+    let frame_size = (width * height * 3 / 2) as usize;
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    let pattern = pattern_from_legacy_args(gop_size, b_count);
+    enc.enable_b_frames = pattern.has_b_frames();
+
+    // Boxed counting hook so the encoder owns it; we'll re-grab
+    // the inner counts via a direct field-access alternative —
+    // but the StegoMbHook trait doesn't expose snapshots. Easiest:
+    // we maintain a parallel counter outside the hook by tracking
+    // GOP boundaries during encode and snapshotting at each.
+    //
+    // The hook is owned by the encoder for the duration. We attach
+    // a wrapper that stores per-GOP snapshots in a shared
+    // Arc<Mutex<...>>. Simpler: re-run the encode without the hook
+    // owning state, just count externally. But we need the same
+    // per-MB `enumerate_*_positions` calls.
+    //
+    // Concretely: a shared `Vec<[usize; 4]>` that the hook updates
+    // as the encoder progresses, snapshotted by gop boundary. We
+    // need a single mutable reference that survives across frames,
+    // which a Box<dyn StegoMbHook> alone doesn't expose. We
+    // therefore use a custom hook type that the encoder owns,
+    // and after the run we drain the hook to get the final running
+    // counts. The orchestrator does the per-GOP snapshotting by
+    // installing a fresh hook PER GOP.
+    //
+    // Per-GOP fresh hook means: per-GOP encoder state too, which
+    // requires Phase 1's mid-clip restart contract. We're using
+    // it.
+
+    let mut per_gop_counts: Vec<[usize; 4]> = Vec::new();
+    let mut current_gop_idx: u32 = u32::MAX;
+    let mut current_gop_running: [usize; 4] = [0; 4];
+
+    // Per-frame encode with a fresh PositionCountingHook installed
+    // at each GOP boundary. The hook accumulates per-GOP counts;
+    // we drain at the next boundary or end-of-clip.
+    let mut frame_iter = iter_frames_in_encode_order(
+        yuv, frame_size, n_frames, pattern,
+    )
+    .peekable();
+
+    // Encoder is fresh across the whole run (single instance for
+    // the full clip). Hooks rotate per-GOP via take_stego_hook +
+    // set_stego_hook. The encoder's mid-clip state hygiene
+    // (Phase 1 verified) ensures cover counts match what a single
+    // PositionLoggerHook over the whole run would produce, sliced
+    // by gop_idx.
+    enc.set_stego_hook(Some(Box::new(PositionCountingHook::new())));
+
+    while let Some((meta, frame)) = frame_iter.next() {
+        // GOP boundary: drain the previous hook's count, install fresh.
+        if meta.gop_idx != current_gop_idx {
+            if current_gop_idx != u32::MAX {
+                // Drain previous hook's snapshot.
+                let mut hook_box = enc
+                    .take_stego_hook()
+                    .ok_or_else(|| StegoError::InvalidVideo(
+                        "missing PositionCountingHook on GOP boundary".into(),
+                    ))?;
+                // Downcast via a snapshot helper exposed through a
+                // counter-only path. The cleanest: have the trait
+                // expose `take_counts_if_counter` (returns Option).
+                // For minimal change we re-create the count by
+                // re-encoding — but that's O(n) work duplicated.
+                // Instead, we use a side-channel: PositionCountingHook
+                // exposes `snapshot()` directly via downcast.
+                //
+                // Use take_counts trait method (added below).
+                let row = hook_box.take_counts_if_counter().ok_or_else(|| {
+                    StegoError::InvalidVideo(
+                        "hook is not PositionCountingHook".into(),
+                    )
+                })?;
+                // Per-GOP delta = row - prior running. Since we
+                // installed a FRESH hook per GOP, row IS the per-GOP
+                // count directly (no diff needed).
+                per_gop_counts.push(row);
+                let _ = current_gop_running; // running unused under fresh-per-GOP
+                current_gop_running = [0; 4];
+            }
+            current_gop_idx = meta.gop_idx;
+            // Install a fresh counting hook for the new GOP.
+            enc.set_stego_hook(Some(Box::new(PositionCountingHook::new())));
+        }
+
+        let ft = meta.frame_type;
+        encode_one_frame(&mut enc, frame, ft).map_err(|e| {
+            StegoError::InvalidVideo(format!("Pass 1 (count): {e}"))
+        })?;
+    }
+
+    // Drain the final GOP's hook.
+    let mut final_hook = enc.take_stego_hook().ok_or_else(|| {
+        StegoError::InvalidVideo("missing final PositionCountingHook".into())
+    })?;
+    let row = final_hook.take_counts_if_counter().ok_or_else(|| {
+        StegoError::InvalidVideo(
+            "final hook is not PositionCountingHook".into(),
+        )
+    })?;
+    per_gop_counts.push(row);
+
+    Ok(per_gop_counts)
+}
+
+/// §long-form-stego Phase 3 — Pass 1 over a single GOP range.
+///
+/// Runs Pass 1 (encoder + PositionLoggerHook) over the YUV frames
+/// belonging to the GOPs in `[gop_start..gop_end)`, with the
+/// encoder primed to start at the first frame's encode-order
+/// index (the §long-form-stego Phase 1 mid-clip restart contract).
+/// Returns a `GopCover` for that range.
+///
+/// `gop_start` MUST align to a GOP boundary in encode order
+/// (i.e. correspond to an IDR position). The caller is
+/// responsible for that mapping; for `GopPattern::Ipppp { gop }`
+/// every multiple of `gop` is a GOP boundary, while
+/// `GopPattern::Ibpbp` GOPs span `gop` frames per GOP in display
+/// order which translates to `gop` frames per GOP in encode order
+/// too (each GOP is an independent encode-order unit).
+///
+/// Bit-exact equivalence to slicing a full Pass 1 by gop_idx
+/// range is verified by Phase 3's
+/// `partial_range_pass1_matches_full_range_slice` test.
+pub fn pass1_capture_4domain_for_gop_range(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    b_count: usize,
+    quality: Option<u8>,
+    gop_start: usize,
+    gop_end: usize,
+) -> Result<super::orchestrate::GopCover, StegoError> {
+    if gop_start >= gop_end {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_start {gop_start} >= gop_end {gop_end}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    let frame_start = gop_start * gop_size;
+    let frame_end = (gop_end * gop_size).min(n_frames);
+    if frame_start >= n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_start {gop_start} maps to frame {frame_start} >= n_frames {n_frames}"
+        )));
+    }
+
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    let pattern = pattern_from_legacy_args(gop_size, b_count);
+    enc.enable_b_frames = pattern.has_b_frames();
+    enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
+
+    // Iterate the FULL clip's encode-order schedule but only
+    // ENCODE frames whose gop_idx is in [gop_start..gop_end).
+    // We can't "skip ahead" cheaply because the encoder is fresh
+    // and stego_frame_idx primes only at start; but for our use
+    // case the GOPs to encode are contiguous, so we just call
+    // iter_encode_order over the full range and filter in-range.
+    //
+    // Optimisation: since the GOPs we want are contiguous, we can
+    // iterate the full schedule once, lazily prime the encoder at
+    // the first in-range frame, and stop after the last in-range
+    // frame.
+    let mut primed = false;
+    for (meta, frame) in iter_frames_in_encode_order(
+        yuv, frame_size, n_frames, pattern,
+    ) {
+        let in_range = (meta.gop_idx as usize) >= gop_start
+            && (meta.gop_idx as usize) < gop_end;
+        if !in_range {
+            // Skip frames before our range; stop after our range.
+            if (meta.gop_idx as usize) >= gop_end {
+                break;
+            }
+            continue;
+        }
+        if !primed {
+            // Phase 1 contract: only stego_frame_idx needs priming;
+            // frame_num / POC / DPB self-correct at IDR. The first
+            // in-range frame must be an IDR for that contract to
+            // hold.
+            debug_assert_eq!(
+                meta.frame_type,
+                super::gop_pattern::FrameType::Idr,
+                "first in-range frame must be IDR (gop_start={gop_start})",
+            );
+            enc.stego_frame_idx = meta.encode_idx;
+            primed = true;
+        }
+        let ft = meta.frame_type;
+        encode_one_frame(&mut enc, frame, ft).map_err(|e| {
+            StegoError::InvalidVideo(format!(
+                "Pass 1 (gop_range): frame_idx={} {e}",
+                meta.encode_idx,
+            ))
+        })?;
+        if meta.encode_idx as usize + 1 >= frame_end {
+            break;
+        }
+    }
+
+    let mut hook = enc.take_stego_hook().ok_or_else(|| {
+        StegoError::InvalidVideo("Pass 1 (gop_range): hook missing".into())
+    })?;
+    let cover = drain_position_logger(&mut hook)?;
+    Ok(cover)
 }
 
 /// Pass 1 helper for §30D-C: encode I + P frames with

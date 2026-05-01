@@ -79,7 +79,22 @@ pub fn stc_embed(
     }
 
     if n > SEGMENTED_THRESHOLD {
-        stc_embed_segmented(cover_bits, costs, message, hhat_matrix, h, w)
+        // §6E-C / Task #24.3 — route the segmented path through
+        // streaming-Viterbi via the InMemoryCoverFetch adapter.
+        // Bit-exact equivalent to the legacy `stc_embed_segmented`
+        // (verified by `streaming_matches_inline_segmented_large` in
+        // streaming_segmented.rs), so callers see no observable
+        // change. The win is the STC-internal O(√n) memory bound
+        // (checkpoint + back-pointer working set vs O(n) back-ptrs
+        // in the inline path) — relevant for long-clip video stego.
+        // A future per-GOP-replay CoverFetch adapter (v1.1+) will
+        // bound cover-side memory to O(√n) too.
+        use crate::stego::stc::streaming_segmented::{
+            stc_embed_streaming_segmented, InMemoryCoverFetch,
+        };
+        let k = ((m as f64).sqrt().ceil() as usize).max(1);
+        let mut cover = InMemoryCoverFetch::new(cover_bits, costs, m, w, k)?;
+        stc_embed_streaming_segmented(&mut cover, message, hhat_matrix, h, w).ok()
     } else {
         stc_embed_inline(cover_bits, costs, message, hhat_matrix, h, w)
     }

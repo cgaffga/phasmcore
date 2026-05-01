@@ -115,3 +115,248 @@ pub fn temp_transcode_path(original: &Path) -> PathBuf {
         .unwrap_or(0);
     std::env::temp_dir().join(format!("{stem}_phasm_baseline_{pid}_{ts}.mp4"))
 }
+
+// ─── Phase 6.5: CABAC-path helpers (cabac-stego feature) ─────────
+//
+// CLI's `video-encode` / `decode` subcommands route through the
+// CABAC v2 streaming orchestrator (matching the iOS + Android bridges)
+// when built with `--features cabac-stego`. The Rust core consumes
+// raw YUV in / Annex-B out; ffmpeg handles the MP4 demux + remux,
+// since phasm-core has no built-in H.264 → YUV decoder.
+
+/// Probed video metadata from `ffprobe`.
+#[cfg(feature = "cabac-stego")]
+#[derive(Debug, Clone)]
+pub struct VideoProbe {
+    pub width: u32,
+    pub height: u32,
+    pub n_frames: usize,
+    /// Frame rate as a "num/den" string (e.g. "30/1", "30000/1001"),
+    /// passed verbatim to ffmpeg `-framerate` for the mux step.
+    pub frame_rate: String,
+    /// True if the input has at least one audio stream we should
+    /// preserve when muxing the stego Annex-B back to MP4.
+    pub has_audio: bool,
+}
+
+/// Run `ffprobe` to read width/height/frame-count/rate from `input`.
+///
+/// MB-alignment (16-multiple width+height) is enforced — H.264
+/// requires it and the v2 orchestrator rejects non-aligned inputs.
+/// Callers that need to handle non-aligned inputs should pre-crop
+/// via ffmpeg before this probe.
+#[cfg(feature = "cabac-stego")]
+pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
+    use std::process::Command;
+    let result = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,nb_frames,r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=0",
+        ])
+        .arg(input)
+        .output()
+        .map_err(|e| CliError::InvalidArgs(format!(
+            "failed to spawn ffprobe: {e}\n\nInstall ffmpeg/ffprobe or transcode manually:\n  {TRANSCODE_SUGGESTION}"
+        )))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(CliError::InvalidArgs(format!(
+            "ffprobe failed (exit {}): {stderr}",
+            result.status.code().unwrap_or(-1),
+        )));
+    }
+    let out = String::from_utf8_lossy(&result.stdout);
+    let mut width: Option<u32> = None;
+    let mut height: Option<u32> = None;
+    let mut n_frames: Option<usize> = None;
+    let mut frame_rate: Option<String> = None;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("width=") {
+            width = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("height=") {
+            height = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("nb_frames=") {
+            n_frames = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("r_frame_rate=") {
+            frame_rate = Some(rest.trim().to_string());
+        }
+    }
+    let width = width.ok_or_else(|| CliError::InvalidArgs(
+        "ffprobe did not report video width".into()
+    ))?;
+    let height = height.ok_or_else(|| CliError::InvalidArgs(
+        "ffprobe did not report video height".into()
+    ))?;
+    let frame_rate = frame_rate.unwrap_or_else(|| "30/1".to_string());
+
+    // nb_frames is sometimes "N/A" for streams without an explicit
+    // frame count; fall back to a duration*fps estimate.
+    let n_frames = if let Some(n) = n_frames {
+        n
+    } else {
+        probe_n_frames_via_packet_count(input)?
+    };
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(CliError::InvalidArgs(format!(
+            "input dimensions {width}x{height} are not 16-aligned. \
+             H.264 macroblock alignment is required. Pre-crop with:\n  \
+             ffmpeg -i input.mp4 -vf 'crop={w16}:{h16}' aligned.mp4",
+            w16 = (width / 16) * 16,
+            h16 = (height / 16) * 16,
+        )));
+    }
+
+    let has_audio = probe_has_audio(input);
+    Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio })
+}
+
+#[cfg(feature = "cabac-stego")]
+fn probe_n_frames_via_packet_count(input: &Path) -> Result<usize, CliError> {
+    use std::process::Command;
+    let result = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-count_packets",
+            "-show_entries", "stream=nb_read_packets",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+        ])
+        .arg(input)
+        .output()
+        .map_err(|e| CliError::InvalidArgs(format!(
+            "failed to spawn ffprobe (packet count): {e}"
+        )))?;
+    let out = String::from_utf8_lossy(&result.stdout);
+    out.trim()
+        .parse::<usize>()
+        .map_err(|_| CliError::InvalidArgs(format!(
+            "ffprobe could not determine frame count for {}",
+            input.display()
+        )))
+}
+
+#[cfg(feature = "cabac-stego")]
+fn probe_has_audio(input: &Path) -> bool {
+    use std::process::Command;
+    Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+        ])
+        .arg(input)
+        .output()
+        .ok()
+        .filter(|r| r.status.success())
+        .map(|r| !r.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Decode the input MP4 to raw YUV420p planar frames at `output`.
+/// Used to feed the v2 streaming orchestrator, which takes raw YUV.
+#[cfg(feature = "cabac-stego")]
+pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
+    use std::process::Command;
+    let result = Command::new("ffmpeg")
+        .arg("-y")
+        .arg("-i").arg(input)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .arg(output)
+        .output()
+        .map_err(|e| CliError::InvalidArgs(format!(
+            "failed to spawn ffmpeg (decode_to_yuv): {e}\n\nInstall ffmpeg or pre-extract YUV manually:\n  {TRANSCODE_SUGGESTION}"
+        )))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        let tail: String = stderr.lines().rev().take(15)
+            .collect::<Vec<_>>().into_iter().rev()
+            .collect::<Vec<_>>().join("\n");
+        return Err(CliError::InvalidArgs(format!(
+            "ffmpeg YUV decode failed (exit {}). Last output:\n\n{tail}",
+            result.status.code().unwrap_or(-1),
+        )));
+    }
+    Ok(())
+}
+
+/// Mux a raw H.264 Annex-B stream into MP4. If `audio_source` is
+/// `Some`, the audio track is copied from there (the original input
+/// file). The video track uses the supplied frame rate.
+#[cfg(feature = "cabac-stego")]
+pub fn mux_annexb_to_mp4(
+    annex_b: &Path,
+    audio_source: Option<&Path>,
+    frame_rate: &str,
+    output: &Path,
+) -> Result<(), CliError> {
+    use std::process::Command;
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-loglevel").arg("error")
+        .args(["-framerate", frame_rate, "-f", "h264"])
+        .arg("-i").arg(annex_b);
+    if let Some(audio) = audio_source {
+        cmd.arg("-i").arg(audio)
+            .args(["-map", "0:v:0", "-map", "1:a:0?"])
+            .args(["-c:v", "copy", "-c:a", "copy"]);
+    } else {
+        cmd.args(["-c:v", "copy"]);
+    }
+    cmd.arg(output);
+
+    let result = cmd.output().map_err(|e| CliError::InvalidArgs(format!(
+        "failed to spawn ffmpeg (mux_annexb_to_mp4): {e}"
+    )))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(CliError::InvalidArgs(format!(
+            "ffmpeg mux failed (exit {}): {stderr}",
+            result.status.code().unwrap_or(-1),
+        )));
+    }
+    Ok(())
+}
+
+/// Extract the H.264 video track from an MP4 as raw Annex-B bytes
+/// (start-code-prefixed NAL stream, the format the CABAC decoder
+/// consumes). Uses ffmpeg's `h264_mp4toannexb` bitstream filter.
+#[cfg(feature = "cabac-stego")]
+pub fn extract_annexb_from_mp4(input: &Path, output: &Path) -> Result<(), CliError> {
+    use std::process::Command;
+    let result = Command::new("ffmpeg")
+        .arg("-y").arg("-loglevel").arg("error")
+        .arg("-i").arg(input)
+        .args(["-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264"])
+        .arg(output)
+        .output()
+        .map_err(|e| CliError::InvalidArgs(format!(
+            "failed to spawn ffmpeg (extract_annexb): {e}"
+        )))?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(CliError::InvalidArgs(format!(
+            "ffmpeg Annex-B extract failed (exit {}): {stderr}",
+            result.status.code().unwrap_or(-1),
+        )));
+    }
+    Ok(())
+}
+
+/// Produce a unique tempfile path with a custom extension. Caller is
+/// responsible for cleaning it up.
+#[cfg(feature = "cabac-stego")]
+pub fn temp_path_with_ext(original: &Path, ext: &str) -> PathBuf {
+    let stem = original
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("phasm_temp");
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("{stem}_phasm_cabac_{pid}_{ts}.{ext}"))
+}

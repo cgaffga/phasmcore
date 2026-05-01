@@ -81,6 +81,15 @@ pub trait StegoMbHook: Send + std::fmt::Debug {
         Vec::new()
     }
 
+    /// §long-form-stego Phase 2 — drain a `PositionCountingHook`'s
+    /// running totals as `[coeff_sign, coeff_suffix, mvd_sign,
+    /// mvd_suffix]`. Default returns `None` for non-counter hooks.
+    /// Used by `pass1_count_per_gop_4domain` to harvest per-GOP
+    /// counts after fresh-per-GOP hook install.
+    fn take_counts_if_counter(&mut self) -> Option<[usize; 4]> {
+        None
+    }
+
     /// Phase 6F.2 — begin a per-MB MVD-position savepoint.
     /// Loggers should remember their current MVD-position offsets
     /// so a subsequent `rollback_mvd_for_mb` can retract any
@@ -536,6 +545,114 @@ impl StegoMbHook for PositionLoggerHook {
             self.cover.cover.mvd_suffix_lsb.push(*b, *p);
             self.cover.costs.mvd_suffix_lsb.push(*c);
         }
+    }
+}
+
+/// §long-form-stego Phase 2 — counting-only Pass 1 hook.
+///
+/// Mirrors `PositionLoggerHook`'s position-enumeration logic but
+/// only RUNS the enumerator and counts the returned length per
+/// domain, without storing bits / costs / PositionKey values. Used
+/// by `pass1_count_per_gop_4domain` to map seg_idx → GOP range
+/// without an O(n) materialization.
+///
+/// The four counters are running totals across the entire encode.
+/// The orchestrator driver snapshots them at each GOP boundary;
+/// per-GOP counts are the diff between consecutive snapshots.
+///
+/// Memory: O(1) — four `usize` counters plus the `mvd_savepoint`
+/// pair for begin/commit/rollback. No vectors, no positions.
+#[derive(Debug, Default)]
+pub struct PositionCountingHook {
+    coeff_sign: usize,
+    coeff_suffix: usize,
+    mvd_sign: usize,
+    mvd_suffix: usize,
+    /// Phase 6F.2 begin/commit/rollback savepoint (mirror of
+    /// PositionLoggerHook's mvd_savepoint). `Some((sign, suffix))`
+    /// snapshot taken at `begin_mvd_for_mb`; rollback truncates
+    /// counters back to it, commit clears the savepoint.
+    mvd_savepoint: Option<(usize, usize)>,
+}
+
+impl PositionCountingHook {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot current running totals as
+    /// `[coeff_sign, coeff_suffix, mvd_sign, mvd_suffix]`. Used by
+    /// the orchestrator driver to build per-GOP count rows.
+    pub fn snapshot(&self) -> [usize; 4] {
+        [self.coeff_sign, self.coeff_suffix, self.mvd_sign, self.mvd_suffix]
+    }
+}
+
+impl StegoMbHook for PositionCountingHook {
+    fn on_residual_block(
+        &mut self,
+        frame_idx: u32,
+        mb_addr: u32,
+        scan_coeffs: &mut [i32],
+        start_idx: usize,
+        end_idx: usize,
+        path_kind: ResidualPathKind,
+    ) {
+        use super::{
+            enumerate_coeff_sign_positions, enumerate_coeff_suffix_lsb_positions,
+        };
+        // CoeffSignBypass count.
+        let positions = enumerate_coeff_sign_positions(
+            scan_coeffs, start_idx, end_idx, frame_idx, mb_addr,
+            |ci| path_kind.path(ci, BinKind::Sign),
+        );
+        self.coeff_sign += positions.len();
+
+        // CoeffSuffixLsb count.
+        let positions = enumerate_coeff_suffix_lsb_positions(
+            scan_coeffs, start_idx, end_idx, frame_idx, mb_addr,
+            |ci| path_kind.path(ci, BinKind::SuffixLsb),
+        );
+        self.coeff_suffix += positions.len();
+    }
+
+    fn on_mvd_slot(
+        &mut self,
+        frame_idx: u32,
+        mb_addr: u32,
+        slot: &mut MvdSlot,
+    ) {
+        use super::{
+            enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
+        };
+        let single = [*slot];
+
+        // MvdSignBypass count.
+        let positions = enumerate_mvd_sign_positions(&single, frame_idx, mb_addr);
+        self.mvd_sign += positions.len();
+
+        // MvdSuffixLsb count.
+        let positions = enumerate_mvd_suffix_lsb_positions(&single, frame_idx, mb_addr);
+        self.mvd_suffix += positions.len();
+    }
+
+    fn begin_mvd_for_mb(&mut self) {
+        self.mvd_savepoint = Some((self.mvd_sign, self.mvd_suffix));
+    }
+
+    fn commit_mvd_for_mb(&mut self) {
+        self.mvd_savepoint = None;
+    }
+
+    fn rollback_mvd_for_mb(&mut self) {
+        if let Some((s, l)) = self.mvd_savepoint.take() {
+            self.mvd_sign = s;
+            self.mvd_suffix = l;
+        }
+    }
+
+    fn take_counts_if_counter(&mut self) -> Option<[usize; 4]> {
+        Some(self.snapshot())
     }
 }
 

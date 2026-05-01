@@ -15,6 +15,7 @@
 
 pub mod cascade_safety;
 pub mod cost_model;
+pub mod cover_replay;
 pub mod decode_pixels;
 pub mod encode_pixels;
 pub mod encoder_hook;
@@ -23,6 +24,7 @@ pub mod hook;
 pub mod inject;
 pub mod keys;
 pub mod orchestrate;
+pub mod per_gop_plan;
 pub mod primary_rs;
 pub mod provisional_emit;
 pub mod shadow;

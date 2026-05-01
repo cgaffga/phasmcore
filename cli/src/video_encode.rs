@@ -7,7 +7,11 @@ use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
 use crate::transcode;
-use phasm_core::{detect_video_codec, h264_ghost_encode, VideoCodec};
+use phasm_core::{detect_video_codec, VideoCodec};
+#[cfg(not(feature = "cabac-stego"))]
+use phasm_core::h264_ghost_encode;
+#[cfg(feature = "cabac-stego")]
+use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -72,34 +76,22 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
 
     let start = Instant::now();
 
-    // Phase 4b: H.264 Baseline CAVLC only. Non-Baseline H.264 inputs
-    // (Main/High profile, CABAC entropy) are auto-transcoded via an
-    // ffmpeg shell-out. HEVC inputs are rejected with an ffmpeg suggestion
-    // — HEVC support is archived behind the `hevc-archive` cargo feature
-    // and will not re-ship in Phase 4.
+    // Phase 6.5 wiring: with `--features cabac-stego`, the CLI routes
+    // through the CABAC v2 streaming orchestrator (matches mobile
+    // bridges). Without that feature it stays on the legacy CAVLC
+    // bitstream-mod path. ffmpeg handles MP4 demux + remux for the
+    // CABAC path; phasm-core has no built-in H.264 → YUV decoder.
     let file_bytes = std::fs::read(&args.video)?;
-    let mut transcode_tempfile: Option<PathBuf> = None;
     match detect_video_codec(&file_bytes) {
         VideoCodec::H264 => {
-            // Try encoding the file as-is; if the pipeline rejects it as
-            // non-Baseline, transcode to Baseline CAVLC and retry once.
-            match h264_ghost_encode(&file_bytes, &message, &passphrase) {
-                Ok(stego) => {
-                    std::fs::write(&output_path, &stego)?;
-                }
-                Err(e) if transcode::is_non_baseline_error(&e) => {
-                    transcode::ensure_ffmpeg_available()?;
-                    let temp = transcode::temp_transcode_path(&args.video);
-                    eprintln!(
-                        "Input is H.264 but not Baseline CAVLC — transcoding via ffmpeg..."
-                    );
-                    transcode::transcode_to_baseline(&args.video, &temp)?;
-                    transcode_tempfile = Some(temp.clone());
-                    let transcoded = std::fs::read(&temp)?;
-                    let stego = h264_ghost_encode(&transcoded, &message, &passphrase)?;
-                    std::fs::write(&output_path, &stego)?;
-                }
-                Err(e) => return Err(CliError::from(e)),
+            #[cfg(feature = "cabac-stego")]
+            {
+                let _ = file_bytes; // consumed by re-read inside run_cabac_encode
+                run_cabac_encode(&args.video, &message, &passphrase, &output_path)?;
+            }
+            #[cfg(not(feature = "cabac-stego"))]
+            {
+                run_cavlc_encode(&args.video, &file_bytes, &message, &passphrase, &output_path)?;
             }
         }
         VideoCodec::Hevc => {
@@ -112,13 +104,9 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
         }
         VideoCodec::Unknown => {
             return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                "unsupported or unrecognised video codec (expected H.264 Baseline CAVLC)".into(),
+                "unsupported or unrecognised video codec (expected H.264)".into(),
             )));
         }
-    }
-    // Clean up the transcode tempfile, if we created one.
-    if let Some(temp) = transcode_tempfile {
-        let _ = std::fs::remove_file(&temp);
     }
     let elapsed = start.elapsed();
 
@@ -139,6 +127,98 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
     let out_str = output_path.to_string_lossy().to_string();
     output::print_video_encode_result(&out_str, elapsed, out_mode);
 
+    Ok(())
+}
+
+/// Phase 6.5 wiring — CABAC v2 streaming-orchestrator path. Mirrors
+/// what the iOS + Android bridges call (`h264_stego_encode_yuv_string
+/// _4domain_multigop_streaming_v2`). Uses ffmpeg to demux MP4 → YUV
+/// and to remux Annex-B + audio → MP4, since phasm-core has no
+/// built-in H.264 → YUV decoder.
+#[cfg(feature = "cabac-stego")]
+fn run_cabac_encode(
+    input: &PathBuf,
+    message: &str,
+    passphrase: &str,
+    output: &PathBuf,
+) -> Result<(), CliError> {
+    transcode::ensure_ffmpeg_available()?;
+    let probe = transcode::probe_video(input)?;
+    eprintln!(
+        "Encoding via CABAC v2: {}x{} × {} frames @ {} fps{}",
+        probe.width, probe.height, probe.n_frames, probe.frame_rate,
+        if probe.has_audio { " (with audio)" } else { "" },
+    );
+
+    // gop_size: default 30 = 1s @ 30fps. Real-world iPhone GOP is
+    // typically 30-300; 30 keeps re-keying frequent enough for
+    // efficient lockstep memory bounds without ballooning IDR
+    // overhead. Fixed for now; CLI flag is a follow-on.
+    let gop_size: usize = 30;
+    let gop_size = gop_size.min(probe.n_frames.max(1));
+
+    let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
+    let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
+    let mut cleanup_paths = vec![yuv_temp.clone(), annex_b_temp.clone()];
+
+    let result = (|| -> Result<(), CliError> {
+        transcode::decode_to_yuv(input, &yuv_temp)?;
+        let yuv_bytes = std::fs::read(&yuv_temp)?;
+        let expected = (probe.width as usize) * (probe.height as usize) * 3 / 2 * probe.n_frames;
+        if yuv_bytes.len() != expected {
+            return Err(CliError::InvalidArgs(format!(
+                "ffmpeg-decoded YUV is {} bytes; expected {} ({}x{} × 1.5 × {})",
+                yuv_bytes.len(), expected, probe.width, probe.height, probe.n_frames,
+            )));
+        }
+        let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
+            &yuv_bytes, probe.width, probe.height, probe.n_frames, gop_size,
+            message, passphrase,
+        )?;
+        std::fs::write(&annex_b_temp, &annex_b)?;
+        let audio_source = probe.has_audio.then_some(input.as_path());
+        transcode::mux_annexb_to_mp4(
+            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        )?;
+        Ok(())
+    })();
+
+    for p in cleanup_paths.drain(..) {
+        let _ = std::fs::remove_file(p);
+    }
+    result
+}
+
+#[cfg(not(feature = "cabac-stego"))]
+fn run_cavlc_encode(
+    input: &PathBuf,
+    file_bytes: &[u8],
+    message: &str,
+    passphrase: &str,
+    output: &PathBuf,
+) -> Result<(), CliError> {
+    let mut transcode_tempfile: Option<PathBuf> = None;
+    match h264_ghost_encode(file_bytes, message, passphrase) {
+        Ok(stego) => {
+            std::fs::write(output, &stego)?;
+        }
+        Err(e) if transcode::is_non_baseline_error(&e) => {
+            transcode::ensure_ffmpeg_available()?;
+            let temp = transcode::temp_transcode_path(input);
+            eprintln!(
+                "Input is H.264 but not Baseline CAVLC — transcoding via ffmpeg..."
+            );
+            transcode::transcode_to_baseline(input, &temp)?;
+            transcode_tempfile = Some(temp.clone());
+            let transcoded = std::fs::read(&temp)?;
+            let stego = h264_ghost_encode(&transcoded, message, passphrase)?;
+            std::fs::write(output, &stego)?;
+        }
+        Err(e) => return Err(CliError::from(e)),
+    }
+    if let Some(temp) = transcode_tempfile {
+        let _ = std::fs::remove_file(&temp);
+    }
     Ok(())
 }
 

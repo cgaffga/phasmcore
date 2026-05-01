@@ -7,8 +7,14 @@ use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
 use phasm_core::{
-    detect_video_codec, h264_ghost_decode, is_mp4, smart_decode, DecodeQuality, VideoCodec,
+    detect_video_codec, is_mp4, smart_decode, DecodeQuality, VideoCodec,
 };
+#[cfg(not(feature = "cabac-stego"))]
+use phasm_core::h264_ghost_decode;
+#[cfg(feature = "cabac-stego")]
+use phasm_core::h264_stego_smart_decode_video;
+#[cfg(feature = "cabac-stego")]
+use crate::transcode;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -63,7 +69,12 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     // (which it would be, since it was produced by `phasm video-encode`).
     let (payload, quality) = if is_mp4(&file_bytes) {
         let payload = match detect_video_codec(&file_bytes) {
-            VideoCodec::H264 => h264_ghost_decode(&file_bytes, &passphrase)?,
+            VideoCodec::H264 => {
+                #[cfg(feature = "cabac-stego")]
+                { decode_h264_cabac(&args.image, &passphrase)? }
+                #[cfg(not(feature = "cabac-stego"))]
+                { h264_ghost_decode(&file_bytes, &passphrase)? }
+            }
             VideoCodec::Hevc => {
                 return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
                     "HEVC/H.265 decode is not supported. This file was encoded outside \
@@ -73,8 +84,7 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
             }
             VideoCodec::Unknown => {
                 return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                    "unsupported or unrecognised video codec (expected H.264 Baseline CAVLC)"
-                        .into(),
+                    "unsupported or unrecognised video codec (expected H.264)".into(),
                 )));
             }
         };
@@ -116,4 +126,29 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     output::print_decode_result(&payload, &quality, extract_dir.as_deref(), elapsed, out_mode);
 
     Ok(())
+}
+
+/// Phase 6.5 wiring — CABAC v2 decoder path. ffmpeg demuxes MP4 →
+/// Annex-B; phasm-core's `h264_stego_smart_decode_video` walks the
+/// CABAC bins for shadow + 4-domain primary recovery. Returns the
+/// decoded text wrapped in a `PayloadData` (no file attachments —
+/// the CABAC stego pipeline is text-only at this stage).
+#[cfg(feature = "cabac-stego")]
+fn decode_h264_cabac(
+    input: &PathBuf,
+    passphrase: &str,
+) -> Result<phasm_core::PayloadData, CliError> {
+    transcode::ensure_ffmpeg_available()?;
+    let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
+    let result = (|| -> Result<phasm_core::PayloadData, CliError> {
+        transcode::extract_annexb_from_mp4(input, &annex_b_temp)?;
+        let annex_b = std::fs::read(&annex_b_temp)?;
+        let text = h264_stego_smart_decode_video(&annex_b, passphrase)?;
+        Ok(phasm_core::PayloadData {
+            text,
+            files: Vec::new(),
+        })
+    })();
+    let _ = std::fs::remove_file(&annex_b_temp);
+    result
 }

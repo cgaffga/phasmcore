@@ -31,3 +31,12 @@ default = []
 # never enabled in cargo-dist GitHub-release builds. Forwards to
 # phasm-core's `h264-encoder` feature.
 h264-encoder = ["phasm-core/h264-encoder"]
+# Enable Phase 6.3 CABAC stego encode/decode (the production
+# 4-domain bypass-bin pipeline used by the iOS + Android bridges).
+# When ON, `phasm video-encode` and `phasm decode` route MP4 video
+# through ffmpeg → YUV → v2 streaming orchestrator → Annex-B →
+# ffmpeg → MP4. When OFF, they fall back to the legacy CAVLC
+# bitstream-mod path (`h264_ghost_encode/decode`). Implies
+# `h264-encoder`. Source-only; cargo-dist binary uses the legacy
+# path (no encoder bundled).
+cabac-stego = ["h264-encoder", "phasm-core/cabac-stego"]

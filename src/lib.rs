@@ -81,6 +81,8 @@ pub use codec::h264::stego::encode_pixels::{
     h264_stego_encode_i_then_p_frames_4domain_multigop,
     h264_stego_encode_yuv_string, h264_stego_encode_yuv_string_4domain,
     h264_stego_encode_yuv_string_4domain_multigop,
+    h264_stego_encode_yuv_string_4domain_multigop_streaming,
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2,
     h264_stego_encode_yuv_string_4domain_multigop_with_pattern,
     h264_stego_encode_yuv_string_i_then_p,
     h264_stego_encode_yuv_string_with_n_shadows,
