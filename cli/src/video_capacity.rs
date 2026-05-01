@@ -23,12 +23,35 @@ pub struct VideoCapacityArgs {
     /// of the conservative default (STC `w = 5`, default stealth).
     /// Useful for power users who want the absolute upper bound on
     /// what the encoder can fit. The default value is what the mobile
-    /// apps display.
+    /// apps display. Ignored when `--cabac-v2` is set.
     #[arg(long)]
     pub max: bool,
+
+    /// Task #96 — Use the CABAC v2 4-domain capacity formula instead
+    /// of the legacy CAVLC `h264_ghost_capacity` path. Requires the
+    /// `cabac-stego` build feature. Reports both primary and shadow
+    /// (single-shadow) capacities. Decodes the input to YUV first
+    /// via ffmpeg (slow on long clips) since the CABAC v2 pipeline
+    /// works on raw pixels not parsed Annex-B.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long)]
+    pub cabac_v2: bool,
+
+    /// Task #96 + #98 — GOP size used by the CABAC v2 capacity
+    /// estimate. Defaults to 30 (matches mobile encoder default at
+    /// 30 fps = 1 IDR/sec). Only honored under `--cabac-v2`.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long, default_value_t = 30)]
+    pub gop_size: usize,
 }
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
+    // Task #96 — CABAC v2 capacity branch.
+    #[cfg(feature = "cabac-stego")]
+    if args.cabac_v2 {
+        return run_cabac_v2(args);
+    }
+
     let mp4_bytes = std::fs::read(&args.video)?;
 
     // Phase 4b: H.264 Baseline CAVLC only. Non-Baseline H.264 inputs
@@ -86,5 +109,49 @@ pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
 
     output::print_video_capacity(&info, args.json);
 
+    Ok(())
+}
+
+/// Task #96 — CABAC v2 capacity branch.
+///
+/// Decodes the input MP4 to a temp YUV via ffmpeg (since CABAC v2's
+/// capacity API works on raw pixels), runs Pass-1 cover counting,
+/// and reports primary + shadow capacity. The decode + Pass 1
+/// together take O(seconds) on 1080p × 10 frames; long clips are
+/// proportionally slower.
+#[cfg(feature = "cabac-stego")]
+fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
+    use phasm_core::h264_stego_capacity_4domain;
+
+    transcode::ensure_ffmpeg_available()?;
+    let probe = transcode::probe_video(&args.video)?;
+    let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
+    transcode::decode_to_yuv(&args.video, &yuv_path)?;
+    let yuv = std::fs::read(&yuv_path).map_err(|e| {
+        CliError::InvalidArgs(format!("read decoded YUV {}: {e}", yuv_path.display()))
+    })?;
+    let _ = std::fs::remove_file(&yuv_path);
+
+    let gop_size = args.gop_size.min(probe.n_frames).max(1);
+    let info = h264_stego_capacity_4domain(
+        &yuv, probe.width, probe.height, probe.n_frames, gop_size,
+    )
+    .map_err(CliError::from)?;
+
+    if args.json {
+        println!(
+            r#"{{"engine":"cabac-v2","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{}}}"#,
+            probe.width, probe.height, probe.n_frames, gop_size,
+            info.cover_size_bits,
+            info.primary_max_message_bytes,
+            info.shadow_max_message_bytes,
+        );
+    } else {
+        println!("CABAC v2 capacity ({}x{}, {} frames, gop={}):",
+            probe.width, probe.height, probe.n_frames, gop_size);
+        println!("  cover bits (3 injectable domains): {}", info.cover_size_bits);
+        println!("  primary max message bytes:         {}", info.primary_max_message_bytes);
+        println!("  shadow max message bytes (n=1):    {}", info.shadow_max_message_bytes);
+    }
     Ok(())
 }

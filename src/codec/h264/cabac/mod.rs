@@ -41,7 +41,9 @@
 pub mod bin_decoder;
 pub mod binarization;
 pub mod context;
+pub mod ctx_offsets;
 pub mod encoder;
+pub mod mb_type_math;
 pub mod engine;
 pub mod neighbor;
 pub mod slice;

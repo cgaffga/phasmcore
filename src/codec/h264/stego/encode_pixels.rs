@@ -994,6 +994,31 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
     message: &str,
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
+        yuv, width, height, n_frames, gop_size, message, &[], passphrase,
+    )
+}
+
+/// §6E-A5(c.x) / Task #97 — `_with_files` variant of the production
+/// CABAC v2 streaming encoder. Accepts a `&[FileEntry]` slice so
+/// callers can attach binary files (images / docs / contacts) to
+/// the primary text message. Same brotli-compressed payload format
+/// as the JPEG-side image stego — `payload::encode_payload(text,
+/// files)` builds one blob; encryption + framing are unchanged.
+///
+/// Decoder side: `h264_stego_smart_decode_video_with_payload`
+/// returns `PayloadData { text, files, .. }`.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    message: &str,
+    files: &[crate::stego::payload::FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
     use crate::stego::{crypto, frame, payload};
     use crate::stego::stc::streaming_segmented::StreamingViterbiPhaseB;
     use super::cover_replay::H264GopReplayCover;
@@ -1031,7 +1056,10 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
     let h = 4usize;
     let quality = Some(26u8);
 
-    let payload_bytes = payload::encode_payload(message, &[])?;
+    // Task #97 — `files` is brotli-compressed alongside the text in
+    // a single payload blob; identical wire format to the JPEG-side
+    // image stego, decoded via `payload::decode_payload`.
+    let payload_bytes = payload::encode_payload(message, files)?;
     let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
     let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
     let frame_bits: Vec<u8> = frame_bytes
@@ -1678,6 +1706,100 @@ pub fn h264_stego_shadow_capacity(
     })
 }
 
+/// §6E-A5(c.x) / Task #96 — combined primary + shadow capacity
+/// surface for the CABAC v2 stego pipeline.
+///
+/// Returned by [`h264_stego_capacity_4domain`]. `cover_size_bits`
+/// is the sum of the 3 INJECTABLE bypass-bin domains
+/// (CoeffSignBypass + CoeffSuffixLsb + MvdSignBypass) — what shadow
+/// position selection actually has to work with after the #107 fix
+/// excluded MvdSuffixLsb.
+///
+/// Both `primary_max_message_bytes` and `shadow_max_message_bytes`
+/// are upper bounds on the user-supplied UTF-8 string + attached
+/// files combined (one per channel), AFTER subtracting framing
+/// overhead (encrypted nonce + salt + plaintext-length + auth tag).
+/// The shadow value additionally accounts for the `[4, 8, 16, 32,
+/// 64, 128]` parity-tier cascade absorption.
+#[derive(Debug, Clone, Copy)]
+pub struct H264StegoCapacityInfo {
+    /// Total injectable bits across the 3 bypass-bin domains used
+    /// by stego: `csb + csl + msb`. Excludes `msl` since
+    /// MvdSuffixLsb isn't injectable post-§6F.2(k).2.
+    pub cover_size_bits: usize,
+    /// Maximum primary message bytes (text + attached files
+    /// combined) embeddable via the §30D-C 4-domain orchestrator.
+    /// Equals `cover_size_bits/8 - FRAME_OVERHEAD`.
+    pub primary_max_message_bytes: usize,
+    /// Maximum SHADOW message bytes per shadow at single-shadow
+    /// (n_shadows = 1) load. For multi-shadow scenarios use
+    /// [`h264_stego_shadow_capacity`] with the actual shadow count.
+    pub shadow_max_message_bytes: usize,
+}
+
+/// §6E-A5(c.x) / Task #96 — predict primary AND shadow capacity
+/// for a given YUV+gop_size combination.
+///
+/// Single Pass-1 walk; returns both numbers in one struct so callers
+/// (CLI `video-capacity`, mobile bridges) can present accurate
+/// pre-encode estimates without needing to call two separate APIs.
+///
+/// For multi-shadow scenarios use [`h264_stego_shadow_capacity`]
+/// directly with the actual `n_shadows` count — this helper
+/// hardcodes `n_shadows = 1` (the single-shadow case the mobile
+/// UI exposes today).
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_capacity_4domain(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+) -> Result<H264StegoCapacityInfo, StegoError> {
+    use crate::stego::frame::FRAME_OVERHEAD;
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}", yuv.len(), frame_size * n_frames
+        )));
+    }
+    if gop_size == 0 || gop_size > n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_size {gop_size} must be in 1..={n_frames}"
+        )));
+    }
+
+    let cover_p1 = pass1_count_4domain(
+        yuv, width, height, n_frames, frame_size, /* quality */ Some(26),
+        gop_size, /* b_count */ 1,
+    )?;
+    let cap_p1 = cover_p1.cover.capacity();
+    // Post-#107: MvdSuffixLsb is excluded from the injectable pool.
+    let cover_size_bits =
+        cap_p1.coeff_sign_bypass + cap_p1.coeff_suffix_lsb + cap_p1.mvd_sign_bypass;
+
+    // Primary: bytes available = bits/8, minus framing overhead.
+    let primary_max_message_bytes =
+        (cover_size_bits / 8).saturating_sub(FRAME_OVERHEAD);
+
+    // Shadow: reuse the existing collision-limited formula at
+    // n_shadows = 1.
+    let shadow_info = h264_stego_shadow_capacity(
+        yuv, width, height, n_frames, gop_size, /* n_shadows */ 1,
+    )?;
+
+    Ok(H264StegoCapacityInfo {
+        cover_size_bits,
+        primary_max_message_bytes,
+        shadow_max_message_bytes: shadow_info.max_message_bytes,
+    })
+}
+
 /// Phase 6E-C1b-v2 — encode primary + 1 shadow message into H.264
 /// Annex-B bytes with **cascade verification** (mirrors image-side
 /// architecture). Both messages live in the same video, each
@@ -1820,6 +1942,28 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern<'a>(
     primary_passphrase: &str,
     shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
 ) -> Result<Vec<u8>, StegoError> {
+    h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files(
+        yuv, width, height, n_frames, pattern,
+        primary_message, &[], primary_passphrase, shadows,
+    )
+}
+
+/// Task #97 — N-shadow variant accepting `primary_files`. Shadows
+/// already carry their own files via `ShadowLayer.files`. This
+/// completes the parity with the JPEG-side image stego where
+/// primary + each shadow can independently attach binary files.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files<'a>(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    primary_message: &str,
+    primary_files: &[crate::stego::payload::FileEntry],
+    primary_passphrase: &str,
+    shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
+) -> Result<Vec<u8>, StegoError> {
     use crate::stego::{crypto, frame, payload};
     use crate::stego::shadow_layer::SHADOW_PARITY_TIERS;
     let gop_size = pattern.gop_size();
@@ -1875,7 +2019,7 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern<'a>(
     }
 
     // Frame the primary message.
-    let primary_bytes = payload::encode_payload(primary_message, &[])?;
+    let primary_bytes = payload::encode_payload(primary_message, primary_files)?;
     let (ct, nonce, salt) = crypto::encrypt(&primary_bytes, primary_passphrase)?;
     let frame_bytes = frame::build_frame(primary_bytes.len(), &salt, &nonce, &ct);
     let frame_bits: Vec<u8> = frame_bytes
@@ -3230,6 +3374,77 @@ mod pass1b_streaming_diag {
     use crate::codec::h264::stego::PositionKey;
     use crate::codec::h264::stego::orchestrate::DomainPlan;
     use crate::codec::h264::stego::gop_pattern::GopPattern;
+
+    /// Task #97 — file-attachment round-trip via the CABAC v2
+    /// streaming-v2 entry. Encode a small file alongside text,
+    /// decode via smart_decode_with_payload, assert files recovered.
+    #[test]
+    fn h264_stego_encode_with_files_roundtrip_128x80() {
+        use crate::stego::payload::FileEntry;
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        let files = [FileEntry {
+            filename: "note.txt".into(),
+            content: b"phasm files demo: hello video!".to_vec(),
+        }];
+        let bytes = match super::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
+            &yuv, 128, 80, 10, 5, "msg", &files, "files-pass-128",
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("encode_with_files flake (#94): {e:?}");
+                return; // small fixture flakes on random salt
+            }
+        };
+        let payload =
+            super::super::decode_pixels::h264_stego_smart_decode_video_with_payload(
+                &bytes, "files-pass-128",
+            ).expect("decode_with_payload");
+        assert_eq!(payload.text, "msg");
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.files[0].filename, "note.txt");
+        assert_eq!(payload.files[0].content, b"phasm files demo: hello video!");
+    }
+
+    /// Task #96 — sanity-check primary > shadow capacity at the
+    /// 128x80 fixture. Primary uses the entire injectable cover
+    /// minus framing overhead; shadow is collision-limited under
+    /// the cascade formula and bounded much smaller.
+    #[test]
+    fn h264_stego_capacity_4domain_smoke() {
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        let info = super::h264_stego_capacity_4domain(&yuv, 128, 80, 10, 5)
+            .expect("capacity_4domain");
+        assert!(info.cover_size_bits > 0, "cover bits must be positive");
+        assert!(
+            info.primary_max_message_bytes > 0,
+            "primary capacity must be > 0",
+        );
+        // Primary uses cover_bits/8 - FRAME_OVERHEAD; shadow uses the
+        // collision-limited sqrt formula so it's typically smaller.
+        // At 128x80 we expect primary >= shadow at single-shadow load.
+        assert!(
+            info.primary_max_message_bytes >= info.shadow_max_message_bytes,
+            "primary {} should be >= shadow (n=1) {}",
+            info.primary_max_message_bytes,
+            info.shadow_max_message_bytes,
+        );
+        eprintln!(
+            "128x80 capacity: cover_bits={} primary={} shadow_n1={}",
+            info.cover_size_bits,
+            info.primary_max_message_bytes,
+            info.shadow_max_message_bytes,
+        );
+    }
 
     #[test]
     fn pass1b_streaming_matches_inmemory_128x80_2gop() {

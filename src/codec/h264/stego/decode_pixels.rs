@@ -36,6 +36,7 @@ use crate::stego::frame::{self, FRAME_OVERHEAD};
 use crate::stego::stc::extract::stc_extract;
 use crate::stego::stc::hhat::generate_hhat;
 use crate::stego::{crypto, payload};
+use crate::stego::payload::PayloadData;
 
 use crate::codec::h264::cabac::bin_decoder::{
     walk_annex_b_for_cover, walk_annex_b_for_cover_with_options,
@@ -183,6 +184,17 @@ pub fn h264_stego_smart_decode_video(
     annex_b: &[u8],
     passphrase: &str,
 ) -> Result<String, StegoError> {
+    h264_stego_smart_decode_video_with_payload(annex_b, passphrase).map(|p| p.text)
+}
+
+/// Task #97 — `_with_payload` variant returning the full
+/// PayloadData (text + attached files) recovered from either the
+/// primary STC plan or a matching shadow layer. Use this when the
+/// caller needs file attachments in addition to text.
+pub fn h264_stego_smart_decode_video_with_payload(
+    annex_b: &[u8],
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
     let opts = WalkOptions { record_mvd: true };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
@@ -203,11 +215,11 @@ pub fn h264_stego_smart_decode_video(
     if let Ok(payload_data) = super::shadow::shadow_extract_all4_safe(
         &walk.cover, passphrase, None, Some(&safe_msl),
     ) {
-        return Ok(payload_data.text);
+        return Ok(payload_data);
     }
 
     // Primary fallback.
-    decode_from_cover_4domain(walk.cover, passphrase)
+    decode_from_cover_4domain_with_payload(walk.cover, passphrase)
 }
 
 /// Shared body for 4-domain decode: brute-force m_total over the
@@ -216,6 +228,16 @@ fn decode_from_cover_4domain(
     cover: DomainCover,
     passphrase: &str,
 ) -> Result<String, StegoError> {
+    decode_from_cover_4domain_with_payload(cover, passphrase).map(|p| p.text)
+}
+
+/// Task #97 — `_with_payload` variant returning the full
+/// PayloadData (text + attached files). Existing
+/// `decode_from_cover_4domain` is the text-only thin wrapper.
+fn decode_from_cover_4domain_with_payload(
+    cover: DomainCover,
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
     let keys = CabacStegoMasterKeys::derive(passphrase)?;
     let seeds = [
         (EmbedDomain::CoeffSignBypass,
@@ -242,10 +264,10 @@ fn decode_from_cover_4domain(
 
     let mut m_total = min_m_total_bits;
     while m_total <= max_m_total_bits {
-        if let Some(plaintext) = try_decode_at_4domain(
+        if let Some(payload_data) = try_decode_at_4domain(
             &cover, &seeds, STC_H, m_total, passphrase,
         ) {
-            return Ok(plaintext);
+            return Ok(payload_data);
         }
         m_total += 8;
     }
@@ -265,7 +287,7 @@ fn try_decode_at_4domain(
     h: usize,
     m_total_bits: usize,
     passphrase: &str,
-) -> Option<String> {
+) -> Option<PayloadData> {
     use super::hook::GopCapacity;
 
     // Phase 6F.2(k).4 — mirror encoder's stealth-weighted
@@ -349,7 +371,7 @@ fn try_decode_at_4domain(
         &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
     ).ok()?;
     let payload_data = payload::decode_payload(&plaintext).ok()?;
-    Some(payload_data.text)
+    Some(payload_data)
 }
 
 /// Try one candidate `m_total` (total framed bit count). Returns

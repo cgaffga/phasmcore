@@ -90,6 +90,11 @@ pub use codec::h264::stego::encode_pixels::{
     h264_stego_encode_yuv_string_with_shadow,
     h264_stego_encode_yuv_string_with_shadow_with_pattern,
     h264_stego_shadow_capacity, H264ShadowCapacityInfo,
+    // Task #96 — combined primary + shadow capacity surface.
+    h264_stego_capacity_4domain, H264StegoCapacityInfo,
+    // Task #97 — file-attachment-aware encode entries.
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files,
+    h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files,
 };
 #[cfg(feature = "cabac-stego")]
 pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
@@ -103,6 +108,9 @@ pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
 pub use codec::h264::stego::decode_pixels::{
     h264_stego_decode_yuv_string, h264_stego_decode_yuv_string_4domain,
     h264_stego_shadow_decode, h264_stego_smart_decode_video,
+    // Task #97 — _with_payload variant returns PayloadData (text +
+    // attached files), not just text.
+    h264_stego_smart_decode_video_with_payload,
 };
 
 // HEVC (archived) re-exports — only available with the `hevc-archive` feature.

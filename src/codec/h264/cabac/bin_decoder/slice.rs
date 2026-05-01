@@ -613,12 +613,11 @@ fn walk_i16x16_mb(
     recorder: &mut PositionRecorder,
     i_mb_type: u32,
 ) -> Result<bool, WalkError> {
-    // Decompose mb_type per spec § 7.3.5 / Table 7-11:
-    //   mb_type = 1 + luma_pred_mode + 4*cbp_chroma + 12*cbp_luma_flag
-    let v = i_mb_type - 1;
-    let _luma_pred_mode = v % 4;
-    let cbp_chroma = (v / 4) % 3;
-    let cbp_luma_flag = v / 12;
+    // Decompose mb_type per spec § 7.3.5 / Table 7-11 — Task #50 helper.
+    let fields = super::super::mb_type_math::unpack_i_16x16_mb_type(i_mb_type);
+    let _luma_pred_mode = fields.luma_pred_mode;
+    let cbp_chroma = fields.cbp_chroma;
+    let cbp_luma_flag = fields.cbp_luma_flag;
 
     let chroma_pred_mode = decode_intra_chroma_pred_mode(dec, mb_x)?;
 

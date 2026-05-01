@@ -4427,8 +4427,14 @@ impl Encoder {
             0
         };
 
-        // 5. mb_type (Table 7-11 encoding).
-        let mb_type = 1 + luma_pred_mode + 4 * cbp_chroma as u32 + 12 * cbp_luma_flag as u32;
+        // 5. mb_type (Table 7-11 encoding) — Task #50 helper.
+        let mb_type = crate::codec::h264::cabac::mb_type_math::pack_i_16x16_mb_type(
+            crate::codec::h264::cabac::mb_type_math::I16x16MbType {
+                luma_pred_mode,
+                cbp_chroma: cbp_chroma as u32,
+                cbp_luma_flag: cbp_luma_flag as u32,
+            },
+        );
 
         // 6. Emit CABAC syntax. In P-slice context, shift the codenum
         // into the P-slice I_16x16 range (values 6..30 per Table 7-13
@@ -5458,13 +5464,18 @@ impl Encoder {
             0
         };
 
-        // 7. mb_type = 1 + pred_mode + 4*CBP_chroma + 12*CBP_luma_flag
-        //    (spec Table 7-11). `pred_mode` is the Intra_16x16 luma
-        //    mode chosen above (0..=3 per the Intra16x16Mode enum).
-        //    For P-slice intra, mb_type_offset = 5 shifts the codenum
-        //    into the P-slice mb_type table (Table 7-13 rows 6..=29).
-        let mb_type =
-            1 + luma_pred_mode + 4 * cbp_chroma as u32 + 12 * cbp_luma_flag as u32;
+        // 7. mb_type per spec Table 7-11 — Task #50 helper.
+        //    `pred_mode` is the Intra_16x16 luma mode chosen above
+        //    (0..=3 per the Intra16x16Mode enum). For P-slice intra,
+        //    mb_type_offset = 5 shifts the codenum into the P-slice
+        //    mb_type table (Table 7-13 rows 6..=29).
+        let mb_type = crate::codec::h264::cabac::mb_type_math::pack_i_16x16_mb_type(
+            crate::codec::h264::cabac::mb_type_math::I16x16MbType {
+                luma_pred_mode,
+                cbp_chroma: cbp_chroma as u32,
+                cbp_luma_flag: cbp_luma_flag as u32,
+            },
+        );
         w.write_ue(mb_type + mb_type_offset);
 
         // intra_chroma_pred_mode: codeNum matches IntraChroma8x8Mode
