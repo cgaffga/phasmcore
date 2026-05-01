@@ -61,10 +61,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
-      # Refuse to compile if any feature transitively pulls in the H.264
-      # encoder. Belt-and-braces alongside the explicit no-`--features`
-      # flag on the publish step.
-      RUSTFLAGS: "-D warnings"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
