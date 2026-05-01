@@ -1,5 +1,6 @@
 # phasm-core
 
+[![crates.io](https://img.shields.io/crates/v/phasm-core.svg)](https://crates.io/crates/phasm-core)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android%20%7C%20Web%20%7C%20CLI-green.svg)](https://phasm.app)
@@ -7,6 +8,34 @@
 Pure-Rust steganography engine for hiding encrypted text messages in JPEG photos.
 
 This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm-steganography/id6759446274), Android, and the [web](https://phasm.app).
+
+## Install
+
+Add the library to your Cargo.toml with default features (no H.264 encoder, per [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent obligations):
+
+```bash
+cargo add phasm-core
+```
+
+Or install the CLI binary:
+
+```bash
+cargo install phasm-cli
+```
+
+### Optional Cargo features
+
+| Feature | Description |
+|---------|-------------|
+| `parallel` | [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD costs, STC embedding, Armor decode sweeps. Recommended for native builds. |
+| `video` | H.264 video stego pipeline (decoder + bitstream parsing). |
+| `simd` | Hand-tuned SIMD intrinsics (NEON / AVX2 / WASM SIMD128) for H.264 motion compensation and SATD. |
+| `h264-encoder` | Pure-Rust clean-room H.264 encoder. **OFF by default — only enable when distributing per local jurisdiction's [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent-pool terms.** Source-only consumption is royalty-free; binary distribution above the free tier (currently 100,000 units/year) is not. |
+
+```bash
+cargo add phasm-core --features parallel
+cargo install phasm-cli --features h264-encoder   # H.264 video stego, source-build only
+```
 
 ## Two Embedding Modes
 

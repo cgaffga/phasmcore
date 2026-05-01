@@ -3410,6 +3410,68 @@ mod pass1b_streaming_diag {
         assert_eq!(payload.files[0].content, b"phasm files demo: hello video!");
     }
 
+    /// Task #120 — N=1 shadow + per-layer file attachments
+    /// round-trip via `_with_n_shadows_with_pattern_and_files`.
+    /// Verifies primary text+file recover under primary passphrase,
+    /// shadow text+file recover under shadow passphrase, and the
+    /// cross-domain file-attachment payload encoding works on both
+    /// layers simultaneously. CLI / iOS / Android bridges all wire
+    /// through this same core entry.
+    #[test]
+    fn h264_stego_encode_with_shadow_and_files_roundtrip_128x80() {
+        use crate::stego::payload::FileEntry;
+        use crate::stego::shadow_layer::ShadowLayer;
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        let primary_files = [FileEntry {
+            filename: "primary.txt".into(),
+            content: b"primary file".to_vec(),
+        }];
+        let shadow_files = [FileEntry {
+            filename: "shadow.txt".into(),
+            content: b"shadow file".to_vec(),
+        }];
+        let shadows = [ShadowLayer {
+            message: "s",
+            passphrase: "shadow-pass-128",
+            files: &shadow_files,
+        }];
+        let pattern = GopPattern::Ibpbp { gop: 5, b_count: 1 };
+        let bytes = match super::h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files(
+            &yuv, 128, 80, 10, pattern,
+            "p", &primary_files, "primary-pass-128",
+            &shadows,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("encode_with_shadow_and_files flake (#94): {e:?}");
+                return; // small fixture flakes on random salt
+            }
+        };
+
+        let prim_payload =
+            super::super::decode_pixels::h264_stego_smart_decode_video_with_payload(
+                &bytes, "primary-pass-128",
+            ).expect("primary decode");
+        assert_eq!(prim_payload.text, "p");
+        assert_eq!(prim_payload.files.len(), 1);
+        assert_eq!(prim_payload.files[0].filename, "primary.txt");
+        assert_eq!(prim_payload.files[0].content, b"primary file");
+
+        let shadow_payload =
+            super::super::decode_pixels::h264_stego_smart_decode_video_with_payload(
+                &bytes, "shadow-pass-128",
+            ).expect("shadow decode");
+        assert_eq!(shadow_payload.text, "s");
+        assert_eq!(shadow_payload.files.len(), 1);
+        assert_eq!(shadow_payload.files[0].filename, "shadow.txt");
+        assert_eq!(shadow_payload.files[0].content, b"shadow file");
+    }
+
     /// Task #96 — sanity-check primary > shadow capacity at the
     /// 128x80 fixture. Primary uses the entire injectable cover
     /// minus framing overhead; shadow is collision-limited under

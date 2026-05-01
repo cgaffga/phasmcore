@@ -12,7 +12,7 @@ use phasm_core::{
 #[cfg(not(feature = "cabac-stego"))]
 use phasm_core::h264_ghost_decode;
 #[cfg(feature = "cabac-stego")]
-use phasm_core::h264_stego_smart_decode_video;
+use phasm_core::h264_stego_smart_decode_video_with_payload;
 #[cfg(feature = "cabac-stego")]
 use crate::transcode;
 use std::path::PathBuf;
@@ -129,10 +129,9 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
 }
 
 /// Phase 6.5 wiring — CABAC v2 decoder path. ffmpeg demuxes MP4 →
-/// Annex-B; phasm-core's `h264_stego_smart_decode_video` walks the
-/// CABAC bins for shadow + 4-domain primary recovery. Returns the
-/// decoded text wrapped in a `PayloadData` (no file attachments —
-/// the CABAC stego pipeline is text-only at this stage).
+/// Annex-B; phasm-core's `h264_stego_smart_decode_video_with_payload`
+/// walks the CABAC bins for shadow + 4-domain primary recovery and
+/// returns full `PayloadData` (text + attached files).
 #[cfg(feature = "cabac-stego")]
 fn decode_h264_cabac(
     input: &PathBuf,
@@ -143,11 +142,7 @@ fn decode_h264_cabac(
     let result = (|| -> Result<phasm_core::PayloadData, CliError> {
         transcode::extract_annexb_from_mp4(input, &annex_b_temp)?;
         let annex_b = std::fs::read(&annex_b_temp)?;
-        let text = h264_stego_smart_decode_video(&annex_b, passphrase)?;
-        Ok(phasm_core::PayloadData {
-            text,
-            files: Vec::new(),
-        })
+        Ok(h264_stego_smart_decode_video_with_payload(&annex_b, passphrase)?)
     })();
     let _ = std::fs::remove_file(&annex_b_temp);
     result
