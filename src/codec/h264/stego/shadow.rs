@@ -15,23 +15,31 @@
 //! - **Shadows** use direct LSB writes + Reed-Solomon error
 //!   correction.
 //!
-//! ## Position selection (this commit, N=1)
+//! ## Position selection (current — §6E-C2 polish + §6E-A5(c.x))
 //!
-//! Shadow positions are restricted to the **CoeffSignBypass domain
-//! only** for §6E-C1b. Two domain restrictions are at play:
+//! Shadow positions are selected across the **3 injectable bypass-bin
+//! domains** by hash priority:
 //!
-//! - **No MVD shadow**: writing shadow bits into MVD positions
-//!   would have to happen BEFORE primary's Pass 2A STC, but Pass
-//!   1B's final residual cover isn't available until after Pass 2A.
-//!   Chicken-and-egg. Deferred to §6E-C2 polish.
-//! - **No CoeffSuffixLsb shadow**: suffix-LSB flips change
-//!   `|coeff|` by ±1, which can push a coefficient from `|coeff|=16`
-//!   (in the suffix-LSB position set) to `|coeff|=15` (out of the
-//!   set). Encoder's selected suffix-LSB shadow position can drop
-//!   out of Pass 3's emitted set, so the decoder doesn't see it.
-//!   Sign flips DON'T change magnitude — they're exactly stable.
-//!   Suffix-LSB shadow is a §6E-C2 polish item; sign-only capacity
-//!   is sufficient for any realistic single-shadow payload.
+//! - **CoeffSignBypass** — sign-bin overrides applied at residual
+//!   block emission (`apply_coeff_sign_overrides`).
+//! - **CoeffSuffixLsb** — magnitude-LSB ±1 flips at eligible
+//!   coeffs (|coeff|≥16); cascade-absorbed for the rare boundary
+//!   case where a flip drops a coefficient out of the suffix-LSB
+//!   set.
+//! - **MvdSignBypass** — sign-bin override at MVD bypass-emit
+//!   (post-§6F.2(k).1, decoupled from `slot.value` so MC + median
+//!   predictor see the encoder's natural MV — no cascade).
+//!
+//! **MvdSuffixLsb is NOT injectable** post-§6F.2(k).2 (magnitude-
+//! LSB flip changes |MVD| → cascades through the median MV
+//! predictor). Pass 1 logs MvdSuffixLsb positions in the cover but
+//! Pass 3 never overrides them in the bitstream. Stamping shadow
+//! bits at MvdSuffixLsb positions would put non-injectable slots
+//! in the shadow's RS frame — the decoder reads the natural value,
+//! not the shadow bit, so ~50% of those slots become noise → RS
+//! exhausts every parity tier (the #107 root cause at 1080p before
+//! `priority_slots_all4` was restricted to the 3 injectable
+//! domains).
 //!
 //! Selection is by hash priority alone —
 //! `ChaCha20(shadow_perm_seed, position_key)`. No locally-adaptive
@@ -320,33 +328,109 @@ fn peek_fdl_from_first_block(
 // MvdSignBypass + MvdSuffixLsb). §6E-C1b-v2 uses these; §6E-C1b
 // (experimental sign-only) keeps using the residual-only variants.
 
-/// 4-domain hash-priority sort. Returns `ShadowSlot` per position
-/// across all 4 bypass-bin domains, priority computed from
-/// `ChaCha20(perm_seed).next_u32()` keyed by `PositionKey.raw()`.
-fn priority_slots_all4(
+/// §6E-A5(d).3 — hash-priority sort across the bypass-bin domains
+/// with optional per-domain cascade-safety masks.
+///
+/// **Without masks (`safe_csl = safe_msl = None`)**: includes the 3
+/// always-injectable domains — CoeffSignBypass + CoeffSuffixLsb +
+/// MvdSignBypass — and EXCLUDES MvdSuffixLsb entirely (the post-#107
+/// default; `priority_slots_all4` wrapper below).
+///
+/// **With masks**: MvdSuffixLsb included where `safe_msl[i] = true`;
+/// CoeffSuffixLsb additionally filtered by `safe_csl[i]` when
+/// supplied. `safe_msl` is the output of
+/// `cascade_safety::derive_msl_safe_from_msb`. `safe_csl` filters
+/// the |coeff|=16→15 boundary case (true iff |coeff|≥17).
+///
+/// Encoder + decoder MUST call with identical inputs to stay in
+/// lockstep — both sides recompute the masks from their own meta
+/// (cover_p1 on encode, walker meta on decode), and the safe-set
+/// analysis is invariant under sign-flips and safe-set magnitude
+/// flips by §6F.2(j) construction.
+pub(super) fn priority_slots_all4_safe(
     cover: &DomainCover,
     perm_seed: &[u8; 32],
+    safe_csl: Option<&[bool]>,
+    safe_msl: Option<&[bool]>,
 ) -> Vec<ShadowSlot> {
     let mut rng = ChaCha20Rng::from_seed(*perm_seed);
-    let mut slots = Vec::with_capacity(cover.total_len());
+    let msl_count = safe_msl
+        .map(|m| m.iter().filter(|&&b| b).count())
+        .unwrap_or(0);
+    let csl_count = match safe_csl {
+        Some(m) => m.iter().filter(|&&b| b).count(),
+        None => cover.coeff_suffix_lsb.len(),
+    };
+    let mut slots = Vec::with_capacity(
+        cover.coeff_sign_bypass.len() + csl_count + cover.mvd_sign_bypass.len() + msl_count,
+    );
 
-    let domains: [(EmbedDomain, &[PositionKey]); 4] = [
-        (EmbedDomain::CoeffSignBypass, &cover.coeff_sign_bypass.positions),
-        (EmbedDomain::CoeffSuffixLsb, &cover.coeff_suffix_lsb.positions),
-        (EmbedDomain::MvdSignBypass, &cover.mvd_sign_bypass.positions),
-        (EmbedDomain::MvdSuffixLsb, &cover.mvd_suffix_lsb.positions),
-    ];
+    // CoeffSignBypass — always injectable (sign-only, no cascade).
+    for (intra_index, key) in cover.coeff_sign_bypass.positions.iter().enumerate() {
+        rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+        slots.push(ShadowSlot {
+            domain: EmbedDomain::CoeffSignBypass,
+            intra_index,
+            priority: rng.next_u32(),
+        });
+    }
 
-    for (domain, positions) in domains {
-        for (intra_index, key) in positions.iter().enumerate() {
+    // CoeffSuffixLsb — optional |coeff|≥17 filter (cascade-aware
+    // when `safe_csl` supplied; otherwise include all).
+    for (intra_index, key) in cover.coeff_suffix_lsb.positions.iter().enumerate() {
+        if let Some(mask) = safe_csl
+            && (intra_index >= mask.len() || !mask[intra_index])
+        {
+            continue;
+        }
+        rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+        slots.push(ShadowSlot {
+            domain: EmbedDomain::CoeffSuffixLsb,
+            intra_index,
+            priority: rng.next_u32(),
+        });
+    }
+
+    // MvdSignBypass — always injectable (post-§6F.2(k).1 sign-only
+    // bitstream-mod override; doesn't mutate slot.value).
+    for (intra_index, key) in cover.mvd_sign_bypass.positions.iter().enumerate() {
+        rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+        slots.push(ShadowSlot {
+            domain: EmbedDomain::MvdSignBypass,
+            intra_index,
+            priority: rng.next_u32(),
+        });
+    }
+
+    // MvdSuffixLsb — ONLY when safe_msl supplied. Default-without-
+    // mask: skip the domain entirely (post-#107 behavior).
+    if let Some(mask) = safe_msl {
+        for (intra_index, key) in cover.mvd_suffix_lsb.positions.iter().enumerate() {
+            if intra_index >= mask.len() || !mask[intra_index] {
+                continue;
+            }
             rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-            let priority = rng.next_u32();
-            slots.push(ShadowSlot { domain, intra_index, priority });
+            slots.push(ShadowSlot {
+                domain: EmbedDomain::MvdSuffixLsb,
+                intra_index,
+                priority: rng.next_u32(),
+            });
         }
     }
 
     slots.sort_by_key(|s| s.priority);
     slots
+}
+
+/// Backwards-compat wrapper around `priority_slots_all4_safe` with
+/// no safety masks. Reproduces the post-#107 3-domain behavior
+/// (MvdSuffixLsb fully excluded). Used by callers that haven't
+/// computed cascade-safety masks (today's production default).
+fn priority_slots_all4(
+    cover: &DomainCover,
+    perm_seed: &[u8; 32],
+) -> Vec<ShadowSlot> {
+    priority_slots_all4_safe(cover, perm_seed, None, None)
 }
 
 /// 4-domain shadow preparation. Same RS-encode + AES-GCM-SIV +
@@ -360,6 +444,26 @@ pub fn prepare_shadow_all4(
     files: &[FileEntry],
     parity_len: usize,
 ) -> Result<ShadowState, StegoError> {
+    prepare_shadow_all4_safe(cover, shadow_pass, message, files, parity_len, None, None)
+}
+
+/// §6E-A5(d).3 — `prepare_shadow_all4` variant accepting optional
+/// per-domain cascade-safety masks. None = backwards-compat (post-
+/// #107 default — 3 always-injectable domains). Some(mask) = include
+/// the corresponding suffix domain at safe positions only.
+///
+/// The masks must be aligned with `cover.coeff_suffix_lsb.positions`
+/// and `cover.mvd_suffix_lsb.positions` respectively. Mask shorter
+/// than the position vector → trailing positions treated as unsafe.
+pub fn prepare_shadow_all4_safe(
+    cover: &DomainCover,
+    shadow_pass: &str,
+    message: &str,
+    files: &[FileEntry],
+    parity_len: usize,
+    safe_csl: Option<&[bool]>,
+    safe_msl: Option<&[bool]>,
+) -> Result<ShadowState, StegoError> {
     let payload_bytes = payload::encode_payload(message, files)?;
     let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
     let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
@@ -370,7 +474,7 @@ pub fn prepare_shadow_all4(
     let n_total = rs_bits.len();
 
     let perm_seed = crypto::derive_shadow_structural_key(shadow_pass)?;
-    let slots = priority_slots_all4(cover, &perm_seed);
+    let slots = priority_slots_all4_safe(cover, &perm_seed, safe_csl, safe_msl);
 
     if slots.len() < n_total {
         return Err(StegoError::MessageTooLarge);
@@ -541,6 +645,31 @@ pub fn prepare_shadow_over_emit_cover(
     )
 }
 
+/// §6E-A5(d).3 — cascade-safety-aware variant of
+/// [`prepare_shadow_over_emit_cover`]. Threads `safe_csl` /
+/// `safe_msl` through to `prepare_shadow_all4_safe` so the encoder
+/// can include MvdSuffixLsb (and the brittle CoeffSuffixLsb
+/// |coeff|=16 boundary case) at cascade-safe positions only.
+pub fn prepare_shadow_over_emit_cover_safe(
+    primary_emit_cover: &DomainCover,
+    shadow_pass: &str,
+    message: &str,
+    files: &[FileEntry],
+    parity_len: usize,
+    safe_csl: Option<&[bool]>,
+    safe_msl: Option<&[bool]>,
+) -> Result<ShadowState, StegoError> {
+    prepare_shadow_all4_safe(
+        primary_emit_cover,
+        shadow_pass,
+        message,
+        files,
+        parity_len,
+        safe_csl,
+        safe_msl,
+    )
+}
+
 /// 4-domain shadow extract — same brute-force-parity-tier algorithm
 /// as `shadow_extract`, but priority sort spans all 4 bypass-bin
 /// domains. Used by §6E-C1b-v2 cascade verification (encoder
@@ -549,12 +678,26 @@ pub fn shadow_extract_all4(
     cover: &DomainCover,
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
+    shadow_extract_all4_safe(cover, passphrase, None, None)
+}
+
+/// §6E-A5(d).3 — cascade-safety-aware variant of
+/// [`shadow_extract_all4`]. Decoder uses this when it has computed
+/// `safe_csl` / `safe_msl` from the walked cover meta. Encoder +
+/// decoder must use IDENTICAL mask inputs to land on the same
+/// priority order.
+pub fn shadow_extract_all4_safe(
+    cover: &DomainCover,
+    passphrase: &str,
+    safe_csl: Option<&[bool]>,
+    safe_msl: Option<&[bool]>,
+) -> Result<PayloadData, StegoError> {
     if cover.total_len() == 0 {
         return Err(StegoError::FrameCorrupted);
     }
 
     let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
-    let slots = priority_slots_all4(cover, &perm_seed);
+    let slots = priority_slots_all4_safe(cover, &perm_seed, safe_csl, safe_msl);
 
     let all_lsbs: Vec<u8> = slots
         .iter()

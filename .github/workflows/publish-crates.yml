@@ -1,0 +1,141 @@
+# Tag-triggered crates.io publishing for the phasmcore public mirror.
+#
+# Companion to release.yml (cargo-dist binary release). Both run on the
+# same `v*.*.*` tag pushes — cargo-dist publishes platform binaries to
+# GitHub Releases; this workflow publishes the `phasm-core` source crate
+# to crates.io.
+#
+# License-compliance constraint (Via LA AVC patent obligations)
+# --------------------------------------------------------------
+# `phasm-core` is published with **default features only** (`default = []`
+# in Cargo.toml). The H.264 encoder lives behind the `h264-encoder`
+# feature and is therefore NOT compiled into the published artefact.
+# Source consumers wanting video-stego rebuild from source themselves
+# with `cargo install phasm-core --features h264-encoder` (or, for the
+# CLI, `cargo install phasm-cli --features h264-encoder` once that crate
+# is publish-ready — see "phasm-cli" note below).
+#
+# This mirrors the cargo-dist binary build (release.yml), which also
+# omits the encoder for the same patent reason. Same constraint, two
+# distribution channels.
+#
+# phasm-cli
+# ---------
+# `phasm-cli` (core/cli/) is a sibling crate in the workspace. Today it
+# declares `phasm-core = { path = ".." }` with no `version` field, so
+# `cargo publish -p phasm-cli` is rejected by cargo with:
+#     "all dependencies must have a version requirement specified when
+#      publishing. dependency `phasm-core` does not specify a version."
+# We do NOT publish the CLI here. Reasons:
+#   1. cargo-dist already ships pre-built CLI binaries via GitHub
+#      Releases for 5 platforms — that is the maintained CLI channel.
+#   2. Publishing `phasm-cli` would require a Cargo.toml change (add
+#      `version = "x.y"` next to `path = ".."`); the user asked for no
+#      Cargo.toml mods in this stage-only setup.
+#   3. Source-install consumers can still build the CLI directly:
+#         cargo install --git https://github.com/cgaffga/phasmcore phasm-cli
+#      (optionally with `--features h264-encoder` for video stego).
+# To enable CLI publishing later, add `version = "0.1.0"` to the
+# `phasm-core` dep in `core/cli/Cargo.toml`, then uncomment the
+# `publish-cli` job below.
+
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  # Manual fallback for re-running if a tag-triggered run fails (e.g.
+  # transient crates.io 5xx, registry index propagation race). The tag
+  # whose version has already been crate-published cannot be re-published
+  # — crates.io is immutable. Use `cargo yank` first if you need to roll
+  # back a bad version (see docs/runbooks/github-push.md § 11).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-core:
+    name: cargo publish -p phasm-core (default features, no encoder)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Refuse to compile if any feature transitively pulls in the H.264
+      # encoder. Belt-and-braces alongside the explicit no-`--features`
+      # flag on the publish step.
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Sanity build (default features — no h264-encoder, no cabac-stego)
+        # Confirms the no-encoder build doesn't transitively pull in
+        # encoder code via a feature-gate mistake. If a future change
+        # accidentally re-routes encoder code into the default cfg, this
+        # step fails before we hit the registry.
+        run: cargo build --release --no-default-features
+        working-directory: .
+
+      - name: Publish phasm-core to crates.io
+        # Default features ONLY. `cargo publish` defaults to
+        # default-feature-set; we don't pass `--features` and we don't
+        # pass `--no-default-features`. `default = []` in Cargo.toml
+        # means the published .crate ships with zero optional features
+        # turned on at compile-time.
+        #
+        # Source on crates.io still contains the encoder modules (the
+        # source is what cargo-dist's release.yml also builds with
+        # default features — same source, same constraint). What
+        # matters for the patent obligation is what GETS COMPILED on a
+        # default `cargo install`: with `default = []` and the encoder
+        # behind `h264-encoder`, the answer is "no encoder."
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p phasm-core --token "$CARGO_REGISTRY_TOKEN"
+        working-directory: .
+
+  # ─────────────────────────────────────────────────────────────────────
+  # publish-cli (DISABLED — see header comment "phasm-cli" section)
+  #
+  # Uncomment + push a Cargo.toml fix when ready:
+  #   1. In core/cli/Cargo.toml change
+  #         phasm-core = { path = "..", features = ["parallel", "video"] }
+  #      to
+  #         phasm-core = { path = "..", version = "0.1.0", features = ["parallel", "video"] }
+  #   2. Uncomment the job below.
+  #   3. Bump versions in lockstep so phasm-cli's `version = "x.y"`
+  #      always matches the just-published phasm-core version.
+  #
+  # publish-cli:
+  #   name: cargo publish -p phasm-cli (default features, no encoder)
+  #   runs-on: ubuntu-latest
+  #   needs: publish-core
+  #   env:
+  #     CARGO_TERM_COLOR: always
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #       with:
+  #         persist-credentials: false
+  #
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     - name: Wait for crates.io index to propagate phasm-core
+  #       # The index is eventually-consistent. Without this sleep,
+  #       # `cargo publish -p phasm-cli` can fail with
+  #       # "no matching package named `phasm-core`" because the just-
+  #       # published version isn't yet visible to the registry resolver.
+  #       run: sleep 30
+  #
+  #     - name: Publish phasm-cli to crates.io
+  #       env:
+  #         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+  #       run: cargo publish -p phasm-cli --token "$CARGO_REGISTRY_TOKEN"
+  #       working-directory: .

@@ -155,7 +155,23 @@ pub fn h264_stego_shadow_decode(
     let opts = WalkOptions { record_mvd: true };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    let payload_data = super::shadow::shadow_extract_all4(&walk.cover, passphrase)?;
+    // §6E-A5(d).6 — derive the cascade-safe MvdSuffixLsb mask from
+    // the walked meta. Encoder ran the IDENTICAL analysis on its
+    // provisional walk (same content modulo shadow-override values
+    // at sign-flip-invariant + safe-set-magnitude-flip-invariant
+    // positions), so encoder + decoder land on the same priority
+    // pool by §6F.2(j) construction.
+    let safe_msb = super::cascade_safety::analyze_safe_mvd_subset(
+        &walk.mvd_meta, walk.mb_w, walk.mb_h,
+    );
+    let safe_msl = super::cascade_safety::derive_msl_safe_from_msb(
+        &walk.cover.mvd_sign_bypass.positions,
+        &safe_msb,
+        &walk.cover.mvd_suffix_lsb.positions,
+    );
+    let payload_data = super::shadow::shadow_extract_all4_safe(
+        &walk.cover, passphrase, None, Some(&safe_msl),
+    )?;
     Ok(payload_data.text)
 }
 
@@ -171,11 +187,22 @@ pub fn h264_stego_smart_decode_video(
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
 
+    // §6E-A5(d).6 — derive cascade-safe MvdSuffixLsb mask. Encoder
+    // ran the same analysis on its provisional walk → identical mask
+    // by §6F.2(j) construction.
+    let safe_msb = super::cascade_safety::analyze_safe_mvd_subset(
+        &walk.mvd_meta, walk.mb_w, walk.mb_h,
+    );
+    let safe_msl = super::cascade_safety::derive_msl_safe_from_msb(
+        &walk.cover.mvd_sign_bypass.positions,
+        &safe_msb,
+        &walk.cover.mvd_suffix_lsb.positions,
+    );
     // Shadow attempt first — AES-GCM-SIV authentication ensures we
     // only return Ok if THIS passphrase matches a shadow layer.
-    // §6E-C2 polish — uses `shadow_extract_all4` to match the
-    // encoder's single-cover position selection.
-    if let Ok(payload_data) = super::shadow::shadow_extract_all4(&walk.cover, passphrase) {
+    if let Ok(payload_data) = super::shadow::shadow_extract_all4_safe(
+        &walk.cover, passphrase, None, Some(&safe_msl),
+    ) {
         return Ok(payload_data.text);
     }
 

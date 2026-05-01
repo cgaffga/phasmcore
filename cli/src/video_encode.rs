@@ -12,6 +12,8 @@ use phasm_core::{detect_video_codec, VideoCodec};
 use phasm_core::h264_ghost_encode;
 #[cfg(feature = "cabac-stego")]
 use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2;
+#[cfg(feature = "cabac-stego")]
+use phasm_core::h264_stego_encode_yuv_string_with_shadow;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -50,6 +52,19 @@ pub struct VideoEncodeArgs {
     /// JSON output
     #[arg(long)]
     pub json: bool,
+
+    /// §6E-A5(c.4) — Shadow message (plausible deniability layer).
+    /// When set, embeds a primary message + ONE shadow message into
+    /// the same video. Each layer decodes only with its own passphrase.
+    /// Requires `--shadow-pass`. CABAC-stego feature only.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "shadow-msg")]
+    pub shadow_message: Option<String>,
+
+    /// Shadow passphrase. Must differ from primary passphrase.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "shadow-pass")]
+    pub shadow_passphrase: Option<String>,
 }
 
 pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
@@ -87,7 +102,21 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
             #[cfg(feature = "cabac-stego")]
             {
                 let _ = file_bytes; // consumed by re-read inside run_cabac_encode
-                run_cabac_encode(&args.video, &message, &passphrase, &output_path)?;
+                match (args.shadow_message.as_deref(), args.shadow_passphrase.as_deref()) {
+                    (Some(smsg), Some(spass)) => {
+                        run_cabac_encode_with_shadow(
+                            &args.video, &message, &passphrase, smsg, spass, &output_path,
+                        )?;
+                    }
+                    (None, None) => {
+                        run_cabac_encode(&args.video, &message, &passphrase, &output_path)?;
+                    }
+                    _ => {
+                        return Err(CliError::InvalidArgs(
+                            "--shadow-msg and --shadow-pass must both be set together".into(),
+                        ));
+                    }
+                }
             }
             #[cfg(not(feature = "cabac-stego"))]
             {
@@ -174,6 +203,64 @@ fn run_cabac_encode(
         let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
             &yuv_bytes, probe.width, probe.height, probe.n_frames, gop_size,
             message, passphrase,
+        )?;
+        std::fs::write(&annex_b_temp, &annex_b)?;
+        let audio_source = probe.has_audio.then_some(input.as_path());
+        transcode::mux_annexb_to_mp4(
+            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        )?;
+        Ok(())
+    })();
+
+    for p in cleanup_paths.drain(..) {
+        let _ = std::fs::remove_file(p);
+    }
+    result
+}
+
+/// §6E-A5(c.4) — CABAC v2 + shadow path. Same MP4 → YUV → encode →
+/// MP4 mux pipeline as `run_cabac_encode`, but calls the shadow
+/// variant of the encoder. The cabac-stego shadow encoder uses
+/// streaming Pass-1B + Pass-3 (§6E-A5(c.3)) so memory stays
+/// bounded on long-form clips.
+#[cfg(feature = "cabac-stego")]
+fn run_cabac_encode_with_shadow(
+    input: &PathBuf,
+    primary_message: &str,
+    primary_passphrase: &str,
+    shadow_message: &str,
+    shadow_passphrase: &str,
+    output: &PathBuf,
+) -> Result<(), CliError> {
+    transcode::ensure_ffmpeg_available()?;
+    let probe = transcode::probe_video(input)?;
+    eprintln!(
+        "Encoding via CABAC v2 + shadow: {}x{} × {} frames @ {} fps{}",
+        probe.width, probe.height, probe.n_frames, probe.frame_rate,
+        if probe.has_audio { " (with audio)" } else { "" },
+    );
+
+    let gop_size: usize = 30;
+    let gop_size = gop_size.min(probe.n_frames.max(1));
+
+    let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
+    let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
+    let mut cleanup_paths = vec![yuv_temp.clone(), annex_b_temp.clone()];
+
+    let result = (|| -> Result<(), CliError> {
+        transcode::decode_to_yuv(input, &yuv_temp)?;
+        let yuv_bytes = std::fs::read(&yuv_temp)?;
+        let expected = (probe.width as usize) * (probe.height as usize) * 3 / 2 * probe.n_frames;
+        if yuv_bytes.len() != expected {
+            return Err(CliError::InvalidArgs(format!(
+                "ffmpeg-decoded YUV is {} bytes; expected {} ({}x{} × 1.5 × {})",
+                yuv_bytes.len(), expected, probe.width, probe.height, probe.n_frames,
+            )));
+        }
+        let annex_b = h264_stego_encode_yuv_string_with_shadow(
+            &yuv_bytes, probe.width, probe.height, probe.n_frames, gop_size,
+            primary_message, primary_passphrase,
+            shadow_message, shadow_passphrase,
         )?;
         std::fs::write(&annex_b_temp, &annex_b)?;
         let audio_source = probe.has_audio.then_some(input.as_path());

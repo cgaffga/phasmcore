@@ -78,6 +78,7 @@
 //! `meta[i]` is safe to flip under the criterion above.
 
 use super::encoder_hook::MvdPositionMeta;
+use super::{Axis, PositionKey, SyntaxPath};
 
 /// Phase 6F.2(j) — analyze which MVD positions are cascade-safe
 /// to flip.
@@ -224,6 +225,59 @@ fn mb_strictly_later(sx: u32, sy: u32, qx: u32, qy: u32) -> bool {
     qy > sy || (qy == sy && qx > sx)
 }
 
+/// §6E-A5(d).2 — map a sign-aligned safe mask to a suffix-aligned
+/// safe mask.
+///
+/// `msb_positions` is `cover.mvd_sign_bypass.positions` (one entry
+/// per logged MVD-sign bypass bin). `safe_msb` is the output of
+/// [`analyze_safe_mvd_subset`], aligned 1:1 with `msb_positions`.
+/// `msl_positions` is `cover.mvd_suffix_lsb.positions`, a subset
+/// of MVD slots — only those with `|MVD| ≥ 9` (which emit a UEG3
+/// suffix-LSB bin).
+///
+/// Returns `Vec<bool>` aligned with `msl_positions`. `true` at
+/// index `j` means the MVD slot whose suffix-LSB lives at
+/// `msl_positions[j]` was marked cascade-safe by `analyze_safe_mvd_subset`.
+///
+/// Implementation: build a `(frame_idx, mb_addr, list, partition,
+/// axis) → bool` lookup table from sign positions + safe_msb;
+/// look up each suffix position's tuple. Sign and suffix bins of
+/// the same MVD slot share these 5 fields and differ only in
+/// `BinKind`, so the lookup is exact.
+///
+/// Slots whose `SyntaxPath` isn't `Mvd` (would indicate a logging
+/// bug) are conservatively marked unsafe — the caller drops them.
+pub fn derive_msl_safe_from_msb(
+    msb_positions: &[PositionKey],
+    safe_msb: &[bool],
+    msl_positions: &[PositionKey],
+) -> Vec<bool> {
+    type SlotKey = (u32, u32, u8, u8, Axis);
+    fn slot_key(k: PositionKey) -> Option<SlotKey> {
+        match k.syntax_path() {
+            SyntaxPath::Mvd { list, partition, axis, .. } =>
+                Some((k.frame_idx(), k.mb_addr(), list, partition, axis)),
+            _ => None,
+        }
+    }
+    let n = msb_positions.len().min(safe_msb.len());
+    let mut map: std::collections::HashMap<SlotKey, bool> =
+        std::collections::HashMap::with_capacity(n);
+    for i in 0..n {
+        if let Some(key) = slot_key(msb_positions[i]) {
+            map.insert(key, safe_msb[i]);
+        }
+    }
+    msl_positions
+        .iter()
+        .map(|&k| {
+            slot_key(k)
+                .and_then(|sk| map.get(&sk).copied())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +391,58 @@ mod tests {
         assert!(!mb_propagates(1, 1, 1, 0));  // above
         assert!(!mb_propagates(1, 1, 3, 1));  // 2 right
         assert!(!mb_propagates(1, 1, 0, 0));  // top-left (upstream)
+    }
+
+    use super::super::{BinKind, EmbedDomain};
+
+    #[test]
+    fn derive_msl_safe_maps_sign_to_suffix_via_position_tuple() {
+        // 3 MVD slots at frame 0, MBs (0,0), (0,1), (0,2).
+        // All same list/partition/axis — only mb_addr differs.
+        // Slot 0 + slot 2 are sign-only (|MVD| < 9 → no suffix).
+        // Slot 1 has |MVD| ≥ 9 → emits suffix-LSB.
+        let mk_path = |kind: BinKind| SyntaxPath::Mvd {
+            list: 0, partition: 0, axis: Axis::X, kind,
+        };
+        let sign_keys = [
+            PositionKey::new(0, 0, EmbedDomain::MvdSignBypass, mk_path(BinKind::Sign)),
+            PositionKey::new(0, 4, EmbedDomain::MvdSignBypass, mk_path(BinKind::Sign)),
+            PositionKey::new(0, 8, EmbedDomain::MvdSignBypass, mk_path(BinKind::Sign)),
+        ];
+        let safe_sign = vec![true, false, true];
+        let suffix_keys = [
+            // Suffix only for slot 1 (mb_addr=4).
+            PositionKey::new(0, 4, EmbedDomain::MvdSuffixLsb, mk_path(BinKind::SuffixLsb)),
+        ];
+        let safe_suffix = derive_msl_safe_from_msb(&sign_keys, &safe_sign, &suffix_keys);
+        assert_eq!(safe_suffix.len(), 1);
+        assert_eq!(safe_suffix[0], false, "suffix slot 1 should match sign safe[1] = false");
+    }
+
+    #[test]
+    fn derive_msl_safe_handles_orthogonal_axes() {
+        // One MVD with X + Y components in the same partition →
+        // two sign positions (axis=X, axis=Y), one suffix per
+        // axis. Y is unsafe, X is safe.
+        let mk_path = |axis: Axis, kind: BinKind| SyntaxPath::Mvd {
+            list: 0, partition: 0, axis, kind,
+        };
+        let sign_keys = [
+            PositionKey::new(0, 0, EmbedDomain::MvdSignBypass, mk_path(Axis::X, BinKind::Sign)),
+            PositionKey::new(0, 0, EmbedDomain::MvdSignBypass, mk_path(Axis::Y, BinKind::Sign)),
+        ];
+        let safe_sign = vec![true, false];
+        let suffix_keys = [
+            PositionKey::new(0, 0, EmbedDomain::MvdSuffixLsb, mk_path(Axis::Y, BinKind::SuffixLsb)),
+            PositionKey::new(0, 0, EmbedDomain::MvdSuffixLsb, mk_path(Axis::X, BinKind::SuffixLsb)),
+        ];
+        let safe_suffix = derive_msl_safe_from_msb(&sign_keys, &safe_sign, &suffix_keys);
+        assert_eq!(safe_suffix, vec![false, true]);
+    }
+
+    #[test]
+    fn derive_msl_safe_returns_empty_for_empty_msl() {
+        let safe = derive_msl_safe_from_msb(&[], &[], &[]);
+        assert!(safe.is_empty());
     }
 }

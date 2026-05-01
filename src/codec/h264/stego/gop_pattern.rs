@@ -115,6 +115,18 @@ impl GopPattern {
         }
     }
 
+    /// Inverse of `pattern_from_legacy_args`. Returns the integer
+    /// `b_count` value that the legacy `(gop_size, b_count)` helper
+    /// signatures expect: `0` for `Ipppp`, `b_count` for `Ibpbp`.
+    /// Bridge for code paths that haven't been migrated to take a
+    /// full `GopPattern` yet.
+    pub fn legacy_b_count(&self) -> usize {
+        match self {
+            Self::Ipppp { .. } => 0,
+            Self::Ibpbp { b_count, .. } => *b_count,
+        }
+    }
+
     /// Returns the frame type at a given DISPLAY-order index.
     /// Closed-GOP: the final position of each GOP is forced to P.
     pub fn frame_type_at(&self, display_idx: usize) -> FrameType {

@@ -1364,21 +1364,6 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
         // memory saving.
         for ready in builder.take_ready_gops() {
             let g = ready.gop_idx;
-            let gop_cover = pass1_capture_4domain_for_gop_range(
-                yuv, width, height, n_frames, gop_size, b_count, quality,
-                g, g + 1,
-            )?;
-
-            let mut gop_cover_only = DomainCover::default();
-            gop_cover_only.coeff_sign_bypass =
-                gop_cover.cover.coeff_sign_bypass.clone();
-            gop_cover_only.coeff_suffix_lsb =
-                gop_cover.cover.coeff_suffix_lsb.clone();
-            gop_cover_only.mvd_sign_bypass =
-                gop_cover.cover.mvd_sign_bypass.clone();
-            gop_cover_only.mvd_suffix_lsb =
-                gop_cover.cover.mvd_suffix_lsb.clone();
-
             let gop_plan = DomainPlan {
                 coeff_sign_bypass: ready.plans[0].clone(),
                 coeff_suffix_lsb: ready.plans[1].clone(),
@@ -1387,38 +1372,10 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
                 total_modifications: 0,
                 total_cost: 0.0,
             };
-
-            let injector = PlanInjector::from_plan(&gop_cover_only, &gop_plan);
-
-            let mut enc = build_encoder(width, height, quality)?;
-            enc.enable_mvd_stego_hook = true;
-            enc.enable_b_frames = pattern.has_b_frames();
-            enc.set_stego_hook(Some(Box::new(InjectionHook::new(injector))));
-
-            let mut primed = false;
-            let mut bytes = Vec::new();
-            for (meta, frame) in iter_frames_in_encode_order(
-                yuv, frame_size, n_frames, pattern,
-            ) {
-                if (meta.gop_idx as usize) != g {
-                    if (meta.gop_idx as usize) > g {
-                        break;
-                    }
-                    continue;
-                }
-                if !primed {
-                    enc.stego_frame_idx = meta.encode_idx;
-                    primed = true;
-                }
-                let frame_bytes =
-                    encode_one_frame(&mut enc, frame, meta.frame_type)
-                        .map_err(|e| StegoError::InvalidVideo(format!(
-                            "v2 Pass 3 GOP {g} frame {}: {e}",
-                            meta.encode_idx,
-                        )))?;
-                bytes.extend_from_slice(&frame_bytes);
-            }
-            gop_bytes[g] = Some(bytes);
+            gop_bytes[g] = Some(encode_one_gop_with_plan_and_capture(
+                yuv, width, height, n_frames, frame_size, quality, pattern,
+                g, &gop_plan, None,
+            )?);
         }
     }
 
@@ -1691,7 +1648,12 @@ pub fn h264_stego_shadow_capacity(
         yuv, width, height, n_frames, frame_size, /* quality */ Some(26), gop_size,
         /* b_count */ 1,
     )?;
-    let cover_size_bits = cover_p1.cover.capacity().total();
+    // §6E-A5(c.x) — shadow position selection excludes MvdSuffixLsb
+    // (not injectable post-§6F.2(k).2). Shadow capacity counts only
+    // the 3 injectable domains so callers get honest numbers.
+    let cap_p1 = cover_p1.cover.capacity();
+    let cover_size_bits =
+        cap_p1.coeff_sign_bypass + cap_p1.coeff_suffix_lsb + cap_p1.mvd_sign_bypass;
 
     let max_message_bytes = if n_shadows == 0 {
         0
@@ -1766,6 +1728,37 @@ pub fn h264_stego_encode_yuv_string_with_shadow(
     )
 }
 
+/// §6E-A5(a) — explicit-pattern variant of
+/// [`h264_stego_encode_yuv_string_with_shadow`]. Mirrors
+/// `h264_stego_encode_yuv_string_4domain_multigop_with_pattern`'s
+/// shape on the primary side. The non-`_with_pattern` form
+/// delegates here with `GopPattern::Ibpbp { gop: gop_size,
+/// b_count: 1 }` (Apple-iPhone canonical IBPBP, M=2).
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_with_shadow_with_pattern(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    primary_message: &str,
+    primary_passphrase: &str,
+    shadow_message: &str,
+    shadow_passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::shadow_layer::ShadowLayer;
+    let shadow = ShadowLayer {
+        message: shadow_message,
+        passphrase: shadow_passphrase,
+        files: &[],
+    };
+    h264_stego_encode_yuv_string_with_n_shadows_with_pattern(
+        yuv, width, height, n_frames, pattern,
+        primary_message, primary_passphrase,
+        std::slice::from_ref(&shadow),
+    )
+}
+
 /// Phase 6E-C2 — encode primary + N shadow messages into H.264
 /// Annex-B bytes with cascade verification across all N shadows.
 /// Each shadow has its own passphrase and independent
@@ -1800,8 +1793,37 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
     primary_passphrase: &str,
     shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
 ) -> Result<Vec<u8>, StegoError> {
+    // Default to Apple-iPhone-canonical IBPBP M=2, matches the
+    // §6E-A.deploy primary default. Callers who want IPPPP or a
+    // different B-frame mix should call the `_with_pattern`
+    // variant directly.
+    h264_stego_encode_yuv_string_with_n_shadows_with_pattern(
+        yuv, width, height, n_frames,
+        super::gop_pattern::GopPattern::Ibpbp { gop: gop_size, b_count: 1 },
+        primary_message, primary_passphrase, shadows,
+    )
+}
+
+/// §6E-A5(a) — explicit-pattern variant of
+/// [`h264_stego_encode_yuv_string_with_n_shadows`]. The
+/// `pattern` argument is forwarded to the inner Pass-1 / Pass-1B
+/// / Pass-3 helpers via `GopPattern::legacy_b_count()`. Picks
+/// `IPPPP` (b_count=0) or `IBPBP` (b_count≥1) end-to-end.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern<'a>(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    primary_message: &str,
+    primary_passphrase: &str,
+    shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
+) -> Result<Vec<u8>, StegoError> {
     use crate::stego::{crypto, frame, payload};
     use crate::stego::shadow_layer::SHADOW_PARITY_TIERS;
+    let gop_size = pattern.gop_size();
+    let b_count = pattern.legacy_b_count();
 
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(StegoError::InvalidVideo(format!(
@@ -1871,12 +1893,28 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
     //     or shadow positions — same cover for every retry. ──
     let cover_p1 = pass1_count_4domain(
         yuv, width, height, n_frames, frame_size, quality, gop_size,
-        /* b_count */ 1,
+        b_count,
     )?;
     let cap_p1 = cover_p1.cover.capacity();
-    let mvd_capacity = cap_p1.mvd_sign_bypass + cap_p1.mvd_suffix_lsb;
+    // §6E-A5(b) — align with §30D-C primary: drop mvd_suffix_lsb
+    // from the MVD capacity used for shadow message split. Magnitude-
+    // LSB MVD flips cascade through the median predictor (§6F.2(j));
+    // the production primary pipeline forces mvd_suffix_lsb = 0 for
+    // the same reason. Shadow inherits that stance; the cascade RS
+    // parity tiers absorb the slight capacity reduction (the
+    // primary-emit cover still has ample headroom).
+    let mvd_capacity = cap_p1.mvd_sign_bypass;
     let m_mvd = m_total.min(mvd_capacity);
     let m_residual = m_total - m_mvd;
+
+    // §6E-A5(c.3) — derive per_gop_counts from cover_p1.positions.
+    // Used by the streaming Pass-1B + Pass-3 variants below to
+    // bound per-cascade-iter encoder working set to a single GOP.
+    // Cheaper than a second `pass1_count_per_gop_4domain` call
+    // since cover_p1 is already materialized.
+    let per_gop_counts = derive_per_gop_counts_from_cover(
+        yuv, frame_size, n_frames, pattern, &cover_p1.cover,
+    );
 
     // ── §6E-C2 polish — provisional pass (no shadow) gives the
     //     `primary_emit_cover` over which shadow positions are
@@ -1891,15 +1929,21 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
     //     Skipped for shadows.is_empty(): no shadow → no provisional
     //     needed → fall through to the no-shadow no-cascade path
     //     below (pure primary 3-pass). ──
-    let (primary_emit_cover, cover_p1b_residual_prov) = if shadows.is_empty() {
-        (super::DomainCover::default(), super::orchestrate::GopCover::default())
+    let (primary_emit_cover, cover_p1b_residual_prov, safe_msl_prov) = if shadows.is_empty() {
+        (
+            super::DomainCover::default(),
+            super::orchestrate::GopCover::default(),
+            Vec::<bool>::new(),
+        )
     } else {
         let plan_a_prov = if m_mvd > 0 {
             let cap_mvd_only = GopCapacity {
                 coeff_sign_bypass: 0,
                 coeff_suffix_lsb: 0,
                 mvd_sign_bypass: cap_p1.mvd_sign_bypass,
-                mvd_suffix_lsb: cap_p1.mvd_suffix_lsb,
+                // §6E-A5(b) — aligned with §30D-C primary
+                // (§6F.2(j) cascade-through-median).
+                mvd_suffix_lsb: 0,
             };
             let messages_a = split_message_per_domain(&frame_bits[..m_mvd], &cap_mvd_only)
                 .ok_or_else(|| StegoError::InvalidVideo(
@@ -1917,9 +1961,9 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
         } else {
             DomainPlan::default()
         };
-        let cover_p1b_prov = pass1b_inject_mvd_log_residual(
+        let cover_p1b_prov = pass1b_inject_mvd_log_residual_streaming(
             yuv, width, height, n_frames, frame_size, quality,
-            &cover_p1.cover, &plan_a_prov, gop_size, /* b_count */ 1,
+            pattern, &cover_p1.cover, &plan_a_prov, &per_gop_counts,
         )?;
         let cap_p1b_prov = cover_p1b_prov.cover.capacity();
         let residual_capacity_prov =
@@ -1950,11 +1994,6 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
         } else {
             DomainPlan::default()
         };
-        let mut combined_cover_prov = super::DomainCover::default();
-        combined_cover_prov.coeff_sign_bypass = cover_p1b_prov.cover.coeff_sign_bypass.clone();
-        combined_cover_prov.coeff_suffix_lsb = cover_p1b_prov.cover.coeff_suffix_lsb.clone();
-        combined_cover_prov.mvd_sign_bypass = cover_p1.cover.mvd_sign_bypass.clone();
-        combined_cover_prov.mvd_suffix_lsb = cover_p1.cover.mvd_suffix_lsb.clone();
         let mut combined_plan_prov = DomainPlan {
             coeff_sign_bypass: plan_b_prov.coeff_sign_bypass.clone(),
             coeff_suffix_lsb: plan_b_prov.coeff_suffix_lsb.clone(),
@@ -1977,14 +2016,27 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
         if combined_plan_prov.mvd_suffix_lsb.is_empty() {
             combined_plan_prov.mvd_suffix_lsb = cover_p1.cover.mvd_suffix_lsb.bits.clone();
         }
-        let bytes_prov = pass3_inject_4domain(
-            yuv, width, height, n_frames, frame_size, quality,
-            &combined_cover_prov, &combined_plan_prov, gop_size, /* b_count */ 1,
+        let bytes_prov = pass3_inject_4domain_streaming(
+            yuv, width, height, n_frames, frame_size, quality, pattern,
+            &combined_plan_prov, &per_gop_counts,
         )?;
         let walk_opts = WalkOptions { record_mvd: true };
         let walk_prov = walk_annex_b_for_cover_with_options(&bytes_prov, walk_opts)
             .map_err(|e| StegoError::InvalidVideo(format!("provisional walk: {e}")))?;
-        (walk_prov.cover, cover_p1b_prov)
+        // §6E-A5(d).6 — derive safe MvdSuffixLsb mask from the
+        // walked provisional cover. Decoder runs the same analysis
+        // on its post-walk meta → identical mask by §6F.2(j)
+        // construction (greedy is invariant under sign-flips +
+        // safe-set magnitude flips).
+        let safe_msb_prov = super::cascade_safety::analyze_safe_mvd_subset(
+            &walk_prov.mvd_meta, walk_prov.mb_w, walk_prov.mb_h,
+        );
+        let safe_msl = super::cascade_safety::derive_msl_safe_from_msb(
+            &walk_prov.cover.mvd_sign_bypass.positions,
+            &safe_msb_prov,
+            &walk_prov.cover.mvd_suffix_lsb.positions,
+        );
+        (walk_prov.cover, cover_p1b_prov, safe_msl)
     };
 
     // ── Cascade loop: parity_idx ∈ [0..6] (tiers [4, 8, 16, 32, 64, 128]).
@@ -2000,15 +2052,22 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
     //     injection flow. Slots whose PositionKey doesn't appear in
     //     the target cover are skipped (small fraction; cascade
     //     absorbs). ──
+    let safe_msl_for_select: Option<&[bool]> =
+        if shadows.is_empty() { None } else { Some(safe_msl_prov.as_slice()) };
     for &parity_len in &SHADOW_PARITY_TIERS {
-        // ── §6E-C2 polish — select shadow positions over
-        //     `primary_emit_cover`. All 4 domains in a single
-        //     priority sort (replaces the mvp's two-phase MVD-only +
-        //     residual-only sorts). ──
+        // ── §6E-C2 polish + §6E-A5(d).6 — select shadow positions
+        //     over `primary_emit_cover`. Spans 4 bypass-bin domains:
+        //     CoeffSignBypass + CoeffSuffixLsb + MvdSignBypass
+        //     unconditionally, plus MvdSuffixLsb at cascade-safe
+        //     positions only (filtered by `safe_msl_prov` from
+        //     `cascade_safety::analyze_safe_mvd_subset` on the
+        //     provisional walked meta). Decoder recomputes the same
+        //     filter from its own walk → encoder + decoder lockstep. ──
         let shadow_states_emit: Vec<super::shadow::ShadowState> = shadows
             .iter()
-            .map(|s| super::shadow::prepare_shadow_over_emit_cover(
+            .map(|s| super::shadow::prepare_shadow_over_emit_cover_safe(
                 &primary_emit_cover, s.passphrase, s.message, s.files, parity_len,
+                None, safe_msl_for_select,
             ))
             .collect::<Result<_, _>>()?;
 
@@ -2060,7 +2119,9 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
                 coeff_sign_bypass: 0,
                 coeff_suffix_lsb: 0,
                 mvd_sign_bypass: cap_p1.mvd_sign_bypass,
-                mvd_suffix_lsb: cap_p1.mvd_suffix_lsb,
+                // §6E-A5(b) — aligned with §30D-C primary
+                // (§6F.2(j) cascade-through-median).
+                mvd_suffix_lsb: 0,
             };
             let messages_a = split_message_per_domain(&frame_bits[..m_mvd], &cap_mvd_only)
                 .ok_or_else(|| StegoError::InvalidVideo("Pass 2A: MVD split failed".into()))?;
@@ -2072,9 +2133,9 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
 
         // ── Pass 1B: re-encode with primary MVD plan applied →
         //     final residual cover (post-MC-with-modified-MVDs). ──
-        let cover_p1b_residual = pass1b_inject_mvd_log_residual(
+        let cover_p1b_residual = pass1b_inject_mvd_log_residual_streaming(
             yuv, width, height, n_frames, frame_size, quality,
-            &cover_p1.cover, &plan_a, gop_size, /* b_count */ 1,
+            pattern, &cover_p1.cover, &plan_a, &per_gop_counts,
         )?;
         let cap_p1b = cover_p1b_residual.cover.capacity();
         let residual_capacity = cap_p1b.coeff_sign_bypass + cap_p1b.coeff_suffix_lsb;
@@ -2182,18 +2243,32 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
             );
         }
 
-        // ── PlanInjector lookup cover: MVD from Pass 1, residual
-        //     from Pass 1B. ──
-        let mut combined_cover = super::DomainCover::default();
-        combined_cover.coeff_sign_bypass = cover_p1b_residual.cover.coeff_sign_bypass.clone();
-        combined_cover.coeff_suffix_lsb = cover_p1b_residual.cover.coeff_suffix_lsb.clone();
-        combined_cover.mvd_sign_bypass = cover_p1.cover.mvd_sign_bypass.clone();
-        combined_cover.mvd_suffix_lsb = cover_p1.cover.mvd_suffix_lsb.clone();
+        // ── §6E-A5(d).6 — build the cascade-safe MvdSuffixLsb gate
+        //     for `InjectionHook`. Includes only the PositionKeys
+        //     where shadow stamped a bit AND cascade-safety greedy
+        //     said the magnitude-LSB flip is bounded. PlanInjector
+        //     would otherwise return Some(plan_bit) at every msl
+        //     position (since combined_plan.mvd_suffix_lsb is filled
+        //     to cover_p1 length), risking false flips at unsafe
+        //     positions where Pass 3's natural cur_lsb diverged from
+        //     Pass 1's cover_bit. ──
+        let mvd_msl_gate: std::collections::HashSet<PositionKey> = shadow_states
+            .iter()
+            .flat_map(|state| state.positions.iter())
+            .filter(|s| s.domain == super::EmbedDomain::MvdSuffixLsb)
+            .filter_map(|s| cover_p1
+                .cover
+                .mvd_suffix_lsb
+                .positions
+                .get(s.intra_index)
+                .copied())
+            .collect();
 
-        // ── Pass 3: emit with combined plan. ──
-        let bytes = pass3_inject_4domain(
-            yuv, width, height, n_frames, frame_size, quality,
-            &combined_cover, &combined_plan, gop_size, /* b_count */ 1,
+        // ── Pass 3: emit with combined plan + cascade-safe gate. ──
+        let bytes = pass3_inject_4domain_streaming_with_gate(
+            yuv, width, height, n_frames, frame_size, quality, pattern,
+            &combined_plan, &per_gop_counts,
+            if mvd_msl_gate.is_empty() { None } else { Some(&mvd_msl_gate) },
         )?;
 
         // ── Verify: walk emitted bytes → 4-domain cover. Each
@@ -2202,9 +2277,22 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
         let opts = WalkOptions { record_mvd: true };
         let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
             .map_err(|e| StegoError::InvalidVideo(format!("verify walk: {e}")))?;
+        // §6E-A5(d).6 — encoder verify must use the same safe-mask
+        // as decoder will compute. Decoder runs analyze on walk meta
+        // → match here.
+        let safe_msb_walk = super::cascade_safety::analyze_safe_mvd_subset(
+            &walk.mvd_meta, walk.mb_w, walk.mb_h,
+        );
+        let safe_msl_walk = super::cascade_safety::derive_msl_safe_from_msb(
+            &walk.cover.mvd_sign_bypass.positions,
+            &safe_msb_walk,
+            &walk.cover.mvd_suffix_lsb.positions,
+        );
         let mut all_ok = true;
         for s in shadows {
-            match super::shadow::shadow_extract_all4(&walk.cover, s.passphrase) {
+            match super::shadow::shadow_extract_all4_safe(
+                &walk.cover, s.passphrase, None, Some(&safe_msl_walk),
+            ) {
                 Ok(payload_data) if payload_data.text == s.message => continue,
                 _ => {
                     all_ok = false;
@@ -2632,6 +2720,40 @@ fn pass1_count_4domain_with_meta(
     Ok((cover, meta))
 }
 
+/// §6E-A5(d).2 — Pass 1 + cascade-safety bundle for shadow.
+///
+/// Wraps `pass1_count_4domain_with_meta` + `analyze_safe_mvd_subset`
+/// + `derive_msl_safe_from_msb`. Returned masks are aligned with
+/// the cover's MVD position lists (`safe_msb` ↔ `mvd_sign_bypass`,
+/// `safe_msl` ↔ `mvd_suffix_lsb`). Both sides (encoder cascade +
+/// decoder shadow_extract) call this so encoder + decoder run the
+/// same hash-priority filter.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // d.3 + d.6 will consume these masks
+fn pass1_count_4domain_with_safe_masks(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    gop_size: usize,
+    b_count: usize,
+) -> Result<(super::orchestrate::GopCover, Vec<bool>, Vec<bool>), StegoError> {
+    let (cover, meta) = pass1_count_4domain_with_meta(
+        yuv, width, height, n_frames, frame_size, quality, gop_size, b_count,
+    )?;
+    let mb_w = width / 16;
+    let mb_h = height / 16;
+    let safe_msb = super::cascade_safety::analyze_safe_mvd_subset(&meta, mb_w, mb_h);
+    let safe_msl = super::cascade_safety::derive_msl_safe_from_msb(
+        &cover.cover.mvd_sign_bypass.positions,
+        &safe_msb,
+        &cover.cover.mvd_suffix_lsb.positions,
+    );
+    Ok((cover, safe_msb, safe_msl))
+}
+
 /// Pass 1B helper for §30D-C: encode I + P frames with
 /// InjectAndLogHook (MVD plan applied + residual logger). The
 /// produced bytes are discarded; only the residual cover matters.
@@ -2729,6 +2851,591 @@ fn pass3_inject_4domain(
     }
 
     Ok(out)
+}
+
+/// §6E-A5(c.3) — derive per-GOP per-domain position counts
+/// from a materialized full-clip `DomainCover`. Used by the
+/// shadow cascade to size the per-GOP slicing for the streaming
+/// Pass-1B + Pass-3 helpers without spending a second
+/// `pass1_count_per_gop_4domain` encoder pass.
+fn derive_per_gop_counts_from_cover(
+    yuv: &[u8],
+    frame_size: usize,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    cover: &super::DomainCover,
+) -> Vec<[usize; 4]> {
+    // encode_idx → gop_idx map. Walks the deterministic encode-
+    // order schedule once; doesn't actually encode (we ignore the
+    // frame slice).
+    let mut encode_to_gop: Vec<usize> = vec![0; n_frames];
+    let mut max_gop: usize = 0;
+    for (meta, _frame) in iter_frames_in_encode_order(yuv, frame_size, n_frames, pattern) {
+        let g = meta.gop_idx as usize;
+        encode_to_gop[meta.encode_idx as usize] = g;
+        if g > max_gop {
+            max_gop = g;
+        }
+    }
+    let num_gops = max_gop + 1;
+    let mut per_gop_counts: Vec<[usize; 4]> = vec![[0; 4]; num_gops];
+    for p in &cover.coeff_sign_bypass.positions {
+        let g = encode_to_gop[p.frame_idx() as usize];
+        per_gop_counts[g][0] += 1;
+    }
+    for p in &cover.coeff_suffix_lsb.positions {
+        let g = encode_to_gop[p.frame_idx() as usize];
+        per_gop_counts[g][1] += 1;
+    }
+    for p in &cover.mvd_sign_bypass.positions {
+        let g = encode_to_gop[p.frame_idx() as usize];
+        per_gop_counts[g][2] += 1;
+    }
+    for p in &cover.mvd_suffix_lsb.positions {
+        let g = encode_to_gop[p.frame_idx() as usize];
+        per_gop_counts[g][3] += 1;
+    }
+    per_gop_counts
+}
+
+/// §6E-A5(c.2) — per-GOP Pass-1B: encode GOP `g` with the MVD
+/// plan applied via InjectAndLogHook, return the per-GOP cover
+/// (all 4 domains; MVD bits reflect the injected sign overrides,
+/// residual coefficients reflect post-MVD-cascade values).
+///
+/// `mvd_cover` and `mvd_plan` are the full-clip Pass-1 cover
+/// (MVD domain) and the full-clip MVD STC plan. The PlanInjector
+/// is built from them; only positions in GOP `g`'s frames are
+/// hit during encode (other entries are dead weight). Per-GOP
+/// pre-slicing of mvd_cover/mvd_plan is a future memory
+/// optimization.
+///
+/// Memory bound: O(per-GOP encoder working set) +
+/// O(full mvd_cover + mvd_plan) for the injector HashMap. The
+/// HashMap is the cover-side cost that c.x might further bound;
+/// the encoder side is fully per-GOP-bounded.
+#[allow(clippy::too_many_arguments)]
+fn encode_one_gop_pass1b_inject_mvd_log_residual(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    pattern: super::gop_pattern::GopPattern,
+    g: usize,
+    mvd_cover: &super::DomainCover,
+    mvd_plan: &DomainPlan,
+) -> Result<super::orchestrate::GopCover, StegoError> {
+    let injector = PlanInjector::from_plan(mvd_cover, mvd_plan);
+    let hook = InjectAndLogHook::new(injector);
+
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    enc.enable_b_frames = pattern.has_b_frames();
+    enc.set_stego_hook(Some(Box::new(hook)));
+
+    let mut primed = false;
+    for (meta, frame) in iter_frames_in_encode_order(
+        yuv, frame_size, n_frames, pattern,
+    ) {
+        if (meta.gop_idx as usize) != g {
+            if (meta.gop_idx as usize) > g {
+                break;
+            }
+            continue;
+        }
+        if !primed {
+            enc.stego_frame_idx = meta.encode_idx;
+            primed = true;
+        }
+        encode_one_frame(&mut enc, frame, meta.frame_type)
+            .map_err(|e| StegoError::InvalidVideo(format!(
+                "Pass 1B GOP {g} frame {}: {e}",
+                meta.encode_idx,
+            )))?;
+    }
+    let mut hook = enc.take_stego_hook().ok_or_else(|| {
+        StegoError::InvalidVideo("Pass 1B GOP hook missing".into())
+    })?;
+    drain_position_logger(&mut hook)
+}
+
+/// §6E-A5(c.2) — streaming counterpart of
+/// `pass1b_inject_mvd_log_residual`. Encodes the full clip
+/// GOP-by-GOP with MVD plan injection + residual logging,
+/// concatenating the per-GOP captured covers into a full-clip
+/// `GopCover` (matches the in-memory output shape so the
+/// downstream Pass-2B can consume it without changes).
+///
+/// Memory bound: only one GOP's encoder working set + the
+/// PlanInjector HashMap is resident at any time during the
+/// per-GOP encode step. The output residual cover is O(n) total
+/// (matches the in-memory variant); pipelining it directly into
+/// a streaming Pass-2B is a future optimization.
+///
+/// Use case: §6E-A5(c.3) shadow cascade refactor — replaces the
+/// in-memory `pass1b_inject_mvd_log_residual` call inside the
+/// cascade loop so each cascade iteration's Pass-1B encode-side
+/// memory is bounded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pass1b_inject_mvd_log_residual_streaming(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    pattern: super::gop_pattern::GopPattern,
+    mvd_cover: &super::DomainCover,
+    mvd_plan: &DomainPlan,
+    per_gop_counts: &[[usize; 4]],
+) -> Result<super::orchestrate::GopCover, StegoError> {
+    let num_gops = per_gop_counts.len();
+    let mut full_cover = super::orchestrate::GopCover::default();
+    for g in 0..num_gops {
+        let gop_cover = encode_one_gop_pass1b_inject_mvd_log_residual(
+            yuv, width, height, n_frames, frame_size, quality, pattern,
+            g, mvd_cover, mvd_plan,
+        )?;
+        // Concatenate per-GOP cover into full_cover. DomainBits
+        // append is bits + positions; costs are Vec<f32>.
+        for b in &gop_cover.cover.coeff_sign_bypass.bits {
+            full_cover.cover.coeff_sign_bypass.bits.push(*b);
+        }
+        for p in &gop_cover.cover.coeff_sign_bypass.positions {
+            full_cover.cover.coeff_sign_bypass.positions.push(*p);
+        }
+        for c in &gop_cover.costs.coeff_sign_bypass {
+            full_cover.costs.coeff_sign_bypass.push(*c);
+        }
+        for b in &gop_cover.cover.coeff_suffix_lsb.bits {
+            full_cover.cover.coeff_suffix_lsb.bits.push(*b);
+        }
+        for p in &gop_cover.cover.coeff_suffix_lsb.positions {
+            full_cover.cover.coeff_suffix_lsb.positions.push(*p);
+        }
+        for c in &gop_cover.costs.coeff_suffix_lsb {
+            full_cover.costs.coeff_suffix_lsb.push(*c);
+        }
+        for b in &gop_cover.cover.mvd_sign_bypass.bits {
+            full_cover.cover.mvd_sign_bypass.bits.push(*b);
+        }
+        for p in &gop_cover.cover.mvd_sign_bypass.positions {
+            full_cover.cover.mvd_sign_bypass.positions.push(*p);
+        }
+        for c in &gop_cover.costs.mvd_sign_bypass {
+            full_cover.costs.mvd_sign_bypass.push(*c);
+        }
+        for b in &gop_cover.cover.mvd_suffix_lsb.bits {
+            full_cover.cover.mvd_suffix_lsb.bits.push(*b);
+        }
+        for p in &gop_cover.cover.mvd_suffix_lsb.positions {
+            full_cover.cover.mvd_suffix_lsb.positions.push(*p);
+        }
+        for c in &gop_cover.costs.mvd_suffix_lsb {
+            full_cover.costs.mvd_suffix_lsb.push(*c);
+        }
+    }
+    let _ = per_gop_counts; // currently only used for num_gops; kept
+                            // as parameter so callers don't need a
+                            // separate count. Future memory-tight
+                            // variant will use cum_counts to slice
+                            // mvd_cover / mvd_plan per GOP.
+    Ok(full_cover)
+}
+
+/// §6E-A5(c.1) — encode a single GOP with a precomputed per-GOP
+/// `DomainPlan`, capturing the GOP's cover via per-GOP Pass 1
+/// replay (`pass1_capture_4domain_for_gop_range`). Used by:
+/// - The Phase 6.3 v2 streaming orchestrator's per-GOP firing.
+/// - The §6E-A5(c.3) streaming-shadow Pass-3 helper below.
+///
+/// Memory bound: O(per-GOP encoder working set) ≈ ~100 MB at 1080p.
+/// Re-running per-GOP Pass 1 for cover capture is O(GOP-encoder)
+/// extra work; mirrors v2's pattern.
+#[allow(clippy::too_many_arguments)]
+fn encode_one_gop_with_plan_and_capture(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    pattern: super::gop_pattern::GopPattern,
+    g: usize,
+    gop_plan: &DomainPlan,
+    mvd_msl_safe_keys: Option<&std::collections::HashSet<PositionKey>>,
+) -> Result<Vec<u8>, StegoError> {
+    let gop_size = pattern.gop_size();
+    let b_count = pattern.legacy_b_count();
+    let gop_cover = pass1_capture_4domain_for_gop_range(
+        yuv, width, height, n_frames, gop_size, b_count, quality, g, g + 1,
+    )?;
+
+    let mut gop_cover_only = super::DomainCover::default();
+    gop_cover_only.coeff_sign_bypass =
+        gop_cover.cover.coeff_sign_bypass.clone();
+    gop_cover_only.coeff_suffix_lsb =
+        gop_cover.cover.coeff_suffix_lsb.clone();
+    gop_cover_only.mvd_sign_bypass =
+        gop_cover.cover.mvd_sign_bypass.clone();
+    gop_cover_only.mvd_suffix_lsb =
+        gop_cover.cover.mvd_suffix_lsb.clone();
+
+    let injector = PlanInjector::from_plan(&gop_cover_only, gop_plan);
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    enc.enable_b_frames = pattern.has_b_frames();
+    let mut hook = InjectionHook::new(injector);
+    if let Some(keys) = mvd_msl_safe_keys {
+        hook.set_mvd_msl_safe_gate(keys.clone());
+    }
+    enc.set_stego_hook(Some(Box::new(hook)));
+
+    let mut primed = false;
+    let mut bytes = Vec::new();
+    for (meta, frame) in iter_frames_in_encode_order(
+        yuv, frame_size, n_frames, pattern,
+    ) {
+        if (meta.gop_idx as usize) != g {
+            if (meta.gop_idx as usize) > g {
+                break;
+            }
+            continue;
+        }
+        if !primed {
+            enc.stego_frame_idx = meta.encode_idx;
+            primed = true;
+        }
+        let frame_bytes = encode_one_frame(&mut enc, frame, meta.frame_type)
+            .map_err(|e| StegoError::InvalidVideo(format!(
+                "Pass 3 GOP {g} frame {}: {e}",
+                meta.encode_idx,
+            )))?;
+        bytes.extend_from_slice(&frame_bytes);
+    }
+    Ok(bytes)
+}
+
+/// §6E-A5(c.1) — streaming counterpart of `pass3_inject_4domain`.
+/// Encodes the full clip GOP-by-GOP with per-GOP cover capture
+/// (no clip-wide cover materialization). Slices `combined_plan`
+/// per-GOP via the per-domain cumulative position counts.
+///
+/// Memory bound: only one GOP's encoder working set + per-GOP
+/// captured cover + a slice of the combined plan are resident at
+/// any time. Suitable for long-form encodes where the legacy
+/// `pass3_inject_4domain` would OOM.
+///
+/// `per_gop_counts[g][d]` is the per-domain position count for
+/// GOP `g`, as produced by `pass1_count_per_gop_4domain`. Caller
+/// passes the same shape used to drive the per-GOP plan slicing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pass3_inject_4domain_streaming(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    pattern: super::gop_pattern::GopPattern,
+    combined_plan: &DomainPlan,
+    per_gop_counts: &[[usize; 4]],
+) -> Result<Vec<u8>, StegoError> {
+    pass3_inject_4domain_streaming_with_gate(
+        yuv, width, height, n_frames, frame_size, quality, pattern,
+        combined_plan, per_gop_counts, None,
+    )
+}
+
+/// §6E-A5(d).6 — `pass3_inject_4domain_streaming` variant that
+/// optionally installs a cascade-safe MvdSuffixLsb gate-set on the
+/// `InjectionHook`. When `mvd_msl_safe_keys = Some(set)`,
+/// `on_mvd_slot` performs ±1 magnitude-LSB flips at the gated
+/// PositionKeys to align with the plan; otherwise it stays a no-op.
+/// The shadow cascade body computes the gate-set from
+/// `shadow_states` (positions selected via
+/// `priority_slots_all4_safe(... safe_msl=Some(...))`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pass3_inject_4domain_streaming_with_gate(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    frame_size: usize,
+    quality: Option<u8>,
+    pattern: super::gop_pattern::GopPattern,
+    combined_plan: &DomainPlan,
+    per_gop_counts: &[[usize; 4]],
+    mvd_msl_safe_keys: Option<&std::collections::HashSet<PositionKey>>,
+) -> Result<Vec<u8>, StegoError> {
+    let num_gops = per_gop_counts.len();
+    let cum: [Vec<usize>; 4] = std::array::from_fn(|d| {
+        let mut v = Vec::with_capacity(num_gops + 1);
+        v.push(0);
+        for row in per_gop_counts.iter() {
+            v.push(*v.last().unwrap() + row[d]);
+        }
+        v
+    });
+
+    let mut out = Vec::new();
+    for g in 0..num_gops {
+        // Slice the combined plan to this GOP's position range, per
+        // domain. Mirrors v2's slicing: clip at plan length when the
+        // plan is shorter than raw cover capacity (m*w < total).
+        let mut gop_plan = DomainPlan::default();
+        for d in 0..4 {
+            let lo = cum[d][g];
+            let hi = cum[d][g + 1];
+            let src = match d {
+                0 => &combined_plan.coeff_sign_bypass,
+                1 => &combined_plan.coeff_suffix_lsb,
+                2 => &combined_plan.mvd_sign_bypass,
+                _ => &combined_plan.mvd_suffix_lsb,
+            };
+            let dst = match d {
+                0 => &mut gop_plan.coeff_sign_bypass,
+                1 => &mut gop_plan.coeff_suffix_lsb,
+                2 => &mut gop_plan.mvd_sign_bypass,
+                _ => &mut gop_plan.mvd_suffix_lsb,
+            };
+            if src.is_empty() {
+                continue;
+            }
+            let lo = lo.min(src.len());
+            let hi = hi.min(src.len());
+            *dst = src[lo..hi].to_vec();
+        }
+
+        let gop_bytes = encode_one_gop_with_plan_and_capture(
+            yuv, width, height, n_frames, frame_size, quality, pattern,
+            g, &gop_plan, mvd_msl_safe_keys,
+        )?;
+        out.extend_from_slice(&gop_bytes);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod pass1b_streaming_diag {
+    //! §6E-A5(c.x) — focused diagnostic for #107.
+    //!
+    //! Compares `pass1b_inject_mvd_log_residual` (in-memory) vs
+    //! `pass1b_inject_mvd_log_residual_streaming` on the same
+    //! inputs. If they diverge → streaming Pass-1B has a bug. If
+    //! they match → bug is downstream.
+    use super::*;
+    use crate::codec::h264::stego::PositionKey;
+    use crate::codec::h264::stego::orchestrate::DomainPlan;
+    use crate::codec::h264::stego::gop_pattern::GopPattern;
+
+    #[test]
+    fn pass1b_streaming_matches_inmemory_128x80_2gop() {
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        compare(&yuv, 128, 80, 10, 5, 1);
+    }
+
+    #[test]
+    #[ignore = "needs /tmp/img4138_1080p_f10.yuv + ~10 min release"]
+    fn pass1b_streaming_matches_inmemory_1080p_2gop() {
+        let yuv = match std::fs::read("/tmp/img4138_1080p_f10.yuv") {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        compare(&yuv, 1920, 1072, 10, 5, 1);
+    }
+
+    fn compare(yuv: &[u8], w: u32, h: u32, n: usize, gop: usize, b: usize) {
+        let frame_size = (w * h * 3 / 2) as usize;
+        let pattern = GopPattern::Ibpbp { gop, b_count: b };
+        let cover_p1 = pass1_count_4domain(
+            yuv, w, h, n, frame_size, Some(26), gop, b,
+        )
+        .expect("pass1");
+        let plan = DomainPlan::default();
+        let in_mem = pass1b_inject_mvd_log_residual(
+            yuv, w, h, n, frame_size, Some(26),
+            &cover_p1.cover, &plan, gop, b,
+        )
+        .expect("in-memory pass1b");
+        let per_gop = derive_per_gop_counts_from_cover(
+            yuv, frame_size, n, pattern, &cover_p1.cover,
+        );
+        let stream = pass1b_inject_mvd_log_residual_streaming(
+            yuv, w, h, n, frame_size, Some(26),
+            pattern, &cover_p1.cover, &plan, &per_gop,
+        )
+        .expect("streaming pass1b");
+
+        let cmp_domain = |label: &str,
+                          a: &Vec<u8>, b: &Vec<u8>,
+                          ap: &Vec<PositionKey>, bp: &Vec<PositionKey>,
+                          ac: &Vec<f32>, bc: &Vec<f32>| {
+            eprintln!(
+                "{label}: in_mem(bits={} positions={} costs={}) stream(bits={} positions={} costs={})",
+                a.len(), ap.len(), ac.len(),
+                b.len(), bp.len(), bc.len(),
+            );
+            assert_eq!(a.len(), b.len(), "{label}: bits len differs");
+            // PositionKey is a packed u64; convert + sort for set
+            // comparison since PositionKey itself isn't Ord.
+            let mut ap_sorted: Vec<u64> =
+                ap.iter().map(|p| p.raw()).collect();
+            let mut bp_sorted: Vec<u64> =
+                bp.iter().map(|p| p.raw()).collect();
+            ap_sorted.sort();
+            bp_sorted.sort();
+            assert_eq!(
+                ap_sorted, bp_sorted,
+                "{label}: position SETS differ",
+            );
+        };
+        cmp_domain(
+            "coeff_sign",
+            &in_mem.cover.coeff_sign_bypass.bits,
+            &stream.cover.coeff_sign_bypass.bits,
+            &in_mem.cover.coeff_sign_bypass.positions,
+            &stream.cover.coeff_sign_bypass.positions,
+            &in_mem.costs.coeff_sign_bypass,
+            &stream.costs.coeff_sign_bypass,
+        );
+        cmp_domain(
+            "coeff_suffix",
+            &in_mem.cover.coeff_suffix_lsb.bits,
+            &stream.cover.coeff_suffix_lsb.bits,
+            &in_mem.cover.coeff_suffix_lsb.positions,
+            &stream.cover.coeff_suffix_lsb.positions,
+            &in_mem.costs.coeff_suffix_lsb,
+            &stream.costs.coeff_suffix_lsb,
+        );
+        cmp_domain(
+            "mvd_sign",
+            &in_mem.cover.mvd_sign_bypass.bits,
+            &stream.cover.mvd_sign_bypass.bits,
+            &in_mem.cover.mvd_sign_bypass.positions,
+            &stream.cover.mvd_sign_bypass.positions,
+            &in_mem.costs.mvd_sign_bypass,
+            &stream.costs.mvd_sign_bypass,
+        );
+        cmp_domain(
+            "mvd_suffix",
+            &in_mem.cover.mvd_suffix_lsb.bits,
+            &stream.cover.mvd_suffix_lsb.bits,
+            &in_mem.cover.mvd_suffix_lsb.positions,
+            &stream.cover.mvd_suffix_lsb.positions,
+            &in_mem.costs.mvd_suffix_lsb,
+            &stream.costs.mvd_suffix_lsb,
+        );
+    }
+
+    /// §6E-A5(c.x) — Pass-1B is byte-equivalent (above tests
+    /// pass), so #107 must be downstream. This test compares the
+    /// cover RECOVERED FROM THE WALKER on streaming-Pass-3 bytes
+    /// vs in-memory-Pass-3 bytes. If they differ, walker sees
+    /// different cover from streaming output → shadow position
+    /// selection over primary_emit_cover diverges → cascade
+    /// verify fails.
+    #[test]
+    fn pass3_walked_cover_matches_inmemory_128x80_2gop() {
+        use crate::codec::h264::cabac::bin_decoder::slice::{
+            walk_annex_b_for_cover_with_options, WalkOptions,
+        };
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        let (w, h, n, gop, b) = (128u32, 80u32, 10usize, 5usize, 1usize);
+        let pattern = GopPattern::Ibpbp { gop, b_count: b };
+        let frame_size = (w * h * 3 / 2) as usize;
+
+        let cover_p1 = pass1_count_4domain(
+            &yuv, w, h, n, frame_size, Some(26), gop, b,
+        )
+        .expect("pass1");
+
+        let combined_plan = DomainPlan {
+            coeff_sign_bypass: cover_p1.cover.coeff_sign_bypass.bits.clone(),
+            coeff_suffix_lsb: cover_p1.cover.coeff_suffix_lsb.bits.clone(),
+            mvd_sign_bypass: cover_p1.cover.mvd_sign_bypass.bits.clone(),
+            mvd_suffix_lsb: cover_p1.cover.mvd_suffix_lsb.bits.clone(),
+            total_modifications: 0,
+            total_cost: 0.0,
+        };
+
+        let in_mem_bytes = pass3_inject_4domain(
+            &yuv, w, h, n, frame_size, Some(26),
+            &cover_p1.cover, &combined_plan, gop, b,
+        )
+        .expect("in-memory pass3");
+
+        let per_gop = derive_per_gop_counts_from_cover(
+            &yuv, frame_size, n, pattern, &cover_p1.cover,
+        );
+        let stream_bytes = pass3_inject_4domain_streaming(
+            &yuv, w, h, n, frame_size, Some(26), pattern,
+            &combined_plan, &per_gop,
+        )
+        .expect("streaming pass3");
+
+        eprintln!(
+            "in-mem bytes: {}, stream bytes: {}",
+            in_mem_bytes.len(),
+            stream_bytes.len(),
+        );
+
+        let walk_opts = WalkOptions { record_mvd: true };
+        let in_mem_walk =
+            walk_annex_b_for_cover_with_options(&in_mem_bytes, walk_opts)
+                .expect("walk in-mem");
+        let stream_walk =
+            walk_annex_b_for_cover_with_options(&stream_bytes, walk_opts)
+                .expect("walk streaming");
+
+        eprintln!(
+            "in-mem walk:  cs={} cl={} ms={} ml={}",
+            in_mem_walk.cover.coeff_sign_bypass.bits.len(),
+            in_mem_walk.cover.coeff_suffix_lsb.bits.len(),
+            in_mem_walk.cover.mvd_sign_bypass.bits.len(),
+            in_mem_walk.cover.mvd_suffix_lsb.bits.len(),
+        );
+        eprintln!(
+            "stream walk:  cs={} cl={} ms={} ml={}",
+            stream_walk.cover.coeff_sign_bypass.bits.len(),
+            stream_walk.cover.coeff_suffix_lsb.bits.len(),
+            stream_walk.cover.mvd_sign_bypass.bits.len(),
+            stream_walk.cover.mvd_suffix_lsb.bits.len(),
+        );
+
+        let mut im_pos: Vec<u64> = in_mem_walk
+            .cover
+            .coeff_sign_bypass
+            .positions
+            .iter()
+            .map(|p| p.raw())
+            .collect();
+        let mut st_pos: Vec<u64> = stream_walk
+            .cover
+            .coeff_sign_bypass
+            .positions
+            .iter()
+            .map(|p| p.raw())
+            .collect();
+        im_pos.sort();
+        st_pos.sort();
+        assert_eq!(
+            im_pos, st_pos,
+            "walker-recovered coeff_sign positions differ between in-memory and streaming Pass-3",
+        );
+    }
 }
 
 #[cfg(test)]
