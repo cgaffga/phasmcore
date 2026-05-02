@@ -126,14 +126,13 @@ pub struct VideoEncodeArgs {
     /// metaclass (Yang/EVA + Altinisik decision-tree leaf), matching
     /// the v1.0 strategy doc target. `ffmpeg` keeps the legacy
     /// shell-out muxer with audio passthrough — less stealthy
-    /// (ffmpeg-class container fingerprint) but preserves audio.
-    /// CABAC v2 path only.
+    /// (ffmpeg-class container fingerprint) but uses ffmpeg for the
+    /// final mux step. CABAC v2 path only.
     ///
-    /// **Audio note**: `handbrake-x264` is currently video-only;
-    /// audio is dropped from the input. Audio passthrough is tracked
-    /// as §Stealth.L4.5 (the highest-priority follow-on after the
-    /// stealth slate ships). Use `--mux-profile=ffmpeg` to keep
-    /// audio.
+    /// **Audio**: both profiles pass the source audio track through
+    /// verbatim (§Stealth.L4.5). The codec configuration record
+    /// (esds for AAC, etc.) is preserved byte-exact; only chunk
+    /// offsets are rewritten.
     #[cfg(feature = "cabac-stego")]
     #[arg(long = "mux-profile", default_value = "handbrake-x264")]
     pub mux_profile: transcode::MuxProfile,
@@ -310,10 +309,7 @@ fn run_cabac_encode(
         )?;
         if dropped_audio {
             eprintln!(
-                "warning: --mux-profile=handbrake-x264 dropped audio from input. \
-                 Pass --mux-profile=ffmpeg to preserve audio (less stealthy \
-                 container fingerprint). Audio passthrough in HandBrake mux is \
-                 the next stealth task (§Stealth.L4.5).",
+                "warning: chosen --mux-profile dropped audio from input.",
             );
         }
         Ok(())
@@ -417,10 +413,7 @@ fn run_cabac_encode_with_shadows(
         )?;
         if dropped_audio {
             eprintln!(
-                "warning: --mux-profile=handbrake-x264 dropped audio from input. \
-                 Pass --mux-profile=ffmpeg to preserve audio (less stealthy \
-                 container fingerprint). Audio passthrough in HandBrake mux is \
-                 the next stealth task (§Stealth.L4.5).",
+                "warning: chosen --mux-profile dropped audio from input.",
             );
         }
         Ok(())

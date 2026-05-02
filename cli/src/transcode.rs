@@ -320,12 +320,16 @@ pub fn parse_frame_rate(s: &str) -> (u32, u32) {
 }
 
 /// Branching mux: handbrake-x264 → phasm's clean-room HandBrake mux
-/// (`phasm_core::codec::mp4::build::build_mp4_with_pattern`); ffmpeg →
-/// the legacy shell-out path with optional audio passthrough.
+/// (`phasm_core::codec::mp4::build::build_mp4_with_pattern_audio` when
+/// audio is present, `_with_pattern` otherwise); ffmpeg → the legacy
+/// shell-out path with audio passthrough via `-c:a copy`.
 ///
-/// Returns whether the chosen profile dropped audio (true iff input
-/// had audio AND profile == HandbrakeX264). Caller surfaces a warning
-/// when this is the case so users aren't silently surprised.
+/// Returns whether the chosen profile silently dropped audio.
+/// Currently `false` for both branches — HandBrake mux now passes
+/// audio through (§Stealth.L4.5) and ffmpeg always has. Kept as a
+/// `bool` return for forward compatibility with future profiles
+/// that may yet drop audio (e.g. an Apple-rotation profile that
+/// replaces the audio track entirely).
 #[cfg(feature = "cabac-stego")]
 #[allow(clippy::too_many_arguments)]
 pub fn mux_annexb_to_mp4_with_profile(
@@ -344,18 +348,33 @@ pub fn mux_annexb_to_mp4_with_profile(
             let annex_b = std::fs::read(annex_b_path)?;
             let (fps_num, fps_den) = parse_frame_rate(frame_rate);
             let timing = phasm_core::codec::mp4::build::FrameTiming { fps_num, fps_den };
-            let mp4 = phasm_core::codec::mp4::build::build_mp4_with_pattern(
-                phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
-                &annex_b,
-                width,
-                height,
-                timing,
-                gop_pattern,
-                n_display_frames,
-            )
-            .map_err(|e| CliError::InvalidArgs(format!("HandBrake mux failed: {e}")))?;
+            let mp4 = if let Some(src_path) = audio_source {
+                let source_mp4 = std::fs::read(src_path).map_err(|e| {
+                    CliError::InvalidArgs(format!(
+                        "failed to read source MP4 for audio passthrough: {e}"
+                    ))
+                })?;
+                phasm_core::codec::mp4::build::build_mp4_with_pattern_audio(
+                    phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
+                    &annex_b,
+                    width, height, timing, gop_pattern, n_display_frames,
+                    &source_mp4,
+                )
+                .map_err(|e| CliError::InvalidArgs(format!(
+                    "HandBrake mux with audio failed: {e}"
+                )))?
+            } else {
+                phasm_core::codec::mp4::build::build_mp4_with_pattern(
+                    phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
+                    &annex_b,
+                    width, height, timing, gop_pattern, n_display_frames,
+                )
+                .map_err(|e| CliError::InvalidArgs(format!(
+                    "HandBrake mux failed: {e}"
+                )))?
+            };
             std::fs::write(output, mp4)?;
-            audio_source.is_some()
+            false // §Stealth.L4.5: HandBrake profile now passes audio through.
         }
         MuxProfile::Ffmpeg => {
             mux_annexb_to_mp4(annex_b_path, audio_source, frame_rate, output)?;

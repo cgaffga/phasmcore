@@ -138,6 +138,7 @@ pub fn build_mp4(
             height,
             timing,
             None,
+            None,
         ),
     }
 }
@@ -231,7 +232,164 @@ pub fn build_mp4_with_pattern(
             height,
             timing,
             composition_offsets.as_deref(),
+            None,
         ),
+    }
+}
+
+/// §Stealth.L4.5 — variant of [`build_mp4_with_pattern`] that also
+/// passes through an audio track from the source MP4. The HandBrake-
+/// class video container shape is unchanged; the audio is added as a
+/// second track inside `moov` with its samples appended to `mdat`
+/// after the video samples.
+///
+/// # Audio handling
+///
+/// The source's first audio track is copied verbatim. The codec
+/// configuration record (mp4a/esds for AAC, dops for Opus, etc.)
+/// passes through unchanged inside the source's `stsd` box. Sample
+/// timing (`stts`/`stsc`/`stsz`) is preserved; only `stco`/`co64`
+/// chunk offsets are rewritten to point at the new MP4's mdat
+/// positions. Track IDs are renumbered so video stays at `track_id=1`
+/// and audio takes `track_id=2`.
+///
+/// `source_mp4` is the original MP4 byte stream (or any MP4 carrying
+/// the desired audio track — typically the same input the YUV came
+/// from). When the source has no audio track, the result is identical
+/// to [`build_mp4_with_pattern`].
+#[cfg(feature = "h264-encoder")]
+pub fn build_mp4_with_pattern_audio(
+    profile: MuxerProfile,
+    annex_b: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    pattern: GopPattern,
+    n_display_frames: usize,
+    source_mp4: &[u8],
+) -> Result<Vec<u8>, Mp4Error> {
+    if width == 0 || height == 0 {
+        return Err(Mp4Error::InvalidBox(format!(
+            "invalid dimensions {width}x{height}"
+        )));
+    }
+    if timing.fps_num == 0 || timing.fps_den == 0 {
+        return Err(Mp4Error::InvalidBox(format!(
+            "invalid frame rate {}/{}",
+            timing.fps_num, timing.fps_den
+        )));
+    }
+    let nals = parse_annexb_nals(annex_b);
+    if nals.is_empty() {
+        return Err(Mp4Error::InvalidBox("no NAL units in input".into()));
+    }
+    let avcc = AvccData::from_annexb(annex_b)
+        .ok_or_else(|| Mp4Error::InvalidBox("missing SPS or PPS in input".into()))?;
+    let access_units = group_access_units(&nals);
+    if access_units.is_empty() {
+        return Err(Mp4Error::InvalidBox("no access units in input".into()));
+    }
+
+    let encode_order: Vec<_> = iter_encode_order(n_display_frames, pattern).collect();
+    if encode_order.len() != access_units.len() {
+        return Err(Mp4Error::InvalidBox(format!(
+            "pattern emits {} frames but input has {} access units",
+            encode_order.len(),
+            access_units.len(),
+        )));
+    }
+    let any_b_frame = encode_order.iter().any(|f| f.frame_type == FrameType::B);
+    let composition_offsets: Option<Vec<i32>> = if any_b_frame {
+        Some(
+            encode_order
+                .iter()
+                .map(|f| {
+                    let display = f.display_idx as i32;
+                    let encode = f.encode_idx as i32;
+                    (display - encode) * (handbrake::STTS_DELTA_PER_FRAME as i32)
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    let audio = AudioPassthrough::extract_first(source_mp4)?;
+
+    match profile {
+        MuxerProfile::HandbrakeX264 => build_handbrake_x264(
+            annex_b,
+            &access_units,
+            &avcc,
+            width,
+            height,
+            timing,
+            composition_offsets.as_deref(),
+            audio.as_ref(),
+        ),
+    }
+}
+
+/// Extracted audio track from a source MP4, ready to splice into a
+/// new HandBrake-class mux. `None` when the source has no audio.
+pub struct AudioPassthrough<'a> {
+    /// Original audio samples in source order. Lifetime tied to the
+    /// caller's source MP4 byte slice.
+    samples: Vec<&'a [u8]>,
+    /// Source's `trak` box bytes — copied verbatim except for
+    /// `tkhd.track_id` (rewritten to 2) and `stco`/`co64` (rewritten
+    /// to point at our new mdat positions).
+    trak_raw: Vec<u8>,
+    /// Source's media-timescale duration in `mdhd.time_scale` units.
+    duration_media: u64,
+    /// Audio sample-table chunk layout from the source. Each entry is
+    /// `(first_sample_index_0based, samples_in_chunk)`.
+    chunks: Vec<(usize, usize)>,
+}
+
+impl<'a> AudioPassthrough<'a> {
+    /// Extract the first audio track from `source_mp4`. Returns `None`
+    /// when no audio track is present (caller proceeds with
+    /// video-only mux).
+    fn extract_first(source_mp4: &'a [u8]) -> Result<Option<Self>, Mp4Error> {
+        let parsed = super::demux::demux(source_mp4)?;
+        // Find first track with handler_type == "soun".
+        let audio_idx = parsed
+            .tracks
+            .iter()
+            .position(|t| &t.handler_type == b"soun");
+        let audio_idx = match audio_idx {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let track = &parsed.tracks[audio_idx];
+        if track.samples.is_empty() {
+            return Ok(None);
+        }
+
+        // Pull sample bytes by slicing into the source — sample.offset
+        // is the absolute byte offset and sample.size is its length.
+        let mut samples: Vec<&[u8]> = Vec::with_capacity(track.samples.len());
+        for s in &track.samples {
+            let start = s.offset as usize;
+            let end = start + s.size as usize;
+            if end > source_mp4.len() {
+                return Err(Mp4Error::UnexpectedEof);
+            }
+            samples.push(&source_mp4[start..end]);
+        }
+
+        // Reconstruct chunk layout from stsc — same logic the patch
+        // path in mux.rs uses. We need this to recompute stco offsets
+        // when the audio samples land at fresh positions in our mdat.
+        let chunks = reconstruct_chunk_layout(&track.trak_raw, track.samples.len())?;
+
+        Ok(Some(AudioPassthrough {
+            samples,
+            trak_raw: track.trak_raw.clone(),
+            duration_media: track.duration,
+            chunks,
+        }))
     }
 }
 
@@ -317,6 +475,7 @@ mod handbrake {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_handbrake_x264(
     annex_b: &[u8],
     access_units: &[AccessUnit],
@@ -325,6 +484,7 @@ fn build_handbrake_x264(
     height: u32,
     timing: FrameTiming,
     composition_offsets: Option<&[i32]>,
+    audio: Option<&AudioPassthrough<'_>>,
 ) -> Result<Vec<u8>, Mp4Error> {
     let mdhd_timescale = handbrake::mdhd_timescale(timing.fps_num, timing.fps_den);
     let frame_count = access_units.len() as u32;
@@ -375,14 +535,18 @@ fn build_handbrake_x264(
     }
 
     let sample_sizes: Vec<u32> = sample_data.iter().map(|s| s.len() as u32).collect();
-    let total_mdat_payload: u64 = sample_sizes.iter().map(|&s| s as u64).sum();
+    let video_payload: u64 = sample_sizes.iter().map(|&s| s as u64).sum();
+    let audio_payload: u64 = audio
+        .map(|a| a.samples.iter().map(|s| s.len() as u64).sum::<u64>())
+        .unwrap_or(0);
+    let total_mdat_payload: u64 = video_payload + audio_payload;
 
     // ─── Compute layout ─────────────────────────────────────────
     //
     // HandBrake (no +faststart) layout: ftyp → mdat → moov.
-    // We need the absolute byte offset of the first sample in mdat
-    // before we can finalise stco. ftyp size is fixed; mdat header
-    // is 8 or 16 bytes depending on payload size.
+    // mdat carries video samples first, then audio samples (when
+    // present) — matches what `ffmpeg -c:a copy` interleaves into a
+    // libx264 file at low frame counts.
 
     let ftyp = build_ftyp_handbrake();
     let ftyp_len = ftyp.len() as u64;
@@ -391,12 +555,20 @@ fn build_handbrake_x264(
     let mdat_total_size = mdat_header_len + total_mdat_payload;
     let first_sample_offset = ftyp_len + mdat_header_len;
 
-    // Per-sample absolute offsets in the output file.
+    // Per-video-sample absolute offsets in the output file.
     let mut sample_offsets: Vec<u64> = Vec::with_capacity(sample_data.len());
     let mut cursor = first_sample_offset;
     for &size in &sample_sizes {
         sample_offsets.push(cursor);
         cursor += size as u64;
+    }
+    // Per-audio-sample absolute offsets — sit right after the video.
+    let mut audio_sample_offsets: Vec<u64> = Vec::new();
+    if let Some(a) = audio {
+        for s in &a.samples {
+            audio_sample_offsets.push(cursor);
+            cursor += s.len() as u64;
+        }
     }
 
     // Sync sample indices (1-based per spec): each access unit whose
@@ -407,11 +579,48 @@ fn build_handbrake_x264(
         .filter_map(|(i, au)| if au.is_sync { Some(i as u32 + 1) } else { None })
         .collect();
 
+    // ─── Patch the audio trak (when present) ────────────────────
+    // Compute new chunk-offset table from the audio sample layout +
+    // source's chunk grouping (stsc), then rewrite the source's
+    // stco/co64 in-place inside its trak_raw clone. tkhd.track_id is
+    // also rewritten to 2 (video has 1).
+    let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
+        let mut trak = a.trak_raw.clone();
+        let chunk_offsets: Vec<u64> = a
+            .chunks
+            .iter()
+            .map(|&(first_idx, _spc)| {
+                audio_sample_offsets
+                    .get(first_idx)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect();
+        // Patch stco/co64. Failures are non-fatal — we just leave
+        // the source's offsets in place (they'd be wrong but the
+        // file would at least decode video). Caller's smoke test
+        // catches misshapen audio, then we'd return an error. For
+        // now, propagate the error.
+        patch_trak_stco(&mut trak, &chunk_offsets)?;
+        patch_trak_track_id(&mut trak, 2)?;
+        Ok::<Vec<u8>, Mp4Error>(trak)
+    }).transpose()?;
+
+    let audio_duration_movie: Option<u64> = audio.map(|a| {
+        // Convert audio's mdhd-timescale duration to movie-timescale
+        // (1000) so mvhd.duration covers the longest track.
+        let mdhd_ts = read_audio_mdhd_timescale(&a.trak_raw).unwrap_or(48000) as u64;
+        a.duration_media * (handbrake::MVHD_TIMESCALE as u64) / mdhd_ts
+    });
+
     // ─── Build moov ─────────────────────────────────────────────
+    let movie_duration_final = audio_duration_movie
+        .map(|ad| ad.max(movie_duration_ms))
+        .unwrap_or(movie_duration_ms);
     let moov = build_moov_handbrake(MoovParams {
         width,
         height,
-        movie_duration_ms,
+        movie_duration_ms: movie_duration_final,
         track_duration_media,
         mdhd_timescale,
         sample_sizes: &sample_sizes,
@@ -419,6 +628,7 @@ fn build_handbrake_x264(
         sync_samples: &sync_samples,
         avcc,
         composition_offsets,
+        audio_trak: audio_trak_patched.as_deref(),
     });
 
     // ─── Assemble output ────────────────────────────────────────
@@ -436,6 +646,11 @@ fn build_handbrake_x264(
     }
     for sample in &sample_data {
         out.extend_from_slice(sample);
+    }
+    if let Some(a) = audio {
+        for s in &a.samples {
+            out.extend_from_slice(s);
+        }
     }
     out.extend_from_slice(&moov);
 
@@ -466,16 +681,24 @@ struct MoovParams<'a> {
     /// `mdhd_timescale` units. `Some` when B-frames are present;
     /// `None` for IPPPP / I-only inputs.
     composition_offsets: Option<&'a [i32]>,
+    /// §Stealth.L4.5 — patched audio `trak` box bytes ready to
+    /// splice. Already has track_id=2 + new stco/co64 offsets. None
+    /// → video-only mux.
+    audio_trak: Option<&'a [u8]>,
 }
 
 fn build_moov_handbrake(p: MoovParams<'_>) -> Vec<u8> {
-    let mvhd = build_mvhd(p.movie_duration_ms, /* next_track_id */ 2);
+    let next_track_id: u32 = if p.audio_trak.is_some() { 3 } else { 2 };
+    let mvhd = build_mvhd(p.movie_duration_ms, next_track_id);
     let trak = build_video_trak_handbrake(&p);
     let udta = build_udta_handbrake();
 
     let mut moov = Vec::new();
     moov.extend_from_slice(&mvhd);
     moov.extend_from_slice(&trak);
+    if let Some(audio_trak) = p.audio_trak {
+        moov.extend_from_slice(audio_trak);
+    }
     moov.extend_from_slice(&udta);
     wrap_box(b"moov", &moov)
 }
@@ -1047,6 +1270,182 @@ fn wrap_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
     out
 }
 
+// ─── §Stealth.L4.5 audio passthrough helpers ──────────────────────────
+//
+// These walk a source `trak` box and rewrite specific sub-fields in
+// place, without parsing or re-emitting the rest of the structure.
+// Same approach as `super::mux::patch_*_in_moov` — preserves opaque
+// fields (esds for AAC, dops for Opus, etc.) byte-exact.
+
+fn find_subbox_offset(buf: &[u8], target: &[u8; 4]) -> Option<usize> {
+    fn recurse(buf: &[u8], start: usize, end: usize, target: &[u8; 4]) -> Option<usize> {
+        let mut found = None;
+        let _ = super::iterate_boxes(buf, start, end, |h, content_start, _| {
+            if found.is_some() {
+                return Ok(());
+            }
+            let box_start = content_start - h.header_len as usize;
+            if h.box_type == *target {
+                found = Some(box_start);
+            } else if matches!(
+                &h.box_type,
+                b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts"
+            ) {
+                let inner_end = box_start + h.size as usize;
+                if let Some(inner) = recurse(buf, content_start, inner_end, target) {
+                    found = Some(inner);
+                }
+            }
+            Ok(())
+        });
+        found
+    }
+    recurse(buf, 0, buf.len(), target)
+}
+
+/// Reconstruct `(first_sample_idx_0based, samples_per_chunk)` for
+/// every chunk in an audio `trak`'s sample table. Mirrors the same
+/// derivation `super::mux::compute_chunk_first_samples` does, but
+/// reads from a standalone trak buffer instead of the moov.
+fn reconstruct_chunk_layout(
+    trak: &[u8],
+    n_samples: usize,
+) -> Result<Vec<(usize, usize)>, Mp4Error> {
+    if n_samples == 0 {
+        return Ok(Vec::new());
+    }
+    // Read num_chunks from stco or co64.
+    let (num_chunks, is_co64) = if let Some(off) = find_subbox_offset(trak, b"stco") {
+        let h = super::parse_box_header(trak, off)?;
+        let cs = off + h.header_len as usize;
+        (super::read_u32(trak, cs + 4)? as usize, false)
+    } else if let Some(off) = find_subbox_offset(trak, b"co64") {
+        let h = super::parse_box_header(trak, off)?;
+        let cs = off + h.header_len as usize;
+        (super::read_u32(trak, cs + 4)? as usize, true)
+    } else {
+        return Ok(Vec::new());
+    };
+    let _ = is_co64;
+
+    let stsc_entries = if let Some(off) = find_subbox_offset(trak, b"stsc") {
+        let h = super::parse_box_header(trak, off)?;
+        let cs = off + h.header_len as usize;
+        super::demux::parse_stsc(trak, cs)?
+    } else {
+        Vec::new()
+    };
+
+    let mut samples_per_chunk = vec![0u32; num_chunks];
+    if stsc_entries.is_empty() {
+        samples_per_chunk.fill(1);
+    } else {
+        for (i, entry) in stsc_entries.iter().enumerate() {
+            let first_chunk = entry.0 as usize;
+            let spc = entry.1;
+            let next_first = if i + 1 < stsc_entries.len() {
+                stsc_entries[i + 1].0 as usize
+            } else {
+                num_chunks + 1
+            };
+            for chunk_idx in first_chunk..next_first {
+                if (1..=num_chunks).contains(&chunk_idx) {
+                    samples_per_chunk[chunk_idx - 1] = spc;
+                }
+            }
+        }
+    }
+
+    let mut chunks = Vec::with_capacity(num_chunks);
+    let mut sample_idx = 0usize;
+    for &spc in &samples_per_chunk {
+        let count = spc as usize;
+        chunks.push((sample_idx, count));
+        sample_idx += count;
+    }
+    Ok(chunks)
+}
+
+/// Rewrite `stco` (32-bit) or `co64` (64-bit) chunk-offset entries
+/// inside a `trak` buffer in place. `new_chunk_offsets` must have
+/// exactly `count(stco/co64.entries)` entries — the source's chunk
+/// count is preserved.
+fn patch_trak_stco(trak: &mut [u8], new_chunk_offsets: &[u64]) -> Result<(), Mp4Error> {
+    if let Some(off) = find_subbox_offset(trak, b"stco") {
+        let h = super::parse_box_header(trak, off)?;
+        let cs = off + h.header_len as usize;
+        let count = super::read_u32(trak, cs + 4)? as usize;
+        if count != new_chunk_offsets.len() {
+            return Err(Mp4Error::InvalidBox(format!(
+                "stco entry count mismatch in audio trak: {} vs {}",
+                count,
+                new_chunk_offsets.len()
+            )));
+        }
+        if new_chunk_offsets.iter().any(|&o| o > u32::MAX as u64) {
+            return Err(Mp4Error::InvalidBox(
+                "audio trak stco offsets exceed 32-bit; co64 upgrade not supported".into(),
+            ));
+        }
+        for (i, &offset) in new_chunk_offsets.iter().enumerate() {
+            let pos = cs + 8 + i * 4;
+            trak[pos..pos + 4].copy_from_slice(&(offset as u32).to_be_bytes());
+        }
+        return Ok(());
+    }
+    if let Some(off) = find_subbox_offset(trak, b"co64") {
+        let h = super::parse_box_header(trak, off)?;
+        let cs = off + h.header_len as usize;
+        let count = super::read_u32(trak, cs + 4)? as usize;
+        if count != new_chunk_offsets.len() {
+            return Err(Mp4Error::InvalidBox(format!(
+                "co64 entry count mismatch in audio trak: {} vs {}",
+                count,
+                new_chunk_offsets.len()
+            )));
+        }
+        for (i, &offset) in new_chunk_offsets.iter().enumerate() {
+            let pos = cs + 8 + i * 8;
+            trak[pos..pos + 8].copy_from_slice(&offset.to_be_bytes());
+        }
+        return Ok(());
+    }
+    Err(Mp4Error::InvalidBox("audio trak missing stco/co64".into()))
+}
+
+/// Rewrite `tkhd.track_id` inside a `trak` buffer in place. Used to
+/// renumber the audio track to 2 (video stays at 1).
+fn patch_trak_track_id(trak: &mut [u8], new_track_id: u32) -> Result<(), Mp4Error> {
+    let off = find_subbox_offset(trak, b"tkhd")
+        .ok_or_else(|| Mp4Error::InvalidBox("audio trak missing tkhd".into()))?;
+    let h = super::parse_box_header(trak, off)?;
+    let cs = off + h.header_len as usize;
+    let version = trak[cs];
+    let track_id_pos = if version == 1 {
+        cs + 4 + 16 // ver+flags(4) + creation(8) + modification(8)
+    } else {
+        cs + 4 + 8 // ver+flags(4) + creation(4) + modification(4)
+    };
+    trak[track_id_pos..track_id_pos + 4].copy_from_slice(&new_track_id.to_be_bytes());
+    Ok(())
+}
+
+/// Read `mdhd.time_scale` from a `trak` buffer (used to convert the
+/// audio track's media-timescale duration to mvhd-timescale ms when
+/// computing the new movie duration).
+fn read_audio_mdhd_timescale(trak: &[u8]) -> Option<u32> {
+    let off = find_subbox_offset(trak, b"mdhd")?;
+    let h = super::parse_box_header(trak, off).ok()?;
+    let cs = off + h.header_len as usize;
+    let version = trak[cs];
+    let ts_pos = if version == 1 {
+        cs + 4 + 16 // ver+flags + creation(8) + modification(8)
+    } else {
+        cs + 4 + 8 // ver+flags + creation(4) + modification(4)
+    };
+    super::read_u32(trak, ts_pos).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,8 +1580,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "h264-encoder")]
-    #[test]
+        #[test]
     fn stbl_child_order_with_ctts_inserts_after_stts() {
         // With B-frames present, stbl order is
         // stsd → stts → ctts → stss → stsc → stsz → stco.
@@ -1587,8 +1985,7 @@ mod tests {
         assert_eq!(&ctts[36..40], &(-512i32).to_be_bytes());
     }
 
-    #[cfg(feature = "h264-encoder")]
-    #[test]
+        #[test]
     fn build_mp4_with_ipppp_pattern_emits_no_ctts_no_edts() {
         // IPPPP (no B-frames) → no ctts, no edts.
         use crate::codec::h264::stego::gop_pattern::GopPattern;
@@ -1607,8 +2004,7 @@ mod tests {
         assert!(!mp4.windows(4).any(|w| w == b"edts"), "no edts box");
     }
 
-    #[cfg(feature = "h264-encoder")]
-    #[test]
+        #[test]
     fn build_mp4_with_pattern_rejects_au_count_mismatch() {
         // Pattern asks for 5 frames but input has 1 → error.
         use crate::codec::h264::stego::gop_pattern::GopPattern;
