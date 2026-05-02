@@ -258,6 +258,13 @@ pub struct SpsParams {
     /// + 4` bits. Phase 6E-A1 default = 4 → 8-bit POC LSB
     /// (range 0..255).
     pub log2_max_pic_order_cnt_lsb_minus4: u8,
+    /// Optional VUI parameter block. When `Some`, the SPS emits
+    /// `vui_parameters_present_flag = 1` followed by the VUI body.
+    /// `None` (the legacy default) emits no VUI — leaves SPS in its
+    /// own L4 metaclass per Altinisik 2022 §IV (only 18 / 119
+    /// classes have an empty VUI). §Stealth.L3.1 enables VUI for
+    /// the HandBrake/x264-medium target.
+    pub vui: Option<VuiParams>,
 }
 
 impl Default for SpsParams {
@@ -269,6 +276,72 @@ impl Default for SpsParams {
             max_num_ref_frames: 1,
             pic_order_cnt_type: 2,
             log2_max_pic_order_cnt_lsb_minus4: 4,
+            vui: None,
+        }
+    }
+}
+
+/// Video Usability Information (H.264 §E.1.1) parameters phasm controls
+/// when targeting a converter-pipeline metaclass (default v1.0:
+/// HandBrake/x264-medium per `docs/design/h264-stealth-strategy.md`).
+///
+/// Field selection follows Agent B 2026-05-02 §"FFmpeg + libx264" + the
+/// libx264 source `x264_sps_init_vui` defaults. Anything the analyst
+/// would expect from a libx264-medium transcode is set; HRD is omitted
+/// (libx264 only emits HRD with `--bitrate` / `--vbv-*` flags, and 60+%
+/// of internet-shared libx264 output omits it).
+#[derive(Debug, Clone, Copy)]
+pub struct VuiParams {
+    /// `aspect_ratio_idc` (spec Table E-1). 1 = 1:1 square pixels —
+    /// phasm always emits square-pixel content.
+    pub aspect_ratio_idc: u8,
+    /// `colour_primaries` (Table E-3). 1 = BT.709 — modern HD default.
+    pub colour_primaries: u8,
+    /// `transfer_characteristics` (Table E-4). 1 = BT.709.
+    pub transfer_characteristics: u8,
+    /// `matrix_coefficients` (Table E-5). 1 = BT.709.
+    pub matrix_coefficients: u8,
+    /// `video_full_range_flag`. False = limited range (16..235), the
+    /// TV-broadcast default x264 emits without `--range pc`.
+    pub video_full_range: bool,
+    /// `num_units_in_tick` for the `timing_info` block. Per spec
+    /// §E.2.1, `time_scale = 2 × frame_rate × num_units_in_tick`. For
+    /// 30 fps with `num_units_in_tick = 1`, `time_scale = 60`. Real
+    /// libx264 typically uses `num_units_in_tick = 1`,
+    /// `time_scale = 2 × fps`.
+    pub num_units_in_tick: u32,
+    /// `time_scale` (see above). Pair with `num_units_in_tick` so
+    /// `time_scale / (2 × num_units_in_tick) = frame_rate`.
+    pub time_scale: u32,
+    /// Bitstream restriction parameters. Always emitted (x264 emits
+    /// these unconditionally with `--no-vui` opt-out).
+    pub max_num_reorder_frames: u8,
+    /// `max_dec_frame_buffering`. Should equal `max_num_ref_frames`
+    /// in the SPS body for x264-medium parity.
+    pub max_dec_frame_buffering: u8,
+}
+
+impl VuiParams {
+    /// HandBrake/x264-medium VUI defaults at the given frame rate.
+    /// All values track libx264's `x264_sps_init_vui` output for
+    /// `preset=medium`, `--no-bitrate`, `--colorspace=auto` (defaults
+    /// to BT.709 for HD content).
+    pub fn handbrake_x264(fps_num: u32, fps_den: u32) -> Self {
+        // libx264 convention: num_units_in_tick = fps_den,
+        //                     time_scale       = 2 × fps_num.
+        // So time_scale / (2 × num_units_in_tick) = fps_num / fps_den
+        // = the actual frame rate. For 30 fps integer this gives
+        // num=1, scale=60; for 29.97 it gives num=1001, scale=60000.
+        Self {
+            aspect_ratio_idc: 1, // 1:1
+            colour_primaries: 1, // BT.709
+            transfer_characteristics: 1, // BT.709
+            matrix_coefficients: 1, // BT.709
+            video_full_range: false, // limited range (TV)
+            num_units_in_tick: fps_den,
+            time_scale: 2u32.saturating_mul(fps_num),
+            max_num_reorder_frames: 2, // M=2 IBPBP / x264-medium default
+            max_dec_frame_buffering: 3, // matches max_num_ref_frames=3
         }
     }
 }
@@ -357,8 +430,8 @@ fn build_sps_inner(p: &SpsParams, profile_idc: u32, constraint_byte: u32) -> Vec
     w.write_bit(true);
     // frame_cropping_flag
     w.write_bit(false);
-    // vui_parameters_present_flag = 0
-    w.write_bit(false);
+    // vui_parameters_present_flag
+    write_vui_section(&mut w, p);
 
     w.write_rbsp_trailing();
     w.finish()
@@ -397,10 +470,69 @@ fn build_sps_inner_high(p: &SpsParams) -> Vec<u8> {
     w.write_bit(true); // frame_mbs_only_flag
     w.write_bit(true); // direct_8x8_inference_flag
     w.write_bit(false); // frame_cropping_flag
-    w.write_bit(false); // vui_parameters_present_flag
+    write_vui_section(&mut w, p);
 
     w.write_rbsp_trailing();
     w.finish()
+}
+
+/// Emit `vui_parameters_present_flag` and the VUI body (when
+/// `p.vui` is `Some`). Pure no-op (zero bit) when `None`. Spec
+/// §7.3.2.1.1 + §E.1.1.
+fn write_vui_section(w: &mut BitWriter, p: &SpsParams) {
+    if let Some(vui) = p.vui {
+        w.write_bit(true); // vui_parameters_present_flag
+        write_vui_body(w, &vui);
+    } else {
+        w.write_bit(false);
+    }
+}
+
+fn write_vui_body(w: &mut BitWriter, v: &VuiParams) {
+    // aspect_ratio_info_present_flag = 1
+    w.write_bit(true);
+    w.write_bits(v.aspect_ratio_idc as u32, 8);
+    if v.aspect_ratio_idc == 255 {
+        // Extended_SAR — not used by phasm; spec keeps it here for
+        // completeness only.
+        w.write_bits(0, 16); // sar_width
+        w.write_bits(0, 16); // sar_height
+    }
+    // overscan_info_present_flag = 0
+    w.write_bit(false);
+    // video_signal_type_present_flag = 1
+    w.write_bit(true);
+    w.write_bits(5, 3); // video_format = 5 (Unspecified) — libx264 default
+    w.write_bit(v.video_full_range);
+    w.write_bit(true); // colour_description_present_flag = 1
+    w.write_bits(v.colour_primaries as u32, 8);
+    w.write_bits(v.transfer_characteristics as u32, 8);
+    w.write_bits(v.matrix_coefficients as u32, 8);
+    // chroma_loc_info_present_flag = 0
+    w.write_bit(false);
+    // timing_info_present_flag = 1
+    w.write_bit(true);
+    w.write_bits(v.num_units_in_tick, 32);
+    w.write_bits(v.time_scale, 32);
+    // fixed_frame_rate_flag = 1 (libx264 default for CFR output)
+    w.write_bit(true);
+    // nal_hrd_parameters_present_flag = 0
+    w.write_bit(false);
+    // vcl_hrd_parameters_present_flag = 0
+    w.write_bit(false);
+    // (low_delay_hrd_flag is conditionally emitted; both HRD off → skipped)
+    // pic_struct_present_flag = 0
+    w.write_bit(false);
+    // bitstream_restriction_flag = 1
+    w.write_bit(true);
+    // motion_vectors_over_pic_boundaries_flag = 1 (libx264 default)
+    w.write_bit(true);
+    w.write_ue(0); // max_bytes_per_pic_denom
+    w.write_ue(0); // max_bits_per_mb_denom
+    w.write_ue(16); // log2_max_mv_length_horizontal
+    w.write_ue(16); // log2_max_mv_length_vertical
+    w.write_ue(v.max_num_reorder_frames as u32);
+    w.write_ue(v.max_dec_frame_buffering as u32);
 }
 
 // ─── PPS ──────────────────────────────────────────────────────────
@@ -1171,6 +1303,70 @@ mod tests {
         assert_eq!(sps.level_idc, 20);
         assert_eq!(sps.width_in_pixels, 320);
         assert_eq!(sps.height_in_pixels, 240);
+    }
+
+    #[test]
+    fn sps_high_with_vui_parses_back() {
+        // §Stealth.L3.1 — when SpsParams.vui = Some(...), the High-
+        // profile SPS emits a VUI body that the in-tree parser
+        // accepts. Round-trip must extract dimensions correctly.
+        let p = SpsParams {
+            width_pixels: 1920,
+            height_pixels: 1088,
+            sps_id: 0,
+            max_num_ref_frames: 3,
+            pic_order_cnt_type: 0,
+            log2_max_pic_order_cnt_lsb_minus4: 4,
+            vui: Some(VuiParams::handbrake_x264(30, 1)),
+        };
+        let rbsp = build_sps_high(&p);
+        let sps = parse_sps(&rbsp).expect("parse_sps accepts VUI-bearing SPS");
+        assert_eq!(sps.profile_idc, 100);
+        assert_eq!(sps.width_in_pixels, 1920);
+        assert_eq!(sps.height_in_pixels, 1088);
+        assert_eq!(sps.max_num_ref_frames, 3);
+    }
+
+    #[test]
+    fn sps_with_vui_is_longer_than_sps_without() {
+        // Adding the VUI body must increase SPS size. (Smoke check that
+        // the section is actually written, not silently skipped.)
+        let p_novui = SpsParams::default();
+        let p_vui = SpsParams {
+            vui: Some(VuiParams::handbrake_x264(30, 1)),
+            ..p_novui
+        };
+        let r_novui = build_sps_high(&p_novui);
+        let r_vui = build_sps_high(&p_vui);
+        assert!(
+            r_vui.len() > r_novui.len(),
+            "VUI-bearing SPS ({} bytes) should be longer than no-VUI SPS ({} bytes)",
+            r_vui.len(),
+            r_novui.len(),
+        );
+    }
+
+    #[test]
+    fn vui_handbrake_x264_30fps_matches_libx264_convention() {
+        // libx264's `x264_sps_init_vui` uses
+        // num_units_in_tick = fps_den, time_scale = 2 × fps_num.
+        // For 30 fps integer: num=1, scale=60.
+        let v = VuiParams::handbrake_x264(30, 1);
+        assert_eq!(v.num_units_in_tick, 1);
+        assert_eq!(v.time_scale, 60);
+        assert_eq!(v.aspect_ratio_idc, 1, "1:1 SAR");
+        assert_eq!(v.colour_primaries, 1, "BT.709 primaries");
+        assert_eq!(v.transfer_characteristics, 1, "BT.709 transfer");
+        assert_eq!(v.matrix_coefficients, 1, "BT.709 matrix");
+        assert!(!v.video_full_range, "limited range default");
+    }
+
+    #[test]
+    fn vui_handbrake_x264_29_97fps_matches_libx264_convention() {
+        // 29.97 = 30000/1001 → num=1001, scale=60000.
+        let v = VuiParams::handbrake_x264(30000, 1001);
+        assert_eq!(v.num_units_in_tick, 1001);
+        assert_eq!(v.time_scale, 60000);
     }
 
     #[test]

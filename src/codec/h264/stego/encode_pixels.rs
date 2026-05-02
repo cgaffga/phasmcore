@@ -241,9 +241,11 @@ fn build_encoder(
     let mut enc = Encoder::new(width, height, quality)
         .map_err(|e| StegoError::InvalidVideo(format!("encoder new: {e}")))?;
     enc.entropy_mode = EntropyMode::Cabac;
-    // Don't enable_transform_8x8 for now — not needed for I-frame-
-    // only stego and avoids the I_8x8 mode-decision branch.
-    enc.enable_transform_8x8 = false;
+    // §Stealth.L3.1 follow-on (#145) — High profile (transform_8x8_mode
+    // = 1) lands phasm output in the HandBrake/x264-medium metaclass at
+    // the SPS level. The CABAC walker handles I_8x8 (transform_size_8x8
+    // = 1) since the same task; encoder + walker are now in parity.
+    enc.enable_transform_8x8 = true;
     let _ = CabacInitSlot::ISI;
     Ok(enc)
 }
@@ -3741,11 +3743,13 @@ mod tests {
         // identical bytes.
         let yuv = deterministic_yuv(32, 32, 1);
 
-        // Baseline: encoder with no stego hook.
+        // Baseline: encoder with no stego hook. Mirror `build_encoder`
+        // (transform_8x8=true, High profile per §Stealth.L3.1 follow-on)
+        // so the stego empty-message run lands on identical bytes.
         use super::super::super::encoder::encoder::{Encoder, EntropyMode};
         let mut baseline_enc = Encoder::new(32, 32, Some(26)).unwrap();
         baseline_enc.entropy_mode = EntropyMode::Cabac;
-        baseline_enc.enable_transform_8x8 = false;
+        baseline_enc.enable_transform_8x8 = true;
         let baseline = baseline_enc.encode_i_frame(&yuv).unwrap();
 
         // Stego with empty message.

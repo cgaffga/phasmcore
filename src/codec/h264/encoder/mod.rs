@@ -47,6 +47,8 @@
 //! returns a `EncoderError::NotImplemented` or panics with `todo!()`.
 //! Real implementations land in Phase 6A through 6E.
 
+pub mod b_direct_predictor;
+pub mod b_partitioned;
 pub mod baseline_transcode;
 pub mod bitstream_writer;
 pub mod deblocking_filter;
@@ -55,6 +57,7 @@ pub mod i4x4_encode;
 pub mod inter_mode;
 pub mod intra_8x8_encode;
 pub mod intra_predictor;
+pub mod mb_decision_b;
 pub mod motion_compensation;
 pub mod motion_estimation;
 pub mod partition_decision;

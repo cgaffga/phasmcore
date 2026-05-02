@@ -1,0 +1,444 @@
+// Copyright (c) 2026 Christoph Gaffga
+// SPDX-License-Identifier: GPL-3.0-only
+// https://github.com/cgaffga/phasmcore
+
+//! §6E-A6.1 — Spatial-direct MV derivation (encoder side, mirrors
+//! what the decoder will compute at the same MB position).
+//!
+//! Spec reference: ISO/IEC 14496-10
+//! - § 8.4.1.2.1 "Derivation process for direct mode prediction"
+//! - § 8.4.1.2.2 "Derivation process for luma motion vectors for
+//!                B_Skip, B_Direct_16x16 and B_Direct_8x8"
+//! - § 8.4.1.3   "Derivation process for luma motion vector
+//!                prediction" (the median predictor)
+//!
+//! Phase 6E-A4 locked `direct_spatial_mv_pred_flag = 1` (matches
+//! mobile-encoder defaults; cleaner than temporal direct). This
+//! module implements ONLY the spatial-direct path; temporal direct
+//! is out of scope.
+//!
+//! ## Scope of this module
+//!
+//! What it does:
+//! - Derives per-MB `(refIdxL0, refIdxL1)` from neighbour A / B / C
+//!   per spec § 8.4.1.2.1 (MIN_POSITIVE of available neighbours,
+//!   per list).
+//! - Both-`-1` boundary case: forces both refs to 0 with zero MVs.
+//! - For each list X with `refIdxLX >= 0`: derives `mvLX` via the
+//!   standard median predictor over neighbours (per § 8.4.1.3).
+//!
+//! What it does NOT do (yet):
+//! - Co-located 4x4 sub-MB static / moving check per spec § 8.4.1.2.3.
+//!   That check requires access to the L1 reference's MV grid +
+//!   mb_type info to determine if the co-located block is "zero
+//!   MV" (static) and can be reset to (0,0). For typical M=2 IBPBP
+//!   content most B_Direct MBs are in static regions where the
+//!   median path also yields (0,0) — so the divergence is rare in
+//!   practice. Tracked as a follow-up task for §6E-A6.1 part 3.
+//!
+//! ## Why this matters for §6E-A6.1
+//!
+//! When the encoder commits a B_Direct / B_Skip MB, it MUST populate
+//! `EncoderMvGrid` with the same MVs the decoder will derive at that
+//! MB. Otherwise subsequent non-direct B-MBs (`B_L0_16x16` / etc)
+//! that look up B_Direct neighbours for MVD prediction will see
+//! REF_IDX_NONE (= "intra, contribute 0 to median") on the encoder
+//! side, while the decoder sees real derived MVs and uses them in
+//! its median. The MVDs encoded against an "encoder predicted 0"
+//! will reconstruct against a "decoder predicted real" → drift.
+//!
+//! See `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+//! § 6E-A6.0 deliverable 5 for the architectural rationale.
+
+use super::motion_estimation::MotionVector;
+use super::partition_state::{predict_mv_for_partition, EncoderMvGrid, REF_IDX_NONE};
+
+/// Result of running spatial-direct MV derivation at one MB.
+///
+/// Per-list `ref_idx == REF_IDX_NONE (-1)` means "this list is not
+/// used at this MB" (decoder won't include this list in MC). The
+/// caller is expected to populate `EncoderMvGrid` accordingly:
+/// `Some((mv, ref_idx))` for active lists, `None` (i.e. clear that
+/// list at the rect) for inactive ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BDirectSpatialResult {
+    /// L0 MV + ref_idx for the whole MB. `ref_idx == -1` means L0 is
+    /// inactive and `mv` is meaningless.
+    pub mv_l0: MotionVector,
+    pub ref_idx_l0: i8,
+    /// L1 MV + ref_idx for the whole MB.
+    pub mv_l1: MotionVector,
+    pub ref_idx_l1: i8,
+}
+
+impl BDirectSpatialResult {
+    /// Convenience: this MB uses L0 (predFlagL0 = 1 in spec terms).
+    pub fn uses_l0(&self) -> bool {
+        self.ref_idx_l0 != REF_IDX_NONE
+    }
+    /// This MB uses L1 (predFlagL1 = 1 in spec terms).
+    pub fn uses_l1(&self) -> bool {
+        self.ref_idx_l1 != REF_IDX_NONE
+    }
+    /// Convenience: bipred (both lists active).
+    pub fn is_bipred(&self) -> bool {
+        self.uses_l0() && self.uses_l1()
+    }
+}
+
+/// Spec § 8.4.1.2.1: derive per-list ref_idx for a B_Direct /
+/// B_Skip MB at (mb_x, mb_y). Reads neighbour A (left), B (above),
+/// C (above-right with D-fallback).
+///
+/// Returns the MIN_POSITIVE of available neighbours per list, or
+/// `REF_IDX_NONE (-1)` if no neighbour has that list. Neighbours
+/// off-frame / not-yet-decoded are treated as "unavailable" and
+/// don't contribute. Intra neighbours (decoded but no MV) are also
+/// "unavailable" per § 8.4.1.2.1.
+fn derive_b_direct_ref_idx(grid: &EncoderMvGrid, mb_x: usize, mb_y: usize) -> (i8, i8) {
+    // 4×4 anchor of the MB's top-left block.
+    let tl_bx = (mb_x * 4) as isize;
+    let tl_by = (mb_y * 4) as isize;
+    // Neighbour A: left of top-left → (tl_bx - 1, tl_by).
+    // Neighbour B: above top-left → (tl_bx, tl_by - 1).
+    // Neighbour C: above-right of MB → (tl_bx + 4, tl_by - 1).
+    //   D-fallback when C unavailable: (tl_bx - 1, tl_by - 1).
+    let a_l0 = grid.get_l0(tl_bx - 1, tl_by);
+    let b_l0 = grid.get_l0(tl_bx, tl_by - 1);
+    let c_l0 = if grid.is_decoded(tl_bx + 4, tl_by - 1) {
+        grid.get_l0(tl_bx + 4, tl_by - 1)
+    } else {
+        grid.get_l0(tl_bx - 1, tl_by - 1)
+    };
+    let a_l1 = grid.get_l1(tl_bx - 1, tl_by);
+    let b_l1 = grid.get_l1(tl_bx, tl_by - 1);
+    let c_l1 = if grid.is_decoded(tl_bx + 4, tl_by - 1) {
+        grid.get_l1(tl_bx + 4, tl_by - 1)
+    } else {
+        grid.get_l1(tl_bx - 1, tl_by - 1)
+    };
+
+    let ref_idx_l0 = min_positive_ref_idx(&[a_l0, b_l0, c_l0]);
+    let ref_idx_l1 = min_positive_ref_idx(&[a_l1, b_l1, c_l1]);
+    (ref_idx_l0, ref_idx_l1)
+}
+
+/// Spec § 8.4.1.2.1 MIN_POSITIVE: among the supplied neighbours,
+/// take the smallest non-negative ref_idx. If all are unavailable
+/// (None / intra), return `REF_IDX_NONE (-1)`.
+fn min_positive_ref_idx(neighbours: &[Option<(MotionVector, i8)>]) -> i8 {
+    let mut best = REF_IDX_NONE;
+    for n in neighbours {
+        if let Some((_, r)) = n
+            && *r >= 0
+        {
+            if best == REF_IDX_NONE || (*r as i32) < (best as i32) {
+                best = *r;
+            }
+        }
+    }
+    best
+}
+
+/// §6E-A6.1 entry point — full spatial-direct MV derivation for one
+/// MB at `(mb_x, mb_y)`. Implements spec § 8.4.1.2.1 + § 8.4.1.2.2
+/// (median path — co-located static/moving check is a TODO,
+/// documented at the top of this module).
+///
+/// Reads the existing `EncoderMvGrid` for neighbour data; the MB
+/// being derived is expected NOT to be in the grid yet (caller
+/// populates it after calling this).
+pub fn derive_b_direct_spatial(
+    grid: &EncoderMvGrid,
+    mb_x: usize,
+    mb_y: usize,
+) -> BDirectSpatialResult {
+    let (ref_idx_l0, ref_idx_l1) = derive_b_direct_ref_idx(grid, mb_x, mb_y);
+
+    // Spec § 8.4.1.2.1 boundary case: if BOTH lists have no
+    // neighbour info, force both refs to 0 with zero MVs (the
+    // "first B after IDR with no usable neighbours" path).
+    if ref_idx_l0 == REF_IDX_NONE && ref_idx_l1 == REF_IDX_NONE {
+        return BDirectSpatialResult {
+            mv_l0: MotionVector::ZERO,
+            ref_idx_l0: 0,
+            mv_l1: MotionVector::ZERO,
+            ref_idx_l1: 0,
+        };
+    }
+
+    // For each active list, derive the MV via the standard median
+    // predictor over neighbours (§ 8.4.1.3). The per-list grid view
+    // means each predictor only sees same-list neighbour data —
+    // exactly the spec semantics.
+    let tl_bx = mb_x * 4;
+    let tl_by = mb_y * 4;
+    let mv_l0 = if ref_idx_l0 != REF_IDX_NONE {
+        // Run median predictor on the L0 view of the grid. Phasm's
+        // existing `predict_mv_for_partition` reads `grid.get`
+        // (= L0). The whole 16x16 partition uses one predictor at
+        // its top-left anchor, with `part_w_4x4 = 4`.
+        predict_mv_for_partition(grid, tl_bx, tl_by, /* part_w_4x4 */ 4, ref_idx_l0)
+    } else {
+        MotionVector::ZERO
+    };
+    let mv_l1 = if ref_idx_l1 != REF_IDX_NONE {
+        // Predicting from L1 needs an L1-view predictor. The
+        // P-side `predict_mv_for_partition` is L0-only; for L1 we
+        // need a per-list variant. §6E-A6.1 part 2 will add this.
+        // For now, fall back to the same algorithm but with manual
+        // L1-list reads.
+        predict_mv_for_partition_l1(grid, tl_bx, tl_by, ref_idx_l1)
+    } else {
+        MotionVector::ZERO
+    };
+
+    BDirectSpatialResult {
+        mv_l0,
+        ref_idx_l0,
+        mv_l1,
+        ref_idx_l1,
+    }
+}
+
+/// §6E-A6.1 — public wrapper over [`predict_mv_for_partition_l1`]
+/// so encoder.rs (and the §6E-A6.1 walker) can compute L1 MVD
+/// predictors without re-implementing the median logic.
+pub fn predict_mv_for_partition_l1_pub(
+    grid: &EncoderMvGrid,
+    tl_bx: usize,
+    tl_by: usize,
+    current_ref_idx: i8,
+) -> MotionVector {
+    predict_mv_for_partition_l1(grid, tl_bx, tl_by, current_ref_idx)
+}
+
+/// L1-view median MV predictor for a 16x16 partition. Mirrors
+/// `predict_mv_for_partition` exactly but reads `grid.get_l1`
+/// instead of `grid.get_l0`. Spec § 8.4.1.3 — same algorithm,
+/// per-list neighbour view.
+///
+/// (A future cleanup might generalize `predict_mv_for_partition`
+/// to take a list selector — but the existing function is used
+/// hot-path P-side and its signature is referenced from many
+/// callers. Adding a parallel l1 variant here keeps the change
+/// minimal.)
+fn predict_mv_for_partition_l1(
+    grid: &EncoderMvGrid,
+    tl_bx: usize,
+    tl_by: usize,
+    current_ref_idx: i8,
+) -> MotionVector {
+    let x = tl_bx as isize;
+    let y = tl_by as isize;
+    let part_w_4x4 = 4isize;
+
+    let a = grid.get_l1(x - 1, y);
+    let b = grid.get_l1(x, y - 1);
+    let c_bx = x + part_w_4x4;
+    let c_by = y - 1;
+    let c = if grid.is_decoded(c_bx, c_by) {
+        grid.get_l1(c_bx, c_by)
+    } else {
+        grid.get_l1(x - 1, y - 1)
+    };
+
+    // Spec § 8.4.1.3: if only one of A/B/C is available, that one
+    // is the predictor.
+    let availability = [a.is_some(), b.is_some(), c.is_some()];
+    let avail_count: u8 = availability.iter().map(|&v| v as u8).sum();
+    if avail_count == 1
+        && let Some((mv, _)) = a.or(b).or(c)
+    {
+        return mv;
+    }
+
+    // Single-matching-ref_idx special case.
+    let matches: [Option<MotionVector>; 3] = [
+        a.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+        b.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+        c.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+    ];
+    let match_count = matches.iter().filter(|m| m.is_some()).count();
+    if match_count == 1
+        && let Some(mv) = matches.iter().flatten().next()
+    {
+        return *mv;
+    }
+
+    // General case: componentwise median; unavailable = zero.
+    let la = a.map(|(m, _)| m).unwrap_or_default();
+    let lb = b.map(|(m, _)| m).unwrap_or_default();
+    let lc = c.map(|(m, _)| m).unwrap_or_default();
+    MotionVector {
+        mv_x: median3(la.mv_x, lb.mv_x, lc.mv_x),
+        mv_y: median3(la.mv_y, lb.mv_y, lc.mv_y),
+    }
+}
+
+/// Three-tap median (i16 components). Local copy — the P-side
+/// `partition_state.rs` keeps its `median3` private. Re-export
+/// would couple modules unnecessarily for one tiny function.
+#[inline]
+fn median3(a: i16, b: i16, c: i16) -> i16 {
+    a.max(b).min(a.max(c)).min(b.max(c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mv(x: i16, y: i16) -> MotionVector {
+        MotionVector { mv_x: x, mv_y: y }
+    }
+
+    // ─── Boundary / edge cases ─────────────────────────────────
+
+    #[test]
+    fn no_neighbours_yields_both_refs_zero_zero_mv() {
+        // Empty grid — current MB is at top-left (0, 0). No
+        // neighbours at all. Spec says: both refs forced to 0
+        // with zero MVs.
+        let grid = EncoderMvGrid::new(2, 2);
+        let r = derive_b_direct_spatial(&grid, 0, 0);
+        assert_eq!(r.ref_idx_l0, 0);
+        assert_eq!(r.ref_idx_l1, 0);
+        assert_eq!(r.mv_l0, MotionVector::ZERO);
+        assert_eq!(r.mv_l1, MotionVector::ZERO);
+        assert!(r.is_bipred());
+    }
+
+    #[test]
+    fn only_l0_neighbour_yields_l0_only() {
+        // Left neighbour has L0 only. Current MB is at (1, 0)
+        // → 4x4 anchor (4, 0). Left neighbour at (3, 0) — belongs
+        // to MB 0, populated.
+        let mut grid = EncoderMvGrid::new(2, 2);
+        grid.fill_lists(0, 0, 4, 4, Some((mv(10, 20), 0)), None);
+        let r = derive_b_direct_spatial(&grid, 1, 0);
+        assert_eq!(r.ref_idx_l0, 0);
+        assert_eq!(r.ref_idx_l1, REF_IDX_NONE);
+        assert!(r.uses_l0());
+        assert!(!r.uses_l1());
+        // Only one neighbour → that's the predictor.
+        assert_eq!(r.mv_l0, mv(10, 20));
+    }
+
+    #[test]
+    fn only_l1_neighbour_yields_l1_only() {
+        let mut grid = EncoderMvGrid::new(2, 2);
+        grid.fill_lists(0, 0, 4, 4, None, Some((mv(-5, 15), 0)));
+        let r = derive_b_direct_spatial(&grid, 1, 0);
+        assert_eq!(r.ref_idx_l0, REF_IDX_NONE);
+        assert_eq!(r.ref_idx_l1, 0);
+        assert_eq!(r.mv_l1, mv(-5, 15));
+    }
+
+    #[test]
+    fn bipred_neighbour_yields_both_lists() {
+        // Left neighbour has both L0 and L1.
+        let mut grid = EncoderMvGrid::new(2, 2);
+        grid.fill_lists(
+            0, 0, 4, 4,
+            Some((mv(7, -3), 0)),
+            Some((mv(-2, 9), 0)),
+        );
+        let r = derive_b_direct_spatial(&grid, 1, 0);
+        assert!(r.is_bipred());
+        assert_eq!(r.mv_l0, mv(7, -3));
+        assert_eq!(r.mv_l1, mv(-2, 9));
+    }
+
+    #[test]
+    fn three_neighbours_use_componentwise_median() {
+        // Top row of MBs (0, 0), (1, 0), (2, 0): set three different
+        // L0 MVs. Then derive at (1, 1).
+        let mut grid = EncoderMvGrid::new(3, 2);
+        grid.fill_lists(0, 0, 4, 4, Some((mv(1, 10), 0)), None);
+        grid.fill_lists(4, 0, 4, 4, Some((mv(2, 20), 0)), None);
+        grid.fill_lists(8, 0, 4, 4, Some((mv(3, 30), 0)), None);
+        // Left neighbour of MB(1, 1) (anchor (4, 4)): cells (3, 4)..
+        grid.fill_lists(0, 4, 4, 4, Some((mv(100, 0), 0)), None);
+        let r = derive_b_direct_spatial(&grid, 1, 1);
+        // A = (100, 0), B = (2, 20), C = (3, 30) (above-right of MB
+        // (1, 1) at 4×4 (8, 3)).
+        // Median x = 3, median y = 20.
+        assert_eq!(r.mv_l0, mv(3, 20));
+        assert_eq!(r.ref_idx_l0, 0);
+    }
+
+    #[test]
+    fn min_positive_picks_smallest_ref_idx() {
+        // Spec § 8.4.1.2.1: refIdxLX = MIN_POSITIVE over neighbours.
+        // We don't have multi-ref configurations in phasm's ship
+        // path (single-ref, refIdx always 0), but the algorithm
+        // must still be correct for general cases.
+        let neighbours = [
+            Some((mv(0, 0), 2)),
+            Some((mv(0, 0), 1)),
+            Some((mv(0, 0), 5)),
+        ];
+        assert_eq!(min_positive_ref_idx(&neighbours), 1);
+    }
+
+    #[test]
+    fn min_positive_skips_intra_neighbours() {
+        // None entries (intra / off-frame) don't contribute.
+        let neighbours = [
+            None,
+            Some((mv(0, 0), 0)),
+            None,
+        ];
+        assert_eq!(min_positive_ref_idx(&neighbours), 0);
+    }
+
+    #[test]
+    fn min_positive_all_intra_returns_neg_one() {
+        let neighbours: [Option<(MotionVector, i8)>; 3] = [None, None, None];
+        assert_eq!(min_positive_ref_idx(&neighbours), REF_IDX_NONE);
+    }
+
+    #[test]
+    fn predict_mv_l1_mirrors_l0_predictor_on_l1_data() {
+        // Sanity: feeding the same neighbour MV pattern via L1
+        // produces the same result the L0 predictor would on L0
+        // data. Spec § 8.4.1.3 doesn't depend on which list it's
+        // applied to.
+        let mut grid_l0 = EncoderMvGrid::new(3, 2);
+        grid_l0.fill_lists(0, 0, 4, 4, Some((mv(1, 10), 0)), None);
+        grid_l0.fill_lists(4, 0, 4, 4, Some((mv(2, 20), 0)), None);
+        grid_l0.fill_lists(8, 0, 4, 4, Some((mv(3, 30), 0)), None);
+        grid_l0.fill_lists(0, 4, 4, 4, Some((mv(100, 0), 0)), None);
+        let l0_pred = predict_mv_for_partition(&grid_l0, 4, 4, 4, 0);
+
+        let mut grid_l1 = EncoderMvGrid::new(3, 2);
+        grid_l1.fill_lists(0, 0, 4, 4, None, Some((mv(1, 10), 0)));
+        grid_l1.fill_lists(4, 0, 4, 4, None, Some((mv(2, 20), 0)));
+        grid_l1.fill_lists(8, 0, 4, 4, None, Some((mv(3, 30), 0)));
+        grid_l1.fill_lists(0, 4, 4, 4, None, Some((mv(100, 0), 0)));
+        let l1_pred = predict_mv_for_partition_l1(&grid_l1, 4, 4, 0);
+
+        assert_eq!(l0_pred, l1_pred,
+            "L0 and L1 predictors must produce identical results on identical neighbour data");
+    }
+
+    #[test]
+    fn split_l0_l1_at_different_neighbours_yields_correct_split_result() {
+        // Two MB row, each gets a different list at a different
+        // neighbour position. Verify L0 and L1 derivation are
+        // independent.
+        let mut grid = EncoderMvGrid::new(3, 2);
+        // Above-left: only L0.
+        grid.fill_lists(0, 0, 4, 4, Some((mv(1, 1), 0)), None);
+        // Above-middle: only L1.
+        grid.fill_lists(4, 0, 4, 4, None, Some((mv(2, 2), 0)));
+        // Left-of-current: bipred.
+        grid.fill_lists(0, 4, 4, 4, Some((mv(50, 0), 0)), Some((mv(0, 50), 0)));
+        // Derive at MB (1, 1) — anchor (4, 4).
+        let r = derive_b_direct_spatial(&grid, 1, 1);
+        // Both lists should be active (each has at least one
+        // neighbour with that list available).
+        assert!(r.is_bipred(),
+            "expected bipred — L0 from A+B?, L1 from A+B?: got {r:?}");
+    }
+}

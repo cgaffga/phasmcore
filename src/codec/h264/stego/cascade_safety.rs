@@ -80,6 +80,47 @@
 use super::encoder_hook::MvdPositionMeta;
 use super::{Axis, PositionKey, SyntaxPath};
 
+/// §6E-A6.0 — hard cap on per-GOP MVD position count.
+///
+/// Sized for 1080p × 30-frame IBPBP under realistic motion: ~50k
+/// positions today (§6E-A4(c)-lite ships zero MVDs from B-frames),
+/// projected ~150-300k under §6E-A6.x partitioned-B with realistic
+/// content. The 200,000 cap leaves headroom while still catching
+/// pathological mode-decision configurations (e.g. all-MBs-emit-
+/// `B_Bi_4x4` would balloon to ~2.6M positions per frame and blow
+/// per-GOP working-set memory budget).
+///
+/// The cap is *advisory* in §6E-A4(c)-lite (today's shipping path
+/// produces well under 200k positions), but becomes a hard guard
+/// rail once §6E-A6.1+ widens the mode set. See
+/// `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+/// open question § 5 (Streaming-Viterbi K window — RESOLVED) for
+/// the rationale.
+pub const MAX_MVD_POSITIONS_PER_GOP: usize = 200_000;
+
+/// §6E-A6.0 — guard rail check. Returns `Err` if `mvd_count` exceeds
+/// the per-GOP working-set budget. Callers (orchestrator, decoder)
+/// invoke this before allocating per-position metadata vectors so a
+/// pathological GOP fails cleanly with a documented error rather
+/// than silently OOM'ing on long-form mobile clips.
+///
+/// `gop_label` is included in the error string so multi-GOP
+/// orchestration can pinpoint the offending GOP.
+pub fn check_mvd_budget(
+    mvd_count: usize,
+    gop_label: &str,
+) -> Result<(), crate::stego::error::StegoError> {
+    if mvd_count > MAX_MVD_POSITIONS_PER_GOP {
+        return Err(crate::stego::error::StegoError::InvalidVideo(format!(
+            "MVD position count {mvd_count} exceeds per-GOP streaming \
+             budget {MAX_MVD_POSITIONS_PER_GOP} at {gop_label}: \
+             encoder mode-decision is producing pathologically fine \
+             partitioning (see §6E-A6.0 working-set guard rail)",
+        )));
+    }
+    Ok(())
+}
+
 /// Phase 6F.2(j) — analyze which MVD positions are cascade-safe
 /// to flip.
 ///
@@ -284,6 +325,37 @@ mod tests {
 
     fn meta(frame_idx: u32, mb_addr: u32, partition: u8, axis: u8, magnitude: u32) -> MvdPositionMeta {
         MvdPositionMeta { frame_idx, mb_addr, partition, axis, magnitude }
+    }
+
+    // ─── §6E-A6.0 working-set budget guard ─────────────────────
+
+    #[test]
+    fn check_mvd_budget_passes_at_cap() {
+        // Exactly at the cap is OK — the cap is `> MAX`, not `>=`.
+        assert!(check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP, "test").is_ok());
+        assert!(check_mvd_budget(0, "test").is_ok());
+        assert!(check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP - 1, "test").is_ok());
+    }
+
+    #[test]
+    fn check_mvd_budget_rejects_above_cap() {
+        let r = check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP + 1, "gop[5]");
+        assert!(r.is_err());
+        // Error message should include the count, the budget, and
+        // the gop_label so a multi-GOP orchestrator can localize.
+        let msg = format!("{:?}", r.unwrap_err());
+        assert!(msg.contains("gop[5]"), "missing gop label: {msg}");
+        assert!(msg.contains(&MAX_MVD_POSITIONS_PER_GOP.to_string()),
+            "missing cap value: {msg}");
+    }
+
+    #[test]
+    fn check_mvd_budget_const_is_nonzero_and_realistic() {
+        // Sanity: 200k positions × 44 bytes/MvdPositionMeta+plan
+        // = ~8.8 MB worst-case per GOP, well within the 250-400 MB
+        // total Phase 6 streaming budget across 2-3 GOPs in flight.
+        assert!(MAX_MVD_POSITIONS_PER_GOP >= 50_000);
+        assert!(MAX_MVD_POSITIONS_PER_GOP <= 1_000_000);
     }
 
     #[test]

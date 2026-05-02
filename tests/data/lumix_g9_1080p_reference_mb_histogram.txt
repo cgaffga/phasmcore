@@ -1,0 +1,29 @@
+# H.264 mb-partition histogram
+# source: /tmp/lumix_g9_demux.h264
+# resolution: 1920x1080 (8160 MBs/frame)
+
+## B-frame (190 frames, 1550400 MBs)
+  no-MV (Skip / Direct / Intra) :       1012 ( 0.07%)
+  emitted MVs                   :    1549388 (99.93%)
+  partition shapes (over 1960371 MV records):
+      16x16 :  1851725 ( 94.46%)
+       16x8 :    59420 (  3.03%)
+       8x16 :    49226 (  2.51%)
+  direction (over 1960371 MV-anchors):
+         L1 :   774767 ( 39.52%)
+         Bi :   737160 ( 37.60%)
+         L0 :   448444 ( 22.88%)
+
+## I-frame (19 frames, 155040 MBs)
+  no-MV (Skip / Direct / Intra) :     155040 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+
+## P-frame (76 frames, 620160 MBs)
+  no-MV (Skip / Direct / Intra) :      14890 ( 2.40%)
+  emitted MVs                   :     605270 (97.60%)
+  partition shapes (over 671726 MV records):
+      16x16 :   567180 ( 84.44%)
+       16x8 :    54961 (  8.18%)
+       8x16 :    49585 (  7.38%)
+  direction (over 671726 MV-anchors):
+         L0 :   671726 (100.00%)

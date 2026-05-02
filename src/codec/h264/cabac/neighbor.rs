@@ -89,9 +89,21 @@ pub struct CabacNeighborMB {
     ///   cat 3 (chroma DC): 2 slots (Cb, Cr).
     ///   cat 4 (chroma AC): 8 slots (4 per plane × 2 planes).
     pub coded_block_flag_cat: [u16; 5],
-    /// Absolute MVD values per 4x4 block, [component][block_in_mb].
-    /// component 0 = x, 1 = y.
+    /// Absolute MVD values per 4x4 block, [component][block_in_mb],
+    /// for **List 0**. component 0 = x, 1 = y. Spec § 9.3.3.1.1.7
+    /// reads this when computing bin0 ctxIdxInc for an `mvd_l0`
+    /// component. P-frames write only this; B-frame non-direct
+    /// modes (mb_types 1..21) write this when the partition uses
+    /// L0 (or Bi).
     pub abs_mvd_comp: [[i16; 16]; 2],
+    /// §6E-A6.1 — Absolute MVD values for **List 1** (B-slice
+    /// L1 / Bi partitions). Same layout as `abs_mvd_comp`. Spec
+    /// § 9.3.3.1.1.7 reads this when computing bin0 ctxIdxInc for
+    /// an `mvd_l1` component. P-frames + I-frames + B_Skip /
+    /// B_Direct leave this at zero (no L1 MVD emitted at those
+    /// MBs); decoder seeing a zero L1 neighbour gets ctxIdxInc=0
+    /// at the LX boundary, exactly the spec behavior.
+    pub abs_mvd_comp_l1: [[i16; 16]; 2],
     /// ref_idx for list 0, per 4x4 block.
     pub ref_idx_l0: [i8; 16],
     /// Whether the neighbor MB used 8×8 transform. Used by
@@ -112,6 +124,7 @@ impl Default for CabacNeighborMB {
             mb_qp_delta: 0,
             coded_block_flag_cat: [0; 5],
             abs_mvd_comp: [[0; 16]; 2],
+            abs_mvd_comp_l1: [[0; 16]; 2],
             ref_idx_l0: [0; 16],
             transform_size_8x8_flag: false,
         }
@@ -273,8 +286,12 @@ pub fn ctx_idx_inc_prior_bin(ctx_idx_offset: u32, bin_idx: u32, prior_bins: &[u8
     }
 }
 
-/// Compute ctxIdxInc for `mvd_lX` bin 0 (spec § 9.3.3.1.1.7 eq 9-15).
-/// Sum of absolute neighbor MVDs thresholded at 3 and 32.
+/// Compute ctxIdxInc for `mvd_l0` bin 0 (spec § 9.3.3.1.1.7 eq 9-15).
+/// L0-list specialisation. Existing P-frame call sites use this;
+/// B-slice non-direct paths use [`ctx_idx_inc_mvd_bin0_per_list`].
+///
+/// Kept as a thin wrapper over the per-list variant so all P-side
+/// call sites continue to compile unchanged.
 pub fn ctx_idx_inc_mvd_bin0(
     ctx: &CabacNeighborContext,
     mb_x: usize,
@@ -282,12 +299,38 @@ pub fn ctx_idx_inc_mvd_bin0(
     block_idx_in_mb_b: usize,
     component: u8,
 ) -> u32 {
-    let abs_a = ctx
-        .neighbor_a(mb_x)
-        .map_or(0, |n| n.abs_mvd_comp[component as usize][block_idx_in_mb_a].unsigned_abs() as u32);
-    let abs_b = ctx
-        .neighbor_b(mb_x)
-        .map_or(0, |n| n.abs_mvd_comp[component as usize][block_idx_in_mb_b].unsigned_abs() as u32);
+    ctx_idx_inc_mvd_bin0_per_list(
+        ctx, mb_x, block_idx_in_mb_a, block_idx_in_mb_b, component, /* list */ 0,
+    )
+}
+
+/// §6E-A6.1 — per-list bin0 ctxIdxInc for `mvd_lX`. Reads the
+/// SAME-LIST neighbour MVD magnitudes per spec § 9.3.3.1.1.7
+/// (encoder uses L0 neighbour MVDs when emitting an L0 MVD bin0,
+/// L1 neighbour MVDs when emitting an L1 MVD bin0).
+///
+/// Phasm's locked single-ref configuration (`num_ref_idx_lX_active_minus1
+/// = 0`) means we never need to compare ref_idx values; the spec's
+/// "different ref_idx → contributes 0" branch never fires in our
+/// ship path. Out-of-frame / not-yet-decoded neighbours still
+/// contribute 0 via the `map_or(0, …)` fallback.
+pub fn ctx_idx_inc_mvd_bin0_per_list(
+    ctx: &CabacNeighborContext,
+    mb_x: usize,
+    block_idx_in_mb_a: usize,
+    block_idx_in_mb_b: usize,
+    component: u8,
+    list: u8,
+) -> u32 {
+    let read = |n: &CabacNeighborMB, blk: usize| -> u32 {
+        let arr = match list {
+            1 => &n.abs_mvd_comp_l1,
+            _ => &n.abs_mvd_comp, // list = 0 (default).
+        };
+        arr[component as usize][blk].unsigned_abs() as u32
+    };
+    let abs_a = ctx.neighbor_a(mb_x).map_or(0, |n| read(n, block_idx_in_mb_a));
+    let abs_b = ctx.neighbor_b(mb_x).map_or(0, |n| read(n, block_idx_in_mb_b));
     let sum = abs_a + abs_b;
     if sum < 3 {
         0
@@ -1217,6 +1260,73 @@ mod tests {
         // intra=false → B=0 → inc = 1.
         let inc = compute_cbf_ctx_idx_inc_luma_ac(&cur, &ctx, 1, 0, 0, false);
         assert_eq!(inc, 1);
+    }
+
+    // ─── §6E-A6.1 per-list MVD ctx tests ──────────────────────
+
+    #[test]
+    fn mvd_bin0_l0_l1_independent_states() {
+        // Neighbour A has L0 MVD=10, L1 MVD=0. Neighbour B has
+        // L0 MVD=0, L1 MVD=10. ctxIdxInc for L0 reads
+        // 10 + 0 = 10 (range [3, 32] → 1). For L1 reads
+        // 0 + 10 = 10 (also 1). They happen to agree here.
+        let mut ctx = make_ctx();
+        let mut a = CabacNeighborMB::default();
+        a.abs_mvd_comp[0][0] = 10; // L0 X
+        ctx.left = Some(a);
+        let mut b = CabacNeighborMB::default();
+        b.abs_mvd_comp_l1[0][0] = 10; // L1 X
+        ctx.top_row[0] = Some(b);
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 0), 1);
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 1), 1);
+    }
+
+    #[test]
+    fn mvd_bin0_l1_only_neighbour_returns_zero_for_l0_inc() {
+        // Neighbour has only L1 MVD set; L0 MVD is 0. The L0 inc
+        // computation reads abs_mvd_comp (L0 array) → sum = 0 → inc = 0.
+        // The L1 inc reads abs_mvd_comp_l1 → sum = 50 → inc = 2 (>32).
+        // This is the case the OLD shared-state implementation got
+        // wrong — it would have read the L1 MVD even when computing
+        // the L0 inc.
+        let mut ctx = make_ctx();
+        let mut a = CabacNeighborMB::default();
+        a.abs_mvd_comp_l1[0][0] = 50; // L1 X large
+        ctx.left = Some(a);
+        // L0 inc: reads abs_mvd_comp (L0) — both A and B's L0 = 0 → inc = 0.
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 0), 0);
+        // L1 inc: reads abs_mvd_comp_l1 — A's L1 = 50, B = 0 → sum 50 > 32 → inc = 2.
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 1), 2);
+    }
+
+    #[test]
+    fn mvd_bin0_l0_only_neighbour_returns_zero_for_l1_inc() {
+        // Symmetry check.
+        let mut ctx = make_ctx();
+        let mut a = CabacNeighborMB::default();
+        a.abs_mvd_comp[0][0] = 50; // L0 X large
+        ctx.left = Some(a);
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 0), 2);
+        assert_eq!(ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, 0, 1), 0);
+    }
+
+    #[test]
+    fn legacy_mvd_bin0_matches_per_list_with_l0() {
+        // The no-list `ctx_idx_inc_mvd_bin0` wrapper must produce
+        // the same result as `ctx_idx_inc_mvd_bin0_per_list(list=0)`.
+        // This is the bit-identity guard for all P-frame call sites.
+        let mut ctx = make_ctx();
+        let mut a = CabacNeighborMB::default();
+        a.abs_mvd_comp[0][0] = 5;
+        a.abs_mvd_comp[1][0] = 7;
+        a.abs_mvd_comp_l1[0][0] = 100; // should NOT affect L0 inc
+        a.abs_mvd_comp_l1[1][0] = 100;
+        ctx.left = Some(a);
+        for component in 0..=1u8 {
+            let legacy = ctx_idx_inc_mvd_bin0(&ctx, 0, 0, 0, component);
+            let per_list = ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, component, 0);
+            assert_eq!(legacy, per_list, "component {component}: legacy {legacy} != per-list {per_list}");
+        }
     }
 
     #[test]

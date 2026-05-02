@@ -47,7 +47,8 @@ use super::syntax::{
     decode_mb_type_b, decode_mb_type_i, decode_mb_type_p,
     decode_mvd_with_bin0_inc,
     decode_prev_intra4x4_pred_mode_flag, decode_rem_intra4x4_pred_mode,
-    decode_residual_block_cabac, decode_sub_mb_type_p,
+    decode_residual_block_cabac, decode_residual_block_cabac_8x8,
+    decode_sub_mb_type_p,
     decode_transform_size_8x8_flag, PositionCtx,
 };
 
@@ -751,59 +752,280 @@ fn walk_b_mb(
     // 1. mb_skip_flag (B-slice ctxIdxOffset = 24).
     let is_skip = decode_mb_skip_flag_b(dec, mb_x)?;
     if is_skip {
-        // B_Skip: no further syntax for this MB.
-        let is_last = decode_end_of_slice_flag(dec)?;
-        let nb = CabacNeighborMB {
-            mb_type: MbTypeClass::BSkipOrDirect,
-            mb_skip_flag: true,
-            ..CabacNeighborMB::default()
-        };
-        dec.neighbors.commit(mb_x, nb);
-        return Ok(is_last);
+        return walk_b_skip(dec, mb_x);
     }
 
-    // 2. mb_type via the §6E-A3 B-slice bin tree.
+    // 2. mb_type via the §6E-A3 B-slice bin tree (covers all 24
+    //    spec values 0..=23). Per-mb_type body dispatch below.
     let mb_type = decode_mb_type_b(dec, mb_x)?;
 
-    // §6E-A4(c)-lite — only B_Direct_16x16 (mb_type=0) handled.
-    // Non-direct modes (B_L0/L1/Bi 16x16 family + 16x8/8x16
-    // partitions + B_8x8 + intra-in-B) error out until §6E-A4(c)-full
-    // adds bipred ME + MVD emission.
-    if mb_type != 0 {
-        return Err(WalkError::H264(H264Error::Unsupported(
-            format!("B-slice non-direct mb_type {mb_type} (Phase 6E-A4-full)"),
-        )));
+    // §6E-A6.0 — per-mb_type dispatcher. Each variant handler
+    // lights up in a dedicated sub-phase:
+    //
+    //   mb_type 0       → walk_b_direct_16x16 (§6E-A4(c)-lite, shipped)
+    //   mb_type 1..=3   → §6E-A6.1 (16x16 L0/L1/Bi family)
+    //   mb_type 4..=21  → §6E-A6.2 (16x8 + 8x16 partitioned)
+    //   mb_type 22      → §6E-A6.3 (B_8x8, sub_mb_type 0..=3)
+    //   mb_type 23      → intra-in-B (out of scope per algorithm note)
+    //
+    // The `Unsupported` returns are progressively replaced as each
+    // sub-phase ships. The `_unused` parameters are wired up now so
+    // sub-phase code drops in without re-touching this dispatcher.
+    match mb_type {
+        0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp),
+        1 => walk_b_l0_16x16(dec, mb_x, prev_mb_qp),
+        2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp),
+        3 => walk_b_bi_16x16(dec, mb_x, prev_mb_qp),
+        4..=21 => walk_b_partitioned(dec, mb_x, prev_mb_qp, mb_type as u8),
+        22 => Err(WalkError::H264(H264Error::Unsupported(format!(
+            "B-slice B_8x8 mb_type {mb_type} (lands in §6E-A6.3)"
+        )))),
+        23 => Err(WalkError::H264(H264Error::Unsupported(
+            "B-slice intra-in-B mb_type 23 (out of scope — see #154 \
+             intra-in-P parity bug; B inherits the same risk class)".into(),
+        ))),
+        _ => Err(WalkError::H264(H264Error::Unsupported(format!(
+            "B-slice mb_type {mb_type} > 23 (spec invalid)"
+        )))),
     }
+}
 
-    // B_Direct_16x16: no MVDs, no ref_idx (decoder uses spatial
-    // direct predictor on neighbors). CBP indicates which residual
-    // blocks are present; if CBP=0 (typical for §6E-A4(c)-lite
-    // encoder output), no residual bits.
+/// `B_Skip`: `mb_skip_flag = 1` already consumed. No further syntax;
+/// commit the BSkipOrDirect neighbour and read `end_of_slice_flag`.
+fn walk_b_skip(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+) -> Result<bool, WalkError> {
+    let is_last = decode_end_of_slice_flag(dec)?;
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::BSkipOrDirect,
+        mb_skip_flag: true,
+        ..CabacNeighborMB::default()
+    };
+    dec.neighbors.commit(mb_x, nb);
+    Ok(is_last)
+}
+
+/// `B_Direct_16x16` (mb_type = 0): no MVDs, no ref_idx (decoder
+/// reconstructs MV via spatial direct on its own side). Read CBP +
+/// (if non-zero) residual blocks via the same path P-frame uses.
+///
+/// §6E-A4(c)-lite encoder emits CBP=0 always; non-zero CBP appears
+/// only once §6E-A4(c)-full / §6E-A6.1 add B-frame residual emission,
+/// at which point this body extends to call the existing
+/// [`decode_residual_block_cabac`] helpers (same code path as P).
+fn walk_b_direct_16x16(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+) -> Result<bool, WalkError> {
     let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
 
     if cbp_luma != 0 || cbp_chroma != 0 {
-        // §6E-A4(c)-full needed for B-frame residuals. Encoder
-        // currently emits CBP=0 always; non-zero CBP is unexpected.
-        return Err(WalkError::H264(H264Error::Unsupported(
-            format!(
-                "B_Direct_16x16 with non-zero CBP {cbp_byte:#x} \
-                 (Phase 6E-A4-full residual decoding)"
-            ),
-        )));
+        // §6E-A6.1 / §6E-A4(c)-full will land B-frame residual
+        // decoding here. Today's §6E-A4(c)-lite encoder produces
+        // CBP=0 always, so a non-zero CBP indicates the bitstream
+        // came from a future-version encoder (or third-party source)
+        // and we need the full residual path before walking it.
+        return Err(WalkError::H264(H264Error::Unsupported(format!(
+            "B_Direct_16x16 with non-zero CBP {cbp_byte:#x} \
+             (lands in §6E-A6.1 with the residual path)"
+        ))));
     }
 
-    // CBP=0 → no mb_qp_delta, no residual blocks. Just commit
-    // neighbor + end_of_slice_flag.
+    // CBP=0 → no mb_qp_delta, no residual blocks. Commit neighbour
+    // + end_of_slice.
     let _ = prev_mb_qp; // QP unchanged when CBP=0
-
     let is_last = decode_end_of_slice_flag(dec)?;
     let nb = CabacNeighborMB {
         mb_type: MbTypeClass::BSkipOrDirect,
         mb_skip_flag: false,
         cbp_luma: 0,
         cbp_chroma: 0,
+        ..CabacNeighborMB::default()
+    };
+    dec.neighbors.commit(mb_x, nb);
+    Ok(is_last)
+}
+
+/// §6E-A6.1 — `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
+/// `ref_idx_l0` is inferred 0 (single-ref ship config; not on the
+/// wire). CBP=0 path only — non-zero CBP errors out as
+/// `Unsupported` until §6E-A6.1 part 4 lands B-frame residuals.
+fn walk_b_l0_16x16(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+) -> Result<bool, WalkError> {
+    let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 0)?;
+    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, /* l0 */ Some((abs_x, abs_y)), /* l1 */ None)
+}
+
+/// §6E-A6.1 — `B_L1_16x16` (mb_type = 2). Mirror of L0 path,
+/// using L1 neighbour state for bin0 ctxIdxInc and committing
+/// `abs_mvd_comp_l1` on neighbour update.
+fn walk_b_l1_16x16(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+) -> Result<bool, WalkError> {
+    let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
+    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, None, Some((abs_x, abs_y)))
+}
+
+/// §6E-A6.1 — `B_Bi_16x16` (mb_type = 3). Two MVD pairs (L0 then L1
+/// per spec § 7.3.5.1 mb_pred order). Each list uses its own
+/// neighbour state for bin0 ctxIdxInc.
+fn walk_b_bi_16x16(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+) -> Result<bool, WalkError> {
+    let l0_pair = decode_b_16x16_mvd_pair(dec, mb_x, 0)?;
+    let l1_pair = decode_b_16x16_mvd_pair(dec, mb_x, 1)?;
+    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, Some(l0_pair), Some(l1_pair))
+}
+
+/// §6E-A6.2 — partitioned B mb_type walker (mb_types 4..21).
+/// Looks up `(shape, list_usage_part0, list_usage_part1)` via
+/// `b_partitioned::partitioned_b_meta`, then decodes per spec
+/// § 7.3.5.1 mb_pred order (partition 0's MVDs L0-then-L1 before
+/// partition 1's). CBP=0 path only — non-zero errors out as
+/// Unsupported (residuals → #127 follow-up).
+fn walk_b_partitioned(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+    mb_type: u8,
+) -> Result<bool, WalkError> {
+    use crate::codec::h264::encoder::b_partitioned::{
+        partitioned_b_meta, BListUse,
+    };
+
+    let meta = partitioned_b_meta(mb_type as u32).ok_or_else(|| {
+        WalkError::H264(H264Error::Unsupported(format!(
+            "walk_b_partitioned: mb_type {mb_type} not in 4..=21"
+        )))
+    })?;
+
+    // Aggregate MVD magnitudes across partitions for neighbour
+    // commit. Encoder-side mirror (`emit_b_partitioned`) uses MAX
+    // across partitions per axis per list — match here so neighbour
+    // bin0 ctxIdxInc agrees on subsequent MBs.
+    let mut max_l0 = (0i16, 0i16);
+    let mut max_l1 = (0i16, 0i16);
+
+    for idx in 0..2 {
+        let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+        // L0 MVD if partition uses L0 or Bi.
+        if matches!(usage, BListUse::L0 | BListUse::Bi) {
+            let (x, y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 0)?;
+            max_l0.0 = max_l0.0.max(x);
+            max_l0.1 = max_l0.1.max(y);
+        }
+        // L1 MVD if partition uses L1 or Bi.
+        if matches!(usage, BListUse::L1 | BListUse::Bi) {
+            let (x, y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
+            max_l1.0 = max_l1.0.max(x);
+            max_l1.1 = max_l1.1.max(y);
+        }
+    }
+
+    let l0_some = if max_l0 == (0, 0) && !any_uses_l0(meta) { None } else { Some(max_l0) };
+    let l1_some = if max_l1 == (0, 0) && !any_uses_l1(meta) { None } else { Some(max_l1) };
+    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, l0_some, l1_some)
+}
+
+/// True if any partition's list usage includes L0 (= L0 or Bi).
+fn any_uses_l0(meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta) -> bool {
+    use crate::codec::h264::encoder::b_partitioned::BListUse;
+    matches!(meta.part0, BListUse::L0 | BListUse::Bi)
+        || matches!(meta.part1, BListUse::L0 | BListUse::Bi)
+}
+
+/// True if any partition's list usage includes L1.
+fn any_uses_l1(meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta) -> bool {
+    use crate::codec::h264::encoder::b_partitioned::BListUse;
+    matches!(meta.part0, BListUse::L1 | BListUse::Bi)
+        || matches!(meta.part1, BListUse::L1 | BListUse::Bi)
+}
+
+/// Decode one X+Y MVD pair for a 16x16 B-slice partition.
+/// `list` (0 = L0, 1 = L1) selects the per-list neighbour state
+/// for bin0 ctxIdxInc per spec § 9.3.3.1.1.7. Returns the decoded
+/// (|MVD_x|, |MVD_y|) magnitudes so the caller can stash them in
+/// the right per-list neighbour field.
+fn decode_b_16x16_mvd_pair(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    list: u8,
+) -> Result<(i16, i16), WalkError> {
+    use crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0_per_list;
+
+    let mut null = NullLogger;
+    let bin0_inc_x = ctx_idx_inc_mvd_bin0_per_list(
+        &dec.neighbors, mb_x, 0, 0, /* component */ 0, list,
+    );
+    let mvd_x = {
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        decode_mvd_with_bin0_inc(dec, /* component */ 0, list, /* partition */ 0, bin0_inc_x, &mut pc)?
+    };
+    let bin0_inc_y = ctx_idx_inc_mvd_bin0_per_list(
+        &dec.neighbors, mb_x, 0, 0, /* component */ 1, list,
+    );
+    let mvd_y = {
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        decode_mvd_with_bin0_inc(dec, 1, list, 0, bin0_inc_y, &mut pc)?
+    };
+    let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_y = mvd_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    Ok((abs_x, abs_y))
+}
+
+/// Shared tail for §6E-A6.1 B-inter walkers: read CBP, error on
+/// non-zero (residual path lands in §6E-A6.1 part 4), commit
+/// neighbour as inter (with per-list MVD magnitudes), read
+/// end_of_slice_flag.
+fn finish_b_inter_cbp_zero(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+    l0_abs: Option<(i16, i16)>,
+    l1_abs: Option<(i16, i16)>,
+) -> Result<bool, WalkError> {
+    let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
+    let cbp_luma = cbp_byte & 0x0F;
+    let cbp_chroma = (cbp_byte >> 4) & 0x03;
+    if cbp_luma != 0 || cbp_chroma != 0 {
+        return Err(WalkError::H264(H264Error::Unsupported(format!(
+            "B-slice 16x16 inter with non-zero CBP {cbp_byte:#x} \
+             (lands in §6E-A6.1 part 4 with residual path)"
+        ))));
+    }
+    let _ = prev_mb_qp; // QP unchanged when CBP=0
+    let is_last = decode_end_of_slice_flag(dec)?;
+    // §6E-A6.1 spec § 9.3.3.1.1.7 fix: commit per-list MVD
+    // magnitudes so subsequent neighbour bin0 ctxIdxInc reads the
+    // right list-specific state.
+    let abs_mvd_l0 = if let Some((x, y)) = l0_abs {
+        [[x; 16], [y; 16]]
+    } else {
+        [[0; 16]; 2]
+    };
+    let abs_mvd_l1 = if let Some((x, y)) = l1_abs {
+        [[x; 16], [y; 16]]
+    } else {
+        [[0; 16]; 2]
+    };
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::PInter,
+        mb_skip_flag: false,
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        abs_mvd_comp: abs_mvd_l0,
+        abs_mvd_comp_l1: abs_mvd_l1,
         ..CabacNeighborMB::default()
     };
     dec.neighbors.commit(mb_x, nb);
@@ -833,20 +1055,20 @@ fn walk_inxn_mb(
     let current_is_intra = true;
 
     // 1. transform_size_8x8_flag — only when PPS enables 8x8 transform
-    //    AND mb_type indicates I_NxN. Reject 8x8 for now (chunk 6E).
-    if pps.transform_8x8_mode_flag {
-        let use_8x8 = decode_transform_size_8x8_flag(dec, mb_x)?;
-        if use_8x8 {
-            return Err(WalkError::H264(H264Error::Unsupported(
-                "I_8x8 (transform_size_8x8_flag=1) not yet wired".into(),
-            )));
-        }
-    }
+    //    AND mb_type indicates I_NxN. Selects I_4x4 (flag=0, 16 luma
+    //    blocks of cat=2) vs I_8x8 (flag=1, 4 luma blocks of cat=5).
+    let use_8x8 = if pps.transform_8x8_mode_flag {
+        decode_transform_size_8x8_flag(dec, mb_x)?
+    } else {
+        false
+    };
 
-    // 2. Per-4x4-block intra prediction modes:
-    //    16x { prev_intra4x4_pred_mode_flag, optional rem_intra4x4_pred_mode }.
-    //    Mirrors encoder.rs:3061-3066.
-    for _ in 0..16 {
+    // 2. Per-block intra prediction modes. I_4x4 emits 16 mode flags
+    //    (one per 4×4 block); I_8x8 emits 4 (one per 8×8 block) per
+    //    encoder.rs:4465 — the contexts are shared (Table 9-39 specifies
+    //    ctxIdxOffsets 68/69 for both I_4x4 and I_8x8).
+    let n_pred_modes = if use_8x8 { 4 } else { 16 };
+    for _ in 0..n_pred_modes {
         let prev_flag = decode_prev_intra4x4_pred_mode_flag(dec)?;
         if !prev_flag {
             let _rem = decode_rem_intra4x4_pred_mode(dec)?;
@@ -874,9 +1096,44 @@ fn walk_inxn_mb(
 
     let mut current_cbf = CurrentMbCbf::new();
 
-    // 6. Luma 4x4 residual blocks (ctxBlockCat=2, 16 coeffs each,
-    //    gated per 8x8 block via cbp_luma bit k/4).
-    if cbp_luma != 0 {
+    if use_8x8 {
+        // 6a. I_8x8 luma residual: 4 blocks of cat=5 (no per-block CBF
+        //     — encoder.rs:4490-4512). Each block has 64 coefficients
+        //     (start=0, end=63). Gated per 8×8 block via cbp_luma bit k.
+        //     Set every 4×4 block within an 8×8-coded block as coded
+        //     in the cat=2 CBF state, mirroring encoder.rs:4519-4527 so
+        //     subsequent I_4x4 MBs see consistent neighbor CBF.
+        for k in 0..4usize {
+            if cbp_luma & (1 << k) != 0 {
+                let path_kind = ResidualPathKind::Luma8x8 {
+                    block_idx: k as u8,
+                };
+                let mut logger = NullLogger;
+                let mut pos_ctx = PositionCtx {
+                    frame_idx,
+                    mb_addr: mb_addr_u32,
+                    logger: &mut logger,
+                };
+                let scan = decode_residual_block_cabac_8x8(
+                    dec,
+                    &mut pos_ctx,
+                    |ci, kind| path_kind.path(ci, kind),
+                )?;
+                recorder.on_residual_block(
+                    frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
+                );
+            }
+            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8 bit
+            // (encoder.rs:4519-4527). Necessary so the next MB's
+            // compute_cbf_ctx_idx_inc_luma_4x4 sees the right neighbor.
+            for sub in 0..4usize {
+                let blk_idx = k * 4 + sub;
+                current_cbf.set(2, blk_idx, cbp_luma & (1 << k) != 0);
+            }
+        }
+    } else if cbp_luma != 0 {
+        // 6b. I_4x4 luma residual: 16 blocks of cat=2 (with per-block
+        //     CBF). Gated per 8x8 block via cbp_luma bit k/4.
         for k in 0..16usize {
             let (bx, by) = BLOCK_INDEX_TO_POS[k];
             if cbp_luma & (1 << (k / 4)) != 0 {
@@ -948,7 +1205,10 @@ fn walk_inxn_mb(
     // 9. end_of_slice_flag.
     let is_last = decode_end_of_slice_flag(dec)?;
 
-    // 10. Commit neighbor state for next MB. Mirrors encoder line 3206.
+    // 10. Commit neighbor state for next MB. Mirrors encoder line 3206
+    //     (I_4x4) and 4590-4598 (I_8x8). The transform_size_8x8_flag bit
+    //     drives the next MB's transform_size_8x8_flag CABAC ctx (Table
+    //     9-39 ctxIdxInc derivation).
     let mut nb = CabacNeighborMB {
         mb_type: MbTypeClass::INxN,
         ..CabacNeighborMB::default()
@@ -958,6 +1218,7 @@ fn walk_inxn_mb(
     nb.cbp_chroma = cbp_chroma;
     nb.mb_qp_delta = qp_delta_emitted;
     nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
+    nb.transform_size_8x8_flag = use_8x8;
     dec.neighbors.commit(mb_x, nb);
 
     Ok(is_last)
@@ -1015,10 +1276,21 @@ fn walk_p_partition_mb(
         mb_type_p, sub_types.as_ref(), recorder, opts,
     )?;
 
+    // Spec `noSubMbPartSizeLessThan8x8Flag` — gates whether
+    // `transform_size_8x8_flag` may be emitted. Always true for
+    // P_L0_16x16 / P_16x8 / P_8x16; for P_8x8 it requires every
+    // sub_mb_type == 0 (P_L0_8x8). Mirrors
+    // partition_decision.rs:no_sub_mb_part_size_lt_8x8.
+    let no_sub_mb_part_size_lt_8x8 = match (mb_type_p, sub_types.as_ref()) {
+        (3, Some(sm)) => sm.iter().all(|&t| t == 0),
+        (3, None) => false,
+        _ => true,
+    };
+
     // 4-9. Shared residual + neighbor commit.
     decode_p_residuals_and_finish(
         dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx,
-        mb_addr_u32, recorder, &current_mvd,
+        mb_addr_u32, recorder, &current_mvd, no_sub_mb_part_size_lt_8x8,
     )
 }
 
@@ -1238,6 +1510,7 @@ fn decode_p_residuals_and_finish(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     current_mvd: &CurrentMbMvdAbs,
+    no_sub_mb_part_size_lt_8x8: bool,
 ) -> Result<bool, WalkError> {
     let current_is_intra = false;
 
@@ -1247,16 +1520,15 @@ fn decode_p_residuals_and_finish(
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
 
     // 5. transform_size_8x8_flag — emitted iff PPS+cbp_luma>0+
-    //    no_sub_mb_part_size_lt_8x8. Reject 8×8 path; chunk-5
-    //    encoder hardcodes enable_transform_8x8=false anyway.
-    if pps.transform_8x8_mode_flag && cbp_luma != 0 {
-        let use_8x8 = decode_transform_size_8x8_flag(dec, mb_x)?;
-        if use_8x8 {
-            return Err(WalkError::H264(H264Error::Unsupported(
-                "P-partition with transform_size_8x8_flag=1 not yet wired".into(),
-            )));
-        }
-    }
+    //    no_sub_mb_part_size_lt_8x8 (encoder.rs:2659-2666).
+    let use_8x8 = if pps.transform_8x8_mode_flag
+        && cbp_luma != 0
+        && no_sub_mb_part_size_lt_8x8
+    {
+        decode_transform_size_8x8_flag(dec, mb_x)?
+    } else {
+        false
+    };
 
     // 6. mb_qp_delta if cbp != 0.
     let qp_delta = if cbp_byte != 0 {
@@ -1269,7 +1541,38 @@ fn decode_p_residuals_and_finish(
 
     // 7. Residuals.
     let mut current_cbf = CurrentMbCbf::new();
-    if cbp_luma != 0 {
+    if use_8x8 {
+        // 8×8 luma residual: 4 cat=5 blocks (no per-block CBF). Mirrors
+        // encoder.rs:2686-2710.
+        for k in 0..4usize {
+            if cbp_luma & (1 << k) != 0 {
+                let path_kind = ResidualPathKind::Luma8x8 {
+                    block_idx: k as u8,
+                };
+                let mut logger = NullLogger;
+                let mut pos_ctx = PositionCtx {
+                    frame_idx,
+                    mb_addr: mb_addr_u32,
+                    logger: &mut logger,
+                };
+                let scan = decode_residual_block_cabac_8x8(
+                    dec,
+                    &mut pos_ctx,
+                    |ci, kind| path_kind.path(ci, kind),
+                )?;
+                recorder.on_residual_block(
+                    frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
+                );
+            }
+            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8 bit
+            // (encoder.rs:2717-2725) so subsequent 4×4 MBs see the same
+            // neighbor CBF state.
+            for sub in 0..4usize {
+                let blk_idx = k * 4 + sub;
+                current_cbf.set(2, blk_idx, cbp_luma & (1 << k) != 0);
+            }
+        }
+    } else if cbp_luma != 0 {
         for k in 0..16usize {
             let (bx, by) = BLOCK_INDEX_TO_POS[k];
             if cbp_luma & (1 << (k / 4)) != 0 {
@@ -1348,7 +1651,7 @@ fn decode_p_residuals_and_finish(
     nb.mb_qp_delta = qp_delta;
     nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
     nb.abs_mvd_comp = current_mvd.to_neighbor();
-    nb.transform_size_8x8_flag = false;
+    nb.transform_size_8x8_flag = use_8x8;
     dec.neighbors.commit(mb_x, nb);
 
     Ok(is_last)

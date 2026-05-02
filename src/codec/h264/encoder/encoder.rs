@@ -32,7 +32,7 @@ use super::bitstream_writer::{
     continue_slice_header_b, continue_slice_header_i, continue_slice_header_p,
     wrap_rbsp_as_nal, BitWriter,
     BSliceHeaderParams, ISliceHeaderParams, PSliceHeaderParams, PpsParams,
-    PrimaryPicType, SpsParams,
+    PrimaryPicType, SpsParams, VuiParams,
 };
 use crate::codec::h264::cabac::context::CabacInitSlot;
 use crate::codec::h264::cabac::encoder::{
@@ -274,7 +274,366 @@ pub const MODE_STAT_INTRA_IN_P_I16X16: usize = 8;
 /// Determinism is required so encoder and decoder see the same
 /// mode distribution; deterministic-from-state means both sides
 /// agree on the bit-stream layout.
-fn mb_skip_or_direct_decision(frame_num: u32, mb_addr: u32) -> bool {
+/// §6E-A6.1 — emit `B_L0_16x16` (mb_type = 1) syntax for one MB:
+/// `mb_skip_flag = 0`, `mb_type = 1`, ref_idx (skipped — inferred
+/// 0 since `num_ref_idx_l0_active_minus1 = 0`), one L0 MVD pair
+/// against the spatial-direct predictor, CBP = 0 (no residual yet
+/// — lands with §6E-A6.1 part 4), then `end_of_slice_flag`.
+///
+/// MV grid: writes the explicit L0 MV into all 16 cells of the MB,
+/// L1 stays absent (REF_IDX_NONE).
+fn emit_b_l0_16x16(
+    cabac: &mut crate::codec::h264::cabac::encoder::CabacEncoder,
+    mb_x: usize,
+    grid: &mut super::partition_state::EncoderMvGrid,
+    grid_mb_x: usize,
+    grid_mb_y: usize,
+    mv: super::motion_estimation::MotionVector,
+) -> Result<(), EncoderError> {
+    use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+    use crate::codec::h264::cabac::neighbor::{CabacNeighborMB, MbTypeClass};
+
+    encode_mb_skip_flag_b(cabac, false, mb_x);
+    encode_mb_type_b(cabac, 1, mb_x);
+
+    // MVD = actual_mv - predicted_mv. Predictor at the 16x16
+    // partition's anchor; `current_ref_idx = 0` per single-ref.
+    // Use the L0-view predictor (existing P-side function reads
+    // the L0 fields).
+    let predicted = super::partition_state::predict_mv_for_mb_partition(
+        grid, grid_mb_x * 4, grid_mb_y * 4, /* part_w_4x4 */ 4, /* part_h_4x4 */ 4,
+        /* mb_part_idx */ 0, /* current_ref_idx */ 0,
+    );
+    let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+    let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+
+    // bin0 ctxIdxInc derived from neighbour MVD magnitudes —
+    // shared neighbour state with the P-side path. (Per-list
+    // separation per spec § 9.3.3.1.1.7 is a §6E-A6.1 follow-up;
+    // walker mirrors the same shared state so round-trip works.)
+    let bin0_inc_x = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0(
+        &cabac.neighbors, mb_x, /* a_blk */ 0, /* b_blk */ 0, /* component */ 0,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_x, /* component */ 0, bin0_inc_x);
+    let bin0_inc_y = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0(
+        &cabac.neighbors, mb_x, 0, 0, /* component */ 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_y, /* component */ 1, bin0_inc_y);
+
+    encode_coded_block_pattern(cabac, /* cbp_value */ 0, mb_x);
+
+    // Commit neighbour as inter (B-slice non-direct looks like
+    // P-frame inter for downstream context purposes). For zero-MV
+    // test paths the abs_mvd_comp default (all 0) is correct;
+    // §6E-A6.1 part 4 will populate it from the current_mvd
+    // tracker once non-zero MVDs flow through.
+    let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_y = mvd_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::PInter,
+        mb_skip_flag: false,
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        ref_idx_l0: [0i8; 16],
+        abs_mvd_comp: [[abs_x; 16], [abs_y; 16]],
+        ..CabacNeighborMB::default()
+    };
+    cabac.neighbors.commit(mb_x, nb);
+
+    // Populate MV grid: explicit L0 MV everywhere, L1 absent.
+    grid.fill_lists(grid_mb_x * 4, grid_mb_y * 4, 4, 4, Some((mv, 0)), None);
+
+    Ok(())
+}
+
+/// §6E-A6.1 — emit `B_L1_16x16` (mb_type = 2). Mirror of `emit_b_l0_16x16`
+/// but writes L1 MVD only and populates the L1 grid.
+fn emit_b_l1_16x16(
+    cabac: &mut crate::codec::h264::cabac::encoder::CabacEncoder,
+    mb_x: usize,
+    grid: &mut super::partition_state::EncoderMvGrid,
+    grid_mb_x: usize,
+    grid_mb_y: usize,
+    mv: super::motion_estimation::MotionVector,
+) -> Result<(), EncoderError> {
+    use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+    use crate::codec::h264::cabac::neighbor::{CabacNeighborMB, MbTypeClass};
+
+    encode_mb_skip_flag_b(cabac, false, mb_x);
+    encode_mb_type_b(cabac, 2, mb_x);
+
+    // L1 predictor — read the L1 view of the grid (B_Direct
+    // neighbours have populated L1 cells via `populate_b_direct_grid`).
+    let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
+        grid, grid_mb_x * 4, grid_mb_y * 4, /* current_ref_idx */ 0,
+    );
+    let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+    let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+
+    // §6E-A6.1 spec § 9.3.3.1.1.7 fix: L1 MVD bin0 ctxIdxInc reads
+    // L1 neighbour state, NOT L0. Use the per-list variant with
+    // list=1.
+    let bin0_inc_x = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0_per_list(
+        &cabac.neighbors, mb_x, 0, 0, 0, /* list */ 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+    let bin0_inc_y = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0_per_list(
+        &cabac.neighbors, mb_x, 0, 0, 1, /* list */ 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+
+    encode_coded_block_pattern(cabac, 0, mb_x);
+
+    let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_y = mvd_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    // §6E-A6.1 spec § 9.3.3.1.1.7 fix: B_L1_16x16 commits its MVDs
+    // to abs_mvd_comp_l1 (NOT abs_mvd_comp). Subsequent neighbours
+    // with L1 MVDs read these per-list arrays.
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::PInter,
+        mb_skip_flag: false,
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        ref_idx_l0: [0i8; 16],
+        abs_mvd_comp_l1: [[abs_x; 16], [abs_y; 16]],
+        ..CabacNeighborMB::default()
+    };
+    cabac.neighbors.commit(mb_x, nb);
+
+    grid.fill_lists(grid_mb_x * 4, grid_mb_y * 4, 4, 4, None, Some((mv, 0)));
+
+    Ok(())
+}
+
+/// §6E-A6.1 — emit `B_Bi_16x16` (mb_type = 3). Both L0 and L1
+/// MVDs are emitted (in spec order: L0 first, then L1 per § 7.3.5.1).
+fn emit_b_bi_16x16(
+    cabac: &mut crate::codec::h264::cabac::encoder::CabacEncoder,
+    mb_x: usize,
+    grid: &mut super::partition_state::EncoderMvGrid,
+    grid_mb_x: usize,
+    grid_mb_y: usize,
+    mv_l0: super::motion_estimation::MotionVector,
+    mv_l1: super::motion_estimation::MotionVector,
+) -> Result<(), EncoderError> {
+    use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+    use crate::codec::h264::cabac::neighbor::{CabacNeighborMB, MbTypeClass};
+
+    encode_mb_skip_flag_b(cabac, false, mb_x);
+    encode_mb_type_b(cabac, 3, mb_x);
+
+    // L0 MVD pair first.
+    let pred_l0 = super::partition_state::predict_mv_for_mb_partition(
+        grid, grid_mb_x * 4, grid_mb_y * 4, 4, 4, 0, 0,
+    );
+    let mvd_l0_x = (mv_l0.mv_x as i32) - (pred_l0.mv_x as i32);
+    let mvd_l0_y = (mv_l0.mv_y as i32) - (pred_l0.mv_y as i32);
+    let bin0_inc_x = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0(
+        &cabac.neighbors, mb_x, 0, 0, 0,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_l0_x, 0, bin0_inc_x);
+    let bin0_inc_y = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0(
+        &cabac.neighbors, mb_x, 0, 0, 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_l0_y, 1, bin0_inc_y);
+
+    // L1 MVD pair second. §6E-A6.1 spec § 9.3.3.1.1.7 fix: bin0
+    // ctxIdxInc for L1 reads L1 neighbour state (per-list).
+    let pred_l1 = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
+        grid, grid_mb_x * 4, grid_mb_y * 4, 0,
+    );
+    let mvd_l1_x = (mv_l1.mv_x as i32) - (pred_l1.mv_x as i32);
+    let mvd_l1_y = (mv_l1.mv_y as i32) - (pred_l1.mv_y as i32);
+    let bin0_inc_x = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0_per_list(
+        &cabac.neighbors, mb_x, 0, 0, 0, /* list */ 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_l1_x, 0, bin0_inc_x);
+    let bin0_inc_y = crate::codec::h264::cabac::neighbor::ctx_idx_inc_mvd_bin0_per_list(
+        &cabac.neighbors, mb_x, 0, 0, 1, /* list */ 1,
+    );
+    encode_mvd_with_bin0_inc(cabac, mvd_l1_y, 1, bin0_inc_y);
+
+    encode_coded_block_pattern(cabac, 0, mb_x);
+
+    // §6E-A6.1 spec § 9.3.3.1.1.7 fix: Bi commits BOTH per-list
+    // MVD magnitudes to their respective neighbour fields.
+    let abs_l0_x = mvd_l0_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_l0_y = mvd_l0_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_l1_x = mvd_l1_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_l1_y = mvd_l1_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::PInter,
+        mb_skip_flag: false,
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        ref_idx_l0: [0i8; 16],
+        abs_mvd_comp: [[abs_l0_x; 16], [abs_l0_y; 16]],
+        abs_mvd_comp_l1: [[abs_l1_x; 16], [abs_l1_y; 16]],
+        ..CabacNeighborMB::default()
+    };
+    cabac.neighbors.commit(mb_x, nb);
+
+    grid.fill_lists(
+        grid_mb_x * 4, grid_mb_y * 4, 4, 4,
+        Some((mv_l0, 0)), Some((mv_l1, 0)),
+    );
+
+    Ok(())
+}
+
+/// §6E-A6.2 — emit a partitioned B mb_type (4..21). Looks up
+/// `(shape, list_usage_part0, list_usage_part1)` via
+/// `b_partitioned::partitioned_b_meta`, then emits per spec
+/// § 7.3.5.1 mb_pred order:
+///   1. mb_skip_flag = 0
+///   2. mb_type bin tree
+///   3. ref_idx_l0 / ref_idx_l1 per partition (skipped — inferred 0
+///      under single-ref ship config)
+///   4. MVDs in spec order: partition 0 (L0 if used, then L1 if
+///      used), partition 1 (L0 if used, then L1 if used)
+///   5. coded_block_pattern (zero — residual emission lands in #127)
+///   6. (no mb_qp_delta when CBP=0)
+///
+/// Per-list MVD bin0 ctxIdxInc uses the `_per_list` variant
+/// (§6E-A6.1 (4/N) fix) so encoder + walker match a spec decoder.
+#[allow(clippy::too_many_arguments)]
+fn emit_b_partitioned(
+    cabac: &mut crate::codec::h264::cabac::encoder::CabacEncoder,
+    mb_x: usize,
+    grid: &mut super::partition_state::EncoderMvGrid,
+    grid_mb_x: usize,
+    grid_mb_y: usize,
+    mb_type: u8,
+    parts: [super::b_partitioned::BPartitionMv; 2],
+) -> Result<(), EncoderError> {
+    use super::b_partitioned::{partitioned_b_meta, BListUse};
+    use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc;
+    use crate::codec::h264::cabac::neighbor::{
+        ctx_idx_inc_mvd_bin0_per_list, CabacNeighborMB, MbTypeClass,
+    };
+
+    let meta = partitioned_b_meta(mb_type as u32).ok_or_else(|| {
+        EncoderError::InvalidInput(format!(
+            "emit_b_partitioned: mb_type {mb_type} not in partitioned range 4..=21"
+        ))
+    })?;
+
+    encode_mb_skip_flag_b(cabac, false, mb_x);
+    encode_mb_type_b(cabac, mb_type as u32, mb_x);
+
+    // Track aggregate MVD magnitudes for neighbour state. For
+    // multi-partition MBs, the SPEC § 9.3.3.1.1.7 bin0 ctxIdxInc
+    // for downstream MBs reads block-position-aware abs_mvd_comp;
+    // for now we approximate with per-MB magnitudes (max over
+    // partitions per axis). #127 follow-up may want per-block.
+    let mut max_l0 = (0i32, 0i32);
+    let mut max_l1 = (0i32, 0i32);
+
+    for (idx, part) in parts.iter().enumerate() {
+        let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+        let (off_x, off_y) = meta.shape.part_offset(idx);
+        let (pw, ph) = meta.shape.part_dim_4x4();
+        let tl_bx = grid_mb_x * 4 + off_x;
+        let tl_by = grid_mb_y * 4 + off_y;
+
+        // L0 MVD if partition uses L0 or Bi.
+        let want_l0 = matches!(usage, BListUse::L0 | BListUse::Bi);
+        if want_l0 {
+            let mv = part.mv_l0.unwrap_or_default();
+            let predicted = super::partition_state::predict_mv_for_mb_partition(
+                grid, tl_bx, tl_by, pw, ph, idx as u8, /* current_ref_idx */ 0,
+            );
+            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+            let bin0_inc_x = ctx_idx_inc_mvd_bin0_per_list(
+                &cabac.neighbors, mb_x, 0, 0, 0, /* list */ 0,
+            );
+            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+            let bin0_inc_y = ctx_idx_inc_mvd_bin0_per_list(
+                &cabac.neighbors, mb_x, 0, 0, 1, 0,
+            );
+            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+            max_l0.0 = max_l0.0.max(mvd_x.abs());
+            max_l0.1 = max_l0.1.max(mvd_y.abs());
+        }
+        // L1 MVD if partition uses L1 or Bi.
+        let want_l1 = matches!(usage, BListUse::L1 | BListUse::Bi);
+        if want_l1 {
+            let mv = part.mv_l1.unwrap_or_default();
+            let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
+                grid, tl_bx, tl_by, /* current_ref_idx */ 0,
+            );
+            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+            let bin0_inc_x = ctx_idx_inc_mvd_bin0_per_list(
+                &cabac.neighbors, mb_x, 0, 0, 0, /* list */ 1,
+            );
+            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+            let bin0_inc_y = ctx_idx_inc_mvd_bin0_per_list(
+                &cabac.neighbors, mb_x, 0, 0, 1, 1,
+            );
+            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+            max_l1.0 = max_l1.0.max(mvd_x.abs());
+            max_l1.1 = max_l1.1.max(mvd_y.abs());
+        }
+
+        // Update grid with this partition's MVs (so partition 1's
+        // predictor can read partition 0's MV when needed).
+        grid.fill_lists(
+            tl_bx, tl_by, pw, ph,
+            part.mv_l0.map(|m| (m, 0)),
+            part.mv_l1.map(|m| (m, 0)),
+        );
+    }
+
+    encode_coded_block_pattern(cabac, /* cbp_value */ 0, mb_x);
+
+    let l0_x = (max_l0.0.unsigned_abs() as i16).min(i16::MAX);
+    let l0_y = (max_l0.1.unsigned_abs() as i16).min(i16::MAX);
+    let l1_x = (max_l1.0.unsigned_abs() as i16).min(i16::MAX);
+    let l1_y = (max_l1.1.unsigned_abs() as i16).min(i16::MAX);
+    let nb = CabacNeighborMB {
+        mb_type: MbTypeClass::PInter,
+        mb_skip_flag: false,
+        cbp_luma: 0,
+        cbp_chroma: 0,
+        ref_idx_l0: [0i8; 16],
+        abs_mvd_comp: [[l0_x; 16], [l0_y; 16]],
+        abs_mvd_comp_l1: [[l1_x; 16], [l1_y; 16]],
+        ..CabacNeighborMB::default()
+    };
+    cabac.neighbors.commit(mb_x, nb);
+
+    Ok(())
+}
+
+/// §6E-A6.1 — populate the encoder MV grid for a B_Direct / B_Skip
+/// macroblock at `(mb_x, mb_y)` using the same spatial-direct
+/// derivation the decoder will run on its side. Both modes leave
+/// no MVD on the wire and the decoder reconstructs the MV via
+/// spec § 8.4.1.2.2 spatial direct; the encoder must mirror that
+/// derivation here so subsequent non-direct B-MBs (§6E-A6.1+) see
+/// consistent neighbour data when they predict their own MVDs.
+///
+/// Writes ONE per-list `(mv, ref_idx)` pair across all 16 of the
+/// MB's 4×4 cells. The median-only spatial-direct path produces
+/// the same MV for every cell (no per-sub-block static check
+/// yet — see `b_direct_predictor.rs` module header), so per-MB
+/// granularity matches the implementation.
+fn populate_b_direct_grid(grid: &mut super::partition_state::EncoderMvGrid, mb_x: usize, mb_y: usize) {
+    let r = super::b_direct_predictor::derive_b_direct_spatial(grid, mb_x, mb_y);
+    let bx = mb_x * 4;
+    let by = mb_y * 4;
+    let l0 = if r.uses_l0() { Some((r.mv_l0, r.ref_idx_l0)) } else { None };
+    let l1 = if r.uses_l1() { Some((r.mv_l1, r.ref_idx_l1)) } else { None };
+    grid.fill_lists(bx, by, 4, 4, l0, l1);
+    // Lists not used at this MB stay at their post-`reset` default
+    // (REF_IDX_NONE) — `fill_lists(..., None, ...)` does NOT touch
+    // the L1 cells, so the absent-list semantic is preserved
+    // automatically. Same for L0 absent.
+}
+
+pub(super) fn mb_skip_or_direct_decision(frame_num: u32, mb_addr: u32) -> bool {
     let mut x = (frame_num as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x = x.wrapping_add(mb_addr as u64);
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -313,6 +672,12 @@ impl Encoder {
             // §6E-A4 enable_b_frames=true bumps to 0 + ref count 3.
             pic_order_cnt_type: 2,
             log2_max_pic_order_cnt_lsb_minus4: 4,
+            // §Stealth.L3.1 — VUI emission is OFF by default; the
+            // CABAC/High path turns it on inside `emit_params_if_needed`
+            // so phasm output lands inside the libx264 metaclass at the
+            // SPS level. CAVLC Baseline keeps VUI absent (the legacy
+            // shape the parser is exercised against).
+            vui: None,
         };
         let pps_params = PpsParams {
             pps_id: 0,
@@ -1037,6 +1402,15 @@ impl Encoder {
         let mut out = Vec::new();
         self.emit_params_if_needed(&mut out);
 
+        // §6E-A6.1 — reset the MV grid so this B-frame's predictors
+        // see only same-frame neighbour data (mirrors P-frame entry
+        // at line 947). §6E-A4(c)-lite shipped without this because
+        // B-frames emitted zero MVDs and didn't read neighbours; once
+        // §6E-A6.1+ adds spatial-direct grid population (and §6E-A6.x
+        // adds non-direct B-MBs that DO read neighbours), the grid
+        // must be frame-local.
+        self.mv_grid.reset();
+
         // AUD with PrimaryPicType::IPB to advertise B-frame presence.
         let aud_rbsp = build_aud_rbsp(PrimaryPicType::IPB);
         let aud_nal = wrap_rbsp_as_nal(&aud_rbsp, NalType::AUD, 0);
@@ -1122,37 +1496,77 @@ impl Encoder {
             if mb_y > 0 && mb_x == 0 {
                 cabac.neighbors.new_row();
             }
-            // Pick B_Skip vs B_Direct_16x16 from a deterministic
-            // hash of (frame_num, mb_addr). 50/50 split keeps the
-            // mode distribution non-pathological without needing a
-            // real cost model. Visual quality unchanged.
-            let mode_is_direct = mb_skip_or_direct_decision(
+            // §6E-A6.0 — route through `mb_decision_b` so the §6E-A6.1
+            // / .2 / .3 sub-phases just enlarge the candidate set in
+            // mb_decision_b without re-touching this dispatch loop.
+            // Today's stub returns Skip / Direct16x16 with the same
+            // hash split as the original §6E-A4(c)-lite inline call.
+            let decision = super::mb_decision_b::mb_decision_b(
+                &self.mv_grid, mb_x, mb_y,
                 self.frame_num as u32, mb_addr as u32,
             );
 
-            if mode_is_direct {
-                // B_Direct_16x16: mb_skip_flag=0 + mb_type=0 + CBP=0,
-                // then end_of_slice. No mb_qp_delta when CBP=0.
-                encode_mb_skip_flag_b(&mut cabac, false, mb_x);
-                encode_mb_type_b(&mut cabac, 0, mb_x);
-                encode_coded_block_pattern(&mut cabac, /* cbp_value */ 0, mb_x);
-                let nb = CabacNeighborMB {
-                    mb_type: MbTypeClass::BSkipOrDirect,
-                    mb_skip_flag: false,
-                    cbp_luma: 0,
-                    cbp_chroma: 0,
-                    ..CabacNeighborMB::default()
-                };
-                cabac.neighbors.commit(mb_x, nb);
-            } else {
-                // B_Skip: mb_skip_flag=1, no further syntax.
-                encode_mb_skip_flag_b(&mut cabac, true, mb_x);
-                let nb = CabacNeighborMB {
-                    mb_type: MbTypeClass::BSkipOrDirect,
-                    mb_skip_flag: true,
-                    ..CabacNeighborMB::default()
-                };
-                cabac.neighbors.commit(mb_x, nb);
+            match decision {
+                super::mb_decision_b::BMbDecision::Direct16x16 => {
+                    // B_Direct_16x16: mb_skip_flag=0 + mb_type=0 + CBP=0,
+                    // then end_of_slice. No mb_qp_delta when CBP=0.
+                    encode_mb_skip_flag_b(&mut cabac, false, mb_x);
+                    encode_mb_type_b(&mut cabac, 0, mb_x);
+                    encode_coded_block_pattern(&mut cabac, /* cbp_value */ 0, mb_x);
+                    let nb = CabacNeighborMB {
+                        mb_type: MbTypeClass::BSkipOrDirect,
+                        mb_skip_flag: false,
+                        cbp_luma: 0,
+                        cbp_chroma: 0,
+                        ..CabacNeighborMB::default()
+                    };
+                    cabac.neighbors.commit(mb_x, nb);
+                    // §6E-A6.1 — populate MV grid with spatial-direct
+                    // derivation so subsequent non-direct B-MBs (when
+                    // §6E-A6.1 mode-decision starts emitting them) see
+                    // consistent neighbour data. For §6E-A4(c)-lite-
+                    // only output (only Skip + Direct16x16) the grid
+                    // population is no-op for downstream readers but
+                    // future-proofs the path.
+                    populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y);
+                }
+                super::mb_decision_b::BMbDecision::Skip => {
+                    // B_Skip: mb_skip_flag=1, no further syntax.
+                    encode_mb_skip_flag_b(&mut cabac, true, mb_x);
+                    let nb = CabacNeighborMB {
+                        mb_type: MbTypeClass::BSkipOrDirect,
+                        mb_skip_flag: true,
+                        ..CabacNeighborMB::default()
+                    };
+                    cabac.neighbors.commit(mb_x, nb);
+                    // §6E-A6.1 — same rationale as Direct16x16 above:
+                    // B_Skip uses spatial-direct on the decoder side
+                    // (§ 7.3.5.1 / § 8.4.1.2.2), so the encoder grid
+                    // must reflect those derived MVs at this MB.
+                    populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y);
+                }
+                super::mb_decision_b::BMbDecision::L0_16x16 { mv } => {
+                    emit_b_l0_16x16(&mut cabac, mb_x, &mut self.mv_grid, mb_x, mb_y, mv)?;
+                }
+                super::mb_decision_b::BMbDecision::L1_16x16 { mv } => {
+                    emit_b_l1_16x16(&mut cabac, mb_x, &mut self.mv_grid, mb_x, mb_y, mv)?;
+                }
+                super::mb_decision_b::BMbDecision::Bi_16x16 { mv_l0, mv_l1 } => {
+                    emit_b_bi_16x16(
+                        &mut cabac, mb_x, &mut self.mv_grid, mb_x, mb_y, mv_l0, mv_l1,
+                    )?;
+                }
+                super::mb_decision_b::BMbDecision::Partitioned { mb_type: t, parts } => {
+                    emit_b_partitioned(
+                        &mut cabac, mb_x, &mut self.mv_grid, mb_x, mb_y, t, parts,
+                    )?;
+                }
+                _ => {
+                    // B_8x8 (§6E-A6.3) lands here once its phase ships.
+                    return Err(EncoderError::NotImplemented(
+                        "BMbDecision B8x8 variant (lands in §6E-A6.3)",
+                    ));
+                }
             }
             // end_of_slice_flag bin emitted at every MB.
             let is_last = mb_addr == mb_count - 1;
@@ -3439,6 +3853,16 @@ impl Encoder {
         // transform opt-in. CAVLC always stays Baseline. CABAC picks
         // High when `enable_transform_8x8` is set, else Main.
         let high_profile = self.entropy_mode == EntropyMode::Cabac && self.enable_transform_8x8;
+        // §Stealth.L3.1 — emit VUI on every CABAC path (Main + High).
+        // Both profiles target the libx264 metaclass; an empty VUI
+        // would be its own L4 fingerprint per Altinisik 2022 §IV (only
+        // 18/119 reference classes have an empty VUI). 30 fps is
+        // phasm's canonical output rate; if the source clip is at a
+        // different rate the bridge owns surfacing the right number.
+        // CAVLC Baseline keeps VUI absent (legacy compat).
+        if self.entropy_mode == EntropyMode::Cabac && self.sps_params.vui.is_none() {
+            self.sps_params.vui = Some(VuiParams::handbrake_x264(30, 1));
+        }
         let sps_rbsp = match (self.entropy_mode, high_profile) {
             (EntropyMode::Cavlc, _) => build_sps_baseline(&self.sps_params),
             (EntropyMode::Cabac, false) => build_sps_main(&self.sps_params),
@@ -6508,6 +6932,85 @@ mod tests {
             "Skip count {skip_count} too low (mode mix biased to Direct)");
         assert!(direct_count >= 64,
             "Direct count {direct_count} too low (mode mix biased to Skip)");
+    }
+
+    /// §6E-A6.1 — encoder + walker round-trip for non-direct B
+    /// mb_types. The env var `PHASM_B_FORCE_MODE` forces
+    /// `mb_decision_b` to return a specific decision; we exercise
+    /// each of L0_16x16 / L1_16x16 / Bi_16x16 in a B-slice and
+    /// verify the walker accepts the encoder's output.
+    ///
+    /// All MVs are zero (placeholder for §6E-A6.1 part 1's encoder
+    /// emission with hardcoded MV); real ME lands in part 4.
+    #[test]
+    fn encode_b_l0_16x16_walker_round_trip() {
+        force_b_mode_round_trip("l0_16x16");
+    }
+    #[test]
+    fn encode_b_l1_16x16_walker_round_trip() {
+        force_b_mode_round_trip("l1_16x16");
+    }
+    #[test]
+    fn encode_b_bi_16x16_walker_round_trip() {
+        force_b_mode_round_trip("bi_16x16");
+    }
+
+    /// §6E-A6.2 — partitioned B mb_type round-trip tests. Sample
+    /// the representative variants spanning all four partition×
+    /// list-combo edges:
+    ///   mb_type 4   = B_L0_L0_16x8  (H, L0 + L0)  — simplest 16x8
+    ///   mb_type 5   = B_L0_L0_8x16  (V, L0 + L0)  — simplest 8x16
+    ///   mb_type 8   = B_L0_L1_16x8  (H, L0 + L1)  — mixed-list 16x8
+    ///   mb_type 11  = B_L1_L0_8x16  (V, L1 + L0)  — v=14 short-circuit
+    ///   mb_type 13  = B_L0_Bi_8x16  (V, L0 + Bi)  — bin6 path
+    ///   mb_type 20  = B_Bi_Bi_16x8  (H, Bi + Bi)  — most-bipred 16x8
+    ///   mb_type 21  = B_Bi_Bi_8x16  (V, Bi + Bi)  — most-bipred 8x16
+    /// Each forces PHASM_B_FORCE_MODE=partitioned_<n>, encodes
+    /// I+P+B at 32x32, walks the result, asserts 3 slices.
+    #[test] fn encode_b_partitioned_mb_4_round_trip() { force_b_mode_round_trip("partitioned_4"); }
+    #[test] fn encode_b_partitioned_mb_5_round_trip() { force_b_mode_round_trip("partitioned_5"); }
+    #[test] fn encode_b_partitioned_mb_8_round_trip() { force_b_mode_round_trip("partitioned_8"); }
+    #[test] fn encode_b_partitioned_mb_11_round_trip() { force_b_mode_round_trip("partitioned_11"); }
+    #[test] fn encode_b_partitioned_mb_13_round_trip() { force_b_mode_round_trip("partitioned_13"); }
+    #[test] fn encode_b_partitioned_mb_20_round_trip() { force_b_mode_round_trip("partitioned_20"); }
+    #[test] fn encode_b_partitioned_mb_21_round_trip() { force_b_mode_round_trip("partitioned_21"); }
+
+    /// Helper for the three above. Uses a process-wide Mutex to
+    /// serialize env-var access (PHASM_B_FORCE_MODE is process-
+    /// global; concurrent tests would race). Shared with the
+    /// `mb_decision_b::tests::distribution_match_x264_medium_buckets`
+    /// test which also depends on the env var being in a known state.
+    fn force_b_mode_round_trip(mode: &str) {
+        use crate::codec::h264::cabac::bin_decoder::walk_annex_b_for_cover_with_options;
+        use crate::codec::h264::cabac::bin_decoder::WalkOptions;
+        use crate::codec::h264::encoder::mb_decision_b::B_FORCE_MODE_ENV_LOCK;
+
+        let _lock = B_FORCE_MODE_ENV_LOCK.lock().expect("lock not poisoned");
+        // SAFETY: serialized across tests via ENV_LOCK; no other
+        // thread reads PHASM_B_FORCE_MODE outside `mb_decision_b`,
+        // and that runs only inside the encoder call below.
+        unsafe { std::env::set_var("PHASM_B_FORCE_MODE", mode); }
+        let result = std::panic::catch_unwind(|| {
+            let mut enc = Encoder::new(32, 32, Some(75)).unwrap();
+            enc.entropy_mode = EntropyMode::Cabac;
+            enc.enable_b_frames = true;
+            let pixels = make_yuv420p(32, 32);
+
+            let mut all = Vec::new();
+            all.extend_from_slice(&enc.encode_i_frame(&pixels).unwrap());
+            all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
+            all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
+
+            let opts = WalkOptions { record_mvd: true };
+            let walk = walk_annex_b_for_cover_with_options(&all, opts)
+                .expect("walker accepts B-slice with non-direct mb_type");
+            assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
+        });
+        // Always clean up the env var, even on panic.
+        unsafe { std::env::remove_var("PHASM_B_FORCE_MODE"); }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     /// §6E-A4(c)-lite — encoder + walker round-trip with the mode

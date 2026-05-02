@@ -95,6 +95,44 @@ impl GopPattern {
         Self::Ibpbp { gop: 30, b_count: 1 }
     }
 
+    /// HandBrake/x264-medium centroid: 30-frame GOP, one B per P
+    /// (M=2). Same shape as `iphone_default` but exposed under the
+    /// strategy doc's terminology — used when the source MP4 is
+    /// non-H.264 (HEVC/AV1) or unavailable, so phasm output lands in
+    /// the libx264 metaclass by default. See
+    /// `docs/design/h264-stealth-strategy.md` § "Per-layer plan →
+    /// Layer 3".
+    pub const fn handbrake_x264_centroid() -> Self {
+        Self::Ibpbp { gop: 30, b_count: 1 }
+    }
+
+    /// §Stealth.L3.2 — source-adaptive `gop_pattern: Auto` selection.
+    ///
+    /// Inspects an optional source MP4 byte slice and picks a
+    /// `GopPattern` that minimises the L3 cadence-fingerprint distance
+    /// from source to phasm output:
+    ///
+    /// - `None` → `handbrake_x264_centroid()` (no source available).
+    /// - Source video track is HEVC/AV1/non-H.264 → centroid (the
+    ///   original H.264 bits never existed; mimicking a non-existent
+    ///   source fingerprint is impossible).
+    /// - Source is H.264 with no `ctts` box (no B-frames) → `Ipppp`
+    ///   with detected GOP size, falling back to 30 if no sync samples
+    ///   were observed.
+    /// - Source is H.264 with `ctts` (B-frames present) → `Ibpbp{
+    ///   b_count: 1 }` (M=2) with detected GOP size, falling back to
+    ///   30. Higher M values (M≥3) are rare in the wild
+    ///   (<5% of HandBrake corpus per Agent A); collapsing to M=2
+    ///   keeps phasm in the populous mode.
+    /// - Demux failure / malformed input → centroid (silently safe).
+    pub fn auto_select(source_mp4: Option<&[u8]>) -> Self {
+        let bytes = match source_mp4 {
+            Some(b) => b,
+            None => return Self::handbrake_x264_centroid(),
+        };
+        analyze_source_pattern(bytes).unwrap_or_else(Self::handbrake_x264_centroid)
+    }
+
     /// Pre-§6E-A.deploy compatibility default. IPPPP, no B-frames.
     /// Layer 3 fingerprint is phasm-distinctive — use only when the
     /// caller cannot opt into B-frames yet.
@@ -295,6 +333,124 @@ impl Iterator for EncodeOrderIter {
 impl ExactSizeIterator for EncodeOrderIter {}
 impl FusedIterator for EncodeOrderIter {}
 
+// ─── §Stealth.L3.2 source-adaptive analyser ───────────────────────────
+
+/// Analyse a source MP4 byte slice and pick a `GopPattern` that mimics
+/// its cadence shape. Returns `None` when the source is non-H.264, the
+/// MP4 fails to demux, or no usable signal is present (caller falls
+/// back to centroid).
+fn analyze_source_pattern(mp4_bytes: &[u8]) -> Option<GopPattern> {
+    let parsed = crate::codec::mp4::demux::demux(mp4_bytes).ok()?;
+    let video_idx = parsed.video_track_idx?;
+    let track = &parsed.tracks[video_idx];
+
+    // Non-H.264 source: original H.264 bits never existed for HEVC/AV1
+    // capture. Centroid default is the closest mimic.
+    if !track.is_h264() {
+        return None;
+    }
+
+    // GOP size detection: distance between consecutive sync samples.
+    // Take the modal (most-common) value across all observed gaps.
+    let detected_gop = detect_modal_gop(&track.samples);
+
+    // B-frame detection: a `ctts` box anywhere in the source's stbl
+    // means the source carries composition-time offsets, which only
+    // appear when display order ≠ encode order — i.e. B-frames are
+    // present. The current demuxer doesn't expose `ctts` directly, so
+    // scan the raw bytes for the 4-CC. False positives from `ctts` as
+    // an arbitrary 4-byte payload are vanishingly rare since we
+    // require it to live inside a well-formed box header.
+    let has_b_frames = source_has_ctts(mp4_bytes);
+
+    let gop = detected_gop.unwrap_or(30).clamp(1, 600);
+    if has_b_frames {
+        Some(GopPattern::Ibpbp { gop, b_count: 1 })
+    } else {
+        Some(GopPattern::Ipppp { gop })
+    }
+}
+
+/// Modal sync-sample interval across a track's samples. None if the
+/// track has fewer than two sync samples.
+fn detect_modal_gop(samples: &[crate::codec::mp4::Sample]) -> Option<usize> {
+    let sync_indices: Vec<usize> = samples
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| if s.is_sync { Some(i) } else { None })
+        .collect();
+    if sync_indices.len() < 2 {
+        return None;
+    }
+    // Histogram of gaps.
+    let mut counts: std::collections::HashMap<usize, usize> = Default::default();
+    for w in sync_indices.windows(2) {
+        let gap = w[1] - w[0];
+        *counts.entry(gap).or_insert(0) += 1;
+    }
+    counts.into_iter().max_by_key(|&(_, n)| n).map(|(gap, _)| gap)
+}
+
+/// True iff `mp4_bytes` contains a `ctts` box. Fast structural scan —
+/// walks the box tree without parsing contents. Inside a track's stbl
+/// is the only valid place; we accept any occurrence to keep the scan
+/// simple (false positives outside stbl don't exist in well-formed
+/// MP4).
+fn source_has_ctts(mp4_bytes: &[u8]) -> bool {
+    let mut found = false;
+    walk_mp4_for_box(mp4_bytes, b"ctts", &mut found);
+    found
+}
+
+/// Recursively walk container boxes (`moov`, `trak`, `mdia`, `minf`,
+/// `stbl`, `udta`) looking for `target`. Sets `*found = true` and
+/// short-circuits on first hit.
+fn walk_mp4_for_box(data: &[u8], target: &[u8; 4], found: &mut bool) {
+    if *found {
+        return;
+    }
+    let _ = crate::codec::mp4::iterate_boxes(data, 0, data.len(), |h, content_start, _| {
+        if *found {
+            return Ok(());
+        }
+        if h.box_type == *target {
+            *found = true;
+            return Ok(());
+        }
+        match &h.box_type {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                let inner_end = content_start + h.size as usize - h.header_len as usize;
+                walk_mp4_subtree(data, content_start, inner_end, target, found);
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+}
+
+fn walk_mp4_subtree(data: &[u8], start: usize, end: usize, target: &[u8; 4], found: &mut bool) {
+    if *found {
+        return;
+    }
+    let _ = crate::codec::mp4::iterate_boxes(data, start, end, |h, cs, _| {
+        if *found {
+            return Ok(());
+        }
+        if h.box_type == *target {
+            *found = true;
+            return Ok(());
+        }
+        match &h.box_type {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                let inner_end = cs + h.size as usize - h.header_len as usize;
+                walk_mp4_subtree(data, cs, inner_end, target, found);
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +590,90 @@ mod tests {
         let pat = GopPattern::legacy_ipppp(10);
         assert!(!pat.has_b_frames());
         assert_eq!(pat.gop_size(), 10);
+    }
+
+    #[test]
+    fn auto_select_none_returns_centroid() {
+        // §Stealth.L3.2 — no source bytes ⇒ HandBrake/x264-medium
+        // centroid. Same shape as iphone_default by design.
+        let p = GopPattern::auto_select(None);
+        assert_eq!(p, GopPattern::Ibpbp { gop: 30, b_count: 1 });
+    }
+
+    #[test]
+    fn auto_select_garbage_returns_centroid() {
+        let p = GopPattern::auto_select(Some(b"this is not an mp4 file at all"));
+        assert_eq!(p, GopPattern::Ibpbp { gop: 30, b_count: 1 });
+    }
+
+    #[test]
+    fn auto_select_picks_ipppp_for_h264_source_without_ctts() {
+        // Build a synthetic H.264 MP4 with sync samples every 5 frames
+        // and NO ctts box → analyser should detect Ipppp{gop=5}.
+        let mp4 = build_h264_mp4_for_test(/* gop_size */ 5, /* with_ctts */ false);
+        let p = GopPattern::auto_select(Some(&mp4));
+        assert_eq!(p, GopPattern::Ipppp { gop: 5 });
+    }
+
+    #[test]
+    fn auto_select_picks_ibpbp_for_h264_source_with_ctts() {
+        // Source has ctts box → has B-frames → IBPBP.
+        let mp4 = build_h264_mp4_for_test(/* gop_size */ 5, /* with_ctts */ true);
+        let p = GopPattern::auto_select(Some(&mp4));
+        assert_eq!(p, GopPattern::Ibpbp { gop: 5, b_count: 1 });
+    }
+
+    /// Build a tiny synthetic H.264 MP4 with `n=10` samples, sync
+    /// every `gop_size` samples, and (optionally) an empty ctts stub
+    /// inside stbl. Just enough structure for the L3.2 analyser to
+    /// run; not a decodable stream.
+    fn build_h264_mp4_for_test(gop_size: usize, with_ctts: bool) -> Vec<u8> {
+        // We piggyback on the existing h264_handbrake_mux integration
+        // path: build a minimal Annex-B with `n=2 × gop_size` access
+        // units, mux via build_mp4, and inject a fake `ctts` box if
+        // requested. For unit-test scope, hand-crafted bytes are
+        // simpler — see the section below.
+        // (Helper kept inline to avoid pulling in a wider test fixture
+        //  module from outside h264/stego/.)
+        use crate::codec::mp4::build::{build_mp4, FrameTiming, MuxerProfile};
+        let mut annexb = Vec::new();
+        let n_frames = gop_size * 2;
+        for i in 0..n_frames {
+            // AU
+            annexb.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
+            // SPS+PPS only on sync samples (every gop_size frames).
+            if i.is_multiple_of(gop_size) {
+                annexb.extend_from_slice(&[
+                    0, 0, 0, 1,
+                    0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x40, 0x40, 0x3C, 0x80,
+                ]);
+                annexb.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xEB, 0xE3, 0xCB]);
+                // IDR slice
+                annexb.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]);
+            } else {
+                // Non-IDR slice
+                annexb.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]);
+            }
+        }
+        let mut mp4 = build_mp4(
+            MuxerProfile::HandbrakeX264,
+            &annexb,
+            64,
+            64,
+            FrameTiming::FPS_30,
+        )
+        .expect("build_mp4");
+        if with_ctts {
+            // Inject a stub ctts atom into the byte stream. The
+            // analyser only checks for box-type presence, not validity,
+            // so a minimal valid box header is sufficient for the
+            // detection signal. We append it right after the moov box
+            // — the structural-walk fallback (recursive) will find it
+            // even though it's outside the standard nesting.
+            let stub = b"\x00\x00\x00\x10ctts\x00\x00\x00\x00\x00\x00\x00\x00";
+            mp4.extend_from_slice(stub);
+        }
+        mp4
     }
 
     #[test]

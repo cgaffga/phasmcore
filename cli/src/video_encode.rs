@@ -111,6 +111,33 @@ pub struct VideoEncodeArgs {
     #[arg(long, action = ArgAction::Append)]
     pub attach: Vec<PathBuf>,
 
+    /// IDR period (gop_size) in frames. Range 1..=n_frames. Default
+    /// 30 (1 s @ 30fps), matching typical phone-source cadence.
+    /// Lower values reduce in-flight memory at long clips (more
+    /// streaming-pipeline lockstep) at the cost of bytestream
+    /// overhead from extra SPS/PPS/AUD/IDR emissions; higher values
+    /// reduce overhead but extend the P/B chain. CABAC v2 path only.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "gop-size")]
+    pub gop_size: Option<usize>,
+
+    /// §Stealth.L4 — output container profile. Default
+    /// `handbrake-x264` lands the file in the libx264 container
+    /// metaclass (Yang/EVA + Altinisik decision-tree leaf), matching
+    /// the v1.0 strategy doc target. `ffmpeg` keeps the legacy
+    /// shell-out muxer with audio passthrough — less stealthy
+    /// (ffmpeg-class container fingerprint) but preserves audio.
+    /// CABAC v2 path only.
+    ///
+    /// **Audio note**: `handbrake-x264` is currently video-only;
+    /// audio is dropped from the input. Audio passthrough is tracked
+    /// as §Stealth.L4.5 (the highest-priority follow-on after the
+    /// stealth slate ships). Use `--mux-profile=ffmpeg` to keep
+    /// audio.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "mux-profile", default_value = "handbrake-x264")]
+    pub mux_profile: transcode::MuxProfile,
+
     // Shadow attachments (attach2..attach9).
     #[cfg(feature = "cabac-stego")]
     #[arg(long, action = ArgAction::Append)] pub attach2: Vec<PathBuf>,
@@ -167,14 +194,16 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                 let _ = file_bytes; // consumed by re-read inside run_cabac_encode
                 let primary_files = load_files(&args.attach)?;
                 let shadows = collect_shadows(&args)?;
+                let gop_override = args.gop_size;
                 if shadows.is_empty() {
                     run_cabac_encode(
-                        &args.video, &message, &primary_files, &passphrase, &output_path,
+                        &args.video, &message, &primary_files, &passphrase,
+                        gop_override, args.mux_profile, &output_path,
                     )?;
                 } else {
                     run_cabac_encode_with_shadows(
                         &args.video, &message, &primary_files, &passphrase,
-                        &shadows, &output_path,
+                        &shadows, gop_override, args.mux_profile, &output_path,
                     )?;
                 }
             }
@@ -225,11 +254,14 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
 /// and to remux Annex-B + audio → MP4, since phasm-core has no
 /// built-in H.264 → YUV decoder.
 #[cfg(feature = "cabac-stego")]
+#[allow(clippy::too_many_arguments)]
 fn run_cabac_encode(
     input: &PathBuf,
     message: &str,
     files: &[FileEntry],
     passphrase: &str,
+    gop_override: Option<usize>,
+    mux_profile: transcode::MuxProfile,
     output: &PathBuf,
 ) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
@@ -240,12 +272,12 @@ fn run_cabac_encode(
         if probe.has_audio { " (with audio)" } else { "" },
     );
 
-    // gop_size: default 30 = 1s @ 30fps. Real-world iPhone GOP is
-    // typically 30-300; 30 keeps re-keying frequent enough for
-    // efficient lockstep memory bounds without ballooning IDR
-    // overhead. Fixed for now; CLI flag is a follow-on.
-    let gop_size: usize = 30;
-    let gop_size = gop_size.min(probe.n_frames.max(1));
+    // gop_size default 30 = 1s @ 30fps, matching real iPhone
+    // capture cadence. Override via `--gop-size N` (#98). Real-
+    // world phone GOP is typically 30-300; 30 keeps re-keying
+    // frequent enough for efficient lockstep memory bounds without
+    // ballooning IDR overhead.
+    let gop_size = resolve_gop_size(gop_override, probe.n_frames)?;
 
     let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
     let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
@@ -267,9 +299,23 @@ fn run_cabac_encode(
         )?;
         std::fs::write(&annex_b_temp, &annex_b)?;
         let audio_source = probe.has_audio.then_some(input.as_path());
-        transcode::mux_annexb_to_mp4(
-            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        // §30D-C orchestrator default: IBPBP{ gop_size, b_count: 1 }.
+        // The patterned mux uses this to derive ctts + edts/elst when
+        // B-frames are present (HandBrake convention).
+        let pattern = phasm_core::GopPattern::Ibpbp { gop: gop_size, b_count: 1 };
+        let dropped_audio = transcode::mux_annexb_to_mp4_with_profile(
+            &annex_b_temp, audio_source, &probe.frame_rate,
+            probe.width, probe.height, probe.n_frames, pattern,
+            mux_profile, output,
         )?;
+        if dropped_audio {
+            eprintln!(
+                "warning: --mux-profile=handbrake-x264 dropped audio from input. \
+                 Pass --mux-profile=ffmpeg to preserve audio (less stealthy \
+                 container fingerprint). Audio passthrough in HandBrake mux is \
+                 the next stealth task (§Stealth.L4.5).",
+            );
+        }
         Ok(())
     })();
 
@@ -285,12 +331,15 @@ fn run_cabac_encode(
 /// `h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files`
 /// with `GopPattern::Ibpbp { gop, b_count: 1 }` (Apple-iPhone canonical).
 #[cfg(feature = "cabac-stego")]
+#[allow(clippy::too_many_arguments)]
 fn run_cabac_encode_with_shadows(
     input: &PathBuf,
     primary_message: &str,
     primary_files: &[FileEntry],
     primary_passphrase: &str,
     shadows: &[ShadowLayer],
+    gop_override: Option<usize>,
+    mux_profile: transcode::MuxProfile,
     output: &PathBuf,
 ) -> Result<(), CliError> {
     use phasm_core::stego::shadow_layer::ShadowLayer as VideoShadowLayer;
@@ -305,9 +354,30 @@ fn run_cabac_encode_with_shadows(
         if probe.has_audio { " (with audio)" } else { "" },
     );
 
-    let gop_size: usize = 30;
-    let gop_size = gop_size.min(probe.n_frames.max(1));
-    let pattern = phasm_core::GopPattern::Ibpbp { gop: gop_size, b_count: 1 };
+    let gop_size = resolve_gop_size(gop_override, probe.n_frames)?;
+    // §Stealth.L3.2 — source-adaptive GOP selection. If the source
+    // clip is H.264 with detectable cadence, mimic it. HEVC/AV1
+    // sources / unreadable input fall through to the
+    // HandBrake/x264-medium centroid (the strategy doc default).
+    // gop-size override still wins over auto-detected GOP.
+    let pattern = {
+        let detected = std::fs::read(input)
+            .ok()
+            .as_deref()
+            .map(|b| phasm_core::GopPattern::auto_select(Some(b)))
+            .unwrap_or_else(phasm_core::GopPattern::handbrake_x264_centroid);
+        // Substitute caller's gop_size override for the detected one
+        // while preserving the detected B-frame structure.
+        match detected {
+            phasm_core::GopPattern::Ipppp { .. } => {
+                phasm_core::GopPattern::Ipppp { gop: gop_size }
+            }
+            phasm_core::GopPattern::Ibpbp { b_count, .. } => {
+                phasm_core::GopPattern::Ibpbp { gop: gop_size, b_count }
+            }
+        }
+    };
+    eprintln!("Auto-selected GopPattern: {pattern:?}");
 
     let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
     let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
@@ -340,9 +410,19 @@ fn run_cabac_encode_with_shadows(
         )?;
         std::fs::write(&annex_b_temp, &annex_b)?;
         let audio_source = probe.has_audio.then_some(input.as_path());
-        transcode::mux_annexb_to_mp4(
-            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        let dropped_audio = transcode::mux_annexb_to_mp4_with_profile(
+            &annex_b_temp, audio_source, &probe.frame_rate,
+            probe.width, probe.height, probe.n_frames, pattern,
+            mux_profile, output,
         )?;
+        if dropped_audio {
+            eprintln!(
+                "warning: --mux-profile=handbrake-x264 dropped audio from input. \
+                 Pass --mux-profile=ffmpeg to preserve audio (less stealthy \
+                 container fingerprint). Audio passthrough in HandBrake mux is \
+                 the next stealth task (§Stealth.L4.5).",
+            );
+        }
         Ok(())
     })();
 
@@ -442,6 +522,29 @@ fn collect_shadows(args: &VideoEncodeArgs) -> Result<Vec<ShadowLayer>, CliError>
 
     shadows.sort_by_key(|s| compressed_payload_size(&s.message, &s.files));
     Ok(shadows)
+}
+
+/// #98 — resolve `--gop-size N` override against the probed
+/// `n_frames`. Defaults to 30 (1 s @ 30 fps phone-capture
+/// cadence). Validates `1 <= gop_size <= n_frames`; returns a
+/// `CliError::InvalidArgs` with a clear message on out-of-range.
+#[cfg(feature = "cabac-stego")]
+fn resolve_gop_size(override_: Option<usize>, n_frames: usize) -> Result<usize, CliError> {
+    const DEFAULT_GOP_SIZE: usize = 30;
+    let n_frames = n_frames.max(1);
+    let gop = override_.unwrap_or(DEFAULT_GOP_SIZE);
+    if gop == 0 {
+        return Err(CliError::InvalidArgs(
+            "--gop-size must be >= 1".into(),
+        ));
+    }
+    if gop > n_frames {
+        return Err(CliError::InvalidArgs(format!(
+            "--gop-size {gop} exceeds video length ({n_frames} frames). \
+             Use a value <= {n_frames} or omit the flag for default {DEFAULT_GOP_SIZE}."
+        )));
+    }
+    Ok(gop)
 }
 
 #[cfg(feature = "cabac-stego")]

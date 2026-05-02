@@ -1,0 +1,31 @@
+# H.264 mb-partition histogram
+# source: /tmp/img4138_x264_reference.h264
+# resolution: 1920x1080 (8160 MBs/frame)
+
+## B-frame (271 frames, 2211360 MBs)
+  no-MV (Skip / Direct / Intra) :     279301 (12.63%)
+  emitted MVs                   :    1932059 (87.37%)
+  partition shapes (over 3209247 MV records):
+      16x16 :  2617734 ( 81.57%)
+        8x8 :   254327 (  7.92%)
+       16x8 :   183214 (  5.71%)
+       8x16 :   153972 (  4.80%)
+  direction (over 3209247 MV-anchors):
+         L0 :  1583023 ( 49.33%)
+         L1 :  1470324 ( 45.82%)
+         Bi :   155900 (  4.86%)
+
+## I-frame (21 frames, 171360 MBs)
+  no-MV (Skip / Direct / Intra) :     171360 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+
+## P-frame (333 frames, 2717280 MBs)
+  no-MV (Skip / Direct / Intra) :    1306759 (48.09%)
+  emitted MVs                   :    1410521 (51.91%)
+  partition shapes (over 2183431 MV records):
+      16x16 :  1088457 ( 49.85%)
+        8x8 :   552801 ( 25.32%)
+       16x8 :   283195 ( 12.97%)
+       8x16 :   258978 ( 11.86%)
+  direction (over 2183431 MV-anchors):
+         L0 :  2183431 (100.00%)

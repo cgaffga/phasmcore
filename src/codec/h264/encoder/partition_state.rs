@@ -19,16 +19,22 @@ pub const REF_IDX_NONE: i8 = -1;
 /// Snapshot of a macroblock's 4×4 of 4×4-blocks rectangle in the
 /// [`EncoderMvGrid`]. Captured before speculative sub-MB writes so
 /// the grid can be rolled back if that candidate isn't picked.
+///
+/// §6E-A6.0 — captures both lists' state. P-frames only ever populate
+/// L0; rollback for those leaves L1 at REF_IDX_NONE everywhere
+/// (the grid's reset state). B-frames populate L0 / L1 / both.
 #[derive(Debug, Clone)]
 pub struct MbMvSnapshot {
-    mvs: [MotionVector; 16],
-    refs: [i8; 16],
+    mvs_l0: [MotionVector; 16],
+    refs_l0: [i8; 16],
+    mvs_l1: [MotionVector; 16],
+    refs_l1: [i8; 16],
     decs: [bool; 16],
     base_bx: usize,
     base_by: usize,
 }
 
-/// Frame-wide 4×4 grid of MVs + ref_idx.
+/// Frame-wide 4×4 grid of MVs + ref_idx, **dual-list** (L0 + L1).
 ///
 /// `decoded[idx]` distinguishes "not yet processed in raster order"
 /// (false) from "processed; ref_idx tells if intra/inter" (true). Per
@@ -36,12 +42,27 @@ pub struct MbMvSnapshot {
 /// applies when C's MB is NOT AVAILABLE (off-frame, different slice,
 /// or `decoded == false`). An in-frame intra neighbour is "available"
 /// and contributes mv=(0, 0) to the median.
+///
+/// §6E-A6.0 dual-list extension: per cell we track `(mv, ref_idx)`
+/// for List 0 and List 1 independently. `ref_idx_lX == REF_IDX_NONE
+/// (-1)` is the "no MV in list X at this cell" sentinel, exactly
+/// mirroring the existing single-list semantics. P-frames only
+/// populate the L0 fields; L1 stays at the post-`reset` defaults
+/// (REF_IDX_NONE, zero MV). B-frames populate L0 / L1 / both per
+/// the partition's list usage flags.
+///
+/// The legacy single-list API (`fill`, `get`) is preserved for the
+/// existing P-side encoder + tests — those methods now operate on
+/// the L0 fields explicitly. New code wanting B-side support uses
+/// `fill_lists` / `get_l0` / `get_l1`.
 #[derive(Debug, Clone)]
 pub struct EncoderMvGrid {
     width_4x4: usize,
     height_4x4: usize,
-    mv: Vec<MotionVector>,
-    ref_idx: Vec<i8>,
+    mv_l0: Vec<MotionVector>,
+    ref_idx_l0: Vec<i8>,
+    mv_l1: Vec<MotionVector>,
+    ref_idx_l1: Vec<i8>,
     decoded: Vec<bool>,
 }
 
@@ -52,8 +73,10 @@ impl EncoderMvGrid {
         Self {
             width_4x4: w,
             height_4x4: h,
-            mv: vec![MotionVector::default(); w * h],
-            ref_idx: vec![REF_IDX_NONE; w * h],
+            mv_l0: vec![MotionVector::default(); w * h],
+            ref_idx_l0: vec![REF_IDX_NONE; w * h],
+            mv_l1: vec![MotionVector::default(); w * h],
+            ref_idx_l1: vec![REF_IDX_NONE; w * h],
             decoded: vec![false; w * h],
         }
     }
@@ -67,12 +90,18 @@ impl EncoderMvGrid {
     }
 
     /// Clear the grid (all positions not yet decoded). Call at the
-    /// start of each P-frame.
+    /// start of each frame.
     pub fn reset(&mut self) {
-        for v in self.mv.iter_mut() {
+        for v in self.mv_l0.iter_mut() {
             *v = MotionVector::default();
         }
-        for r in self.ref_idx.iter_mut() {
+        for r in self.ref_idx_l0.iter_mut() {
+            *r = REF_IDX_NONE;
+        }
+        for v in self.mv_l1.iter_mut() {
+            *v = MotionVector::default();
+        }
+        for r in self.ref_idx_l1.iter_mut() {
             *r = REF_IDX_NONE;
         }
         for d in self.decoded.iter_mut() {
@@ -80,10 +109,15 @@ impl EncoderMvGrid {
         }
     }
 
-    /// Write a partition's MV+ref_idx into the rectangle
-    /// `[bx, bx+w) × [by, by+h)` at 4×4-block granularity. Marks the
-    /// slots as decoded (so future neighbour lookups can distinguish
-    /// intra from not-yet-processed).
+    /// Legacy single-list (L0-only) write — keeps the existing P-side
+    /// encoder call sites working unchanged. Writes the partition's
+    /// MV+ref_idx into the L0 fields of the rectangle
+    /// `[bx, bx+w) × [by, by+h)` at 4×4-block granularity, marks
+    /// the slots as decoded, and **does not touch L1** (which stays
+    /// at REF_IDX_NONE for P-frames, the post-`reset` default).
+    ///
+    /// New B-side code should call [`Self::fill_lists`] for explicit
+    /// per-list control.
     pub fn fill(
         &mut self,
         bx: usize,
@@ -93,15 +127,80 @@ impl EncoderMvGrid {
         mv: MotionVector,
         ref_idx: i8,
     ) {
+        self.fill_lists(bx, by, w, h, Some((mv, ref_idx)), None);
+    }
+
+    /// §6E-A6.0 — write a partition's L0 / L1 MV+ref_idx independently.
+    /// `None` for either list means "this list is absent at the
+    /// partition; leave the grid's L1 / L0 untouched". `Some((mv,
+    /// REF_IDX_NONE))` is treated as a literal "ref_idx_none" sentinel
+    /// write (clears that list's entries to absent at this rect).
+    ///
+    /// Always marks the rect as decoded.
+    pub fn fill_lists(
+        &mut self,
+        bx: usize,
+        by: usize,
+        w: usize,
+        h: usize,
+        l0: Option<(MotionVector, i8)>,
+        l1: Option<(MotionVector, i8)>,
+    ) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let x = bx + dx;
+                let y = by + dy;
+                if x >= self.width_4x4 || y >= self.height_4x4 {
+                    continue;
+                }
+                let idx = y * self.width_4x4 + x;
+                if let Some((mv, ref_idx)) = l0 {
+                    self.mv_l0[idx] = mv;
+                    self.ref_idx_l0[idx] = ref_idx;
+                }
+                if let Some((mv, ref_idx)) = l1 {
+                    self.mv_l1[idx] = mv;
+                    self.ref_idx_l1[idx] = ref_idx;
+                }
+                self.decoded[idx] = true;
+            }
+        }
+    }
+
+    /// §6E-A6.0 — explicitly mark a list as absent at a rect (sets
+    /// `ref_idx_lX = REF_IDX_NONE` for every cell). Used by spec
+    /// § 8.4.1.2.2 spatial direct when the whole-MB `refIdxLX = -1`
+    /// (no neighbour has list X) — every cell in the MB gets that
+    /// list cleared so subsequent neighbour predictors see "no MV
+    /// in list X" exactly like an intra neighbour.
+    ///
+    /// Does NOT touch the `decoded` flag — caller is expected to also
+    /// `fill_lists(..., other_list_data, None)` or leave the cells
+    /// not-yet-decoded as appropriate.
+    pub fn clear_l0_at(&mut self, bx: usize, by: usize, w: usize, h: usize) {
         for dy in 0..h {
             for dx in 0..w {
                 let x = bx + dx;
                 let y = by + dy;
                 if x < self.width_4x4 && y < self.height_4x4 {
                     let idx = y * self.width_4x4 + x;
-                    self.mv[idx] = mv;
-                    self.ref_idx[idx] = ref_idx;
-                    self.decoded[idx] = true;
+                    self.mv_l0[idx] = MotionVector::default();
+                    self.ref_idx_l0[idx] = REF_IDX_NONE;
+                }
+            }
+        }
+    }
+
+    /// Mirror of [`Self::clear_l0_at`] for List 1.
+    pub fn clear_l1_at(&mut self, bx: usize, by: usize, w: usize, h: usize) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let x = bx + dx;
+                let y = by + dy;
+                if x < self.width_4x4 && y < self.height_4x4 {
+                    let idx = y * self.width_4x4 + x;
+                    self.mv_l1[idx] = MotionVector::default();
+                    self.ref_idx_l1[idx] = REF_IDX_NONE;
                 }
             }
         }
@@ -110,12 +209,15 @@ impl EncoderMvGrid {
     /// Snapshot the 4×4-block rectangle spanned by one macroblock so
     /// it can be restored after speculative writes (Phase A.2 scratch
     /// pattern for sub-MB median predictors — see
-    /// `docs/design/h264-encoder-quality-plan.md`).
+    /// `docs/design/h264-encoder-quality-plan.md`). §6E-A6.0 captures
+    /// both lists.
     pub fn snapshot_mb(&self, mb_x: usize, mb_y: usize) -> MbMvSnapshot {
         let base_bx = mb_x * 4;
         let base_by = mb_y * 4;
-        let mut mvs = [MotionVector::default(); 16];
-        let mut refs = [REF_IDX_NONE; 16];
+        let mut mvs_l0 = [MotionVector::default(); 16];
+        let mut refs_l0 = [REF_IDX_NONE; 16];
+        let mut mvs_l1 = [MotionVector::default(); 16];
+        let mut refs_l1 = [REF_IDX_NONE; 16];
         let mut decs = [false; 16];
         for dy in 0..4 {
             for dx in 0..4 {
@@ -123,17 +225,20 @@ impl EncoderMvGrid {
                 let y = base_by + dy;
                 if x < self.width_4x4 && y < self.height_4x4 {
                     let idx = y * self.width_4x4 + x;
-                    mvs[dy * 4 + dx] = self.mv[idx];
-                    refs[dy * 4 + dx] = self.ref_idx[idx];
-                    decs[dy * 4 + dx] = self.decoded[idx];
+                    let slot = dy * 4 + dx;
+                    mvs_l0[slot] = self.mv_l0[idx];
+                    refs_l0[slot] = self.ref_idx_l0[idx];
+                    mvs_l1[slot] = self.mv_l1[idx];
+                    refs_l1[slot] = self.ref_idx_l1[idx];
+                    decs[slot] = self.decoded[idx];
                 }
             }
         }
-        MbMvSnapshot { mvs, refs, decs, base_bx, base_by }
+        MbMvSnapshot { mvs_l0, refs_l0, mvs_l1, refs_l1, decs, base_bx, base_by }
     }
 
     /// Undo any writes within the MB rectangle captured by a prior
-    /// [`Self::snapshot_mb`] call.
+    /// [`Self::snapshot_mb`] call. §6E-A6.0 restores both lists.
     pub fn restore_mb(&mut self, snap: &MbMvSnapshot) {
         for dy in 0..4 {
             for dx in 0..4 {
@@ -141,17 +246,50 @@ impl EncoderMvGrid {
                 let y = snap.base_by + dy;
                 if x < self.width_4x4 && y < self.height_4x4 {
                     let idx = y * self.width_4x4 + x;
-                    self.mv[idx] = snap.mvs[dy * 4 + dx];
-                    self.ref_idx[idx] = snap.refs[dy * 4 + dx];
-                    self.decoded[idx] = snap.decs[dy * 4 + dx];
+                    let slot = dy * 4 + dx;
+                    self.mv_l0[idx] = snap.mvs_l0[slot];
+                    self.ref_idx_l0[idx] = snap.refs_l0[slot];
+                    self.mv_l1[idx] = snap.mvs_l1[slot];
+                    self.ref_idx_l1[idx] = snap.refs_l1[slot];
+                    self.decoded[idx] = snap.decs[slot];
                 }
             }
         }
     }
 
-    /// Lookup the MV+ref_idx at 4×4 grid position `(bx, by)`. Returns
-    /// `None` if out-of-bounds or if the position is marked intra.
+    /// Legacy single-list lookup — alias for [`Self::get_l0`] kept so
+    /// existing P-side call sites work unchanged.
     pub fn get(&self, bx: isize, by: isize) -> Option<(MotionVector, i8)> {
+        self.get_l0(bx, by)
+    }
+
+    /// §6E-A6.0 — lookup the L0 MV+ref_idx at 4×4 grid position
+    /// `(bx, by)`. Returns `None` if out-of-bounds or if the position
+    /// is marked "no L0" (`ref_idx_l0 == REF_IDX_NONE`).
+    pub fn get_l0(&self, bx: isize, by: isize) -> Option<(MotionVector, i8)> {
+        let idx = self.cell_idx(bx, by)?;
+        let r = self.ref_idx_l0[idx];
+        if r == REF_IDX_NONE {
+            None
+        } else {
+            Some((self.mv_l0[idx], r))
+        }
+    }
+
+    /// §6E-A6.0 — lookup the L1 MV+ref_idx at 4×4 grid position
+    /// `(bx, by)`. Returns `None` if out-of-bounds or if the position
+    /// is marked "no L1" (`ref_idx_l1 == REF_IDX_NONE`).
+    pub fn get_l1(&self, bx: isize, by: isize) -> Option<(MotionVector, i8)> {
+        let idx = self.cell_idx(bx, by)?;
+        let r = self.ref_idx_l1[idx];
+        if r == REF_IDX_NONE {
+            None
+        } else {
+            Some((self.mv_l1[idx], r))
+        }
+    }
+
+    fn cell_idx(&self, bx: isize, by: isize) -> Option<usize> {
         if bx < 0 || by < 0 {
             return None;
         }
@@ -160,13 +298,7 @@ impl EncoderMvGrid {
         if bx >= self.width_4x4 || by >= self.height_4x4 {
             return None;
         }
-        let idx = by * self.width_4x4 + bx;
-        let r = self.ref_idx[idx];
-        if r == REF_IDX_NONE {
-            None
-        } else {
-            Some((self.mv[idx], r))
-        }
+        Some(by * self.width_4x4 + bx)
     }
 
     /// True iff `(bx, by)` has already been processed (fill called).
@@ -484,6 +616,97 @@ mod tests {
         g.fill(4, 0, 4, 4, MotionVector { mv_x: 0, mv_y: 0 }, 0); // B trivial
         let mv = predict_p_skip_mv(&g, 4, 4);
         assert_eq!(mv, MotionVector::ZERO);
+    }
+
+    // ─── §6E-A6.0 dual-list grid tests ─────────────────────
+
+    #[test]
+    fn dual_list_l1_independent_from_l0() {
+        let mut g = EncoderMvGrid::new(2, 2);
+        let mv_l0 = MotionVector { mv_x: 10, mv_y: 20 };
+        let mv_l1 = MotionVector { mv_x: -30, mv_y: -40 };
+        // P-style fill: L0 only. L1 stays absent.
+        g.fill(0, 0, 4, 4, mv_l0, 0);
+        assert_eq!(g.get_l0(0, 0), Some((mv_l0, 0)));
+        assert_eq!(g.get_l1(0, 0), None);
+        // Now add L1 at the same cells without disturbing L0.
+        g.fill_lists(0, 0, 4, 4, None, Some((mv_l1, 0)));
+        assert_eq!(g.get_l0(0, 0), Some((mv_l0, 0)));
+        assert_eq!(g.get_l1(0, 0), Some((mv_l1, 0)));
+    }
+
+    #[test]
+    fn dual_list_bipred_fill_then_clear_l1() {
+        let mut g = EncoderMvGrid::new(2, 2);
+        let mv_l0 = MotionVector { mv_x: 1, mv_y: 2 };
+        let mv_l1 = MotionVector { mv_x: 3, mv_y: 4 };
+        g.fill_lists(0, 0, 4, 4, Some((mv_l0, 0)), Some((mv_l1, 0)));
+        assert_eq!(g.get_l0(0, 0), Some((mv_l0, 0)));
+        assert_eq!(g.get_l1(0, 0), Some((mv_l1, 0)));
+        // §8.4.1.2.2: when refIdxL1 == -1 for the whole MB, the
+        // encoder clears L1 across the rect — subsequent neighbour
+        // L1 lookup must return None at every cell.
+        g.clear_l1_at(0, 0, 4, 4);
+        for bx in 0..4 {
+            for by in 0..4 {
+                assert_eq!(g.get_l1(bx, by), None,
+                    "L1 should be absent at ({bx},{by}) after clear_l1_at");
+                assert_eq!(g.get_l0(bx, by), Some((mv_l0, 0)),
+                    "L0 should be unchanged at ({bx},{by})");
+            }
+        }
+    }
+
+    #[test]
+    fn dual_list_reset_clears_both() {
+        let mut g = EncoderMvGrid::new(1, 1);
+        g.fill_lists(
+            0, 0, 4, 4,
+            Some((MotionVector { mv_x: 1, mv_y: 2 }, 0)),
+            Some((MotionVector { mv_x: 3, mv_y: 4 }, 0)),
+        );
+        g.reset();
+        assert_eq!(g.get_l0(0, 0), None);
+        assert_eq!(g.get_l1(0, 0), None);
+        assert!(!g.is_decoded(0, 0));
+    }
+
+    #[test]
+    fn dual_list_snapshot_restore_preserves_both_lists() {
+        let mut g = EncoderMvGrid::new(2, 2);
+        let mv_l0_before = MotionVector { mv_x: 10, mv_y: 20 };
+        let mv_l1_before = MotionVector { mv_x: 30, mv_y: 40 };
+        g.fill_lists(0, 0, 4, 4, Some((mv_l0_before, 0)), Some((mv_l1_before, 0)));
+        let snap = g.snapshot_mb(0, 0);
+        // Speculatively rewrite both lists.
+        g.fill_lists(
+            0, 0, 4, 4,
+            Some((MotionVector { mv_x: 99, mv_y: 99 }, 0)),
+            Some((MotionVector { mv_x: -99, mv_y: -99 }, 0)),
+        );
+        // Roll back. Both lists must come back to the snapshot values.
+        g.restore_mb(&snap);
+        for bx in 0..4 {
+            for by in 0..4 {
+                assert_eq!(g.get_l0(bx, by), Some((mv_l0_before, 0)));
+                assert_eq!(g.get_l1(bx, by), Some((mv_l1_before, 0)));
+            }
+        }
+    }
+
+    #[test]
+    fn p_style_fill_leaves_l1_absent_for_predictor() {
+        // Spec § 8.4.1.3 reads neighbour cells per-list. If a
+        // P-frame's `fill` accidentally wrote to L1, a subsequent
+        // B-frame's L1 predictor would see stale data. Verify the
+        // legacy fill path doesn't touch L1.
+        let mut g = EncoderMvGrid::new(2, 2);
+        g.fill(0, 0, 4, 4, MotionVector { mv_x: 7, mv_y: 9 }, 0);
+        for bx in 0..4 {
+            for by in 0..4 {
+                assert_eq!(g.get_l1(bx, by), None);
+            }
+        }
     }
 
     #[test]

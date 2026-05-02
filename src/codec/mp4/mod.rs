@@ -18,6 +18,7 @@
 //! - Only handles single-fragment MP4 files (no fragmented MP4/fMP4)
 //! - Requires `mdat` box to be after `moov` for muxing (standard for camera output)
 
+pub mod build;
 pub mod demux;
 pub mod mux;
 

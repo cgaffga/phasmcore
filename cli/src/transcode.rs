@@ -283,6 +283,88 @@ pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+/// §Stealth.L4.* — output container profile selection. Drives whether
+/// the CLI muxes via the phasm-owned HandBrake/x264-medium builder or
+/// via ffmpeg passthrough. Default is `HandbrakeX264` because the
+/// strategy doc (`docs/design/h264-stealth-strategy.md`) names it as
+/// the v1.0 ship target — output lands inside the libx264 container
+/// metaclass instead of phasm's own (per Yang/EVA + Altinisik).
+#[cfg(feature = "cabac-stego")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum MuxProfile {
+    /// HandBrake/x264-medium container shape (default). Video-only —
+    /// drops audio from the input. Lands at the Yang/EVA libx264-class
+    /// leaf; topology matches the Altinisik tree-hash reference.
+    #[default]
+    #[value(name = "handbrake-x264")]
+    HandbrakeX264,
+    /// FFmpeg native mux with audio passthrough. Larger L4
+    /// fingerprint distance from libx264 (ffmpeg-class instead of
+    /// HandBrake-class) but preserves audio.
+    #[value(name = "ffmpeg")]
+    Ffmpeg,
+}
+
+/// Parse an `r_frame_rate` string ("30/1", "30000/1001") into
+/// `(num, den)`. Returns `(30, 1)` on any parse failure — the
+/// fallback fps phasm uses for the stealth-measurement fixtures.
+#[cfg(feature = "cabac-stego")]
+pub fn parse_frame_rate(s: &str) -> (u32, u32) {
+    let mut parts = s.splitn(2, '/');
+    let num = parts.next().and_then(|x| x.trim().parse().ok());
+    let den = parts.next().and_then(|x| x.trim().parse().ok()).unwrap_or(1u32);
+    match num {
+        Some(n) if n > 0 && den > 0 => (n, den),
+        _ => (30, 1),
+    }
+}
+
+/// Branching mux: handbrake-x264 → phasm's clean-room HandBrake mux
+/// (`phasm_core::codec::mp4::build::build_mp4_with_pattern`); ffmpeg →
+/// the legacy shell-out path with optional audio passthrough.
+///
+/// Returns whether the chosen profile dropped audio (true iff input
+/// had audio AND profile == HandbrakeX264). Caller surfaces a warning
+/// when this is the case so users aren't silently surprised.
+#[cfg(feature = "cabac-stego")]
+#[allow(clippy::too_many_arguments)]
+pub fn mux_annexb_to_mp4_with_profile(
+    annex_b_path: &Path,
+    audio_source: Option<&Path>,
+    frame_rate: &str,
+    width: u32,
+    height: u32,
+    n_display_frames: usize,
+    gop_pattern: phasm_core::GopPattern,
+    profile: MuxProfile,
+    output: &Path,
+) -> Result<bool, CliError> {
+    let dropped_audio = match profile {
+        MuxProfile::HandbrakeX264 => {
+            let annex_b = std::fs::read(annex_b_path)?;
+            let (fps_num, fps_den) = parse_frame_rate(frame_rate);
+            let timing = phasm_core::codec::mp4::build::FrameTiming { fps_num, fps_den };
+            let mp4 = phasm_core::codec::mp4::build::build_mp4_with_pattern(
+                phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
+                &annex_b,
+                width,
+                height,
+                timing,
+                gop_pattern,
+                n_display_frames,
+            )
+            .map_err(|e| CliError::InvalidArgs(format!("HandBrake mux failed: {e}")))?;
+            std::fs::write(output, mp4)?;
+            audio_source.is_some()
+        }
+        MuxProfile::Ffmpeg => {
+            mux_annexb_to_mp4(annex_b_path, audio_source, frame_rate, output)?;
+            false
+        }
+    };
+    Ok(dropped_audio)
+}
+
 /// Mux a raw H.264 Annex-B stream into MP4. If `audio_source` is
 /// `Some`, the audio track is copied from there (the original input
 /// file). The video track uses the supplied frame rate.

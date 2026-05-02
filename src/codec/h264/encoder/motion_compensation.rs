@@ -286,6 +286,106 @@ pub fn apply_chroma_mv_block(
     }
 }
 
+/// §6E-A6.0 — bipred (B-frame "Bi") motion compensation. Predicts
+/// from BOTH a List 0 reference and a List 1 reference, then averages
+/// per-sample with rounding: `pred = (L0_pred + L1_pred + 1) >> 1`.
+/// Spec § 8.4.2.3.1 (implicit weighted bipred, the variant phasm
+/// targets — `weighted_bipred_idc = 0`).
+///
+/// Caller-provided output buffer + stride match the single-list
+/// `apply_luma_mv_block` convention. Both reference frames must have
+/// the same dimensions; the function does not validate that — caller
+/// is expected to feed L0/L1 from the same DPB-tracked frame size.
+///
+/// The internal scratch buffers are stack-allocated for the worst-
+/// case 16×16 luma block. For sub-MB partitions (down to 4×4) the
+/// stride math still uses the full 16-row scratch layout — slightly
+/// wasteful but stack-cheap and simpler than a dynamic alloc.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_luma_mv_block_bipred(
+    ref_l0: &ReconFrame,
+    mv_l0: MotionVector,
+    ref_l1: &ReconFrame,
+    mv_l1: MotionVector,
+    block_x: u32,
+    block_y: u32,
+    block_w: u32,
+    block_h: u32,
+    out: &mut [u8],
+    out_stride: usize,
+) {
+    debug_assert!(block_w <= 16 && block_h <= 16, "bipred block max is 16x16 (got {block_w}x{block_h})");
+    debug_assert!(out.len() >= ((block_h - 1) as usize) * out_stride + block_w as usize);
+
+    let mut buf_l0 = [0u8; 16 * 16];
+    let mut buf_l1 = [0u8; 16 * 16];
+    let scratch_stride = 16usize;
+
+    apply_luma_mv_block(
+        ref_l0, block_x, block_y, block_w, block_h, mv_l0,
+        &mut buf_l0, scratch_stride,
+    );
+    apply_luma_mv_block(
+        ref_l1, block_x, block_y, block_w, block_h, mv_l1,
+        &mut buf_l1, scratch_stride,
+    );
+
+    for yl in 0..block_h as usize {
+        let l0_row_off = yl * scratch_stride;
+        let l1_row_off = yl * scratch_stride;
+        let out_row_off = yl * out_stride;
+        for xl in 0..block_w as usize {
+            let l0 = buf_l0[l0_row_off + xl] as u16;
+            let l1 = buf_l1[l1_row_off + xl] as u16;
+            // Spec § 8.4.2.3.1: pred = (L0 + L1 + 1) >> 1.
+            out[out_row_off + xl] = ((l0 + l1 + 1) >> 1) as u8;
+        }
+    }
+}
+
+/// §6E-A6.0 — chroma bipred. Same averaging shape as the luma bipred
+/// helper but on chroma samples (one component at a time).
+#[allow(clippy::too_many_arguments)]
+pub fn apply_chroma_mv_block_bipred(
+    ref_l0: &ReconFrame,
+    mv_l0: MotionVector,
+    ref_l1: &ReconFrame,
+    mv_l1: MotionVector,
+    component: u8,
+    block_x: u32,
+    block_y: u32,
+    block_w: u32,
+    block_h: u32,
+    out: &mut [u8],
+    out_stride: usize,
+) {
+    debug_assert!(block_w <= 8 && block_h <= 8, "chroma bipred block max is 8x8 (got {block_w}x{block_h})");
+    debug_assert!(out.len() >= ((block_h - 1) as usize) * out_stride + block_w as usize);
+
+    let mut buf_l0 = [0u8; 8 * 8];
+    let mut buf_l1 = [0u8; 8 * 8];
+    let scratch_stride = 8usize;
+
+    apply_chroma_mv_block(
+        ref_l0, component, block_x, block_y, block_w, block_h, mv_l0,
+        &mut buf_l0, scratch_stride,
+    );
+    apply_chroma_mv_block(
+        ref_l1, component, block_x, block_y, block_w, block_h, mv_l1,
+        &mut buf_l1, scratch_stride,
+    );
+
+    for yc in 0..block_h as usize {
+        let row_off_in = yc * scratch_stride;
+        let row_off_out = yc * out_stride;
+        for xc in 0..block_w as usize {
+            let a = buf_l0[row_off_in + xc] as u16;
+            let b = buf_l1[row_off_in + xc] as u16;
+            out[row_off_out + xc] = ((a + b + 1) >> 1) as u8;
+        }
+    }
+}
+
 /// Thin 8×8 wrapper around [`apply_chroma_mv_block`]. Kept for
 /// pre-6B.3.2 call sites.
 pub fn apply_chroma_mv_8x8(
@@ -461,5 +561,104 @@ mod tests {
         let mv = MotionVector { mv_x: 4, mv_y: 4 };
         let block = apply_chroma_mv_8x8(&reference, 0, 0, 0, mv);
         assert_eq!(block[4][4], 156);
+    }
+
+    // ─── §6E-A6.0 bipred MC tests ──────────────────────────────
+
+    #[test]
+    fn bipred_luma_two_zero_mvs_averages_per_sample() {
+        // L0 ref = solid 100 ; L1 ref = solid 200. Bipred with both
+        // MVs = (0, 0) should give pred = (100 + 200 + 1) >> 1 = 150.
+        let ref_l0 = make_reference(48, 32, |_, _| 100);
+        let ref_l1 = make_reference(48, 32, |_, _| 200);
+        let mv0 = MotionVector { mv_x: 0, mv_y: 0 };
+        let mut out = [0u8; 16 * 16];
+        apply_luma_mv_block_bipred(
+            &ref_l0, mv0, &ref_l1, mv0, 16, 8, 16, 16, &mut out, 16,
+        );
+        for &v in &out {
+            assert_eq!(v, 150, "expected (100+200+1)>>1 = 150");
+        }
+    }
+
+    #[test]
+    fn bipred_luma_rounds_to_nearest_with_tie_to_higher() {
+        // Spec § 8.4.2.3.1: pred = (L0 + L1 + 1) >> 1 — ties round up.
+        // Pick L0=100, L1=101: average is 100.5; expected 101.
+        let ref_l0 = make_reference(32, 32, |_, _| 100);
+        let ref_l1 = make_reference(32, 32, |_, _| 101);
+        let mv0 = MotionVector { mv_x: 0, mv_y: 0 };
+        let mut out = [0u8; 16 * 16];
+        apply_luma_mv_block_bipred(
+            &ref_l0, mv0, &ref_l1, mv0, 8, 8, 16, 16, &mut out, 16,
+        );
+        for &v in &out {
+            assert_eq!(v, 101, "(100+101+1)>>1 must round up to 101");
+        }
+    }
+
+    #[test]
+    fn bipred_luma_partition_smaller_than_16x16() {
+        // Verify the bipred path works on sub-MB partitions. 8x8 here.
+        let ref_l0 = make_reference(48, 32, |_, _| 50);
+        let ref_l1 = make_reference(48, 32, |_, _| 150);
+        let mv0 = MotionVector { mv_x: 0, mv_y: 0 };
+        let mut out = [0u8; 16 * 16];
+        apply_luma_mv_block_bipred(
+            &ref_l0, mv0, &ref_l1, mv0, 0, 0, 8, 8, &mut out, 16,
+        );
+        // (50 + 150 + 1) >> 1 = 100.5 → 100 (since 50+150+1 = 201, >>1 = 100).
+        for yl in 0..8 {
+            for xl in 0..8 {
+                assert_eq!(out[yl * 16 + xl], 100, "({xl},{yl})");
+            }
+        }
+        // Cells outside the 8x8 written rect should remain at zero.
+        for yl in 0..16 {
+            for xl in 0..16 {
+                if xl >= 8 || yl >= 8 {
+                    assert_eq!(out[yl * 16 + xl], 0, "out-of-rect ({xl},{yl})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bipred_chroma_averages_components() {
+        // Chroma reference 1: cb = 60. Reference 2: cb = 120. Bipred
+        // = (60 + 120 + 1) >> 1 = 90.
+        let mut ref_l0 = make_reference(48, 32, |_, _| 0);
+        for v in ref_l0.cb.iter_mut() { *v = 60; }
+        let mut ref_l1 = make_reference(48, 32, |_, _| 0);
+        for v in ref_l1.cb.iter_mut() { *v = 120; }
+        let mv0 = MotionVector { mv_x: 0, mv_y: 0 };
+        let mut out = [0u8; 8 * 8];
+        apply_chroma_mv_block_bipred(
+            &ref_l0, mv0, &ref_l1, mv0,
+            /* cb */ 0, 4, 4, 8, 8, &mut out, 8,
+        );
+        for &v in &out {
+            assert_eq!(v, 90);
+        }
+    }
+
+    #[test]
+    fn bipred_luma_pred_l0_eq_pred_l1_unchanged() {
+        // If both refs predict the same pixel value at the same
+        // (block_x, block_y), the average is that value (modulo
+        // the +1 round-up at odd intermediates — here both are
+        // identical so no rounding effect).
+        let reference = make_reference(48, 32, |x, y| ((x * 3 + y * 5) & 0xFF) as u8);
+        let mv0 = MotionVector { mv_x: 0, mv_y: 0 };
+        let mut out = [0u8; 16 * 16];
+        apply_luma_mv_block_bipred(
+            &reference, mv0, &reference, mv0, 16, 8, 16, 16, &mut out, 16,
+        );
+        for yl in 0..16 {
+            for xl in 0..16 {
+                let expected = (((16 + xl) * 3 + (8 + yl) * 5) & 0xFF) as u8;
+                assert_eq!(out[yl * 16 + xl], expected, "pixel ({xl},{yl})");
+            }
+        }
     }
 }

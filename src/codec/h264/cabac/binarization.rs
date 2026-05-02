@@ -326,21 +326,34 @@ const MB_TYPE_B_BINS: [&[u8]; 23] = [
     // (where the 4-bit prefix is v=8..12 = 1000..1100, hence the 5-bit prefix
     //  contributes [1,0,0,0]..[1,1,0,0] AFTER the leading [1,1] header.)
     //
-    // For Phase 6E-A3 we ship 0..3 + 22 (and intra via prefix). Values
-    // 4..21 are populated for completeness but the encoder won't emit
-    // them until §6E-A6. Decoder won't see them either if we only emit
-    // §6E-A3-supported values.
-    &[1, 1, 0, 1, 0, 0, 0],          // 11: B_L0_L1_8x16 actually — placeholder for §6E-A6
-    &[1, 1, 0, 1, 0, 0, 0],          // 12: placeholder
-    &[1, 1, 0, 1, 0, 0, 1],          // 13: placeholder
-    &[1, 1, 0, 1, 0, 1, 0],          // 14: placeholder
-    &[1, 1, 0, 1, 0, 1, 1],          // 15: placeholder
-    &[1, 1, 0, 1, 1, 0, 0],          // 16: placeholder
-    &[1, 1, 0, 1, 1, 0, 1],          // 17: placeholder
-    &[1, 1, 0, 1, 1, 1, 0],          // 18: placeholder
-    &[1, 1, 0, 1, 1, 1, 1],          // 19: placeholder
-    &[1, 1, 1, 0, 0, 0, 0],          // 20: placeholder
-    &[1, 1, 1, 0, 0, 0, 1],          // 21: placeholder
+    // §6E-A6.2 — entries 4..10 + 22 cover the §6E-A3 active set;
+    // entries 11..21 land here per OpenH264 `ParseMBTypeBSliceCabac`
+    // (cisco/openh264 master 2026-05-02). Spec mapping derived from
+    // the inverse of the decoder's bin tree:
+    //
+    //   v=14 (bin2=1, bin3=1, bin4=1, bin5=0) → mb_type = 11
+    //   v=15 → mb_type = 22 (above)
+    //   v=13 → intra-in-B (handled outside this table)
+    //   v ∈ {8, 9, 10, 11, 12}: bin6 read; mb_type = (v<<1 | bin6) - 4
+    //     v=8,  bin6=0 → 12   v=8,  bin6=1 → 13
+    //     v=9,  bin6=0 → 14   v=9,  bin6=1 → 15
+    //     v=10, bin6=0 → 16   v=10, bin6=1 → 17
+    //     v=11, bin6=0 → 18   v=11, bin6=1 → 19
+    //     v=12, bin6=0 → 20   v=12, bin6=1 → 21
+    //
+    // Bin format: [bin0=1, bin1=1, bin2..bin5(=v big-endian),
+    //              optional bin6]
+    &[1, 1, 1, 1, 1, 0],             // 11: B_L1_L0_8x16   (v=14)
+    &[1, 1, 1, 0, 0, 0, 0],          // 12: B_L0_Bi_16x8   (v=8,  bin6=0)
+    &[1, 1, 1, 0, 0, 0, 1],          // 13: B_L0_Bi_8x16   (v=8,  bin6=1)
+    &[1, 1, 1, 0, 0, 1, 0],          // 14: B_L1_Bi_16x8   (v=9,  bin6=0)
+    &[1, 1, 1, 0, 0, 1, 1],          // 15: B_L1_Bi_8x16   (v=9,  bin6=1)
+    &[1, 1, 1, 0, 1, 0, 0],          // 16: B_Bi_L0_16x8   (v=10, bin6=0)
+    &[1, 1, 1, 0, 1, 0, 1],          // 17: B_Bi_L0_8x16   (v=10, bin6=1)
+    &[1, 1, 1, 0, 1, 1, 0],          // 18: B_Bi_L1_16x8   (v=11, bin6=0)
+    &[1, 1, 1, 0, 1, 1, 1],          // 19: B_Bi_L1_8x16   (v=11, bin6=1)
+    &[1, 1, 1, 1, 0, 0, 0],          // 20: B_Bi_Bi_16x8   (v=12, bin6=0)
+    &[1, 1, 1, 1, 0, 0, 1],          // 21: B_Bi_Bi_8x16   (v=12, bin6=1)
     &[1, 1, 1, 1, 1, 1],             // 22: B_8x8 (v=15 short-circuit, no bin6)
 ];
 
@@ -632,6 +645,64 @@ mod tests {
     #[test]
     fn mb_type_b_intra_prefix_matches_v13() {
         assert_eq!(mb_type_b_intra_prefix(), &[1, 1, 1, 1, 0, 1][..]);
+    }
+
+    /// §6E-A6.2 — partitioned 16x8/8x16 family bin sequences.
+    /// Verified against OpenH264 `ParseMBTypeBSliceCabac` 2026-05-02.
+    #[test]
+    fn mb_type_b_bins_partitioned_family_4_to_10() {
+        // 16x16 L0/L1 (v=0..7) → 6 bins each, last 4 = v big-endian.
+        assert_eq!(mb_type_b_bins(4),  &[1, 1, 0, 0, 0, 1][..]); // B_L0_L0_16x8 (v=1)
+        assert_eq!(mb_type_b_bins(5),  &[1, 1, 0, 0, 1, 0][..]); // B_L0_L0_8x16 (v=2)
+        assert_eq!(mb_type_b_bins(6),  &[1, 1, 0, 0, 1, 1][..]); // B_L1_L1_16x8 (v=3)
+        assert_eq!(mb_type_b_bins(7),  &[1, 1, 0, 1, 0, 0][..]); // B_L1_L1_8x16 (v=4)
+        assert_eq!(mb_type_b_bins(8),  &[1, 1, 0, 1, 0, 1][..]); // B_L0_L1_16x8 (v=5)
+        assert_eq!(mb_type_b_bins(9),  &[1, 1, 0, 1, 1, 0][..]); // B_L0_L1_8x16 (v=6)
+        assert_eq!(mb_type_b_bins(10), &[1, 1, 0, 1, 1, 1][..]); // B_L1_L0_16x8 (v=7)
+    }
+
+    #[test]
+    fn mb_type_b_bins_v14_to_15_special() {
+        // v=14 short-circuit: B_L1_L0_8x16 (mb_type 11) — 6 bins, no bin6.
+        assert_eq!(mb_type_b_bins(11), &[1, 1, 1, 1, 1, 0][..]);
+        // v=15 short-circuit: B_8x8 (mb_type 22) — 6 bins.
+        assert_eq!(mb_type_b_bins(22), &[1, 1, 1, 1, 1, 1][..]);
+    }
+
+    #[test]
+    fn mb_type_b_bins_bin6_family_12_to_21() {
+        // v=8..12 + bin6: 7-bin sequences, mb_type = (v<<1 | bin6) - 4.
+        // v=8 (bin2..5 = 1,0,0,0):
+        assert_eq!(mb_type_b_bins(12), &[1, 1, 1, 0, 0, 0, 0][..]); // B_L0_Bi_16x8
+        assert_eq!(mb_type_b_bins(13), &[1, 1, 1, 0, 0, 0, 1][..]); // B_L0_Bi_8x16
+        // v=9 (1,0,0,1):
+        assert_eq!(mb_type_b_bins(14), &[1, 1, 1, 0, 0, 1, 0][..]); // B_L1_Bi_16x8
+        assert_eq!(mb_type_b_bins(15), &[1, 1, 1, 0, 0, 1, 1][..]); // B_L1_Bi_8x16
+        // v=10 (1,0,1,0):
+        assert_eq!(mb_type_b_bins(16), &[1, 1, 1, 0, 1, 0, 0][..]); // B_Bi_L0_16x8
+        assert_eq!(mb_type_b_bins(17), &[1, 1, 1, 0, 1, 0, 1][..]); // B_Bi_L0_8x16
+        // v=11 (1,0,1,1):
+        assert_eq!(mb_type_b_bins(18), &[1, 1, 1, 0, 1, 1, 0][..]); // B_Bi_L1_16x8
+        assert_eq!(mb_type_b_bins(19), &[1, 1, 1, 0, 1, 1, 1][..]); // B_Bi_L1_8x16
+        // v=12 (1,1,0,0):
+        assert_eq!(mb_type_b_bins(20), &[1, 1, 1, 1, 0, 0, 0][..]); // B_Bi_Bi_16x8
+        assert_eq!(mb_type_b_bins(21), &[1, 1, 1, 1, 0, 0, 1][..]); // B_Bi_Bi_8x16
+    }
+
+    #[test]
+    fn mb_type_b_bins_all_unique_no_collisions() {
+        // §6E-A6.2 sanity: every mb_type in 0..=22 must produce a
+        // unique bin sequence (no two mb_types decode to the same
+        // bins — would break round-trip).
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for mb in 0..=22u32 {
+            let bins = mb_type_b_bins(mb);
+            for prior in &seen {
+                assert_ne!(*prior, bins,
+                    "mb_type {mb} duplicates an earlier sequence: {bins:?}");
+            }
+            seen.push(bins);
+        }
     }
 
     /// §6E-A3 — every B mb_type value 0..=22 returns a non-empty
