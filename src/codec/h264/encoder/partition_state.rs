@@ -317,6 +317,38 @@ impl EncoderMvGrid {
         }
         self.decoded[by * self.width_4x4 + bx]
     }
+
+    /// §B-direct-fix — capture an MB-resolution snapshot of the L0
+    /// motion state for use as the next B-frame's `colMb` per spec
+    /// § 8.4.1.2.2.
+    ///
+    /// For each MB, samples the L0 MV+ref_idx at the top-left 4x4
+    /// block (= "MB partition 0, sub-MB 0" in spec terms — the
+    /// position spec uses for the colZeroFlag check at MB top-level).
+    /// Intra MBs (no L0 ref) → `ColocatedMvCell::INTRA`.
+    pub fn to_colocated_grid(&self)
+        -> super::reference_buffer::ColocatedMvGrid
+    {
+        let mb_w = (self.width_4x4 / 4) as u32;
+        let mb_h = (self.height_4x4 / 4) as u32;
+        let mut grid = super::reference_buffer::ColocatedMvGrid::new(mb_w, mb_h);
+        for mb_y in 0..mb_h {
+            for mb_x in 0..mb_w {
+                let bx = (mb_x * 4) as isize;
+                let by = (mb_y * 4) as isize;
+                let cell = match self.get_l0(bx, by) {
+                    Some((mv, r)) => super::reference_buffer::ColocatedMvCell {
+                        ref_idx_l0: r,
+                        mv_l0_x: mv.mv_x,
+                        mv_l0_y: mv.mv_y,
+                    },
+                    None => super::reference_buffer::ColocatedMvCell::INTRA,
+                };
+                grid.set(mb_x, mb_y, cell);
+            }
+        }
+        grid
+    }
 }
 
 /// Three-tap median filter (i16 components).

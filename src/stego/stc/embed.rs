@@ -235,6 +235,7 @@ fn stc_embed_inline(
 // Two forward passes: one to save checkpoints, one to recompute segments.
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)] // Superseded by stc_embed_segmented streaming variant; kept for ref.
 fn stc_embed_segmented(
     cover_bits: &[u8],
     costs: &[f32],

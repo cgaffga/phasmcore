@@ -72,6 +72,7 @@ pub(crate) mod wasm;
 /// - `PHASM_H264_DISABLE_SIMD=1` env var forces scalar regardless
 ///   (no-op in browser WASM since `std::env::var` returns `Err`
 ///   there → defaults to enabled).
+#[allow(dead_code)] // Diagnostic — feature-flag introspection; reserved for tooling.
 #[inline]
 pub(crate) fn simd_enabled() -> bool {
     #[cfg(not(all(
@@ -83,7 +84,7 @@ pub(crate) fn simd_enabled() -> bool {
         ),
     )))]
     {
-        return false;
+        false
     }
     #[cfg(all(
         feature = "simd",

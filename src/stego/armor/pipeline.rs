@@ -696,6 +696,7 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
 ///
 /// Used by the parallel smart_decode path to run STDM and Phase 3 concurrently
 /// with Fortress (which runs on a separate thread).
+#[allow(dead_code)] // Reserved for parallel smart_decode path (deferred wiring).
 pub(crate) fn armor_decode_no_fortress(img: &JpegImage, stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     match try_armor_decode(img, passphrase) {
         Ok(result) => Ok(result),

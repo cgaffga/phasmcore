@@ -29,6 +29,12 @@ pub enum DecodeError {
     /// often indicates a malformed bitstream or end-of-slice reached
     /// without seeing the end-of-slice flag.
     UnexpectedEof,
+    /// Bin decoder parsed a value the current implementation scope
+    /// does not support (e.g. §6E-A6.3 walker encountering B-slice
+    /// `sub_mb_type` 4..=12). The static message names the scope —
+    /// the walker layer adds dynamic context when wrapping into
+    /// `WalkError::H264(Unsupported)`.
+    Unsupported(&'static str),
 }
 
 /// CABAC arithmetic decoder state.

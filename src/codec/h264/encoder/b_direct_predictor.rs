@@ -8,9 +8,9 @@
 //! Spec reference: ISO/IEC 14496-10
 //! - § 8.4.1.2.1 "Derivation process for direct mode prediction"
 //! - § 8.4.1.2.2 "Derivation process for luma motion vectors for
-//!                B_Skip, B_Direct_16x16 and B_Direct_8x8"
-//! - § 8.4.1.3   "Derivation process for luma motion vector
-//!                prediction" (the median predictor)
+//!   B_Skip, B_Direct_16x16 and B_Direct_8x8"
+//! - § 8.4.1.3 "Derivation process for luma motion vector
+//!   prediction" (the median predictor)
 //!
 //! Phase 6E-A4 locked `direct_spatial_mv_pred_flag = 1` (matches
 //! mobile-encoder defaults; cleaner than temporal direct). This
@@ -52,6 +52,7 @@
 
 use super::motion_estimation::MotionVector;
 use super::partition_state::{predict_mv_for_partition, EncoderMvGrid, REF_IDX_NONE};
+use super::reference_buffer::ColocatedMvGrid;
 
 /// Result of running spatial-direct MV derivation at one MB.
 ///
@@ -131,27 +132,55 @@ fn min_positive_ref_idx(neighbours: &[Option<(MotionVector, i8)>]) -> i8 {
     for n in neighbours {
         if let Some((_, r)) = n
             && *r >= 0
-        {
-            if best == REF_IDX_NONE || (*r as i32) < (best as i32) {
+            && (best == REF_IDX_NONE || (*r as i32) < (best as i32)) {
                 best = *r;
             }
-        }
     }
     best
 }
 
 /// §6E-A6.1 entry point — full spatial-direct MV derivation for one
-/// MB at `(mb_x, mb_y)`. Implements spec § 8.4.1.2.1 + § 8.4.1.2.2
-/// (median path — co-located static/moving check is a TODO,
-/// documented at the top of this module).
-///
-/// Reads the existing `EncoderMvGrid` for neighbour data; the MB
-/// being derived is expected NOT to be in the grid yet (caller
-/// populates it after calling this).
+/// MB at `(mb_x, mb_y)`. Implements spec § 8.4.1.2.1 + the median
+/// path of § 8.4.1.2.2. Co-located static/moving check (colZeroFlag)
+/// is gated on `l1_motion_grid` — pass `Some(&grid)` to enable
+/// (production B-slice paths), `None` to disable (tests, callers
+/// without DPB context).
 pub fn derive_b_direct_spatial(
     grid: &EncoderMvGrid,
     mb_x: usize,
     mb_y: usize,
+) -> BDirectSpatialResult {
+    derive_b_direct_spatial_with_col(grid, mb_x, mb_y, None)
+}
+
+/// §6E-A6.1 + spec § 8.4.1.2.2 step 6 — spatial-direct MV derivation
+/// with co-located static/moving check.
+///
+/// `l1_motion_grid` is the L1 reference picture's per-MB collocated
+/// motion grid (= the next-anchor P-frame's `motion_grid`). When
+/// present, the colZeroFlag check is applied: for each list X with
+/// `refIdxLX == 0`, if the colMb is "static" (intra → false; else
+/// `ref_idx_l0 == 0 && |mv_l0| ≤ 1` quarter-pel units → true), then
+/// `mvLX = (0, 0)` regardless of the median predictor.
+///
+/// **Why this matters**: without colZeroFlag, a static-background
+/// B-MB can pick up motion from its neighbour that overlapped a
+/// moving subject — the median picks the moving MV and the
+/// background is predicted from a shifted reference, producing a
+/// "ghost" of the moving subject on the static wall. The colMb
+/// check forces (0, 0) when the L1 reference's co-located content
+/// is itself static, preventing that ghost.
+///
+/// **Granularity**: spec is per-4×4 sub-block. Phasm's
+/// `ColocatedMvGrid` only stores one cell per MB (top-left 4×4
+/// sample, see `EncoderMvGrid::to_colocated_grid`). For 16×16
+/// partitions all sub-blocks share one MV anyway, so the MB-level
+/// check matches the spec's collapsed result for that case.
+pub fn derive_b_direct_spatial_with_col(
+    grid: &EncoderMvGrid,
+    mb_x: usize,
+    mb_y: usize,
+    l1_motion_grid: Option<&ColocatedMvGrid>,
 ) -> BDirectSpatialResult {
     let (ref_idx_l0, ref_idx_l1) = derive_b_direct_ref_idx(grid, mb_x, mb_y);
 
@@ -167,28 +196,54 @@ pub fn derive_b_direct_spatial(
         };
     }
 
+    // Spec § 8.4.1.2.2 step 6: derive colZeroFlag from the L1
+    // reference's co-located MB. Only meaningful when the colMb
+    // grid is available (P-frame DPB snapshot via promote_with_motion).
+    let col_zero_flag = l1_motion_grid
+        .map(|g| {
+            // Out-of-bounds = treat as moving (conservative;
+            // shouldn't happen in practice as mb_x/mb_y are within
+            // the picture).
+            if mb_x as u32 >= g.mb_w || mb_y as u32 >= g.mb_h {
+                return false;
+            }
+            let cell = g.get(mb_x as u32, mb_y as u32);
+            // Intra colMb → colZeroFlag = 0 (= moving).
+            if cell.ref_idx_l0 < 0 {
+                return false;
+            }
+            // Static check: ref_idx_l0 == 0 AND
+            // |mv_l0| ≤ 1 quarter-pel unit. Per spec § 8.4.1.2.2:
+            // "the reference index … is equal to 0 … and the absolute
+            // value of any component of the motion vector … is not
+            // greater than 1 in quarter sample units".
+            cell.ref_idx_l0 == 0
+                && cell.mv_l0_x.abs() <= 1
+                && cell.mv_l0_y.abs() <= 1
+        })
+        .unwrap_or(false);
+
     // For each active list, derive the MV via the standard median
-    // predictor over neighbours (§ 8.4.1.3). The per-list grid view
-    // means each predictor only sees same-list neighbour data —
-    // exactly the spec semantics.
+    // predictor over neighbours (§ 8.4.1.3). Then apply the
+    // colZeroFlag override per spec § 8.4.1.2.2 step 6: if
+    // refIdxLX == 0 AND colZeroFlag → mvLX = (0, 0).
     let tl_bx = mb_x * 4;
     let tl_by = mb_y * 4;
     let mv_l0 = if ref_idx_l0 != REF_IDX_NONE {
-        // Run median predictor on the L0 view of the grid. Phasm's
-        // existing `predict_mv_for_partition` reads `grid.get`
-        // (= L0). The whole 16x16 partition uses one predictor at
-        // its top-left anchor, with `part_w_4x4 = 4`.
-        predict_mv_for_partition(grid, tl_bx, tl_by, /* part_w_4x4 */ 4, ref_idx_l0)
+        if col_zero_flag && ref_idx_l0 == 0 {
+            MotionVector::ZERO
+        } else {
+            predict_mv_for_partition(grid, tl_bx, tl_by, /* part_w_4x4 */ 4, ref_idx_l0)
+        }
     } else {
         MotionVector::ZERO
     };
     let mv_l1 = if ref_idx_l1 != REF_IDX_NONE {
-        // Predicting from L1 needs an L1-view predictor. The
-        // P-side `predict_mv_for_partition` is L0-only; for L1 we
-        // need a per-list variant. §6E-A6.1 part 2 will add this.
-        // For now, fall back to the same algorithm but with manual
-        // L1-list reads.
-        predict_mv_for_partition_l1(grid, tl_bx, tl_by, ref_idx_l1)
+        if col_zero_flag && ref_idx_l1 == 0 {
+            MotionVector::ZERO
+        } else {
+            predict_mv_for_partition_l1(grid, tl_bx, tl_by, ref_idx_l1)
+        }
     } else {
         MotionVector::ZERO
     };

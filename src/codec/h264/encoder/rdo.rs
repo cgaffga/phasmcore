@@ -545,7 +545,6 @@ pub struct PMbRdoResult {
 /// the caller's grid state is preserved — safe to call multiple times
 /// per MB for candidate comparison.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn evaluate_p_mb_rdo(
     choice: &PMbChoice,
     src_y: &[[u8; 16]; 16],

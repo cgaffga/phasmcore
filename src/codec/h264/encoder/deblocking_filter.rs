@@ -109,12 +109,12 @@ pub enum EdgeKind {
 /// absolute 4×4-block coordinates.
 ///
 /// Per spec § 8.7.2.1:
-///   - bs=4: edge at MB boundary AND either side is intra.
-///   - bs=3: either side is intra (not at MB boundary → internal).
-///   - bs=2: either side has nonzero transform coefficients.
-///   - bs=1: both sides inter AND (different refs OR |mv_diff|>=4 qpel
-///           on either axis).
-///   - bs=0: both sides inter AND same ref AND |mv_diff|<4 on both axes.
+/// - bs=4: edge at MB boundary AND either side is intra.
+/// - bs=3: either side is intra (not at MB boundary → internal).
+/// - bs=2: either side has nonzero transform coefficients.
+/// - bs=1: both sides inter AND (different refs OR |mv_diff|>=4 qpel
+///   on either axis).
+/// - bs=0: both sides inter AND same ref AND |mv_diff|<4 on both axes.
 ///
 /// `p_intra` / `q_intra`: true if the 4×4 block belongs to an intra MB.
 /// `p_has_coeff` / `q_has_coeff`: true if the block has any nonzero AC

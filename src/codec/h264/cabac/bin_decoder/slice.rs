@@ -48,7 +48,7 @@ use super::syntax::{
     decode_mvd_with_bin0_inc,
     decode_prev_intra4x4_pred_mode_flag, decode_rem_intra4x4_pred_mode,
     decode_residual_block_cabac, decode_residual_block_cabac_8x8,
-    decode_sub_mb_type_p,
+    decode_sub_mb_type_b, decode_sub_mb_type_p,
     decode_transform_size_8x8_flag, PositionCtx,
 };
 
@@ -347,7 +347,8 @@ where
                     current_gop_idx = current_gop_idx.wrapping_add(1);
                     gop_n_mb = 0;
                     gop_n_slices = 0;
-                    had_vcl_in_current_gop = false;
+                    // had_vcl_in_current_gop is reasserted to true on the
+                    // next VCL NAL (line ~382); no explicit reset needed.
                 }
 
                 let mb_w = sps.pic_width_in_mbs as usize;
@@ -740,13 +741,13 @@ fn walk_i16x16_mb(
 /// - Stego coverage = zero (no bypass bins emitted by this MB).
 fn walk_b_mb(
     dec: &mut CabacDecoder<'_>,
-    _pps: &Pps,
+    pps: &Pps,
     mb_x: usize,
-    _mb_y: usize,
-    _mb_w: usize,
+    mb_y: usize,
+    mb_w: usize,
     prev_mb_qp: &mut i32,
-    _frame_idx: u32,
-    _recorder: &mut PositionRecorder,
+    frame_idx: u32,
+    recorder: &mut PositionRecorder,
     _opts: &WalkOptions,
 ) -> Result<bool, WalkError> {
     // 1. mb_skip_flag (B-slice ctxIdxOffset = 24).
@@ -758,28 +759,30 @@ fn walk_b_mb(
     // 2. mb_type via the §6E-A3 B-slice bin tree (covers all 24
     //    spec values 0..=23). Per-mb_type body dispatch below.
     let mb_type = decode_mb_type_b(dec, mb_x)?;
+    let mb_addr_u32 = (mb_y * mb_w + mb_x) as u32;
+
+    // §B-direct-fix.v2 (#194): mirror the encoder's
+    // transform_size_8x8_flag emission gate. For all B-MB inter
+    // modes phasm ships (16x16/16x8/8x16/B_8x8 with sub_mb_type ≤ 3),
+    // noSubMbPartSizeLessThan8x8Flag = 1 (no sub-8x8 partitions).
+    // Encoder emits the flag iff `pps.transform_8x8_mode_flag &&
+    // cbp_luma != 0`; walker must consume it accordingly.
+    let t8x8 = pps.transform_8x8_mode_flag;
 
     // §6E-A6.0 — per-mb_type dispatcher. Each variant handler
-    // lights up in a dedicated sub-phase:
-    //
-    //   mb_type 0       → walk_b_direct_16x16 (§6E-A4(c)-lite, shipped)
-    //   mb_type 1..=3   → §6E-A6.1 (16x16 L0/L1/Bi family)
-    //   mb_type 4..=21  → §6E-A6.2 (16x8 + 8x16 partitioned)
-    //   mb_type 22      → §6E-A6.3 (B_8x8, sub_mb_type 0..=3)
-    //   mb_type 23      → intra-in-B (out of scope per algorithm note)
-    //
-    // The `Unsupported` returns are progressively replaced as each
-    // sub-phase ships. The `_unused` parameters are wired up now so
-    // sub-phase code drops in without re-touching this dispatcher.
+    // lights up in a dedicated sub-phase. §6E-A6.1q.c (#152): the
+    // L0/L1/Bi/partitioned/B_8x8 walkers now decode non-zero CBP
+    // residuals via the shared `finish_b_inter` tail.
     match mb_type {
         0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp),
-        1 => walk_b_l0_16x16(dec, mb_x, prev_mb_qp),
-        2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp),
-        3 => walk_b_bi_16x16(dec, mb_x, prev_mb_qp),
-        4..=21 => walk_b_partitioned(dec, mb_x, prev_mb_qp, mb_type as u8),
-        22 => Err(WalkError::H264(H264Error::Unsupported(format!(
-            "B-slice B_8x8 mb_type {mb_type} (lands in §6E-A6.3)"
-        )))),
+        1 => walk_b_l0_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        3 => walk_b_bi_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        4..=21 => walk_b_partitioned(
+            dec, mb_x, prev_mb_qp, mb_type as u8,
+            frame_idx, mb_addr_u32, recorder, t8x8,
+        ),
+        22 => walk_b_8x8(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
         23 => Err(WalkError::H264(H264Error::Unsupported(
             "B-slice intra-in-B mb_type 23 (out of scope — see #154 \
              intra-in-P parity bug; B inherits the same risk class)".into(),
@@ -852,53 +855,88 @@ fn walk_b_direct_16x16(
 
 /// §6E-A6.1 — `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
 /// `ref_idx_l0` is inferred 0 (single-ref ship config; not on the
-/// wire). CBP=0 path only — non-zero CBP errors out as
-/// `Unsupported` until §6E-A6.1 part 4 lands B-frame residuals.
+/// wire). §6E-A6.1q.c (#152): non-zero CBP now decodes residuals
+/// (luma 4×4 + chroma DC/AC) via the shared `finish_b_inter` tail.
+#[allow(clippy::too_many_arguments)]
 fn walk_b_l0_16x16(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
     let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 0)?;
-    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, /* l0 */ Some((abs_x, abs_y)), /* l1 */ None)
+    finish_b_inter(
+        dec, mb_x, prev_mb_qp,
+        /* l0 */ Some([[abs_x; 16], [abs_y; 16]]), /* l1 */ None,
+        frame_idx, mb_addr_u32, recorder, t8x8,
+    )
 }
 
 /// §6E-A6.1 — `B_L1_16x16` (mb_type = 2). Mirror of L0 path,
 /// using L1 neighbour state for bin0 ctxIdxInc and committing
 /// `abs_mvd_comp_l1` on neighbour update.
+#[allow(clippy::too_many_arguments)]
 fn walk_b_l1_16x16(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
     let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
-    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, None, Some((abs_x, abs_y)))
+    finish_b_inter(
+        dec, mb_x, prev_mb_qp,
+        None, Some([[abs_x; 16], [abs_y; 16]]),
+        frame_idx, mb_addr_u32, recorder, t8x8,
+    )
 }
 
 /// §6E-A6.1 — `B_Bi_16x16` (mb_type = 3). Two MVD pairs (L0 then L1
 /// per spec § 7.3.5.1 mb_pred order). Each list uses its own
 /// neighbour state for bin0 ctxIdxInc.
+#[allow(clippy::too_many_arguments)]
 fn walk_b_bi_16x16(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
-    let l0_pair = decode_b_16x16_mvd_pair(dec, mb_x, 0)?;
-    let l1_pair = decode_b_16x16_mvd_pair(dec, mb_x, 1)?;
-    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, Some(l0_pair), Some(l1_pair))
+    let (l0_x, l0_y) = decode_b_16x16_mvd_pair(dec, mb_x, 0)?;
+    let (l1_x, l1_y) = decode_b_16x16_mvd_pair(dec, mb_x, 1)?;
+    finish_b_inter(
+        dec, mb_x, prev_mb_qp,
+        Some([[l0_x; 16], [l0_y; 16]]),
+        Some([[l1_x; 16], [l1_y; 16]]),
+        frame_idx, mb_addr_u32, recorder, t8x8,
+    )
 }
 
 /// §6E-A6.2 — partitioned B mb_type walker (mb_types 4..21).
 /// Looks up `(shape, list_usage_part0, list_usage_part1)` via
 /// `b_partitioned::partitioned_b_meta`, then decodes per spec
 /// § 7.3.5.1 mb_pred order (partition 0's MVDs L0-then-L1 before
-/// partition 1's). CBP=0 path only — non-zero errors out as
-/// Unsupported (residuals → #127 follow-up).
+/// partition 1's). §B-Partitioned-Residual Stage D (#206) — non-zero
+/// CBP residuals are decoded via `finish_b_inter`'s shared luma 4×4
+/// + chroma DC/AC path (mirror of the encoder's
+/// `emit_b_residual_for_pred` at the partitioned emit site).
+#[allow(clippy::too_many_arguments)]
 fn walk_b_partitioned(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
     mb_type: u8,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
     use crate::codec::h264::encoder::b_partitioned::{
         partitioned_b_meta, BListUse,
@@ -910,32 +948,125 @@ fn walk_b_partitioned(
         )))
     })?;
 
-    // Aggregate MVD magnitudes across partitions for neighbour
-    // commit. Encoder-side mirror (`emit_b_partitioned`) uses MAX
-    // across partitions per axis per list — match here so neighbour
-    // bin0 ctxIdxInc agrees on subsequent MBs.
-    let mut max_l0 = (0i16, 0i16);
-    let mut max_l1 = (0i16, 0i16);
+    // §6E-A6.1q.e (#154) — within-MB MVD tracker per-list. Mirror of
+    // the encoder's `emit_b_partitioned`. Partition 1's bin 0
+    // ctxIdxInc reads partition 0's just-decoded MVD via
+    // `compute_mvd_ctx_idx_inc_bin0_per_list`.
+    let mut current_mvd = CurrentMbMvdAbs::new();
+    let (pw, ph) = meta.shape.part_dim_4x4();
 
     for idx in 0..2 {
         let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+        let (off_x, off_y) = meta.shape.part_offset(idx);
+        let cur_bx = off_x as u8;
+        let cur_by = off_y as u8;
+
         // L0 MVD if partition uses L0 or Bi.
         if matches!(usage, BListUse::L0 | BListUse::Bi) {
-            let (x, y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 0)?;
-            max_l0.0 = max_l0.0.max(x);
-            max_l0.1 = max_l0.1.max(y);
+            let (x, y) = decode_b_partition_mvd_pair(
+                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 0,
+            )?;
+            current_mvd.fill_region(cur_bx, cur_by, pw as u8, ph as u8, x, y);
         }
         // L1 MVD if partition uses L1 or Bi.
         if matches!(usage, BListUse::L1 | BListUse::Bi) {
-            let (x, y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
-            max_l1.0 = max_l1.0.max(x);
-            max_l1.1 = max_l1.1.max(y);
+            let (x, y) = decode_b_partition_mvd_pair(
+                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 1,
+            )?;
+            current_mvd.fill_region_l1(cur_bx, cur_by, pw as u8, ph as u8, x, y);
         }
     }
 
-    let l0_some = if max_l0 == (0, 0) && !any_uses_l0(meta) { None } else { Some(max_l0) };
-    let l1_some = if max_l1 == (0, 0) && !any_uses_l1(meta) { None } else { Some(max_l1) };
-    finish_b_inter_cbp_zero(dec, mb_x, prev_mb_qp, l0_some, l1_some)
+    // §Task #207 (2026-05-04) — pass the full per-sub-MB MVD layout
+    // (not a broadcast of the max magnitude) so the encoder's
+    // `current_mvd.to_neighbor()` per-position fill matches on the
+    // walker side. Otherwise the next MB's bin0 ctxIdxInc reads from
+    // a position the encoder filled with 0 but the walker filled with
+    // max — CABAC desync at the bin level.
+    let l0_for_finish = if any_uses_l0(meta) { Some(current_mvd.comp) } else { None };
+    let l1_for_finish = if any_uses_l1(meta) { Some(current_mvd.comp_l1) } else { None };
+    finish_b_inter(
+        dec, mb_x, prev_mb_qp, l0_for_finish, l1_for_finish,
+        frame_idx, mb_addr_u32, recorder, t8x8,
+    )
+}
+
+/// §6E-A6.3 — `B_8x8` walker (mb_type = 22). Decodes:
+///
+/// 1. 4 × `sub_mb_type` (each 0..=3 — B_Direct_8x8 / B_L0_8x8 /
+///    B_L1_8x8 / B_Bi_8x8 — via `decode_sub_mb_type_b`).
+/// 2. Per sub-MB s in raster order, the MVDs implied by its
+///    sub_mb_type's list usage:
+///      - 0 (Direct): no MVDs
+///      - 1 (L0):     L0 MVD pair
+///      - 2 (L1):     L1 MVD pair
+///      - 3 (Bi):     L0 MVD pair, then L1 MVD pair
+///    `ref_idx_lX` is inferred 0 (single-ref ship config).
+/// 3. coded_block_pattern. §B-Partitioned-Residual Stage D (#206) —
+///    non-zero CBP is decoded via `finish_b_inter` (luma 4×4 + chroma
+///    DC/AC), mirroring the encoder-side wiring in
+///    `emit_b_8x8_method`.
+/// 4. end_of_slice_flag.
+///
+/// Aggregate MVD magnitudes across sub-MBs (max per axis per list)
+/// for neighbour commit — matches `emit_b_8x8`'s aggregation.
+#[allow(clippy::too_many_arguments)]
+fn walk_b_8x8(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
+) -> Result<bool, WalkError> {
+    let mut sub_mb_types = [0u8; 4];
+    for s in &mut sub_mb_types {
+        let value = decode_sub_mb_type_b(dec)?;
+        debug_assert!(
+            value <= 3,
+            "decode_sub_mb_type_b returned {value}; §6E-A6.3 supports 0..=3"
+        );
+        *s = value as u8;
+    }
+
+    // §6E-A6.1q.e (#154) — within-MB MVD tracker. Mirror of
+    // `emit_b_8x8`.
+    let mut current_mvd = CurrentMbMvdAbs::new();
+
+    for (s_idx, &sub) in sub_mb_types.iter().enumerate() {
+        let off_bx = (s_idx & 1) * 2;
+        let off_by = (s_idx >> 1) * 2;
+        let cur_bx = off_bx as u8;
+        let cur_by = off_by as u8;
+        let pw = 2u8;
+        let ph = 2u8;
+        // L0 MVD pair when sub_mb_type uses L0 (1 or 3).
+        if matches!(sub, 1 | 3) {
+            let (x, y) = decode_b_partition_mvd_pair(
+                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 0,
+            )?;
+            current_mvd.fill_region(cur_bx, cur_by, pw, ph, x, y);
+        }
+        // L1 MVD pair when sub_mb_type uses L1 (2 or 3).
+        if matches!(sub, 2 | 3) {
+            let (x, y) = decode_b_partition_mvd_pair(
+                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 1,
+            )?;
+            current_mvd.fill_region_l1(cur_bx, cur_by, pw, ph, x, y);
+        }
+    }
+
+    // §Task #207 — pass per-sub-MB MVD layout (mirror of
+    // walk_b_partitioned fix above).
+    let any_l0 = sub_mb_types.iter().any(|&s| matches!(s, 1 | 3));
+    let any_l1 = sub_mb_types.iter().any(|&s| matches!(s, 2 | 3));
+    let l0_some = if any_l0 { Some(current_mvd.comp) } else { None };
+    let l1_some = if any_l1 { Some(current_mvd.comp_l1) } else { None };
+    finish_b_inter(
+        dec, mb_x, prev_mb_qp, l0_some, l1_some,
+        frame_idx, mb_addr_u32, recorder, t8x8,
+    )
 }
 
 /// True if any partition's list usage includes L0 (= L0 or Bi).
@@ -984,50 +1115,186 @@ fn decode_b_16x16_mvd_pair(
     Ok((abs_x, abs_y))
 }
 
-/// Shared tail for §6E-A6.1 B-inter walkers: read CBP, error on
-/// non-zero (residual path lands in §6E-A6.1 part 4), commit
-/// neighbour as inter (with per-list MVD magnitudes), read
-/// end_of_slice_flag.
-fn finish_b_inter_cbp_zero(
+/// §6E-A6.1q.e (#154) — decode one X+Y MVD pair for a B-slice
+/// partition with within-MB-aware bin 0 ctxIdxInc derivation.
+/// `(cur_bx, cur_by)` are the partition's TL 4×4-block coordinates
+/// within the MB. For partition 1 of 16×8/8×16 (and sub-MBs 1+ of
+/// B_8x8), this consults `current_mvd` (per-list) before falling
+/// back to cross-MB neighbours.
+///
+/// Mirror of the encoder's `compute_mvd_ctx_idx_inc_bin0_per_list`
+/// call sites in `emit_b_partitioned` / `emit_b_8x8`.
+fn decode_b_partition_mvd_pair(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    current_mvd: &CurrentMbMvdAbs,
+    cur_bx: u8,
+    cur_by: u8,
+    list: u8,
+) -> Result<(i16, i16), WalkError> {
+    use crate::codec::h264::cabac::neighbor::compute_mvd_ctx_idx_inc_bin0_per_list;
+
+    let mut null = NullLogger;
+    let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
+        current_mvd, &dec.neighbors, mb_x, cur_bx, cur_by,
+        /* component */ 0, list,
+    );
+    let mvd_x = {
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        decode_mvd_with_bin0_inc(dec, 0, list, 0, bin0_inc_x, &mut pc)?
+    };
+    let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
+        current_mvd, &dec.neighbors, mb_x, cur_bx, cur_by, 1, list,
+    );
+    let mvd_y = {
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        decode_mvd_with_bin0_inc(dec, 1, list, 0, bin0_inc_y, &mut pc)?
+    };
+    let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
+    let abs_y = mvd_y.unsigned_abs().min(i16::MAX as u32) as i16;
+    Ok((abs_x, abs_y))
+}
+
+/// Shared tail for §6E-A6.1 B-inter walkers: read CBP, decode
+/// `mb_qp_delta` + residual blocks (luma 4×4 + chroma DC + chroma
+/// AC) when `cbp != 0`, commit neighbour as inter (with per-list
+/// MVD magnitudes), read `end_of_slice_flag`.
+///
+/// §6E-A6.1q.c (#152): the CBP=0 fast path is preserved; the
+/// non-zero CBP path mirrors `walk_p_inter_residual`'s 4×4 luma +
+/// chroma DC/AC decode (no 8×8 transform support — B-side encoder
+/// stays on 4×4 transform per §6E-A6.1q.b scope).
+///
+/// Task #207 (2026-05-04): `l0_abs` / `l1_abs` are `Option<[[i16; 16]; 2]>`
+/// — full per-position arrays so partitioned + B_8x8 walkers can
+/// mirror the encoder's `current_mvd.to_neighbor()` per-sub-MB layout
+/// (instead of the broadcast that 16x16 walkers use). When sub-MB MVDs
+/// differ across the MB (e.g. B_8x8 with one non-zero sub-MB and three
+/// zero), the broadcast was overstating magnitude at zero positions
+/// → next-MB bin0 ctxIdxInc disagreed with encoder → CABAC desync.
+#[allow(clippy::too_many_arguments)]
+fn finish_b_inter(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
-    l0_abs: Option<(i16, i16)>,
-    l1_abs: Option<(i16, i16)>,
+    l0_abs: Option<[[i16; 16]; 2]>,
+    l1_abs: Option<[[i16; 16]; 2]>,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
     let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
-    if cbp_luma != 0 || cbp_chroma != 0 {
-        return Err(WalkError::H264(H264Error::Unsupported(format!(
-            "B-slice 16x16 inter with non-zero CBP {cbp_byte:#x} \
-             (lands in §6E-A6.1 part 4 with residual path)"
-        ))));
+
+    // §B-direct-fix.v2 (#194): mirror the encoder's transform_size_8x8_flag
+    // emission gate. For all B-MB inter modes phasm ships
+    // (16x16/16x8/8x16/B_8x8 with sub_mb_type ≤ 3),
+    // noSubMbPartSizeLessThan8x8Flag = 1, so the gate reduces to
+    // `transform_8x8_mode_flag && cbp_luma != 0`. The encoder
+    // always emits `false` (B-MB residuals stay on 4x4); decoder
+    // just consumes the bin to keep CABAC sync.
+    if t8x8 && cbp_luma != 0 {
+        let _flag = decode_transform_size_8x8_flag(dec, mb_x)?;
     }
-    let _ = prev_mb_qp; // QP unchanged when CBP=0
+
+    // mb_qp_delta only when cbp != 0 (mirrors encoder).
+    let qp_delta = if cbp_byte != 0 {
+        let d = decode_mb_qp_delta(dec)?;
+        *prev_mb_qp += d;
+        d
+    } else {
+        0
+    };
+
+    // Residuals: luma 4×4 + chroma DC + chroma AC.
+    let mut current_cbf = CurrentMbCbf::new();
+    let current_is_intra = false;
+    if cbp_luma != 0 {
+        for k in 0..16usize {
+            let (bx, by) = BLOCK_INDEX_TO_POS[k];
+            if cbp_luma & (1 << (k / 4)) != 0 {
+                let inc = compute_cbf_ctx_idx_inc_luma_4x4(
+                    &current_cbf, &dec.neighbors,
+                    mb_x, bx, by, current_is_intra,
+                );
+                let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
+                let scan = decode_residual_block_with_null_logger(
+                    dec, 0, 15, /* cat */ 2, inc,
+                    frame_idx, mb_addr_u32, path,
+                )?;
+                let coded = scan.iter().any(|&v| v != 0);
+                current_cbf.set(2, k, coded);
+                recorder.on_residual_block(
+                    frame_idx, mb_addr_u32, &scan, 0, 15, path,
+                );
+            }
+        }
+    }
+    if cbp_chroma >= 1 {
+        for plane in 0u8..2 {
+            let inc = compute_cbf_ctx_idx_inc_chroma_dc(
+                &dec.neighbors, mb_x, plane, current_is_intra,
+            );
+            let path = ResidualPathKind::ChromaDc { plane };
+            let dc_flat = decode_residual_block_with_null_logger(
+                dec, 0, 3, /* cat */ 3, inc,
+                frame_idx, mb_addr_u32, path,
+            )?;
+            let coded = dc_flat.iter().any(|&v| v != 0);
+            current_cbf.set(3, plane as usize, coded);
+            recorder.on_residual_block(
+                frame_idx, mb_addr_u32, &dc_flat, 0, 3, path,
+            );
+        }
+    }
+    if cbp_chroma == 2 {
+        for plane in 0u8..2 {
+            for sub in 0..4usize {
+                let bx = (sub % 2) as u8;
+                let by = (sub / 2) as u8;
+                let inc = compute_cbf_ctx_idx_inc_chroma_ac(
+                    &current_cbf, &dec.neighbors,
+                    mb_x, plane, bx, by, current_is_intra,
+                );
+                let path = ResidualPathKind::ChromaAc {
+                    plane, block_idx: sub as u8,
+                };
+                let ac_scan = decode_residual_block_with_null_logger(
+                    dec, 0, 14, /* cat */ 4, inc,
+                    frame_idx, mb_addr_u32, path,
+                )?;
+                let coded = ac_scan.iter().any(|&v| v != 0);
+                current_cbf.set(
+                    4, block_pos_to_chroma_ac_idx(plane, bx, by), coded,
+                );
+                recorder.on_residual_block(
+                    frame_idx, mb_addr_u32, &ac_scan, 0, 14, path,
+                );
+            }
+        }
+    }
+
     let is_last = decode_end_of_slice_flag(dec)?;
+
     // §6E-A6.1 spec § 9.3.3.1.1.7 fix: commit per-list MVD
     // magnitudes so subsequent neighbour bin0 ctxIdxInc reads the
     // right list-specific state.
-    let abs_mvd_l0 = if let Some((x, y)) = l0_abs {
-        [[x; 16], [y; 16]]
-    } else {
-        [[0; 16]; 2]
-    };
-    let abs_mvd_l1 = if let Some((x, y)) = l1_abs {
-        [[x; 16], [y; 16]]
-    } else {
-        [[0; 16]; 2]
-    };
-    let nb = CabacNeighborMB {
+    let abs_mvd_l0 = l0_abs.unwrap_or([[0; 16]; 2]);
+    let abs_mvd_l1 = l1_abs.unwrap_or([[0; 16]; 2]);
+    let mut nb = CabacNeighborMB {
         mb_type: MbTypeClass::PInter,
         mb_skip_flag: false,
-        cbp_luma: 0,
-        cbp_chroma: 0,
+        cbp_luma,
+        cbp_chroma,
         abs_mvd_comp: abs_mvd_l0,
         abs_mvd_comp_l1: abs_mvd_l1,
         ..CabacNeighborMB::default()
     };
+    nb.mb_qp_delta = qp_delta;
+    nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
+    nb.transform_size_8x8_flag = false;
     dec.neighbors.commit(mb_x, nb);
     Ok(is_last)
 }

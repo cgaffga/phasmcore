@@ -202,6 +202,24 @@ pub fn parse_slice_header(
         skip_ref_pic_list_modification(&mut r, slice_type)?;
     }
 
+    // §Stealth.L4.6.4 — pred_weight_table (spec § 7.3.3.2). Only present
+    // when (PPS weighted_pred_flag && (P|SP)) ||
+    //      (PPS weighted_bipred_idc == 1 && B).
+    // Phasm uses weighted_bipred_idc = 2 (implicit, no explicit table)
+    // and weighted_pred_flag is configurable in the PPS.
+    let pwt_p = pps.weighted_pred_flag
+        && (slice_type == SliceType::P || slice_type == SliceType::SP);
+    let pwt_b = pps.weighted_bipred_idc == 1 && slice_type == SliceType::B;
+    if pwt_p || pwt_b {
+        skip_pred_weight_table(
+            &mut r,
+            sps,
+            num_ref_idx_l0_active,
+            num_ref_idx_l1_active,
+            slice_type,
+        )?;
+    }
+
     // dec_ref_pic_marking (skip) — only present for reference pictures
     if nal_ref_idc > 0 {
         if nal_type.is_idr() {
@@ -297,6 +315,68 @@ pub fn parse_slice_header(
 }
 
 /// Skip ref_pic_list_modification syntax (H.264 Section 7.3.3.1).
+/// §Stealth.L4.6.4 — Skip the `pred_weight_table` block per spec §
+/// 7.3.3.2 without applying any weights (phasm uses unweighted MC).
+///
+/// Layout (4:2:0, ChromaArrayType=1):
+/// - `luma_log2_weight_denom`             : ue(v)
+/// - `chroma_log2_weight_denom`           : ue(v)
+/// - For each i in 0..num_ref_idx_l0_active:
+///   - `luma_weight_l0_flag`              : u(1)
+///   - if flag: `luma_weight_l0[i]`       : se(v) + `luma_offset_l0[i]` : se(v)
+///   - `chroma_weight_l0_flag`            : u(1)
+///   - if flag: 2× (`chroma_weight_l0[i][j]` : se(v) + `chroma_offset_l0[i][j]` : se(v))
+/// - For B-slices, repeat the loop for L1.
+///
+/// For our 4:2:0 streams ChromaArrayType is always 1, so chroma fields
+/// are always present. The skipper does not apply any weights — phasm
+/// reconstruction uses the unweighted formula either way (the table is
+/// emitted purely as an L4 fingerprint match against x264-medium).
+fn skip_pred_weight_table(
+    r: &mut RbspReader<'_>,
+    sps: &Sps,
+    num_ref_idx_l0_active: u8,
+    num_ref_idx_l1_active: u8,
+    slice_type: SliceType,
+) -> Result<(), H264Error> {
+    let chroma_array_type = if sps.separate_colour_plane_flag {
+        0
+    } else {
+        sps.chroma_format_idc
+    };
+
+    let _ = r.read_ue()?; // luma_log2_weight_denom
+    if chroma_array_type != 0 {
+        let _ = r.read_ue()?; // chroma_log2_weight_denom
+    }
+
+    let skip_list_for = |r: &mut RbspReader<'_>, n_active: u8| -> Result<(), H264Error> {
+        for _ in 0..n_active {
+            let luma_flag = r.read_bit()?;
+            if luma_flag {
+                let _ = r.read_se()?; // luma_weight
+                let _ = r.read_se()?; // luma_offset
+            }
+            if chroma_array_type != 0 {
+                let chroma_flag = r.read_bit()?;
+                if chroma_flag {
+                    for _ in 0..2 {
+                        let _ = r.read_se()?; // chroma_weight
+                        let _ = r.read_se()?; // chroma_offset
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    skip_list_for(r, num_ref_idx_l0_active)?;
+    if slice_type == SliceType::B {
+        skip_list_for(r, num_ref_idx_l1_active)?;
+    }
+    Ok(())
+}
+
 fn skip_ref_pic_list_modification(
     r: &mut RbspReader<'_>,
     slice_type: SliceType,

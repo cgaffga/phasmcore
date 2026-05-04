@@ -549,6 +549,47 @@ pub struct PpsParams {
     /// 6A.7 stopgap — set this + `ISliceHeaderParams::disable_deblocking = 1`
     /// to skip the deblocker until the real filter ships.
     pub deblocking_filter_control_present: bool,
+    /// §6E-D.5(l) — `weighted_bipred_idc`. Spec § 7.4.2.2 / § 8.4.2.3.
+    /// 0 = default bipred (`(L0+L1+1)>>1`).
+    /// 1 = explicit weighted prediction (encoder transmits weights, NOT used).
+    /// 2 = implicit weighted prediction (weights derived from POC distances
+    ///     between B-frame and L0/L1 anchors). x264-medium default. Closes
+    ///     the bipred SATD gap on temporally-asymmetric content (where
+    ///     L0 and L1 are at different distances from the B-frame).
+    pub weighted_bipred_idc: u8,
+    /// §Stealth.L4.6.2 — `num_ref_idx_l0_default_active_minus1` (spec
+    /// § 7.4.2.2). PPS-level default count of L0 reference indices that
+    /// the slice may use without an `num_ref_idx_active_override_flag`.
+    /// x264-medium emits 2 (3 active refs default). When phasm is in
+    /// 1-ref-P mode (Phase 6E-B not yet shipped), every slice header
+    /// MUST set `num_ref_idx_active_override_flag = 1` +
+    /// `num_ref_idx_l0_active_minus1 = 0` to bring the active count back
+    /// down to 1 ref. Closes the L4 PPS fingerprint gap.
+    pub num_ref_idx_l0_default_active_minus1: u8,
+    /// §Stealth.L4.6.2 — `num_ref_idx_l1_default_active_minus1` (spec
+    /// § 7.4.2.2). x264-medium emits 0 (1 active L1 default), which
+    /// matches phasm. Kept parameterized for symmetry.
+    pub num_ref_idx_l1_default_active_minus1: u8,
+    /// §Stealth.L4.6.3 — `chroma_qp_index_offset` (spec § 7.4.2.2 +
+    /// § 8.5.11). Cb chroma QP = clip3(0, 51, qp_y + this_offset).
+    /// x264-medium emits -2 (chroma slightly lower QP than luma →
+    /// preserved chroma fidelity at modest cost). Phasm previously
+    /// emitted 0; closes a PPS L4 fingerprint gap.
+    pub chroma_qp_index_offset: i8,
+    /// §Stealth.L4.6.3 — `second_chroma_qp_index_offset` (spec §
+    /// 7.4.2.2 in High profile only). Cr chroma QP offset. x264-medium
+    /// emits -2 (matching the Cb offset).
+    pub second_chroma_qp_index_offset: i8,
+    /// §Stealth.L4.6.4 — `weighted_pred_flag` (spec § 7.4.2.2).
+    /// 0 = no explicit weighted prediction in P-slices.
+    /// 1 = P-slice header carries `pred_weight_table` (spec § 7.3.3.2).
+    /// x264-medium emits 1 unconditionally; phasm previously emitted 0.
+    /// When true, every P-slice writer emits a (degenerate) weight
+    /// table — for our 1-ref-P shape this is just 4 bits
+    /// (luma_log2_weight_denom + chroma_log2_weight_denom + two zero
+    /// flags). No actual weighted prediction in motion compensation
+    /// — this is a container-level L4 fingerprint match only.
+    pub weighted_pred_flag: bool,
 }
 
 impl Default for PpsParams {
@@ -558,6 +599,12 @@ impl Default for PpsParams {
             sps_id: 0,
             pic_init_qp: 26,
             deblocking_filter_control_present: false,
+            weighted_bipred_idc: 0,
+            num_ref_idx_l0_default_active_minus1: 0,
+            num_ref_idx_l1_default_active_minus1: 0,
+            chroma_qp_index_offset: 0,
+            second_chroma_qp_index_offset: 0,
+            weighted_pred_flag: false,
         }
     }
 }
@@ -597,20 +644,25 @@ fn build_pps_inner(p: &PpsParams, entropy_coding_mode: bool, high_profile_suffix
     w.write_bit(false);
     // num_slice_groups_minus1 = 0 (no FMO)
     w.write_ue(0);
-    // num_ref_idx_l0_default_active_minus1 = 0
-    w.write_ue(0);
-    // num_ref_idx_l1_default_active_minus1 = 0
-    w.write_ue(0);
-    // weighted_pred_flag = 0
-    w.write_bit(false);
-    // weighted_bipred_idc = 0
-    w.write_bits(0, 2);
+    // §Stealth.L4.6.2 — num_ref_idx_l0_default_active_minus1 from
+    // params (x264-medium = 2). Slice headers must override down to 0
+    // for phasm's 1-ref-P shape.
+    w.write_ue(p.num_ref_idx_l0_default_active_minus1 as u32);
+    // num_ref_idx_l1_default_active_minus1 (x264-medium = 0).
+    w.write_ue(p.num_ref_idx_l1_default_active_minus1 as u32);
+    // §Stealth.L4.6.4 — weighted_pred_flag from params (x264-medium = 1).
+    // When true, P-slice writers must emit a (degenerate) pred_weight_table.
+    w.write_bit(p.weighted_pred_flag);
+    // weighted_bipred_idc — §6E-D.5(l) configurable. 2 = implicit
+    // weighted prediction for B-slices (x264-medium default).
+    w.write_bits(p.weighted_bipred_idc as u32, 2);
     // pic_init_qp_minus26
     w.write_se(p.pic_init_qp as i32 - 26);
     // pic_init_qs_minus26 = 0
     w.write_se(0);
-    // chroma_qp_index_offset = 0
-    w.write_se(0);
+    // §Stealth.L4.6.3 — chroma_qp_index_offset from params (x264-medium
+    // = -2). Cb chroma QP shifts by this against luma.
+    w.write_se(p.chroma_qp_index_offset as i32);
     // deblocking_filter_control_present_flag
     w.write_bit(p.deblocking_filter_control_present);
     // constrained_intra_pred_flag = 0
@@ -624,8 +676,9 @@ fn build_pps_inner(p: &PpsParams, entropy_coding_mode: bool, high_profile_suffix
         w.write_bit(true);
         // pic_scaling_matrix_present_flag = 0 (flat / default).
         w.write_bit(false);
-        // second_chroma_qp_index_offset = 0.
-        w.write_se(0);
+        // §Stealth.L4.6.3 — second_chroma_qp_index_offset from params
+        // (x264-medium = -2). Applies to Cr chroma QP only.
+        w.write_se(p.second_chroma_qp_index_offset as i32);
     }
 
     w.write_rbsp_trailing();
@@ -799,6 +852,12 @@ pub struct PSliceHeaderParams {
     /// `entropy_coding_mode_flag = 1`. `None` (default) omits the field
     /// and matches the CAVLC path.
     pub cabac_init_idc: Option<u8>,
+    /// §Stealth.L4.6.4 — when `true`, the slice writer emits a
+    /// degenerate `pred_weight_table` (luma_log2_weight_denom=0,
+    /// chroma_log2_weight_denom=0, all luma/chroma weight flags=0)
+    /// between ref_pic_list_modification and dec_ref_pic_marking.
+    /// Mirrors PPS `weighted_pred_flag`.
+    pub weighted_pred_flag: bool,
 }
 
 
@@ -832,6 +891,29 @@ pub fn continue_slice_header_p(w: &mut BitWriter, p: &PSliceHeaderParams) {
     // ref_pic_list_modification_flag_l0 = 0 (no modification for
     // single-ref P slices)
     w.write_bit(false);
+    // §Stealth.L4.6.4 — pred_weight_table (spec § 7.3.3.2). Per spec
+    // § 7.3.3, this comes AFTER ref_pic_list_modification and BEFORE
+    // dec_ref_pic_marking. Emit when PPS weighted_pred_flag = 1 (only
+    // for P/SP slices — B uses weighted_bipred_idc instead).
+    //
+    // Phasm emits a degenerate table: zero log2_weight_denoms +
+    // num_ref_idx_l0_active iterations of (luma_weight_flag=0 +
+    // chroma_weight_flag=0). For 1-ref-P this is 4 bits total. No
+    // motion-compensation change — just L4 fingerprint match.
+    if p.weighted_pred_flag {
+        // luma_log2_weight_denom = 0
+        w.write_ue(0);
+        // chroma_log2_weight_denom = 0 (ChromaArrayType = 1 for 4:2:0)
+        w.write_ue(0);
+        // For each ref index in L0 (= num_ref_idx_l0_active_minus1 + 1):
+        //   luma_weight_l0_flag = 0
+        //   chroma_weight_l0_flag = 0
+        let l0_count = p.num_ref_idx_l0_active_minus1 as u32 + 1;
+        for _ in 0..l0_count {
+            w.write_bit(false); // luma_weight_l0_flag[i] = 0
+            w.write_bit(false); // chroma_weight_l0_flag[i] = 0
+        }
+    }
     // Decoded reference picture marking: for non-IDR P slices, just
     // adaptive_ref_pic_marking_mode_flag = 0.
     w.write_bit(false);

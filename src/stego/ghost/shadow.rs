@@ -502,11 +502,10 @@ fn try_extract_with_lsbs(
         if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
 
         // First-block peek: derive exact fdl from first RS block.
-        if let Some(fdl) = peek_fdl_from_first_block(all_lsbs, parity_len, max_fdl) {
-            if let Some(result) = try_single_fdl(all_lsbs, fdl, parity_len, passphrase) {
+        if let Some(fdl) = peek_fdl_from_first_block(all_lsbs, parity_len, max_fdl)
+            && let Some(result) = try_single_fdl(all_lsbs, fdl, parity_len, passphrase) {
                 return Some(result);
             }
-        }
 
         // Small-fdl fallback: scan partial-block range (fdl < k).
         let small_max = (k - 1).min(max_fdl);

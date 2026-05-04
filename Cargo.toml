@@ -3,7 +3,7 @@ members = ["cli"]
 
 [package]
 name = "phasm-core"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"

@@ -568,8 +568,10 @@ fn ghost_encode_with_shadows_impl(
         .sum();
 
     // 5. Embed shadows + primary STC (always short STC: frame_bits, not padded).
-    let mut stc_total_cost: f64 = 0.0;
-    let mut stc_num_modifications: usize = 0;
+    // Values land via one of the if/else branches below; reassigned in
+    // inner search loops too, hence `mut`.
+    let mut stc_total_cost: f64;
+    let mut stc_num_modifications: usize;
 
     if shadow_states.is_empty() {
         // No shadows → no verification UNIWARD pass needed.
@@ -702,13 +704,11 @@ fn ghost_encode_with_shadows_impl(
                     for &(frac, par) in CASCADE {
                         // Early termination: if fraction=1 failed at a parity,
                         // tighter fractions at that same parity will also fail.
-                        if frac > 1 {
-                            if let Some(failed_par) = last_fraction_1_failed_parity {
-                                if par <= failed_par {
+                        if frac > 1
+                            && let Some(failed_par) = last_fraction_1_failed_parity
+                                && par <= failed_par {
                                     continue;
                                 }
-                            }
-                        }
 
                         for state in shadow_states.iter_mut() {
                             shadow::rebuild_shadow(state, &cascade_positions, par, frac)?;

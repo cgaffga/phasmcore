@@ -1,0 +1,54 @@
+# §6E-D.6(c) — same-fixture x264-medium reference for §6E-A6.5 gate.
+#
+# Encoded with:
+#   ffmpeg -y -f rawvideo -pix_fmt yuv420p -s 1920x1072 -r 30 \
+#       -i /tmp/img4138_1080p_f10.yuv \
+#       -c:v libx264 -preset medium -crf 23 \
+#       -x264-params bframes=1:b-pyramid=0:keyint=5:min-keyint=5:scenecut=0:no-deblock=0
+#
+# Source fixture: SAME 10 frames of IMG_4138 the gate test runs phasm
+# against. This is apples-to-apples: any partition-shape / direction
+# gap vs phasm reflects encoder behaviour differences only, not
+# fixture-content differences.
+#
+# Histogram extracted via core/scripts/h264_mb_partition_histogram.py
+# (PyAV side-data path). Note the libavcodec MV-exporter labels
+# Skip/Direct B-MBs with their spatial-direct synthesized MV
+# directions, so direction shares partly reflect spatial-direct's
+# behaviour, not encoder mode-decision (see
+# memory/h264_phase6e_d_trace_breakthrough.md).
+#
+# Replaces tests/data/x264_reference_mb_histogram.txt (271-frame
+# mixed-content batch) — kept only for historical context.
+
+# H.264 mb-partition histogram
+# source: /tmp/x264_medium_img4138_f10.h264
+# resolution: 1920x1072 (8040 MBs/frame)
+
+## B-frame (4 frames, 32160 MBs)
+  no-MV (Skip / Direct / Intra) :        579 ( 1.80%)
+  emitted MVs                   :      31581 (98.20%)
+  partition shapes (over 45658 MV records):
+      16x16 :    43944 ( 96.25%)
+       8x16 :      755 (  1.65%)
+       16x8 :      557 (  1.22%)
+        8x8 :      402 (  0.88%)
+  direction (over 45658 MV-anchors):
+         L1 :    25861 ( 56.64%)
+         L0 :    19295 ( 42.26%)
+         Bi :      502 (  1.10%)
+
+## I-frame (2 frames, 16080 MBs)
+  no-MV (Skip / Direct / Intra) :      16080 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+
+## P-frame (4 frames, 32160 MBs)
+  no-MV (Skip / Direct / Intra) :       2477 ( 7.70%)
+  emitted MVs                   :      29683 (92.30%)
+  partition shapes (over 37567 MV records):
+      16x16 :    26730 ( 71.15%)
+        8x8 :     5897 ( 15.70%)
+       8x16 :     2562 (  6.82%)
+       16x8 :     2378 (  6.33%)
+  direction (over 37567 MV-anchors):
+         L0 :    37567 (100.00%)

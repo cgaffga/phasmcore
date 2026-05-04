@@ -24,8 +24,8 @@
 //! | 7 | (Bi, L1)       | 18 | 19 |
 //! | 8 | (Bi, Bi)       | 20 | 21 |
 //!
-//! Verified against `ParseMBTypeBSliceCabac` in cisco/openh264
-//! master 2026-05-02 + spec Table 7-14.
+//! Mapping derived directly from spec Table 7-14 (B macroblock
+//! types) — the bin-tree → mb_type translation is normative.
 
 use super::motion_estimation::MotionVector;
 

@@ -15,7 +15,7 @@
 //! Algorithm note:
 //!   docs/design/h264-encoder-algorithms/motion-estimation.md
 
-use super::motion_compensation::apply_luma_mv_block;
+use super::motion_compensation::{apply_luma_mv_block, apply_luma_mv_block_bipred};
 use super::reference_buffer::ReconFrame;
 use super::transform::forward_hadamard_4x4;
 
@@ -175,6 +175,118 @@ impl MotionEstimator {
             16,
             predicted_mv,
         )
+    }
+
+    /// §6E-D.5(c) — bipred-aware joint MV refinement (subme≥7 style).
+    ///
+    /// After independent L0 / L1 ME has produced seed MVs, refine them
+    /// jointly to minimise *bipred* SATD + λ × (mvbits_l0 + mvbits_l1).
+    /// Mirrors x264's `--subme 7+` joint refinement pass.
+    ///
+    /// Algorithm (from x264 `me.c::x264_me_search_ref` Bi branch):
+    /// alternately hold one list fixed and search a small qpel diamond
+    /// around the other list's current best; iterate until both converge.
+    /// Total candidates per round = 5 (L0 diamond) + 5 (L1 diamond) = 10
+    /// bipred SATDs + 2 anchor evaluations.
+    ///
+    /// Returns: `(refined_l0_mv, refined_l1_mv)`. If the seeds are already
+    /// at the joint minimum, returns them unchanged. Always returns MVs
+    /// at quarter-pel precision (no integer/half-pel snapping).
+    ///
+    /// Use case: in B-frame mode-decision, the explicit-MV candidates
+    /// (Bi_16x16, L0_16x16, L1_16x16) all benefit from this. After
+    /// refinement, the L0_16x16 / L1_16x16 candidates also use the
+    /// JOINT-refined L0 / L1 MVs (they're at least as good as the
+    /// independent-ME seeds, and often better since joint refinement
+    /// finds local minima that independent-ME's rate-cost-blocked search
+    /// missed).
+    ///
+    /// `predicted_l0` / `predicted_l1` are the median predictors used
+    /// for MVD bit-cost computation (matches the encoder's actual rate
+    /// accounting at MVD emission time).
+    #[allow(clippy::too_many_arguments)]
+    pub fn refine_bipred(
+        &mut self,
+        source: &[u8],
+        source_stride: usize,
+        l0_ref: &ReconFrame,
+        l1_ref: &ReconFrame,
+        block_x: u32,
+        block_y: u32,
+        block_w: u32,
+        block_h: u32,
+        l0_seed: MotionVector,
+        l1_seed: MotionVector,
+        predicted_l0: MotionVector,
+        predicted_l1: MotionVector,
+    ) -> (MotionVector, MotionVector) {
+        let lambda = me_lambda();
+        let mut best_l0 = clip_mv_to_frame(l0_seed, l0_ref, block_x, block_y, block_w, block_h);
+        let mut best_l1 = clip_mv_to_frame(l1_seed, l1_ref, block_x, block_y, block_w, block_h);
+        let mut best_cost = bipred_cost_at(
+            source, source_stride, l0_ref, l1_ref,
+            block_x, block_y, block_w, block_h,
+            best_l0, best_l1, predicted_l0, predicted_l1, lambda,
+        );
+
+        // 5-point diamond (qpel offsets): center + N/S/E/W.
+        const DIAMOND: [(i16, i16); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+
+        // Up to 2 alternating passes. Each pass refines one list with
+        // the other held fixed. Convergence check: if a pass produces
+        // no change to either list, stop early.
+        for _iter in 0..2 {
+            let prev_l0 = best_l0;
+            let prev_l1 = best_l1;
+
+            // Pass A — refine L0 with L1 fixed.
+            for (dx, dy) in DIAMOND.iter().copied() {
+                if dx == 0 && dy == 0 { continue; }
+                let cand_l0_raw = MotionVector {
+                    mv_x: best_l0.mv_x.saturating_add(dx),
+                    mv_y: best_l0.mv_y.saturating_add(dy),
+                };
+                let cand_l0 = clip_mv_to_frame(
+                    cand_l0_raw, l0_ref, block_x, block_y, block_w, block_h,
+                );
+                let cost = bipred_cost_at(
+                    source, source_stride, l0_ref, l1_ref,
+                    block_x, block_y, block_w, block_h,
+                    cand_l0, best_l1, predicted_l0, predicted_l1, lambda,
+                );
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_l0 = cand_l0;
+                }
+            }
+
+            // Pass B — refine L1 with L0 fixed.
+            for (dx, dy) in DIAMOND.iter().copied() {
+                if dx == 0 && dy == 0 { continue; }
+                let cand_l1_raw = MotionVector {
+                    mv_x: best_l1.mv_x.saturating_add(dx),
+                    mv_y: best_l1.mv_y.saturating_add(dy),
+                };
+                let cand_l1 = clip_mv_to_frame(
+                    cand_l1_raw, l1_ref, block_x, block_y, block_w, block_h,
+                );
+                let cost = bipred_cost_at(
+                    source, source_stride, l0_ref, l1_ref,
+                    block_x, block_y, block_w, block_h,
+                    best_l0, cand_l1, predicted_l0, predicted_l1, lambda,
+                );
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_l1 = cand_l1;
+                }
+            }
+
+            if best_l0 == prev_l0 && best_l1 == prev_l1 {
+                break; // converged
+            }
+        }
+
+        (best_l0, best_l1)
     }
 }
 
@@ -643,6 +755,40 @@ fn satd_at_mv(
     satd_block(source, source_stride, pred, block_w as usize, block_w, block_h)
 }
 
+/// §6E-D.5(c) — bipred-domain SATD + λ × (mvbits_l0 + mvbits_l1).
+///
+/// Used by [`MotionEstimator::refine_bipred`] to score bipred MV pair
+/// candidates. Builds the bipred prediction at (mv_l0, mv_l1) — i.e.
+/// `(L0[block + mv_l0] + L1[block + mv_l1] + 1) / 2` per spec
+/// § 8.4.2.3.1 — and returns the Lagrangian cost.
+#[allow(clippy::too_many_arguments)]
+fn bipred_cost_at(
+    source: &[u8],
+    source_stride: usize,
+    l0_ref: &ReconFrame,
+    l1_ref: &ReconFrame,
+    block_x: u32,
+    block_y: u32,
+    block_w: u32,
+    block_h: u32,
+    mv_l0: MotionVector,
+    mv_l1: MotionVector,
+    pred_l0: MotionVector,
+    pred_l1: MotionVector,
+    lambda: u32,
+) -> u32 {
+    let used = (block_w * block_h) as usize;
+    let mut pred_storage = [0u8; 256];
+    let pred = &mut pred_storage[..used];
+    apply_luma_mv_block_bipred(
+        l0_ref, mv_l0, l1_ref, mv_l1,
+        block_x, block_y, block_w, block_h,
+        pred, block_w as usize,
+    );
+    let satd = satd_block(source, source_stride, pred, block_w as usize, block_w, block_h);
+    satd + lambda * (mv_bit_cost(mv_l0, pred_l0) + mv_bit_cost(mv_l1, pred_l1))
+}
+
 /// Clip `mv` (qpel) so the referenced `block_w × block_h` window
 /// plus the 6-tap filter halo stays within the reference frame.
 /// Edge replication in `apply_luma_mv_block` handles out-of-bound
@@ -944,5 +1090,118 @@ mod tests {
         );
         assert_eq!(r.mv, MotionVector { mv_x: 16, mv_y: 0 });
         assert_eq!(r.cost, 0);
+    }
+
+    // -- §6E-D.5(c) refine_bipred tests -------------------------------------
+
+    #[test]
+    fn refine_bipred_returns_seeds_when_already_optimal() {
+        // Both refs identical to source → bipred at (0,0) gives zero
+        // residual. Refinement should not move from (0,0) seeds.
+        let src_fill = |_x: u32, _y: u32| 100;
+        let l0_ref = build_ref(64, 64, src_fill);
+        let l1_ref = build_ref(64, 64, src_fill);
+        let src = extract_block(&l0_ref, 16, 16);
+        let mut me = MotionEstimator::new();
+        let (r_l0, r_l1) = me.refine_bipred(
+            src.as_flattened(), 16,
+            &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+        );
+        assert_eq!(r_l0, MotionVector::ZERO);
+        assert_eq!(r_l1, MotionVector::ZERO);
+    }
+
+    #[test]
+    fn refine_bipred_finds_opposite_motion() {
+        // Construct a scenario where bipred averaging helps:
+        //   src(x, y) = 100
+        //   L0_ref(x, y) = 80 (= src - 20)  → at (0,0) L0 alone is wrong by 20
+        //   L1_ref(x, y) = 120 (= src + 20) → at (0,0) L1 alone is wrong by 20
+        //   bipred = (80 + 120 + 1)/2 = 100 → exact match.
+        // refine_bipred starting at (0,0) seeds should keep them at (0,0)
+        // because that's already the bipred-optimal pair.
+        let l0_ref = build_ref(64, 64, |_x, _y| 80);
+        let l1_ref = build_ref(64, 64, |_x, _y| 120);
+        let src = [[100u8; 16]; 16];
+        let mut me = MotionEstimator::new();
+        let (r_l0, r_l1) = me.refine_bipred(
+            src.as_flattened(), 16,
+            &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+        );
+        assert_eq!(r_l0, MotionVector::ZERO);
+        assert_eq!(r_l1, MotionVector::ZERO);
+    }
+
+    #[test]
+    fn refine_bipred_improves_on_nearby_seeds() {
+        // L0_ref shifted +1 qpel left (so true L0 MV is +1 qpel right).
+        // L1_ref shifted +1 qpel right (so true L1 MV is +1 qpel left).
+        // Source content matches the bipred at the optimal pair.
+        // Seed at (0,0)/(0,0) — slightly off the optimum.
+        // Refinement should at least not increase cost.
+        let l0_ref = build_ref(64, 64, |x, _y| {
+            // ramp content shifted by +1 in x relative to "ideal" position.
+            ((x as i32) * 5 + 50).clamp(0, 255) as u8
+        });
+        let l1_ref = build_ref(64, 64, |x, _y| {
+            ((x as i32) * 5 + 50).clamp(0, 255) as u8
+        });
+        let src = extract_block(&l0_ref, 16, 16);
+        let mut me = MotionEstimator::new();
+
+        // Score initial bipred at (0,0)/(0,0).
+        let lambda = me_lambda();
+        let cost_seed = bipred_cost_at(
+            src.as_flattened(), 16, &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+            lambda,
+        );
+
+        let (r_l0, r_l1) = me.refine_bipred(
+            src.as_flattened(), 16,
+            &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+        );
+        let cost_refined = bipred_cost_at(
+            src.as_flattened(), 16, &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            r_l0, r_l1, MotionVector::ZERO, MotionVector::ZERO,
+            lambda,
+        );
+        assert!(cost_refined <= cost_seed,
+            "refinement must never INCREASE cost: seed={cost_seed} refined={cost_refined}");
+    }
+
+    #[test]
+    fn refine_bipred_deterministic() {
+        // Same inputs → same output (load-bearing for stego Pass 1 / Pass 3).
+        let l0_ref = build_ref(64, 64, |x, y| ((x * 3 + y * 5) & 0xFF) as u8);
+        let l1_ref = build_ref(64, 64, |x, y| ((x * 5 + y * 3 + 7) & 0xFF) as u8);
+        let src = [[100u8; 16]; 16];
+        let mut me = MotionEstimator::new();
+        let (a_l0, a_l1) = me.refine_bipred(
+            src.as_flattened(), 16, &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+        );
+        let (b_l0, b_l1) = me.refine_bipred(
+            src.as_flattened(), 16, &l0_ref, &l1_ref,
+            16, 16, 16, 16,
+            MotionVector::ZERO, MotionVector::ZERO,
+            MotionVector::ZERO, MotionVector::ZERO,
+        );
+        assert_eq!(a_l0, b_l0);
+        assert_eq!(a_l1, b_l1);
     }
 }

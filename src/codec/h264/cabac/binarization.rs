@@ -373,6 +373,58 @@ pub fn sub_mb_type_p_bins(sub_mb_type: u32) -> &'static [u8] {
     }
 }
 
+// ─── Table-driven: sub_mb_type B (Table 9-38 B rows, scope 0..=3) ─
+
+/// Bin string for a B-slice sub_mb_type value, restricted to the
+/// uniform 8x8 family (sub_mb_types 0..=3 — `B_Direct_8x8`,
+/// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). Spec Table 9-38.
+///
+/// **Scope**: §6E-A6.3 ships uniform B_8x8 only. Sub-sub partitions
+/// (sub_mb_type 4..=12) land in §6E-A6.4 (descoped per the x264-medium
+/// finding — see `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+/// § "B-slice sub_mb_type bin tree"). Use [`sub_mb_type_b_ctx_inc`]
+/// for the per-bin ctxIdxInc — it varies on bin 2 depending on bin 1.
+pub fn sub_mb_type_b_bins(sub_mb_type: u32) -> &'static [u8] {
+    match sub_mb_type {
+        0 => &[0],                // B_Direct_8x8
+        1 => &[1, 0, 0],          // B_L0_8x8
+        2 => &[1, 0, 1],          // B_L1_8x8
+        3 => &[1, 1, 0, 0, 0],    // B_Bi_8x8
+        _ => {
+            debug_assert!(
+                false,
+                "B-slice sub_mb_type {sub_mb_type} out of §6E-A6.3 scope (0..=3)"
+            );
+            &[]
+        }
+    }
+}
+
+/// Per-bin `ctxIdxInc` for B-slice sub_mb_type at ctxIdxOffset 36
+/// (spec Table 9-39, B-slice sub_mb_type column). The table is path-
+/// dependent: bin 2's ctxIdxInc depends on bin 1's value (the L0/L1
+/// 3-bin tail uses ctxIdxInc=3, the Bi/sub-sub-partition family uses
+/// ctxIdxInc=2). Bins 3+ all use ctxIdxInc=3.
+///
+/// `prior_bin1` is `Some(0)` for the bin1=0 path (sub_mb_type 1, 2),
+/// `Some(1)` for the bin1=1 path (sub_mb_type 3..=12), `None` when
+/// bin_idx < 2 (where the increment is fixed regardless).
+pub fn sub_mb_type_b_ctx_inc(bin_idx: usize, prior_bin1: Option<u8>) -> u32 {
+    match bin_idx {
+        0 => 0,
+        1 => 1,
+        2 => match prior_bin1 {
+            Some(0) => 3, // L0/L1 tail terminates here
+            Some(1) => 2, // Bi/sub-sub-partition discriminator
+            _ => {
+                debug_assert!(false, "bin_idx=2 requires prior bin1");
+                3
+            }
+        },
+        _ => 3,
+    }
+}
+
 // ─── Test helpers (Vec<u8> wrappers) ────────────────────────────
 
 /// Unary binarization → `Vec<u8>` (test / debug convenience).

@@ -48,10 +48,12 @@
 //! Real implementations land in Phase 6A through 6E.
 
 pub mod b_direct_predictor;
+pub mod b_inter_prediction;
 pub mod b_partitioned;
 pub mod baseline_transcode;
 pub mod bitstream_writer;
 pub mod deblocking_filter;
+#[allow(clippy::module_inception)] // Encoder driver lives in encoder/encoder.rs by design.
 pub mod encoder;
 pub mod i4x4_encode;
 pub mod inter_mode;
@@ -66,6 +68,7 @@ pub mod poc;
 pub mod quantization;
 pub mod rate_control;
 pub mod rdo;
+pub mod rdo_b;
 pub mod reconstruction;
 pub mod reference_buffer;
 pub mod reorder;

@@ -16,7 +16,8 @@
 
 use super::binarization::{
     binarize_egk_suffix, binarize_tu, binarize_unary, mb_qp_delta_remap,
-    mb_type_i_bins, mb_type_p_bins_prefix, sub_mb_type_p_bins,
+    mb_type_i_bins, mb_type_p_bins_prefix, sub_mb_type_b_bins,
+    sub_mb_type_b_ctx_inc, sub_mb_type_p_bins,
 };
 use super::context::{initialize_contexts, CabacContext, CabacInitSlot};
 use super::engine::CabacEngine;
@@ -184,6 +185,21 @@ fn ctx_idx_inc_mb_type_bin(
         (17, 3) => env_or("PHASM_IIP_CTX_17_3", 2),
         (17, 5) => env_or("PHASM_IIP_CTX_17_5", 3),
         (17, 6) => env_or("PHASM_IIP_CTX_17_6", 3),
+        // §6E-A6.1q.f (2026-05-02): B-slice mb_type prefix bin
+        // ctxIdxInc per spec Table 9-41 / ffmpeg
+        // `decode_cabac_mb_type_b_slice`. Bins 1, 3, 4, 5 were
+        // defaulting to 0; per spec bin 1 = 3, bins 3-5 = 5. The
+        // missing entries caused encoder/walker to land on a
+        // different CABAC context state from ffmpeg, breaking
+        // ffmpeg-conformance on every B-frame larger than 1 MB.
+        // Round-trip kept working because both sides mirrored the
+        // wrong context. Bin 2 (multi-partition) is handled via
+        // `ctx_idx_inc_prior_bin` (correctly: 4 if prior_bin[1]==1
+        // else 5).
+        (27, 1) => 3,
+        (27, 3) => 5,
+        (27, 4) => 5,
+        (27, 5) => 5,
         _ => 0,
     }
 }
@@ -705,6 +721,23 @@ pub fn encode_sub_mb_type_p(enc: &mut CabacEncoder, sub_mb_type: u32) {
         // All bins use Table 9-39 static increments {0, 1, 2}.
         let ctx_inc = bin_idx as u32;
         enc.encode_dec(bin, ctx_offset::SUB_MB_TYPE_P + ctx_inc);
+    }
+}
+
+/// §6E-A6.3 — encode `sub_mb_type` for a B-slice (Table 9-38 B rows,
+/// scope 0..=3 — uniform 8x8 family). ctxIdxOffset 36 with the path-
+/// dependent increment table from spec Table 9-39 (bin 2 differs by
+/// prior bin 1). See [`sub_mb_type_b_bins`] / [`sub_mb_type_b_ctx_inc`].
+pub fn encode_sub_mb_type_b(enc: &mut CabacEncoder, sub_mb_type: u32) {
+    debug_assert!(
+        sub_mb_type <= 3,
+        "B-slice sub_mb_type {sub_mb_type} outside §6E-A6.3 scope (0..=3)"
+    );
+    let bins = sub_mb_type_b_bins(sub_mb_type);
+    let prior_bin1 = bins.get(1).copied();
+    for (bin_idx, &bin) in bins.iter().enumerate() {
+        let ctx_inc = sub_mb_type_b_ctx_inc(bin_idx, prior_bin1);
+        enc.encode_dec(bin, ctx_offset::SUB_MB_TYPE_B + ctx_inc);
     }
 }
 

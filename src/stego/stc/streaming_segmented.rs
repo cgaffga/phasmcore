@@ -375,7 +375,7 @@ impl<'a> StreamingViterbiPhaseB<'a> {
                 }
 
                 progress_counter_a += 1;
-                if progress_counter_a % progress_interval_a == 0 {
+                if progress_counter_a.is_multiple_of(progress_interval_a) {
                     if progress::is_cancelled() {
                         return Err("cancelled");
                     }

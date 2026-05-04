@@ -193,7 +193,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     // bar jumping back to 0%.  The bar continues smoothly from the Armor
     // phase into the Ghost phase.
     let (armor_done, _) = progress::get();
-    progress::set_total(armor_done + GHOST_DECODE_STEPS as u32);
+    progress::set_total(armor_done + GHOST_DECODE_STEPS);
     let ghost_result = ghost_decode(stego_bytes, passphrase);
     match ghost_result {
         Ok(payload) => return Ok((payload, DecodeQuality::ghost())),

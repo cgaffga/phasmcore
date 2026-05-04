@@ -48,13 +48,14 @@ const STC_H: usize = 7;
 ///
 /// Compiles to a no-op (always 1) when the `parallel` Cargo feature is
 /// disabled — WASM and feature-off CLI builds.
+#[allow(dead_code)] // Used only under #[cfg(feature = "parallel")] in max_parallel_gops().
 const MAX_PARALLEL_GOPS_DEFAULT: usize = 4;
 
 /// Resolve the runtime cap on parallel GOP encodes.
 fn max_parallel_gops() -> usize {
     #[cfg(not(feature = "parallel"))]
     {
-        return 1;
+        1
     }
     #[cfg(feature = "parallel")]
     {
@@ -449,6 +450,7 @@ fn read_u32_be_from_bits(bits: &[u8]) -> u32 {
 /// position where `stego_bits` differs from `cover_bits`, flip the bit in
 /// `output` (guarded against emulation-prevention-byte corruption). Shared
 /// by the coefficient and MVD domain passes at encode.
+#[allow(dead_code)] // Pre-§30D-C primitive; superseded by inline injection hooks.
 fn apply_domain_flips(
     output: &mut [u8],
     stego_bits: &[u8],
@@ -1421,7 +1423,6 @@ fn scan_frame_range(
     let mut all_positions = Vec::new();
     let mut all_ac_energies = Vec::new();
     let mut uniward_costs: Vec<Option<f32>> = Vec::new();
-    let mut gop_position = 0u32;
     let mut global_block_idx = 0u32;
     // Phase 2c state — one pending I-frame at a time.
     let mut pending_drift: Option<PendingIFrameDrift> = None;
@@ -1445,11 +1446,6 @@ fn scan_frame_range(
     {
         if sample.data.is_empty() {
             continue;
-        }
-
-        // Reset GOP position on sync (IDR) frames
-        if sample.is_sync {
-            gop_position = 0;
         }
 
         // Parse NAL units from sample data, finding slice NALs with EP byte maps
@@ -1850,8 +1846,6 @@ fn scan_frame_range(
                 // planes / frame_mbs / frame_qps drop on scope exit.
             }
         }
-
-        gop_position += 1;
     }
 
     // Phase 2c: finalise the last pending I-frame's drift now that we've

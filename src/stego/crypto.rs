@@ -191,13 +191,28 @@ pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<
 /// The ciphertext includes the 16-byte authentication tag appended by AES-GCM-SIV.
 pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONCE_LEN], [u8; SALT_LEN]), StegoError> {
     use rand::RngCore;
-    let mut rng = rand::thread_rng();
 
     let mut salt = [0u8; SALT_LEN];
-    rng.fill_bytes(&mut salt);
-
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce_bytes);
+
+    // §B-direct-fix diag — `PHASM_DETERMINISTIC_SEED=<u64>` env var
+    // overrides the OsRng salt+nonce with a ChaCha8-seeded RNG so
+    // consecutive encode runs produce byte-identical output (modulo
+    // any other non-determinism in the encoder). Diagnostic-only:
+    // production paths leave the env var unset, falling back to
+    // `rand::thread_rng` for cryptographic salt+nonce per spec.
+    if let Ok(seed_str) = std::env::var("PHASM_DETERMINISTIC_SEED")
+        && let Ok(seed) = seed_str.parse::<u64>()
+    {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+        rng.fill_bytes(&mut salt);
+        rng.fill_bytes(&mut nonce_bytes);
+    } else {
+        let mut rng = rand::thread_rng();
+        rng.fill_bytes(&mut salt);
+        rng.fill_bytes(&mut nonce_bytes);
+    }
 
     let key = derive_encryption_key(passphrase, &salt)?;
     let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");

@@ -135,6 +135,7 @@ impl Default for CabacNeighborMB {
 /// top-row MBs and the immediate-left MB so the derivation rules can
 /// answer neighbor queries.
 pub struct CabacNeighborContext {
+    #[allow(dead_code)] // Stored at construction for diagnostics; readers index via mb_x.
     mb_width: usize,
     /// Top row: one entry per MB column (index = mb_x).
     top_row: Vec<Option<CabacNeighborMB>>,
@@ -706,7 +707,11 @@ impl CurrentMbCbf {
 /// BLOCK_INDEX_TO_POS ordering.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CurrentMbMvdAbs {
+    /// L0 magnitudes (also used by P-slice paths — single list).
     pub comp: [[i16; 16]; 2],
+    /// §6E-A6.1q.e (#154) — L1 magnitudes for B-slice partitioned
+    /// MBs. P-slice paths leave these at 0 (no L1 partitions).
+    pub comp_l1: [[i16; 16]; 2],
 }
 
 impl CurrentMbMvdAbs {
@@ -716,7 +721,8 @@ impl CurrentMbMvdAbs {
 
     /// Fill a rectangular 4×4-block region within the current MB with
     /// this partition's absolute MVD values. The region is (bx0..bx0+w)
-    /// × (by0..by0+h) in 4×4-block coords.
+    /// × (by0..by0+h) in 4×4-block coords. L0 list path (P-slice + L0
+    /// partitions of B-slice).
     pub fn fill_region(&mut self, bx0: u8, by0: u8, w: u8, h: u8, abs_mvd_x: i16, abs_mvd_y: i16) {
         for dy in 0..h {
             for dx in 0..w {
@@ -727,14 +733,51 @@ impl CurrentMbMvdAbs {
         }
     }
 
+    /// §6E-A6.1q.e (#154) — fill the L1-list region. Mirror of
+    /// `fill_region` but writes `comp_l1` for B-slice L1 partitions.
+    pub fn fill_region_l1(
+        &mut self,
+        bx0: u8,
+        by0: u8,
+        w: u8,
+        h: u8,
+        abs_mvd_x: i16,
+        abs_mvd_y: i16,
+    ) {
+        for dy in 0..h {
+            for dx in 0..w {
+                let idx = block_pos_to_luma_idx(bx0 + dx, by0 + dy);
+                self.comp_l1[0][idx] = abs_mvd_x;
+                self.comp_l1[1][idx] = abs_mvd_y;
+            }
+        }
+    }
+
     #[inline]
     pub fn get(&self, component: u8, block_idx: usize) -> i16 {
         self.comp[component as usize][block_idx]
     }
 
+    /// §6E-A6.1q.e — read per-list within-MB magnitude.
+    #[inline]
+    pub fn get_per_list(&self, component: u8, block_idx: usize, list: u8) -> i16 {
+        match list {
+            1 => self.comp_l1[component as usize][block_idx],
+            _ => self.comp[component as usize][block_idx],
+        }
+    }
+
     #[inline]
     pub fn to_neighbor(&self) -> [[i16; 16]; 2] {
         self.comp
+    }
+
+    /// §6E-A6.1q.e — extract L1 magnitudes for the
+    /// `CabacNeighborMB::abs_mvd_comp_l1` commit on B-slice
+    /// partitioned MBs.
+    #[inline]
+    pub fn to_neighbor_l1(&self) -> [[i16; 16]; 2] {
+        self.comp_l1
     }
 }
 
@@ -771,6 +814,72 @@ pub fn compute_mvd_ctx_idx_inc_bin0(
             Some(mb) => mb.abs_mvd_comp[component as usize]
                 [block_pos_to_luma_idx(cur_bx, 3)]
                 .unsigned_abs() as u32,
+            None => 0,
+        }
+    };
+    let sum = abs_a + abs_b;
+    if sum < 3 {
+        0
+    } else if sum > 32 {
+        2
+    } else {
+        1
+    }
+}
+
+/// §6E-A6.1q.e (#154) — per-list bin 0 ctxIdxInc for `mvd_lX` with
+/// proper within-MB / cross-MB neighbour selection. Spec §
+/// 9.3.3.1.1.7 eq 9-15.
+///
+/// `cur_bx`, `cur_by`: partition's top-left 4×4-block coordinates
+/// within the current MB (each 0..=3).
+///
+/// For the A neighbour (`cur_bx > 0`), reads partition's left
+/// neighbour from `current_mb` per-list. For B (`cur_by > 0`),
+/// reads above-neighbour. Otherwise falls back to cross-MB
+/// `neighbors` per-list.
+///
+/// Used by B-slice partitioned (16×8 / 8×16, mb_types 4..21) +
+/// B_8x8 (mb_type 22) emission and walker paths where partition
+/// 1+'s within-MB neighbour is partition 0's just-emitted MVD.
+pub fn compute_mvd_ctx_idx_inc_bin0_per_list(
+    current_mb: &CurrentMbMvdAbs,
+    neighbors: &CabacNeighborContext,
+    mb_x: usize,
+    cur_bx: u8,
+    cur_by: u8,
+    component: u8,
+    list: u8,
+) -> u32 {
+    let abs_a: u32 = if cur_bx > 0 {
+        current_mb
+            .get_per_list(component, block_pos_to_luma_idx(cur_bx - 1, cur_by), list)
+            .unsigned_abs() as u32
+    } else {
+        match neighbors.neighbor_a(mb_x) {
+            Some(mb) => {
+                let arr = match list {
+                    1 => &mb.abs_mvd_comp_l1,
+                    _ => &mb.abs_mvd_comp,
+                };
+                arr[component as usize][block_pos_to_luma_idx(3, cur_by)].unsigned_abs() as u32
+            }
+            None => 0,
+        }
+    };
+    let abs_b: u32 = if cur_by > 0 {
+        current_mb
+            .get_per_list(component, block_pos_to_luma_idx(cur_bx, cur_by - 1), list)
+            .unsigned_abs() as u32
+    } else {
+        match neighbors.neighbor_b(mb_x) {
+            Some(mb) => {
+                let arr = match list {
+                    1 => &mb.abs_mvd_comp_l1,
+                    _ => &mb.abs_mvd_comp,
+                };
+                arr[component as usize][block_pos_to_luma_idx(cur_bx, 3)].unsigned_abs() as u32
+            }
             None => 0,
         }
     };
@@ -1327,6 +1436,70 @@ mod tests {
             let per_list = ctx_idx_inc_mvd_bin0_per_list(&ctx, 0, 0, 0, component, 0);
             assert_eq!(legacy, per_list, "component {component}: legacy {legacy} != per-list {per_list}");
         }
+    }
+
+    /// §6E-A6.1q.e (#154) — partition 1 of 16×8 (cur_bx=0, cur_by=2)
+    /// reads partition 0's just-emitted MVD via `current_mvd`'s
+    /// within-MB B neighbour at (0, 1). Cross-MB-only would read top
+    /// MB's (0, 3) and miss the within-MB context entirely.
+    #[test]
+    fn compute_mvd_bin0_per_list_within_mb_b_neighbour() {
+        let ctx = make_ctx();
+        let mut current = CurrentMbMvdAbs::new();
+        // Partition 0 (top half, 16×8): blocks (0..4) × (0..2). Fill
+        // its L0 MVD with abs |MVD_x|=20 (above the spec >32 sum
+        // threshold? 20 < 32, so we expect the |sum| < 3 / 3..=32 / >32
+        // path to land on the middle case for a single neighbour =20).
+        current.fill_region(0, 0, 4, 2, /* abs_x */ 20, /* abs_y */ 0);
+
+        // Partition 1 TL = (0, 2). B neighbour = within-MB (0, 1) =
+        // partition 0's MVD = |20|. A = cross-MB left (none here, 0).
+        // Sum = 20 → 3..=32 → ctxIdxInc = 1.
+        let inc = compute_mvd_ctx_idx_inc_bin0_per_list(
+            &current, &ctx, /* mb_x */ 0,
+            /* cur_bx */ 0, /* cur_by */ 2,
+            /* component */ 0, /* list */ 0,
+        );
+        assert_eq!(
+            inc, 1,
+            "partition 1 should read partition 0's |20| from within-MB"
+        );
+    }
+
+    /// §6E-A6.1q.e — when cur_bx=0 cur_by=0 (top-left partition or
+    /// 16×16 MB), no within-MB neighbours exist; should fall back to
+    /// cross-MB. With no neighbours either side, ctxIdxInc = 0.
+    #[test]
+    fn compute_mvd_bin0_per_list_no_within_mb_top_left() {
+        let ctx = make_ctx();
+        let current = CurrentMbMvdAbs::new();
+        let inc = compute_mvd_ctx_idx_inc_bin0_per_list(
+            &current, &ctx, 0, 0, 0, 0, 0,
+        );
+        assert_eq!(inc, 0);
+    }
+
+    /// §6E-A6.1q.e — L1 path reads `comp_l1` not `comp` for within-MB.
+    #[test]
+    fn compute_mvd_bin0_per_list_l1_separate_state() {
+        let ctx = make_ctx();
+        let mut current = CurrentMbMvdAbs::new();
+        // L0 partition 0 has MVD=50 (would push sum past 32 if read).
+        current.fill_region(0, 0, 4, 2, 50, 0);
+        // L1 partition 0 has MVD=0 (left untouched).
+
+        // Partition 1 of 16×8 reading L1: B neighbour = within-MB L1
+        // (0, 1) = 0. A = none. Sum = 0 → ctxIdxInc = 0.
+        let inc_l1 = compute_mvd_ctx_idx_inc_bin0_per_list(
+            &current, &ctx, 0, 0, 2, 0, /* list */ 1,
+        );
+        assert_eq!(inc_l1, 0, "L1 partition 1 sees zero MVD on L1 list");
+
+        // Same partition reading L0: sees 50 → sum=50 > 32 → inc=2.
+        let inc_l0 = compute_mvd_ctx_idx_inc_bin0_per_list(
+            &current, &ctx, 0, 0, 2, 0, /* list */ 0,
+        );
+        assert_eq!(inc_l0, 2, "L0 partition 1 sees |50| on L0 list");
     }
 
     #[test]

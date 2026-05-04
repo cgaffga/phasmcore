@@ -118,7 +118,8 @@ drone encoder restricts itself to the two extremes, never picking
 
 ## File index
 
-- `x264_reference_mb_histogram.txt` — IMG_4138 HEVC source → x264 medium-CRF23
+- `x264_reference_mb_histogram_samefixture.txt` — **GATE LIVE** (post §6E-D.6(c) 2026-05-03). x264-medium-CRF23 IBPBP encode of the SAME 10-frame IMG_4138 fixture the gate test runs phasm on. Apples-to-apples comparison; isolates encoder behaviour from fixture content. See `memory/h264_phase6e_d_x264_same_fixture.md`.
+- `x264_reference_mb_histogram.txt` — **LEGACY** (pre §6E-D.6(c)). IMG_4138 HEVC source → x264 medium-CRF23, 271-frame mixed-content batch. Kept for historical context. NOT used by the live gate any more — its content distribution differed from the gate's 4-B-frame slice, conflating fixture-content gaps with encoder-behaviour gaps.
 - `x264_reference_mb_histogram_4273.txt` — IMG_4273 same pipeline
 - `lumix_g9_1080p_reference_mb_histogram.txt` — Panasonic Lumix G9 P1024246 (real camera output)
 - `dji_mini2_2_7k_reference_mb_histogram.txt` — DJI Mini2 DJI_0558 (real drone output)

@@ -1,7 +1,13 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
-//
+
+// `let mut x = X::default(); x.field = ...;` is the intended pattern in
+// the §30D-C orchestrator: defaults handle the common-case shape, with
+// per-call overrides toggling specific fields. Refactoring into struct
+// literals would obscure the layered-default semantics.
+#![allow(clippy::field_reassign_with_default)]
+
 // Phase 6D.8 chunk 4 — two-run encode-time stego orchestration driver.
 //
 // Wires the framework (chunks 1+2 hook trait + Encoder field + chunks
@@ -246,6 +252,16 @@ fn build_encoder(
     // the SPS level. The CABAC walker handles I_8x8 (transform_size_8x8
     // = 1) since the same task; encoder + walker are now in parity.
     enc.enable_transform_8x8 = true;
+    // Task #204 + #208 (2026-05-04) — production stego paths default
+    // to `BRdoConfig::PRODUCTION_VISUAL` (RDO mode-decision + B-frame
+    // residual emission). This is the HandBrake/x264-medium-mimic
+    // visual-quality preset, paired with `MuxerProfile::HandbrakeX264`
+    // at the mux layer in CLI / iOS / Android bridges.
+    //
+    // No-op for IPPPP (b_count=0) patterns — only fires on IBPBP /
+    // multi-B GopPattern. #208 closed the shadow-under-residual
+    // regression; cascade-safe across primary + N-shadow paths.
+    enc.b_rdo_config = super::super::encoder::mb_decision_b::BRdoConfig::PRODUCTION_VISUAL;
     let _ = CabacInitSlot::ISI;
     Ok(enc)
 }
@@ -720,7 +736,18 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming(
         )));
     }
 
-    let b_count = 1usize; // §6E-A.deploy.3 default IBPBP M=2
+    // §Default-flip.IBPBP (#193) 2026-05-03: B-frame visual bug
+    // root-caused + fixed in commit 5b85432 — bucket-based no-RDO
+    // L0/L1/Bi emission was polluting the spatial-direct grid.
+    // Fallback now emits Skip / Direct only. Visual quality
+    // confirmed clean on iPhone7 1080p (commit message references
+    // ~24-25 dB Y-PSNR per frame at 640×384 IBPBP).
+    //
+    // Default restored to IBPBP{ b_count: 1 } (Apple-iPhone canonical
+    // M=2). With §6E-D.5(m) HF-prop Direct multiplier + §6E-D.5(o)
+    // Bi rate hack also restored, mode distribution within ε=5pp of
+    // x264-medium on the §6E-A6.5 gate fixture.
+    let b_count = 1usize;
     let h = 4usize;
     let quality = Some(26u8);
 
@@ -1010,6 +1037,10 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
 ///
 /// Decoder side: `h264_stego_smart_decode_video_with_payload`
 /// returns `PayloadData { text, files, .. }`.
+///
+/// Defaults to the §6E-A.deploy IBPBP{ gop, b_count: 1 } pattern.
+/// For source-adaptive cadence (§Stealth.L3.2), use
+/// [`h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files`].
 #[allow(clippy::too_many_arguments)]
 pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
     yuv: &[u8],
@@ -1021,16 +1052,50 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
     files: &[crate::stego::payload::FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
+    // §Default-flip.IBPBP (#193) — visual bug fixed in commit 5b85432.
+    let pattern = super::gop_pattern::GopPattern::Ibpbp {
+        gop: gop_size,
+        b_count: 1,
+    };
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files(
+        yuv, width, height, n_frames, pattern, message, files, passphrase,
+    )
+}
+
+/// §Stealth.L3.2 follow-on (#149) — pattern-aware variant of
+/// [`h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files`].
+///
+/// Lets the caller pick the GOP cadence (typically via
+/// `GopPattern::auto_select(source_mp4)`); the streaming v2
+/// orchestrator + per-GOP Phase B Viterbi infrastructure is
+/// already pattern-driven via the underlying `pass1_count_per_gop_
+/// 4domain` and `pass3_inject_4domain_streaming` helpers, so this
+/// just exposes the parameter that was already plumbed through.
+///
+/// `pattern.gop_size()` drives the IDR period; `pattern.legacy_
+/// b_count()` drives the encoder's `enable_b_frames` and
+/// `pattern_from_legacy_args` derivations downstream.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    message: &str,
+    files: &[crate::stego::payload::FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    let gop_size = pattern.gop_size();
     use crate::stego::{crypto, frame, payload};
     use crate::stego::stc::streaming_segmented::StreamingViterbiPhaseB;
     use super::cover_replay::H264GopReplayCover;
     use super::hook::EmbedDomain;
-    use super::inject::DomainCover;
+    
     use super::orchestrate::{
-        stealth_weighted_allocation, split_message_per_domain, DomainPlan,
-        PlanInjector, StealthAllocator,
+        stealth_weighted_allocation, split_message_per_domain, DomainPlan, StealthAllocator,
     };
-    use super::encoder_hook::InjectionHook;
+    
     use super::keys::CabacStegoMasterKeys;
     use super::gop_pattern::GopPattern;
     use super::per_gop_plan::PerGopPlanBuilder;
@@ -1054,7 +1119,7 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
         )));
     }
 
-    let b_count = 1usize;
+    let b_count = pattern.legacy_b_count();
     let h = 4usize;
     let quality = Some(26u8);
 
@@ -1297,7 +1362,11 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
 
     let mut builder = PerGopPlanBuilder::new(&effective_counts, active_domains);
     debug_assert_eq!(builder.num_gops(), num_gops);
-    let pattern = GopPattern::Ibpbp { gop: gop_size, b_count };
+    // Pattern is now a parameter — `pattern_from_legacy_args` would
+    // have produced the same value but the caller's choice wins
+    // (e.g. Ipppp from `auto_select` on an H.264 IPPPP-source clip
+    // collapses to b_count=0 here).
+    let _ = GopPattern::Ipppp { gop: 0 }; // keep GopPattern import live
 
     // Per-GOP encoded bytes, filled out-of-order as GOPs fire;
     // assembled into the final stream in temporal order at the end.
@@ -1917,10 +1986,7 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows<'a>(
     primary_passphrase: &str,
     shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
 ) -> Result<Vec<u8>, StegoError> {
-    // Default to Apple-iPhone-canonical IBPBP M=2, matches the
-    // §6E-A.deploy primary default. Callers who want IPPPP or a
-    // different B-frame mix should call the `_with_pattern`
-    // variant directly.
+    // §Default-flip.IBPBP (#193) — visual bug fixed in commit 5b85432.
     h264_stego_encode_yuv_string_with_n_shadows_with_pattern(
         yuv, width, height, n_frames,
         super::gop_pattern::GopPattern::Ibpbp { gop: gop_size, b_count: 1 },
@@ -2536,6 +2602,7 @@ fn translate_shadow_state(
 /// frame 0 is IDR (today's §30D-C single-GOP shape). `gop_size = G`
 /// ⇒ IDR every G frames (multi-IDR shape locked in for §6E-C1a).
 /// `is_idr(fi) = fi % gop_size == 0`.
+#[allow(dead_code)] // §6E-C1a frame-typing helper, kept for diagnostics + future re-wire.
 #[inline]
 fn is_idr_frame(fi: usize, gop_size: usize) -> bool {
     debug_assert!(gop_size > 0, "gop_size must be > 0");
@@ -2553,12 +2620,12 @@ fn is_idr_frame(fi: usize, gop_size: usize) -> bool {
 /// callers pass `GopPattern::Ipppp { gop: gop_size }` to keep encode
 /// order ≡ display order — output is byte-identical to the
 /// pre-refactor `for fi in 0..n_frames` shape.
-fn iter_frames_in_encode_order<'a>(
-    yuv: &'a [u8],
+fn iter_frames_in_encode_order(
+    yuv: &[u8],
     frame_size: usize,
     n_frames: usize,
     pattern: super::gop_pattern::GopPattern,
-) -> impl Iterator<Item = (super::gop_pattern::EncodeOrderFrame, &'a [u8])> {
+) -> impl Iterator<Item = (super::gop_pattern::EncodeOrderFrame, &[u8])> {
     super::gop_pattern::iter_encode_order(n_frames, pattern).map(move |meta| {
         let d = meta.display_idx as usize;
         let frame = &yuv[d * frame_size..(d + 1) * frame_size];
@@ -2628,7 +2695,7 @@ pub fn pass1_count_per_gop_4domain(
     // Per-frame encode with a fresh PositionCountingHook installed
     // at each GOP boundary. The hook accumulates per-GOP counts;
     // we drain at the next boundary or end-of-clip.
-    let mut frame_iter = iter_frames_in_encode_order(
+    let frame_iter = iter_frames_in_encode_order(
         yuv, frame_size, n_frames, pattern,
     )
     .peekable();
@@ -2641,7 +2708,7 @@ pub fn pass1_count_per_gop_4domain(
     // by gop_idx.
     enc.set_stego_hook(Some(Box::new(PositionCountingHook::new())));
 
-    while let Some((meta, frame)) = frame_iter.next() {
+    for (meta, frame) in frame_iter {
         // GOP boundary: drain the previous hook's count, install fresh.
         if meta.gop_idx != current_gop_idx {
             if current_gop_idx != u32::MAX {
@@ -4022,6 +4089,32 @@ mod tests {
         let recovered_shadow = h264_stego_shadow_decode(&bytes, shadow_pass)
             .expect("shadow decode");
         assert_eq!(recovered_shadow, shadow);
+    }
+
+    /// Task #208 diagnostic — same setup as the failing
+    /// `shadow_roundtrip_handles_longer_primary_via_cascade` but
+    /// PRIMARY ONLY (no shadow). If this passes under
+    /// B_RDO+RESIDUAL, the bug is shadow-specific (cascade-safety
+    /// or shadow-position-selection). If it ALSO fails, the bug is
+    /// in primary STC under B-frame residual cover.
+    #[test]
+    #[ignore]
+    fn task208_primary_only_long_msg_under_residual() {
+        use super::super::decode_pixels::h264_stego_decode_yuv_string_4domain;
+
+        let yuv = correlated_yuv(64, 64, 4);
+        let primary = "primary message — a sentence of moderate length to drive primary STC's residual flips up";
+        let primary_pass = "alice";
+
+        let bytes = h264_stego_encode_yuv_string_4domain_multigop(
+            &yuv, 64, 64, 4, /* gop_size */ 4,
+            primary, primary_pass,
+        ).expect("primary-only encode");
+
+        let recovered = h264_stego_decode_yuv_string_4domain(
+            &bytes, primary_pass,
+        ).expect("primary decode");
+        assert_eq!(recovered, primary);
     }
 
     /// Phase 6E-C1b-v2 — cascade verification handles longer primary

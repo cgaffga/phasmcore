@@ -205,7 +205,7 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     (0..n_blocks).into_par_iter().for_each(compute_block);
 
     #[cfg(not(feature = "parallel"))]
-    (0..n_blocks).for_each(|bi| compute_block(bi));
+    (0..n_blocks).for_each(compute_block);
 
     map
 }
@@ -296,7 +296,7 @@ pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<
     (0..n_blocks).into_par_iter().for_each(compute_block);
 
     #[cfg(not(feature = "parallel"))]
-    (0..n_blocks).for_each(|bi| compute_block(bi));
+    (0..n_blocks).for_each(compute_block);
 
     let phase3_steps = UNIWARD_PROGRESS_STEPS - phase1_steps - phase2_steps;
     for _ in 0..phase3_steps {
@@ -748,7 +748,7 @@ pub fn compute_positions_streaming(
         (0..n_strip_blocks).into_par_iter().for_each(compute_block);
 
         #[cfg(not(feature = "parallel"))]
-        (0..n_strip_blocks).for_each(|bi| compute_block(bi));
+        (0..n_strip_blocks).for_each(compute_block);
 
         // Scan strip CostMap and collect positions.
         for br_local in 0..strip_bt {

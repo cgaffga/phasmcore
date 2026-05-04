@@ -12,14 +12,14 @@
 //! module owns its own implementation.
 //!
 //! Phase 6C sub-sub-phases:
-//!   - 6C.1 CABAC arithmetic engine (state, put, bypass, terminate, renorm, finish)
-//!   - 6C.2 H.264 CABAC tables (RANGE_TAB_LPS, TRANS_IDX_*, context-init)
-//!   - 6C.3 Binarization (unary, truncated unary, Exp-Golomb, fixed-length, custom)
-//!   - 6C.4 Context selection logic (depends on neighbor values)
-//!   - 6C.5 Per-syntax-element encoders (mb_skip_flag, mb_type, sub_mb_type,
-//!          intra modes, ref_idx, mvd, qp_delta, CBP, residual block)
-//!   - 6C.6 Integration (PPS wiring, slice framing, feature parity)
-//!   - 6C.7 Post-CABAC polish (including 8×8 DCT from deferred #11)
+//! - 6C.1 CABAC arithmetic engine (state, put, bypass, terminate, renorm, finish)
+//! - 6C.2 H.264 CABAC tables (RANGE_TAB_LPS, TRANS_IDX_*, context-init)
+//! - 6C.3 Binarization (unary, truncated unary, Exp-Golomb, fixed-length, custom)
+//! - 6C.4 Context selection logic (depends on neighbor values)
+//! - 6C.5 Per-syntax-element encoders (mb_skip_flag, mb_type, sub_mb_type,
+//!   intra modes, ref_idx, mvd, qp_delta, CBP, residual block)
+//! - 6C.6 Integration (PPS wiring, slice framing, feature parity)
+//! - 6C.7 Post-CABAC polish (including 8×8 DCT from deferred #11)
 //!
 //! ## Critical lessons from the HEVC CABAC saga (DO NOT repeat):
 //!

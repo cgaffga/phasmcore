@@ -11,7 +11,7 @@ use phasm_core::{detect_video_codec, VideoCodec};
 #[cfg(not(feature = "cabac-stego"))]
 use phasm_core::h264_ghost_encode;
 #[cfg(feature = "cabac-stego")]
-use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files;
+use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files;
 #[cfg(feature = "cabac-stego")]
 use phasm_core::h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files;
 #[cfg(feature = "cabac-stego")]
@@ -292,16 +292,34 @@ fn run_cabac_encode(
                 yuv_bytes.len(), expected, probe.width, probe.height, probe.n_frames,
             )));
         }
-        let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files(
-            &yuv_bytes, probe.width, probe.height, probe.n_frames, gop_size,
+        // §Stealth.L3.2 — auto-select GOP pattern from source MP4
+        // cadence. IPPPP-source clips emit IPPPP (no B-frames, no
+        // ctts); IBPBP-source clips emit IBPBP. HEVC/AV1/non-H.264
+        // sources fall through to the HandBrake/x264-medium centroid.
+        // Caller's --gop-size override wins over detected GOP size
+        // while preserving the detected B-frame structure.
+        let pattern = {
+            let detected = std::fs::read(input)
+                .ok()
+                .as_deref()
+                .map(|b| phasm_core::GopPattern::auto_select(Some(b)))
+                .unwrap_or_else(phasm_core::GopPattern::handbrake_x264_centroid);
+            match detected {
+                phasm_core::GopPattern::Ipppp { .. } => {
+                    phasm_core::GopPattern::Ipppp { gop: gop_size }
+                }
+                phasm_core::GopPattern::Ibpbp { b_count, .. } => {
+                    phasm_core::GopPattern::Ibpbp { gop: gop_size, b_count }
+                }
+            }
+        };
+        eprintln!("Auto-selected GopPattern: {pattern:?}");
+        let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files(
+            &yuv_bytes, probe.width, probe.height, probe.n_frames, pattern,
             message, files, passphrase,
         )?;
         std::fs::write(&annex_b_temp, &annex_b)?;
         let audio_source = probe.has_audio.then_some(input.as_path());
-        // §30D-C orchestrator default: IBPBP{ gop_size, b_count: 1 }.
-        // The patterned mux uses this to derive ctts + edts/elst when
-        // B-frames are present (HandBrake convention).
-        let pattern = phasm_core::GopPattern::Ibpbp { gop: gop_size, b_count: 1 };
         let dropped_audio = transcode::mux_annexb_to_mp4_with_profile(
             &annex_b_temp, audio_source, &probe.frame_rate,
             probe.width, probe.height, probe.n_frames, pattern,

@@ -59,6 +59,11 @@ pub fn decode_unary(
 
 /// Decode a Truncated-Unary value with cMax. Read up to `c_max` bins;
 /// stop at the first 0 OR after `c_max` ones (saturated).
+// Spec § 9.3.2.6 TU decode is described in terms of an accumulator
+// `v` that increments for every emitted '1' until the first '0'.
+// Mirroring that shape — even though `v == bin_idx` here — keeps the
+// reader aligned with the spec's prose.
+#[allow(clippy::explicit_counter_loop)]
 pub fn decode_tu(
     dec: &mut CabacDecoder<'_>,
     c_max: u32,
@@ -291,6 +296,12 @@ fn ctx_idx_inc_mb_type_bin(
         (17, 3) => 2,
         (17, 5) => 3,
         (17, 6) => 3,
+        // §6E-A6.1q.f — B-slice mb_type prefix bins per spec Table
+        // 9-41 / ffmpeg. Mirror of encoder.rs:178-203 fix.
+        (27, 1) => 3,
+        (27, 3) => 5,
+        (27, 4) => 5,
+        (27, 5) => 5,
         _ => 0,
     }
 }
@@ -576,6 +587,50 @@ pub fn decode_sub_mb_type_p(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeErr
     // bin 2: ctxIdxInc = 2
     let bin2 = dec.decode_dec(ctx_offset::SUB_MB_TYPE_P + 2)?;
     Ok(if bin2 == 1 { 2 } else { 3 })
+}
+
+/// §6E-A6.3 — decode `sub_mb_type` for a B-slice (uniform 8x8 family,
+/// values 0..=3). Spec Table 9-38 B rows, ctxIdxOffset 36; ctxIdxInc
+/// from Table 9-39 with bin 2 path-dependent on bin 1.
+///
+/// **Scope**: §6E-A6.3 ships sub_mb_types 0..=3 (`B_Direct_8x8`,
+/// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). The remaining 9 sub-sub-
+/// partition variants (4..=12, descoped per the x264-medium finding)
+/// return `DecodeError::Unsupported` until §6E-A6.4.
+pub fn decode_sub_mb_type_b(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeError> {
+    let base = ctx_offset::SUB_MB_TYPE_B;
+    // bin 0 (ctxIdxInc 0): 0 → B_Direct_8x8.
+    let bin0 = dec.decode_dec(base)?;
+    if bin0 == 0 {
+        return Ok(0);
+    }
+    // bin 1 (ctxIdxInc 1): 0 → L0/L1 tail; 1 → Bi/sub-sub family.
+    let bin1 = dec.decode_dec(base + 1)?;
+    if bin1 == 0 {
+        // bin 2 (ctxIdxInc 3): 0 → B_L0_8x8 (1); 1 → B_L1_8x8 (2).
+        let bin2 = dec.decode_dec(base + 3)?;
+        return Ok(if bin2 == 0 { 1 } else { 2 });
+    }
+    // bin 2 (ctxIdxInc 2): 0 → B_Bi_8x8 / sub_mb_type 4..=6 family;
+    //                     1 → sub_mb_type 7..=12 family (out of scope).
+    let bin2 = dec.decode_dec(base + 2)?;
+    if bin2 == 1 {
+        return Err(DecodeError::Unsupported(
+            "B-slice sub_mb_type 7..=12 (sub-sub partitions, lands in §6E-A6.4)",
+        ));
+    }
+    // bin 3 (ctxIdxInc 3): 0 → B_Bi_8x8 (3) / B_L0_8x4 (4); 1 → 5/6.
+    let bin3 = dec.decode_dec(base + 3)?;
+    // bin 4 (ctxIdxInc 3): completes the 3 + 2*bin3 + bin4 mapping.
+    let bin4 = dec.decode_dec(base + 3)?;
+    let value = 3 + 2 * (bin3 as u32) + (bin4 as u32);
+    if value == 3 {
+        Ok(3) // B_Bi_8x8 — only in-scope value of this branch
+    } else {
+        Err(DecodeError::Unsupported(
+            "B-slice sub_mb_type 4..=6 (sub-sub partitions, lands in §6E-A6.4)",
+        ))
+    }
 }
 
 // ─── MVD decoder (with stego-position emission) ─────────────────

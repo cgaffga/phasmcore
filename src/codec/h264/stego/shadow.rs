@@ -67,7 +67,9 @@
 //! walk variant is a §6E-C1b polish item (deferred — `walk_annex_b_for_cover_with_options`
 //! already accumulates whole-stream cover transparently).
 
-use super::{DomainCover, EmbedDomain, PositionKey};
+use super::{DomainCover, EmbedDomain};
+#[cfg(test)]
+use super::PositionKey;
 use crate::stego::armor::ecc;
 use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;

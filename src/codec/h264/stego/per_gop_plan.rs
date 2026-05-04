@@ -191,12 +191,7 @@ impl PerGopPlanBuilder {
         if domain_idx >= 4 {
             return None;
         }
-        for g in (0..self.num_gops).rev() {
-            if !self.gop_domain_done[g][domain_idx] {
-                return Some(g);
-            }
-        }
-        None
+        (0..self.num_gops).rev().find(|&g| !self.gop_domain_done[g][domain_idx])
     }
 
     /// Accept one Phase B segment emission. Splits `stego_bits`
