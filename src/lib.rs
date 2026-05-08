@@ -94,6 +94,7 @@ pub use codec::h264::stego::encode_pixels::{
     h264_stego_capacity_4domain, H264StegoCapacityInfo,
     // Task #97 — file-attachment-aware encode entries.
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files,
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files,
     h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files,
 };
 #[cfg(feature = "cabac-stego")]

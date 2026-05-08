@@ -256,6 +256,120 @@ pub fn derive_b_direct_spatial_with_col(
     }
 }
 
+/// §B-direct-fix.v3 — temporal-direct MV derivation per spec
+/// § 8.4.1.2.3.
+///
+/// Unlike spatial-direct (median over neighbours A/B/C, vulnerable
+/// to motion-boundary mis-inheritance), temporal-direct uses the
+/// L1-reference-frame's colocated MB's L0 MV directly, scaled by
+/// the temporal POC distance ratio. No median, no neighbour
+/// mixing.
+///
+/// For IBPBP M=2 (POC distances td=4, tb=2):
+///   DistScaleFactor ≈ 128
+///   mvL0 ≈ mvCol / 2 (rounded)
+///   mvL1 ≈ -mvCol / 2 (rounded)
+///
+/// On motion-boundary content (e.g., a slow-moving pants MB
+/// adjacent to a torso MB with different motion vector),
+/// spatial-direct's median picks the wrong neighbour and predicts
+/// from a misaligned reference region → visible streak / staircase
+/// pixels. Temporal-direct uses the colocated MB's own MV (the
+/// pants's own motion, not the neighbour's) → correct reference
+/// region → no artifact.
+///
+/// `l1_motion_grid` is the L1 reference picture's per-MB
+/// colocated motion grid (same data spatial-direct uses for the
+/// colZeroFlag check). When None, falls back to zero MVs.
+///
+/// `poc_curr`, `poc_l0`, `poc_l1` are the FULL (un-wrapped) POCs
+/// for the current B-frame and its L0 / L1 references. For IBPBP
+/// M=2: `poc_l0 = poc_curr - 2`, `poc_l1 = poc_curr + 2`.
+///
+/// Returns `(zero, zero)` MVs with `ref_idx_l0 = ref_idx_l1 = 0`
+/// when:
+/// - `l1_motion_grid` is None
+/// - colocated MB is intra (`ref_idx_l0 < 0`)
+/// - degenerate POC (`td == 0`)
+pub fn derive_b_direct_temporal(
+    l1_motion_grid: Option<&ColocatedMvGrid>,
+    mb_x: usize,
+    mb_y: usize,
+    poc_curr: i32,
+    poc_l0: i32,
+    poc_l1: i32,
+) -> BDirectSpatialResult {
+    let zero = BDirectSpatialResult {
+        mv_l0: MotionVector::ZERO,
+        ref_idx_l0: 0,
+        mv_l1: MotionVector::ZERO,
+        ref_idx_l1: 0,
+    };
+
+    let grid = match l1_motion_grid {
+        Some(g) => g,
+        None => return zero,
+    };
+    if mb_x as u32 >= grid.mb_w || mb_y as u32 >= grid.mb_h {
+        return zero;
+    }
+    let cell = grid.get(mb_x as u32, mb_y as u32);
+    if cell.ref_idx_l0 < 0 {
+        return zero;
+    }
+
+    let mv_col_x = cell.mv_l0_x as i32;
+    let mv_col_y = cell.mv_l0_y as i32;
+
+    // §B-direct-fix.v3 2026-05-07 — near-zero colMb override.
+    // Spec § 8.4.1.2.2 step 6 (colZeroFlag) exists for spatial-direct
+    // but NOT for temporal-direct (§ 8.4.1.2.3 has no equivalent).
+    // Empirical: on motion boundaries, P-frame ME picks a spurious
+    // sub-pixel MV (|mv|≤1 quarter-pel = ≤0.25 px) for "static" wall
+    // MBs at the kid's silhouette — SAD/SATD finds a tiny win by
+    // aligning silhouette gradient slightly. Without this override,
+    // temporal-direct faithfully scales the noise → mvL0 ≈ ±mvCol/2
+    // → wall MB pulls 4-5 px of texture from the adjacent foreground
+    // → "pants pixels spill out onto the wall" (user 2026-05-07).
+    // Real-world consumer encoders sidestep this via aggressive RDO
+    // that picks L0/L1/Bi at motion boundaries; phasm currently picks
+    // Direct 99% of B-MBs and so MUST override the noise here.
+    // Match the spec colZeroFlag's |mv|≤1 quarter-pel threshold and
+    // ref_idx==0 condition (single-ref IBPBP M=2 always sees ref=0).
+    if cell.ref_idx_l0 == 0 && mv_col_x.abs() <= 1 && mv_col_y.abs() <= 1 {
+        return zero;
+    }
+
+    let td = (poc_l1 - poc_l0).clamp(-128, 127);
+    let tb = (poc_curr - poc_l0).clamp(-128, 127);
+    if td == 0 {
+        return zero;
+    }
+
+    // Spec § 8.4.1.2.3 eq 8-203 / 8-204 / 8-205:
+    //   tx = (16384 + Abs(td / 2)) / td
+    //   DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
+    //   mvLX = (DistScaleFactor * mvCol + 128) >> 8
+    let tx = (16384 + (td.abs() / 2)) / td;
+    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+
+    let mv_l0 = MotionVector {
+        mv_x: ((dsf * mv_col_x + 128) >> 8) as i16,
+        mv_y: ((dsf * mv_col_y + 128) >> 8) as i16,
+    };
+    let mv_l1 = MotionVector {
+        mv_x: (mv_l0.mv_x as i32 - mv_col_x) as i16,
+        mv_y: (mv_l0.mv_y as i32 - mv_col_y) as i16,
+    };
+
+    BDirectSpatialResult {
+        mv_l0,
+        ref_idx_l0: 0,
+        mv_l1,
+        ref_idx_l1: 0,
+    }
+}
+
 /// §6E-A6.1 — public wrapper over [`predict_mv_for_partition_l1`]
 /// so encoder.rs (and the §6E-A6.1 walker) can compute L1 MVD
 /// predictors without re-implementing the median logic.

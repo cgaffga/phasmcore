@@ -59,7 +59,7 @@ use super::quantization::{
     trellis_quantize_4x4, QuantParams, QuantSlice,
 };
 use super::rate_control::{FrameType, RateController};
-use super::reconstruction::{raster_to_scan_levels, ReconBuffer};
+use super::reconstruction::{raster_to_scan_levels, scan_to_raster_levels, ReconBuffer};
 use super::reference_buffer::ReferenceBuffer;
 use super::transform::{forward_dct_4x4, forward_hadamard_2x2, forward_hadamard_4x4};
 use super::EncoderError;
@@ -111,6 +111,27 @@ pub struct Encoder {
     pub stego_frame_idx: u32,
     pub rc: RateController,
     pub recon: ReconBuffer,
+    /// §B-cascade-real v1.1 — Phase 1.1.A.
+    ///
+    /// Decoupled visual-quality recon buffer. `recon` (above) tracks
+    /// PRE-stego-flip levels and is used as the reference buffer for
+    /// next-MB neighbour prediction + B-frame DPB lookup; this
+    /// preserves the multi-pass orchestrator's cover-capture invariant
+    /// (Pass 1 cover-capture and Pass 3 emit see identical
+    /// neighbour-derived cover values at every position).
+    ///
+    /// `visual_recon` tracks POST-flip levels and is what a downstream
+    /// player (ffmpeg / VLC / hostile decoder) reconstructs from the
+    /// emitted bitstream. Mux output reads from this buffer so the
+    /// muxed mp4 visually matches what any compliant decoder produces
+    /// from our bitstream → no encoder/player drift cliff.
+    ///
+    /// Phase 1.1.A: field plumbed, helpers added, but writes are
+    /// identical to `recon` (no flips applied yet). Phase 1.1.B will
+    /// wire actual post-flip writes at residual reconstruct sites.
+    ///
+    /// See `docs/design/h264-b-cascade-real-v1-1-plan.md`.
+    pub visual_recon: ReconBuffer,
     pub sps_params: SpsParams,
     pub pps_params: PpsParams,
     /// True once the first frame has emitted SPS + PPS. Subsequent
@@ -577,61 +598,92 @@ fn emit_b_partitioned_method(
     let mut current_mvd = CurrentMbMvdAbs::new();
     let (pw_4x4, ph_4x4) = meta.shape.part_dim_4x4();
 
-    for (idx, part) in parts.iter().enumerate() {
-        let usage = if idx == 0 { meta.part0 } else { meta.part1 };
-        let (off_x, off_y) = meta.shape.part_offset(idx);
-        let tl_bx = mb_x * 4 + off_x;
-        let tl_by = mb_y * 4 + off_y;
-        let cur_bx = off_x as u8;
-        let cur_by = off_y as u8;
+    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
+    // H.264 spec § 7.3.5.1 / § 9.3.3.1.1 interprets B-slice partitioned
+    // MVD parsing in **list-major** loop order: outer iterates list
+    // 0..2, inner iterates partition index 0..N-1, emitting an MVD
+    // pair only when that partition uses that list. Phasm previously
+    // used **partition-major** order which is round-trip-clean against
+    // phasm's own walker but desyncs vs spec-compliant decoders for
+    // asymmetric mb_types where the orders differ:
+    //   mb_type 14 (B_L1_Bi 16x8): partition-major emits L1_p0
+    //     before L0_p1; spec order emits L0_p1 before L1_p0.
+    //   Same for 15 (B_L1_Bi 8x16), 16 (B_Bi_L0 16x8), 17 (8x16).
+    // Default ME often converges to MVD=0 making the desync invisible
+    // (MV reconstructs to predictor regardless of bit assignment),
+    // but real-world content with non-zero MVDs produces 100+ pixel
+    // divergences. List-major matches the spec's interpretation;
+    // walker `walk_b_partitioned` in cabac/bin_decoder/slice.rs
+    // updated in lockstep.
+    for list in 0u8..2 {
+        for idx in 0..2usize {
+            let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+            let part = &parts[idx];
+            let uses_this_list = match (list, usage) {
+                (0, BListUse::L0) | (0, BListUse::Bi) => true,
+                (1, BListUse::L1) | (1, BListUse::Bi) => true,
+                _ => false,
+            };
+            if !uses_this_list {
+                continue;
+            }
+            let (off_x, off_y) = meta.shape.part_offset(idx);
+            let tl_bx = mb_x * 4 + off_x;
+            let tl_by = mb_y * 4 + off_y;
+            let cur_bx = off_x as u8;
+            let cur_by = off_y as u8;
 
-        let want_l0 = matches!(usage, BListUse::L0 | BListUse::Bi);
-        if want_l0 {
-            let mv = part.mv_l0.unwrap_or_default();
-            let predicted = super::partition_state::predict_mv_for_mb_partition(
-                &enc.mv_grid, tl_bx, tl_by, pw_4x4, ph_4x4, idx as u8,
-                /* current_ref_idx */ 0,
-            );
-            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
-            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
-            let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 0,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
-            let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 0,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
-            let abs_x = mvd_x.unsigned_abs() as i16;
-            let abs_y = mvd_y.unsigned_abs() as i16;
-            current_mvd.fill_region(cur_bx, cur_by, pw_4x4 as u8, ph_4x4 as u8, abs_x, abs_y);
+            if list == 0 {
+                let mv = part.mv_l0.unwrap_or_default();
+                let predicted = super::partition_state::predict_mv_for_mb_partition(
+                    &enc.mv_grid, tl_bx, tl_by, pw_4x4, ph_4x4, idx as u8,
+                    /* current_ref_idx */ 0,
+                );
+                let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+                let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+                let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 0,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+                let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 0,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+                let abs_x = mvd_x.unsigned_abs() as i16;
+                let abs_y = mvd_y.unsigned_abs() as i16;
+                current_mvd.fill_region(cur_bx, cur_by, pw_4x4 as u8, ph_4x4 as u8, abs_x, abs_y);
+                // Update L0 grid in place so partition 1's L0 predict
+                // (and downstream L1 cross-list reads) see the MV.
+                enc.mv_grid.fill_lists(
+                    tl_bx, tl_by, pw_4x4, ph_4x4,
+                    part.mv_l0.map(|m| (m, 0)),
+                    None,
+                );
+            } else {
+                let mv = part.mv_l1.unwrap_or_default();
+                let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
+                    &enc.mv_grid, tl_bx, tl_by, /* current_ref_idx */ 0,
+                );
+                let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+                let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+                let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 1,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+                let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 1,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+                let abs_x = mvd_x.unsigned_abs() as i16;
+                let abs_y = mvd_y.unsigned_abs() as i16;
+                current_mvd.fill_region_l1(cur_bx, cur_by, pw_4x4 as u8, ph_4x4 as u8, abs_x, abs_y);
+                enc.mv_grid.fill_lists(
+                    tl_bx, tl_by, pw_4x4, ph_4x4,
+                    None,
+                    part.mv_l1.map(|m| (m, 0)),
+                );
+            }
         }
-        let want_l1 = matches!(usage, BListUse::L1 | BListUse::Bi);
-        if want_l1 {
-            let mv = part.mv_l1.unwrap_or_default();
-            let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
-                &enc.mv_grid, tl_bx, tl_by, /* current_ref_idx */ 0,
-            );
-            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
-            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
-            let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 1,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
-            let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 1,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
-            let abs_x = mvd_x.unsigned_abs() as i16;
-            let abs_y = mvd_y.unsigned_abs() as i16;
-            current_mvd.fill_region_l1(cur_bx, cur_by, pw_4x4 as u8, ph_4x4 as u8, abs_x, abs_y);
-        }
-
-        enc.mv_grid.fill_lists(
-            tl_bx, tl_by, pw_4x4, ph_4x4,
-            part.mv_l0.map(|m| (m, 0)),
-            part.mv_l1.map(|m| (m, 0)),
-        );
     }
 
     // §B-Partitioned-Residual (#206) — full-residual path when refs
@@ -853,80 +905,126 @@ fn emit_b_8x8_method(
         &enc.mv_grid, mb_x, mb_y, l1_motion_grid,
     );
 
-    for (s_idx, (&sub, part)) in sub_mb_types.iter().zip(parts.iter()).enumerate() {
+    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
+    // The spec runs B_Direct sub-MB MV derivation BEFORE the MVD
+    // parsing loop (spec § 8.4.1.2 + § 9.3.3.1.1), populating
+    // Direct sub-MBs' MV cache up-front. When the list-major MVD
+    // loop predicts L0/L1 for a non-Direct sub-MB, it can see a
+    // Direct neighbour's already-filled MV. Phasm previously
+    // deferred Direct grid fill to a post-pass which worked under
+    // sub-mb-major ordering (Direct came first if at s_idx=0) but
+    // breaks under list-major: e.g. mixed [Direct, L0, L1, Bi]
+    // now emits L0_s1 before any grid fill for s0=Direct, making
+    // predict_mv_for_mb_partition see None where the spec-compliant
+    // decoder sees direct_result.
+    for (s_idx, &sub) in sub_mb_types.iter().enumerate() {
+        if sub != 0 {
+            continue;
+        }
         let off_bx = (s_idx & 1) * 2;
         let off_by = (s_idx >> 1) * 2;
         let tl_bx = mb_x * 4 + off_bx;
         let tl_by = mb_y * 4 + off_by;
         let pw = 2usize;
         let ph = 2usize;
-        let cur_bx = off_bx as u8;
-        let cur_by = off_by as u8;
-
-        let want_l0 = matches!(sub, 1 | 3);
-        if want_l0 {
-            let mv = part.mv_l0.unwrap_or_default();
-            let predicted = super::partition_state::predict_mv_for_mb_partition(
-                &enc.mv_grid, tl_bx, tl_by, pw, ph, s_idx as u8,
-                /* current_ref_idx */ 0,
-            );
-            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
-            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
-            let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 0,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
-            let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 0,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
-            let abs_x = mvd_x.unsigned_abs() as i16;
-            let abs_y = mvd_y.unsigned_abs() as i16;
-            current_mvd.fill_region(cur_bx, cur_by, pw as u8, ph as u8, abs_x, abs_y);
-        }
-
-        let want_l1 = matches!(sub, 2 | 3);
-        if want_l1 {
-            let mv = part.mv_l1.unwrap_or_default();
-            let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
-                &enc.mv_grid, tl_bx, tl_by, /* current_ref_idx */ 0,
-            );
-            let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
-            let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
-            let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 1,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
-            let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
-                &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 1,
-            );
-            encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
-            let abs_x = mvd_x.unsigned_abs() as i16;
-            let abs_y = mvd_y.unsigned_abs() as i16;
-            current_mvd.fill_region_l1(cur_bx, cur_by, pw as u8, ph as u8, abs_x, abs_y);
-        }
-
-        // Grid update.
-        if sub == 0 {
-            let l0 = if direct_result.uses_l0() {
-                Some((direct_result.mv_l0, direct_result.ref_idx_l0))
-            } else {
-                None
-            };
-            let l1 = if direct_result.uses_l1() {
-                Some((direct_result.mv_l1, direct_result.ref_idx_l1))
-            } else {
-                None
-            };
-            enc.mv_grid.fill_lists(tl_bx, tl_by, pw, ph, l0, l1);
+        let l0 = if direct_result.uses_l0() {
+            Some((direct_result.mv_l0, direct_result.ref_idx_l0))
         } else {
-            enc.mv_grid.fill_lists(
-                tl_bx, tl_by, pw, ph,
-                part.mv_l0.map(|m| (m, 0)),
-                part.mv_l1.map(|m| (m, 0)),
-            );
+            None
+        };
+        let l1 = if direct_result.uses_l1() {
+            Some((direct_result.mv_l1, direct_result.ref_idx_l1))
+        } else {
+            None
+        };
+        enc.mv_grid.fill_lists(tl_bx, tl_by, pw, ph, l0, l1);
+    }
+
+    // The spec parses B_8x8 sub-MB MVDs in **list-major** order
+    // (H.264 spec § 7.3.5.1 + § 9.3.3.1.1): outer iterates list 0..2,
+    // inner iterates sub-MB index 0..4, emitting an MVD pair only
+    // when that sub-MB uses that list. Phasm previously used
+    // **sub-mb-major** order which round-trips clean against phasm's
+    // own walker but desyncs vs spec-compliant decoders for any
+    // sub_mb_type combo where order matters (uniform_bi: max|Δ|=180,
+    // mixed: max|Δ|=170 with non-zero MVDs). Walker `walk_b_8x8` in
+    // cabac/bin_decoder/slice.rs updated in lockstep.
+    for list in 0u8..2 {
+        for s_idx in 0..4usize {
+            let sub = sub_mb_types[s_idx];
+            let part = &parts[s_idx];
+            let uses_this_list = match (list, sub) {
+                (0, 1) | (0, 3) => true,
+                (1, 2) | (1, 3) => true,
+                _ => false,
+            };
+            if !uses_this_list {
+                continue;
+            }
+            let off_bx = (s_idx & 1) * 2;
+            let off_by = (s_idx >> 1) * 2;
+            let tl_bx = mb_x * 4 + off_bx;
+            let tl_by = mb_y * 4 + off_by;
+            let pw = 2usize;
+            let ph = 2usize;
+            let cur_bx = off_bx as u8;
+            let cur_by = off_by as u8;
+
+            if list == 0 {
+                let mv = part.mv_l0.unwrap_or_default();
+                let predicted = super::partition_state::predict_mv_for_mb_partition(
+                    &enc.mv_grid, tl_bx, tl_by, pw, ph, s_idx as u8,
+                    /* current_ref_idx */ 0,
+                );
+                let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+                let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+                let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 0,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+                let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 0,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+                let abs_x = mvd_x.unsigned_abs() as i16;
+                let abs_y = mvd_y.unsigned_abs() as i16;
+                current_mvd.fill_region(cur_bx, cur_by, pw as u8, ph as u8, abs_x, abs_y);
+                // Update L0 grid in place so subsequent emits in the same
+                // sub-MB or downstream sub-MBs see the just-emitted L0 MV.
+                enc.mv_grid.fill_lists(
+                    tl_bx, tl_by, pw, ph,
+                    part.mv_l0.map(|m| (m, 0)),
+                    None,
+                );
+            } else {
+                let mv = part.mv_l1.unwrap_or_default();
+                let predicted = super::b_direct_predictor::predict_mv_for_partition_l1_pub(
+                    &enc.mv_grid, tl_bx, tl_by, /* current_ref_idx */ 0,
+                );
+                let mvd_x = (mv.mv_x as i32) - (predicted.mv_x as i32);
+                let mvd_y = (mv.mv_y as i32) - (predicted.mv_y as i32);
+                let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 0, 1,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_x, 0, bin0_inc_x);
+                let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
+                    &current_mvd, &cabac.neighbors, mb_x, cur_bx, cur_by, 1, 1,
+                );
+                encode_mvd_with_bin0_inc(cabac, mvd_y, 1, bin0_inc_y);
+                let abs_x = mvd_x.unsigned_abs() as i16;
+                let abs_y = mvd_y.unsigned_abs() as i16;
+                current_mvd.fill_region_l1(cur_bx, cur_by, pw as u8, ph as u8, abs_x, abs_y);
+                enc.mv_grid.fill_lists(
+                    tl_bx, tl_by, pw, ph,
+                    None,
+                    part.mv_l1.map(|m| (m, 0)),
+                );
+            }
         }
     }
+
+    // (Direct sub-MB grid fill moved BEFORE the MVD loop above per
+    // the spec-mandated direct-prediction ordering.)
 
     if let (Some((l0_ref, l1_ref)), true) = (b_refs, residual_enabled) {
         let mb_px_x = (mb_x * 16) as u32;
@@ -1076,15 +1174,73 @@ fn emit_b_8x8_method(
 /// the same MV for every cell (no per-sub-block static check
 /// yet — see `b_direct_predictor.rs` module header), so per-MB
 /// granularity matches the implementation.
+///
+/// §B-direct-fix Stage 2 (#232): now returns the
+/// [`BDirectSpatialResult`] so callers (B_Skip / B_Direct_16x16
+/// emit paths) can build the prediction surface and write it to
+/// recon + visual_recon. Without that write the encoder's recon
+/// for the MB stays at the previous frame's pixels (the decoder
+/// reconstructs predicted pixels from the bitstream's spatial-
+/// direct MVs) → encoder.recon ≠ ffmpeg.decode → cascade.
+/// §B-direct-fix.v3 — Direct-mode dispatch context.
+///
+/// `Spatial` runs the spec § 8.4.1.2.2 spatial-direct path (median
+/// of A/B/C with colZeroFlag). `Temporal { .. }` runs the spec
+/// § 8.4.1.2.3 temporal-direct path (scaled colocated MV, no
+/// median, no neighbour mixing).
+///
+/// Temporal-direct is preferred for motion-boundary content where
+/// spatial-direct's median picks the wrong neighbour and causes
+/// visible streaks. See `docs/design/h264-encoder-quality-plan.md`
+/// §B-direct-fix.v3 section.
+#[derive(Debug, Clone, Copy)]
+pub enum BDirectMode {
+    Spatial,
+    Temporal { poc_curr: i32, poc_l0: i32, poc_l1: i32 },
+}
+
+/// §B-direct-fix.v3.ROOT.v13 2026-05-07 — predictor magnitude clamp for
+/// B-frame ME bit-cost anchor.
+///
+/// When the spec's median predictor is huge (>8 px = 32 quarter-pel),
+/// it's almost always wrong (chain-propagated bad MV from raster
+/// neighbour). Using it as the rate anchor traps ME in a wrong-MV
+/// local minimum. Threshold of 32 qpel covers typical camera-shake
+/// while excluding the body-internal-boundary chain-propagation
+/// pattern observed at 1080p (-205, 112) and similar.
+///
+/// Returns ZERO when predicted is >32 qpel in either axis; passthrough
+/// otherwise. The bitstream-side MVD computation still uses the real
+/// median predictor (spec-compliant); only ME's internal cost model
+/// uses this clamped anchor.
+fn clamp_me_anchor(predicted: MotionVector) -> MotionVector {
+    const ME_ANCHOR_CLAMP_QPEL: i16 = 32;
+    if predicted.mv_x.abs() > ME_ANCHOR_CLAMP_QPEL
+        || predicted.mv_y.abs() > ME_ANCHOR_CLAMP_QPEL
+    {
+        MotionVector::ZERO
+    } else {
+        predicted
+    }
+}
+
 fn populate_b_direct_grid(
     grid: &mut super::partition_state::EncoderMvGrid,
     mb_x: usize,
     mb_y: usize,
     l1_motion_grid: Option<&super::reference_buffer::ColocatedMvGrid>,
-) {
-    let r = super::b_direct_predictor::derive_b_direct_spatial_with_col(
-        grid, mb_x, mb_y, l1_motion_grid,
-    );
+    direct_mode: BDirectMode,
+) -> super::b_direct_predictor::BDirectSpatialResult {
+    let r = match direct_mode {
+        BDirectMode::Spatial => super::b_direct_predictor::derive_b_direct_spatial_with_col(
+            grid, mb_x, mb_y, l1_motion_grid,
+        ),
+        BDirectMode::Temporal { poc_curr, poc_l0, poc_l1 } => {
+            super::b_direct_predictor::derive_b_direct_temporal(
+                l1_motion_grid, mb_x, mb_y, poc_curr, poc_l0, poc_l1,
+            )
+        }
+    };
     let bx = mb_x * 4;
     let by = mb_y * 4;
     let l0 = if r.uses_l0() { Some((r.mv_l0, r.ref_idx_l0)) } else { None };
@@ -1094,6 +1250,34 @@ fn populate_b_direct_grid(
     // (REF_IDX_NONE) — `fill_lists(..., None, ...)` does NOT touch
     // the L1 cells, so the absent-list semantic is preserved
     // automatically. Same for L0 absent.
+    r
+}
+
+/// §B-direct-fix Stage 2 (#232) — convert spatial-direct derivation
+/// result into a [`BInterMode`] for prediction recon. B_Skip and
+/// B_Direct_16x16 reconstruct their pixels from spatial-direct MVs
+/// per spec § 7.3.5.1 / § 8.4.1.2.2; this helper picks the matching
+/// inter-mode shape so [`Encoder::write_b_prediction_recon`] can
+/// build the prediction surface.
+fn b_direct_to_inter_mode(
+    direct: &super::b_direct_predictor::BDirectSpatialResult,
+) -> super::b_inter_prediction::BInterMode {
+    use super::b_inter_prediction::BInterMode;
+    match (direct.uses_l0(), direct.uses_l1()) {
+        (true, true) => BInterMode::Bi_16x16 {
+            mv_l0: direct.mv_l0,
+            mv_l1: direct.mv_l1,
+        },
+        (true, false) => BInterMode::L0_16x16 { mv: direct.mv_l0 },
+        (false, true) => BInterMode::L1_16x16 { mv: direct.mv_l1 },
+        // Spec § 8.4.1.2.1 boundary case in `derive_b_direct_spatial_with_col`
+        // forces both refs to 0 so this branch shouldn't fire — defensive
+        // fallback to zero-MV bipred matches the spec's collapsed result.
+        (false, false) => BInterMode::Bi_16x16 {
+            mv_l0: MotionVector::ZERO,
+            mv_l1: MotionVector::ZERO,
+        },
+    }
 }
 
 #[allow(dead_code)] // §6E-A4(c)-lite legacy helper, kept for diagnostic compat.
@@ -1215,6 +1399,7 @@ impl Encoder {
             enable_mvd_stego_hook: false,
             rc: RateController::new(quality),
             recon: ReconBuffer::new(width, height)?,
+            visual_recon: ReconBuffer::new(width, height)?,
             sps_params,
             pps_params,
             params_emitted: false,
@@ -1299,6 +1484,64 @@ impl Encoder {
             hook.on_residual_block(
                 frame, mb_addr, scan_coeffs, start_idx, end_idx, path_kind,
             );
+        }
+    }
+
+    /// §B-cascade-real v1.1 — Phase 1.1.A.
+    ///
+    /// Write a 16×16 luma macroblock to BOTH `self.recon` (used as
+    /// neighbour for next-MB prediction; preserves cover-capture
+    /// invariant) AND `self.visual_recon` (used by the mux output;
+    /// reflects what a downstream player produces from our bitstream).
+    ///
+    /// Phase 1.1.A: both buffers receive IDENTICAL pixels. Behaviour
+    /// is byte-identical to a single-buffer `self.recon.write_luma_mb`
+    /// call (apart from the second copy). Phase 1.1.B will diverge
+    /// the inputs: `pre_flip` for `self.recon`, `post_flip` for
+    /// `self.visual_recon`.
+    #[inline]
+    pub fn write_luma_mb_dual(
+        &mut self,
+        mb_x: u32,
+        mb_y: u32,
+        pixels: &[[u8; 16]; 16],
+    ) {
+        self.recon.write_luma_mb(mb_x, mb_y, pixels);
+        self.visual_recon.write_luma_mb(mb_x, mb_y, pixels);
+    }
+
+    /// §B-cascade-real v1.1 — Phase 1.1.A. Companion to
+    /// [`Self::write_luma_mb_dual`] for the chroma plane.
+    #[inline]
+    pub fn write_chroma_block_dual(
+        &mut self,
+        mb_x: u32,
+        mb_y: u32,
+        plane: u8,
+        pixels: &[[u8; 8]; 8],
+    ) {
+        self.recon.write_chroma_block(mb_x, mb_y, plane, pixels);
+        self.visual_recon.write_chroma_block(mb_x, mb_y, plane, pixels);
+    }
+
+    /// §B-direct-fix Stage 2 (#232) — mirror a freshly-written
+    /// 16x16 luma block from `self.recon` into `self.visual_recon`.
+    /// Used after `encode_i4x4_mb` / `encode_i8x8_mb` (both write
+    /// only `&mut ReconBuffer`, not visual_recon — Phase 1.1.B
+    /// Shape 2 deferred those luma helpers as #224 / #225). Without
+    /// this mirror, intra-in-P MBs leave visual_recon stale at the
+    /// previous frame's pixels → encoder/decoder recon parity break
+    /// → cascade.
+    #[inline]
+    fn mirror_luma_mb_to_visual_recon(&mut self, mb_x: u32, mb_y: u32) {
+        let stride = self.recon.width as usize;
+        let px = (mb_x as usize) * 16;
+        let py = (mb_y as usize) * 16;
+        for dy in 0..16 {
+            for dx in 0..16 {
+                self.visual_recon.y[(py + dy) * stride + (px + dx)] =
+                    self.recon.y[(py + dy) * stride + (px + dx)];
+            }
         }
     }
 
@@ -1603,6 +1846,25 @@ impl Encoder {
         self.gop_length = gop_length;
     }
 
+    /// §B-direct-fix Stage 2 (#232) follow-up — read-only accessor
+    /// for the per-MB intra flag grid. Tests use this to tag hotspot
+    /// MBs as intra-vs-inter when localizing encoder/decoder recon
+    /// divergence.
+    pub fn intra_grid(&self) -> &[bool] {
+        &self.intra_grid
+    }
+
+    /// §B-direct-fix Stage 2 (#232) follow-up — read-only accessor
+    /// for the encoder's per-MB L0 MV at the top-left 4×4 sub-block.
+    /// Tests use this to compare encoder's chosen MV against what
+    /// ffmpeg decodes from the bitstream MVD, to localize MV emit
+    /// vs decode mismatches.
+    pub fn mv_l0_at_mb(&self, mb_x: u32, mb_y: u32)
+        -> Option<(super::motion_estimation::MotionVector, i8)>
+    {
+        self.mv_grid.get_l0((mb_x * 4) as isize, (mb_y * 4) as isize)
+    }
+
     /// Enable CABAC bin-by-bin tracing. Subsequent slice emissions
     /// will attach a trace to the CABAC engine; the per-slice trace
     /// is copied into `cabac_trace_buffer` when the slice finalizes.
@@ -1637,6 +1899,26 @@ impl Encoder {
 
     pub fn has_reference(&self) -> bool {
         self.dpb.has_reference()
+    }
+
+    /// §B-cascade-real Phase 1.1.C — accessor for the post-flip +
+    /// deblocked reconstruction buffer that mirrors what a downstream
+    /// H.264 player produces from the emitted bitstream.
+    ///
+    /// External consumers comparing encoder output to ffmpeg.decode
+    /// (visual-quality regression tests, PSNR gates, mux output) MUST
+    /// read this buffer instead of `recon`. `recon` stays pre-flip to
+    /// preserve the multi-pass orchestrator's cover-capture invariant
+    /// — its content does NOT match the bitstream when stego flips
+    /// fire, but its evolution stays stable across Pass 1 (no hook)
+    /// and Pass 3 (hook fires).
+    ///
+    /// Mux/PSNR rule of thumb: if the consumer needs to know "what
+    /// pixels will the player see?" → `visual_recon`. If the consumer
+    /// is INSIDE the encoder doing next-MB neighbour prediction →
+    /// `recon`.
+    pub fn visual_recon(&self) -> &ReconBuffer {
+        &self.visual_recon
     }
 
     /// Scene-change probe for `encode_p_frame`. Computes a cheap
@@ -1733,6 +2015,9 @@ impl Encoder {
         // Snapshot the just-reconstructed frame into the DPB for use
         // by the next P-frame.
         self.dpb.promote(&self.recon, self.frame_num);
+        // §B-cascade-real Phase 1.1.B step 3: per-MB visual_recon
+        // writes (step 2) + parallel deblocking populate visual_recon
+        // throughout the frame. The step 1 frame-end mirror is gone.
         self.frame_num = (self.frame_num + 1) & 0xF;
         self.stego_frame_idx = self.stego_frame_idx.wrapping_add(1);
         self.gop_position = 1; // after the IDR, next frame is position 1
@@ -1911,6 +2196,13 @@ impl Encoder {
                 "encode_b_frame called with enable_b_frames=false".into(),
             ));
         }
+        // §B-instrument v1 (#251) — set the current B-frame's display
+        // index for the per-MB recorder. mb_decision_b_rdo reads this
+        // when PHASM_B_INSTRUMENT=1 to tag records by frame.
+        super::mb_decision_b::B_INSTRUMENT_FRAME_IDX.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if !self.dpb.has_reference() {
             return Err(EncoderError::InvalidInput(
                 "encode_b_frame called without a reference in the DPB; \
@@ -2048,13 +2340,37 @@ impl Encoder {
         // Mod-16 wraparound matches log2_max_frame_num_minus4=0
         // → MaxFrameNum=16 in our SPS.
         let b_frame_num = self.frame_num.wrapping_sub(1) & 0xF;
+        let b_disable_deblock = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
+        // §B-direct-fix.v3 2026-05-07 — temporal-direct mode toggle.
+        // PHASM_B_TEMPORAL_DIRECT=1 switches BOTH the slice header
+        // flag AND the encoder's MV derivation to temporal direct
+        // (§ 8.4.1.2.3 scaled colocated MV). Fixes visible motion-
+        // boundary streaks on slow-motion content (user screenshot
+        // 2026-05-07). Spatial direct is the legacy default to keep
+        // existing tests green; flip the default once V6 visual
+        // gate passes.
+        let direct_spatial = std::env::var_os("PHASM_B_TEMPORAL_DIRECT").is_none();
+        // Compute POCs for temporal direct. IBPBP M=2 layout: B_disp
+        // = anchor - 1, L0 = anchor - 2 (past P), L1 = anchor (next P).
+        // For longer M the formula is the same — POC step is 2 per
+        // display index regardless.
+        let b_direct_mode = if direct_spatial {
+            BDirectMode::Spatial
+        } else {
+            let poc_curr = self.poc_tracker.full_poc_for(b_display_index) as i32;
+            let poc_l0 = self.poc_tracker
+                .full_poc_for(b_display_index.saturating_sub(1)) as i32;
+            let poc_l1 = self.poc_tracker
+                .full_poc_for(b_display_index + 1) as i32;
+            BDirectMode::Temporal { poc_curr, poc_l0, poc_l1 }
+        };
         let hdr = BSliceHeaderParams {
             pps_id: 0,
             frame_num: b_frame_num,
             pic_order_cnt_lsb,
-            direct_spatial_mv_pred_flag: true,
+            direct_spatial_mv_pred_flag: direct_spatial,
             slice_qp_delta: qp as i32 - pic_init_qp,
-            disable_deblocking: false,
+            disable_deblocking: b_disable_deblock,
             // §Stealth.L4.6.2 — PPS now defaults L0=3, but phasm B-slice
             // uses 1 L0 + 1 L1. Override down to 1+1 to match x264-medium
             // wire format (which also overrides on B-slices).
@@ -2072,6 +2388,39 @@ impl Encoder {
         let mb_h = (self.height / 16) as usize;
         let mb_count = mb_w * mb_h;
         let mut cabac = CabacEncoder::new_slice(CabacInitSlot::PIdc0, qp as i32, mb_w);
+
+        // §B-cascade-real fix 2026-05-06 (task #233): reset frame-state
+        // grids + prev_mb_qp before the per-MB loop. Mirror of the
+        // equivalent block in `build_p_slice_rbsp_cabac`
+        // (encoder.rs:2765-2790 + 2770). Without these resets, B-slice
+        // encoding starts with values from the previous P-frame in
+        // `intra_grid`, `qp_grid`, `transform_8x8_grid`, the four
+        // total-coeff grids, and `prev_mb_qp` — leaking stale state into
+        // CBF context derivation, intra-edge boundary strength in the
+        // deblock pass, intra-mode neighbour queries, and the first-MB
+        // mb_qp_delta when residuals fire. Each downstream operation
+        // that reads these diverges from ffmpeg's spec-compliant decode
+        // (which correctly resets between frames). Empirical: the
+        // missing reset is a contributing root cause of the
+        // §B-cascade-real visual cascade (v1.0 BLOCKER).
+        for v in self.total_coeff_grid.iter_mut() {
+            *v = 0xFF;
+        }
+        for v in self.intra16x16_dc_tc_grid.iter_mut() {
+            *v = 0xFF;
+        }
+        for v in self.chroma_cb_tc_grid.iter_mut() {
+            *v = 0;
+        }
+        for v in self.chroma_cr_tc_grid.iter_mut() {
+            *v = 0;
+        }
+        for v in self.transform_8x8_grid.iter_mut() { *v = false; }
+        for v in self.qp_grid.iter_mut() { *v = 0xFF; }
+        for v in self.intra_grid.iter_mut() { *v = false; }
+        for m in self.i4x4_mode_grid.iter_mut() { *m = 0xFF; }
+        for m in self.i8x8_mode_grid.iter_mut() { *m = 0xFF; }
+        self.prev_mb_qp = qp as i32;
 
         // §6E-A4(c)-lite — emit a hash-based mix of B_Skip and
         // B_Direct_16x16. Both modes use the spatial direct
@@ -2108,14 +2457,225 @@ impl Encoder {
                 let predicted_l1 = super::mb_decision_b::predict_b_partition_mv_l1_pub(
                     &self.mv_grid, mb_x, mb_y,
                 );
-                let l0_search = self.me.search_block(
-                    y_plane, y_stride, l0_ref,
-                    mb_px as u32, mb_py as u32, 16, 16, predicted_l0,
+                // §B-direct-fix.v3 ROOT-CAUSE 2026-05-07 — multi-pred ME for
+                // B-slices, full-symmetry version mirroring P-frame's
+                // `build_me_candidates`.
+                //
+                // V11 fix shipped `[predicted, ZERO]` and closed the wall-MB
+                // bug (homogeneous source: zero MV gives perfect SATD).
+                // Visual A/B confirmed wall artifacts gone — but body-
+                // internal boundary MBs (pants/skin, jacket/scarf junctions)
+                // still showed colored block artifacts.
+                //
+                // Diagnosis: heterogeneous-source MBs need a non-zero best
+                // MV (1-2 px from camera shake / body micro-motion). The
+                // median predictor can land on a wrong-direction body MV
+                // inherited from raster propagation; ZERO is wrong too
+                // because the source genuinely moved. The CORRECT MV is
+                // what actual neighbour MBs picked — not the median, not
+                // zero.
+                //
+                // P-frame ME's `build_me_candidates` solves this by
+                // including A (left), B (top), C (top-right) raw neighbour
+                // MVs from the grid. Body MBs in P raster get clean motion
+                // through their A/B/C neighbours.
+                //
+                // This fix: add A/B/C neighbour L0 MVs to B-frame's L0 ME
+                // candidate list, and A/B/C L1 MVs to L1 ME. The grid is
+                // populated by previously-encoded B-MBs of the current
+                // frame, so neighbours reflect the actual motion of nearby
+                // body content.
+                let bx = (mb_x * 4) as isize;
+                let by = (mb_y * 4) as isize;
+                // §B-direct-fix.v3.ROOT.v13 2026-05-07 — predictor magnitude clamp.
+                //
+                // Per-MB dump confirmed body MBs' predicted_mv inherits a
+                // chain-propagated bad MV (e.g., (-205, 112)). ME's cost
+                // function `SATD + λ × bits(mv - predicted)` penalises any
+                // MV that diverges from the wrong predicted, including
+                // MV=0. On body content where periodic-shift positions
+                // yield ~equal SATD, the rate term tips the balance toward
+                // the wrong MV (bits=0 at predicted vs ~18 bits at zero).
+                //
+                // Encoder/decoder semantic test (`dump_b_frame_recon_vs_decode`)
+                // confirmed encoder.recon ≡ ffmpeg.decode — encoder is
+                // honest. Artifacts ARE the encoder's "best match" given
+                // its broken cost function.
+                //
+                // The structural fix: ME's bit-cost anchor must NOT trust
+                // predicted_mv when its magnitude is large. Real motion
+                // content has small predicted_mv (median of small
+                // neighbours); chain-propagated body MVs have huge
+                // magnitudes. Clamp threshold at 32 quarter-pel = 8 px,
+                // ~2x typical camera-shake displacement.
+                //
+                // Bitstream emission still uses the spec-compliant median
+                // predictor for MVD computation; only ME's INTERNAL
+                // preference shifts. ME picks MV=X based on cheap rate
+                // anchor; emit-time MVD = X - median_predictor (correct
+                // per spec).
+                // §B-boundary-anchor v1 (#251, 2026-05-08) — at
+                // motion-boundary MBs (neighbour L0 MVs span more
+                // than 1 px), override the rate-cost anchor to
+                // (0,0). Otherwise ME's `SAD + λ × bits(mv -
+                // predicted)` cost function pulls toward the
+                // (likely wrong-direction) spatial-median predictor,
+                // and ME converges to wall-direction MVs at
+                // jacket-edge MBs even though (0,0) gives a much
+                // lower SAD. With the (0,0) anchor, ME is naturally
+                // attracted to (0,0) when content is static-ish
+                // and its SAD is competitive — content-correct
+                // predictions at boundaries.
+                //
+                // Bitstream emission still uses the spec-compliant
+                // median predictor for MVD computation (only ME's
+                // INTERNAL preference shifts). MVD = chosen_mv -
+                // median_predictor stays correct.
+                //
+                // Disable via PHASM_B_NO_BOUNDARY_REFUSE=1 (same
+                // env gate that disables the matching Direct
+                // refusal in mb_decision_b_rdo).
+                let at_boundary = super::mb_decision_b::is_motion_boundary(
+                    &self.mv_grid, mb_x, mb_y,
                 );
-                let l1_search = self.me.search_block(
-                    y_plane, y_stride, l1_ref,
-                    mb_px as u32, mb_py as u32, 16, 16, predicted_l1,
-                );
+                // §B-direct-magnitude-clamp v1 (#251) — also override
+                // ME anchor to (0,0) when predicted MV magnitude
+                // exceeds 32 qpel. Chain-propagated huge MVs in
+                // spatial-median bias ME's rate cost toward keeping
+                // the huge MV; clamping anchor to (0,0) breaks the
+                // chain (ME's rate cost now favours (0,0)-direction
+                // candidates).
+                let predicted_too_large = predicted_l0.mv_x.abs() > 32
+                    || predicted_l0.mv_y.abs() > 32
+                    || predicted_l1.mv_x.abs() > 32
+                    || predicted_l1.mv_y.abs() > 32;
+                let override_anchor = (at_boundary
+                    && std::env::var_os("PHASM_B_NO_BOUNDARY_REFUSE").is_none())
+                    || (predicted_too_large
+                        && std::env::var_os("PHASM_B_NO_DIRECT_MAGCLAMP").is_none());
+                let me_anchor_l0 = if override_anchor {
+                    MotionVector::ZERO
+                } else {
+                    clamp_me_anchor(predicted_l0)
+                };
+                let me_anchor_l1 = if override_anchor {
+                    MotionVector::ZERO
+                } else {
+                    clamp_me_anchor(predicted_l1)
+                };
+                let mut cands_l0 = Vec::with_capacity(6);
+                cands_l0.push(me_anchor_l0);
+                cands_l0.push(MotionVector::ZERO);
+                if let Some((mv, _)) = self.mv_grid.get_l0(bx - 1, by) { cands_l0.push(mv); }
+                if let Some((mv, _)) = self.mv_grid.get_l0(bx, by - 1) { cands_l0.push(mv); }
+                if let Some((mv, _)) = self.mv_grid.get_l0(bx + 4, by - 1) { cands_l0.push(mv); }
+                let mut cands_l1 = Vec::with_capacity(6);
+                cands_l1.push(me_anchor_l1);
+                cands_l1.push(MotionVector::ZERO);
+                if let Some((mv, _)) = self.mv_grid.get_l1(bx - 1, by) { cands_l1.push(mv); }
+                if let Some((mv, _)) = self.mv_grid.get_l1(bx, by - 1) { cands_l1.push(mv); }
+                if let Some((mv, _)) = self.mv_grid.get_l1(bx + 4, by - 1) { cands_l1.push(mv); }
+                // Phase 4 (#251) — temporal candidate is env-gated via
+                // `PHASM_B_TEMPORAL_CAND=1`. Default OFF: Phase 4.2
+                // empirical V18 demo (commit pending) showed that
+                // adding the L1-reference's collocated MV alone is
+                // net-neutral-to-slightly-worse on real content
+                // (body=1005 → 1037 anomalies on iPhone7 1080p IBPBP
+                // M=2). Cause: the multi-cand search picks the
+                // lowest-initial-cost candidate as the start then
+                // refines once; a temporal candidate with marginally
+                // lower initial cost but a worse refinement basin
+                // displaces ME from a better spatial-median basin.
+                // Proper fix is multi-pass refine-from-each-cand,
+                // tracked under Phase 4.3+ (#251 follow-on). Keep the
+                // env gate for ablation experiments; ship behavior
+                // unchanged.
+                if std::env::var_os("PHASM_B_TEMPORAL_CAND").is_some() {
+                    let poc_curr_b = self.poc_tracker.full_poc_for(b_display_index) as i32;
+                    let poc_l0_b = self.poc_tracker
+                        .full_poc_for(b_display_index.saturating_sub(1)) as i32;
+                    let poc_l1_b = self.poc_tracker
+                        .full_poc_for(b_display_index + 1) as i32;
+                    let temporal_cand = super::b_direct_predictor::derive_b_direct_temporal(
+                        l1_motion_grid.as_ref(), mb_x, mb_y, poc_curr_b, poc_l0_b, poc_l1_b,
+                    );
+                    cands_l0.push(temporal_cand.mv_l0);
+                    cands_l1.push(temporal_cand.mv_l1);
+                }
+                // Phase 4.3 (#251) — refine-from-each-cand. When
+                // `PHASM_B_MULTI_REFINE=1`, switch from the default
+                // best-seed-then-refine to refine-from-each-then-pick-
+                // best. ~2× ME cost at N=6 candidates but unlocks the
+                // temporal candidate's potential AND any future
+                // candidate whose refinement basin beats the median's.
+                let use_multi_refine = std::env::var_os("PHASM_B_MULTI_REFINE").is_some();
+                let l0_search = if use_multi_refine {
+                    self.me.search_block_multi_refine(
+                        y_plane, y_stride, l0_ref,
+                        mb_px as u32, mb_py as u32, 16, 16, me_anchor_l0, &cands_l0,
+                    )
+                } else {
+                    self.me.search_block_with_candidates(
+                        y_plane, y_stride, l0_ref,
+                        mb_px as u32, mb_py as u32, 16, 16, me_anchor_l0, &cands_l0,
+                    )
+                };
+                let l1_search = if use_multi_refine {
+                    self.me.search_block_multi_refine(
+                        y_plane, y_stride, l1_ref,
+                        mb_px as u32, mb_py as u32, 16, 16, me_anchor_l1, &cands_l1,
+                    )
+                } else {
+                    self.me.search_block_with_candidates(
+                        y_plane, y_stride, l1_ref,
+                        mb_px as u32, mb_py as u32, 16, 16, me_anchor_l1, &cands_l1,
+                    )
+                };
+
+                // §B-me-result-clamp v1 (#251 follow-on, V26 2026-05-08).
+                //
+                // Phase 2.11 instrumentation finding: post-V25, top-10
+                // worst-deviation B-MBs shifted from mode=Direct (huge
+                // spatial-derived MVs) to mode=L1 (huge ME-derived MVs).
+                // Examples: mvL1=(132,-295), (196,-359), (3,-412),
+                // (192,34) — ME's L1 search finding coincidentally-low-
+                // SATD matches at 30-100 pixel distances. These MVs
+                // produce wrong-content luma AND wrong chroma stripes
+                // (chroma values from completely different image
+                // regions).
+                //
+                // Hard-clamp ME result magnitude to 64 qpel (16 px) on
+                // each axis. Real motion at 30fps rarely exceeds 16 px
+                // between adjacent B-frame and reference; magnitudes
+                // beyond are coincidence-matches not motion-tracking.
+                // When clamp fires, snap MV to (0,0) — predict from
+                // same-position reference + emit residual.
+                //
+                // Default ON. Disable via PHASM_B_NO_ME_RESULT_CLAMP=1.
+                const ME_RESULT_QPEL_CAP: i16 = 64;
+                let me_clamp = std::env::var_os("PHASM_B_NO_ME_RESULT_CLAMP").is_none();
+                let l0_search = if me_clamp
+                    && (l0_search.mv.mv_x.abs() > ME_RESULT_QPEL_CAP
+                        || l0_search.mv.mv_y.abs() > ME_RESULT_QPEL_CAP)
+                {
+                    super::motion_estimation::MotionSearchResult {
+                        mv: MotionVector::ZERO,
+                        cost: l0_search.cost,
+                    }
+                } else {
+                    l0_search
+                };
+                let l1_search = if me_clamp
+                    && (l1_search.mv.mv_x.abs() > ME_RESULT_QPEL_CAP
+                        || l1_search.mv.mv_y.abs() > ME_RESULT_QPEL_CAP)
+                {
+                    super::motion_estimation::MotionSearchResult {
+                        mv: MotionVector::ZERO,
+                        cost: l1_search.cost,
+                    }
+                } else {
+                    l1_search
+                };
                 // §6E-D.5(c) — bipred-aware joint refinement when RDO
                 // is active. Independent L0+L1 ME finds MVs close to
                 // spatial-direct neighbour-median (because that's the
@@ -2157,6 +2717,17 @@ impl Encoder {
                 super::mb_decision_b::forced_b_mode_from_env()
             {
                 forced
+            } else if self.b_rdo_config.force_l0_zero_b_mode {
+                // Phase F (#262, 2026-05-08, v1.0 ship path) — override
+                // every B-MB to L0_16x16 with MV=(0,0). Bypasses
+                // spatial-direct + ME-derived MV paths so encoder +
+                // decoder agree on MC reference positions. Closes the
+                // corpus ghost-image / blocky-motion bug (Phase D
+                // bisect finding). v1.1 follow-on aligns encoder MC
+                // with decoder spec to remove this workaround.
+                super::mb_decision_b::BMbDecision::L0_16x16 {
+                    mv: MotionVector::ZERO,
+                }
             } else if super::mb_decision_b::b_rdo_enabled_with(self.b_rdo_config) {
                 if let (Some((l0_ref, l1_ref)), Some(mvs)) = (b_refs_opt.as_ref(), me_mvs) {
                     let mut src_y = [[0u8; 16]; 16];
@@ -2186,6 +2757,18 @@ impl Encoder {
                 )
             };
 
+            // §B-deblock-fix (#242, 2026-05-07) — pre-seed qp_grid +
+            // intra_grid for this B-MB BEFORE dispatch. Most emit paths
+            // overwrite via emit_b_residual_for_pred → commit_mb_state,
+            // but B_Skip / B_Direct (CBP=0) and the residual-disabled
+            // L0/L1/Bi fallback never call commit_mb_state. Without
+            // pre-seeding, qp_grid stays at the 0xFF reset sentinel and
+            // the new end-of-slice deblock pass panics on
+            // ALPHA_TABLE[255] OOB. Per-mode commit_mb_state can later
+            // overwrite this with mb-specific qp (e.g., when residual
+            // emits an mb_qp_delta).
+            self.commit_mb_state(mb_x, mb_y, qp, false);
+
             match decision {
                 super::mb_decision_b::BMbDecision::Direct16x16 => {
                     // B_Direct_16x16: mb_skip_flag=0 + mb_type=0 + CBP=0,
@@ -2204,11 +2787,48 @@ impl Encoder {
                     // §6E-A6.1 — populate MV grid with spatial-direct
                     // derivation so subsequent non-direct B-MBs (when
                     // §6E-A6.1 mode-decision starts emitting them) see
-                    // consistent neighbour data. For §6E-A4(c)-lite-
-                    // only output (only Skip + Direct16x16) the grid
-                    // population is no-op for downstream readers but
-                    // future-proofs the path.
-                    populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y, l1_motion_grid_ref);
+                    // consistent neighbour data.
+                    let direct = populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y, l1_motion_grid_ref, b_direct_mode);
+                    // §B-direct-fix Stage 2 (#232) — write the spatial-
+                    // direct predicted pixels to BOTH self.recon AND
+                    // self.visual_recon. Decoder reconstructs B_Direct
+                    // pixels from these MVs via L0/L1 references; if
+                    // we don't write the same pixels here, encoder.recon
+                    // stays at the previous frame's pixels for this MB
+                    // → encoder.recon ≠ ffmpeg.decode → cascade.
+                    if let Some((l0_ref, l1_ref)) = b_refs_opt.as_ref() {
+                        let mode = b_direct_to_inter_mode(&direct);
+                        // §B-direct-fix Stage 2 (#232) — write predicted
+                        // pixels to visual_recon ONLY (not self.recon).
+                        // self.recon is the cover-capture reference for
+                        // the streaming-Viterbi orchestrator (Phase
+                        // 1.1.B/C philosophy: self.recon stays at the
+                        // pre-flip / Pass-1 state across passes).
+                        // Writing predicted pixels into self.recon for
+                        // B-skip/B-direct paths breaks the cover
+                        // invariant and regresses stego cost (-14.58 dB
+                        // vs -7.67 dB on the 480p × 12f probe).
+                        // visual_recon == decoder reconstruction is what
+                        // the test gate measures, so this is sufficient.
+                        let pred_y =
+                            super::b_inter_prediction::build_b_luma_prediction(
+                                mode, l0_ref, l1_ref, mb_x, mb_y,
+                            );
+                        let pred_cb =
+                            super::b_inter_prediction::build_b_chroma_prediction(
+                                mode, l0_ref, l1_ref, 0, mb_x, mb_y,
+                            );
+                        let pred_cr =
+                            super::b_inter_prediction::build_b_chroma_prediction(
+                                mode, l0_ref, l1_ref, 1, mb_x, mb_y,
+                            );
+                        self.visual_recon
+                            .write_luma_mb(mb_x as u32, mb_y as u32, &pred_y);
+                        self.visual_recon
+                            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &pred_cb);
+                        self.visual_recon
+                            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &pred_cr);
+                    }
                 }
                 super::mb_decision_b::BMbDecision::Skip => {
                     // B_Skip: mb_skip_flag=1, no further syntax.
@@ -2223,7 +2843,46 @@ impl Encoder {
                     // B_Skip uses spatial-direct on the decoder side
                     // (§ 7.3.5.1 / § 8.4.1.2.2), so the encoder grid
                     // must reflect those derived MVs at this MB.
-                    populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y, l1_motion_grid_ref);
+                    let direct = populate_b_direct_grid(&mut self.mv_grid, mb_x, mb_y, l1_motion_grid_ref, b_direct_mode);
+                    // §B-direct-fix Stage 2 (#232) — same recon-parity
+                    // fix as Direct16x16 above. B_Skip reconstructs from
+                    // the spatial-direct prediction surface; encoder
+                    // must write those pixels to recon + visual_recon
+                    // so the next P/B frame's reference matches what
+                    // the decoder reconstructs from the bitstream.
+                    if let Some((l0_ref, l1_ref)) = b_refs_opt.as_ref() {
+                        let mode = b_direct_to_inter_mode(&direct);
+                        // §B-direct-fix Stage 2 (#232) — write predicted
+                        // pixels to visual_recon ONLY (not self.recon).
+                        // self.recon is the cover-capture reference for
+                        // the streaming-Viterbi orchestrator (Phase
+                        // 1.1.B/C philosophy: self.recon stays at the
+                        // pre-flip / Pass-1 state across passes).
+                        // Writing predicted pixels into self.recon for
+                        // B-skip/B-direct paths breaks the cover
+                        // invariant and regresses stego cost (-14.58 dB
+                        // vs -7.67 dB on the 480p × 12f probe).
+                        // visual_recon == decoder reconstruction is what
+                        // the test gate measures, so this is sufficient.
+                        let pred_y =
+                            super::b_inter_prediction::build_b_luma_prediction(
+                                mode, l0_ref, l1_ref, mb_x, mb_y,
+                            );
+                        let pred_cb =
+                            super::b_inter_prediction::build_b_chroma_prediction(
+                                mode, l0_ref, l1_ref, 0, mb_x, mb_y,
+                            );
+                        let pred_cr =
+                            super::b_inter_prediction::build_b_chroma_prediction(
+                                mode, l0_ref, l1_ref, 1, mb_x, mb_y,
+                            );
+                        self.visual_recon
+                            .write_luma_mb(mb_x as u32, mb_y as u32, &pred_y);
+                        self.visual_recon
+                            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &pred_cb);
+                        self.visual_recon
+                            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &pred_cr);
+                    }
                 }
                 super::mb_decision_b::BMbDecision::L0_16x16 { mv } => {
                     if let Some((l0_ref, l1_ref)) = b_refs_opt.as_ref().filter(|_| residual_enabled) {
@@ -2309,6 +2968,33 @@ impl Encoder {
             // end_of_slice_flag bin emitted at every MB.
             let is_last = mb_addr == mb_count - 1;
             encode_end_of_slice_flag(&mut cabac, is_last);
+        }
+
+        // §B-deblock-fix (#242, 2026-05-07) — apply in-loop deblock to
+        // B-slice recon, mirroring the P-slice path. Without this,
+        // self.recon + self.visual_recon stay un-deblocked while ffmpeg
+        // (parsing slice header `disable_deblocking_filter_idc=0`)
+        // applies deblock per spec — divergence on every B-MB
+        // boundary. Dominant tail residual source per `dump_b_frame_recon_vs_decode`
+        // (PHASM_DISABLE_DEBLOCK=1 cuts nz% by 30-40× on B-frames).
+        if !b_disable_deblock {
+            // Per Phase 1.1.B/C philosophy: only `visual_recon` gets
+            // deblocked. `self.recon` stays at the cover-pristine /
+            // pre-flip state for the streaming-Viterbi orchestrator and
+            // existing round-trip tests that assume self.recon ≡ what
+            // the walker would reconstruct from the bitstream sans
+            // deblock. (P-slices deblock both because they need
+            // post-deblock recon as the next P/B frame's reference;
+            // B-slices don't promote to DPB so self.recon's
+            // deblock-state doesn't matter for downstream frames.)
+            let coded_flags = self.build_coded_flags();
+            super::deblocking_filter::filter_frame(
+                &mut self.visual_recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                &coded_flags,
+                Some(&self.mv_grid),
+            );
         }
 
         // Finish CABAC, append to slice writer.
@@ -2430,6 +3116,16 @@ impl Encoder {
                 &coded_flags,
                 Some(&self.mv_grid),
             );
+            // §B-cascade-real Phase 1.1.B step 3: deblock visual_recon
+            // in parallel so muxed-output PSNR reflects what a
+            // downstream player produces.
+            super::deblocking_filter::filter_frame(
+                &mut self.visual_recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                &coded_flags,
+                Some(&self.mv_grid),
+            );
         }
 
         if std::env::var_os("PHASM_MODE_STATS").is_some() {
@@ -2471,13 +3167,14 @@ impl Encoder {
         let qp = self.rc.base_qp_for_frame_type(FrameType::P);
         let qp_c = crate::codec::h264::transform::derive_chroma_qp(qp as i32, self.pps_params.chroma_qp_index_offset as i32) as u8;
         let pic_init_qp = self.pps_params.pic_init_qp as i32;
+        let disable_deblock = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
         let hdr = PSliceHeaderParams {
             pps_id: 0,
             frame_num: self.frame_num,
             pic_order_cnt_lsb: self.maybe_p_poc_lsb(),
             log2_max_pic_order_cnt_lsb_minus4: self.sps_params.log2_max_pic_order_cnt_lsb_minus4,
             slice_qp_delta: qp as i32 - pic_init_qp,
-            disable_deblocking: false,
+            disable_deblocking: disable_deblock,
             // §Stealth.L4.6.2 — override PPS default L0=3 down to 1.
             num_ref_idx_active_override: true,
             num_ref_idx_l0_active_minus1: 0,
@@ -2562,15 +3259,30 @@ impl Encoder {
         }
 
         // In-loop deblocking (same as CAVLC P path).
-        let coded_flags = self.build_coded_flags();
-        super::deblocking_filter::filter_frame_with_transform(
-            &mut self.recon,
-            &self.qp_grid,
-            &self.intra_grid,
-            Some(&self.transform_8x8_grid),
-            &coded_flags,
-            Some(&self.mv_grid),
-        );
+        // PHASM_DISABLE_DEBLOCK env-gated: when set, skip deblock to
+        // match the slice header's disable_deblocking_filter_idc=1
+        // emission (encoder + decoder both skip deblock).
+        if std::env::var_os("PHASM_DISABLE_DEBLOCK").is_none() {
+            let coded_flags = self.build_coded_flags();
+            super::deblocking_filter::filter_frame_with_transform(
+                &mut self.recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                Some(&self.transform_8x8_grid),
+                &coded_flags,
+                Some(&self.mv_grid),
+            );
+            // §B-cascade-real Phase 1.1.B step 3: deblock visual_recon
+            // in parallel.
+            super::deblocking_filter::filter_frame_with_transform(
+                &mut self.visual_recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                Some(&self.transform_8x8_grid),
+                &coded_flags,
+                Some(&self.mv_grid),
+            );
+        }
 
         let bin_count = cabac.engine.bin_count();
         let pic_size_mbs = (mb_w * mb_h) as u32;
@@ -2785,9 +3497,12 @@ impl Encoder {
                     encode_mb_skip_flag(cabac, true, mb_x);
                     encode_end_of_slice_flag(cabac, is_last_mb);
                     self.mv_grid.fill(mb_x * 4, mb_y * 4, 4, 4, p_skip_mv, 0);
-                    self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &s_pred_y);
-                    self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
-                    self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
+                    // §B-cascade-real Phase 1.1.B step 3: dual-write
+                    // Skip prediction. No residual → no flip → both
+                    // buffers receive identical pixels.
+                    self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &s_pred_y);
+                    self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
+                    self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
                     for k in 0..16 {
                         let (bx, by) = BLOCK_INDEX_TO_POS[k];
                         self.store_total_coeff_luma(
@@ -3182,6 +3897,16 @@ impl Encoder {
 
         let (cb_ac, cb_dc) = self.encode_chroma_component(&src_cb, &pred_cb, chroma_qp);
         let (cr_ac, cr_dc) = self.encode_chroma_component(&src_cr, &pred_cr, chroma_qp);
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip
+        // arrays for the visual_recon recon pass at function epilogue.
+        // Updated by the residual-hook fire sites below; if no flip
+        // fires, _post stays equal to pre-flip and visual_recon ends
+        // up byte-identical to encoder.recon.
+        let mut luma_ac_levels_post = luma_ac_levels;
+        let mut cb_ac_post = cb_ac;
+        let mut cb_dc_post = cb_dc;
+        let mut cr_ac_post = cr_ac;
+        let mut cr_dc_post = cr_dc;
         let any_cb_ac = cb_ac.iter().any(|b| b.iter().any(|r| r.iter().any(|&v| v != 0)));
         let any_cr_ac = cr_ac.iter().any(|b| b.iter().any(|r| r.iter().any(|&v| v != 0)));
         let any_cb_dc = cb_dc.iter().flatten().any(|&v| v != 0);
@@ -3214,6 +3939,9 @@ impl Encoder {
 
         let eligible_8x8 = self.enable_transform_8x8 && choice.no_sub_mb_part_size_lt_8x8();
         let mut levels_8x8: [[[i16; 8]; 8]; 4] = [[[0i16; 8]; 8]; 4];
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip 8×8
+        // luma levels for the visual_recon path.
+        let mut levels_8x8_post: [[[i16; 8]; 8]; 4] = [[[0i16; 8]; 8]; 4];
         let mut cbp_luma_via_8x8 = 0u8;
         let mut sse_8x8: u64 = 0;
         let mut luma_nonzero_count_8x8: u64 = 0;
@@ -3249,6 +3977,9 @@ impl Encoder {
                 luma_nonzero_count_8x8 +=
                     lvl.iter().flatten().filter(|&&v| v != 0).count() as u64;
             }
+            // §B-cascade-real Phase 1.1.B step 2: seed _post with
+            // pre-flip levels; the hook will overwrite per-block.
+            levels_8x8_post = levels_8x8;
         }
 
         // Phase 100-J RDO chooser. The 8×8 path can be legally
@@ -3328,17 +4059,20 @@ impl Encoder {
             // reconstruction was already computed via
             // `build_luma_prediction`/`build_chroma_prediction` above
             // with this MV (we only entered the skip branch when
-            // `choice.mv == p_skip_mv`), so the recon buffer is
-            // already correct.
+            // `choice.mv == p_skip_mv`).
             if let PMbChoice::P16x16 { mv } = choice {
                 self.mv_grid.fill(mb_x * 4, mb_y * 4, 4, 4, mv, 0);
             }
-            self.recon
-                .write_luma_mb(mb_x as u32, mb_y as u32, &pred_y);
-            self.recon
-                .write_chroma_block(mb_x as u32, mb_y as u32, 0, &pred_cb);
-            self.recon
-                .write_chroma_block(mb_x as u32, mb_y as u32, 1, &pred_cr);
+            // §B-direct-fix Stage 2 (#232) — dual-write predicted
+            // pixels. P_Skip carries no residual, so visual_recon ==
+            // self.recon for this MB. But visual_recon MUST receive
+            // the prediction surface anyway: omitting the write
+            // leaves visual_recon at the previous frame's pixels for
+            // this MB region, breaking encoder/decoder recon parity
+            // when the next P/B frame references it.
+            self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &pred_y);
+            self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &pred_cb);
+            self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &pred_cr);
 
             // total_coeff_grid cleared for all blocks in this MB.
             for k in 0..16 {
@@ -3449,6 +4183,12 @@ impl Encoder {
                             block_idx: k as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip 8×8 luma into levels_8x8_post.
+                    for i in 0..64 {
+                        let pos = ZIGZAG_8X8[i] as usize;
+                        levels_8x8_post[k][pos / 8][pos % 8] = scan[i] as i16;
+                    }
                     encode_residual_block_cabac_8x8(cabac, &scan);
                 }
             }
@@ -3480,6 +4220,9 @@ impl Encoder {
                             block_idx: k as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip 4×4 luma into luma_ac_levels_post.
+                    luma_ac_levels_post[k] = scan_to_raster_levels(&scan);
                     let inc = compute_cbf_ctx_idx_inc_luma_4x4(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3521,6 +4264,15 @@ impl Encoder {
                         plane: plane as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // chroma DC.
+                let dc_post_raster: [[i32; 2]; 2] =
+                    [[dc_flat[0], dc_flat[1]], [dc_flat[2], dc_flat[3]]];
+                if plane == 0 {
+                    cb_dc_post = dc_post_raster;
+                } else {
+                    cr_dc_post = dc_post_raster;
+                }
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -3543,6 +4295,14 @@ impl Encoder {
                             block_idx: sub as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip chroma AC.
+                    let ac_post_raster = ac_scan_15_to_raster(&ac_scan);
+                    if plane == 0 {
+                        cb_ac_post[sub] = ac_post_raster;
+                    } else {
+                        cr_ac_post[sub] = ac_post_raster;
+                    }
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -3621,6 +4381,58 @@ impl Encoder {
         let recon_cr = self.reconstruct_chroma_mb(&pred_cr, &cr_ac, &cr_dc, qp_c);
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+
+        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path with
+        // POST-flip levels (sites 9-12 of 15: P-frame 8×8 + 4×4 luma +
+        // chroma DC + chroma AC). Re-run the same recon code with
+        // _post arrays.
+        let mut visual_recon_luma = [[0u8; 16]; 16];
+        if use_8x8 {
+            for blk in 0..4 {
+                let (bx_mb, by_mb) = I8X8_BLOCK_POS[blk];
+                let bx0 = (bx_mb * 8) as usize;
+                let by0 = (by_mb * 8) as usize;
+                let dq = dequant_8x8_block(&levels_8x8_post[blk], qp);
+                let inv = inverse_dct_8x8(&dq);
+                for dy in 0..8 {
+                    for dx in 0..8 {
+                        let pixel_res = (inv[dy][dx] + 32) >> 6;
+                        let v = pred_y[by0 + dy][bx0 + dx] as i32 + pixel_res;
+                        visual_recon_luma[by0 + dy][bx0 + dx] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        } else {
+            // 4×4 path: dequant + inverse on _post levels (no cached
+            // residual exists for post-flip values; recompute here).
+            use crate::codec::h264::transform::{dequant_4x4, inverse_4x4_integer};
+            for k in 0..16 {
+                let (bx, by) = BLOCK_INDEX_TO_POS[k];
+                let sby = by as usize;
+                let sbx = bx as usize;
+                let dq = dequant_4x4(&luma_ac_levels_post[k], qp as i32, false);
+                let res = inverse_4x4_integer(&dq);
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let v = pred_y[sby * 4 + dy][sbx * 4 + dx] as i32
+                            + res[dy][dx];
+                        visual_recon_luma[sby * 4 + dy][sbx * 4 + dx] =
+                            v.clamp(0, 255) as u8;
+                    }
+                }
+            }
+        }
+        self.visual_recon
+            .write_luma_mb(mb_x as u32, mb_y as u32, &visual_recon_luma);
+        let visual_cb =
+            self.reconstruct_chroma_mb(&pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
+        let visual_cr =
+            self.reconstruct_chroma_mb(&pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
 
         // Phase 6F.2: inter MB committed; the MVDs logged earlier
         // by apply_mvd_hook_to_choice are now real bitstream
@@ -4135,9 +4947,12 @@ impl Encoder {
                     self.commit_mb_state(mb_x, mb_y, self.prev_mb_qp as u8, false);
                     *skip_run += 1;
                     self.mv_grid.fill(mb_x * 4, mb_y * 4, 4, 4, p_skip_mv, 0);
-                    self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &s_pred_y);
-                    self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
-                    self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
+                    // §B-cascade-real Phase 1.1.B step 3: dual-write
+                    // Skip prediction. No residual → no flip → both
+                    // buffers receive identical pixels.
+                    self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &s_pred_y);
+                    self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
+                    self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
                     for k in 0..16 {
                         let (bx, by) = BIP[k];
                         self.store_total_coeff_luma(
@@ -4209,9 +5024,11 @@ impl Encoder {
                 self.commit_mb_state(mb_x, mb_y, self.prev_mb_qp as u8, false);
                 *skip_run += 1;
                 self.mv_grid.fill(mb_x * 4, mb_y * 4, 4, 4, p_skip_mv, 0);
-                self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &s_pred_y);
-                self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
-                self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
+                // §B-cascade-real Phase 1.1.B step 3: dual-write
+                // Skip prediction (P/B Skip variant).
+                self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &s_pred_y);
+                self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &s_pred_cb);
+                self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &s_pred_cr);
                 use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS as BIP_SKIP;
                 for k in 0..16 {
                     let (bx, by) = BIP_SKIP[k];
@@ -4726,6 +5543,14 @@ impl Encoder {
                 &coded_flags,
                 None,
             );
+            // §B-cascade-real Phase 1.1.B step 3: deblock visual_recon.
+            super::deblocking_filter::filter_frame(
+                &mut self.visual_recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                &coded_flags,
+                None,
+            );
         }
 
         w.write_rbsp_trailing();
@@ -4872,6 +5697,16 @@ impl Encoder {
             self.encode_chroma_component(&src_cb, &pred_cb, chroma_qp);
         let (cr_ac_levels, cr_dc_levels) =
             self.encode_chroma_component(&src_cr, &pred_cr, chroma_qp);
+
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip
+        // chroma arrays. Initialised to the pre-flip levels; updated
+        // by the residual-hook fire sites below to track what CABAC
+        // actually emits. Used at function epilogue for the
+        // visual_recon recon pass (what a downstream player sees).
+        let mut cb_ac_post = cb_ac_levels;
+        let mut cb_dc_post = cb_dc_levels;
+        let mut cr_ac_post = cr_ac_levels;
+        let mut cr_dc_post = cr_dc_levels;
 
         // ── CBP computation ──
         let mut luma_nonzero = [false; 16];
@@ -5024,6 +5859,15 @@ impl Encoder {
                         plane: plane as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // DC into the parallel _post array.
+                let dc_post_raster: [[i32; 2]; 2] =
+                    [[dc_flat[0], dc_flat[1]], [dc_flat[2], dc_flat[3]]];
+                if plane == 0 {
+                    cb_dc_post = dc_post_raster;
+                } else {
+                    cr_dc_post = dc_post_raster;
+                }
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -5048,6 +5892,14 @@ impl Encoder {
                             block_idx: sub as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip AC into the parallel _post array.
+                    let ac_post_raster = ac_scan_15_to_raster(&ac_scan);
+                    if plane == 0 {
+                        cb_ac_post[sub] = ac_post_raster;
+                    } else {
+                        cr_ac_post[sub] = ac_post_raster;
+                    }
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -5092,6 +5944,35 @@ impl Encoder {
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_levels, &cr_dc_levels, qp_c);
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+
+        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path:
+        // re-run chroma reconstruct using POST-flip levels, write to
+        // visual_recon. When no flips fired this is byte-identical to
+        // the encoder.recon writes above. NB: the frame-end mirror in
+        // encode_*_frame currently clobbers these per-MB writes; the
+        // mirror gets removed (and visual_recon deblocking added) in
+        // step 3, at which point this differentiation becomes
+        // observable to mux/PSNR consumers.
+        let visual_cb =
+            self.reconstruct_chroma_mb(&pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
+        let visual_cr =
+            self.reconstruct_chroma_mb(&pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
+        // I_4x4 luma is Shape 2 (recon-inside-helper, deferred); copy
+        // pre-flip luma from self.recon to self.visual_recon for the
+        // current MB so the luma plane stays in sync at MB boundary.
+        let lx0 = (mb_x * 16) as u32;
+        let ly0 = (mb_y * 16) as u32;
+        let stride = self.recon.width as usize;
+        for dy in 0..16u32 {
+            for dx in 0..16u32 {
+                let idx = ((ly0 + dy) as usize) * stride + (lx0 + dx) as usize;
+                self.visual_recon.y[idx] = self.recon.y[idx];
+            }
+        }
 
         // Publish the mode grid so subsequent MBs see these I_4x4 modes.
         self.store_i4x4_mode_grid_for_mb(mb_x, mb_y, &i4x4.modes);
@@ -5162,6 +6043,14 @@ impl Encoder {
             self.encode_chroma_component(&src_cb, &pred_cb, chroma_qp);
         let (cr_ac_levels, cr_dc_levels) =
             self.encode_chroma_component(&src_cr, &pred_cr, chroma_qp);
+
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip
+        // chroma arrays for the visual_recon recon pass at function
+        // epilogue.
+        let mut cb_ac_post = cb_ac_levels;
+        let mut cb_dc_post = cb_dc_levels;
+        let mut cr_ac_post = cr_ac_levels;
+        let mut cr_dc_post = cr_dc_levels;
 
         // ── CBP computation ──
         // Luma: one bit per 8×8 block. `i8x8.nonzero[k]` is the k-th
@@ -5281,6 +6170,15 @@ impl Encoder {
                         plane: plane as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // DC into the parallel _post array.
+                let dc_post_raster: [[i32; 2]; 2] =
+                    [[dc_flat[0], dc_flat[1]], [dc_flat[2], dc_flat[3]]];
+                if plane == 0 {
+                    cb_dc_post = dc_post_raster;
+                } else {
+                    cr_dc_post = dc_post_raster;
+                }
                 let inc = compute_cbf_ctx_idx_inc_chroma_dc(
                     &cabac.neighbors,
                     mb_x,
@@ -5307,6 +6205,14 @@ impl Encoder {
                             block_idx: sub as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip AC into the parallel _post array.
+                    let ac_post_raster = ac_scan_15_to_raster(&ac_scan);
+                    if plane == 0 {
+                        cb_ac_post[sub] = ac_post_raster;
+                    } else {
+                        cr_ac_post[sub] = ac_post_raster;
+                    }
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -5351,6 +6257,28 @@ impl Encoder {
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_levels, &cr_dc_levels, qp_c);
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+
+        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path with
+        // POST-flip levels. I_8x8 luma is Shape 2 (recon-inside-helper,
+        // deferred); copy pre-flip luma to keep visual_recon's luma
+        // plane in sync at MB boundary.
+        let visual_cb =
+            self.reconstruct_chroma_mb(&pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
+        let visual_cr =
+            self.reconstruct_chroma_mb(&pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
+        let lx0 = (mb_x * 16) as u32;
+        let ly0 = (mb_y * 16) as u32;
+        let stride = self.recon.width as usize;
+        for dy in 0..16u32 {
+            for dx in 0..16u32 {
+                let idx = ((ly0 + dy) as usize) * stride + (lx0 + dx) as usize;
+                self.visual_recon.y[idx] = self.recon.y[idx];
+            }
+        }
 
         // Publish 8×8 mode grid; clear 4×4 grid for this MB.
         self.store_i8x8_mode_grid_for_mb(mb_x, mb_y, &i8x8.modes);
@@ -5438,6 +6366,15 @@ impl Encoder {
             let coded_flags = self.build_coded_flags();
             super::deblocking_filter::filter_frame_with_transform(
                 &mut self.recon,
+                &self.qp_grid,
+                &self.intra_grid,
+                Some(&self.transform_8x8_grid),
+                &coded_flags,
+                None,
+            );
+            // §B-cascade-real Phase 1.1.B step 3: deblock visual_recon.
+            super::deblocking_filter::filter_frame_with_transform(
+                &mut self.visual_recon,
                 &self.qp_grid,
                 &self.intra_grid,
                 Some(&self.transform_8x8_grid),
@@ -5578,6 +6515,16 @@ impl Encoder {
         let (cr_ac_levels, cr_dc_levels) =
             self.encode_chroma_component(&src_cr, &pred_cr, chroma_intra);
 
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip
+        // Intra_16x16 arrays. Initialised to pre-flip levels; updated
+        // by the residual-hook fire sites below.
+        let mut ac_levels_post = ac_levels;
+        let mut dc_levels_post = dc_levels;
+        let mut cb_ac_post = cb_ac_levels;
+        let mut cb_dc_post = cb_dc_levels;
+        let mut cr_ac_post = cr_ac_levels;
+        let mut cr_dc_post = cr_dc_levels;
+
         let any_chroma_ac = cb_ac_levels
             .iter()
             .chain(cr_ac_levels.iter())
@@ -5635,6 +6582,9 @@ impl Encoder {
             mb_x, mb_y, &mut dc_scan, 0, 15,
             super::super::stego::orchestrate::ResidualPathKind::LumaDcIntra16x16,
         );
+        // §B-cascade-real Phase 1.1.B step 2: capture post-flip DC
+        // raster for visual_recon.
+        dc_levels_post = scan_to_raster_levels(&dc_scan);
         if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
             eprintln!("ENC IIP@({},{}) DC scan: {:?}", mb_x, mb_y, dc_scan);
         }
@@ -5657,6 +6607,10 @@ impl Encoder {
                         block_idx: k as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // AC raster for visual_recon. AC has [0][0] = 0 because
+                // DC was extracted to dc_levels.
+                ac_levels_post[k] = ac_scan_15_to_raster(&ac_scan);
                 if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
                     eprintln!("ENC IIP AC k={} bx={} by={} scan: {:?}", k, bx, by, ac_scan);
                 }
@@ -5687,6 +6641,15 @@ impl Encoder {
                         plane: plane as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // chroma DC.
+                let dc_post_raster: [[i32; 2]; 2] =
+                    [[dc_flat[0], dc_flat[1]], [dc_flat[2], dc_flat[3]]];
+                if plane == 0 {
+                    cb_dc_post = dc_post_raster;
+                } else {
+                    cr_dc_post = dc_post_raster;
+                }
                 let inc =
                     compute_cbf_ctx_idx_inc_chroma_dc(&cabac.neighbors, mb_x, plane as u8, current_is_intra);
                 let coded = encode_residual_block_cabac_with_cbf_inc(
@@ -5715,6 +6678,14 @@ impl Encoder {
                             block_idx: sub as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip chroma AC.
+                    let ac_post_raster = ac_scan_15_to_raster(&ac_scan);
+                    if plane == 0 {
+                        cb_ac_post[sub] = ac_post_raster;
+                    } else {
+                        cr_ac_post[sub] = ac_post_raster;
+                    }
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf,
                         &cabac.neighbors,
@@ -5745,9 +6716,11 @@ impl Encoder {
         nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
         cabac.neighbors.commit(mb_x, nb);
 
-        // 9. Reconstruction.
+        // 9. Reconstruction (CAVLC variant — no stego hooks, so both
+        // recon buffers identical; dual-write keeps visual_recon in
+        // sync after step 3 removes the frame-end mirror).
         let recon_y = self.reconstruct_luma_mb(&pred_y, &ac_levels, &dc_levels, qp);
-        self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &recon_y);
+        self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &recon_y);
         let recon_cb =
             self.reconstruct_chroma_mb(&pred_cb, &cb_ac_levels, &cb_dc_levels, qp_c);
         self.recon
@@ -5756,6 +6729,23 @@ impl Encoder {
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_levels, &cr_dc_levels, qp_c);
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+
+        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path with
+        // POST-flip levels (luma + chroma). Intra_16x16 luma is Shape 1
+        // (recon at function epilogue), so we get a true second-pass
+        // reconstruct here, not a mirror. Sites 5–8 of 15.
+        let visual_recon_y =
+            self.reconstruct_luma_mb(&pred_y, &ac_levels_post, &dc_levels_post, qp);
+        self.visual_recon
+            .write_luma_mb(mb_x as u32, mb_y as u32, &visual_recon_y);
+        let visual_cb =
+            self.reconstruct_chroma_mb(&pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
+        let visual_cr =
+            self.reconstruct_chroma_mb(&pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
 
         // 10. Keep total_coeff_grid populated for the deblocker's
         //     coded_flags reader (matches the CAVLC path behavior).
@@ -6018,9 +7008,11 @@ impl Encoder {
             }
         }
 
-        self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &luma_block);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &cb_block);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &cr_block);
+        // §B-cascade-real Phase 1.1.B step 3: dual-write PCM (lossless
+        // pixel copy — no stego flips can apply here).
+        self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &luma_block);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &cb_block);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &cr_block);
 
         Ok(())
     }
@@ -6472,13 +7464,13 @@ impl Encoder {
             }
         }
 
-        // ── Chroma reconstruction ──
+        // ── Chroma reconstruction ── (CAVLC variant; no stego hooks)
         let recon_cb =
             self.reconstruct_chroma_mb(&pred_cb, &cb_ac_levels, &cb_dc_levels, qp_c);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &recon_cb);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &recon_cb);
         let recon_cr =
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_levels, &cr_dc_levels, qp_c);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &recon_cr);
 
         // Luma recon is already in `self.recon` from `encode_i4x4_mb`.
         // Publish the mode grid.
@@ -6740,18 +7732,18 @@ impl Encoder {
             }
         }
 
-        // 9. Reconstruction: reverse the whole pipeline.
+        // 9. Reconstruction (CAVLC I_16x16 — no stego hooks).
         let recon_y =
             self.reconstruct_luma_mb(&pred_y, &ac_levels, &dc_levels, qp);
-        self.recon.write_luma_mb(mb_x as u32, mb_y as u32, &recon_y);
+        self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &recon_y);
 
         let recon_cb =
             self.reconstruct_chroma_mb(&pred_cb, &cb_ac_levels, &cb_dc_levels, qp_c);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 0, &recon_cb);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &recon_cb);
 
         let recon_cr =
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_levels, &cr_dc_levels, qp_c);
-        self.recon.write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &recon_cr);
 
         Ok(())
     }
@@ -7008,12 +8000,11 @@ impl Encoder {
         let pred_cr = super::b_inter_prediction::build_b_chroma_prediction(
             mode, l0_ref, l1_ref, /* cr */ 1, mb_x, mb_y,
         );
-        self.recon
-            .write_luma_mb(mb_x as u32, mb_y as u32, &pred_y);
-        self.recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &pred_cb);
-        self.recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &pred_cr);
+        // §B-cascade-real Phase 1.1.B step 3: dual-write B-prediction.
+        // No residual emitted → no flip → both buffers identical.
+        self.write_luma_mb_dual(mb_x as u32, mb_y as u32, &pred_y);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 0, &pred_cb);
+        self.write_chroma_block_dual(mb_x as u32, mb_y as u32, 1, &pred_cr);
     }
 
     /// §B-Partitioned-Residual Stage A (#206) — extract the residual
@@ -7127,6 +8118,13 @@ impl Encoder {
         // ── 3. Forward DCT + quant for chroma (DC + AC) ────────────
         let (cb_ac, cb_dc) = self.encode_chroma_component(&src_cb, pred_cb, chroma_qp_params);
         let (cr_ac, cr_dc) = self.encode_chroma_component(&src_cr, pred_cr, chroma_qp_params);
+        // §B-cascade-real Phase 1.1.B step 2 — parallel post-flip
+        // arrays for the visual_recon path. Sites 13-15 of 15.
+        let mut luma_ac_levels_post = luma_ac_levels;
+        let mut cb_ac_post = cb_ac;
+        let mut cb_dc_post = cb_dc;
+        let mut cr_ac_post = cr_ac;
+        let mut cr_dc_post = cr_dc;
         let any_cb_ac = cb_ac.iter().any(|b| b.iter().any(|r| r.iter().any(|&v| v != 0)));
         let any_cr_ac = cr_ac.iter().any(|b| b.iter().any(|r| r.iter().any(|&v| v != 0)));
         let any_cb_dc = cb_dc.iter().flatten().any(|&v| v != 0);
@@ -7187,6 +8185,9 @@ impl Encoder {
                             block_idx: k as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip 4×4 luma into luma_ac_levels_post.
+                    luma_ac_levels_post[k] = scan_to_raster_levels(&scan);
                     let inc = compute_cbf_ctx_idx_inc_luma_4x4(
                         &current_cbf, &cabac.neighbors, mb_x, bx, by, current_is_intra,
                     );
@@ -7227,6 +8228,15 @@ impl Encoder {
                         plane: plane as u8,
                     },
                 );
+                // §B-cascade-real Phase 1.1.B step 2: capture post-flip
+                // chroma DC.
+                let dc_post_raster: [[i32; 2]; 2] =
+                    [[dc_flat[0], dc_flat[1]], [dc_flat[2], dc_flat[3]]];
+                if plane == 0 {
+                    cb_dc_post = dc_post_raster;
+                } else {
+                    cr_dc_post = dc_post_raster;
+                }
                 let inc = compute_cbf_ctx_idx_inc_chroma_dc(
                     &cabac.neighbors, mb_x, plane as u8, current_is_intra,
                 );
@@ -7250,6 +8260,14 @@ impl Encoder {
                             block_idx: sub as u8,
                         },
                     );
+                    // §B-cascade-real Phase 1.1.B step 2: capture
+                    // post-flip chroma AC.
+                    let ac_post_raster = ac_scan_15_to_raster(&ac_scan);
+                    if plane == 0 {
+                        cb_ac_post[sub] = ac_post_raster;
+                    } else {
+                        cr_ac_post[sub] = ac_post_raster;
+                    }
                     let inc = compute_cbf_ctx_idx_inc_chroma_ac(
                         &current_cbf, &cabac.neighbors, mb_x, plane as u8,
                         bx, by, current_is_intra,
@@ -7286,6 +8304,38 @@ impl Encoder {
         let recon_cr = self.reconstruct_chroma_mb(pred_cr, &cr_ac, &cr_dc, qp_c);
         self.recon
             .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
+
+        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path with
+        // POST-flip levels. Sites 13-15 of 15: B-frame luma 4x4 +
+        // chroma DC + chroma AC. Recompute residual from post-flip
+        // levels (no cache exists for post-flip).
+        let mut visual_recon_luma = [[0u8; 16]; 16];
+        use crate::codec::h264::transform::{dequant_4x4, inverse_4x4_integer};
+        for k in 0..16 {
+            let (bx, by) = BLOCK_INDEX_TO_POS[k];
+            let sby = by as usize;
+            let sbx = bx as usize;
+            let dq = dequant_4x4(&luma_ac_levels_post[k], qp as i32, false);
+            let res = inverse_4x4_integer(&dq);
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    let v = pred_y[sby * 4 + dy][sbx * 4 + dx] as i32
+                        + res[dy][dx];
+                    visual_recon_luma[sby * 4 + dy][sbx * 4 + dx] =
+                        v.clamp(0, 255) as u8;
+                }
+            }
+        }
+        self.visual_recon
+            .write_luma_mb(mb_x as u32, mb_y as u32, &visual_recon_luma);
+        let visual_cb =
+            self.reconstruct_chroma_mb(pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
+        let visual_cr =
+            self.reconstruct_chroma_mb(pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.visual_recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
 
         let _ = current_is_intra;
         Ok(BResidualResult {
@@ -7868,6 +8918,22 @@ fn ac_scan_order_15(raster: &[[i32; 4]; 4]) -> Vec<i32> {
     }
     debug_assert_eq!(out.len(), 15);
     out
+}
+
+/// §B-cascade-real Phase 1.1.B step 2 — inverse of [`ac_scan_order_15`].
+/// Lifts a 15-entry chroma-AC zigzag scan back into a raster 4×4 grid
+/// with `[0][0]` left zero (the DC coefficient lives in a separate
+/// chroma DC Hadamard block).
+fn ac_scan_15_to_raster(scan: &[i32]) -> [[i32; 4]; 4] {
+    use crate::codec::h264::tables::ZIGZAG_4X4;
+    debug_assert_eq!(scan.len(), 15);
+    let mut raster = [[0i32; 4]; 4];
+    for (offset, &v) in scan.iter().enumerate() {
+        let scan_idx = offset + 1; // skip DC at scan[0]
+        let raster_idx = ZIGZAG_4X4[scan_idx] as usize;
+        raster[raster_idx / 4][raster_idx % 4] = v;
+    }
+    raster
 }
 
 #[cfg(test)]
@@ -9095,5 +10161,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// §B-cascade-real v1.1 — Phase 1.1.A regression test.
+    ///
+    /// Verifies that `Encoder::new` allocates `visual_recon` with the
+    /// same dimensions as `recon`, both buffers start zero-initialised,
+    /// and `write_luma_mb_dual` / `write_chroma_block_dual` write
+    /// identical pixels to both buffers.
+    #[test]
+    fn visual_recon_dual_write_matches_recon() {
+        let enc = Encoder::new(64, 48, None).expect("enc new");
+        assert_eq!(enc.recon.width, enc.visual_recon.width);
+        assert_eq!(enc.recon.height, enc.visual_recon.height);
+        assert_eq!(enc.recon.y, enc.visual_recon.y);
+        assert_eq!(enc.recon.cb, enc.visual_recon.cb);
+        assert_eq!(enc.recon.cr, enc.visual_recon.cr);
+
+        let mut enc = enc;
+        let pixels: [[u8; 16]; 16] = std::array::from_fn(|y| {
+            std::array::from_fn(|x| ((y * 16 + x) & 0xFF) as u8)
+        });
+        enc.write_luma_mb_dual(0, 0, &pixels);
+        assert_eq!(
+            enc.recon.y, enc.visual_recon.y,
+            "Phase 1.1.A: dual-write should produce identical luma planes"
+        );
+
+        let chroma: [[u8; 8]; 8] = std::array::from_fn(|y| {
+            std::array::from_fn(|x| ((y * 8 + x) & 0xFF) as u8)
+        });
+        enc.write_chroma_block_dual(0, 0, 0, &chroma);
+        enc.write_chroma_block_dual(0, 0, 1, &chroma);
+        assert_eq!(
+            enc.recon.cb, enc.visual_recon.cb,
+            "Phase 1.1.A: dual-write should produce identical Cb planes"
+        );
+        assert_eq!(
+            enc.recon.cr, enc.visual_recon.cr,
+            "Phase 1.1.A: dual-write should produce identical Cr planes"
+        );
+    }
+
+    /// §B-cascade-real Phase 1.1.B step 2 — `ac_scan_15_to_raster`
+    /// inverts `ac_scan_order_15`: lifting a chroma-AC scan back into
+    /// raster form must reproduce the input raster (with `[0][0]`
+    /// zeroed because `ac_scan_order_15` skips DC).
+    #[test]
+    fn ac_scan_15_round_trip() {
+        let mut raster = [[0i32; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                raster[i][j] = (i * 4 + j) as i32 * 7 - 3;
+            }
+        }
+        let scan = ac_scan_order_15(&raster);
+        let lifted = ac_scan_15_to_raster(&scan);
+        let mut expected = raster;
+        expected[0][0] = 0; // DC is excluded by ac_scan_order_15
+        assert_eq!(lifted, expected);
     }
 }

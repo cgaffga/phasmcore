@@ -140,6 +140,204 @@ pub fn h264_stego_decode_yuv_string_4domain(
     decode_from_cover_4domain(walk.cover, passphrase)
 }
 
+/// §B-cascade-real Bug #1a fix decoder mirror (#235) — per-GOP STC extract.
+///
+/// Mirrors `h264_stego_encode_yuv_string_4domain_per_gop_v3`. Walks the
+/// stego stream per-GOP, extracts STC per-GOP per-domain with
+/// `gop_idx`-keyed seeds, concatenates per-GOP bits in canonical
+/// (MVD-sign | coeff-sign | coeff-suffix) per-GOP order matching
+/// encoder layout, then unpacks the framed payload.
+pub fn h264_stego_decode_yuv_string_4domain_per_gop_v3(
+    annex_b: &[u8],
+    passphrase: &str,
+) -> Result<String, StegoError> {
+    use crate::codec::h264::cabac::bin_decoder::{walk_annex_b_streaming, WalkAction};
+    use super::hook::GopCapacity;
+    use super::orchestrate::{stealth_weighted_allocation, StealthAllocator};
+
+    // Walk per-GOP, keep per-GOP DomainCover.
+    let mut per_gop_covers: Vec<DomainCover> = Vec::new();
+    let opts = WalkOptions { record_mvd: true };
+    walk_annex_b_streaming(annex_b, opts, |gop_ctx| {
+        per_gop_covers.push(gop_ctx.cover);
+        Ok(WalkAction::Continue)
+    })
+    .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
+    let num_gops = per_gop_covers.len();
+    if num_gops == 0 {
+        return Err(StegoError::InvalidVideo("no GOPs walked".into()));
+    }
+
+    // Per-GOP per-domain capacities (mirrors encoder's per_gop_counts).
+    let mut per_gop_counts: Vec<[usize; 4]> = Vec::with_capacity(num_gops);
+    for gc in &per_gop_covers {
+        per_gop_counts.push([
+            gc.coeff_sign_bypass.len(),
+            gc.coeff_suffix_lsb.len(),
+            gc.mvd_sign_bypass.len(),
+            gc.mvd_suffix_lsb.len(),
+        ]);
+    }
+    let mut totals = [0usize; 4];
+    for row in &per_gop_counts {
+        for d in 0..4 {
+            totals[d] += row[d];
+        }
+    }
+    let cap_for_alloc = GopCapacity {
+        coeff_sign_bypass: totals[0],
+        coeff_suffix_lsb: totals[1],
+        mvd_sign_bypass: totals[2],
+        mvd_suffix_lsb: 0,
+    };
+
+    let keys = CabacStegoMasterKeys::derive(passphrase)?;
+
+    let alloc_per_gop = |m_global: usize, dom: usize| -> Vec<usize> {
+        let mut out = vec![0usize; num_gops];
+        if m_global == 0 || totals[dom] == 0 {
+            return out;
+        }
+        let mut allocated = 0usize;
+        for g in 0..num_gops {
+            let m_g = (m_global as u64 * per_gop_counts[g][dom] as u64
+                / totals[dom] as u64) as usize;
+            out[g] = m_g;
+            allocated += m_g;
+        }
+        let mut rem = m_global - allocated;
+        for g in 0..num_gops {
+            if rem == 0 { break; }
+            if out[g] < per_gop_counts[g][dom] {
+                out[g] += 1;
+                rem -= 1;
+            }
+        }
+        out
+    };
+
+    let total_cover = totals.iter().sum::<usize>();
+    if total_cover == 0 {
+        return Err(StegoError::InvalidVideo("empty cover".into()));
+    }
+    let max_m = (frame::MAX_FRAME_BITS).min(total_cover);
+    let min_m = FRAME_OVERHEAD * 8;
+    let allocator = StealthAllocator::v1_default();
+
+    let mut m_total = min_m;
+    while m_total <= max_m {
+        if let Some(payload_data) = try_decode_at_per_gop(
+            &per_gop_covers, &per_gop_counts, &keys, &cap_for_alloc,
+            &allocator, &alloc_per_gop, m_total, passphrase,
+        ) {
+            return Ok(payload_data.text);
+        }
+        m_total += 8;
+    }
+    Err(StegoError::FrameCorrupted)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_decode_at_per_gop(
+    per_gop_covers: &[DomainCover],
+    _per_gop_counts: &[[usize; 4]],
+    keys: &CabacStegoMasterKeys,
+    cap_for_alloc: &super::hook::GopCapacity,
+    allocator: &super::orchestrate::StealthAllocator,
+    alloc_per_gop: &dyn Fn(usize, usize) -> Vec<usize>,
+    m_total: usize,
+    passphrase: &str,
+) -> Option<PayloadData> {
+    use super::hook::GopCapacity;
+    let (m_cs_swa, m_cl_swa, m_ms_swa, _) =
+        super::orchestrate::stealth_weighted_allocation(m_total, cap_for_alloc, allocator)?;
+    let m_mvd = m_ms_swa;
+    let m_residual = m_cs_swa + m_cl_swa;
+    if m_total != m_mvd + m_residual {
+        return None;
+    }
+
+    // Mirror encoder's split_message_per_domain on the same coeff-only
+    // capacity view to recover encoder's actual m_cs / m_cl. The
+    // weighted-allocation values use weighted ratios (cs=0.5, cl=0.8)
+    // while split_message_per_domain uses pure-capacity ratios — these
+    // diverge except in the trivial single-domain case. Encoder uses
+    // split-derived lengths (see `encode_pixels::...per_gop_v3`), so we
+    // must too.
+    let cap_mvd_only = GopCapacity {
+        coeff_sign_bypass: 0, coeff_suffix_lsb: 0,
+        mvd_sign_bypass: cap_for_alloc.mvd_sign_bypass, mvd_suffix_lsb: 0,
+    };
+    let cap_coeff_only = GopCapacity {
+        coeff_sign_bypass: cap_for_alloc.coeff_sign_bypass,
+        coeff_suffix_lsb: cap_for_alloc.coeff_suffix_lsb,
+        mvd_sign_bypass: 0, mvd_suffix_lsb: 0,
+    };
+    let stub_mvd = vec![0u8; m_mvd];
+    let split_a = super::orchestrate::split_message_per_domain(&stub_mvd, &cap_mvd_only)?;
+    let stub_residual = vec![0u8; m_residual];
+    let split_b = super::orchestrate::split_message_per_domain(&stub_residual, &cap_coeff_only)?;
+
+    let m_ms = split_a.mvd_sign_bypass.len();
+    let m_cs = split_b.coeff_sign_bypass.len();
+    let m_cl = split_b.coeff_suffix_lsb.len();
+
+    let m_cs_per_gop = alloc_per_gop(m_cs, 0);
+    let m_cl_per_gop = alloc_per_gop(m_cl, 1);
+    let m_ms_per_gop = alloc_per_gop(m_ms, 2);
+
+    // Per-GOP STC extract → concat per-domain bits across GOPs.
+    let mut all_mvd_sign = Vec::with_capacity(m_mvd);
+    let mut all_coeff_sign = Vec::with_capacity(m_cs);
+    let mut all_coeff_suffix = Vec::with_capacity(m_cl);
+
+    for (g, cover) in per_gop_covers.iter().enumerate() {
+        let m_cs_g = m_cs_per_gop[g];
+        let m_cl_g = m_cl_per_gop[g];
+        let m_ms_g = m_ms_per_gop[g];
+
+        if m_ms_g > 0 {
+            let seed = keys.per_gop_seeds(EmbedDomain::MvdSignBypass, g as u32).hhat_seed;
+            let bits = extract_one_domain(
+                &cover.mvd_sign_bypass.bits, m_ms_g, 4, &seed,
+            )?;
+            all_mvd_sign.extend_from_slice(&bits);
+        }
+        if m_cs_g > 0 {
+            let seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, g as u32).hhat_seed;
+            let bits = extract_one_domain(
+                &cover.coeff_sign_bypass.bits, m_cs_g, 4, &seed,
+            )?;
+            all_coeff_sign.extend_from_slice(&bits);
+        }
+        if m_cl_g > 0 {
+            let seed = keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, g as u32).hhat_seed;
+            let bits = extract_one_domain(
+                &cover.coeff_suffix_lsb.bits, m_cl_g, 4, &seed,
+            )?;
+            all_coeff_suffix.extend_from_slice(&bits);
+        }
+    }
+
+    if all_mvd_sign.len() + all_coeff_sign.len() + all_coeff_suffix.len() != m_total {
+        return None;
+    }
+
+    // Encoder layout: frame_bits = MVD bits || coeff bits.
+    // Within MVD: only mvd_sign (suffix forced 0).
+    // Within coeff: coeff_sign || coeff_suffix.
+    let mut all_bits = Vec::with_capacity(m_total);
+    all_bits.extend_from_slice(&all_mvd_sign);
+    all_bits.extend_from_slice(&all_coeff_sign);
+    all_bits.extend_from_slice(&all_coeff_suffix);
+    let frame_bytes = bits_to_bytes_msb_first(&all_bits);
+    let parsed = frame::parse_frame(&frame_bytes).ok()?;
+    let plaintext = crypto::decrypt(
+        &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
+    ).ok()?;
+    payload::decode_payload(&plaintext).ok()
+}
+
 /// Phase 6E-C1b — decode a shadow message from the Annex-B byte
 /// stream produced by `h264_stego_encode_yuv_string_with_shadow`.
 /// Pairs the shadow side: walks the stego bytes → 4-domain cover,

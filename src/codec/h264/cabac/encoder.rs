@@ -200,6 +200,16 @@ fn ctx_idx_inc_mb_type_bin(
         (27, 3) => 5,
         (27, 4) => 5,
         (27, 5) => 5,
+        // §B-encoder-decoder-divergence (2026-05-07, task #242). Bin 6
+        // is only emitted by mb_types 12..21 (the v∈{8..12} branch of
+        // the spec table) and uses ctxIdxInc=5 per ffmpeg
+        // `decode_cabac_mb_type_b_slice` h264_cabac.c:1997 +
+        // openh264 / spec § 9.3.3.1.1.3. Was falling through to 0;
+        // caused a 1-bin CABAC desync that flipped mb_type 12↔13,
+        // 14↔15, ..., 20↔21 on parse → wrong list-usage per partition
+        // → visible artifacts across both halves of every B-MB the
+        // RDO picked from the partitioned-Bi family.
+        (27, 6) => 5,
         _ => 0,
     }
 }

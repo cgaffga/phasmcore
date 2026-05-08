@@ -252,16 +252,30 @@ fn build_encoder(
     // the SPS level. The CABAC walker handles I_8x8 (transform_size_8x8
     // = 1) since the same task; encoder + walker are now in parity.
     enc.enable_transform_8x8 = true;
-    // Task #204 + #208 (2026-05-04) — production stego paths default
-    // to `BRdoConfig::PRODUCTION_VISUAL` (RDO mode-decision + B-frame
-    // residual emission). This is the HandBrake/x264-medium-mimic
-    // visual-quality preset, paired with `MuxerProfile::HandbrakeX264`
-    // at the mux layer in CLI / iOS / Android bridges.
+    // Phase F (#262, 2026-05-08) — production stego paths default
+    // to `BRdoConfig::SAFE_L0_ZERO`. This is RDO + residual emission
+    // ON, but every B-MB is overridden to L0_16x16 with MV=(0,0),
+    // bypassing spatial-direct + ME-derived MV paths that diverge
+    // between encoder and decoder.
+    //
+    // Phase D bisect (commit 26412b2 / corpus 10-fixture parallel
+    // run) confirmed: forced (0,0) MV makes encoder + decoder MC
+    // agree on reference positions, eliminating ghost-image and
+    // blocky-motion artifacts on textured-motion content. PSNR is
+    // equal-or-better than the prior PRODUCTION_VISUAL preset on
+    // motion fixtures (+0.4-0.7 dB on horseflag/piratebattle/
+    // schoolfight/carplane); minor regression (≤0.24 dB) on
+    // already-clean static content where Skip selections were
+    // optimal — accepted trade-off for v1.0.
     //
     // No-op for IPPPP (b_count=0) patterns — only fires on IBPBP /
-    // multi-B GopPattern. #208 closed the shadow-under-residual
-    // regression; cascade-safe across primary + N-shadow paths.
-    enc.b_rdo_config = super::super::encoder::mb_decision_b::BRdoConfig::PRODUCTION_VISUAL;
+    // multi-B GopPattern. Single source of truth across CLI / iOS /
+    // Android / WASM-decode / streaming-v2 paths since all entry
+    // points route through `build_encoder()`.
+    //
+    // v1.1 follow-on: align encoder spatial-direct + bipred MC code
+    // with decoder spec § 8.4.1.2 to remove the workaround.
+    enc.b_rdo_config = super::super::encoder::mb_decision_b::BRdoConfig::SAFE_L0_ZERO;
     let _ = CabacInitSlot::ISI;
     Ok(enc)
 }
@@ -975,6 +989,326 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming(
                 .map_err(|e| StegoError::InvalidVideo(format!(
                     "Pass 3 streaming GOP {g} frame {}: {e}",
                     meta.encode_idx,
+                )))?;
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// §B-cascade-real Bug #1a fix (#235) — per-GOP STC orchestrator (2026-05-07).
+///
+/// V5 production probe revealed that the streaming-Viterbi orchestrator
+/// concentrates per-domain flips in whichever GOP holds that domain's
+/// bulk capacity. GOP 0 (chroma-rich IDR-heavy) gets chroma-heavy flips
+/// (-5 dB U-plane); GOP 1 (motion-rich P-frame-heavy) gets luma-heavy
+/// flips (-14 dB Y catastrophic). Bug is the global STC trellis spanning
+/// all GOPs.
+///
+/// This function uses per-GOP STC: each GOP's cover and message are
+/// planned independently with `pass2_stc_plan_with_keys(.., gop_idx=g)`.
+/// Trellis windows can no longer span GOP boundaries, so flips are
+/// proportionally distributed across GOPs.
+///
+/// Identical signature + behaviour to v2 streaming for callers — same
+/// frame format, same encryption, same Pass 3 emit. Only the STC layer
+/// differs. Decoder mirror in `h264_stego_decode_yuv_string_4domain_per_gop_v3`.
+///
+/// Memory: per-GOP cover capture (one GOP at a time). Suitable for both
+/// short fixtures (V5 1080p × 45f) and long clips. Not faster than
+/// streaming-Viterbi for very long clips but bug-free.
+#[allow(clippy::too_many_arguments)]
+pub fn h264_stego_encode_yuv_string_4domain_per_gop_v3(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: super::gop_pattern::GopPattern,
+    message: &str,
+    files: &[crate::stego::payload::FileEntry],
+    passphrase: &str,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::{crypto, frame, payload};
+    use super::orchestrate::{
+        stealth_weighted_allocation, split_message_per_domain,
+        DomainPlan, StealthAllocator, pass2_stc_plan_with_keys,
+        DomainMessages,
+    };
+    use super::keys::CabacStegoMasterKeys;
+    use super::gop_pattern::GopPattern;
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}", yuv.len(), frame_size * n_frames,
+        )));
+    }
+    let gop_size = pattern.gop_size();
+    let b_count = pattern.legacy_b_count();
+    if gop_size == 0 || gop_size > n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "gop_size {gop_size} must be in 1..={n_frames}"
+        )));
+    }
+    let h = 4usize;
+    let quality = Some(26u8);
+
+    // Encrypt + frame the message + files.
+    let payload_bytes = payload::encode_payload(message, files)?;
+    let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
+    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
+    let frame_bits: Vec<u8> = frame_bytes
+        .iter()
+        .flat_map(|&byte| (0..8).rev().map(move |i| (byte >> i) & 1))
+        .collect();
+    let m_total = frame_bits.len();
+    let keys = CabacStegoMasterKeys::derive(passphrase)?;
+
+    // Pass 1: count per-GOP per-domain capacities.
+    let per_gop_counts = pass1_count_per_gop_4domain(
+        yuv, width, height, n_frames, gop_size, b_count, quality,
+    )?;
+    let num_gops = per_gop_counts.len();
+    let mut totals = [0usize; 4];
+    for row in &per_gop_counts {
+        for d in 0..4 {
+            totals[d] += row[d];
+        }
+    }
+    let cap_p1 = GopCapacity {
+        coeff_sign_bypass: totals[0],
+        coeff_suffix_lsb: totals[1],
+        mvd_sign_bypass: totals[2],
+        mvd_suffix_lsb: 0,
+    };
+
+    // Stealth allocation: global m_cs / m_cl / m_ms (unchanged).
+    let allocator = StealthAllocator::v1_default();
+    let (m_cs, m_cl, m_ms, _m_ml) =
+        stealth_weighted_allocation(m_total, &cap_p1, &allocator)
+            .ok_or(StegoError::MessageTooLarge)?;
+    let m_mvd = m_ms;
+    let m_residual = m_cs + m_cl;
+    debug_assert_eq!(m_total, m_mvd + m_residual);
+
+    // Per-GOP message-bit allocation: distribute global m_d
+    // proportionally to per-GOP cap_d_g. Round-robin remainder to
+    // earliest GOPs to conserve total. Per-domain.
+    let alloc_per_gop = |m_global: usize, dom: usize| -> Vec<usize> {
+        let mut out = vec![0usize; num_gops];
+        if m_global == 0 || totals[dom] == 0 {
+            return out;
+        }
+        let mut allocated = 0usize;
+        for g in 0..num_gops {
+            let m_g = (m_global as u64 * per_gop_counts[g][dom] as u64
+                / totals[dom] as u64) as usize;
+            out[g] = m_g;
+            allocated += m_g;
+        }
+        // Distribute rounding remainder to earliest GOPs that still
+        // have capacity headroom.
+        let mut rem = m_global - allocated;
+        for g in 0..num_gops {
+            if rem == 0 { break; }
+            if out[g] < per_gop_counts[g][dom] {
+                out[g] += 1;
+                rem -= 1;
+            }
+        }
+        debug_assert_eq!(out.iter().sum::<usize>(), m_global);
+        out
+    };
+    // (per-GOP allocation deferred until after split_message_per_domain
+    // — that's where we get the real per-domain message lengths.)
+    let _ = (m_cs, m_cl, m_ms); // placeholder to keep totals validated
+
+    // Slice frame_bits per-domain first. Encoder layout matches
+    // `decode_pixels::try_decode_at_4domain`: frame_bits[..m_mvd]
+    // = MVD-domain bits, frame_bits[m_mvd..] = residual-domain bits.
+    let cap_mvd_only = GopCapacity {
+        coeff_sign_bypass: 0, coeff_suffix_lsb: 0,
+        mvd_sign_bypass: cap_p1.mvd_sign_bypass, mvd_suffix_lsb: 0,
+    };
+    let cap_coeff_only = GopCapacity {
+        coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+        coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+        mvd_sign_bypass: 0, mvd_suffix_lsb: 0,
+    };
+    let messages_a = split_message_per_domain(&frame_bits[..m_mvd], &cap_mvd_only)
+        .ok_or_else(|| StegoError::InvalidVideo("v3: MVD split failed".into()))?;
+    let messages_b = split_message_per_domain(&frame_bits[m_mvd..], &cap_coeff_only)
+        .ok_or_else(|| StegoError::InvalidVideo("v3: residual split failed".into()))?;
+
+    // Re-derive m_cs/m_cl/m_ms from the actual split lengths (round-
+    // trip safety). `stealth_weighted_allocation` and
+    // `split_message_per_domain` use slightly different rounding;
+    // decoder side also uses `split_message_per_domain`, so we
+    // must base per-GOP allocation on those exact lengths.
+    let m_cs = messages_b.coeff_sign_bypass.len();
+    let m_cl = messages_b.coeff_suffix_lsb.len();
+    let m_ms_actual = messages_a.mvd_sign_bypass.len();
+
+    // Recompute per-GOP allocation against the actual per-domain
+    // message lengths.
+    let m_cs_per_gop = alloc_per_gop(m_cs, 0);
+    let m_cl_per_gop = alloc_per_gop(m_cl, 1);
+    let m_ms_per_gop = alloc_per_gop(m_ms_actual, 2);
+
+    // Per-GOP STC. For each GOP: capture per-GOP cover, run Pass 2A
+    // (MVD), Pass 1B (residual re-capture with MVD plan), Pass 2B
+    // (residual). Concatenate plans into combined_plan.
+    let mut combined_plan = DomainPlan::default();
+    let mut cs_off = 0usize;
+    let mut cl_off = 0usize;
+    let mut ms_off = 0usize;
+
+    for g in 0..num_gops {
+        let m_cs_g = m_cs_per_gop[g];
+        let m_cl_g = m_cl_per_gop[g];
+        let m_ms_g = m_ms_per_gop[g];
+
+        // Per-GOP message slices (bit-level, already split per-domain
+        // across the whole clip — slice into per-GOP chunks here).
+        let mvd_msg_g: Vec<u8> = if m_ms_g > 0 {
+            messages_a.mvd_sign_bypass[ms_off..ms_off + m_ms_g].to_vec()
+        } else { Vec::new() };
+        let cs_msg_g: Vec<u8> = if m_cs_g > 0 {
+            messages_b.coeff_sign_bypass[cs_off..cs_off + m_cs_g].to_vec()
+        } else { Vec::new() };
+        let cl_msg_g: Vec<u8> = if m_cl_g > 0 {
+            messages_b.coeff_suffix_lsb[cl_off..cl_off + m_cl_g].to_vec()
+        } else { Vec::new() };
+
+        // Capture this GOP's cover (MVD + naive residual).
+        let gop_cover = pass1_capture_4domain_for_gop_range(
+            yuv, width, height, n_frames, gop_size, b_count, quality, g, g + 1,
+        )?;
+
+        // Pass 2A: plan MVD STC for this GOP.
+        let mvd_messages = DomainMessages {
+            coeff_sign_bypass: Vec::new(),
+            coeff_suffix_lsb: Vec::new(),
+            mvd_sign_bypass: mvd_msg_g.clone(),
+            mvd_suffix_lsb: Vec::new(),
+        };
+        let plan_a_g = pass2_stc_plan_with_keys(
+            &gop_cover, &mvd_messages, h, &keys, g as u32,
+        ).ok_or_else(|| StegoError::InvalidVideo(format!(
+            "v3 Pass 2A GOP {g}: STC plan failed"
+        )))?;
+
+        // Pass 1B: re-encode this GOP with MVD plan applied + residual logger.
+        let cover_p1b = encode_one_gop_pass1b_inject_mvd_log_residual(
+            yuv, width, height, n_frames, frame_size, quality, pattern,
+            g, &gop_cover.cover, &plan_a_g,
+        )?;
+
+        // Pass 2B: plan residual STC for this GOP.
+        let res_messages = DomainMessages {
+            coeff_sign_bypass: cs_msg_g,
+            coeff_suffix_lsb: cl_msg_g,
+            mvd_sign_bypass: Vec::new(),
+            mvd_suffix_lsb: Vec::new(),
+        };
+        let plan_b_g = pass2_stc_plan_with_keys(
+            &cover_p1b, &res_messages, h, &keys, g as u32,
+        ).ok_or_else(|| StegoError::InvalidVideo(format!(
+            "v3 Pass 2B GOP {g}: STC plan failed"
+        )))?;
+
+        // Concatenate this GOP's per-domain plan slices into combined.
+        combined_plan.coeff_sign_bypass.extend_from_slice(&plan_b_g.coeff_sign_bypass);
+        combined_plan.coeff_suffix_lsb.extend_from_slice(&plan_b_g.coeff_suffix_lsb);
+        combined_plan.mvd_sign_bypass.extend_from_slice(&plan_a_g.mvd_sign_bypass);
+        combined_plan.total_modifications +=
+            plan_a_g.total_modifications + plan_b_g.total_modifications;
+        combined_plan.total_cost += plan_a_g.total_cost + plan_b_g.total_cost;
+
+        cs_off += m_cs_g;
+        cl_off += m_cl_g;
+        ms_off += m_ms_g;
+
+        let _ = pattern;  // reserved for future use
+    }
+    let _ = GopPattern::Ipppp { gop: 0 };  // keep import live
+
+    // Pass 3: per-GOP encode with combined_plan (mirrors streaming-v1
+    // pattern at line 911-981). Cumulative per-GOP per-domain offsets
+    // needed for plan slicing per-GOP.
+    let cum: [Vec<usize>; 4] = std::array::from_fn(|d| {
+        let mut v = Vec::with_capacity(num_gops + 1);
+        v.push(0);
+        for row in per_gop_counts.iter() {
+            v.push(*v.last().unwrap() + row[d]);
+        }
+        v
+    });
+
+    let mut out = Vec::new();
+    for g in 0..num_gops {
+        let gop_cover = pass1_capture_4domain_for_gop_range(
+            yuv, width, height, n_frames, gop_size, b_count, quality, g, g + 1,
+        )?;
+
+        let mut gop_plan = DomainPlan::default();
+        for d in 0..4 {
+            let lo = cum[d][g];
+            let hi = cum[d][g + 1];
+            let src = match d {
+                0 => &combined_plan.coeff_sign_bypass,
+                1 => &combined_plan.coeff_suffix_lsb,
+                2 => &combined_plan.mvd_sign_bypass,
+                _ => &combined_plan.mvd_suffix_lsb,
+            };
+            let dst = match d {
+                0 => &mut gop_plan.coeff_sign_bypass,
+                1 => &mut gop_plan.coeff_suffix_lsb,
+                2 => &mut gop_plan.mvd_sign_bypass,
+                _ => &mut gop_plan.mvd_suffix_lsb,
+            };
+            if src.is_empty() {
+                continue;
+            }
+            let lo = lo.min(src.len());
+            let hi = hi.min(src.len());
+            *dst = src[lo..hi].to_vec();
+        }
+
+        let mut gop_cover_only = super::DomainCover::default();
+        gop_cover_only.coeff_sign_bypass = gop_cover.cover.coeff_sign_bypass.clone();
+        gop_cover_only.coeff_suffix_lsb = gop_cover.cover.coeff_suffix_lsb.clone();
+        gop_cover_only.mvd_sign_bypass = gop_cover.cover.mvd_sign_bypass.clone();
+        gop_cover_only.mvd_suffix_lsb = gop_cover.cover.mvd_suffix_lsb.clone();
+        let injector = PlanInjector::from_plan(&gop_cover_only, &gop_plan);
+
+        let mut enc = build_encoder(width, height, quality)?;
+        enc.enable_mvd_stego_hook = true;
+        enc.enable_b_frames = pattern.has_b_frames();
+        enc.set_stego_hook(Some(Box::new(super::encoder_hook::InjectionHook::new(injector))));
+
+        let mut primed = false;
+        for (meta, frame) in iter_frames_in_encode_order(
+            yuv, frame_size, n_frames, pattern,
+        ) {
+            if (meta.gop_idx as usize) != g {
+                if (meta.gop_idx as usize) > g {
+                    break;
+                }
+                continue;
+            }
+            if !primed {
+                enc.stego_frame_idx = meta.encode_idx;
+                primed = true;
+            }
+            let bytes = encode_one_frame(&mut enc, frame, meta.frame_type)
+                .map_err(|e| StegoError::InvalidVideo(format!(
+                    "v3 Pass 3 GOP {g} frame {}: {e}", meta.encode_idx,
                 )))?;
             out.extend_from_slice(&bytes);
         }

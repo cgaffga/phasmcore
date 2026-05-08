@@ -33,11 +33,23 @@
 
 use super::{EmbedDomain, MvdSlot};
 
-/// Cost weight for a 1-bit `CoeffSignBypass` flip. Conceptually
-/// proportional to `2·|coeff|² · drift_factor`, but for sign-only
-/// flips the magnitude is preserved, so the visual change comes
-/// purely from changing the sign of a single residual sample. Base
-/// = 1.0 distortion unit, scaled by drift later.
+/// Cost weight per |coeff|² for `CoeffSignBypass` flips. Sign flip
+/// changes a dequantized residual sample from `+N·qstep` to
+/// `-N·qstep` (or vice versa) — a change of `2N·qstep` per
+/// coefficient. Pixel-domain L2 distortion after IDCT is then
+/// proportional to `(2N)² = 4N²`, dominated by high-magnitude
+/// coefficients. UNIWARD's distortion model treats this as
+/// `4·|coeff|²` (per-coefficient squared L2). Without this scaling,
+/// STC has no incentive to prefer low-magnitude positions, and it
+/// will pick arbitrary signs to satisfy parity — including
+/// high-magnitude DC coefficients that translate to ~50+ pixel
+/// errors per 4×4 block (10+ dB PSNR damage on IDR-only stego at
+/// QP=26, observed §B-cascade-real bisect 2026-05-06).
+pub const COEFF_SIGN_PER_MAG2: f32 = 4.0;
+
+/// Legacy flat-cost constant kept for tests + per-domain dispatch in
+/// [`domain_base_cost`]. Real per-position cost in [`coeff_sign_cost`]
+/// uses [`COEFF_SIGN_PER_MAG2`] × |coeff|² post-2026-05-06 fix.
 pub const COEFF_SIGN_BASE_COST: f32 = 1.0;
 
 /// Cost weight per |coeff|² for `CoeffSuffixLsb` flips. Each flip
@@ -111,11 +123,17 @@ impl PositionCostCtx {
 }
 
 /// Cost of flipping the `CoeffSignBypass` bin for one nonzero
-/// coefficient. Independent of magnitude (sign flip preserves
-/// magnitude exactly).
+/// coefficient. Proportional to `4·|coeff|²` — sign flip produces
+/// a 2N change in the dequantized sample, so pixel-domain L2
+/// distortion after IDCT is proportional to (2N)² = 4N². See
+/// [`COEFF_SIGN_PER_MAG2`] for the §B-cascade-real fix rationale
+/// (2026-05-06; was previously a flat constant, causing IDR-only
+/// stego cost of -8.77 dB at QP=26 because STC had no incentive
+/// to prefer low-magnitude positions).
 #[inline]
-pub fn coeff_sign_cost(_coeff: i32, ctx: &PositionCostCtx) -> f32 {
-    COEFF_SIGN_BASE_COST * ctx.drift_factor()
+pub fn coeff_sign_cost(coeff: i32, ctx: &PositionCostCtx) -> f32 {
+    let mag = coeff.unsigned_abs() as f32;
+    COEFF_SIGN_PER_MAG2 * mag * mag * ctx.drift_factor()
 }
 
 /// Cost of flipping the `CoeffSuffixLsb` bin for one coefficient.
@@ -217,14 +235,17 @@ mod tests {
     }
 
     #[test]
-    fn coeff_sign_cost_independent_of_magnitude() {
+    fn coeff_sign_cost_grows_with_magnitude_squared() {
+        // Updated 2026-05-06 (§B-cascade-real): cost is now 4·|coeff|²
+        // (was a flat constant pre-fix). UNIWARD-aligned.
         let c = ctx();
-        let small = coeff_sign_cost(1, &c);
-        let medium = coeff_sign_cost(50, &c);
-        let large = coeff_sign_cost(1000, &c);
-        assert_eq!(small, medium);
-        assert_eq!(medium, large);
-        assert!(small > 0.0);
+        let c1 = coeff_sign_cost(1, &c);
+        let c10 = coeff_sign_cost(10, &c);
+        let c100 = coeff_sign_cost(100, &c);
+        // 10x magnitude → 100x cost.
+        assert!((c10 - 100.0 * c1).abs() < 0.01);
+        assert!((c100 - 10000.0 * c1).abs() < 1.0);
+        assert!(c1 > 0.0);
     }
 
     #[test]
@@ -239,13 +260,18 @@ mod tests {
     }
 
     #[test]
-    fn coeff_suffix_lsb_cost_higher_than_sign_for_large_coeffs() {
+    fn coeff_sign_cost_higher_than_suffix_for_same_coeff() {
+        // Updated 2026-05-06 (§B-cascade-real): now sign > suffix
+        // for the same coefficient. Sign flip changes dequant value
+        // by 2N (full sign reversal); LSB flip changes by 1. So
+        // sign distortion = (2N)² = 4N², suffix distortion = N²:
+        // sign/suffix ratio = 2 (4·|c|² / 2·|c|²).
         let c = ctx();
         let sign = coeff_sign_cost(20, &c);
         let suffix = coeff_suffix_lsb_cost(20, &c);
-        assert!(suffix > sign, "suffix LSB cost must exceed sign cost for large coeffs");
-        // 2 × 20² = 800, vs sign cost 1 → 800× ratio.
-        assert!(suffix / sign > 100.0);
+        assert!(sign > suffix, "sign cost must exceed suffix cost for same coeff");
+        assert!((sign / suffix - 2.0).abs() < 0.01,
+            "sign cost should be 2x suffix cost at same magnitude");
     }
 
     #[test]
@@ -269,14 +295,19 @@ mod tests {
     fn cost_vec_matches_enumerate_order() {
         // Build a scan with mixed signs; verify cost_vec aligns
         // with the position enumeration order (reverse scan).
+        // Updated 2026-05-06 (§B-cascade-real fix): cost is now
+        // 4·|coeff|², no longer constant.
         let mut scan = vec![0i32; 16];
         scan[0] = 5; scan[3] = -8; scan[7] = 12;
         let costs = coeff_sign_cost_vec(&scan, 0, 15, &ctx());
-        // 3 positions; sign cost is constant for sign domain.
+        // 3 positions, reverse scan: scan[7]=12, scan[3]=-8, scan[0]=5
         assert_eq!(costs.len(), 3);
-        for &c in &costs {
-            assert_eq!(c, COEFF_SIGN_BASE_COST);
-        }
+        // 4 × 12² = 576
+        assert!((costs[0] - 576.0).abs() < 0.01);
+        // 4 × 8² = 256
+        assert!((costs[1] - 256.0).abs() < 0.01);
+        // 4 × 5² = 100
+        assert!((costs[2] - 100.0).abs() < 0.01);
     }
 
     #[test]

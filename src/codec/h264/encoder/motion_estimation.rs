@@ -155,6 +155,84 @@ impl MotionEstimator {
         MotionSearchResult { mv: qpel_mv, cost }
     }
 
+    /// Phase 4.3 (#251) — multi-candidate refine-from-each then pick
+    /// best. Distinct from `search_block_with_candidates` which uses
+    /// best-seed-then-refine: that strategy picks the candidate with
+    /// the lowest *initial* `SAD + λ·rate` and runs full UMH +
+    /// integer-hex + sub-pel refinement only from that winner. A
+    /// candidate whose initial cost is lower but whose refinement
+    /// basin is worse displaces ME from a better-final-result basin.
+    ///
+    /// This variant runs an integer-pel hex search from EACH candidate
+    /// independently, tracks the global best post-integer-refinement
+    /// cost, then runs sub-pel (half + quarter) refinement only on
+    /// that absolute winner. Cost: ~N × integer-hex (cheap, ~50 SAD
+    /// points each) + 1 × sub-pel. Roughly 2× the single-start cost
+    /// at N=6 candidates — manageable.
+    ///
+    /// Use this when you suspect the spatial-median seed is biased in
+    /// a way the lowest-initial-cost selection can't escape (e.g.
+    /// motion-boundary MBs whose neighbour MVs all point to a wall
+    /// background that gives flat-and-low SAD anywhere on the wall —
+    /// initial-cost picks any wall direction; refine-from-each gives
+    /// a content-correct candidate a fair shot at a better basin).
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_block_multi_refine(
+        &mut self,
+        source: &[u8],
+        source_stride: usize,
+        reference: &ReconFrame,
+        block_x: u32,
+        block_y: u32,
+        block_w: u32,
+        block_h: u32,
+        predicted_mv: MotionVector,
+        candidates: &[MotionVector],
+    ) -> MotionSearchResult {
+        let lambda = me_lambda();
+        // Run integer hex search starting from each candidate.
+        // Track the global best (cost, integer-pel mv) across all.
+        let mut best_int_mv = clip_mv_to_frame(
+            predicted_mv, reference, block_x, block_y, block_w, block_h,
+        );
+        let mut best_int_cost = u32::MAX;
+        for &c in candidates.iter() {
+            let c_int = MotionVector {
+                mv_x: (c.mv_x >> 2) << 2,
+                mv_y: (c.mv_y >> 2) << 2,
+            };
+            let c_clipped = clip_mv_to_frame(
+                c_int, reference, block_x, block_y, block_w, block_h,
+            );
+            let int_mv = integer_hex_search(
+                source, source_stride, reference, block_x, block_y, block_w, block_h,
+                c_clipped, predicted_mv, lambda,
+            );
+            let cost = satd_at_mv(
+                source, source_stride, reference,
+                block_x, block_y, block_w, block_h, int_mv,
+            ) + lambda * mv_bit_cost(int_mv, predicted_mv);
+            if cost < best_int_cost {
+                best_int_cost = cost;
+                best_int_mv = int_mv;
+            }
+        }
+        // Sub-pel refinement on the absolute integer winner.
+        let halfpel_mv = refine_5point(
+            source, source_stride, reference, block_x, block_y, block_w, block_h,
+            best_int_mv, 2, predicted_mv, lambda,
+        );
+        let qpel_mv = refine_5point(
+            source, source_stride, reference, block_x, block_y, block_w, block_h,
+            halfpel_mv, 1, predicted_mv, lambda,
+        );
+        let cost = satd_at_mv(
+            source, source_stride, reference,
+            block_x, block_y, block_w, block_h, qpel_mv,
+        );
+        MotionSearchResult { mv: qpel_mv, cost }
+    }
+
     /// Back-compat wrapper for callers that pass a `[[u8; 16]; 16]`
     /// source and expect the 16×16 result.
     pub fn search_16x16(

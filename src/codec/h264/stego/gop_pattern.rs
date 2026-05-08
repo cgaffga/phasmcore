@@ -283,7 +283,19 @@ impl EncodeOrderIter {
                     while sub_start < gop_end {
                         let sub_end = (sub_start + m).min(gop_end);
                         let anchor = sub_end - 1;
-                        let anchor_ft = pattern.frame_type_at(anchor);
+                        // §B-direct-fix Stage 2 ROOT-CAUSE FIX 2026-05-06:
+                        // when n_frames truncates a sub-GOP, the natural
+                        // frame_type_at(anchor) might be B (since anchor
+                        // sits at a B position in the M=2 cycle). Emitting
+                        // a trailing B with no future L1 anchor causes
+                        // ffmpeg's reorder/DPB to corrupt the prior P
+                        // (~40% pixel diff at d=10 in 12f IBPBP probe).
+                        // Force anchor=P always: the LAST frame in a
+                        // truncated sub-GOP is an anchor, not a B.
+                        let anchor_ft = match pattern.frame_type_at(anchor) {
+                            FrameType::B => FrameType::P,
+                            ft => ft,
+                        };
                         frames.push(EncodeOrderFrame {
                             encode_idx,
                             display_idx: anchor as u32,

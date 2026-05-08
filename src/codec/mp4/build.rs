@@ -748,45 +748,25 @@ fn build_video_trak_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
     wrap_box(b"trak", &trak)
 }
 
-/// `edts/elst` for B-frame-aware streams. HandBrake emits a single
-/// `elst` entry pointing at `media_time = b_offset` (the PTS of the
-/// first DISPLAYED frame, in track-media units) so the player skips
-/// the encode-order pre-roll. `None` when no composition offsets are
-/// supplied (no B-frames → no `edts` needed).
-fn build_edts_handbrake(p: &MoovParams<'_>) -> Option<Vec<u8>> {
-    let offsets = p.composition_offsets?;
-    if offsets.is_empty() {
-        return None;
-    }
-    // Find the first displayed frame's PTS in mdhd-timescale units.
-    // For closed IBPBP M=2: display_idx 0 = encode_idx 0 (the IDR), so
-    // PTS_of_first_display = 0. The "pre-roll" is the difference
-    // between the latest (max) DTS+ctts and the encode-order range.
-    // Practically, HandBrake sets media_time = (-min(ctts)) so the
-    // smallest negative composition shift becomes a leading silent
-    // edit.
-    let min_ctts = offsets.iter().copied().min().unwrap_or(0);
-    if min_ctts >= 0 {
-        return None; // no negative offsets → no pre-roll needed
-    }
-    // Convert min_ctts (in mdhd-timescale) to mvhd-timescale (1000) for
-    // segment_duration; media_time stays in mdhd-timescale.
-    let pre_roll_media: u64 = (-min_ctts) as u64;
-    let pre_roll_movie: u64 = pre_roll_media * (handbrake::MVHD_TIMESCALE as u64) /
-        (p.mdhd_timescale as u64);
-    let track_duration_movie: u64 = p.movie_duration_ms; // already movie-timescale
-
-    // Single edit: segment_duration covers full track, media_time =
-    // pre_roll_media so the playhead starts at the first displayed
-    // frame.
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version=0, flags=0
-    content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    content.extend_from_slice(&((track_duration_movie + pre_roll_movie) as u32).to_be_bytes());
-    content.extend_from_slice(&(pre_roll_media as u32).to_be_bytes()); // media_time
-    content.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // media_rate = 1.0
-    let elst = wrap_box(b"elst", &content);
-    Some(wrap_box(b"edts", &elst))
+/// `edts/elst` for B-frame-aware streams.
+///
+/// **2026-05-05 fix**: real x264-medium output emits NO `edts/elst`
+/// box. The original §Stealth.L4.2 follow-on (#146) emitted one with
+/// `media_time = -min(ctts)` thinking it matched x264; in fact x264
+/// relies on `ctts` version=1 signed offsets alone to encode B-frame
+/// PTS reordering, with all DTS values non-negative and all PTS = DTS
+/// + ctts non-negative. The leading-empty-edit phasm was emitting
+/// instead instructed players to start playback past the IDR, dropping
+/// the IDR from display output and producing a 1-frame
+/// presentation-time shift that read as ~5–10 dB Y-PSNR vs source.
+///
+/// See `docs/design/h264-encoder-quality-perf-gap-2026-05-04.md`.
+///
+/// Kept around as `_unused` for diff readability — caller never invokes.
+#[allow(dead_code)]
+fn build_edts_handbrake(_p: &MoovParams<'_>) -> Option<Vec<u8>> {
+    // x264 doesn't emit edts/elst. We don't either.
+    None
 }
 
 fn build_tkhd_video(duration_ms: u64, width: u32, height: u32) -> Vec<u8> {
@@ -1616,6 +1596,58 @@ mod tests {
             order.iter().map(|s| *s).collect::<Vec<_>>(),
             expected.iter().map(|s| **s).collect::<Vec<_>>(),
         );
+    }
+
+    /// §Stealth.L4.2.fix regression test (2026-05-05).
+    ///
+    /// Phasm MUST NOT emit `edts/elst` boxes — real x264-medium output
+    /// has none, and a leading-empty-edit shifts the IDR's presentation
+    /// time to a negative value (or past the start) that ffmpeg trims
+    /// from display, causing a 1-frame frame-pairing offset that read
+    /// as a 7+ dB Y-PSNR cliff in stego measurements. CTTS version=1
+    /// signed offsets handle B-frame PTS reordering without any edit
+    /// list. Lock this in: scan the entire MP4 byte stream for the
+    /// `elst` 4-CC and assert it never appears, even with B-frames in
+    /// the GOP pattern.
+    #[test]
+    fn ibpbp_mp4_does_not_emit_edts_elst() {
+        use crate::codec::h264::stego::gop_pattern::GopPattern;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x40, 0x40, 0x3C, 0x80]);
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xEB, 0xE3, 0xCB]);
+        bytes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]);
+        for _ in 0..4 {
+            bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30]);
+            bytes.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]);
+        }
+        let mp4 = build_mp4_with_pattern(
+            MuxerProfile::HandbrakeX264,
+            &bytes,
+            1920,
+            1080,
+            FrameTiming::FPS_30,
+            GopPattern::Ibpbp { gop: 5, b_count: 1 },
+            5,
+        )
+        .unwrap();
+        // Search for 'edts' and 'elst' 4-CC anywhere in the byte
+        // stream. Both must be absent for a spec-correct B-frame
+        // container that doesn't trim the IDR.
+        for needle in [b"edts", b"elst"] {
+            let mut found = false;
+            for window in mp4.windows(4) {
+                if window == needle.as_slice() {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                !found,
+                "MP4 contains '{}' box — phasm must not emit edts/elst (see §Stealth.L4.2.fix)",
+                std::str::from_utf8(needle).unwrap(),
+            );
+        }
     }
 
     /// Walk the box tree to find moov/trak/mdia/minf/stbl and return its

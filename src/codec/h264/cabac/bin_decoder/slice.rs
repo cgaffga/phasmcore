@@ -774,7 +774,7 @@ fn walk_b_mb(
     // L0/L1/Bi/partitioned/B_8x8 walkers now decode non-zero CBP
     // residuals via the shared `finish_b_inter` tail.
     match mb_type {
-        0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp),
+        0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
         1 => walk_b_l0_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
         2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
         3 => walk_b_bi_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
@@ -821,36 +821,34 @@ fn walk_b_direct_16x16(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
     prev_mb_qp: &mut i32,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
 ) -> Result<bool, WalkError> {
-    let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
-    let cbp_luma = cbp_byte & 0x0F;
-    let cbp_chroma = (cbp_byte >> 4) & 0x03;
-
-    if cbp_luma != 0 || cbp_chroma != 0 {
-        // §6E-A6.1 / §6E-A4(c)-full will land B-frame residual
-        // decoding here. Today's §6E-A4(c)-lite encoder produces
-        // CBP=0 always, so a non-zero CBP indicates the bitstream
-        // came from a future-version encoder (or third-party source)
-        // and we need the full residual path before walking it.
-        return Err(WalkError::H264(H264Error::Unsupported(format!(
-            "B_Direct_16x16 with non-zero CBP {cbp_byte:#x} \
-             (lands in §6E-A6.1 with the residual path)"
-        ))));
-    }
-
-    // CBP=0 → no mb_qp_delta, no residual blocks. Commit neighbour
-    // + end_of_slice.
-    let _ = prev_mb_qp; // QP unchanged when CBP=0
-    let is_last = decode_end_of_slice_flag(dec)?;
-    let nb = CabacNeighborMB {
-        mb_type: MbTypeClass::BSkipOrDirect,
-        mb_skip_flag: false,
-        cbp_luma: 0,
-        cbp_chroma: 0,
-        ..CabacNeighborMB::default()
-    };
-    dec.neighbors.commit(mb_x, nb);
-    Ok(is_last)
+    // §B-direct-residual.walker (#244, 2026-05-07) — B_Direct_16x16
+    // CAN have CBP > 0 per spec § 7.4.5.1. The previous walker
+    // hardcoded CBP=0 + WalkError::Unsupported for any non-zero CBP,
+    // which prevented re-enabling Direct+residual emission on the
+    // encoder side (V16 negative result root cause).
+    //
+    // The path now mirrors L0/L1/Bi: parse CBP byte, if non-zero
+    // parse mb_qp_delta + luma 4x4 + chroma DC/AC residuals, then
+    // commit BSkipOrDirect neighbour state (NOT PInter — the next
+    // MB's mb_skip_flag bin0 ctx + B-slice mb_type prefix bin0 ctx
+    // depend on whether this neighbour is direct-class, per spec
+    // § 9.3.3.1.1.1 + § 9.3.3.1.1.3).
+    //
+    // Direct has NO MVDs on the wire — they're derived from
+    // neighbour state at decode time. Pass `None, None` for MVD
+    // abs values; the neighbour commit will use the
+    // `abs_mvd_comp* = 0` defaults (correct for Direct).
+    finish_b_inter_with_mb_type(
+        dec, mb_x, prev_mb_qp,
+        /* l0_abs */ None, /* l1_abs */ None,
+        frame_idx, mb_addr_u32, recorder, t8x8,
+        MbTypeClass::BSkipOrDirect,
+    )
 }
 
 /// §6E-A6.1 — `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
@@ -952,28 +950,40 @@ fn walk_b_partitioned(
     // the encoder's `emit_b_partitioned`. Partition 1's bin 0
     // ctxIdxInc reads partition 0's just-decoded MVD via
     // `compute_mvd_ctx_idx_inc_bin0_per_list`.
+    //
+    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
+    // H.264 spec § 7.3.5.1 / § 9.3.3.1.1 interprets B-slice
+    // partitioned MVDs in **list-major** order: outer iterates
+    // list 0..2, inner iterates partition index 0..N-1, decoding
+    // an MVD pair only when that partition uses that list. Walker
+    // now mirrors that. Encoder side updated in lockstep
+    // in `core/src/codec/h264/encoder/encoder.rs::emit_b_partitioned_method`.
     let mut current_mvd = CurrentMbMvdAbs::new();
     let (pw, ph) = meta.shape.part_dim_4x4();
 
-    for idx in 0..2 {
-        let usage = if idx == 0 { meta.part0 } else { meta.part1 };
-        let (off_x, off_y) = meta.shape.part_offset(idx);
-        let cur_bx = off_x as u8;
-        let cur_by = off_y as u8;
+    for list in 0u8..2 {
+        for idx in 0..2 {
+            let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+            let uses_this_list = match (list, usage) {
+                (0, BListUse::L0) | (0, BListUse::Bi) => true,
+                (1, BListUse::L1) | (1, BListUse::Bi) => true,
+                _ => false,
+            };
+            if !uses_this_list {
+                continue;
+            }
+            let (off_x, off_y) = meta.shape.part_offset(idx);
+            let cur_bx = off_x as u8;
+            let cur_by = off_y as u8;
 
-        // L0 MVD if partition uses L0 or Bi.
-        if matches!(usage, BListUse::L0 | BListUse::Bi) {
             let (x, y) = decode_b_partition_mvd_pair(
-                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 0,
+                dec, mb_x, &current_mvd, cur_bx, cur_by, list,
             )?;
-            current_mvd.fill_region(cur_bx, cur_by, pw as u8, ph as u8, x, y);
-        }
-        // L1 MVD if partition uses L1 or Bi.
-        if matches!(usage, BListUse::L1 | BListUse::Bi) {
-            let (x, y) = decode_b_partition_mvd_pair(
-                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 1,
-            )?;
-            current_mvd.fill_region_l1(cur_bx, cur_by, pw as u8, ph as u8, x, y);
+            if list == 0 {
+                current_mvd.fill_region(cur_bx, cur_by, pw as u8, ph as u8, x, y);
+            } else {
+                current_mvd.fill_region_l1(cur_bx, cur_by, pw as u8, ph as u8, x, y);
+            }
         }
     }
 
@@ -1032,28 +1042,41 @@ fn walk_b_8x8(
 
     // §6E-A6.1q.e (#154) — within-MB MVD tracker. Mirror of
     // `emit_b_8x8`.
+    //
+    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
+    // The spec parses B_8x8 sub-MB MVDs in **list-major** order
+    // (H.264 spec § 7.3.5.1 + § 9.3.3.1.1): outer iterates list
+    // 0..2, inner iterates sub-MB index 0..4, decoding an MVD
+    // pair only when that sub-MB uses that list. Walker now
+    // mirrors that. Encoder side updated in lockstep in
+    // `core/src/codec/h264/encoder/encoder.rs::emit_b_8x8_method`.
     let mut current_mvd = CurrentMbMvdAbs::new();
 
-    for (s_idx, &sub) in sub_mb_types.iter().enumerate() {
-        let off_bx = (s_idx & 1) * 2;
-        let off_by = (s_idx >> 1) * 2;
-        let cur_bx = off_bx as u8;
-        let cur_by = off_by as u8;
-        let pw = 2u8;
-        let ph = 2u8;
-        // L0 MVD pair when sub_mb_type uses L0 (1 or 3).
-        if matches!(sub, 1 | 3) {
+    for list in 0u8..2 {
+        for s_idx in 0..4 {
+            let sub = sub_mb_types[s_idx];
+            let uses_this_list = match (list, sub) {
+                (0, 1) | (0, 3) => true,
+                (1, 2) | (1, 3) => true,
+                _ => false,
+            };
+            if !uses_this_list {
+                continue;
+            }
+            let off_bx = (s_idx & 1) * 2;
+            let off_by = (s_idx >> 1) * 2;
+            let cur_bx = off_bx as u8;
+            let cur_by = off_by as u8;
+            let pw = 2u8;
+            let ph = 2u8;
             let (x, y) = decode_b_partition_mvd_pair(
-                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 0,
+                dec, mb_x, &current_mvd, cur_bx, cur_by, list,
             )?;
-            current_mvd.fill_region(cur_bx, cur_by, pw, ph, x, y);
-        }
-        // L1 MVD pair when sub_mb_type uses L1 (2 or 3).
-        if matches!(sub, 2 | 3) {
-            let (x, y) = decode_b_partition_mvd_pair(
-                dec, mb_x, &current_mvd, cur_bx, cur_by, /* list */ 1,
-            )?;
-            current_mvd.fill_region_l1(cur_bx, cur_by, pw, ph, x, y);
+            if list == 0 {
+                current_mvd.fill_region(cur_bx, cur_by, pw, ph, x, y);
+            } else {
+                current_mvd.fill_region_l1(cur_bx, cur_by, pw, ph, x, y);
+            }
         }
     }
 
@@ -1184,6 +1207,25 @@ fn finish_b_inter(
     recorder: &mut PositionRecorder,
     t8x8: bool,
 ) -> Result<bool, WalkError> {
+    finish_b_inter_with_mb_type(
+        dec, mb_x, prev_mb_qp, l0_abs, l1_abs, frame_idx, mb_addr_u32,
+        recorder, t8x8, MbTypeClass::PInter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_b_inter_with_mb_type(
+    dec: &mut CabacDecoder<'_>,
+    mb_x: usize,
+    prev_mb_qp: &mut i32,
+    l0_abs: Option<[[i16; 16]; 2]>,
+    l1_abs: Option<[[i16; 16]; 2]>,
+    frame_idx: u32,
+    mb_addr_u32: u32,
+    recorder: &mut PositionRecorder,
+    t8x8: bool,
+    mb_type_class: MbTypeClass,
+) -> Result<bool, WalkError> {
     let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
@@ -1284,7 +1326,7 @@ fn finish_b_inter(
     let abs_mvd_l0 = l0_abs.unwrap_or([[0; 16]; 2]);
     let abs_mvd_l1 = l1_abs.unwrap_or([[0; 16]; 2]);
     let mut nb = CabacNeighborMB {
-        mb_type: MbTypeClass::PInter,
+        mb_type: mb_type_class,
         mb_skip_flag: false,
         cbp_luma,
         cbp_chroma,
@@ -2605,9 +2647,23 @@ mod tests {
     ///
     /// Status: PASSES post-§6F.2(g) MVD-disable. Round trip recovers
     /// the original message on real-iPhone YUV.
+    ///
+    /// **2026-05-05 race fix**: this test reads PHASM_B_RDO /
+    /// PHASM_B_RESIDUAL / PHASM_B_FORCE_MODE / PHASM_B_FORCE_MV
+    /// indirectly through the multigop pipeline. Setter tests in
+    /// encoder.rs hold `B_FORCE_MODE_ENV_LOCK` while their env vars
+    /// are set. This test now ALSO takes the lock so a concurrent
+    /// setter cannot pollute its mid-encode env reads (previously
+    /// caused intermittent FrameCorrupted under cargo test -p
+    /// phasm-core --lib with default parallelism).
     #[test]
     fn pass3_roundtrip_real_world_64x48_5f_diagnostic() {
+        use crate::codec::h264::encoder::mb_decision_b::B_FORCE_MODE_ENV_LOCK;
         use crate::codec::h264::stego::encode_pixels::h264_stego_encode_yuv_string_4domain_multigop;
+
+        let _lock = B_FORCE_MODE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
         let yuv = match std::fs::read(yuv_path) {

@@ -91,6 +91,25 @@ pub fn raster_to_scan_levels(raster: &[[i32; 4]; 4]) -> [i32; 16] {
     scan
 }
 
+/// §B-cascade-real v1.1 — Phase 1.1.B. Inverse of
+/// [`raster_to_scan_levels`]: write zigzag-order scan levels back into
+/// a 2D raster-order block.
+///
+/// The dual-recon decoder uses this to lift the post-flip `scan`
+/// (returned by the stego hook) into a raster `[[i32; 4]; 4]` block
+/// suitable for `dequant_4x4` + `inverse_4x4_integer`, computing the
+/// "what a downstream player will see" residual that goes into
+/// `visual_recon`.
+pub fn scan_to_raster_levels(scan: &[i32; 16]) -> [[i32; 4]; 4] {
+    use crate::codec::h264::tables::ZIGZAG_4X4;
+    let mut raster = [[0i32; 4]; 4];
+    for scan_idx in 0..16 {
+        let raster_idx = ZIGZAG_4X4[scan_idx] as usize;
+        raster[raster_idx / 4][raster_idx % 4] = scan[scan_idx];
+    }
+    raster
+}
+
 /// Reconstructed-pixel buffer for a frame.
 ///
 /// Holds the reconstructed YUV planes populated MB-by-MB during
@@ -99,7 +118,7 @@ pub fn raster_to_scan_levels(raster: &[[i32; 4]; 4]) -> [i32; 16] {
 ///
 /// Storage is yuv420p — Y full-resolution, Cb/Cr half-resolution per
 /// axis. Indexing is `plane[y * stride + x]`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReconBuffer {
     pub width: u32,
     pub height: u32,

@@ -43,5 +43,7 @@ pub use positions::PositionRecorder;
 pub use slice::{
     walk_annex_b_for_cover, walk_annex_b_for_cover_with_options,
     walk_nalus_for_cover, walk_nalus_for_cover_with_options,
-    CoverWalkOutput, WalkError, WalkOptions,
+    walk_annex_b_streaming, walk_nalus_streaming_with_options,
+    CoverWalkOutput, GopContext, StreamingWalkOutput, WalkAction,
+    WalkError, WalkOptions,
 };

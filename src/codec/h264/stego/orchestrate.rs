@@ -113,6 +113,36 @@ impl ResidualPathKind {
             },
         }
     }
+
+    /// §B-cascade-real fix 2026-05-07 — per-path-kind cost multiplier
+    /// for sign + suffix-LSB flips. DC paths (LumaDcIntra16x16,
+    /// ChromaDc) propagate through inverse Hadamard to ALL sub-blocks
+    /// of the parent macroblock — a single DC sign flip changes the
+    /// average brightness of 256 luma pixels (or 64 chroma) by
+    /// 2N×qstep, vs an AC flip that only affects one 4×4 region
+    /// (16 pixels) with mostly-canceling IDCT response. Without this
+    /// weighting STC sees DC and AC as equivalent at the same |coeff|
+    /// and may pick a low-magnitude DC over a high-magnitude AC →
+    /// catastrophic visual damage at QP=26 IDR.
+    ///
+    /// Multipliers are conservative (perceptual visibility, not strict
+    /// pixel-area count) and capture the dominant order-of-magnitude
+    /// difference. Production paths can refine via cost calibration.
+    pub fn cost_multiplier(self) -> f32 {
+        match self {
+            // 4×4 hadamard DC propagates to 16 sub-blocks → 256 pixels
+            // of coherent DC offset.
+            ResidualPathKind::LumaDcIntra16x16 => 16.0,
+            // 2×2 hadamard DC (4:2:0 chroma) propagates to 4 sub-blocks
+            // = 64 chroma pixels. Chroma plane is 1/4 of luma area but
+            // perceptually equally visible (color shift) — keep 16×.
+            ResidualPathKind::ChromaDc { .. } => 16.0,
+            // AC paths: baseline cost. Single-block locality.
+            ResidualPathKind::Luma4x4 { .. } => 1.0,
+            ResidualPathKind::Luma8x8 { .. } => 1.0,
+            ResidualPathKind::ChromaAc { .. } => 1.0,
+        }
+    }
 }
 
 /// Per-GOP decision cache. Pass 1 populates the cover; Pass 3
@@ -160,6 +190,13 @@ pub fn pass1_collect_cover(cache: &GopDecisionCache) -> GopCover {
 
         // Per-residual-block contributions to coeff domains.
         for blk in &mb.residual_blocks {
+            // §B-cascade-real fix 2026-05-07: per-path-kind cost multiplier.
+            // DC paths (LumaDcIntra16x16, ChromaDc) propagate through inverse
+            // hadamard to all 16 (luma) or 4 (chroma) sub-blocks. Without
+            // this weighting STC has no incentive to avoid catastrophic-DC
+            // sign flips at IDR.
+            let path_mult = blk.path_kind.cost_multiplier();
+
             // CoeffSignBypass.
             let positions = enumerate_coeff_sign_positions(
                 &blk.scan_coeffs,
@@ -177,7 +214,7 @@ pub fn pass1_collect_cover(cache: &GopDecisionCache) -> GopCover {
             );
             for ((p, b), c) in positions.iter().zip(bits.iter()).zip(costs.iter()) {
                 out.cover.coeff_sign_bypass.push(*b, *p);
-                out.costs.coeff_sign_bypass.push(*c);
+                out.costs.coeff_sign_bypass.push(*c * path_mult);
             }
 
             // CoeffSuffixLsb.
@@ -197,7 +234,7 @@ pub fn pass1_collect_cover(cache: &GopDecisionCache) -> GopCover {
             );
             for ((p, b), c) in positions.iter().zip(bits.iter()).zip(costs.iter()) {
                 out.cover.coeff_suffix_lsb.push(*b, *p);
-                out.costs.coeff_suffix_lsb.push(*c);
+                out.costs.coeff_suffix_lsb.push(*c * path_mult);
             }
         }
 
@@ -496,7 +533,7 @@ impl Default for StealthAllocator {
 
 impl StealthAllocator {
     /// v1.0 default weights (see struct doc-comment for rationale).
-    pub const fn v1_default() -> Self {
+    pub const fn v1_default_const() -> Self {
         Self {
             w_coeff_sign: 0.5,
             w_coeff_suffix: 0.8,
@@ -504,6 +541,26 @@ impl StealthAllocator {
             w_mvd_suffix: 1.0,
             mvd_drift_budget_frac: 0.20,
         }
+    }
+
+    /// v1.0 default weights with optional `PHASM_STEALTH_ABLATE` env
+    /// override for §B-cascade-real domain bisect (2026-05-06). Set to
+    /// `cs` / `cl` / `ms` / `ml` to ablate to a single-domain
+    /// allocator (other 3 weights = 0). Empty / unset = full v1
+    /// defaults. Used to identify which of the 4 stego domains
+    /// triggers CABAC bin-context desync at IDR.
+    pub fn v1_default() -> Self {
+        let mut a = Self::v1_default_const();
+        if let Ok(v) = std::env::var("PHASM_STEALTH_ABLATE") {
+            match v.as_str() {
+                "cs" => { a.w_coeff_suffix = 0.0; a.w_mvd_sign = 0.0; a.w_mvd_suffix = 0.0; }
+                "cl" => { a.w_coeff_sign = 0.0; a.w_mvd_sign = 0.0; a.w_mvd_suffix = 0.0; }
+                "ms" => { a.w_coeff_sign = 0.0; a.w_coeff_suffix = 0.0; a.w_mvd_suffix = 0.0; a.mvd_drift_budget_frac = 1.0; }
+                "ml" => { a.w_coeff_sign = 0.0; a.w_coeff_suffix = 0.0; a.w_mvd_sign = 0.0; a.mvd_drift_budget_frac = 1.0; }
+                _ => {}
+            }
+        }
+        a
     }
 }
 
