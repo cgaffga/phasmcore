@@ -17,6 +17,15 @@
 //   - Incremental: ninja -C _build_static (meson setup is idempotent
 //     and skipped when the build dir already has build.ninja)
 //   - Re-run trigger: any change under vendor/phasm-openh264/codec/
+//
+// Task #381 (Phase B.12) — graceful fallback when the submodule is
+// absent (e.g., the phasmcore mirror, which is `git archive`'d and
+// doesn't carry submodules). Detection + stub-compile path lives in
+// `build_stub` below; the function emits cargo:warning, skips meson,
+// and compiles `shim/phasm_openh264_stub.c` as a no-op library that
+// satisfies the Rust FFI surface in `src/lib.rs`. Calls into the
+// stubbed backend return error codes at runtime so callers fall back
+// to the pure-Rust walker path.
 
 use std::env;
 use std::path::PathBuf;
@@ -29,28 +38,24 @@ fn main() {
 
     // Locate submodule at <project root>/vendor/phasm-openh264.
     // From core/openh264-sys/, the project root is two levels up.
-    let submodule_path = manifest_dir
+    let submodule_path_raw = manifest_dir
         .join("..")
         .join("..")
         .join("vendor")
         .join("phasm-openh264");
-    let submodule_path = submodule_path.canonicalize().unwrap_or_else(|e| {
-        panic!(
-            "phasm-openh264 submodule not found at {}: {}\n\
-             Run `git submodule update --init --recursive` from the project root.",
-            submodule_path.display(),
-            e
-        );
-    });
 
-    if !submodule_path.join("meson.build").exists() {
-        panic!(
-            "phasm-openh264 submodule directory exists at {} but contains no meson.build.\n\
-             The submodule may not be checked out. Run\n\
-             `git submodule update --init --recursive` from the project root.",
-            submodule_path.display()
-        );
-    }
+    // Task #381 — detect missing-submodule state. Two failure modes
+    // both flow into the stub path:
+    //   1. canonicalize() fails (path doesn't exist at all)
+    //   2. canonicalize() succeeds but meson.build is missing (e.g.,
+    //      directory was created but submodule wasn't checked out)
+    let submodule_path = match submodule_path_raw.canonicalize() {
+        Ok(p) if p.join("meson.build").exists() => p,
+        _ => {
+            build_stub(&manifest_dir, &submodule_path_raw);
+            return;
+        }
+    };
 
     // Phase B.8 step 5 — SHA pin. The Rust-side scan-table + hook-key
     // translation in `core-openh264-sys` depends on Phase A.5's hook
@@ -255,4 +260,89 @@ fn check_tool_available(tool: &str, install_hint: &str) {
             tool, install_hint
         ),
     }
+}
+
+/// Task #381 — Phase B.12: stub-build fallback when the
+/// `vendor/phasm-openh264` submodule is absent.
+///
+/// Phasmcore mirror consumers receive a `git archive`'d snapshot of
+/// `core/` that does NOT carry the submodule. Without this fallback,
+/// `cargo build --features openh264-backend` would panic in the
+/// canonicalize() / meson.build check above. Instead, this function:
+///
+/// 1. Emits a loud `cargo:warning=...` pointing at the README setup
+///    instructions, so users see the situation at build time.
+/// 2. Compiles `shim/phasm_openh264_stub.c` (a plain-C TU defining
+///    every FFI symbol as a fail-fast no-op) as `phasm_shims`.
+/// 3. Sets `cfg=phasm_openh264_stub` so Rust-side code can pick a
+///    different path if it wants (optional — runtime detection via
+///    `WelsStegoAbiVersion() == 0` works too).
+/// 4. Skips the `cargo:rustc-link-lib=static=openh264` directive
+///    (no archive was built).
+/// 5. Skips the C++ stdlib link (stub is plain C).
+///
+/// Runtime: every backend call returns -1 / NULL. Rust-side wrappers
+/// (`StegoSession::new`, `Decoder::new`) propagate that as an error,
+/// and the higher-level orchestrator falls back to the pure-Rust
+/// walker path. No production breakage; just degraded backend
+/// availability with a visible warning.
+fn build_stub(manifest_dir: &std::path::Path, expected_submodule_path: &std::path::Path) {
+    println!(
+        "cargo:warning=phasm-openh264 submodule not found at {}",
+        expected_submodule_path.display()
+    );
+    println!(
+        "cargo:warning=  → building openh264-sys with fail-fast stubs only."
+    );
+    println!(
+        "cargo:warning=  → backend calls will return errors at runtime."
+    );
+    println!(
+        "cargo:warning=  → to enable the real backend, see core/README.md"
+    );
+    println!(
+        "cargo:warning=    \"Optional OpenH264 backend (experimental)\" section."
+    );
+    println!(
+        "cargo:warning=    TL;DR: from the monorepo, run"
+    );
+    println!(
+        "cargo:warning=      git submodule update --init --recursive"
+    );
+    println!(
+        "cargo:warning=    from the phasmcore mirror, additionally clone"
+    );
+    println!(
+        "cargo:warning=    https://github.com/cgaffga/phasm-openh264 into"
+    );
+    println!(
+        "cargo:warning=    vendor/phasm-openh264 on the SHA pinned in"
+    );
+    println!(
+        "cargo:warning=    core/openh264-sys/build.rs."
+    );
+
+    // Compile the stub TU as `phasm_shims` so the rest of cargo's
+    // link directives (already emitted by cc) wire it up
+    // automatically. Plain C — no C++ stdlib needed.
+    let shim_dir = manifest_dir.join("shim");
+    cc::Build::new()
+        .file(shim_dir.join("phasm_openh264_stub.c"))
+        .include(&shim_dir)
+        .flag_if_supported("-std=c11")
+        .warnings(true)
+        .compile("phasm_shims");
+
+    // Surface the stub state to downstream Rust code as a cfg flag.
+    // Optional consumer: tests can `#[cfg(not(phasm_openh264_stub))]`
+    // to skip when the backend isn't really there.
+    println!("cargo:rustc-check-cfg=cfg(phasm_openh264_stub)");
+    println!("cargo:rustc-cfg=phasm_openh264_stub");
+
+    // Re-run if the user later checks out the submodule.
+    println!(
+        "cargo:rerun-if-changed={}",
+        expected_submodule_path.display()
+    );
+    println!("cargo:rerun-if-changed={}", shim_dir.display());
 }

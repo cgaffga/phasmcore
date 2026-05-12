@@ -277,22 +277,29 @@ Cisco's OpenH264 codec (BSD-2-Clause), statically linked via the
 `core/openh264-sys/build.rs` and reached via git submodule at
 `vendor/phasm-openh264`.
 
-The backend is **OFF by default**, **not production-wired** (still
-behind the pure-Rust path for `smart_decode`), and currently requires
-manually checking out the fork submodule before building because
-phasmcore's source mirror does not carry the submodule. To try:
+The backend is **OFF by default** and **not production-wired** (still
+behind the pure-Rust path for `smart_decode`). The fork submodule is
+not carried by phasmcore's source mirror, so `cargo build --features
+openh264-backend` will **build against fail-fast stubs** unless you
+check out the fork separately:
 
 ```bash
 git clone https://github.com/cgaffga/phasmcore.git
 cd phasmcore
+# Optional — without this, openh264-backend builds with stubs that
+# return errors at runtime, and the pure-Rust path still works.
 git clone https://github.com/cgaffga/phasm-openh264.git vendor/phasm-openh264
-git -C vendor/phasm-openh264 checkout phasm-stego-v0.1.0
+git -C vendor/phasm-openh264 checkout $(grep -m1 -oE '[a-f0-9]{40}' core/openh264-sys/build.rs)
 cargo build --features openh264-backend
 ```
 
-A v1.x+ build-switch follow-on will make `cargo build --features
-openh264-backend` degrade gracefully (warn + stub) when the submodule
-is absent, rather than `panic!` in `build.rs`. Tracked internally.
+If the submodule is absent, the build prints a `cargo:warning=...`
+explaining the situation and points back here. Backend calls compile
+and link fine but return `-1` / `NULL` at runtime so callers fall back
+to the pure-Rust path with a clear error. Useful state for downstream
+consumers that want to use phasm-core's JPEG path or the pure-Rust
+H.264 path without the C++ toolchain (meson + ninja) the real backend
+needs.
 
 ### Source-only distribution (patent-pool posture)
 
@@ -333,7 +340,7 @@ production use is not recommended at this stage.
 | `video` | H.264 video stego pipeline (decoder + bitstream parsing). Experimental — see "Video steganography (in development)" above. |
 | `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. Experimental + source-only (AVC patent-pool). |
 | `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. Experimental. |
-| `openh264-backend` | **Experimental** second H.264 path via the `phasm-openh264` fork (BSD-2-Clause). Requires `vendor/phasm-openh264` submodule checkout. Not production-wired — pure-Rust path is the live extract today. |
+| `openh264-backend` | **Experimental** second H.264 path via the `phasm-openh264` fork (BSD-2-Clause). Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). Not production-wired — pure-Rust path is the live extract today. |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
 
 ## CLI
