@@ -149,8 +149,10 @@ jobs:
             if (got !== MSG) throw new Error(`got '${got}' != '${MSG}'`);
           });
           check('wrong passphrase fails decode', () => {
-            try { phasm.decode(stego_ghost, 'wrong-passphrase'); throw new Error('should have failed'); }
-            catch (e) { if (!String(e).match(/DECRYPT|decryption|fail|invalid/i)) throw e; }
+            let result;
+            try { result = phasm.decode(stego_ghost, 'wrong-passphrase'); }
+            catch (_) { return; } // any throw from decode = wrong-passphrase rejected
+            throw new Error(`expected throw, got '${result}'`);
           });
 
           console.log('');
