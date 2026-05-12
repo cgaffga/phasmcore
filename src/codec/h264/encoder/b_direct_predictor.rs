@@ -123,7 +123,7 @@ pub fn drain_spatial_direct_traces() -> Vec<SpatialDirectTrace> {
 }
 
 fn push_spatial_direct_trace(trace: SpatialDirectTrace) {
-    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_none() {
+    if !super::mb_decision_b::env_var_os_is_some("PHASM_B_SPATIAL_DIRECT_TRACE") {
         return;
     }
     if let Ok(mut guard) = spatial_direct_traces().lock() {
@@ -461,7 +461,7 @@ pub fn derive_b_direct_spatial_with_col(
     // so an analysis pass can correlate max-deviation MBs with the
     // exact derivation inputs and locate where phasm's algorithm
     // diverges from spec § 8.4.1.2.2.
-    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_some() {
+    if super::mb_decision_b::env_var_os_is_some("PHASM_B_SPATIAL_DIRECT_TRACE") {
         let tl_bx_isize = (mb_x * 4) as isize;
         let tl_by_isize = (mb_y * 4) as isize;
         let a_l0 = neighbour_to_tuple(grid.get_l0(tl_bx_isize - 1, tl_by_isize));
@@ -661,7 +661,7 @@ pub fn derive_b_direct_temporal(
     // Phase 2.7 (#272) — temporal-direct trace. Neighbour fields
     // are unused in the temporal path (no median over A/B/C); they
     // are populated with REF_IDX_NONE sentinels.
-    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_some() {
+    if super::mb_decision_b::env_var_os_is_some("PHASM_B_SPATIAL_DIRECT_TRACE") {
         push_spatial_direct_trace(SpatialDirectTrace {
             frame_idx: current_frame_idx(),
             mb_x: mb_x as u16,

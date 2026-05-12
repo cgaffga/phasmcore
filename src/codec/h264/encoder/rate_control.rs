@@ -182,12 +182,12 @@ impl RateController {
                 // that perceptually matter. PHASM_B_QP=N overrides to
                 // absolute QP N (clamped 0..=51); PHASM_B_QP_OFFSET=±N
                 // adjusts the +2 default by ±N.
-                if let Some(qp) = std::env::var("PHASM_B_QP")
-                    .ok().and_then(|s| s.parse::<i32>().ok())
+                if let Some(qp) = super::mb_decision_b::env_var("PHASM_B_QP")
+                    .and_then(|s| s.parse::<i32>().ok())
                 {
                     qp.clamp(0, 51) as u8
-                } else if let Some(off) = std::env::var("PHASM_B_QP_OFFSET")
-                    .ok().and_then(|s| s.parse::<i32>().ok())
+                } else if let Some(off) = super::mb_decision_b::env_var("PHASM_B_QP_OFFSET")
+                    .and_then(|s| s.parse::<i32>().ok())
                 {
                     (base as i32 + off).clamp(0, 51) as u8
                 } else {

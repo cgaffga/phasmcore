@@ -63,6 +63,22 @@ pub struct H264GopReplayCover<'a> {
     w: usize,
     /// Message block count `m`.
     m: usize,
+    /// Task #383 — `EncoderEnvSnapshot` captured ONCE at cover
+    /// construction, installed as the thread-local "current
+    /// snapshot" for this cover's lifetime. Both the count Pass 1
+    /// (in `new` / `from_counts`) and every capture Pass 1 (in
+    /// `fetch_segment`) build encoders via
+    /// `Encoder::new` → `EncoderEnvSnapshot::capture_or_inherit`,
+    /// which inherits this installed snapshot. Result: count and
+    /// capture see byte-identical env state, even if env-mutating
+    /// tests on other threads change `PHASM_*` env vars between
+    /// `new` and `fetch_segment`. Production: no installed snapshot
+    /// → `capture` falls back to live env, behavior unchanged.
+    ///
+    /// `EnvSnapshotGuard` handles reentrance: multiple covers in
+    /// the same orchestrator share the outermost cover's install
+    /// (their inner installs are no-ops).
+    _env_guard: super::super::encoder::mb_decision_b::EnvSnapshotGuard,
 }
 
 impl<'a> H264GopReplayCover<'a> {
@@ -96,6 +112,14 @@ impl<'a> H264GopReplayCover<'a> {
                 "w and segment_size_in_blocks must be > 0".into(),
             ));
         }
+
+        // Task #383 — capture + install env snapshot BEFORE the
+        // counting Pass 1 so all encoder constructions within this
+        // cover's lifetime (count + every fetch_segment capture)
+        // inherit the same snapshot via
+        // `EncoderEnvSnapshot::capture_or_inherit`.
+        let env_snapshot = super::super::encoder::mb_decision_b::EncoderEnvSnapshot::capture();
+        let env_guard = env_snapshot.install();
 
         // Phase 2 — counting-only Pass 1 for per-GOP per-domain
         // counts.
@@ -133,6 +157,7 @@ impl<'a> H264GopReplayCover<'a> {
             segment_size_in_blocks,
             w,
             m,
+            _env_guard: env_guard,
         })
     }
 
@@ -161,6 +186,15 @@ impl<'a> H264GopReplayCover<'a> {
                 "w and segment_size_in_blocks must be > 0".into(),
             ));
         }
+
+        // Task #383 — same env-snapshot install semantics as `new`.
+        // The first cover in an orchestrator installs; subsequent
+        // covers' guards are no-ops (outer install wins). This makes
+        // all encoders built within the orchestrator's lifetime
+        // inherit one consistent snapshot.
+        let env_snapshot = super::super::encoder::mb_decision_b::EncoderEnvSnapshot::capture();
+        let env_guard = env_snapshot.install();
+
         let domain_idx = domain as usize;
         let mut cum_positions = Vec::with_capacity(per_gop_counts.len() + 1);
         cum_positions.push(0);
@@ -190,6 +224,7 @@ impl<'a> H264GopReplayCover<'a> {
             segment_size_in_blocks,
             w,
             m,
+            _env_guard: env_guard,
         })
     }
 

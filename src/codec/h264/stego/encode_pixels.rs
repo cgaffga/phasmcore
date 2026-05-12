@@ -1434,14 +1434,24 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_a
     use crate::stego::stc::streaming_segmented::StreamingViterbiPhaseB;
     use super::cover_replay::H264GopReplayCover;
     use super::hook::EmbedDomain;
-    
+
     use super::orchestrate::{
         stealth_weighted_allocation, split_message_per_domain, DomainPlan, StealthAllocator,
     };
-    
+
     use super::keys::CabacStegoMasterKeys;
     use super::gop_pattern::GopPattern;
     use super::per_gop_plan::PerGopPlanBuilder;
+
+    // Task #383 — capture + install env snapshot at the orchestrator
+    // entry so that the counting Pass 1 (`pass1_count_per_gop_4domain`
+    // below) AND the later capture Pass 1's (via `H264GopReplayCover::
+    // from_counts` → `fetch_segment` → `pass1_capture_4domain_for_
+    // gop_range`) all see the same env state. Without this, env-
+    // mutating tests on other threads could race with the count vs.
+    // capture passes and produce divergent per-GOP bit counts →
+    // slice-OOB at cover_replay.rs:262.
+    let _orchestrator_env_guard = super::super::encoder::mb_decision_b::EncoderEnvSnapshot::capture().install();
 
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(StegoError::InvalidVideo(format!(

@@ -113,7 +113,7 @@ pub fn drain_b_intra_fallback_count() -> u64 {
 
 /// §B-instrument v1 — internal pushd; gated by `PHASM_B_INSTRUMENT=1`.
 fn push_b_mb_record(record: BMbRecord) {
-    if std::env::var_os("PHASM_B_INSTRUMENT").is_none() {
+    if !env_var_os_is_some("PHASM_B_INSTRUMENT") {
         return;
     }
     if let Ok(mut guard) = b_mb_records().lock() {
@@ -125,8 +125,25 @@ fn push_b_mb_record(record: BMbRecord) {
 /// manipulate the `PHASM_B_FORCE_MODE` env var. Tests touching
 /// the env var (force-mode round-trip + distribution-match)
 /// must hold this lock to prevent parallel-test races.
+///
+/// Task #383 (2026-05-12): also held by [`EncoderEnvLock`] (a
+/// reentrant wrapper) so tests that build encoders without
+/// mutating env vars (streaming-cover replay, shadow-capacity)
+/// can serialize against env-mutating tests transparently.
+/// Direct `B_FORCE_MODE_ENV_LOCK.lock()` callers + reentrant
+/// `EncoderEnvLock::acquire()` callers share the same underlying
+/// mutex; the reentrant pattern is for nested same-thread acquires
+/// only (cross-thread acquires always serialize on the mutex).
 #[cfg(test)]
 pub(crate) static B_FORCE_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Task #383 — `EncoderEnvLock` was an interim reentrant mutex
+// design; replaced by the install-pattern in `EncoderEnvSnapshot`
+// + `EnvSnapshotGuard` (below), which captures one snapshot at the
+// orchestrator scope and lets every encoder constructed within
+// inherit it. The install pattern is strictly more correct
+// (snapshot is the source of truth; live env is irrelevant within
+// the snapshot's scope) and doesn't need a mutex at all.
 
 /// Outcome of a B-slice mode decision for a single macroblock.
 ///
@@ -266,7 +283,11 @@ pub fn mb_decision_b(
     frame_num: u32,
     mb_addr: u32,
 ) -> BMbDecision {
-    mb_decision_b_with_mvs(grid, mb_x, mb_y, frame_num, mb_addr, /* me_mvs */ None)
+    mb_decision_b_with_mvs(
+        grid, mb_x, mb_y, frame_num, mb_addr,
+        /* me_mvs */ None,
+        /* force_override */ None,
+    )
 }
 
 /// §6E-A6.1q.b (#151) — variant of [`mb_decision_b`] that consumes
@@ -288,8 +309,13 @@ pub fn mb_decision_b_with_mvs(
     frame_num: u32,
     mb_addr: u32,
     me_mvs: Option<(MotionVector, MotionVector)>,
+    force_override: Option<BMbDecision>,
 ) -> BMbDecision {
-    if let Some(forced) = forced_b_mode_from_env() {
+    // Task #383 — debug force-mode override comes from the encoder's
+    // `EncoderEnvSnapshot` (captured at construction). The legacy
+    // `mb_decision_b()` wrapper passes `None` for backwards
+    // compatibility with any caller that doesn't have an encoder.
+    if let Some(forced) = force_override {
         return forced;
     }
 
@@ -465,9 +491,9 @@ impl BRdoConfig {
 /// instead of relying on env-var grossness. Existing callers can
 /// pass `BRdoConfig::SAFE` for the legacy default behaviour.
 pub fn b_rdo_enabled_with(config: BRdoConfig) -> bool {
-    match std::env::var("PHASM_B_RDO") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" => false,
+    match env_var("PHASM_B_RDO").as_deref() {
+        Some("1") => true,
+        Some("0") => false,
         _ => config.enable_rdo,
     }
 }
@@ -564,7 +590,7 @@ fn skip_cbp_is_zero(
     // (SAD ≤ ~1500 per V21 force-L0 noise floor) from
     // content-wrong Skip predictions (SAD ≥ 5000+ at jacket-vs-
     // wall mismatch). Disable via PHASM_B_SKIP_NO_SAD_CHECK=1.
-    if std::env::var_os("PHASM_B_SKIP_NO_SAD_CHECK").is_none() {
+    if !env_var_os_is_some("PHASM_B_SKIP_NO_SAD_CHECK") {
         let mut sad: u32 = 0;
         for dy in 0..16 {
             for dx in 0..16 {
@@ -669,7 +695,7 @@ pub fn mb_decision_b_rdo(
     // through the full RDO sweep. Used to measure how much of the
     // visible drift on motion content is driven by Skip-without-
     // residual emission. Default OFF (production behaviour unchanged).
-    if std::env::var_os("PHASM_B_SKIP_NO_CBP_PRECHECK").is_none()
+    if !env_var_os_is_some("PHASM_B_SKIP_NO_CBP_PRECHECK")
         && skip_cbp_is_zero(&direct, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp)
     {
         // Phase 2.7 (#272 follow-on) — Skip pre-check fires for many
@@ -677,7 +703,7 @@ pub fn mb_decision_b_rdo(
         // post-fix bisect harness shows them as "BMbRecord missing"
         // and assumes Partitioned/B_8x8. Push a Skip-flavoured
         // record so the harness can distinguish.
-        if std::env::var_os("PHASM_B_INSTRUMENT").is_some() {
+        if env_var_os_is_some("PHASM_B_INSTRUMENT") {
             let frame_idx = B_INSTRUMENT_FRAME_IDX
                 .load(std::sync::atomic::Ordering::Relaxed);
             push_b_mb_record(BMbRecord {
@@ -799,7 +825,7 @@ pub fn mb_decision_b_rdo(
     let bi_passes_threshold = true;
     let _ = best_single_satd; // referenced below by diagnostic only
 
-    if std::env::var_os("PHASM_B_RDO_LOG_BI").is_some() {
+    if env_var_os_is_some("PHASM_B_RDO_LOG_BI") {
         eprintln!(
             "B-MB ({mb_x},{mb_y}) qp={mb_qp} l0_satd={} l1_satd={} bi_satd={} ratio={:.3} pass={}",
             r_l0.satd, r_l1.satd, r_bi.satd,
@@ -813,7 +839,7 @@ pub fn mb_decision_b_rdo(
     // Note: counts ONLY MBs that fall through to RDO — not the
     // CBP-zero-Skip-pre-check path (those are counted upstream
     // by the encoder loop's BMbDecision::Skip emit branch).
-    if std::env::var_os("PHASM_B_RDO_TRACE").is_some() {
+    if env_var_os_is_some("PHASM_B_RDO_TRACE") {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static DIRECT_CNT: AtomicUsize = AtomicUsize::new(0);
         static L0_CNT: AtomicUsize = AtomicUsize::new(0);
@@ -879,7 +905,7 @@ pub fn mb_decision_b_rdo(
     // Env-gated via `PHASM_B_BOUNDARY_PENALTY=1` until validated by
     // visual demo. Default off; flip to default on after V8 demo
     // shows the visible artifact closes.
-    let direct_cost_adjusted = if std::env::var_os("PHASM_B_BOUNDARY_PENALTY").is_some() {
+    let direct_cost_adjusted = if env_var_os_is_some("PHASM_B_BOUNDARY_PENALTY") {
         let factor_q8 = compute_motion_boundary_factor_q8(grid, mb_x, mb_y);
         ((r_skip_or_direct.cost as u128 * factor_q8 as u128) >> 8) as u64
     } else {
@@ -983,7 +1009,7 @@ pub fn mb_decision_b_rdo(
     // Default ON. Disable via PHASM_B_NO_DIRECT_SATD_FLOOR=1.
     const DIRECT_SATD_FLOOR: u32 = 3072;
     let direct_satd_too_high = r_skip_or_direct.satd > DIRECT_SATD_FLOOR
-        && std::env::var_os("PHASM_B_NO_DIRECT_SATD_FLOOR").is_none();
+        && !env_var_os_is_some("PHASM_B_NO_DIRECT_SATD_FLOOR");
 
     // v1.5 §B-fast-motion (#317) — RELATIVE SATD gate. The absolute
     // DIRECT_SATD_FLOOR (3072) misses MBs where Direct's SATD is
@@ -1007,12 +1033,12 @@ pub fn mb_decision_b_rdo(
         .max(1);
     let direct_satd_ratio_too_high = (r_skip_or_direct.satd as u64) * 2
         > (best_alt_satd as u64) * 3
-        && std::env::var_os("PHASM_B_NO_DIRECT_SATD_RATIO").is_none();
+        && !env_var_os_is_some("PHASM_B_NO_DIRECT_SATD_RATIO");
 
     let direct_cost_validated = if (at_boundary
-        && std::env::var_os("PHASM_B_NO_BOUNDARY_REFUSE").is_none())
+        && !env_var_os_is_some("PHASM_B_NO_BOUNDARY_REFUSE"))
         || (direct_mv_too_large
-            && std::env::var_os("PHASM_B_NO_DIRECT_MAGCLAMP").is_none())
+            && !env_var_os_is_some("PHASM_B_NO_DIRECT_MAGCLAMP"))
         || direct_satd_too_high
         || direct_satd_ratio_too_high
     {
@@ -1031,7 +1057,7 @@ pub fn mb_decision_b_rdo(
     // V14/V20/V23 demos. Single-list (L0 or L1) avoids the
     // averaging artifact.
     let bi_cost_validated = if at_boundary
-        && std::env::var_os("PHASM_B_NO_BOUNDARY_REFUSE").is_none()
+        && !env_var_os_is_some("PHASM_B_NO_BOUNDARY_REFUSE")
     {
         u64::MAX
     } else {
@@ -1067,8 +1093,8 @@ pub fn mb_decision_b_rdo(
     // Higher value → fewer intra emissions; lower → more. v1.6.0 default
     // 25000 lands at 0.53% of B-MBs on carplane, matching the converter-pipeline centroid
     // 0.1-2% range. Phase 5 visual A/B may revise this.
-    let intra_fallback_threshold: u32 = std::env::var("PHASM_B_INTRA_FALLBACK_SATD_MIN")
-        .ok()
+    let intra_fallback_threshold: u32 = env_var("PHASM_B_INTRA_FALLBACK_SATD_MIN")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(25_000);
     let best_inter_satd = r_skip_or_direct.satd
@@ -1085,7 +1111,7 @@ pub fn mb_decision_b_rdo(
     // Intentional: the decision-side wiring exists so Phase 3 can
     // light up the actual emit without further plumbing changes.
     if intra_fallback_eligible
-        && std::env::var_os("PHASM_B_INTRA_FALLBACK").is_some()
+        && env_var_os_is_some("PHASM_B_INTRA_FALLBACK")
     {
         return BMbDecision::IntraI16x16 {
             i16x16_mode: 2,        // DC (works without neighbour pixels)
@@ -1098,7 +1124,7 @@ pub fn mb_decision_b_rdo(
     // luma) AND the chosen prediction is non-trivial. Prints the
     // candidate's MV and the source/prediction luma summary so we can
     // see exactly what's happening on the artifact MBs.
-    if std::env::var_os("PHASM_INVEST_DUMP").is_some() {
+    if env_var_os_is_some("PHASM_INVEST_DUMP") {
         let mut src_min = 255u8;
         let mut src_max = 0u8;
         let mut src_sum: u32 = 0;
@@ -1111,7 +1137,7 @@ pub fn mb_decision_b_rdo(
         }
         let src_mean = (src_sum / 256) as u8;
         // Allow PHASM_INVEST_DUMP_ALL=1 to log all MBs, not just wall.
-        let dump_all = std::env::var_os("PHASM_INVEST_DUMP_ALL").is_some();
+        let dump_all = env_var_os_is_some("PHASM_INVEST_DUMP_ALL");
         if dump_all || (src_mean >= 220 && src_max - src_min <= 10) {
             let mode_name = match best.1 {
                 1 => "Direct",
@@ -1325,16 +1351,196 @@ pub fn predict_b_partition_mv_l1_pub(grid: &EncoderMvGrid, mb_x: usize, mb_y: us
     predict_b_partition_mv_l1(grid, mb_x, mb_y)
 }
 
+/// Task #383 — snapshot of all `PHASM_*` process env vars at
+/// encoder construction time. The encoder reads from this snapshot
+/// throughout its lifetime instead of calling `std::env::var`
+/// directly, so mid-encode env mutations by other test threads can
+/// never affect this encoder's behavior.
+///
+/// Construct via [`EncoderEnvSnapshot::capture`] from `Encoder::new`.
+/// Pre-decoded common knobs are exposed as typed fields
+/// (`force_b_mode`, `residual_override`, `b_rdo_override`); rarer
+/// knobs are looked up via [`var`](Self::var) /
+/// [`var_os`](Self::var_os).
+///
+/// Cover-replay flow: [`crate::codec::h264::stego::cover_replay`]
+/// captures one snapshot at `H264GopReplayCover::new` and threads
+/// it through both Pass-1 encoder constructions so the count pass
+/// and capture pass see byte-identical env state — closes the
+/// slice-OOB at cover_replay.rs:227 under parallel test scheduling.
+#[derive(Debug, Clone, Default)]
+pub struct EncoderEnvSnapshot {
+    /// Snapshot of [`forced_b_mode_from_env`] at encoder construction.
+    /// `None` when no PHASM_B_FORCE_MODE env var was set.
+    pub force_b_mode: Option<BMbDecision>,
+    /// Snapshot of `PHASM_B_RESIDUAL` at encoder construction.
+    /// - `Some(true)` — env was "1" — force residual emission ON
+    /// - `Some(false)` — env was "0" — force residual emission OFF
+    /// - `None` — env unset, defer to `BRdoConfig::enable_residual`
+    pub residual_override: Option<bool>,
+    /// Snapshot of `PHASM_B_RDO` at encoder construction.
+    /// - `Some(true)` — env was "1" — force fast-RDO B-mode-decision ON
+    /// - `Some(false)` — env was "0" — force fast-RDO B-mode-decision OFF
+    /// - `None` — env unset, defer to `BRdoConfig::enable_rdo`
+    pub b_rdo_override: Option<bool>,
+    /// All other `PHASM_*` env vars captured at construction. Use
+    /// [`var`](Self::var) / [`var_os`](Self::var_os) to read.
+    /// Includes the three typed knobs above as well (callers may use
+    /// either route).
+    pub raw_vars: std::collections::HashMap<String, String>,
+}
+
+impl EncoderEnvSnapshot {
+    /// Capture process env state freshly. Call from `Encoder::new`
+    /// only when no outer snapshot is installed via [`install`].
+    pub fn capture() -> Self {
+        let raw_vars: std::collections::HashMap<String, String> = std::env::vars()
+            .filter(|(k, _)| k.starts_with("PHASM_"))
+            .collect();
+        Self {
+            force_b_mode: forced_b_mode_from_env_uncached(),
+            residual_override: match raw_vars.get("PHASM_B_RESIDUAL").map(|s| s.as_str()) {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+            b_rdo_override: match raw_vars.get("PHASM_B_RDO").map(|s| s.as_str()) {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+            raw_vars,
+        }
+    }
+
+    /// Inherit from the currently-installed thread-local snapshot
+    /// ([`current`]) if there is one; otherwise capture fresh.
+    /// `Encoder::new` calls this, so cover-replay (which installs at
+    /// `H264GopReplayCover::new`) gets count + capture encoders that
+    /// share one snapshot.
+    pub fn capture_or_inherit() -> Self {
+        match current() {
+            Some(installed) => installed,
+            None => Self::capture(),
+        }
+    }
+
+    /// Snapshot-equivalent of [`std::env::var`]: returns `Some(value)`
+    /// if the var was set at capture time, `None` if unset.
+    pub fn var(&self, name: &str) -> Option<&str> {
+        self.raw_vars.get(name).map(|s| s.as_str())
+    }
+
+    /// Snapshot-equivalent of [`std::env::var_os`]`(name).is_some()`.
+    pub fn var_os_is_some(&self, name: &str) -> bool {
+        self.raw_vars.contains_key(name)
+    }
+
+    /// Install this snapshot as the thread-local "current snapshot"
+    /// for the lifetime of the returned guard. Nested installs are
+    /// no-ops — the outermost install wins. Free functions called
+    /// from inside encoder hot paths read from the current snapshot
+    /// via [`env_var`] / [`env_var_os_is_some`].
+    pub fn install(&self) -> EnvSnapshotGuard {
+        CURRENT_ENV_SNAPSHOT.with(|cell| {
+            let already_installed = cell.borrow().is_some();
+            if !already_installed {
+                *cell.borrow_mut() = Some(self.clone());
+            }
+            EnvSnapshotGuard { installed: !already_installed }
+        })
+    }
+
+    /// Returns `true` iff fast-RDO B-mode-decision should run, given
+    /// this encoder's snapshot + supplied config. Mirrors
+    /// [`b_rdo_enabled_with`] but uses the captured snapshot rather
+    /// than re-reading env. See Task #383.
+    pub fn b_rdo_enabled(&self, config: BRdoConfig) -> bool {
+        self.b_rdo_override.unwrap_or(config.enable_rdo)
+    }
+}
+
+thread_local! {
+    /// Thread-local "currently-installed" snapshot. Set by
+    /// [`EncoderEnvSnapshot::install`], read by [`current`] /
+    /// [`env_var`] / [`env_var_os_is_some`]. `RefCell` rather than
+    /// `Cell` because `EncoderEnvSnapshot` is not `Copy`.
+    static CURRENT_ENV_SNAPSHOT: std::cell::RefCell<Option<EncoderEnvSnapshot>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Returns a clone of the currently-installed snapshot, or `None`
+/// if no scope has called [`EncoderEnvSnapshot::install`] on this
+/// thread.
+pub fn current() -> Option<EncoderEnvSnapshot> {
+    CURRENT_ENV_SNAPSHOT.with(|cell| cell.borrow().clone())
+}
+
+/// RAII guard returned by [`EncoderEnvSnapshot::install`]. Restores
+/// the previous (`None`) thread-local state on drop. Nested installs
+/// produce a guard with `installed = false` and are no-ops on drop.
+pub struct EnvSnapshotGuard {
+    installed: bool,
+}
+
+impl Drop for EnvSnapshotGuard {
+    fn drop(&mut self) {
+        if self.installed {
+            CURRENT_ENV_SNAPSHOT.with(|cell| {
+                *cell.borrow_mut() = None;
+            });
+        }
+    }
+}
+
+/// Snapshot-aware replacement for `std::env::var(name).ok()`. Looks
+/// up the var in the thread-local installed snapshot first; if no
+/// snapshot is installed, falls back to live `std::env::var` (which
+/// is correct for non-encoder callers, since they're outside any
+/// snapshot scope).
+pub fn env_var(name: &str) -> Option<String> {
+    CURRENT_ENV_SNAPSHOT.with(|cell| {
+        if let Some(snap) = cell.borrow().as_ref() {
+            return snap.var(name).map(String::from);
+        }
+        std::env::var(name).ok()
+    })
+}
+
+/// Snapshot-aware replacement for `std::env::var_os(name).is_some()`.
+pub fn env_var_os_is_some(name: &str) -> bool {
+    CURRENT_ENV_SNAPSHOT.with(|cell| {
+        if let Some(snap) = cell.borrow().as_ref() {
+            return snap.var_os_is_some(name);
+        }
+        std::env::var_os(name).is_some()
+    })
+}
+
+/// **DEPRECATED for new callers — use [`EncoderEnvSnapshot::capture`]
+/// at `Encoder::new` and read `encoder.env_snapshot.force_b_mode`
+/// during encode.** Public-API thin wrapper retained for backwards
+/// compatibility with any external caller that constructed mode
+/// decisions without an `Encoder`.
+pub fn forced_b_mode_from_env() -> Option<BMbDecision> {
+    forced_b_mode_from_env_uncached()
+}
+
 /// §6E-A6.1 — read `PHASM_B_FORCE_MODE` env var and translate to a
 /// `BMbDecision`. Returns `None` if the var is unset / unrecognized
 /// (production path falls through to the §6E-A4(c)-lite hash mix).
-pub fn forced_b_mode_from_env() -> Option<BMbDecision> {
-    let var = std::env::var("PHASM_B_FORCE_MODE").ok()?;
+///
+/// Internal helper — DO NOT call directly from encode-time code
+/// paths. Call [`EncoderEnvSnapshot::capture`] at encoder construction
+/// time, then read `encoder.env_snapshot.force_b_mode` during encode.
+fn forced_b_mode_from_env_uncached() -> Option<BMbDecision> {
+    let var = env_var("PHASM_B_FORCE_MODE")?;
     let zero = MotionVector { mv_x: 0, mv_y: 0 };
     // §B-RDO.debug.6 — optional non-zero MV override via PHASM_B_FORCE_MV
     // (=qpel_x,qpel_y in 1/4-luma-pel units). Used to probe sub-pel MC.
-    let forced_mv = std::env::var("PHASM_B_FORCE_MV")
-        .ok()
+    let forced_mv = env_var("PHASM_B_FORCE_MV")
+        
         .and_then(|s| {
             let mut parts = s.splitn(2, ',');
             let x: i16 = parts.next()?.trim().parse().ok()?;
@@ -1344,8 +1550,8 @@ pub fn forced_b_mode_from_env() -> Option<BMbDecision> {
         .unwrap_or(zero);
     // §B-RDO.debug.7 — optional asymmetric L1 MV for bi_16x16 to
     // probe asymmetric bipred MC (mv_l0 ≠ mv_l1).
-    let forced_mv_l1 = std::env::var("PHASM_B_FORCE_MV_L1")
-        .ok()
+    let forced_mv_l1 = env_var("PHASM_B_FORCE_MV_L1")
+        
         .and_then(|s| {
             let mut parts = s.splitn(2, ',');
             let x: i16 = parts.next()?.trim().parse().ok()?;
@@ -1701,6 +1907,10 @@ mod tests {
 
     #[test]
     fn b_rdo_enabled_reads_env() {
+        // Task #383 — hold B_FORCE_MODE_ENV_LOCK while mutating
+        // PHASM_B_RDO so we don't race with concurrent encoder
+        // constructions that snapshot it.
+        let _lock = B_FORCE_MODE_ENV_LOCK.lock().expect("lock not poisoned");
         // Default off.
         unsafe { std::env::remove_var("PHASM_B_RDO"); }
         assert!(!b_rdo_enabled());

@@ -20,8 +20,8 @@ use super::reference_buffer::ReconFrame;
 /// residual energy, Q=26 clears the +0.5 dB go/no-go. Opt out via
 /// `PHASM_ME_MULTI_PRED=0`.
 fn multi_pred_enabled() -> bool {
-    std::env::var("PHASM_ME_MULTI_PRED")
-        .ok()
+    super::mb_decision_b::env_var("PHASM_ME_MULTI_PRED")
+        
         .is_none_or(|v| v != "0")
 }
 
@@ -77,8 +77,8 @@ fn build_me_candidates(
 /// Kept opt-in (`PHASM_INTER_PSY_STRENGTH=N`) pending visual
 /// confirmation of STR=1024 at low QP.
 fn inter_psy_strength() -> u32 {
-    std::env::var("PHASM_INTER_PSY_STRENGTH")
-        .ok()
+    super::mb_decision_b::env_var("PHASM_INTER_PSY_STRENGTH")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
@@ -405,7 +405,7 @@ pub fn decide_p_mb_with_cost(
     // requires per-8x8 sub-block resolution). If the cascade drops
     // when P-frames are pure P_16x16, the hypothesis is confirmed.
     // Default OFF.
-    if std::env::var_os("PHASM_P_FORCE_16X16").is_some() {
+    if super::mb_decision_b::env_var_os_is_some("PHASM_P_FORCE_16X16") {
         best_idx = 0; // P16x16 is index 0 per SATD_CANDIDATE_ORDER
     }
 
@@ -523,7 +523,7 @@ fn decide_sub_mb(
     // Leaving env-gated pending bitrate measurement; A.2 ship
     // criterion per the quality plan is "net positive OR neutral
     // on R-D" not just PSNR.
-    let pred_sub_8x8 = if std::env::var("PHASM_SUBMB_MEDIAN_PRED").ok().as_deref() == Some("1") {
+    let pred_sub_8x8 = if super::mb_decision_b::env_var("PHASM_SUBMB_MEDIAN_PRED").as_deref() == Some("1") {
         predict_mv_for_partition(grid, sub_bx, sub_by, 2, 0)
     } else {
         MotionVector::ZERO
@@ -667,7 +667,7 @@ pub fn refine_p_choice_multi_ref(
     //    (spec § 6.4.11.6 within-MB partition rules).
     //  - MVD PMV cascade asymmetry under ref_idx>0.
     // Set PHASM_V14_REFINE_ON=1 to fire (debug only).
-    if std::env::var_os("PHASM_V14_REFINE_ON").is_none() {
+    if !super::mb_decision_b::env_var_os_is_some("PHASM_V14_REFINE_ON") {
         return false;
     }
     {
@@ -758,7 +758,7 @@ pub fn refine_p_choice_multi_ref(
     // v1.4 Phase 4.5 follow-up — `PHASM_V14_REFINE_TRACE=1` emits per-MB
     // refine outcome to stderr. Use to bisect the P-side cliff: count
     // upgrades, compare SATD ratios, identify which MBs picked ref_1.
-    if std::env::var_os("PHASM_V14_REFINE_TRACE").is_some() {
+    if super::mb_decision_b::env_var_os_is_some("PHASM_V14_REFINE_TRACE") {
         let shape = match choice {
             PMbChoice::P16x16 { .. } => "16x16",
             PMbChoice::P16x8 { .. } => "16x8",

@@ -554,7 +554,7 @@ fn filter_mb_edges(
                 ];
                 // Order for filter: p[0] closest to edge.
                 let mut p_rev = [p[3], p[2], p[1], p[0]];
-                let trace_v = std::env::var_os("PHASM_EDGE_TRACE").is_some()
+                let trace_v = super::mb_decision_b::env_var_os_is_some("PHASM_EDGE_TRACE")
                     && mb_x == 31 && mb_y == 49 && edge_x == 8 && row4 == 2;
                 let p_before = p_rev;
                 let q_before = q;
@@ -709,7 +709,7 @@ fn filter_mb_edges(
                 // root MB. PHASM_EDGE_TRACE=1 dumps {bS, qp, alpha, beta,
                 // tC0, p, q} for MB (31, 49) horizontal edges. Match
                 // against the reference decoder a reference-decoder trace log output to find divergence.
-                let trace_active = std::env::var_os("PHASM_EDGE_TRACE").is_some()
+                let trace_active = super::mb_decision_b::env_var_os_is_some("PHASM_EDGE_TRACE")
                     && mb_x == 31 && mb_y == 49;
                 if trace_active && col4 == 0 && sample_col == 0 {
                     let p_cof_h = coded(coded_flags, w4, p_bx, p_by);

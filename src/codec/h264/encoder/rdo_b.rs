@@ -174,11 +174,11 @@ pub(crate) fn psy_hf_satd_16x16(block: &[[u8; 16]; 16]) -> u32 {
 
 /// Read `PHASM_PSY_RD` env: returns (enabled, shift).
 pub(crate) fn psy_rd_config() -> (bool, u32) {
-    let enabled = std::env::var_os("PHASM_PSY_RD")
+    let enabled = super::mb_decision_b::env_var("PHASM_PSY_RD")
         .map(|v| v == "1")
         .unwrap_or(false);
-    let shift = std::env::var("PHASM_PSY_RD_SHIFT")
-        .ok()
+    let shift = super::mb_decision_b::env_var("PHASM_PSY_RD_SHIFT")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(PSY_RD_SHIFT_DEFAULT);
     (enabled, shift)

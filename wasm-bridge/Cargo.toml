@@ -3,8 +3,13 @@ name = "phasm-wasm"
 version = "0.1.0"
 edition = "2021"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
+# Declare a standalone workspace so cargo does NOT try to attach this
+# crate to the phasm-core workspace when wasm-bridge sits next to core's
+# manifest in the synced phasmcore layout. In the monorepo this is a
+# no-op (no parent Cargo.toml at phasm/); in phasmcore it decouples
+# wasm-bridge from the phasm-core workspace, which only declares
+# ["cli", "openh264-sys"] as members.
+[workspace]
 
 [dependencies]
 phasm-core = { path = "..", features = ["wasm"] }

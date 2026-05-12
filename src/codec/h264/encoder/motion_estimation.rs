@@ -380,7 +380,7 @@ impl MotionEstimator {
             (1, 0), (-1, 0), (0, 1), (0, -1),
             (1, 1), (1, -1), (-1, 1), (-1, -1),
         ];
-        let wide = std::env::var_os("PHASM_B_REFINE_BIPRED_WIDE").is_some();
+        let wide = super::mb_decision_b::env_var_os_is_some("PHASM_B_REFINE_BIPRED_WIDE");
         let max_iter = if wide { 4 } else { 2 };
         let diamond: &[(i16, i16)] = if wide { &DIAMOND_9 } else { &DIAMOND_5 };
 
@@ -617,8 +617,8 @@ const LAMBDA_MOTION_DEFAULT: u32 = 1;
 
 #[inline]
 fn me_lambda() -> u32 {
-    std::env::var("PHASM_ME_LAMBDA")
-        .ok()
+    super::mb_decision_b::env_var("PHASM_ME_LAMBDA")
+        
         .and_then(|s| s.parse::<u32>().ok())
         .map_or(LAMBDA_MOTION_DEFAULT, |v| v.clamp(1, 32))
 }
@@ -738,8 +738,8 @@ fn multi_hex_search(
 /// `PHASM_ME_UMH=0` to opt out.
 #[inline]
 fn umh_enabled() -> bool {
-    std::env::var("PHASM_ME_UMH")
-        .ok()
+    super::mb_decision_b::env_var("PHASM_ME_UMH")
+        
         .is_none_or(|v| v != "0")
 }
 
@@ -802,7 +802,7 @@ fn integer_hex_search(
 /// lands and rewards fractional-pel accuracy more.
 #[inline]
 fn diamond_enabled() -> bool {
-    std::env::var_os("PHASM_ME_DIAMOND").is_some()
+    super::mb_decision_b::env_var_os_is_some("PHASM_ME_DIAMOND")
 }
 
 #[allow(clippy::too_many_arguments)]

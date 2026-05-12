@@ -369,6 +369,15 @@ pub struct Encoder {
     /// MVD modifications make residuals diverge from Pass 1's
     /// logged residuals.
     pub enable_mvd_stego_hook: bool,
+    /// **Task #383 (2026-05-12)** — process-env snapshot taken at
+    /// `Encoder::new`. The encoder reads several PHASM_B_* env vars
+    /// for debug overrides (force-mode, force-MV, residual on/off);
+    /// previously these were re-read at encode-time, which races
+    /// with parallel tests that mutate the env vars. Snapshotting
+    /// once at construction makes a single encoder's behavior
+    /// internally consistent regardless of mid-encode env mutations
+    /// from other threads.
+    pub env_snapshot: super::mb_decision_b::EncoderEnvSnapshot,
 }
 
 /// Indices into `Encoder::mode_stats`.
@@ -1801,6 +1810,11 @@ impl Encoder {
             cabac_trace_buffer: Vec::new(),
             mode_stats: [0; 9],
             stego_hook: None,
+            // Task #383 — snapshot env-derived debug knobs ONCE here.
+            // The encoder then reads from this snapshot for the rest
+            // of its life; mid-encode env mutations by other test
+            // threads cannot affect this encoder's behavior.
+            env_snapshot: super::mb_decision_b::EncoderEnvSnapshot::capture_or_inherit(),
         })
     }
 
@@ -2322,7 +2336,7 @@ impl Encoder {
     /// `encode_i_frame`. Sampling every 8th pixel to keep probe
     /// cheap (<1% of encode time).
     pub fn should_force_idr_for_scene_change(&self, pixels: &[u8]) -> bool {
-        if std::env::var_os("PHASM_DISABLE_SCENECUT").is_some() {
+        if super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_SCENECUT") {
             return false;
         }
         let reference = match self.dpb.last_ref.as_ref() {
@@ -2386,6 +2400,12 @@ impl Encoder {
     }
 
     pub fn encode_i_frame(&mut self, pixels: &[u8]) -> Result<Vec<u8>, EncoderError> {
+        // Task #383 — install env snapshot for the duration of this
+        // frame so free functions in the hot path (mb_decision_b,
+        // partition_decision, etc.) read consistent env state.
+        // No-op if an outer scope (cover_replay, test) already
+        // installed.
+        let _env_guard = self.env_snapshot.install();
         self.apply_crf_base_qp();
         let expected_len = self.frame_size_bytes();
         if pixels.len() != expected_len {
@@ -2494,6 +2514,8 @@ impl Encoder {
     /// Only `P_L0_16x16` partitions are supported in this phase;
     /// sub-MB partitions (16×8, 8×16, 8×8, ...) are deferred.
     pub fn encode_p_frame(&mut self, pixels: &[u8]) -> Result<Vec<u8>, EncoderError> {
+        // Task #383 — see `encode_i_frame` comment.
+        let _env_guard = self.env_snapshot.install();
         self.apply_crf_base_qp();
         if !self.dpb.has_reference() {
             return Err(EncoderError::InvalidInput(
@@ -2614,6 +2636,8 @@ impl Encoder {
     ///   doesn't actually consume the references for prediction
     ///   (no MVDs emitted), so single-slot DPB is fine for now.
     pub fn encode_b_frame(&mut self, pixels: &[u8]) -> Result<Vec<u8>, EncoderError> {
+        // Task #383 — see `encode_i_frame` comment.
+        let _env_guard = self.env_snapshot.install();
         self.apply_crf_base_qp();
         if !self.enable_b_frames {
             return Err(EncoderError::InvalidInput(
@@ -2749,13 +2773,19 @@ impl Encoder {
         // (the "FIXED_RDO.mp4 broken" pattern observed 2026-05-03).
         //
         // Task #204 (v1.1): typed `BRdoConfig` on the encoder is the
-        // primary control. `PHASM_B_RESIDUAL` env var still wins as
-        // a debug override.
-        let residual_enabled = match std::env::var("PHASM_B_RESIDUAL") {
-            Ok(v) if v == "1" => true,
-            Ok(v) if v == "0" => false,
-            _ => self.b_rdo_config.enable_residual,
-        };
+        // primary control. `PHASM_B_RESIDUAL` env var still wins as a
+        // debug override.
+        //
+        // Task #383 (2026-05-12): env-var snapshot is captured in
+        // `Encoder::new` to make the encoder internally consistent
+        // under parallel test execution. Reading the snapshot here
+        // instead of re-reading the env var prevents mid-encode
+        // mutations by other threads from changing this encoder's
+        // residual-emit decision.
+        let residual_enabled = self
+            .env_snapshot
+            .residual_override
+            .unwrap_or(self.b_rdo_config.enable_residual);
 
         let mut w = BitWriter::with_capacity(self.frame_size_bytes().max(512));
         // §B-QP-bug-fix 2026-05-09 (#300) — was FrameType::P; the entire
@@ -2784,7 +2814,7 @@ impl Encoder {
         // Mod-16 wraparound matches log2_max_frame_num_minus4=0
         // → MaxFrameNum=16 in our SPS.
         let b_frame_num = self.frame_num.wrapping_sub(1) & 0xF;
-        let b_disable_deblock = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
+        let b_disable_deblock = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK");
         // §B-direct-fix.v3 2026-05-07 — temporal-direct mode toggle.
         // PHASM_B_TEMPORAL_DIRECT=1 switches BOTH the slice header
         // flag AND the encoder's MV derivation to temporal direct
@@ -2793,7 +2823,7 @@ impl Encoder {
         // 2026-05-07). Spatial direct is the legacy default to keep
         // existing tests green; flip the default once V6 visual
         // gate passes.
-        let direct_spatial = std::env::var_os("PHASM_B_TEMPORAL_DIRECT").is_none();
+        let direct_spatial = !super::mb_decision_b::env_var_os_is_some("PHASM_B_TEMPORAL_DIRECT");
         // Compute POCs for temporal direct. IBPBP M=2 layout: B_disp
         // = anchor - 1, L0 = anchor - 2 (past P), L1 = anchor (next P).
         // For longer M the formula is the same — POC step is 2 per
@@ -3009,9 +3039,9 @@ impl Encoder {
                     || predicted_l1.mv_x.abs() > 32
                     || predicted_l1.mv_y.abs() > 32;
                 let override_anchor = (at_boundary
-                    && std::env::var_os("PHASM_B_NO_BOUNDARY_REFUSE").is_none())
+                    && !super::mb_decision_b::env_var_os_is_some("PHASM_B_NO_BOUNDARY_REFUSE"))
                     || (predicted_too_large
-                        && std::env::var_os("PHASM_B_NO_DIRECT_MAGCLAMP").is_none());
+                        && !super::mb_decision_b::env_var_os_is_some("PHASM_B_NO_DIRECT_MAGCLAMP"));
                 let me_anchor_l0 = if override_anchor {
                     MotionVector::ZERO
                 } else {
@@ -3049,7 +3079,7 @@ impl Encoder {
                 // tracked under Phase 4.3+ (#251 follow-on). Keep the
                 // env gate for ablation experiments; ship behavior
                 // unchanged.
-                if std::env::var_os("PHASM_B_TEMPORAL_CAND").is_some() {
+                if super::mb_decision_b::env_var_os_is_some("PHASM_B_TEMPORAL_CAND") {
                     let poc_curr_b = self.poc_tracker.full_poc_for(b_display_index) as i32;
                     let poc_l0_b = self.poc_tracker
                         .full_poc_for(b_display_index.saturating_sub(1)) as i32;
@@ -3067,7 +3097,7 @@ impl Encoder {
                 // best. ~2× ME cost at N=6 candidates but unlocks the
                 // temporal candidate's potential AND any future
                 // candidate whose refinement basin beats the median's.
-                let use_multi_refine = std::env::var_os("PHASM_B_MULTI_REFINE").is_some();
+                let use_multi_refine = super::mb_decision_b::env_var_os_is_some("PHASM_B_MULTI_REFINE");
                 let l0_search = if use_multi_refine {
                     self.me.search_block_multi_refine(
                         y_plane, y_stride, l0_ref,
@@ -3112,7 +3142,7 @@ impl Encoder {
                 //
                 // Default ON. Disable via PHASM_B_NO_ME_RESULT_CLAMP=1.
                 const ME_RESULT_QPEL_CAP: i16 = 64;
-                let me_clamp = std::env::var_os("PHASM_B_NO_ME_RESULT_CLAMP").is_none();
+                let me_clamp = !super::mb_decision_b::env_var_os_is_some("PHASM_B_NO_ME_RESULT_CLAMP");
                 let l0_search = if me_clamp
                     && (l0_search.mv.mv_x.abs() > ME_RESULT_QPEL_CAP
                         || l0_search.mv.mv_y.abs() > ME_RESULT_QPEL_CAP)
@@ -3147,7 +3177,7 @@ impl Encoder {
                 // turn making the L0/L1/Bi candidates more competitive
                 // with Skip on cost. See §6E-D.5(d) trace breakthrough
                 // memory for full motivation.
-                let (refined_l0, refined_l1) = if super::mb_decision_b::b_rdo_enabled_with(self.b_rdo_config) {
+                let (refined_l0, refined_l1) = if self.env_snapshot.b_rdo_enabled(self.b_rdo_config) {
                     self.me.refine_bipred(
                         y_plane, y_stride, l0_ref, l1_ref,
                         mb_px as u32, mb_py as u32, 16, 16,
@@ -3173,7 +3203,7 @@ impl Encoder {
             // were actually running full RDO. Lifted the check to the
             // call site so both branches honour it equally.
             let mut decision = if let Some(forced) =
-                super::mb_decision_b::forced_b_mode_from_env()
+                self.env_snapshot.force_b_mode.clone()
             {
                 forced
             } else if self.b_rdo_config.force_l0_zero_b_mode {
@@ -3188,7 +3218,7 @@ impl Encoder {
                     mv: MotionVector::ZERO,
                     ref_idx_l0: 0,
                 }
-            } else if super::mb_decision_b::b_rdo_enabled_with(self.b_rdo_config) {
+            } else if self.env_snapshot.b_rdo_enabled(self.b_rdo_config) {
                 if let (Some((l0_ref, l1_ref)), Some(mvs)) = (b_refs_opt.as_ref(), me_mvs) {
                     let mut src_y = [[0u8; 16]; 16];
                     let mb_px_x = mb_x * 16;
@@ -3207,6 +3237,7 @@ impl Encoder {
                         &self.mv_grid, mb_x, mb_y,
                         self.frame_num as u32, mb_addr as u32,
                         me_mvs,
+                        self.env_snapshot.force_b_mode.clone(),
                     )
                 }
             } else {
@@ -3214,6 +3245,7 @@ impl Encoder {
                     &self.mv_grid, mb_x, mb_y,
                     self.frame_num as u32, mb_addr as u32,
                     me_mvs,
+                    self.env_snapshot.force_b_mode.clone(),
                 )
             };
 
@@ -3273,16 +3305,15 @@ impl Encoder {
                 }
             }
             let aq_variance = super::rate_control::mb_variance_16x16(&aq_src_y);
-            let aq_mode: u8 = std::env::var("PHASM_AQ_MODE")
-                .ok()
+            let aq_mode: u8 = super::mb_decision_b::env_var("PHASM_AQ_MODE")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(1);
-            let aq_disabled = std::env::var_os("PHASM_DISABLE_PAQ").is_some();
+            let aq_disabled = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_PAQ");
             let aq_qp_offset: i32 = if aq_disabled {
                 0
             } else if aq_mode == 3 {
-                let strength: i32 = std::env::var("PHASM_AQ_STRENGTH_Q10")
-                    .ok()
+                let strength: i32 = super::mb_decision_b::env_var("PHASM_AQ_STRENGTH_Q10")
+                    
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(256);
                 let mut luma_sum: u32 = 0;
@@ -3664,7 +3695,7 @@ impl Encoder {
         let qp = self.rc.base_qp_for_frame_type(FrameType::P);
         let qp_c = crate::codec::h264::transform::derive_chroma_qp(qp as i32, self.pps_params.chroma_qp_index_offset as i32) as u8;
         let pic_init_qp = self.pps_params.pic_init_qp as i32;
-        let disable_deblock = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
+        let disable_deblock = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK");
         // v1.4 Phase 4.5 (#316) — P-side actual L0 active count.
         // ref_0 = last_ref (always present after IDR), ref_1 =
         // past_anchor (None for first P after IDR). Mirrors B-side
@@ -3795,7 +3826,7 @@ impl Encoder {
             );
         }
 
-        if std::env::var_os("PHASM_MODE_STATS").is_some() {
+        if super::mb_decision_b::env_var_os_is_some("PHASM_MODE_STATS") {
             let s = &self.mode_stats;
             // Phase D.3: total excludes the intra-in-P sub-counters
             // (I4X4 / I16X16) since those are already summed into
@@ -3834,7 +3865,7 @@ impl Encoder {
         let qp = self.rc.base_qp_for_frame_type(FrameType::P);
         let qp_c = crate::codec::h264::transform::derive_chroma_qp(qp as i32, self.pps_params.chroma_qp_index_offset as i32) as u8;
         let pic_init_qp = self.pps_params.pic_init_qp as i32;
-        let disable_deblock = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
+        let disable_deblock = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK");
         // v1.4 Phase 4.5 (#316) — P-side CABAC actual L0 active count.
         // Same gating as CAVLC build_p_slice_rbsp.
         let actual_l0_p = if self.multi_ref_config.max_l0_active > 1
@@ -3956,7 +3987,7 @@ impl Encoder {
         // PHASM_DISABLE_DEBLOCK env-gated: when set, skip deblock to
         // match the slice header's disable_deblocking_filter_idc=1
         // emission (encoder + decoder both skip deblock).
-        if std::env::var_os("PHASM_DISABLE_DEBLOCK").is_none() {
+        if !super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK") {
             let coded_flags = self.build_coded_flags();
             super::deblocking_filter::filter_frame_with_transform(
                 &mut self.recon,
@@ -3984,7 +4015,7 @@ impl Encoder {
             self.cabac_trace_buffer.extend(trace);
         }
 
-        if std::env::var_os("PHASM_MODE_STATS").is_some() {
+        if super::mb_decision_b::env_var_os_is_some("PHASM_MODE_STATS") {
             let s = &self.mode_stats;
             // Phase D.3: total excludes the intra-in-P sub-counters
             // (already summed into MODE_STAT_INTRA_IN_P).
@@ -4084,16 +4115,15 @@ impl Encoder {
         //     for details).
         //   PHASM_DISABLE_PAQ=1: all MBs use slice QP unchanged.
         let variance = super::rate_control::mb_variance_16x16(&src_y);
-        let aq_mode: u8 = std::env::var("PHASM_AQ_MODE")
-            .ok()
+        let aq_mode: u8 = super::mb_decision_b::env_var("PHASM_AQ_MODE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        let aq_disabled = std::env::var_os("PHASM_DISABLE_PAQ").is_some();
+        let aq_disabled = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_PAQ");
         let qp_offset: i32 = if aq_disabled {
             0
         } else if aq_mode == 3 {
-            let strength: i32 = std::env::var("PHASM_AQ_STRENGTH_Q10")
-                .ok()
+            let strength: i32 = super::mb_decision_b::env_var("PHASM_AQ_STRENGTH_Q10")
+                
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256);
             let mut luma_sum: u32 = 0;
@@ -4153,7 +4183,7 @@ impl Encoder {
         // knob, which adds complexity without a clear user-facing
         // R-D win. Ship as opt-in for callers doing size-constrained
         // encoding at Q≥80.
-        let skip_fast_enabled = std::env::var("PHASM_CABAC_SKIP_FAST").ok().as_deref() == Some("1");
+        let skip_fast_enabled = super::mb_decision_b::env_var("PHASM_CABAC_SKIP_FAST").as_deref() == Some("1");
         let p_skip_mv = super::partition_state::predict_p_skip_mv(
             &self.mv_grid,
             mb_x * 4,
@@ -4283,15 +4313,14 @@ impl Encoder {
         //   - `PHASM_CABAC_INTRA_IN_P_FORCE_MB="x,y"`: force intra-in-P
         //     ONLY on the specified MB(s); suppresses natural firings
         //     elsewhere. Single-MB repro harness for future debug.
-        let trace_would_be_intra = std::env::var_os("PHASM_TRACE_WOULD_BE_INTRA").is_some();
-        let intra_in_p_enabled = std::env::var("PHASM_CABAC_INTRA_IN_P")
-            .ok()
+        let trace_would_be_intra = super::mb_decision_b::env_var_os_is_some("PHASM_TRACE_WOULD_BE_INTRA");
+        let intra_in_p_enabled = super::mb_decision_b::env_var("PHASM_CABAC_INTRA_IN_P")
             .is_none_or(|v| v != "0");
         // FORCE_MB semantics: when set, intra-in-P fires ONLY on the
         // specified MB (suppresses natural firings elsewhere). Lets us
         // isolate parity bugs to a single MB emit for bin-by-bin
         // comparison. Format: "x,y" or "x,y;x2,y2;..." (semi-colon list).
-        let force_mb_setting = std::env::var("PHASM_CABAC_INTRA_IN_P_FORCE_MB").ok();
+        let force_mb_setting = super::mb_decision_b::env_var("PHASM_CABAC_INTRA_IN_P_FORCE_MB");
         let force_mb_active = force_mb_setting.is_some();
         let force_intra_here = intra_in_p_enabled
             && force_mb_setting
@@ -4333,20 +4362,17 @@ impl Encoder {
             // the AC-energy-preservation bonus caused visible
             // artefacts on smooth surfaces on this content. Opt out
             // of the RDO gate via `PHASM_INTRA_RDO=0`.
-            let intra_rdo_enabled = std::env::var("PHASM_INTRA_RDO")
-                .ok()
+            let intra_rdo_enabled = super::mb_decision_b::env_var("PHASM_INTRA_RDO")
                 .is_none_or(|v| v != "0");
             let intra_rdo_wins = if intra_rdo_enabled && !satd_fast_out && !force_mb_active {
                 let frame_w4 = (self.width / 4) as usize;
-                let chroma_mode = std::env::var("PHASM_INTRA_CHROMA_MODE")
-                    .ok()
+                let chroma_mode = super::mb_decision_b::env_var("PHASM_INTRA_CHROMA_MODE")
                     .and_then(|s| s.parse::<u32>().ok())
                     .unwrap_or(0);
                 // Phase C.v3 chroma RDO: build source Cb/Cr blocks
                 // from the current MB. Enabled by default; opt out
                 // via `PHASM_CHROMA_RDO=0` to keep luma-only cost.
-                let chroma_rdo_enabled = std::env::var("PHASM_CHROMA_RDO")
-                    .ok()
+                let chroma_rdo_enabled = super::mb_decision_b::env_var("PHASM_CHROMA_RDO")
                     .is_none_or(|v| v != "0");
                 let (src_cb, src_cr) = if chroma_rdo_enabled {
                     let cy0 = mb_y * 8;
@@ -4434,12 +4460,10 @@ impl Encoder {
                 // target). PSNR is flat-to-+0.1 dB tighter.
                 //
                 // Env-tunable via `PHASM_INTRA_RDO_CEIL_NUM`/`_DEN`.
-                let ceil_num: u64 = std::env::var("PHASM_INTRA_RDO_CEIL_NUM")
-                    .ok()
+                let ceil_num: u64 = super::mb_decision_b::env_var("PHASM_INTRA_RDO_CEIL_NUM")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(Self::INTRA_RDO_CEIL_NUM);
-                let ceil_den: u64 = std::env::var("PHASM_INTRA_RDO_CEIL_DEN")
-                    .ok()
+                let ceil_den: u64 = super::mb_decision_b::env_var("PHASM_INTRA_RDO_CEIL_DEN")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(Self::INTRA_RDO_CEIL_DEN);
                 let ceiling = inter_rdo.cost.saturating_mul(ceil_num) / ceil_den.max(1);
@@ -4471,8 +4495,8 @@ impl Encoder {
                     // (task #52) matched the reference encoder's
                     // ~4 % I_4x4 share within intra-in-P within
                     // ±5 pp on both clips.
-                    let i4x4_allow = std::env::var("PHASM_INTRA_IN_P_ALLOW_I4X4")
-                        .ok()
+                    let i4x4_allow = super::mb_decision_b::env_var("PHASM_INTRA_IN_P_ALLOW_I4X4")
+                        
                         .is_none_or(|v| v != "0");
                     // Phase D.4 fast-intra gate (task #51). I_4x4
                     // exploration runs 9 modes × 16 blocks = 144 SATDs
@@ -4484,8 +4508,8 @@ impl Encoder {
                     // the inter cost, so drift-damaged MBs (large
                     // residual → large `inter_cost`) still get the
                     // I_4x4 pick when it matters.
-                    let d4_thresh_q10: u32 = std::env::var("PHASM_D4_FAST_INTRA_THRESH_Q10")
-                        .ok()
+                    let d4_thresh_q10: u32 = super::mb_decision_b::env_var("PHASM_D4_FAST_INTRA_THRESH_Q10")
+                        
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(Self::D4_FAST_INTRA_THRESH_Q10);
                     // `inter_cost * 1024 > satd_i16x16 * thresh_q10`
@@ -4511,8 +4535,8 @@ impl Encoder {
                         // 3.9 %) — both within ±5 pp of the
                         // reference. See plan doc for the full
                         // sweep table.
-                        let penalty = std::env::var("PHASM_IIP_I4X4_PENALTY")
-                            .ok()
+                        let penalty = super::mb_decision_b::env_var("PHASM_IIP_I4X4_PENALTY")
+                            
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(Self::IIP_I4X4_PENALTY);
                         let i4x4_cost = i4x4_result.total_satd
@@ -5620,7 +5644,7 @@ impl Encoder {
 
         // Task #154 tracer: log entry state so we see every MB even if
         // later branches take an early return.
-        let trace_mb = std::env::var("PHASM_DUMP_MB").ok().is_some_and(|s| {
+        let trace_mb = super::mb_decision_b::env_var("PHASM_DUMP_MB").is_some_and(|s| {
             s.split(';').any(|pair| {
                 let mut parts = pair.split(',');
                 let x: Option<usize> = parts.next().and_then(|p| p.trim().parse().ok());
@@ -5652,16 +5676,15 @@ impl Encoder {
         // +79% bits). Measurement details in
         // `docs/design/video/h264/encoder-quality-plan.md` Phase F.
         let variance = super::rate_control::mb_variance_16x16(&src_y);
-        let aq_mode: u8 = std::env::var("PHASM_AQ_MODE")
-            .ok()
+        let aq_mode: u8 = super::mb_decision_b::env_var("PHASM_AQ_MODE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        let aq_disabled = std::env::var_os("PHASM_DISABLE_PAQ").is_some();
+        let aq_disabled = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_PAQ");
         let qp_offset: i32 = if aq_disabled {
             0
         } else if aq_mode == 3 {
-            let strength: i32 = std::env::var("PHASM_AQ_STRENGTH_Q10")
-                .ok()
+            let strength: i32 = super::mb_decision_b::env_var("PHASM_AQ_STRENGTH_Q10")
+                
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(256);
             let mut luma_sum: u32 = 0;
@@ -5787,7 +5810,7 @@ impl Encoder {
         // AQ mode 3 + psy-RDO + trellis-at-high-QP; our pipeline is
         // lean, so λ² needs re-calibration for our feature set
         // (Phase C.v2).
-        let (choice, inter_cost) = if std::env::var_os("PHASM_ENABLE_RDO").is_some() {
+        let (choice, inter_cost) = if super::mb_decision_b::env_var_os_is_some("PHASM_ENABLE_RDO") {
             let frame_w4 = (self.width / 4) as usize;
             select_p_mb_via_rdo(
                 &src_y, reference, &mut self.mv_grid, mb_x, mb_y, mb_qp, &decision,
@@ -5863,8 +5886,7 @@ impl Encoder {
         // reference decoder's parse. Other MBs unchanged.
         // Accepts a semicolon-separated list of MB coords, e.g.
         // "5,3;6,3;7,3" to force intra on three MBs at once.
-        let force_intra = std::env::var("PHASM_FORCE_INTRA_IN_P_MB")
-            .ok()
+        let force_intra = super::mb_decision_b::env_var("PHASM_FORCE_INTRA_IN_P_MB")
             .is_some_and(|s| {
                 s.split(';').any(|pair| {
                     let mut parts = pair.split(',');
@@ -5884,7 +5906,7 @@ impl Encoder {
         // intra-in-P path (force_intra still works). Useful for
         // isolating whether a parity divergence is caused by intra-
         // neighbor handling elsewhere in the pipeline.
-        let intra_disabled = std::env::var_os("PHASM_DISABLE_INTRA").is_some();
+        let intra_disabled = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_INTRA");
         if (intra_cost < inter_cost && !intra_disabled) || force_intra {
             self.mode_stats[MODE_STAT_INTRA_IN_P] += 1;
             // Intra-in-P: flush any pending skip run before emitting.
@@ -6020,7 +6042,7 @@ impl Encoder {
         // as the encoder emits. Pair with a conformant external decoder's
         // MB-level debug output to find the first MB where the two
         // disagree.
-        let dump_this_mb = std::env::var("PHASM_DUMP_MB").ok().is_some_and(|s| {
+        let dump_this_mb = super::mb_decision_b::env_var("PHASM_DUMP_MB").is_some_and(|s| {
             s.split(';').any(|pair| {
                 let mut parts = pair.split(',');
                 let x: Option<usize> = parts.next().and_then(|p| p.trim().parse().ok());
@@ -6337,7 +6359,7 @@ impl Encoder {
         // Apply the in-loop deblocking filter (spec § 8.7). Matches
         // what the decoder produces — mandatory so our DPB aligns
         // with downstream inter-frame prediction.
-        if std::env::var_os("PHASM_DISABLE_DEBLOCK").is_none() {
+        if !super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK") {
             let coded_flags = self.build_coded_flags();
             super::deblocking_filter::filter_frame(
                 &mut self.recon,
@@ -7165,7 +7187,7 @@ impl Encoder {
         // Deblocking filter on reconstruction (same as CAVLC path).
         // CABAC IDR path can use 8×8 transform — pass the grid so
         // internal 4-pixel-grid edges are skipped on those MBs.
-        if std::env::var_os("PHASM_DISABLE_DEBLOCK").is_none() {
+        if !super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK") {
             let coded_flags = self.build_coded_flags();
             super::deblocking_filter::filter_frame_with_transform(
                 &mut self.recon,
@@ -7435,7 +7457,7 @@ impl Encoder {
         // §B-cascade-real Phase 1.1.B step 2: capture post-flip DC
         // raster for visual_recon.
         dc_levels_post = scan_to_raster_levels(&dc_scan);
-        if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
+        if super::mb_decision_b::env_var_os_is_some("PHASM_DEBUG_IIP_LEVELS") && in_p_slice {
             eprintln!("ENC IIP@({},{}) DC scan: {:?}", mb_x, mb_y, dc_scan);
         }
         let dc_inc = compute_cbf_ctx_idx_inc_luma_dc(&cabac.neighbors, mb_x);
@@ -7461,7 +7483,7 @@ impl Encoder {
                 // AC raster for visual_recon. AC has [0][0] = 0 because
                 // DC was extracted to dc_levels.
                 ac_levels_post[k] = ac_scan_15_to_raster(&ac_scan);
-                if std::env::var_os("PHASM_DEBUG_IIP_LEVELS").is_some() && in_p_slice {
+                if super::mb_decision_b::env_var_os_is_some("PHASM_DEBUG_IIP_LEVELS") && in_p_slice {
                     eprintln!("ENC IIP AC k={} bx={} by={} scan: {:?}", k, bx, by, ac_scan);
                 }
                 let ac_inc = compute_cbf_ctx_idx_inc_luma_ac(
@@ -7722,8 +7744,7 @@ impl Encoder {
         mb_w: usize,
         mb_h: usize,
     ) -> i32 {
-        let mode: u8 = std::env::var("PHASM_AQ_MODE")
-            .ok()
+        let mode: u8 = super::mb_decision_b::env_var("PHASM_AQ_MODE")
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
         if mode != 3 {
@@ -7774,7 +7795,7 @@ impl Encoder {
     fn idr_slice_header(&self) -> ISliceHeaderParams {
         let slice_qp = self.rc.target_crf as i32;
         let pic_init_qp = self.pps_params.pic_init_qp as i32;
-        let disable_deblocking = std::env::var_os("PHASM_DISABLE_DEBLOCK").is_some();
+        let disable_deblocking = super::mb_decision_b::env_var_os_is_some("PHASM_DISABLE_DEBLOCK");
         ISliceHeaderParams {
             is_idr: true,
             pps_id: 0,

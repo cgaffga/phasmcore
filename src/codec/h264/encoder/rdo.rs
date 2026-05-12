@@ -624,8 +624,8 @@ pub fn evaluate_p_mb_rdo(
     // default 256 = 1.0 = no drift penalty). Values > 256 increase
     // the inter penalty. Only applied inside `evaluate_p_mb_rdo`
     // (the inter path); `evaluate_intra_in_p_rdo` keeps pure SSD.
-    let drift_factor_q8: u64 = std::env::var("PHASM_INTER_DRIFT_FACTOR_Q8")
-        .ok()
+    let drift_factor_q8: u64 = super::mb_decision_b::env_var("PHASM_INTER_DRIFT_FACTOR_Q8")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
     let d_luma_drift = (d_luma * drift_factor_q8.max(1)) >> 8;
@@ -709,8 +709,8 @@ pub fn evaluate_p_mb_rdo(
         (0, 0)
     };
 
-    let lambda2_denom: u64 = std::env::var("PHASM_RDO_LAMBDA_DENOM")
-        .ok()
+    let lambda2_denom: u64 = super::mb_decision_b::env_var("PHASM_RDO_LAMBDA_DENOM")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let lambda2 = (lambda2_for_qp(mb_qp) as u64) / lambda2_denom.max(1);
@@ -767,8 +767,8 @@ fn apply_psy_rd(src_y: &[[u8; 16]; 16], recon_y: &[[u8; 16]; 16], _mb_qp: u8) ->
     // across a wider band of borderline-flat MBs, protecting
     // against the door-style artefact on content classes we
     // haven't measured. Opt out with `PHASM_PSY_RD_STRENGTH=0`.
-    let strength: u64 = std::env::var("PHASM_PSY_RD_STRENGTH")
-        .ok()
+    let strength: u64 = super::mb_decision_b::env_var("PHASM_PSY_RD_STRENGTH")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
     if strength == 0 {
@@ -780,12 +780,12 @@ fn apply_psy_rd(src_y: &[[u8; 16]; 16], recon_y: &[[u8; 16]; 16], _mb_qp: u8) ->
     let ac_diff = (src_ac as i64 - recon_ac).unsigned_abs();
 
     // Phase E.v2 content-aware clamp — scale down psy for flat MBs.
-    let low: u32 = std::env::var("PHASM_PSY_CLAMP_LOW")
-        .ok()
+    let low: u32 = super::mb_decision_b::env_var("PHASM_PSY_CLAMP_LOW")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(500);
-    let high: u32 = std::env::var("PHASM_PSY_CLAMP_HIGH")
-        .ok()
+    let high: u32 = super::mb_decision_b::env_var("PHASM_PSY_CLAMP_HIGH")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(3000);
     let clamped_strength = if src_ac <= low {
@@ -953,8 +953,8 @@ pub fn evaluate_intra_in_p_rdo(
     };
     let _ = chroma_pred_mode; // reserved for real mode-based R delta later
 
-    let lambda2_denom: u64 = std::env::var("PHASM_RDO_LAMBDA_DENOM")
-        .ok()
+    let lambda2_denom: u64 = super::mb_decision_b::env_var("PHASM_RDO_LAMBDA_DENOM")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let lambda2 = (lambda2_for_qp(mb_qp) as u64) / lambda2_denom.max(1);

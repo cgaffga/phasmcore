@@ -263,8 +263,8 @@ pub fn trellis_quantize_4x4(
 
     // `PHASM_TRELLIS_LAMBDA_MULT` (Q.10, default 1024 = 1.0) lets us
     // sweep the operating point without touching the spec table.
-    let mult_q10: i64 = std::env::var("PHASM_TRELLIS_LAMBDA_MULT")
-        .ok()
+    let mult_q10: i64 = super::mb_decision_b::env_var("PHASM_TRELLIS_LAMBDA_MULT")
+        
         .and_then(|s| s.parse().ok())
         .unwrap_or(1024);
     let lambda2_scaled: i64 = (lambda2_q8 * mult_q10) >> 10;
