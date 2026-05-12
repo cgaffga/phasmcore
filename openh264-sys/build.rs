@@ -94,6 +94,11 @@ fn main() {
             // WET-eligible threshold). Closes B.9.2 fork-side: all 4
             // stego domains now fire decoder hooks bit-exact vs walker.
             "715ac507da3dcb37f222aaadce4e8e1c9b795744",
+            // 2026-05-12: fork CI fix — PhasmStegoAbi.VersionNotZero
+            // hardcoded 0x010000 but PHASM_STEGO_ABI_VERSION had been
+            // bumped to 0x010100 for the dec_post_read additions.
+            // Test now reads the macro from wels_stego.h directly.
+            "6bf4565af7f2d827781cac180539a8c738b70ae4",
         ];
         let head_output = Command::new("git")
             .arg("-C")

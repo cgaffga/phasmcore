@@ -11,6 +11,9 @@ edition = "2021"
 # ["cli", "openh264-sys"] as members.
 [workspace]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 phasm-core = { path = "..", features = ["wasm"] }
 wasm-bindgen = "0.2"
