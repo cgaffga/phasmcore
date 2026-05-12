@@ -15,7 +15,7 @@ path = "src/main.rs"
 # IMPORTANT: do NOT add `h264-encoder` to phasm-core's features here.
 # The GitHub-release CLI binary distributed via cargo-dist must NOT
 # bundle the H.264 encoder (Via LA AVC patent obligations — see
-# `docs/design/h264-video-steganography.md` § "Patent licensing —
+# `docs/design/video/h264/video-steganography.md` § "Patent licensing —
 # distribution plan"). Users wanting CLI video stego rebuild from
 # source themselves with:
 #     cargo install phasm-cli --features h264-encoder

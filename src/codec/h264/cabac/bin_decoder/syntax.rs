@@ -214,18 +214,30 @@ pub fn decode_transform_size_8x8_flag(
     Ok(bin != 0)
 }
 
-/// Decode `ref_idx_lX` (unary; ctxIdxOffset=54).
+/// Decode `ref_idx_lX` (regular unary, terminator-based; ctxIdxOffset=54).
+/// Spec § 9.3.2 Table 9-34 row "ref_idx_lX" type U; matches the spec
+/// spec § 9.3.2.2 ref_idx binarization. `_c_max` retained on signature for caller
+/// uniformity but unused in body (no truncation).
+///
+/// v1.4 Phase 4.5 (#316) — `current_mb` + `(cur_bx, cur_by)` replaces
+/// the prior `(block_idx_in_mb_a, block_idx_in_mb_b)` parameter pair.
+/// Caller fills `current_mb` AFTER this returns so subsequent partitions
+/// in the same MB read the just-decoded ref_idx for within-MB
+/// neighbour lookups (spec § 6.4.11.7).
 pub fn decode_ref_idx(
     dec: &mut CabacDecoder<'_>,
+    current_mb: &crate::codec::h264::cabac::neighbor::CurrentMbRefIdx,
     mb_x: usize,
-    block_idx_in_mb_a: usize,
-    block_idx_in_mb_b: usize,
+    cur_bx: u8,
+    cur_by: u8,
+    _c_max: u32,
 ) -> Result<u32, DecodeError> {
-    let bin0_inc = ctx_idx_inc_ref_idx_bin0(
+    let bin0_inc = crate::codec::h264::cabac::neighbor::compute_ref_idx_ctx_idx_inc_bin0(
+        current_mb,
         &dec.neighbors,
         mb_x,
-        block_idx_in_mb_a,
-        block_idx_in_mb_b,
+        cur_bx,
+        cur_by,
     );
     decode_unary(dec, 31, |bin_idx| {
         let ctx_inc = match bin_idx {
@@ -297,7 +309,7 @@ fn ctx_idx_inc_mb_type_bin(
         (17, 5) => 3,
         (17, 6) => 3,
         // §6E-A6.1q.f — B-slice mb_type prefix bins per spec Table
-        // 9-41 / ffmpeg. Mirror of encoder.rs:178-203 fix.
+        // 9-41 / the reference decoder. Mirror of encoder.rs:178-203 fix.
         (27, 1) => 3,
         (27, 3) => 5,
         (27, 4) => 5,
@@ -595,7 +607,7 @@ pub fn decode_sub_mb_type_p(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeErr
 ///
 /// **Scope**: §6E-A6.3 ships sub_mb_types 0..=3 (`B_Direct_8x8`,
 /// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). The remaining 9 sub-sub-
-/// partition variants (4..=12, descoped per the x264-medium finding)
+/// partition variants (4..=12, descoped per the the converter-pipeline centroid finding)
 /// return `DecodeError::Unsupported` until §6E-A6.4.
 pub fn decode_sub_mb_type_b(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeError> {
     let base = ctx_offset::SUB_MB_TYPE_B;
@@ -1200,24 +1212,28 @@ mod tests {
 
     #[test]
     fn ref_idx_zero_roundtrip() {
+        use crate::codec::h264::cabac::neighbor::CurrentMbRefIdx;
         let mut enc = fresh_p_enc();
-        cenc::encode_ref_idx(&mut enc, 0, 0, 0, 0);
+        let cur = CurrentMbRefIdx::new();
+        cenc::encode_ref_idx(&mut enc, 0, &cur, 0, 0, 0, 31);
         enc.engine.encode_terminate(1);
         let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
         let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_ref_idx(&mut dec, 0, 0, 0).unwrap();
+        let v = decode_ref_idx(&mut dec, &cur, 0, 0, 0, 31).unwrap();
         assert_eq!(v, 0);
     }
 
     #[test]
     fn ref_idx_nonzero_roundtrip() {
+        use crate::codec::h264::cabac::neighbor::CurrentMbRefIdx;
         for &idx in &[1u32, 3, 7] {
             let mut enc = fresh_p_enc();
-            cenc::encode_ref_idx(&mut enc, idx, 0, 0, 0);
+            let cur = CurrentMbRefIdx::new();
+            cenc::encode_ref_idx(&mut enc, idx, &cur, 0, 0, 0, 31);
             enc.engine.encode_terminate(1);
             let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
             let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_ref_idx(&mut dec, 0, 0, 0).unwrap();
+            let v = decode_ref_idx(&mut dec, &cur, 0, 0, 0, 31).unwrap();
             assert_eq!(v, idx);
         }
     }

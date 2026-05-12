@@ -51,7 +51,7 @@ None of these clips are redistributed; all stay gitignored.
 For the ytnews clip (1280×720 news broadcast), regen pulls the
 already-compressed `.h264` elementary stream in `/tmp/ytnews.h264`
 (also gitignored). If that's missing you need to re-save from the
-upstream source; see `docs/design/h264-encoder-quality-plan.md`
+upstream source; see `docs/design/video/h264/encoder-quality-plan.md`
 § D.2-stealth for the original download path. Single-vendor and
 not in active use post-§6E-A6 reference-distribution work.
 

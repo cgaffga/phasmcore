@@ -4,11 +4,17 @@
 
 //! Phase 6 — pure-Rust H.264 encoder.
 //!
+//! **Clean-room invariant**: this subtree is derived from the H.264
+//! spec (ITU-T Rec. H.264 | ISO/IEC 14496-10) plus published academic
+//! literature. Code MUST cite spec sections, not other implementations.
+//! The `core/src/codec/h264/openh264.rs` file is the explicit exception
+//! — it binds against the OpenH264 BSD-2 fork intentionally.
+//!
 //! Module skeleton (Phase 6.0a). Most types are empty placeholders that
 //! get filled in as the per-module sessions land — see
-//! `docs/design/h264-encoder-algorithms/README.md` for the per-module
+//! `docs/design/video/h264/encoder-algorithms/README.md` for the per-module
 //! note + implementation tracking, and
-//! `docs/design/h264-video-steganography.md` § Phase 6 for the full
+//! `docs/design/video/h264/video-steganography.md` § Phase 6 for the full
 //! sub-phase plan.
 //!
 //! ## Module structure
@@ -59,7 +65,9 @@ pub mod i4x4_encode;
 pub mod inter_mode;
 pub mod intra_8x8_encode;
 pub mod intra_predictor;
+pub mod lookahead;
 pub mod mb_decision_b;
+pub mod mb_tree;
 pub mod motion_compensation;
 pub mod motion_estimation;
 pub mod partition_decision;

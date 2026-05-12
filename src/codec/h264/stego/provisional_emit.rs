@@ -24,7 +24,7 @@
 //! the polish sequence (single-cover shadow position selection
 //! refactor).
 //!
-//! See `docs/design/h264-shadow-messages.md` § "§6E-C2 polish"
+//! See `docs/design/video/h264/shadow-messages.md` § "§6E-C2 polish"
 //! for the full architecture.
 
 use crate::codec::h264::cabac::bin_decoder::{

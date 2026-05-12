@@ -30,7 +30,7 @@ pub mod fingerprint;
 // GitHub-release CLI binary never accidentally bundles an encoder
 // subject to Via LA AVC patent obligations. Mobile bridges enable the
 // feature explicitly. See
-// `docs/design/h264-video-steganography.md` § Phase 6.
+// `docs/design/video/h264/video-steganography.md` § Phase 6.
 #[cfg(feature = "h264-encoder")]
 pub mod cabac;
 #[cfg(feature = "h264-encoder")]
@@ -50,6 +50,12 @@ pub mod encoder;
 // `stego::*` types unconditionally.
 #[cfg(feature = "h264-encoder")]
 pub mod stego;
+
+/// High-level Rust API for the cgaffga/phasm-openh264 fork's stego
+/// hooks. Gated by the `openh264-backend` Cargo feature (Phase B);
+/// pulls in `core-openh264-sys` for the raw FFI bindings.
+#[cfg(feature = "openh264-backend")]
+pub mod openh264;
 
 use std::fmt;
 

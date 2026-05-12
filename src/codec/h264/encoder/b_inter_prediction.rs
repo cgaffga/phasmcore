@@ -143,6 +143,131 @@ pub fn build_b_chroma_prediction(
     out
 }
 
+/// Phase 2.12.d (#280, 2026-05-08) — per-8×8 luma prediction builder
+/// for B_Skip / B_Direct_16x16 with per-sub-block MVs.
+///
+/// Spec § 8.4.1.2.2 step 6 applies the colZeroFlag override PER 8×8
+/// sub-block. Some sub-blocks get MV=(0,0), others keep the median
+/// predictor. The encoder must apply MC per-sub-block to match the
+/// decoder's reconstruction.
+///
+/// `mv_l0_per_8x8`/`mv_l1_per_8x8` indexed in raster order
+/// (TL=0, TR=1, BL=2, BR=3). Each 8×8 luma sub-block covers 8×8
+/// pixels at offsets (0,0), (8,0), (0,8), (8,8).
+///
+/// `uses_l0`/`uses_l1` indicate which lists are active for this MB.
+/// At least one MUST be active (caller responsibility — boundary
+/// case where both are inactive should never reach this function).
+pub fn build_b_luma_prediction_per_8x8(
+    mv_l0_per_8x8: [MotionVector; 4],
+    mv_l1_per_8x8: [MotionVector; 4],
+    uses_l0: bool,
+    uses_l1: bool,
+    l0_ref: &ReconFrame,
+    l1_ref: &ReconFrame,
+    mb_x: usize,
+    mb_y: usize,
+) -> [[u8; 16]; 16] {
+    let mut out = [[0u8; 16]; 16];
+    let mb_px_x = (mb_x * 16) as u32;
+    let mb_px_y = (mb_y * 16) as u32;
+    for i8 in 0..4 {
+        let off_x = ((i8 & 1) * 8) as u32;
+        let off_y = ((i8 >> 1) * 8) as u32;
+        let sub_px_x = mb_px_x + off_x;
+        let sub_px_y = mb_px_y + off_y;
+        // Slice into the 16×16 output buffer at the sub-block's
+        // top-left, with stride 16 so the 8×8 fill writes to the
+        // correct rows.
+        let flat = out.as_flattened_mut();
+        let start = (off_y as usize) * 16 + (off_x as usize);
+        let sub_slice = &mut flat[start..];
+        match (uses_l0, uses_l1) {
+            (true, false) => {
+                apply_luma_mv_block(
+                    l0_ref, sub_px_x, sub_px_y, 8, 8,
+                    mv_l0_per_8x8[i8], sub_slice, 16,
+                );
+            }
+            (false, true) => {
+                apply_luma_mv_block(
+                    l1_ref, sub_px_x, sub_px_y, 8, 8,
+                    mv_l1_per_8x8[i8], sub_slice, 16,
+                );
+            }
+            (true, true) => {
+                apply_luma_mv_block_bipred(
+                    l0_ref, mv_l0_per_8x8[i8],
+                    l1_ref, mv_l1_per_8x8[i8],
+                    sub_px_x, sub_px_y, 8, 8, sub_slice, 16,
+                );
+            }
+            (false, false) => {
+                // Should never happen — boundary case forces both refs
+                // to 0 in the spatial-direct derivation.
+                debug_assert!(false, "per_8x8 prediction with both lists inactive");
+            }
+        }
+    }
+    out
+}
+
+/// Phase 2.12.d (#280) — per-8×8 chroma prediction builder for
+/// B_Skip / B_Direct_16x16. Each luma 8×8 sub-block corresponds to
+/// a chroma 4×4 sub-block (4:2:0 subsampling). Sub-block raster:
+/// TL chroma at (0,0), TR at (4,0), BL at (0,4), BR at (4,4) in
+/// the 8×8 chroma output buffer.
+pub fn build_b_chroma_prediction_per_8x8(
+    mv_l0_per_8x8: [MotionVector; 4],
+    mv_l1_per_8x8: [MotionVector; 4],
+    uses_l0: bool,
+    uses_l1: bool,
+    l0_ref: &ReconFrame,
+    l1_ref: &ReconFrame,
+    component: u8,
+    mb_x: usize,
+    mb_y: usize,
+) -> [[u8; 8]; 8] {
+    let mut out = [[0u8; 8]; 8];
+    let mb_chroma_px_x = (mb_x * 8) as u32;
+    let mb_chroma_px_y = (mb_y * 8) as u32;
+    for i8 in 0..4 {
+        // Each luma 8×8 sub-block = chroma 4×4 sub-block in 4:2:0.
+        let off_x_c = ((i8 & 1) * 4) as u32;
+        let off_y_c = ((i8 >> 1) * 4) as u32;
+        let sub_cpx_x = mb_chroma_px_x + off_x_c;
+        let sub_cpx_y = mb_chroma_px_y + off_y_c;
+        let flat = out.as_flattened_mut();
+        let start = (off_y_c as usize) * 8 + (off_x_c as usize);
+        let sub_slice = &mut flat[start..];
+        match (uses_l0, uses_l1) {
+            (true, false) => {
+                apply_chroma_mv_block(
+                    l0_ref, component, sub_cpx_x, sub_cpx_y, 4, 4,
+                    mv_l0_per_8x8[i8], sub_slice, 8,
+                );
+            }
+            (false, true) => {
+                apply_chroma_mv_block(
+                    l1_ref, component, sub_cpx_x, sub_cpx_y, 4, 4,
+                    mv_l1_per_8x8[i8], sub_slice, 8,
+                );
+            }
+            (true, true) => {
+                apply_chroma_mv_block_bipred(
+                    l0_ref, mv_l0_per_8x8[i8],
+                    l1_ref, mv_l1_per_8x8[i8],
+                    component, sub_cpx_x, sub_cpx_y, 4, 4, sub_slice, 8,
+                );
+            }
+            (false, false) => {
+                debug_assert!(false, "per_8x8 chroma prediction with both lists inactive");
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

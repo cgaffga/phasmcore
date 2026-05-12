@@ -8,7 +8,7 @@
 //! (ffmpeg) and reports whether the bitstream decodes cleanly and
 //! whether the decoded pixels match a reference reconstruction.
 //!
-//! Design doc: `docs/design/h264-encoder-algorithms/oracle-harness.md`
+//! Design doc: `docs/design/video/h264/encoder-algorithms/oracle-harness.md`
 //!
 //! Three layers:
 //!   - Layer 0: ffmpeg parses the file (no crash, no errors).

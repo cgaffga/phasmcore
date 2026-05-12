@@ -3,7 +3,7 @@
 # encoded with x264 (HandBrake "Fast 1080p30"-equivalent settings).
 #
 # Used by Phase 6E-A6 stealth-comparison work
-# (`docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`).
+# (`docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`).
 # x264 is the dominant in-the-wild H.264 producer (HandBrake, ffmpeg
 # default, OBS, video converters), so matching its output distribution
 # is the canonical "look like a typical converted H.264 video" target.

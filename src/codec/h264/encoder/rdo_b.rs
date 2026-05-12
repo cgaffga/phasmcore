@@ -14,16 +14,16 @@
 //! This module is standalone foundation that compiles + tests on
 //! its own.
 //!
-//! ## Fast RDO (default, x264-medium-style)
+//! ## Fast RDO (default, the converter-pipeline centroid-style)
 //!
 //! Uses **SATD distortion + bin-count rate** rather than full
 //! quant→dequant→IDCT→recon→SSD. Standard fast-RDO formulation:
 //! the 4×4 Hadamard concentrates residual energy the same way the
 //! integer DCT does, so SATD ranks candidates within ~95% of true
-//! post-quant SSD ordering at ~1/5th the cost. x264-medium uses
+//! post-quant SSD ordering at ~1/5th the cost. the converter-pipeline centroid uses
 //! exactly this pattern for mode decision; phasm matches that
-//! behaviour because matching x264-medium output is the v1 stealth
-//! goal (see `docs/design/h264-stealth-strategy.md`).
+//! behaviour because matching the converter-pipeline centroid output is the v1 stealth
+//! goal (see `docs/design/video/h264/stealth-strategy.md`).
 //!
 //! Cost formula:
 //!
@@ -45,7 +45,7 @@
 //! adjustment — B-frames are not used as references
 //! (`nal_ref_idc=0`, §6E-A4), so quant noise doesn't propagate
 //! and the rate-distortion trade tolerates higher distortion at
-//! the same QP. `1.44 ≈ x264's default b_frame_pyramid weighting
+//! the same QP. `1.44 ≈ standard b_frame_pyramid weighting
 //! when --bframes 1`.
 //!
 //! ## Skip / Direct collapse
@@ -121,8 +121,8 @@ pub const LAMBDA_TAB_B: [u32; 52] = [
 /// L0's slightly-better SATD usually couldn't clear at QP=34.
 ///
 /// §6E-D.5(f): RARE_BIN_COST = 2. This still over-charges relative
-/// to true CABAC fractional bins (real x264 charges ~0.5-1.5 bits
-/// at warm state), but stays conservative. Empirical x264 same-
+/// to true CABAC fractional bins (real the reference fast encoder charges ~0.5-1.5 bits
+/// at warm state), but stays conservative. Empirical the reference fast encoder same-
 /// fixture mb_type prefix bins for rare cases: average ~1.5 bits.
 /// Integer-rounded UP to 2 to keep cost-model defensibly above
 /// minimum CABAC charge — this is correctness (matches actual
@@ -138,9 +138,9 @@ const RARE_BIN_COST: u32 = 2;
 
 /// PSY-RD strength shift (Q.0 fixed-point divisor). Final psy term is
 /// added as `(source_hf - pred_hf).abs() >> PSY_RD_SHIFT`. Calibrated
-/// to x264's `psy-rd=1.0` default scale: x264 applies `psy_rd × psy_term`
+/// to the PSY-RD=1.0 baseline from published rate-control literature scale: the reference fast encoder applies `psy_rd × psy_term`
 /// directly to its lambda-weighted cost; in our SATD+λR scale, shift=4
-/// (divide-by-16) approximates x264's lambda-cost-relative impact at
+/// (divide-by-16) approximates the reference fast encoder's lambda-cost-relative impact at
 /// medium QP range (~30-36).
 ///
 /// Env-overridable via `PHASM_PSY_RD_SHIFT` (default 4). Set higher
@@ -346,7 +346,7 @@ fn b_8x8_overhead_bits(sub_mb_types: &[u8; 4], parts: &[BPartitionMvPair; 4]) ->
 
 /// §6E-D.2 — overhead bin count for a Partitioned (mb_type 4..21).
 ///
-/// CABAC bin lengths from x264 / reference decoder:
+/// CABAC bin lengths from the reference fast encoder / reference decoder:
 ///   - mb_type bin string for 16x8/8x16 partitioned: ~4-6 bins
 ///     depending on combo. Use a flat 5-bin estimate for ranking;
 ///     differences across combos are <2 bins → does not flip the
@@ -381,10 +381,25 @@ fn partitioned_overhead_bits(meta: &BPartitionedMeta,
 ///
 /// Validity contract: if `meta.partN` is `L0` then `mv_l0` is the
 /// active MV, `mv_l1` must be ignored. If `Bi`, both are active.
+///
+/// v1.4 Phase 2 (#305): `ref_idx_l0` carries the L0 reference index
+/// for this partition. Default 0 = closest past anchor (single-ref
+/// behavior). When multi-ref is enabled, ME populates it per
+/// partition. L1 stays single-ref (Q1 — no `ref_idx_l1` field).
 #[derive(Debug, Clone, Copy)]
 pub struct BPartitionMvPair {
     pub mv_l0: MotionVector,
     pub mv_l1: MotionVector,
+    pub ref_idx_l0: u8,
+}
+
+impl BPartitionMvPair {
+    /// Construct with explicit MVs and ref_idx_l0=0 (single-ref
+    /// default). Existing builder paths use this; multi-ref-aware
+    /// callers set `ref_idx_l0` directly via struct literal.
+    pub fn new(mv_l0: MotionVector, mv_l1: MotionVector) -> Self {
+        Self { mv_l0, mv_l1, ref_idx_l0: 0 }
+    }
 }
 
 /// §6E-D.1 + §6E-D.2 — B-slice candidate family for fast RDO.
@@ -399,18 +414,34 @@ pub enum BMbCandidate {
     /// the cheaper wire form AFTER fast-RDO ranking by checking CBP
     /// on the winner. Spatial-direct MV derived from neighbours via
     /// `derive_b_direct_spatial`.
+    ///
+    /// Phase 2.12.f (#282): `mv_l0_per_8x8` / `mv_l1_per_8x8` carry
+    /// the per-sub-block MVs from `BDirectSpatialResult`. When at
+    /// least one sub-block diverges from the top-left (= colZeroFlag
+    /// override fired), the SATD evaluator must use the per-8x8
+    /// builder, otherwise the cost diverges from actual emit and
+    /// RDO ranks SkipOrDirect incorrectly.
     SkipOrDirect {
         mv_l0: MotionVector,
         mv_l1: MotionVector,
         uses_l0: bool,
         uses_l1: bool,
+        mv_l0_per_8x8: [MotionVector; 4],
+        mv_l1_per_8x8: [MotionVector; 4],
     },
     /// `mb_type=1` — single L0 reference, MV from ME.
-    L0_16x16 { mv_l0: MotionVector },
-    /// `mb_type=2` — single L1 reference, MV from ME.
+    ///
+    /// v1.4 Phase 2 (#305): `ref_idx_l0` carries the L0 reference
+    /// index. Default 0 = closest past anchor (single-ref behavior).
+    /// Multi-ref ME (Phase 4) populates it; emit side (Phase 2/9)
+    /// writes it via `encode_ref_idx()` when num_active_l0 > 1.
+    L0_16x16 { mv_l0: MotionVector, ref_idx_l0: u8 },
+    /// `mb_type=2` — single L1 reference, MV from ME. L1 stays
+    /// single-ref under v1.4 (Q1).
     L1_16x16 { mv_l1: MotionVector },
     /// `mb_type=3` — bipred over both lists, both MVs from ME.
-    Bi_16x16 { mv_l0: MotionVector, mv_l1: MotionVector },
+    /// `ref_idx_l0` per L0_16x16; L1 stays single-ref.
+    Bi_16x16 { mv_l0: MotionVector, mv_l1: MotionVector, ref_idx_l0: u8 },
     /// `mb_type=4..21` — partitioned 16x8 / 8x16 with per-partition
     /// list usage. Per-partition MVs come from ME for the required
     /// lists; the unused list's MV is ignored by `evaluate_b_mb_rdo`.
@@ -468,16 +499,15 @@ pub struct BMbRdoResult {
 /// uses the resulting mode choice in Pass 1 + Pass 3, so
 /// determinism is load-bearing — fast RDO is fully deterministic
 /// given the same inputs.
-pub fn evaluate_b_mb_rdo(
+/// Build the 16×16 luma prediction for one B-slice candidate.
+/// Pure: no encoder state mutation.
+fn build_luma_prediction_for_candidate(
     candidate: &BMbCandidate,
-    src_y: &[[u8; 16]; 16],
     l0_ref: &ReconFrame,
     l1_ref: &ReconFrame,
     mb_x: usize,
     mb_y: usize,
-    mb_qp: u8,
-) -> BMbRdoResult {
-    // ── 1. Prediction ────────────────────────────────────────────
+) -> [[u8; 16]; 16] {
     let mb_px_x = (mb_x * 16) as u32;
     let mb_px_y = (mb_y * 16) as u32;
 
@@ -485,35 +515,47 @@ pub fn evaluate_b_mb_rdo(
     let pred_flat = pred_y.as_flattened_mut();
 
     match *candidate {
-        BMbCandidate::SkipOrDirect { mv_l0, mv_l1, uses_l0, uses_l1 } => {
-            match (uses_l0, uses_l1) {
-                (true, true) => apply_luma_mv_block_bipred(
-                    l0_ref, mv_l0, l1_ref, mv_l1,
-                    mb_px_x, mb_px_y, 16, 16, pred_flat, 16,
-                ),
-                (true, false) => apply_luma_mv_block(
-                    l0_ref, mb_px_x, mb_px_y, 16, 16, mv_l0, pred_flat, 16,
-                ),
-                (false, true) => apply_luma_mv_block(
-                    l1_ref, mb_px_x, mb_px_y, 16, 16, mv_l1, pred_flat, 16,
-                ),
-                (false, false) => {
-                    // Pathological case: spatial-direct derived no
-                    // valid list. Fall back to L0 zero MV.
-                    apply_luma_mv_block(
-                        l0_ref, mb_px_x, mb_px_y, 16, 16,
-                        MotionVector::ZERO, pred_flat, 16,
-                    );
+        BMbCandidate::SkipOrDirect { mv_l0, mv_l1, uses_l0, uses_l1, mv_l0_per_8x8, mv_l1_per_8x8 } => {
+            // Phase 2.12.f (#282) — per-sub-block MVs differ when
+            // colZeroFlag override fires on at least one 8x8 sub-block.
+            let needs_per_8x8 = mv_l0_per_8x8.iter().any(|&m| m != mv_l0)
+                || mv_l1_per_8x8.iter().any(|&m| m != mv_l1);
+            if needs_per_8x8 {
+                pred_y = super::b_inter_prediction::build_b_luma_prediction_per_8x8(
+                    mv_l0_per_8x8, mv_l1_per_8x8,
+                    uses_l0, uses_l1,
+                    l0_ref, l1_ref, mb_x, mb_y,
+                );
+            } else {
+                match (uses_l0, uses_l1) {
+                    (true, true) => apply_luma_mv_block_bipred(
+                        l0_ref, mv_l0, l1_ref, mv_l1,
+                        mb_px_x, mb_px_y, 16, 16, pred_flat, 16,
+                    ),
+                    (true, false) => apply_luma_mv_block(
+                        l0_ref, mb_px_x, mb_px_y, 16, 16, mv_l0, pred_flat, 16,
+                    ),
+                    (false, true) => apply_luma_mv_block(
+                        l1_ref, mb_px_x, mb_px_y, 16, 16, mv_l1, pred_flat, 16,
+                    ),
+                    (false, false) => {
+                        // Pathological case: spatial-direct derived no
+                        // valid list. Fall back to L0 zero MV.
+                        apply_luma_mv_block(
+                            l0_ref, mb_px_x, mb_px_y, 16, 16,
+                            MotionVector::ZERO, pred_flat, 16,
+                        );
+                    }
                 }
             }
         }
-        BMbCandidate::L0_16x16 { mv_l0 } => apply_luma_mv_block(
+        BMbCandidate::L0_16x16 { mv_l0, .. } => apply_luma_mv_block(
             l0_ref, mb_px_x, mb_px_y, 16, 16, mv_l0, pred_flat, 16,
         ),
         BMbCandidate::L1_16x16 { mv_l1 } => apply_luma_mv_block(
             l1_ref, mb_px_x, mb_px_y, 16, 16, mv_l1, pred_flat, 16,
         ),
-        BMbCandidate::Bi_16x16 { mv_l0, mv_l1 } => apply_luma_mv_block_bipred(
+        BMbCandidate::Bi_16x16 { mv_l0, mv_l1, .. } => apply_luma_mv_block_bipred(
             l0_ref, mv_l0, l1_ref, mv_l1,
             mb_px_x, mb_px_y, 16, 16, pred_flat, 16,
         ),
@@ -542,6 +584,23 @@ pub fn evaluate_b_mb_rdo(
         }
     }
 
+    pred_y
+}
+
+pub fn evaluate_b_mb_rdo(
+    candidate: &BMbCandidate,
+    src_y: &[[u8; 16]; 16],
+    l0_ref: &ReconFrame,
+    l1_ref: &ReconFrame,
+    mb_x: usize,
+    mb_y: usize,
+    mb_qp: u8,
+) -> BMbRdoResult {
+    // ── 1. Prediction ────────────────────────────────────────────
+    let pred_y = build_luma_prediction_for_candidate(
+        candidate, l0_ref, l1_ref, mb_x, mb_y,
+    );
+
     // ── 2. SATD ─────────────────────────────────────────────────
     let satd = satd_16x16(src_y, &pred_y);
 
@@ -564,7 +623,7 @@ pub fn evaluate_b_mb_rdo(
             r_bits += 1; // mb_type=0 bin
             r_bits += 4; // cbp + qp_delta overhead
         }
-        BMbCandidate::L0_16x16 { mv_l0 } => {
+        BMbCandidate::L0_16x16 { mv_l0, .. } => {
             // 3 bins: 1 leading (frequent) + 2 rare-context.
             r_bits += 1 + 2 * RARE_BIN_COST;
             r_bits += mvd_rate_estimate(mv_l0.mv_x, mv_l0.mv_y);
@@ -575,8 +634,8 @@ pub fn evaluate_b_mb_rdo(
             r_bits += mvd_rate_estimate(mv_l1.mv_x, mv_l1.mv_y);
             r_bits += 4;
         }
-        BMbCandidate::Bi_16x16 { mv_l0, mv_l1 } => {
-            // §6E-D.5(o) — drop bins from 5 to 2 (HACK toward x264
+        BMbCandidate::Bi_16x16 { mv_l0, mv_l1, .. } => {
+            // §6E-D.5(o) — drop bins from 5 to 2 (HACK toward the reference fast encoder
             // warm-state CABAC). Static binarization-tree gives 5
             // bins; warm-state CABAC charges only ~1.5-3 bits because
             // ctxIdxInc 27/30/32 are highly biased toward Direct
@@ -613,7 +672,7 @@ pub fn evaluate_b_mb_rdo(
     // candidates, treating them as if they all had equivalent post-
     // quant distortion. That under-charges Direct's actual no-
     // residual SSD distortion and over-charges explicit-MV's small
-    // quant-noise distortion. x264's full RDO catches this naturally
+    // quant-noise distortion. full RDO catches this naturally
     // by computing SSD on actual reconstructions.
     //
     // The multiplier reflects "Direct's distortion ≈ N× explicit-MV's
@@ -646,7 +705,7 @@ pub fn evaluate_b_mb_rdo(
     //     than Direct's no-residual, justifying the rate cost."
     // Both answers are codec-purpose-driven, not statistical-fit.
     //
-    // Maps to x264's full-RDO behaviour as approximation.
+    // Approximates a full-RDO reference baseline.
     let lambda = LAMBDA_TAB_B[mb_qp.min(51) as usize] as u64;
     // §6E-D.5(k): multiplier 5/2 (= 2.5). §6E-D.5(j) ×3 measurement
     // showed Direct dropped to 46.3% (target 55.65%, undershot by
@@ -681,7 +740,7 @@ pub fn evaluate_b_mb_rdo(
     // is anchored at flat: shifts the balance per-MB without breaking
     // the population-level fit on mid-HF content.
     //
-    // Maps to x264 medium full-RDO behavior: flat MBs ~Direct wins
+    // Approximates a fast-encoder full-RDO reference baseline: flat MBs ~Direct wins
     // because true SSD ≈ for both candidates and Direct has lower
     // rate; textured MBs ~L0/L1 wins because residual coding closes
     // the true-SSD gap that SATD alone undersells for Direct.
@@ -735,6 +794,7 @@ pub fn evaluate_b_mb_rdo(
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +845,8 @@ mod tests {
             mv_l1: MotionVector::ZERO,
             uses_l0: true,
             uses_l1: false,
+            mv_l0_per_8x8: [MotionVector::ZERO; 4],
+            mv_l1_per_8x8: [MotionVector::ZERO; 4],
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert_eq!(res.satd, 0, "zero residual → zero SATD");
@@ -801,6 +863,7 @@ mod tests {
         let l1 = make_recon(64, 64, 100);
         let cand = BMbCandidate::L0_16x16 {
             mv_l0: MotionVector { mv_x: 0, mv_y: 0 },
+            ref_idx_l0: 0,
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         // §6E-D.5(f): RARE_BIN_COST=2. 1 (skip) + (1 + 2×2) (mb_type rare bins) + 6 (mvd zero) + 4 (cbp/qp) = 16.
@@ -817,6 +880,7 @@ mod tests {
         let cand = BMbCandidate::Bi_16x16 {
             mv_l0: MotionVector::ZERO,
             mv_l1: MotionVector::ZERO,
+            ref_idx_l0: 0,
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         // §6E-D.5(o): 1 (skip) + (1 + 2×2) (mb_type 3 bins after warm-state
@@ -833,7 +897,7 @@ mod tests {
         let src = const_src_y(100);
         let l0 = make_recon(64, 64, 200);
         let l1 = make_recon(64, 64, 200);
-        let cand = BMbCandidate::L0_16x16 { mv_l0: MotionVector::ZERO };
+        let cand = BMbCandidate::L0_16x16 { mv_l0: MotionVector::ZERO, ref_idx_l0: 0 };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert!(res.satd > 1000, "residual MB should produce non-trivial SATD");
         // cost = SATD + λ × r_bits should exceed rate-alone.
@@ -846,7 +910,7 @@ mod tests {
         let src = const_src_y(100);
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 100);
-        let cand = BMbCandidate::L0_16x16 { mv_l0: MotionVector::ZERO };
+        let cand = BMbCandidate::L0_16x16 { mv_l0: MotionVector::ZERO, ref_idx_l0: 0 };
         let lo = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 21);
         let hi = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 36);
         assert!(hi.cost > lo.cost, "λ should grow with QP: {} > {}", hi.cost, lo.cost);
@@ -875,8 +939,8 @@ mod tests {
             .expect("mb_type 4 valid");
         let cand = BMbCandidate::Partitioned {
             meta,
-            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
-            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
+            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
+            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert_eq!(res.satd, 0, "zero residual → zero SATD");
@@ -894,8 +958,8 @@ mod tests {
             .expect("mb_type 21 valid");
         let cand = BMbCandidate::Partitioned {
             meta,
-            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
-            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
+            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
+            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         // §6E-D.5(f): 1 (skip) + (1+4×2) (mb_type rare) + 12 (Bi mvds part0) + 12 (part1) + 4 (cbp/qp) = 38.
@@ -918,8 +982,8 @@ mod tests {
             .expect("mb_type 8 valid");
         let cand = BMbCandidate::Partitioned {
             meta,
-            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
-            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
+            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
+            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert_eq!(res.satd, 0,
@@ -939,8 +1003,8 @@ mod tests {
             .expect("mb_type 4 valid");
         let cand = BMbCandidate::Partitioned {
             meta,
-            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
-            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
+            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
+            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert!(res.satd > 1000,
@@ -955,7 +1019,7 @@ mod tests {
         let src = const_src_y(100);
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 100);
-        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) };
+        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 };
         let cand = BMbCandidate::B_8x8 {
             sub_mb_types: [1, 1, 1, 1],
             parts: [zero; 4],
@@ -973,7 +1037,7 @@ mod tests {
         let src = const_src_y(100);
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 100);
-        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) };
+        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 };
         let cand = BMbCandidate::B_8x8 {
             sub_mb_types: [0, 0, 0, 0],
             parts: [zero; 4],
@@ -992,7 +1056,7 @@ mod tests {
         let src = const_src_y(100);
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 100);
-        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) };
+        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 };
         let cand = BMbCandidate::B_8x8 {
             sub_mb_types: [3, 3, 3, 3],
             parts: [zero; 4],
@@ -1022,7 +1086,7 @@ mod tests {
         }
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 200);
-        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) };
+        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 };
         // Per-sub list selection: L0 for TL/BR (sub=1), L1 for TR/BL (sub=2).
         let cand = BMbCandidate::B_8x8 {
             sub_mb_types: [1, 2, 2, 1],
@@ -1048,7 +1112,7 @@ mod tests {
         }
         let l0 = make_recon(64, 64, 100);
         let l1 = make_recon(64, 64, 200);
-        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) };
+        let zero = BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 };
         let cand = BMbCandidate::B_8x8 {
             sub_mb_types: [1, 1, 1, 1],
             parts: [zero; 4],
@@ -1072,8 +1136,8 @@ mod tests {
             .expect("mb_type 9 valid");
         let cand = BMbCandidate::Partitioned {
             meta,
-            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
-            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0) },
+            part0_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
+            part1_mvs: BPartitionMvPair { mv_l0: pmv(0, 0), mv_l1: pmv(0, 0), ref_idx_l0: 0 },
         };
         let res = evaluate_b_mb_rdo(&cand, &src, &l0, &l1, 0, 0, 30);
         assert_eq!(res.satd, 0,

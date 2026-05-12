@@ -15,8 +15,8 @@
 //! encoded BEFORE the displayed-between B (L1 ref for that B).
 //! Slot 2 = IDR carry-over slack at GOP boundaries.
 //!
-//! See `docs/design/h264-encoder-algorithms/reference-management.md`
-//! and `docs/design/h264-encoder-algorithms/b-frames.md`.
+//! See `docs/design/video/h264/encoder-algorithms/reference-management.md`
+//! and `docs/design/video/h264/encoder-algorithms/b-frames.md`.
 //!
 //! ## Backwards compatibility
 //!
@@ -66,31 +66,77 @@ impl ColocatedMvCell {
 
 /// §B-direct-fix — per-frame collocated MV grid.
 ///
-/// `cells[mb_y * mb_w + mb_x]` is the MB at MB-position `(mb_x, mb_y)`
-/// in the frame this grid was snapshotted from. `mb_w` and `mb_h`
-/// are macroblock counts (= `ceil(width / 16)` × `ceil(height / 16)`).
+/// **Phase 2.11 (#272 follow-on, 2026-05-08)**: extended from one-cell-per-MB
+/// to per-4×4 granularity. The original layout (top-left 4×4 only) lost
+/// information about partitioned P-frame MBs (P_16x8/P_8x16/P_8x8) where
+/// the MV varies across 8×8 sub-blocks. Spec § 8.4.1.2.2's spatial-direct
+/// derivation reads ref_idx_l0/l1 per 8×8 sub-block AND mv_l0/l1 per 4×4
+/// sub-block; when the encoder used MB-level colMb data only, the
+/// colZeroFlag check produced different results than the spec's
+/// per-sub-block check → cascade through B-frame Skip/Direct's
+/// spatial-direct chain.
+///
+/// Empirical verification (2026-05-08): forcing P-frame partition-decision
+/// to P_16x16-only (PHASM_P_FORCE_16X16=1) made all default-RDO B-frames
+/// byte-exact (max|Δ|=199 → 0 on carplane display=1). This confirmed
+/// per-8x8 colMb granularity was the cascade root.
+///
+/// Layout: `cells[by * width_4x4 + bx]` indexed by absolute 4×4-block
+/// position. `width_4x4` = `mb_w * 4`, `height_4x4` = `mb_h * 4`.
 #[derive(Debug, Clone)]
 pub struct ColocatedMvGrid {
     pub mb_w: u32,
     pub mb_h: u32,
+    pub width_4x4: u32,
+    pub height_4x4: u32,
     pub cells: Vec<ColocatedMvCell>,
 }
 
 impl ColocatedMvGrid {
     pub fn new(mb_w: u32, mb_h: u32) -> Self {
+        let width_4x4 = mb_w * 4;
+        let height_4x4 = mb_h * 4;
         Self {
             mb_w,
             mb_h,
-            cells: vec![ColocatedMvCell::INTRA; (mb_w * mb_h) as usize],
+            width_4x4,
+            height_4x4,
+            cells: vec![ColocatedMvCell::INTRA; (width_4x4 * height_4x4) as usize],
         }
     }
 
+    /// Backward-compat: read the TOP-LEFT 4×4 cell of the MB at
+    /// `(mb_x, mb_y)`. Existing callers using MB-level granularity
+    /// (e.g., 16x16 partition spatial-direct) keep working.
     pub fn get(&self, mb_x: u32, mb_y: u32) -> &ColocatedMvCell {
-        &self.cells[(mb_y * self.mb_w + mb_x) as usize]
+        let bx = mb_x * 4;
+        let by = mb_y * 4;
+        &self.cells[(by * self.width_4x4 + bx) as usize]
     }
 
+    /// Phase 2.11 (#272) — read per-4×4 sub-block at absolute 4×4
+    /// coords `(bx, by)` (= `mb_x*4 + sub_x, mb_y*4 + sub_y`).
+    /// Required for spec § 8.4.1.2.2 step 6 colZeroFlag check at
+    /// per-8×8 granularity.
+    pub fn get_4x4(&self, bx: u32, by: u32) -> &ColocatedMvCell {
+        debug_assert!(bx < self.width_4x4 && by < self.height_4x4,
+            "ColocatedMvGrid::get_4x4 out of bounds: ({},{}) of ({},{})",
+            bx, by, self.width_4x4, self.height_4x4);
+        &self.cells[(by * self.width_4x4 + bx) as usize]
+    }
+
+    /// Backward-compat: write the TOP-LEFT 4×4 cell only. Existing
+    /// callers that don't know about per-4×4 granularity keep working.
+    /// New callers should use [`Self::set_4x4`].
     pub fn set(&mut self, mb_x: u32, mb_y: u32, cell: ColocatedMvCell) {
-        self.cells[(mb_y * self.mb_w + mb_x) as usize] = cell;
+        let bx = mb_x * 4;
+        let by = mb_y * 4;
+        self.cells[(by * self.width_4x4 + bx) as usize] = cell;
+    }
+
+    /// Phase 2.11 (#272) — write per-4×4 sub-block.
+    pub fn set_4x4(&mut self, bx: u32, by: u32, cell: ColocatedMvCell) {
+        self.cells[(by * self.width_4x4 + bx) as usize] = cell;
     }
 }
 
@@ -187,6 +233,15 @@ pub struct ReferenceBuffer {
     pub past_anchor: Option<ReconFrame>,
     /// `frame_num` of `past_anchor`. Mirrors `last_ref_frame_num`.
     pub past_anchor_frame_num: Option<u8>,
+    /// v1.4 Phase 4.3 (#314) — third slot for B-frame L0 multi-ref.
+    /// Holds the anchor before `past_anchor`. For B-frames in
+    /// IBPBP M=2: when current B's L0=past_anchor (= P_(N-2)),
+    /// `pre_past_anchor` = P_(N-3) is the second-closest past = L0
+    /// ref_idx=1 candidate. None when fewer than 3 anchors have
+    /// been promoted.
+    pub pre_past_anchor: Option<ReconFrame>,
+    /// `frame_num` of `pre_past_anchor`. Mirrors past_anchor_frame_num.
+    pub pre_past_anchor_frame_num: Option<u8>,
 }
 
 impl ReferenceBuffer {
@@ -196,26 +251,32 @@ impl ReferenceBuffer {
             last_ref_frame_num: None,
             past_anchor: None,
             past_anchor_frame_num: None,
+            pre_past_anchor: None,
+            pre_past_anchor_frame_num: None,
         }
     }
 
-    /// Clear both slots — called on every IDR.
+    /// Clear all slots — called on every IDR.
     pub fn reset(&mut self) {
         self.last_ref = None;
         self.last_ref_frame_num = None;
         self.past_anchor = None;
         self.past_anchor_frame_num = None;
+        self.pre_past_anchor = None;
+        self.pre_past_anchor_frame_num = None;
     }
 
     /// Promote the just-reconstructed frame into the buffer. Shifts
-    /// the prior `last_ref` into `past_anchor` first, then overwrites
-    /// `last_ref` with the new snapshot.
+    /// the chain: pre_past ← past_anchor, past_anchor ← last_ref,
+    /// last_ref ← new snapshot.
     ///
     /// B-frames must NOT call this — they're non-reference (nal_ref_idc=0)
     /// and don't enter the DPB. Callers gate via frame type.
     pub fn promote(&mut self, recon: &ReconBuffer, frame_num: u8) {
-        // Shift current → past first. `take()` clears the source so
-        // there's no double-borrow when assigning the new last_ref.
+        // Shift past → pre_past, current → past, then overwrite current.
+        // `take()` chain avoids double-borrows.
+        self.pre_past_anchor = self.past_anchor.take();
+        self.pre_past_anchor_frame_num = self.past_anchor_frame_num.take();
         self.past_anchor = self.last_ref.take();
         self.past_anchor_frame_num = self.last_ref_frame_num.take();
         self.last_ref = Some(ReconFrame::snapshot(recon));
@@ -236,6 +297,9 @@ impl ReferenceBuffer {
         frame_num: u8,
         motion_grid: ColocatedMvGrid,
     ) {
+        // v1.4 Phase 4.3 (#314) — same 3-slot shift as `promote`.
+        self.pre_past_anchor = self.past_anchor.take();
+        self.pre_past_anchor_frame_num = self.past_anchor_frame_num.take();
         self.past_anchor = self.last_ref.take();
         self.past_anchor_frame_num = self.last_ref_frame_num.take();
         self.last_ref = Some(
@@ -352,12 +416,43 @@ impl MultiSlotDpb {
         full_poc: u32,
         role: SlotRole,
     ) {
-        let new_slot = DpbSlot {
-            recon: ReconFrame::snapshot(recon),
+        self.promote_inner(
+            ReconFrame::snapshot(recon),
             frame_num,
             full_poc,
             role,
-        };
+        );
+    }
+
+    /// v1.4 multi-ref Phase 1 (#304) — `promote` variant that ALSO
+    /// attaches a per-MB collocated MV grid. Mirrors the legacy
+    /// `ReferenceBuffer::promote_with_motion` API so callers can
+    /// preserve B-frame spatial-direct correctness when migrating
+    /// off the 2-slot buffer.
+    pub fn promote_with_motion(
+        &mut self,
+        recon: &ReconBuffer,
+        frame_num: u8,
+        full_poc: u32,
+        role: SlotRole,
+        motion_grid: ColocatedMvGrid,
+    ) {
+        self.promote_inner(
+            ReconFrame::snapshot(recon).with_motion_grid(motion_grid),
+            frame_num,
+            full_poc,
+            role,
+        );
+    }
+
+    fn promote_inner(
+        &mut self,
+        recon: ReconFrame,
+        frame_num: u8,
+        full_poc: u32,
+        role: SlotRole,
+    ) {
+        let new_slot = DpbSlot { recon, frame_num, full_poc, role };
 
         // First-fit: place into any empty slot.
         if let Some(empty) = self.slots.iter_mut().find(|s| s.is_none()) {
@@ -403,6 +498,71 @@ impl MultiSlotDpb {
             .filter_map(|s| s.as_ref())
             .filter(|s| s.role == SlotRole::Future && s.full_poc > current_poc)
             .min_by_key(|s| s.full_poc)
+    }
+
+    /// v1.4 multi-ref Phase 1 (#304) — Spec § 8.2.4.2.1 / 8.2.4.2.3
+    /// initial L0 ref-list construction at slice POC `current_poc`.
+    ///
+    /// Order:
+    ///   1. Past references (POC < current), descending POC (closest
+    ///      past first).
+    ///   2. Future references (POC > current), ascending POC (closest
+    ///      future first).
+    ///
+    /// Caller takes the first `num_active_l0` slots — typically 2 for
+    /// our v1.4 multi-ref scope. Pure POC-based filter; the legacy
+    /// `SlotRole` annotation is ignored here so that a slot promoted
+    /// as `Future` for an earlier slice still surfaces as a "past"
+    /// ref for any later slice whose POC has moved beyond it.
+    pub fn ref_list_l0(&self, current_poc: u32) -> Vec<&DpbSlot> {
+        let mut past: Vec<&DpbSlot> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| s.full_poc < current_poc)
+            .collect();
+        past.sort_by_key(|s| std::cmp::Reverse(s.full_poc));
+
+        let mut future: Vec<&DpbSlot> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| s.full_poc > current_poc)
+            .collect();
+        future.sort_by_key(|s| s.full_poc);
+
+        past.extend(future);
+        past
+    }
+
+    /// v1.4 multi-ref Phase 1 (#304) — Spec § 8.2.4.2.3 initial L1
+    /// ref-list construction at slice POC `current_poc`. Used only
+    /// for B-slices; P-slices have no L1.
+    ///
+    /// Order:
+    ///   1. Future references (POC > current), ascending POC (closest
+    ///      future first).
+    ///   2. Past references (POC < current), descending POC (closest
+    ///      past first).
+    pub fn ref_list_l1(&self, current_poc: u32) -> Vec<&DpbSlot> {
+        let mut future: Vec<&DpbSlot> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| s.full_poc > current_poc)
+            .collect();
+        future.sort_by_key(|s| s.full_poc);
+
+        let mut past: Vec<&DpbSlot> = self
+            .slots
+            .iter()
+            .filter_map(|s| s.as_ref())
+            .filter(|s| s.full_poc < current_poc)
+            .collect();
+        past.sort_by_key(|s| std::cmp::Reverse(s.full_poc));
+
+        future.extend(past);
+        future
     }
 }
 
@@ -626,5 +786,149 @@ mod tests {
         dpb.promote(&r1, 1, 2, SlotRole::Past);
         assert_eq!(dpb.occupied(), 1);
         assert_eq!(dpb.get(0).unwrap().recon.y_at(0, 0), 200);
+    }
+
+    // ─── v1.4 Phase 1 (#304) — multi-ref ref-list helpers ─────────
+
+    #[test]
+    fn ref_list_l0_at_b_picks_two_past_in_descending_poc() {
+        // IBPBP M=2 timeline; encode order: I, P2, B1, P4, B3, P6, B5, ...
+        // At B5 (display POC=5): DPB holds I(0)+P2(2)+P4(4)+P6(6)
+        // (assuming capacity ≥ 4; or P2/P4/P6 if I has been evicted).
+        // Spec § 8.2.4.2.3 initial L0 = past refs descending POC,
+        // then future refs ascending POC.
+        let mut dpb = MultiSlotDpb::with_capacity(4);
+        let r = make_recon(16, 16, 0, 128);
+        dpb.promote(&r, 0, 0, SlotRole::Past);   // I
+        dpb.promote(&r, 1, 2, SlotRole::Past);   // P2
+        dpb.promote(&r, 2, 4, SlotRole::Past);   // P4
+        dpb.promote(&r, 3, 6, SlotRole::Future); // P6 (future of B5)
+
+        // Multi-ref L0 list at B5 (current_poc=5):
+        //   past: P4(4), P2(2), I(0) descending → [4, 2, 0]
+        //   future: P6(6) ascending → [6]
+        //   merged: [4, 2, 0, 6]
+        let l0 = dpb.ref_list_l0(/* current_poc */ 5);
+        let pocs: Vec<u32> = l0.iter().map(|s| s.full_poc).collect();
+        assert_eq!(pocs, vec![4, 2, 0, 6],
+            "L0 at B5 must be [P4, P2, I, P6]");
+
+        // 2-ref L0 (Q1 default): take the first two. {P4, P2} = the
+        // two closest past references.
+        assert_eq!(pocs[..2], [4, 2],
+            "2-ref L0 active set = closest two past anchors");
+
+        // L1 list at B5: future first (ascending), then past (descending)
+        //   future: P6(6) → [6]
+        //   past: P4(4), P2(2), I(0) descending → [4, 2, 0]
+        //   merged: [6, 4, 2, 0]
+        let l1 = dpb.ref_list_l1(5);
+        let pocs1: Vec<u32> = l1.iter().map(|s| s.full_poc).collect();
+        assert_eq!(pocs1, vec![6, 4, 2, 0],
+            "L1 at B5 must be [P6, P4, P2, I]");
+    }
+
+    #[test]
+    fn ref_list_l0_at_p_picks_closest_past_first() {
+        // P-slice: only past refs are useful. Multi-ref P (Q4 scope)
+        // wants the two closest past anchors at L0[0] / L0[1].
+        let mut dpb = MultiSlotDpb::with_capacity(3);
+        let r = make_recon(16, 16, 0, 128);
+        dpb.promote(&r, 0, 0, SlotRole::Past);
+        dpb.promote(&r, 1, 2, SlotRole::Past);
+        dpb.promote(&r, 2, 4, SlotRole::Past);
+
+        // Encoding P at POC=6: all 3 slots are past.
+        let l0 = dpb.ref_list_l0(/* current_poc */ 6);
+        let pocs: Vec<u32> = l0.iter().map(|s| s.full_poc).collect();
+        assert_eq!(pocs, vec![4, 2, 0],
+            "P-frame L0 = past refs descending POC");
+    }
+
+    #[test]
+    fn ref_list_l0_handles_empty_dpb() {
+        let dpb = MultiSlotDpb::with_capacity(3);
+        assert!(dpb.ref_list_l0(0).is_empty());
+        assert!(dpb.ref_list_l1(0).is_empty());
+    }
+
+    #[test]
+    fn ref_list_l0_ignores_role_uses_only_poc() {
+        // A slot promoted as Future for an earlier slice still
+        // appears as "past" for any later slice whose POC has moved
+        // beyond it. Validates pure-POC filtering in ref_list_l0.
+        let mut dpb = MultiSlotDpb::with_capacity(2);
+        let r = make_recon(16, 16, 0, 128);
+        dpb.promote(&r, 0, 4, SlotRole::Future); // promoted as Future for an earlier B
+        dpb.promote(&r, 1, 6, SlotRole::Past);
+
+        // Slice at POC=8: both refs are past (POC < 8).
+        let l0 = dpb.ref_list_l0(8);
+        let pocs: Vec<u32> = l0.iter().map(|s| s.full_poc).collect();
+        assert_eq!(pocs, vec![6, 4],
+            "ref_list_l0 must ignore SlotRole and use POC");
+    }
+
+    #[test]
+    fn ref_list_after_idr_drops_pre_idr_refs() {
+        // Cross-GOP test: after `reset()`, no pre-IDR refs survive
+        // in the ref list, even if there's residual capacity.
+        let mut dpb = MultiSlotDpb::with_capacity(3);
+        let r = make_recon(16, 16, 0, 128);
+        dpb.promote(&r, 0, 0, SlotRole::Past);
+        dpb.promote(&r, 1, 2, SlotRole::Past);
+        dpb.promote(&r, 2, 4, SlotRole::Past);
+        assert_eq!(dpb.occupied(), 3);
+
+        // IDR clears.
+        dpb.reset();
+        assert!(dpb.ref_list_l0(0).is_empty());
+
+        // Post-IDR sequence at GOP-2 (frame_num resets, new POC base).
+        dpb.promote(&r, 0, 30, SlotRole::Past); // new I (GOP 2 starts)
+        dpb.promote(&r, 1, 32, SlotRole::Past);
+        let l0 = dpb.ref_list_l0(34);
+        let pocs: Vec<u32> = l0.iter().map(|s| s.full_poc).collect();
+        assert_eq!(pocs, vec![32, 30],
+            "post-IDR refs only — no pre-IDR leftovers");
+    }
+
+    #[test]
+    fn ref_list_l0_capacity_3_drops_oldest_under_ibpbp_pressure() {
+        // Capacity=3 (matches converter-pipeline centroid
+        // num_ref_idx_l0_default=2 + one slack for L1's future P).
+        // Walk through 4 anchors to verify oldest gets evicted.
+        let mut dpb = MultiSlotDpb::with_capacity(3);
+        let r = make_recon(16, 16, 0, 128);
+        dpb.promote(&r, 0, 0, SlotRole::Past);   // I
+        dpb.promote(&r, 1, 2, SlotRole::Past);   // P2
+        dpb.promote(&r, 2, 4, SlotRole::Past);   // P4 (DPB full)
+        dpb.promote(&r, 3, 6, SlotRole::Future); // P6 → evicts oldest (I, POC=0)
+
+        let l0 = dpb.ref_list_l0(5);
+        let pocs: Vec<u32> = l0.iter().map(|s| s.full_poc).collect();
+        // I (POC=0) was evicted; surviving past refs at B5 = {P4, P2}.
+        assert_eq!(pocs, vec![4, 2, 6],
+            "after eviction at capacity=3, L0 = [P4, P2, P6]");
+        assert_eq!(pocs[..2], [4, 2],
+            "2-ref active set at B5 = [P4, P2] post-eviction");
+    }
+
+    #[test]
+    fn promote_with_motion_attaches_grid() {
+        // Phase 1 (#304) — promote_with_motion smoke test.
+        let mut dpb = MultiSlotDpb::with_capacity(2);
+        let r = make_recon(32, 32, 100, 128);
+        let grid = ColocatedMvGrid::new(2, 2);
+        dpb.promote_with_motion(
+            &r,
+            /* frame_num */ 0,
+            /* full_poc */ 0,
+            SlotRole::Past,
+            grid,
+        );
+        let slot = dpb.get(0).expect("slot occupied");
+        assert!(slot.recon.motion_grid.is_some(),
+            "promote_with_motion must attach grid to ReconFrame");
     }
 }

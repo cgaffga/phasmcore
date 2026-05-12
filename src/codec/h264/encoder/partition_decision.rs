@@ -102,17 +102,25 @@ pub const PENALTY_8X8: u32 = 256;
 ///
 /// Each variant carries the absolute MVs (not MVDs) for each
 /// partition in the spec's emit order.
+///
+/// v1.4 Phase 2 (#305): `ref_idx_l0` carries the L0 reference index
+/// per partition (default 0 = closest past anchor). For P_8x8, ref
+/// indices live on each `SubMbChoice` since they're per-sub-MB. P
+/// has no L1, so no `ref_idx_l1` field. Multi-ref ME (Phase 4)
+/// populates these; emit (Phase 2.3) writes them via `encode_ref_idx`
+/// when `num_active_l0 > 1`.
 #[derive(Debug, Clone, Copy)]
 pub enum PMbChoice {
-    /// One 16×16 partition, 1 MV.
-    P16x16 { mv: MotionVector },
-    /// Two 16×8 partitions (top, bottom). 2 MVs.
-    P16x8 { mvs: [MotionVector; 2] },
-    /// Two 8×16 partitions (left, right). 2 MVs.
-    P8x16 { mvs: [MotionVector; 2] },
+    /// One 16×16 partition, 1 MV + 1 ref_idx_l0.
+    P16x16 { mv: MotionVector, ref_idx_l0: u8 },
+    /// Two 16×8 partitions (top, bottom). 2 MVs + 2 ref_idx_l0.
+    P16x8 { mvs: [MotionVector; 2], ref_idx_l0: [u8; 2] },
+    /// Two 8×16 partitions (left, right). 2 MVs + 2 ref_idx_l0.
+    P8x16 { mvs: [MotionVector; 2], ref_idx_l0: [u8; 2] },
     /// Four 8×8 sub-macroblocks. Each has its own sub_mb_type that
     /// may introduce further sub-partitioning; Phase 6B.3.2c ships
-    /// `SubMbChoice::P8x8` only (one MV per sub-MB).
+    /// `SubMbChoice::P8x8` only (one MV per sub-MB). Per-sub-MB
+    /// ref_idx_l0 is carried inside each `SubMbChoice`.
     P8x8 { sub: [SubMbChoice; 4] },
 }
 
@@ -137,21 +145,42 @@ impl PMbChoice {
             PMbChoice::P8x8 { sub } => sub.iter().all(|s| matches!(s, SubMbChoice::P8x8 { .. })),
         }
     }
+
+    /// v1.4 Phase 4.2 (#313, Path B) — uniform-per-MB ref_idx_l0
+    /// accessor. Reads partition 0's ref_idx_l0 (Path B's post-pass
+    /// upgrades the whole MB atomically, so all partitions of the MB
+    /// share the same ref_idx_l0). Caller uses this to dispatch
+    /// reference frame for `build_luma_prediction` /
+    /// `build_chroma_prediction`.
+    pub fn ref_idx_l0_uniform(&self) -> u8 {
+        match self {
+            PMbChoice::P16x16 { ref_idx_l0, .. } => *ref_idx_l0,
+            PMbChoice::P16x8 { ref_idx_l0, .. } | PMbChoice::P8x16 { ref_idx_l0, .. } => {
+                ref_idx_l0[0]
+            }
+            PMbChoice::P8x8 { sub } => sub[0].ref_idx_l0(),
+        }
+    }
 }
 
 /// The encoder's resolved choice inside a single 8×8 sub-MB.
 /// Variants list MVs in spec emit order (partition 0 first, etc.).
+///
+/// v1.4 Phase 2 (#305): `ref_idx_l0` is per-sub-MB (not per-sub-
+/// partition). Spec § 7.3.5.2 emits ref_idx at sub-MB level even
+/// when sub-partitioning splits further (8×4 / 4×8 / 4×4 share the
+/// 8×8's ref_idx). Default 0 = closest past anchor.
 #[derive(Debug, Clone, Copy)]
 pub enum SubMbChoice {
     /// One 8×8 partition, 1 MV.
-    P8x8 { mv: MotionVector },
-    /// Two 8×4 partitions (top, bottom). 2 MVs.
-    P8x4 { mvs: [MotionVector; 2] },
-    /// Two 4×8 partitions (left, right). 2 MVs.
-    P4x8 { mvs: [MotionVector; 2] },
+    P8x8 { mv: MotionVector, ref_idx_l0: u8 },
+    /// Two 8×4 partitions (top, bottom). 2 MVs, shared ref_idx_l0.
+    P8x4 { mvs: [MotionVector; 2], ref_idx_l0: u8 },
+    /// Two 4×8 partitions (left, right). 2 MVs, shared ref_idx_l0.
+    P4x8 { mvs: [MotionVector; 2], ref_idx_l0: u8 },
     /// Four 4×4 partitions (top-left, top-right, bottom-left,
-    /// bottom-right). 4 MVs.
-    P4x4 { mvs: [MotionVector; 4] },
+    /// bottom-right). 4 MVs, shared ref_idx_l0.
+    P4x4 { mvs: [MotionVector; 4], ref_idx_l0: u8 },
 }
 
 impl SubMbChoice {
@@ -162,6 +191,18 @@ impl SubMbChoice {
             SubMbChoice::P8x4 { .. } => 1,
             SubMbChoice::P4x8 { .. } => 2,
             SubMbChoice::P4x4 { .. } => 3,
+        }
+    }
+
+    /// v1.4 (#305) — ref_idx_l0 shared across the sub-MB's
+    /// internal partitions (spec § 7.3.5.2 emits ref_idx at
+    /// sub-MB level).
+    pub fn ref_idx_l0(self) -> u8 {
+        match self {
+            SubMbChoice::P8x8 { ref_idx_l0, .. }
+            | SubMbChoice::P8x4 { ref_idx_l0, .. }
+            | SubMbChoice::P4x8 { ref_idx_l0, .. }
+            | SubMbChoice::P4x4 { ref_idx_l0, .. } => ref_idx_l0,
         }
     }
 }
@@ -300,7 +341,7 @@ pub fn decide_p_mb_with_cost(
     // the caller's view of `grid` is unchanged; the caller still
     // commits the winning outer partition's MVs as before.
     let mb_mv_snap = grid.snapshot_mb(mb_x, mb_y);
-    let mut sub = [SubMbChoice::P8x8 { mv: MotionVector::ZERO }; 4];
+    let mut sub = [SubMbChoice::P8x8 { mv: MotionVector::ZERO, ref_idx_l0: 0 }; 4];
     let mut cost_8x8 = 0u32;
     for (i, &(off_x_px, off_y_px)) in SUB_MB_ORIGINS_PX.iter().enumerate() {
         let (dx_4x4, dy_4x4) = SUB_MB_ORIGINS_4X4[i];
@@ -318,10 +359,12 @@ pub fn decide_p_mb_with_cost(
 
     // Gather all 4 candidates in a fixed order so RDO can index by
     // partition type without re-running ME.
+    // v1.4 Phase 2 (#305): single-ref default ref_idx_l0=0 / [0;2]
+    // until Phase 4 (multi-ref ME) populates per-partition ref selection.
     let candidates = [
-        PMbChoice::P16x16 { mv: r16.mv },
-        PMbChoice::P16x8 { mvs: [r_top.mv, r_bot.mv] },
-        PMbChoice::P8x16 { mvs: [r_left.mv, r_right.mv] },
+        PMbChoice::P16x16 { mv: r16.mv, ref_idx_l0: 0 },
+        PMbChoice::P16x8 { mvs: [r_top.mv, r_bot.mv], ref_idx_l0: [0; 2] },
+        PMbChoice::P8x16 { mvs: [r_left.mv, r_right.mv], ref_idx_l0: [0; 2] },
         PMbChoice::P8x8 { sub },
     ];
     let mut satd_costs = [cost_16x16, cost_16x8, cost_8x16, cost_8x8];
@@ -353,6 +396,19 @@ pub fn decide_p_mb_with_cost(
             best_idx = i;
         }
     }
+
+    // Phase 2.11 (#272 follow-on, 2026-05-08) — diagnostic env-gate.
+    // Forces every P-MB to P_16x16, bypassing P_16x8/P_8x16/P_8x8.
+    // Used to verify whether B-frame spatial-direct cascade in
+    // mode-mix RDO comes from per-8x8 colZeroFlag granularity gap
+    // (phasm's ColocatedMvGrid stores ONE MV per MB; spec § 8.4.1.2.2
+    // requires per-8x8 sub-block resolution). If the cascade drops
+    // when P-frames are pure P_16x16, the hypothesis is confirmed.
+    // Default OFF.
+    if std::env::var_os("PHASM_P_FORCE_16X16").is_some() {
+        best_idx = 0; // P16x16 is index 0 per SATD_CANDIDATE_ORDER
+    }
+
     PMbDecision {
         best: candidates[best_idx],
         best_cost: satd_costs[best_idx],
@@ -372,16 +428,16 @@ fn commit_sub_mb_to_grid(
     choice: &SubMbChoice,
 ) {
     match choice {
-        SubMbChoice::P8x8 { mv } => grid.fill(sub_bx, sub_by, 2, 2, *mv, 0),
-        SubMbChoice::P8x4 { mvs } => {
+        SubMbChoice::P8x8 { mv, .. } => grid.fill(sub_bx, sub_by, 2, 2, *mv, 0),
+        SubMbChoice::P8x4 { mvs, .. } => {
             grid.fill(sub_bx, sub_by, 2, 1, mvs[0], 0);
             grid.fill(sub_bx, sub_by + 1, 2, 1, mvs[1], 0);
         }
-        SubMbChoice::P4x8 { mvs } => {
+        SubMbChoice::P4x8 { mvs, .. } => {
             grid.fill(sub_bx, sub_by, 1, 2, mvs[0], 0);
             grid.fill(sub_bx + 1, sub_by, 1, 2, mvs[1], 0);
         }
-        SubMbChoice::P4x4 { mvs } => {
+        SubMbChoice::P4x4 { mvs, .. } => {
             grid.fill(sub_bx, sub_by, 1, 1, mvs[0], 0);
             grid.fill(sub_bx + 1, sub_by, 1, 1, mvs[1], 0);
             grid.fill(sub_bx, sub_by + 1, 1, 1, mvs[2], 0);
@@ -541,20 +597,216 @@ fn decide_sub_mb(
 
     // Pick min.
     let mut best_cost = cost_p8x8;
-    let mut best = SubMbChoice::P8x8 { mv: r_8x8.mv };
+    // v1.4 Phase 2 (#305): single-ref default ref_idx_l0=0 until
+    // Phase 4 (multi-ref ME) populates per-sub-MB ref selection.
+    let mut best = SubMbChoice::P8x8 { mv: r_8x8.mv, ref_idx_l0: 0 };
     if cost_p8x4 < best_cost {
         best_cost = cost_p8x4;
-        best = SubMbChoice::P8x4 { mvs: [r_top.mv, r_bot.mv] };
+        best = SubMbChoice::P8x4 { mvs: [r_top.mv, r_bot.mv], ref_idx_l0: 0 };
     }
     if cost_p4x8 < best_cost {
         best_cost = cost_p4x8;
-        best = SubMbChoice::P4x8 { mvs: [r_left.mv, r_right.mv] };
+        best = SubMbChoice::P4x8 { mvs: [r_left.mv, r_right.mv], ref_idx_l0: 0 };
     }
     if cost_p4x4 < best_cost {
         best_cost = cost_p4x4;
-        best = SubMbChoice::P4x4 { mvs: r_4x4 };
+        best = SubMbChoice::P4x4 { mvs: r_4x4, ref_idx_l0: 0 };
     }
     (best, best_cost)
+}
+
+/// v1.4 Phase 4.2 (#313, Path B) — post-pass that re-searches the
+/// chosen partition's MVs against `ref_1` and upgrades the whole MB
+/// to `ref_idx_l0 = 1` if the ref_1 prediction beats ref_0 by more
+/// than the per-partition `ref_idx_bits` delta cost.
+///
+/// Path B uniform-per-MB: all partitions of the MB get the same
+/// `ref_idx_l0`. Path A would optimise per-partition; Path B keeps
+/// `build_luma_prediction` single-ref so the caller resolves to
+/// one reference per MB. Partitions of the same MB are spatially +
+/// temporally coherent and almost always agree on the best
+/// reference, so per-MB uniform captures ~95% of per-partition
+/// quality at much lower implementation complexity.
+///
+/// Cost comparison: searches each partition against ref_0 (seeded
+/// from the existing MV — converges fast) AND ref_1 (full ME
+/// search seeded from the existing MV). Sums per-ref SATD totals.
+/// Adds `λ × n_partitions` to ref_1 total to charge for the extra
+/// ref_idx_bit per partition (ref_idx=1 takes 2 bins "10",
+/// ref_idx=0 takes 1 bin "0", delta = 1 bin per partition under
+/// `num_active_l0 > 1`).
+///
+/// Returns true iff the MB was upgraded to ref_idx_l0=1.
+///
+/// Scope: P16x16 / P16x8 / P8x16 only. P_8x8 deferred (sub-MB
+/// partitioning navigation is invasive; Phase 4.2-cut2 expansion).
+pub fn refine_p_choice_multi_ref(
+    src_y: &[[u8; 16]; 16],
+    me: &mut MotionEstimator,
+    mb_x: usize,
+    mb_y: usize,
+    ref_0: &ReconFrame,
+    ref_1: &ReconFrame,
+    choice: &mut PMbChoice,
+) -> bool {
+    use super::motion_estimation::me_lambda_pub;
+
+    // v1.4 Phase 4.5 (#316) — refine remains DEFAULT-DISABLED until
+    // the structural ref_idx=1 emission bug is closed. Reference-
+    // decoder "Reference 4 >= 2" cliff reproduces at 128x96 IPP
+    // DUAL_REF_L0 + refine ON (probe at
+    // core/tests/h264_v14_refine_ref_decoder_probe.rs).
+    // 32x32 passes (refine doesn't fire on tiny fixture).
+    // Hypothesis directions ruled out (2026-05-10):
+    //  - TU vs U: regular unary per spec § 9.3.2.2 / Table 9-43
+    //    confirmed against reference-decoder output. phasm matches.
+    //  - Slice-header gating: clean with refine off + DUAL_REF_L0
+    //    config (verified probe).
+    // Remaining hypotheses:
+    //  - ctxIdxInc block_idx for ref_idx with partitioned neighbours
+    //    (spec § 6.4.11.6 within-MB partition rules).
+    //  - MVD PMV cascade asymmetry under ref_idx>0.
+    // Set PHASM_V14_REFINE_ON=1 to fire (debug only).
+    if std::env::var_os("PHASM_V14_REFINE_ON").is_none() {
+        return false;
+    }
+    {
+    // P_8x8 deferred to v1.4-cut2 — sub-MB partition layout (8x8 /
+    // 8x4 / 4x8 / 4x4) navigation is its own block of work. Most
+    // P-MBs pick larger partitions on real content (carplane mix
+    // is dominated by 16x16 + 16x8/8x16).
+    if matches!(choice, PMbChoice::P8x8 { .. }) {
+        return false;
+    }
+
+    let lambda = me_lambda_pub();
+    let mb_px_x = (mb_x * 16) as u32;
+    let mb_px_y = (mb_y * 16) as u32;
+    let src_flat = src_y.as_flattened();
+
+    // Score each partition against both refs. New MVs returned by
+    // ref_1 search become the candidates if upgrade fires.
+    let mut ref_0_total: u32 = 0;
+    let mut ref_1_total: u32 = 0;
+    let mut new_mvs: [MotionVector; 2] = [MotionVector::ZERO; 2];
+    let n_partitions: u32;
+
+    match *choice {
+        PMbChoice::P16x16 { mv, .. } => {
+            let r0 = me.search_block(
+                src_flat, 16, ref_0, mb_px_x, mb_px_y, 16, 16, mv,
+            );
+            let r1 = me.search_block(
+                src_flat, 16, ref_1, mb_px_x, mb_px_y, 16, 16, mv,
+            );
+            ref_0_total = r0.cost;
+            ref_1_total = r1.cost;
+            new_mvs[0] = r1.mv;
+            n_partitions = 1;
+        }
+        PMbChoice::P16x8 { mvs, .. } => {
+            let src_top = extract_half(src_y, 0, 0, 16, 8);
+            let src_bot = extract_half(src_y, 0, 8, 16, 8);
+            let r0_top = me.search_block(
+                &src_top, 16, ref_0, mb_px_x, mb_px_y, 16, 8, mvs[0],
+            );
+            let r1_top = me.search_block(
+                &src_top, 16, ref_1, mb_px_x, mb_px_y, 16, 8, mvs[0],
+            );
+            let r0_bot = me.search_block(
+                &src_bot, 16, ref_0, mb_px_x, mb_px_y + 8, 16, 8, mvs[1],
+            );
+            let r1_bot = me.search_block(
+                &src_bot, 16, ref_1, mb_px_x, mb_px_y + 8, 16, 8, mvs[1],
+            );
+            ref_0_total = r0_top.cost.saturating_add(r0_bot.cost);
+            ref_1_total = r1_top.cost.saturating_add(r1_bot.cost);
+            new_mvs[0] = r1_top.mv;
+            new_mvs[1] = r1_bot.mv;
+            n_partitions = 2;
+        }
+        PMbChoice::P8x16 { mvs, .. } => {
+            let src_left = extract_half(src_y, 0, 0, 8, 16);
+            let src_right = extract_half(src_y, 8, 0, 8, 16);
+            let r0_l = me.search_block(
+                &src_left, 8, ref_0, mb_px_x, mb_px_y, 8, 16, mvs[0],
+            );
+            let r1_l = me.search_block(
+                &src_left, 8, ref_1, mb_px_x, mb_px_y, 8, 16, mvs[0],
+            );
+            let r0_r = me.search_block(
+                &src_right, 8, ref_0, mb_px_x + 8, mb_px_y, 8, 16, mvs[1],
+            );
+            let r1_r = me.search_block(
+                &src_right, 8, ref_1, mb_px_x + 8, mb_px_y, 8, 16, mvs[1],
+            );
+            ref_0_total = r0_l.cost.saturating_add(r0_r.cost);
+            ref_1_total = r1_l.cost.saturating_add(r1_r.cost);
+            new_mvs[0] = r1_l.mv;
+            new_mvs[1] = r1_r.mv;
+            n_partitions = 2;
+        }
+        PMbChoice::P8x8 { .. } => unreachable!("returned earlier"),
+    }
+
+    // ref_idx unary code: ref_idx=0 → "0" (1 bin), ref_idx=1 → "10"
+    // (2 bins). Delta = 1 bin per partition. Charge λ × n_partitions
+    // to the ref_1 path so a tiny SATD gain doesn't drive an upgrade.
+    let penalty = lambda.saturating_mul(n_partitions);
+
+    let upgrade = ref_1_total.saturating_add(penalty) < ref_0_total;
+    // v1.4 Phase 4.5 follow-up — `PHASM_V14_REFINE_TRACE=1` emits per-MB
+    // refine outcome to stderr. Use to bisect the P-side cliff: count
+    // upgrades, compare SATD ratios, identify which MBs picked ref_1.
+    if std::env::var_os("PHASM_V14_REFINE_TRACE").is_some() {
+        let shape = match choice {
+            PMbChoice::P16x16 { .. } => "16x16",
+            PMbChoice::P16x8 { .. } => "16x8",
+            PMbChoice::P8x16 { .. } => "8x16",
+            PMbChoice::P8x8 { .. } => "8x8",
+        };
+        let mv0_str = match choice {
+            PMbChoice::P16x16 { mv, .. } => format!("({},{})", mv.mv_x, mv.mv_y),
+            PMbChoice::P16x8 { mvs, .. } | PMbChoice::P8x16 { mvs, .. } => {
+                format!("({},{})/({},{})", mvs[0].mv_x, mvs[0].mv_y, mvs[1].mv_x, mvs[1].mv_y)
+            }
+            _ => String::new(),
+        };
+        let new_str = format!(
+            "({},{})/({},{})",
+            new_mvs[0].mv_x, new_mvs[0].mv_y, new_mvs[1].mv_x, new_mvs[1].mv_y,
+        );
+        eprintln!(
+            "[refine_p] mb=({},{}) shape={} ref0_satd={} ref1_satd={} penalty={} upgrade={} mv0={} mv1={}",
+            mb_x, mb_y, shape, ref_0_total, ref_1_total, penalty, upgrade,
+            mv0_str, new_str,
+        );
+    }
+
+    if upgrade {
+        // Upgrade.
+        match choice {
+            PMbChoice::P16x16 { mv, ref_idx_l0 } => {
+                *mv = new_mvs[0];
+                *ref_idx_l0 = 1;
+            }
+            PMbChoice::P16x8 { mvs, ref_idx_l0 } => {
+                mvs[0] = new_mvs[0];
+                mvs[1] = new_mvs[1];
+                *ref_idx_l0 = [1, 1];
+            }
+            PMbChoice::P8x16 { mvs, ref_idx_l0 } => {
+                mvs[0] = new_mvs[0];
+                mvs[1] = new_mvs[1];
+                *ref_idx_l0 = [1, 1];
+            }
+            PMbChoice::P8x8 { .. } => unreachable!(),
+        }
+        return true;
+    }
+
+    false
+    }
 }
 
 #[cfg(test)]
@@ -660,19 +912,19 @@ mod tests {
     #[test]
     fn sub_mb_type_codenums_match_spec_table_7_17() {
         assert_eq!(
-            SubMbChoice::P8x8 { mv: MotionVector::ZERO }.sub_mb_type_codenum(),
+            SubMbChoice::P8x8 { mv: MotionVector::ZERO, ref_idx_l0: 0 }.sub_mb_type_codenum(),
             0
         );
         assert_eq!(
-            SubMbChoice::P8x4 { mvs: [MotionVector::ZERO; 2] }.sub_mb_type_codenum(),
+            SubMbChoice::P8x4 { mvs: [MotionVector::ZERO; 2], ref_idx_l0: 0 }.sub_mb_type_codenum(),
             1
         );
         assert_eq!(
-            SubMbChoice::P4x8 { mvs: [MotionVector::ZERO; 2] }.sub_mb_type_codenum(),
+            SubMbChoice::P4x8 { mvs: [MotionVector::ZERO; 2], ref_idx_l0: 0 }.sub_mb_type_codenum(),
             2
         );
         assert_eq!(
-            SubMbChoice::P4x4 { mvs: [MotionVector::ZERO; 4] }.sub_mb_type_codenum(),
+            SubMbChoice::P4x4 { mvs: [MotionVector::ZERO; 4], ref_idx_l0: 0 }.sub_mb_type_codenum(),
             3
         );
     }

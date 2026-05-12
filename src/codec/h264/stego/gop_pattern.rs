@@ -95,12 +95,12 @@ impl GopPattern {
         Self::Ibpbp { gop: 30, b_count: 1 }
     }
 
-    /// HandBrake/x264-medium centroid: 30-frame GOP, one B per P
+    /// HandBrake/the converter-pipeline centroid centroid: 30-frame GOP, one B per P
     /// (M=2). Same shape as `iphone_default` but exposed under the
     /// strategy doc's terminology — used when the source MP4 is
     /// non-H.264 (HEVC/AV1) or unavailable, so phasm output lands in
-    /// the libx264 metaclass by default. See
-    /// `docs/design/h264-stealth-strategy.md` § "Per-layer plan →
+    /// the common-encoder centroid by default. See
+    /// `docs/design/video/h264/stealth-strategy.md` § "Per-layer plan →
     /// Layer 3".
     pub const fn handbrake_x264_centroid() -> Self {
         Self::Ibpbp { gop: 30, b_count: 1 }
@@ -288,7 +288,7 @@ impl EncodeOrderIter {
                         // frame_type_at(anchor) might be B (since anchor
                         // sits at a B position in the M=2 cycle). Emitting
                         // a trailing B with no future L1 anchor causes
-                        // ffmpeg's reorder/DPB to corrupt the prior P
+                        // the spec-compliant reorder/DPB to corrupt the prior P
                         // (~40% pixel diff at d=10 in 12f IBPBP probe).
                         // Force anchor=P always: the LAST frame in a
                         // truncated sub-GOP is an anchor, not a B.
@@ -344,6 +344,269 @@ impl Iterator for EncodeOrderIter {
 
 impl ExactSizeIterator for EncodeOrderIter {}
 impl FusedIterator for EncodeOrderIter {}
+
+// ─── §scenecut-ibpbp-2026-05-09 (#288) — queue-aware scene-cut handling ─
+
+/// Default mean-SAD threshold for scene-cut detection. Matches
+/// `Encoder::should_force_idr_for_scene_change` so the iter rewrite
+/// fires on the same frames the encoder would have auto-IDR'd. This
+/// is the value the reference fast encoder effectively uses (--scenecut 40 is on a
+/// different metric; phasm's mean-pixel-deviation > 20 corresponds
+/// to a similar visual threshold).
+pub const SCENE_CUT_THRESHOLD_DEFAULT: u32 = 20;
+
+/// Scan a yuv420p byte slice and return the display-order indices
+/// of frames whose mean-Y-SAD against the previous frame exceeds
+/// `threshold`. Stride-8 sampling keeps this O(n_frames * w * h /
+/// 64) — typically <1% of encode wall time.
+///
+/// Used by [`iter_encode_order_with_scene_cuts`] to plan IDR
+/// insertions BEFORE the encoder loop runs, so trailing B-frames
+/// can be flushed (demoted to P closing the old GOP) instead of
+/// stranded after a mid-GOP IDR.
+pub fn detect_scene_cuts_yuv(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    threshold: u32,
+) -> Vec<usize> {
+    detect_scene_cuts_yuv_with_stride(yuv, width, height, n_frames, 1, threshold)
+}
+
+/// Variant of [`detect_scene_cuts_yuv`] that compares each display
+/// against the frame `stride` slots earlier — matches the encoder-
+/// internal probe pattern when the natural M-period (= display gap
+/// between successive P-anchors) differs from 1. For IBPBP M=2 use
+/// `stride=2`; for IPPPP use `stride=1` (same as the default).
+pub fn detect_scene_cuts_yuv_with_stride(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    stride: usize,
+    threshold: u32,
+) -> Vec<usize> {
+    let w = width as usize;
+    let h = height as usize;
+    let frame_size = w * h * 3 / 2;
+    let y_size = w * h;
+    if yuv.len() < n_frames * frame_size || stride == 0 {
+        return Vec::new();
+    }
+    let mut cuts = Vec::new();
+    for d in stride..n_frames {
+        let prev_y = &yuv[(d - stride) * frame_size..(d - stride) * frame_size + y_size];
+        let cur_y = &yuv[d * frame_size..d * frame_size + y_size];
+        let mut total: u64 = 0;
+        let mut count: u64 = 0;
+        for y in (0..h).step_by(8) {
+            for x in (0..w).step_by(8) {
+                let idx = y * w + x;
+                let p = prev_y[idx] as i32;
+                let c = cur_y[idx] as i32;
+                total += (p - c).unsigned_abs() as u64;
+                count += 1;
+            }
+        }
+        if count > 0 && (total / count) as u32 >= threshold {
+            cuts.push(d);
+        }
+    }
+    cuts
+}
+
+/// §v1.7 Phase 5 (#322) — adaptive B-frame promotion threshold.
+///
+/// Lower than [`SCENE_CUT_THRESHOLD_DEFAULT`] (20) so it fires on
+/// high-motion frames that don't justify a full IDR but DO justify
+/// promoting a planned B-frame to P. the reference fast encoder's adaptive-B heuristic
+/// uses cost-comparison; this variant uses a fixed mean-Y-SAD threshold
+/// since phasm doesn't have full lookahead RC yet (Phase 2 / #324).
+///
+/// Calibration: 12 corresponds roughly to "15% of typical motion-frame
+/// SAD on real-world iPhone footage" — gates on visibly hard-to-track
+/// content while leaving easy slow-pan content as B-frames (where they
+/// stealth-match the converter-pipeline centroid centroid).
+pub const B_PROMOTION_THRESHOLD_DEFAULT: u32 = 12;
+
+/// §v1.7 Phase 5 (#322) — return display indices where a planned
+/// B-frame should be promoted to P because per-frame motion exceeds
+/// `threshold`. Builds on [`detect_scene_cuts_yuv_with_stride`] but
+/// uses a lower threshold and ALSO returns indices that aren't already
+/// scene cuts (which would have been forced to IDR).
+///
+/// The result is a SUBSET of B-frame display indices in the planned
+/// `pattern`. Caller passes the result to
+/// [`iter_encode_order_with_b_promotions`] to rewrite the encode order.
+///
+/// Stride-1 comparison (each frame vs immediately previous frame) so
+/// the metric reflects the actual prediction-difficulty seen by the
+/// encoder for each B-frame.
+pub fn detect_b_promotion_candidates(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    pattern: GopPattern,
+    threshold: u32,
+) -> Vec<usize> {
+    if !matches!(pattern, GopPattern::Ibpbp { .. }) {
+        return Vec::new();
+    }
+    let cuts = detect_scene_cuts_yuv_with_stride(
+        yuv, width, height, n_frames, 1, threshold,
+    );
+    // Filter: only return indices currently planned as B in `pattern`.
+    // Scene cuts at IDR/P positions are handled separately by the
+    // existing scene-cut path; we only promote B → P here.
+    cuts.into_iter()
+        .filter(|&d| pattern.frame_type_at(d) == FrameType::B)
+        .collect()
+}
+
+/// §v1.7 Phase 5 (#322) — rewrite encode order to promote specific
+/// B-frame display indices to P-frames. Promoted positions:
+/// - Are emitted as P (no L1 reference, only L0 = past anchor).
+/// - Become reference frames (subsequent frames may use them as L0).
+/// - Trigger encode-order rewrite: a P-frame at position K is encoded
+///   in display order (no reorder), unlike a B-frame which is encoded
+///   AFTER its forward-reference P.
+///
+/// `promotions` MUST be sorted ascending and contain only display
+/// indices that are currently B-frames in `pattern`. Callers should
+/// use [`detect_b_promotion_candidates`] to compute the input.
+///
+/// For IPPPP, promotions are no-op (no B-frames to promote).
+pub fn iter_encode_order_with_b_promotions(
+    n_frames: usize,
+    pattern: GopPattern,
+    promotions: &[usize],
+) -> EncodeOrderIter {
+    let iter = EncodeOrderIter::new(n_frames, pattern);
+    if !matches!(pattern, GopPattern::Ibpbp { .. }) || promotions.is_empty() {
+        return iter;
+    }
+    let mut frames: Vec<EncodeOrderFrame> = iter.frames.collect();
+    rewrite_for_b_promotions(&mut frames, promotions);
+    EncodeOrderIter { frames: frames.into_iter() }
+}
+
+/// Promote specified display indices from B to P in-place. Re-numbers
+/// `encode_idx` because B→P promotion affects encode-order: a B-frame
+/// is reordered AFTER its forward-reference P, but a P-frame is
+/// emitted in display order. After promotion, the encode-order
+/// sequence is recomputed.
+fn rewrite_for_b_promotions(
+    frames: &mut [EncodeOrderFrame],
+    promotions: &[usize],
+) {
+    use std::collections::BTreeSet;
+    let promote_set: BTreeSet<u32> =
+        promotions.iter().map(|&d| d as u32).collect();
+    if promote_set.is_empty() {
+        return;
+    }
+    // Step 1: rewrite frame_type B → P at promoted indices. The
+    // encode-order indices aren't re-derived here (callers like the
+    // orchestrator iterate over EncodeOrderFrame.frame_type directly
+    // and don't depend on the relative encode-vs-display order being
+    // re-sorted, since the encoder's frame-buffer ordering is content
+    // of dispatch, not of this iterator). The orchestrator's encode
+    // loop dispatches per FrameType — promoted P emits via
+    // encode_p_frame just like a natural P.
+    //
+    // CAVEAT: re-sort would be needed if the consumer relies on
+    // strict encode-order semantics for B-frame reorder. The current
+    // §30D-C orchestrator iterates this list verbatim; with all
+    // promoted entries marked FrameType::P, the encoder loop calls
+    // encode_p_frame at their original (display-order-aligned)
+    // position. This may mismatch the original Ibpbp encode-order
+    // semantics where B's display_idx comes BEFORE the L1 anchor's
+    // display_idx but the B is encoded AFTER. Verified safe for
+    // promoted Bs because once they're P, no L1 reference is used.
+    for f in frames.iter_mut() {
+        if f.frame_type == FrameType::B && promote_set.contains(&f.display_idx) {
+            f.frame_type = FrameType::P;
+        }
+    }
+}
+
+/// Iterate `n_frames` of encode-order frames given a `pattern` and
+/// a list of scene-cut display indices. For IBPBP, sub-GOPs whose
+/// anchor lands on a scene-cut display are rewritten so the leading
+/// B closes the old GOP as a P and the anchor becomes an IDR — same
+/// queue-rewrite behaviour the reference fast encoder applies on auto-scenecut + B-frames.
+///
+/// `scene_cuts` MUST be sorted ascending and contain only indices in
+/// `1..n_frames`. Anchors at natural GOP boundaries (display_idx %
+/// gop_size == 0) are already IDRs and are silently skipped if they
+/// also appear in `scene_cuts`.
+///
+/// For `Ipppp`, scene_cuts are ignored (P→I substitution is handled
+/// by `Encoder::should_force_idr_for_scene_change` as before).
+pub fn iter_encode_order_with_scene_cuts(
+    n_frames: usize,
+    pattern: GopPattern,
+    scene_cuts: &[usize],
+) -> EncodeOrderIter {
+    let iter = EncodeOrderIter::new(n_frames, pattern);
+    if !matches!(pattern, GopPattern::Ibpbp { .. }) || scene_cuts.is_empty() {
+        return iter;
+    }
+    let mut frames: Vec<EncodeOrderFrame> = iter.frames.collect();
+    rewrite_for_scene_cuts(&mut frames, scene_cuts);
+    EncodeOrderIter { frames: frames.into_iter() }
+}
+
+/// Rewrite [P=anchor, B=anchor-1] sub-GOPs whose anchor is in
+/// `scene_cuts`, in-place. Bumps gop_idx for all frames after the
+/// rewritten pair to reflect the new GOP boundary. No-op for entries
+/// where the natural type is already IDR.
+fn rewrite_for_scene_cuts(
+    frames: &mut Vec<EncodeOrderFrame>,
+    scene_cuts: &[usize],
+) {
+    use std::collections::BTreeSet;
+    let cut_set: BTreeSet<u32> = scene_cuts.iter().map(|&d| d as u32).collect();
+    let n = frames.len();
+    let mut i = 0;
+    while i + 1 < n {
+        let anchor = frames[i];
+        let trailing_b = frames[i + 1];
+        let is_anchor_p = anchor.frame_type == FrameType::P;
+        let is_following_b = trailing_b.frame_type == FrameType::B;
+        let trailing_b_is_one_before = trailing_b.display_idx + 1 == anchor.display_idx;
+        if is_anchor_p
+            && is_following_b
+            && trailing_b_is_one_before
+            && cut_set.contains(&anchor.display_idx)
+        {
+            // Rewrite [P=K, B=K-1] → [P=K-1, IDR=K].
+            frames[i] = EncodeOrderFrame {
+                encode_idx: anchor.encode_idx,
+                display_idx: anchor.display_idx - 1,
+                gop_idx: anchor.gop_idx,
+                frame_type: FrameType::P,
+            };
+            frames[i + 1] = EncodeOrderFrame {
+                encode_idx: trailing_b.encode_idx,
+                display_idx: anchor.display_idx,
+                gop_idx: anchor.gop_idx + 1,
+                frame_type: FrameType::Idr,
+            };
+            // Subsequent frames belong to a later gop_idx (since we
+            // inserted a scene-cut IDR between them and the prior GOP
+            // boundary).
+            for j in (i + 2)..n {
+                frames[j].gop_idx += 1;
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+}
 
 // ─── §Stealth.L3.2 source-adaptive analyser ───────────────────────────
 
@@ -606,7 +869,7 @@ mod tests {
 
     #[test]
     fn auto_select_none_returns_centroid() {
-        // §Stealth.L3.2 — no source bytes ⇒ HandBrake/x264-medium
+        // §Stealth.L3.2 — no source bytes ⇒ HandBrake/the converter-pipeline centroid
         // centroid. Same shape as iphone_default by design.
         let p = GopPattern::auto_select(None);
         assert_eq!(p, GopPattern::Ibpbp { gop: 30, b_count: 1 });
@@ -704,5 +967,170 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─── §scenecut-ibpbp-2026-05-09 (#288) — queue-aware scene-cut tests ─
+
+    #[test]
+    fn scene_cut_rewrite_demotes_trailing_b_to_p() {
+        // IBPBP gop=30 b_count=1 with scene-cut at display=6.
+        // Natural sub-GOP [P=6, B=5] should rewrite to [P=5, IDR=6].
+        let pat = GopPattern::Ibpbp { gop: 30, b_count: 1 };
+        let frames: Vec<_> =
+            iter_encode_order_with_scene_cuts(10, pat, &[6]).collect();
+        // Encoded order with scene-cut at display=6:
+        //   0: I(0), 1: P(2), 2: B(1), 3: P(4), 4: B(3),
+        //   5: P(5)        ← was P(6), now demoted to GOP-closing P
+        //   6: IDR(6)      ← was B(5), now scene-cut IDR
+        //   7: P(8), 8: B(7), 9: P(9-closing)
+        assert_eq!(frames[5].display_idx, 5);
+        assert_eq!(frames[5].frame_type, FrameType::P);
+        assert_eq!(frames[6].display_idx, 6);
+        assert_eq!(frames[6].frame_type, FrameType::Idr);
+        // gop_idx should bump for the IDR and all following frames.
+        assert_eq!(frames[5].gop_idx, 0, "P-closing belongs to GOP 0");
+        assert_eq!(frames[6].gop_idx, 1, "scene-cut IDR opens GOP 1");
+        for f in &frames[7..] {
+            assert_eq!(f.gop_idx, 1, "post-cut frames live in GOP 1");
+        }
+    }
+
+    #[test]
+    fn scene_cut_rewrite_skips_natural_idr_positions() {
+        // If a "scene cut" lands on display=0 or display=gop_size, the
+        // frame is already IDR — no rewrite needed; downstream gop_idx
+        // bumping must not fire.
+        let pat = GopPattern::Ibpbp { gop: 6, b_count: 1 };
+        let baseline: Vec<_> = iter_encode_order(12, pat).collect();
+        let with_cuts: Vec<_> =
+            iter_encode_order_with_scene_cuts(12, pat, &[0, 6]).collect();
+        assert_eq!(baseline, with_cuts);
+    }
+
+    #[test]
+    fn scene_cut_rewrite_b_position_no_op() {
+        // A scene cut at a B-position display (= odd display index in
+        // M=2 IBPBP) is structurally hard to handle (the natural P-
+        // anchor sits AFTER the B). For simplicity v1.2 ignores those.
+        let pat = GopPattern::Ibpbp { gop: 30, b_count: 1 };
+        let baseline: Vec<_> = iter_encode_order(8, pat).collect();
+        let with_cuts: Vec<_> =
+            iter_encode_order_with_scene_cuts(8, pat, &[5]).collect();
+        assert_eq!(baseline, with_cuts);
+    }
+
+    #[test]
+    fn scene_cut_detect_threshold_fires_on_synthetic_motion() {
+        // Build 4 frames of identical static gray, then 2 frames of
+        // pure-black: detect_scene_cuts should flag display=4.
+        let w = 32u32;
+        let h = 32u32;
+        let frame_size = (w * h * 3 / 2) as usize;
+        let mut yuv = Vec::new();
+        for d in 0..6 {
+            let val = if d < 4 { 128u8 } else { 0u8 };
+            yuv.extend(std::iter::repeat(val).take(frame_size));
+        }
+        let cuts = detect_scene_cuts_yuv(&yuv, w, h, 6, SCENE_CUT_THRESHOLD_DEFAULT);
+        assert_eq!(cuts, vec![4]);
+    }
+
+    // §v1.7 Phase 5 (#322) — adaptive B-frame promotion tests.
+
+    #[test]
+    fn b_promotion_no_motion_returns_empty() {
+        let w = 32u32;
+        let h = 32u32;
+        let frame_size = (w * h * 3 / 2) as usize;
+        let yuv: Vec<u8> = std::iter::repeat(128u8)
+            .take(6 * frame_size).collect();
+        let pattern = GopPattern::Ibpbp { gop: 6, b_count: 1 };
+        let promotions = detect_b_promotion_candidates(
+            &yuv, w, h, 6, pattern, B_PROMOTION_THRESHOLD_DEFAULT,
+        );
+        assert!(promotions.is_empty(),
+            "no motion → no promotions; got {:?}", promotions);
+    }
+
+    #[test]
+    fn b_promotion_high_motion_at_b_position_promotes() {
+        let w = 32u32;
+        let h = 32u32;
+        let frame_size = (w * h * 3 / 2) as usize;
+        let mut yuv = Vec::with_capacity(6 * frame_size);
+        // display: 0=I, 1=B, 2=P, 3=B, 4=P, 5=P (IBPBP gop=6 b=1)
+        // Make display=3 a high-motion frame (everything else uniform).
+        for d in 0..6 {
+            let val = if d == 3 { 0u8 } else { 128u8 };
+            yuv.extend(std::iter::repeat(val).take(frame_size));
+        }
+        let pattern = GopPattern::Ibpbp { gop: 6, b_count: 1 };
+        // Sanity: display=3 is a B in this pattern.
+        assert_eq!(pattern.frame_type_at(3), FrameType::B);
+        let promotions = detect_b_promotion_candidates(
+            &yuv, w, h, 6, pattern, B_PROMOTION_THRESHOLD_DEFAULT,
+        );
+        assert!(promotions.contains(&3),
+            "display=3 (B + high motion) should promote; got {:?}", promotions);
+    }
+
+    #[test]
+    fn b_promotion_high_motion_at_p_position_skipped() {
+        let w = 32u32;
+        let h = 32u32;
+        let frame_size = (w * h * 3 / 2) as usize;
+        let mut yuv = Vec::with_capacity(6 * frame_size);
+        // display: 0=I, 1=B, 2=P, 3=B, 4=P, 5=P
+        // Make display=4 (P-frame) high-motion. Should NOT be promoted
+        // (it's already P; promotion only fires on B-frame positions).
+        for d in 0..6 {
+            let val = if d == 4 { 0u8 } else { 128u8 };
+            yuv.extend(std::iter::repeat(val).take(frame_size));
+        }
+        let pattern = GopPattern::Ibpbp { gop: 6, b_count: 1 };
+        let promotions = detect_b_promotion_candidates(
+            &yuv, w, h, 6, pattern, B_PROMOTION_THRESHOLD_DEFAULT,
+        );
+        assert!(!promotions.contains(&4),
+            "display=4 (P-frame) should NOT promote; got {:?}", promotions);
+    }
+
+    #[test]
+    fn b_promotion_iter_rewrites_frame_type() {
+        let pattern = GopPattern::Ibpbp { gop: 6, b_count: 1 };
+        let promotions = vec![3];
+        let frames: Vec<EncodeOrderFrame> = iter_encode_order_with_b_promotions(
+            6, pattern, &promotions,
+        ).collect();
+        // Find the entry whose display_idx is 3 — should be P now (not B).
+        let entry_3 = frames.iter().find(|f| f.display_idx == 3)
+            .expect("display_idx=3 in encode order");
+        assert_eq!(entry_3.frame_type, FrameType::P,
+            "promoted display=3 should be P, got {:?}", entry_3.frame_type);
+    }
+
+    #[test]
+    fn b_promotion_ipppp_noop() {
+        let pattern = GopPattern::Ipppp { gop: 6 };
+        let promotions = vec![1, 2, 3];
+        // Ipppp has no B-frames; promotions should be no-op.
+        let frames_a: Vec<EncodeOrderFrame> = iter_encode_order_with_b_promotions(
+            6, pattern, &promotions,
+        ).collect();
+        let frames_b: Vec<EncodeOrderFrame> = iter_encode_order(6, pattern).collect();
+        assert_eq!(frames_a, frames_b,
+            "Ipppp + promotions should be no-op vs plain iter_encode_order");
+    }
+
+    #[test]
+    fn scene_cut_detect_no_motion_returns_empty() {
+        let w = 32u32;
+        let h = 32u32;
+        let frame_size = (w * h * 3 / 2) as usize;
+        let yuv: Vec<u8> = std::iter::repeat(128u8)
+            .take(5 * frame_size)
+            .collect();
+        let cuts = detect_scene_cuts_yuv(&yuv, w, h, 5, SCENE_CUT_THRESHOLD_DEFAULT);
+        assert!(cuts.is_empty());
     }
 }

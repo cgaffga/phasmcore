@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli"]
+members = ["cli", "openh264-sys"]
 
 [package]
 name = "phasm-core"
@@ -30,7 +30,7 @@ video = ["memmap2"]
 # core/src/codec/h264/encoder/) plus its CABAC entropy-coder companion
 # (core/src/codec/h264/cabac/). OFF by default so the GitHub-release
 # CLI binary distribution NEVER bundles an H.264 encoder (Via LA AVC
-# patent-pool obligations — see docs/design/h264-video-steganography.md
+# patent-pool obligations — see docs/design/video/h264/video-steganography.md
 # §"Patent licensing — distribution plan"). Mobile bridges
 # (ios-bridge, android-bridge) enable this feature explicitly. CLI
 # users wanting video stego must build from source with
@@ -48,6 +48,22 @@ h264-encoder = ["video"]
 # orchestration framework so the legacy CAVLC pipeline is never
 # accidentally bypassed.
 cabac-stego = ["h264-encoder"]
+# `openh264-backend` (Phase B) enables the two-encoder mode that
+# routes video stego through the cgaffga/phasm-openh264 fork instead
+# of the pure-Rust encoder under core/src/codec/h264/encoder/. The
+# fork is pinned at tag phasm-stego-v0.1.0 (commit 5d657c83) via the
+# vendor/phasm-openh264 git submodule. Builds OpenH264 statically via
+# meson+ninja (see core-openh264-sys/build.rs, Phase B.2) and exposes
+# the stego hooks via the C ABI at codec/api/wels/wels_stego.h.
+#
+# OFF by default — pure-Rust h264-encoder remains the live path
+# until Phase B integration completes. Mobile bridges + CLI will
+# opt-in via Cargo features once Phase B ships end-to-end round-trip.
+#
+# Patent posture: H.264 / AVC Via LA pool. Self-build only — no
+# pre-built binaries of the fork are redistributed. See
+# vendor/phasm-openh264/README.md "Patent licensing" for details.
+openh264-backend = ["dep:core-openh264-sys"]
 wasm = ["js-sys", "wasm-bindgen"]
 
 [dependencies]
@@ -65,6 +81,7 @@ zeroize = "1"
 memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+core-openh264-sys = { path = "openh264-sys", optional = true }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -1,8 +1,15 @@
+Last updated: 2026-05-12.
+
 This file lists the licenses of third-party Rust crate dependencies of
 phasm-core (and its companion phasm-cli). The list reflects the
 transitive dependency tree built with the full feature set
 (`--features parallel,video,h264-encoder,cabac-stego`) — the minimal
 default-feature build pulls fewer crates but no different licenses.
+
+The `openh264-backend` feature additionally pulls in the
+`phasm-openh264` C/C++ source via the `core-openh264-sys` workspace
+member; that source is BSD-2-Clause licensed and attributed
+separately under GROUP 7 below.
 
 All listed licenses are compatible with the phasm-core GPL-3.0-only
 umbrella. No GPL/AGPL/LGPL transitive dependencies exist; permissive
@@ -17,25 +24,25 @@ the choices are summarized.
 ===============================================================================
 GROUP 1 — MIT OR Apache-2.0 (used under the MIT license)
 
-The following 101 crates are dual-licensed MIT OR Apache-2.0 (or
+The following 104 crates are dual-licensed MIT OR Apache-2.0 (or
 equivalent variants like "Apache-2.0 OR MIT", "MIT/Apache-2.0", or
 MIT-only). Used here under the MIT license. See
 https://opensource.org/licenses/MIT for the canonical MIT text.
 
-aead, aes, aes-gcm-siv, anstream, anstyle, anstyle-parse, anstyle-query,
-anstyle-wincon, argon2, autocfg, base64ct, bitflags, blake2,
-block-buffer, bumpalo, cfg-if, cipher, clap, clap_builder, clap_derive,
-clap_lex, color_quant, colorchoice, console, cpufeatures, crc32fast,
-crossbeam-deque, crossbeam-epoch, crossbeam-utils, crunchy,
+aead, aes, aes-gcm-siv, anstream, anstyle, anstyle-parse,
+anstyle-query, anstyle-wincon, argon2, autocfg, base64ct, bitflags,
+blake2, block-buffer, bumpalo, cc, cfg-if, cipher, clap, clap_builder,
+clap_derive, clap_lex, color_quant, colorchoice, console, cpufeatures,
+crc32fast, crossbeam-deque, crossbeam-epoch, crossbeam-utils, crunchy,
 crypto-common, ctr, digest, either, encode_unicode, fax, fax_derive,
-fdeflate, flate2, generic-array, getrandom, gif, half, heck, hmac,
-image, image-webp, indicatif, inout, is_terminal_polyfill, js-sys,
-libc, memmap2, num-complex, num-traits, number_prefix, once_cell,
-once_cell_polyfill, opaque-debug, password-hash, png, polyval,
-portable-atomic, ppv-lite86, proc-macro2, quick-error, quote, rand,
-rand_chacha, rand_core, rayon, rayon-core, rustversion, sha2,
-simd-adler32, strsim, syn, tiff, typenum, unicode-width,
-universal-hash, utf8parse, version_check, wasm-bindgen,
+fdeflate, find-msvc-tools, flate2, generic-array, getrandom, gif,
+half, heck, hmac, image, image-webp, indicatif, inout,
+is_terminal_polyfill, js-sys, libc, memmap2, num-complex, num-traits,
+number_prefix, once_cell, once_cell_polyfill, opaque-debug,
+password-hash, png, polyval, portable-atomic, ppv-lite86, proc-macro2,
+quick-error, quote, rand, rand_chacha, rand_core, rayon, rayon-core,
+rustversion, sha2, shlex, simd-adler32, strsim, syn, tiff, typenum,
+unicode-width, universal-hash, utf8parse, version_check, wasm-bindgen,
 wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
 web-time, weezl, windows-link, windows-sys, windows-targets,
 windows_aarch64_gnullvm, windows_aarch64_msvc, windows_i686_gnu,
@@ -121,7 +128,30 @@ License: BSD-3-Clause
 Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence.
 
 ===============================================================================
-BSD-2-Clause / BSD-3-Clause license text (applies to GROUP 5 and GROUP 6)
+GROUP 7 — OpenH264 fork (only when `openh264-backend` feature is enabled)
+
+When the `openh264-backend` Cargo feature is built, `core-openh264-sys`
+compiles and statically links the `phasm-openh264` C/C++ source tree
+(forked from Cisco's reference OpenH264 codec at
+https://github.com/cisco/openh264). The fork itself lives at
+https://github.com/cgaffga/phasm-openh264 and adds phasm-specific
+stego hooks on the `phasm-stego` branch.
+
+OpenH264 (Cisco upstream + phasm-openh264 fork) is licensed under
+the BSD-2-Clause License. The phasm-added patches preserve the
+upstream BSD-2-Clause headers on every modified file and add an
+SPDX-License-Identifier header on every new file (GPL-3.0-only
+for our patches that wrap or call upstream BSD-2 code).
+
+The full BSD-2-Clause license text appears below the GROUP 5 / 6
+shared block.
+
+OpenH264 also implements parts of the ITU-T H.264 / ISO/IEC 14496-10
+specification, which is subject to Via LA's AVC patent pool. See the
+H.264 / AVC patent-pool note at the bottom of this file.
+
+===============================================================================
+BSD-2-Clause / BSD-3-Clause license text (applies to GROUP 5, GROUP 6, and GROUP 7)
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -151,10 +181,27 @@ POSSIBILITY OF SUCH DAMAGE.
 ===============================================================================
 H.264 / AVC patent-pool note (not a software license)
 
-The pure-Rust H.264 encoder under the `h264-encoder` Cargo feature
-is gated OFF by default. Distribution of compiled binaries that
-include the encoder is subject to Via LA Licensing's AVC patent-pool
-terms; see https://www.via-la.com/licensing-2/avc-h-264/. The
-phasm-cli pre-built binaries published on GitHub Releases do NOT
-bundle the encoder. This patent-pool obligation is not a software
-license and is listed here for transparency only.
+Two H.264 encoder paths exist in the source tree:
+
+  - The pure-Rust H.264 encoder under the `h264-encoder` Cargo
+    feature.
+  - The OpenH264 fork pulled in via the `openh264-backend` feature
+    (`core-openh264-sys` + `vendor/phasm-openh264`).
+
+Both features are gated OFF by default. Distribution of compiled
+binaries that include either encoder is subject to Via LA
+Licensing's AVC patent-pool terms; see
+https://www.via-la.com/licensing-2/avc-h-264/. The phasm-cli
+pre-built binaries published on GitHub Releases do NOT bundle
+either encoder.
+
+For the OpenH264 path specifically, Cisco upstream provides
+binaries under the OpenH264 Binary Royalty-Free License (Cisco
+covers Via LA fees for those Cisco-published binaries). Phasm
+does not redistribute Cisco's pre-built binaries; phasm builds
+the fork from source. AVC patent-pool obligations therefore
+apply to phasm-built binaries that enable `openh264-backend`,
+just as they apply to the pure-Rust `h264-encoder` path.
+
+This patent-pool obligation is not a software license and is
+listed here for transparency only.

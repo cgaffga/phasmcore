@@ -13,7 +13,7 @@
 //! 2. Measure bias (Hamming distance vs reference) and per-position
 //!    flip-rate divergence at varying K.
 //! 3. Produce the K sweep table that goes into
-//!    `docs/design/h264-encoder-algorithms/streaming-viterbi.md`.
+//!    `docs/design/video/h264/encoder-algorithms/streaming-viterbi.md`.
 //!
 //! Once K is chosen, §6E-C1a will reimplement streaming Viterbi
 //! with the chosen K baked in, integrated with ChaCha20 H-column

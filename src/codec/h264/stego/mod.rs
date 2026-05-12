@@ -9,7 +9,7 @@
 //! the encoder integration happens alongside the first concrete hook
 //! to avoid wiring call sites without test coverage.
 //!
-//! See `docs/design/h264-encoder-algorithms/stego-encode-time-architecture.md`
+//! See `docs/design/video/h264/encoder-algorithms/stego-encode-time-architecture.md`
 //! for the architectural decisions A1–A7 and overall design,
 //! and `cabac-bypass-bin-stego.md` for the bin-by-bin invariant proofs.
 

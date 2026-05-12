@@ -188,7 +188,7 @@ pub fn h264_ghost_encode_inplace(
     // Per-GOP streaming caps peak working set at ~150 MB on 1080p / 30-frame
     // GOP videos. Multi-GOP message-spread is the #68 enhancement: capacity
     // scales with video length, and the message spreads across all GOPs for
-    // stealth. See docs/design/h264-encoder-memory-analysis.md.
+    // stealth. See docs/design/video/h264/encoder-memory-analysis.md.
     let capacities = scan_gop_capacities(track, &sps, &pps, length_size, &*mp4_bytes)?;
     if capacities.is_empty() {
         return Err(StegoError::InvalidVideo(

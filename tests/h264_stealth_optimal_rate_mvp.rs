@@ -5,7 +5,7 @@
 // §Stealth.L1+L2.1 — cascade-safety regression test against Li et al.
 // 2023 "Optimal-rate-of-MVP" (arXiv:2308.06464).
 //
-// Per the strategy doc (`docs/design/h264-stealth-strategy.md`):
+// Per the strategy doc (`docs/design/video/h264/stealth-strategy.md`):
 //
 // > §Stealth.1.a — cascade-safety CI regression test that runs a
 // > clean-room reimplementation of Li et al. 2023 "Optimal-rate-of-MVP"

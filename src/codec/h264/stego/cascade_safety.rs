@@ -93,7 +93,7 @@ use super::{Axis, PositionKey, SyntaxPath};
 /// The cap is *advisory* in §6E-A4(c)-lite (today's shipping path
 /// produces well under 200k positions), but becomes a hard guard
 /// rail once §6E-A6.1+ widens the mode set. See
-/// `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+/// `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`
 /// open question § 5 (Streaming-Viterbi K window — RESOLVED) for
 /// the rationale.
 pub const MAX_MVD_POSITIONS_PER_GOP: usize = 200_000;

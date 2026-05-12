@@ -19,7 +19,7 @@
 //!  - § 9.3.4.4 EncodeBypass (Figure 9-10).
 //!  - § 9.3.4.5 EncodeTerminate + EncodeFlush (Figures 9-11, 9-12).
 //!
-//! Algorithm note: `docs/design/h264-encoder-algorithms/cabac-engine.md`.
+//! Algorithm note: `docs/design/video/h264/encoder-algorithms/cabac-engine.md`.
 
 use super::context::CabacContext;
 use super::tables::RANGE_TAB_LPS;

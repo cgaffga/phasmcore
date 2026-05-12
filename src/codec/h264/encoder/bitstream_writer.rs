@@ -14,7 +14,7 @@
 //!      prevention bytes via the existing
 //!      `codec::h264::bitstream::insert_emulation_prevention`.
 //!
-//! Algorithm note: docs/design/h264-encoder-algorithms/bitstream.md.
+//! Algorithm note: docs/design/video/h264/encoder-algorithms/bitstream.md.
 //!
 //! MB layer writing is Phase 6A.4's job (CAVLC). P-slice header is
 //! Phase 6B.3.
@@ -263,7 +263,7 @@ pub struct SpsParams {
     /// `None` (the legacy default) emits no VUI — leaves SPS in its
     /// own L4 metaclass per Altinisik 2022 §IV (only 18 / 119
     /// classes have an empty VUI). §Stealth.L3.1 enables VUI for
-    /// the HandBrake/x264-medium target.
+    /// the HandBrake/the converter-pipeline centroid target.
     pub vui: Option<VuiParams>,
 }
 
@@ -283,13 +283,13 @@ impl Default for SpsParams {
 
 /// Video Usability Information (H.264 §E.1.1) parameters phasm controls
 /// when targeting a converter-pipeline metaclass (default v1.0:
-/// HandBrake/x264-medium per `docs/design/h264-stealth-strategy.md`).
+/// HandBrake/the converter-pipeline centroid per `docs/design/video/h264/stealth-strategy.md`).
 ///
-/// Field selection follows Agent B 2026-05-02 §"FFmpeg + libx264" + the
-/// libx264 source `x264_sps_init_vui` defaults. Anything the analyst
-/// would expect from a libx264-medium transcode is set; HRD is omitted
-/// (libx264 only emits HRD with `--bitrate` / `--vbv-*` flags, and 60+%
-/// of internet-shared libx264 output omits it).
+/// Field selection follows Agent B 2026-05-02 §"Common-encoder + standard demuxer" + the
+/// common-encoder reference standard VUI defaults defaults. Anything the analyst
+/// would expect from a libthe converter-pipeline centroid transcode is set; HRD is omitted
+/// (the reference fast encoder only emits HRD with `--bitrate` / `--vbv-*` flags, and 60+%
+/// of internet-shared the reference fast encoder output omits it).
 #[derive(Debug, Clone, Copy)]
 pub struct VuiParams {
     /// `aspect_ratio_idc` (spec Table E-1). 1 = 1:1 square pixels —
@@ -302,32 +302,32 @@ pub struct VuiParams {
     /// `matrix_coefficients` (Table E-5). 1 = BT.709.
     pub matrix_coefficients: u8,
     /// `video_full_range_flag`. False = limited range (16..235), the
-    /// TV-broadcast default x264 emits without `--range pc`.
+    /// TV-broadcast default the reference fast encoder emits without `--range pc`.
     pub video_full_range: bool,
     /// `num_units_in_tick` for the `timing_info` block. Per spec
     /// §E.2.1, `time_scale = 2 × frame_rate × num_units_in_tick`. For
     /// 30 fps with `num_units_in_tick = 1`, `time_scale = 60`. Real
-    /// libx264 typically uses `num_units_in_tick = 1`,
+    /// libcommon-encoder default is `num_units_in_tick = 1`,
     /// `time_scale = 2 × fps`.
     pub num_units_in_tick: u32,
     /// `time_scale` (see above). Pair with `num_units_in_tick` so
     /// `time_scale / (2 × num_units_in_tick) = frame_rate`.
     pub time_scale: u32,
-    /// Bitstream restriction parameters. Always emitted (x264 emits
+    /// Bitstream restriction parameters. Always emitted (the reference fast encoder emits
     /// these unconditionally with `--no-vui` opt-out).
     pub max_num_reorder_frames: u8,
     /// `max_dec_frame_buffering`. Should equal `max_num_ref_frames`
-    /// in the SPS body for x264-medium parity.
+    /// in the SPS body for the converter-pipeline centroid parity.
     pub max_dec_frame_buffering: u8,
 }
 
 impl VuiParams {
-    /// HandBrake/x264-medium VUI defaults at the given frame rate.
-    /// All values track libx264's `x264_sps_init_vui` output for
+    /// HandBrake/the converter-pipeline centroid VUI defaults at the given frame rate.
+    /// All values track libthe standard fast-encoder VUI defaults output for
     /// `preset=medium`, `--no-bitrate`, `--colorspace=auto` (defaults
     /// to BT.709 for HD content).
     pub fn handbrake_x264(fps_num: u32, fps_den: u32) -> Self {
-        // libx264 convention: num_units_in_tick = fps_den,
+        // common-encoder convention: num_units_in_tick = fps_den,
         //                     time_scale       = 2 × fps_num.
         // So time_scale / (2 × num_units_in_tick) = fps_num / fps_den
         // = the actual frame rate. For 30 fps integer this gives
@@ -340,7 +340,7 @@ impl VuiParams {
             video_full_range: false, // limited range (TV)
             num_units_in_tick: fps_den,
             time_scale: 2u32.saturating_mul(fps_num),
-            max_num_reorder_frames: 2, // M=2 IBPBP / x264-medium default
+            max_num_reorder_frames: 2, // M=2 IBPBP / the converter-pipeline centroid default
             max_dec_frame_buffering: 3, // matches max_num_ref_frames=3
         }
     }
@@ -502,7 +502,7 @@ fn write_vui_body(w: &mut BitWriter, v: &VuiParams) {
     w.write_bit(false);
     // video_signal_type_present_flag = 1
     w.write_bit(true);
-    w.write_bits(5, 3); // video_format = 5 (Unspecified) — libx264 default
+    w.write_bits(5, 3); // video_format = 5 (Unspecified) — common-encoder default
     w.write_bit(v.video_full_range);
     w.write_bit(true); // colour_description_present_flag = 1
     w.write_bits(v.colour_primaries as u32, 8);
@@ -514,7 +514,7 @@ fn write_vui_body(w: &mut BitWriter, v: &VuiParams) {
     w.write_bit(true);
     w.write_bits(v.num_units_in_tick, 32);
     w.write_bits(v.time_scale, 32);
-    // fixed_frame_rate_flag = 1 (libx264 default for CFR output)
+    // fixed_frame_rate_flag = 1 (common-encoder default for CFR output)
     w.write_bit(true);
     // nal_hrd_parameters_present_flag = 0
     w.write_bit(false);
@@ -525,7 +525,7 @@ fn write_vui_body(w: &mut BitWriter, v: &VuiParams) {
     w.write_bit(false);
     // bitstream_restriction_flag = 1
     w.write_bit(true);
-    // motion_vectors_over_pic_boundaries_flag = 1 (libx264 default)
+    // motion_vectors_over_pic_boundaries_flag = 1 (common-encoder default)
     w.write_bit(true);
     w.write_ue(0); // max_bytes_per_pic_denom
     w.write_ue(0); // max_bits_per_mb_denom
@@ -553,37 +553,37 @@ pub struct PpsParams {
     /// 0 = default bipred (`(L0+L1+1)>>1`).
     /// 1 = explicit weighted prediction (encoder transmits weights, NOT used).
     /// 2 = implicit weighted prediction (weights derived from POC distances
-    ///     between B-frame and L0/L1 anchors). x264-medium default. Closes
+    ///     between B-frame and L0/L1 anchors). the converter-pipeline centroid default. Closes
     ///     the bipred SATD gap on temporally-asymmetric content (where
     ///     L0 and L1 are at different distances from the B-frame).
     pub weighted_bipred_idc: u8,
     /// §Stealth.L4.6.2 — `num_ref_idx_l0_default_active_minus1` (spec
     /// § 7.4.2.2). PPS-level default count of L0 reference indices that
     /// the slice may use without an `num_ref_idx_active_override_flag`.
-    /// x264-medium emits 2 (3 active refs default). When phasm is in
+    /// the converter-pipeline centroid emits 2 (3 active refs default). When phasm is in
     /// 1-ref-P mode (Phase 6E-B not yet shipped), every slice header
     /// MUST set `num_ref_idx_active_override_flag = 1` +
     /// `num_ref_idx_l0_active_minus1 = 0` to bring the active count back
     /// down to 1 ref. Closes the L4 PPS fingerprint gap.
     pub num_ref_idx_l0_default_active_minus1: u8,
     /// §Stealth.L4.6.2 — `num_ref_idx_l1_default_active_minus1` (spec
-    /// § 7.4.2.2). x264-medium emits 0 (1 active L1 default), which
+    /// § 7.4.2.2). the converter-pipeline centroid emits 0 (1 active L1 default), which
     /// matches phasm. Kept parameterized for symmetry.
     pub num_ref_idx_l1_default_active_minus1: u8,
     /// §Stealth.L4.6.3 — `chroma_qp_index_offset` (spec § 7.4.2.2 +
     /// § 8.5.11). Cb chroma QP = clip3(0, 51, qp_y + this_offset).
-    /// x264-medium emits -2 (chroma slightly lower QP than luma →
+    /// the converter-pipeline centroid emits -2 (chroma slightly lower QP than luma →
     /// preserved chroma fidelity at modest cost). Phasm previously
     /// emitted 0; closes a PPS L4 fingerprint gap.
     pub chroma_qp_index_offset: i8,
     /// §Stealth.L4.6.3 — `second_chroma_qp_index_offset` (spec §
-    /// 7.4.2.2 in High profile only). Cr chroma QP offset. x264-medium
+    /// 7.4.2.2 in High profile only). Cr chroma QP offset. the converter-pipeline centroid
     /// emits -2 (matching the Cb offset).
     pub second_chroma_qp_index_offset: i8,
     /// §Stealth.L4.6.4 — `weighted_pred_flag` (spec § 7.4.2.2).
     /// 0 = no explicit weighted prediction in P-slices.
     /// 1 = P-slice header carries `pred_weight_table` (spec § 7.3.3.2).
-    /// x264-medium emits 1 unconditionally; phasm previously emitted 0.
+    /// the converter-pipeline centroid emits 1 unconditionally; phasm previously emitted 0.
     /// When true, every P-slice writer emits a (degenerate) weight
     /// table — for our 1-ref-P shape this is just 4 bits
     /// (luma_log2_weight_denom + chroma_log2_weight_denom + two zero
@@ -645,22 +645,22 @@ fn build_pps_inner(p: &PpsParams, entropy_coding_mode: bool, high_profile_suffix
     // num_slice_groups_minus1 = 0 (no FMO)
     w.write_ue(0);
     // §Stealth.L4.6.2 — num_ref_idx_l0_default_active_minus1 from
-    // params (x264-medium = 2). Slice headers must override down to 0
+    // params (the converter-pipeline centroid = 2). Slice headers must override down to 0
     // for phasm's 1-ref-P shape.
     w.write_ue(p.num_ref_idx_l0_default_active_minus1 as u32);
-    // num_ref_idx_l1_default_active_minus1 (x264-medium = 0).
+    // num_ref_idx_l1_default_active_minus1 (the converter-pipeline centroid = 0).
     w.write_ue(p.num_ref_idx_l1_default_active_minus1 as u32);
-    // §Stealth.L4.6.4 — weighted_pred_flag from params (x264-medium = 1).
+    // §Stealth.L4.6.4 — weighted_pred_flag from params (the converter-pipeline centroid = 1).
     // When true, P-slice writers must emit a (degenerate) pred_weight_table.
     w.write_bit(p.weighted_pred_flag);
     // weighted_bipred_idc — §6E-D.5(l) configurable. 2 = implicit
-    // weighted prediction for B-slices (x264-medium default).
+    // weighted prediction for B-slices (the converter-pipeline centroid default).
     w.write_bits(p.weighted_bipred_idc as u32, 2);
     // pic_init_qp_minus26
     w.write_se(p.pic_init_qp as i32 - 26);
     // pic_init_qs_minus26 = 0
     w.write_se(0);
-    // §Stealth.L4.6.3 — chroma_qp_index_offset from params (x264-medium
+    // §Stealth.L4.6.3 — chroma_qp_index_offset from params (the converter-pipeline centroid
     // = -2). Cb chroma QP shifts by this against luma.
     w.write_se(p.chroma_qp_index_offset as i32);
     // deblocking_filter_control_present_flag
@@ -677,7 +677,7 @@ fn build_pps_inner(p: &PpsParams, entropy_coding_mode: bool, high_profile_suffix
         // pic_scaling_matrix_present_flag = 0 (flat / default).
         w.write_bit(false);
         // §Stealth.L4.6.3 — second_chroma_qp_index_offset from params
-        // (x264-medium = -2). Applies to Cr chroma QP only.
+        // (the converter-pipeline centroid = -2). Applies to Cr chroma QP only.
         w.write_se(p.second_chroma_qp_index_offset as i32);
     }
 
@@ -1429,8 +1429,8 @@ mod tests {
     }
 
     #[test]
-    fn vui_handbrake_x264_30fps_matches_libx264_convention() {
-        // libx264's `x264_sps_init_vui` uses
+    fn vui_handbrake_30fps_matches_common_centroid() {
+        // Common-encoder VUI defaults use
         // num_units_in_tick = fps_den, time_scale = 2 × fps_num.
         // For 30 fps integer: num=1, scale=60.
         let v = VuiParams::handbrake_x264(30, 1);
@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn vui_handbrake_x264_29_97fps_matches_libx264_convention() {
+    fn vui_handbrake_29_97fps_matches_common_centroid() {
         // 29.97 = 30000/1001 → num=1001, scale=60000.
         let v = VuiParams::handbrake_x264(30000, 1001);
         assert_eq!(v.num_units_in_tick, 1001);

@@ -17,7 +17,7 @@
 //! so callers don't need to refactor.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/quantization.md
+//!   docs/design/video/h264/encoder-algorithms/quantization.md
 
 use super::EncoderError;
 

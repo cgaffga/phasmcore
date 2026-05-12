@@ -9,7 +9,7 @@
 //! column), `TRANS_IDX_MPS` (Table 9-45 MPS column).
 //!
 //! Context-initialization tables (9-12 through 9-33) land in Phase 6C.2.
-//! See `docs/design/h264-encoder-algorithms/cabac-tables.md` for the
+//! See `docs/design/video/h264/encoder-algorithms/cabac-tables.md` for the
 //! full transcription reference.
 
 /// Spec Table 9-44, `rangeTabLPS[pStateIdx][qCodIRangeIdx]`.

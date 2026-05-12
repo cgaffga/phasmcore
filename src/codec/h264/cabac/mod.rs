@@ -35,7 +35,7 @@
 //! - **No "modify someone else's CABAC stream" anywhere**. Phase 6C
 //!   only generates from scratch. We do not mix bytes.
 //!
-//! See `docs/design/h264-encoder-algorithms/cabac-engine.md` (and
+//! See `docs/design/video/h264/encoder-algorithms/cabac-engine.md` (and
 //! sibling notes) for the per-module algorithm notes.
 
 pub mod bin_decoder;

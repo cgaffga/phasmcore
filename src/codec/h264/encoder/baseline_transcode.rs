@@ -94,7 +94,7 @@ impl BaselineTranscodeConfig {
 /// # Output stream
 /// Annex-B NAL stream with start codes (0x00000001) between NAL
 /// units. The first NAL is an SPS, then PPS, then the first slice.
-/// Compatible with ffmpeg / AVFoundation / MediaCodec demuxers.
+/// Compatible with the reference decoder / AVFoundation / MediaCodec demuxers.
 ///
 /// # Errors
 /// `EncoderError::InvalidInput` for non-MB-aligned dimensions or

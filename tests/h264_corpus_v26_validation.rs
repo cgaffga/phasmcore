@@ -86,7 +86,13 @@ fn clear_b_env() {
         std::env::remove_var("PHASM_B_NO_DIRECT_MAGCLAMP");
         std::env::remove_var("PHASM_B_NO_ME_RESULT_CLAMP");
         std::env::remove_var("PHASM_B_INSTRUMENT");
-        std::env::remove_var("PHASM_B_FORCE_MODE");
+        // Phase 2.13 (#270 follow-on, 2026-05-08) — preserve
+        // PHASM_B_FORCE_MODE / PHASM_B_FORCE_MV / PHASM_B_FORCE_MV_L1
+        // when explicitly set externally. Used to bisect explicit-MV
+        // B-mode encoder/decoder divergence on the corpus harness.
+        if std::env::var_os("PHASM_B_FORCE_MODE").is_none() {
+            std::env::remove_var("PHASM_B_FORCE_MODE");
+        }
         // Phase A (#257) finding: encode_p_frame auto-promotes P→IDR
         // when scene-cut SAD exceeds 20 gray levels. Fast-motion
         // content (CarPlane) trips this, breaking the predictable
@@ -409,8 +415,17 @@ fn run_fixture(spec: &FixtureSpec) {
     // overrides every B-MB to L0_16x16+MV=(0,0). Bypasses derived-MV
     // paths so encoder/decoder MC agrees. Closes the corpus
     // ghost-image / blocky-motion bug from Phase D bisect.
-    enc.b_rdo_config =
-        phasm_core::codec::h264::encoder::mb_decision_b::BRdoConfig::SAFE_L0_ZERO;
+    //
+    // Phase 2.12 closure (#270, 2026-05-08): PHASM_LIFT_SAFE_L0_ZERO=1
+    // switches to PRODUCTION_VISUAL (RDO + residual + real B-mode
+    // decisions). Used to validate that Phase 2.12 per-8x8 MC closed
+    // the cascade structurally and SAFE_L0_ZERO is no longer required.
+    let lift_safe = std::env::var_os("PHASM_LIFT_SAFE_L0_ZERO").is_some();
+    enc.b_rdo_config = if lift_safe {
+        phasm_core::codec::h264::encoder::mb_decision_b::BRdoConfig::PRODUCTION_VISUAL
+    } else {
+        phasm_core::codec::h264::encoder::mb_decision_b::BRdoConfig::SAFE_L0_ZERO
+    };
 
     let t0 = std::time::Instant::now();
     let mut bs = Vec::new();
@@ -438,10 +453,14 @@ fn run_fixture(spec: &FixtureSpec) {
         n_frames,
     )
     .expect("mp4 mux");
-    let demo = format!(
-        "/Users/cgaffga/Desktop/phasm_corpus_{}_v26.mp4",
-        spec.name
-    );
+    // PHASM_LIFT_SAFE_L0_ZERO=1 writes lifted demos to /tmp with a
+    // `_lifted` suffix to keep the user's desktop tidy and avoid
+    // overwriting the v0.2.6 SAFE_L0_ZERO baseline demos.
+    let demo = if lift_safe {
+        format!("/tmp/phasm_corpus_{}_v26_lifted.mp4", spec.name)
+    } else {
+        format!("/Users/cgaffga/Desktop/phasm_corpus_{}_v26.mp4", spec.name)
+    };
     std::fs::write(&demo, &mp4).expect("write demo mp4");
 
     let h264 = std::env::temp_dir().join(format!("phasm_corpus_{}.h264", spec.name));
@@ -587,7 +606,14 @@ fn run_fixture(spec: &FixtureSpec) {
         ypd = y_psnr_delta,
         ssd = ssim_y_delta,
     );
-    let report_path = format!("/tmp/phasm_corpus_{}_report.txt", spec.name);
+    let lift_suffix = if lift_safe { "_lifted" } else { "" };
+    let force_mode_suffix = std::env::var("PHASM_B_FORCE_MODE")
+        .map(|fm| format!("_fm-{}", fm))
+        .unwrap_or_default();
+    let report_path = format!(
+        "/tmp/phasm_corpus_{}_report{}{}.txt",
+        spec.name, lift_suffix, force_mode_suffix
+    );
     std::fs::write(&report_path, &report).expect("write report");
 
     eprintln!(
@@ -788,9 +814,14 @@ fn corpus_v26_zzz_summary() {
         "max_dev",
         "verdict",
     );
+    let lift_safe = std::env::var_os("PHASM_LIFT_SAFE_L0_ZERO").is_some();
+    let report_suffix = if lift_safe { "_lifted" } else { "" };
     let mut found = 0;
     for name in names {
-        let path = format!("/tmp/phasm_corpus_{}_report.txt", name);
+        let path = format!(
+            "/tmp/phasm_corpus_{}_report{}.txt",
+            name, report_suffix
+        );
         let Ok(line) = std::fs::read_to_string(&path) else {
             eprintln!("{:<22}  (no report — skip or rerun)", name);
             continue;

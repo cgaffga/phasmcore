@@ -82,10 +82,16 @@ pub struct BPartitionedMeta {
 
 /// Per-partition MV pair (L0 / L1 optional). `None` for a list
 /// means the partition doesn't use that list (matching `BListUse`).
+///
+/// v1.4 (#305) — `ref_idx_l0` carries the L0 reference index per
+/// partition. Default 0 keeps emit + walker bit-identical to v1.3
+/// at `MultiRefConfig::SINGLE_REF`. L1 stays single-ref under v1.4
+/// scope (Q1: 2-ref L0 only).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BPartitionMv {
     pub mv_l0: Option<MotionVector>,
     pub mv_l1: Option<MotionVector>,
+    pub ref_idx_l0: u8,
 }
 
 /// §6E-A6.2 — look up partition metadata for a B mb_type.

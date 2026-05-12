@@ -344,6 +344,13 @@ pub fn ctx_idx_inc_mvd_bin0_per_list(
 
 /// Compute ctxIdxInc for `ref_idx_lX` bin 0 (spec § 9.3.3.1.1.6, eq 9-14).
 /// `ctxIdxInc = condTermFlagA + 2·condTermFlagB`.
+///
+/// **DEPRECATED — buggy for partitioned MBs.** Always reads from cross-MB
+/// neighbours regardless of the partition's position within current MB,
+/// which spec § 6.4.11.7 says must use within-MB neighbours for any
+/// partition whose left/top edge is interior to the MB. Use
+/// [`compute_ref_idx_ctx_idx_inc_bin0`] instead for new code; this
+/// wrapper remains until all callers are migrated.
 pub fn ctx_idx_inc_ref_idx_bin0(
     ctx: &CabacNeighborContext,
     mb_x: usize,
@@ -360,6 +367,97 @@ pub fn ctx_idx_inc_ref_idx_bin0(
     };
     cond(ctx.neighbor_a(mb_x), block_idx_in_mb_a)
         + 2 * cond(ctx.neighbor_b(mb_x), block_idx_in_mb_b)
+}
+
+/// v1.4 Phase 4.5 (#316) — progressive ref_idx_l0 state for current MB,
+/// built up as partitions emit. Used by the spec-correct ref_idx bin 0
+/// ctxIdxInc derivation (`compute_ref_idx_ctx_idx_inc_bin0`) when the
+/// neighbouring partition falls INSIDE the current MB (partition 1 of
+/// P_16x8, right partition of P_8x16, interior sub-MBs of P_8x8).
+///
+/// Mirror of [`CurrentMbMvdAbs`]: 16-cell array indexed by
+/// [`block_pos_to_luma_idx`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CurrentMbRefIdx {
+    /// Per-4×4-block emitted ref_idx_l0 in the current MB. -1 (or any
+    /// negative) marks "not yet emitted" but the within-MB lookup only
+    /// reads cells from already-emitted partitions, so the default 0
+    /// never reaches a `condTermFlag` evaluation.
+    pub ref_idx_l0: [i8; 16],
+}
+
+impl CurrentMbRefIdx {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fill a rectangular 4×4-block region within the current MB with
+    /// `ref_idx_l0`. The region is `(bx0..bx0+w) × (by0..by0+h)` in
+    /// 4×4-block coords. Invoke right after the partition's
+    /// `encode_ref_idx` so subsequent partitions in the same MB can see
+    /// it.
+    pub fn fill_region(&mut self, bx0: u8, by0: u8, w: u8, h: u8, ref_idx: i8) {
+        for dy in 0..h {
+            for dx in 0..w {
+                self.ref_idx_l0[block_pos_to_luma_idx(bx0 + dx, by0 + dy)] = ref_idx;
+            }
+        }
+    }
+}
+
+/// v1.4 Phase 4.5 (#316) — spec-correct bin 0 ctxIdxInc for `ref_idx_lX`
+/// (spec § 9.3.3.1.1.6 eq 9-14, with neighbouring partition derivation
+/// per spec § 6.4.11.7).
+///
+/// `cur_bx`, `cur_by`: current partition's top-left 4×4-block coordinates
+/// within the current MB (each 0..=3). For P/B 16×16 = (0,0). For P/B
+/// 16×8 partition 0 = (0,0), partition 1 = (0,2). For 8×16 = (0,0) /
+/// (2,0). For P_8x8 / B_8x8 sub-MBs `i` ∈ 0..4 = (2*(i&1), 2*(i>>1)).
+///
+/// Lookup convention:
+/// - **Left neighbour partition** is at (cur_bx-1, cur_by). If
+///   `cur_bx == 0` it lies in the LEFT MB at (3, cur_by) → cross-MB
+///   read. Else it lies inside the current MB → read from
+///   `current_mb`.
+/// - **Top neighbour partition** at (cur_bx, cur_by-1). If `cur_by == 0`
+///   → TOP MB at (cur_bx, 3). Else within current MB.
+///
+/// `condTermFlag = 0` if neighbour is unavailable / intra / has
+/// `ref_idx == 0`, else 1.
+pub fn compute_ref_idx_ctx_idx_inc_bin0(
+    current_mb: &CurrentMbRefIdx,
+    neighbors: &CabacNeighborContext,
+    mb_x: usize,
+    cur_bx: u8,
+    cur_by: u8,
+) -> u32 {
+    let cond_a: u32 = if cur_bx > 0 {
+        // Within-MB left neighbour. Already-emitted partition's
+        // ref_idx is in `current_mb`. condTermFlag = 1 iff ref != 0.
+        if current_mb.ref_idx_l0[block_pos_to_luma_idx(cur_bx - 1, cur_by)] != 0 { 1 } else { 0 }
+    } else {
+        match neighbors.neighbor_a(mb_x) {
+            None => 0,
+            Some(mb) if mb.mb_type.is_skip() || mb.mb_type.is_intra() => 0,
+            Some(mb) => {
+                let blk = block_pos_to_luma_idx(3, cur_by);
+                if mb.ref_idx_l0[blk] == 0 { 0 } else { 1 }
+            }
+        }
+    };
+    let cond_b: u32 = if cur_by > 0 {
+        if current_mb.ref_idx_l0[block_pos_to_luma_idx(cur_bx, cur_by - 1)] != 0 { 1 } else { 0 }
+    } else {
+        match neighbors.neighbor_b(mb_x) {
+            None => 0,
+            Some(mb) if mb.mb_type.is_skip() || mb.mb_type.is_intra() => 0,
+            Some(mb) => {
+                let blk = block_pos_to_luma_idx(cur_bx, 3);
+                if mb.ref_idx_l0[blk] == 0 { 0 } else { 1 }
+            }
+        }
+    };
+    cond_a + 2 * cond_b
 }
 
 /// Compute ctxIdxInc for `mb_qp_delta` bin 0 (spec § 9.3.3.1.1.5).

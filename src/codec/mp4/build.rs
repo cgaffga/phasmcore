@@ -9,7 +9,7 @@
 //! `HandbrakeX264` profile lands phasm output inside the HandBrake/x264
 //! converter-pipeline metaclass — the largest single container metaclass on
 //! the open internet (Agent B 2026-05-02 + strategy doc
-//! `docs/design/h264-stealth-strategy.md`).
+//! `docs/design/video/h264/stealth-strategy.md`).
 //!
 //! Distinct from [`super::mux`], which patches an existing source MP4 by
 //! copying its `moov` and substituting modified samples — that path makes
@@ -760,7 +760,7 @@ fn build_video_trak_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
 /// the IDR from display output and producing a 1-frame
 /// presentation-time shift that read as ~5–10 dB Y-PSNR vs source.
 ///
-/// See `docs/design/h264-encoder-quality-perf-gap-2026-05-04.md`.
+/// See `docs/design/video/h264/encoder-quality-perf-gap-2026-05-04.md`.
 ///
 /// Kept around as `_unused` for diff readability — caller never invokes.
 #[allow(dead_code)]

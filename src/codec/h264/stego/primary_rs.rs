@@ -13,7 +13,7 @@
 //! decoder STC-extracts as usual, then RS-decodes to recover the
 //! framed message.
 //!
-//! See `docs/design/h264-shadow-messages.md` § "§6E-C2 polish" for
+//! See `docs/design/video/h264/shadow-messages.md` § "§6E-C2 polish" for
 //! the full architecture.
 //!
 //! ## Status (this commit — utility only)

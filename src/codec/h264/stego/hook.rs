@@ -17,7 +17,7 @@
 //! The traits are intentionally distinct: a concrete hook
 //! implementation belongs to exactly one pass, and the encoder only
 //! invokes the contract that is meaningful for the pass it is in.
-//! See `docs/design/h264-encoder-algorithms/stego-encode-time-architecture.md`
+//! See `docs/design/video/h264/encoder-algorithms/stego-encode-time-architecture.md`
 //! § 6 for rationale.
 //!
 //! [`PositionKey`] is a 64-bit packed integer so per-position

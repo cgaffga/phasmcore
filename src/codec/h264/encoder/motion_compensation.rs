@@ -12,7 +12,7 @@
 //! edges via `Clip3(0, width−1, …)` — replicating edge pixels for
 //! out-of-bounds MVs.
 //!
-//! Algorithm note: docs/design/h264-encoder-algorithms/motion-compensation.md
+//! Algorithm note: docs/design/video/h264/encoder-algorithms/motion-compensation.md
 
 use super::motion_estimation::MotionVector;
 use super::reference_buffer::ReconFrame;

@@ -27,7 +27,7 @@
 //!   - [`positions`] — position tracker that emits `PositionKey`s during parse
 //!   - [`slice`] — top-level slice walker
 //!
-//! See `docs/design/h264-encoder-algorithms/stego-encode-time-architecture.md`
+//! See `docs/design/video/h264/encoder-algorithms/stego-encode-time-architecture.md`
 //! § A3 for scope rationale and § 12 ("6D.2 — slice boundary handling")
 //! for the single-slice constraint that this decoder honours.
 

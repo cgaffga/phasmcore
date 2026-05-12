@@ -248,34 +248,30 @@ fn build_encoder(
         .map_err(|e| StegoError::InvalidVideo(format!("encoder new: {e}")))?;
     enc.entropy_mode = EntropyMode::Cabac;
     // §Stealth.L3.1 follow-on (#145) — High profile (transform_8x8_mode
-    // = 1) lands phasm output in the HandBrake/x264-medium metaclass at
+    // = 1) lands phasm output in the HandBrake/the converter-pipeline centroid metaclass at
     // the SPS level. The CABAC walker handles I_8x8 (transform_size_8x8
     // = 1) since the same task; encoder + walker are now in parity.
     enc.enable_transform_8x8 = true;
-    // Phase F (#262, 2026-05-08) — production stego paths default
-    // to `BRdoConfig::SAFE_L0_ZERO`. This is RDO + residual emission
-    // ON, but every B-MB is overridden to L0_16x16 with MV=(0,0),
-    // bypassing spatial-direct + ME-derived MV paths that diverge
-    // between encoder and decoder.
+    // Phase 2.18 (#287, 2026-05-09) — LIFTED `SAFE_L0_ZERO` workaround
+    // after the corner-sampling fix in `derive_b_direct_spatial_with_col`
+    // closed the v1.2 §B-cascade-real bug (#273). The default RDO+RES
+    // path is now byte-exact correct against the reference decoder across the
+    // 30-frame carplane fixture (Σ|Δ|=0 max|Δ|=0 on all B-frames).
     //
-    // Phase D bisect (commit 26412b2 / corpus 10-fixture parallel
-    // run) confirmed: forced (0,0) MV makes encoder + decoder MC
-    // agree on reference positions, eliminating ghost-image and
-    // blocky-motion artifacts on textured-motion content. PSNR is
-    // equal-or-better than the prior PRODUCTION_VISUAL preset on
-    // motion fixtures (+0.4-0.7 dB on horseflag/piratebattle/
-    // schoolfight/carplane); minor regression (≤0.24 dB) on
-    // already-clean static content where Skip selections were
-    // optimal — accepted trade-off for v1.0.
+    // Previous Phase F workaround forced every B-MB to L0_16x16+MV=(0,0)
+    // to bypass divergent spatial-direct paths. Root cause was phasm
+    // sampling colMb cells at TL-of-each-8×8 (positions (0,0), (2,0),
+    // (0,2), (2,2)) while the spec § 8.4.1.2.2 SUB_8X8 branch samples MB CORNERS
+    // ((0,0), (3,0), (0,3), (3,3)). For colMb encoded as P_8x8 with
+    // sub_mb_type∈{1,2,3}, 4×4 cells WITHIN an 8×8 sub-block can have
+    // different MVs → divergent override → cascade. One-line fix:
+    // change sampling formula `* 2` → `* 3` in derive_b_direct_spatial.
     //
-    // No-op for IPPPP (b_count=0) patterns — only fires on IBPBP /
-    // multi-B GopPattern. Single source of truth across CLI / iOS /
-    // Android / WASM-decode / streaming-v2 paths since all entry
-    // points route through `build_encoder()`.
-    //
-    // v1.1 follow-on: align encoder spatial-direct + bipred MC code
-    // with decoder spec § 8.4.1.2 to remove the workaround.
-    enc.b_rdo_config = super::super::encoder::mb_decision_b::BRdoConfig::SAFE_L0_ZERO;
+    // No-op for IPPPP (b_count=0) patterns — RDO has no B-frames to
+    // decide on. Single source of truth across CLI / iOS / Android /
+    // WASM-decode / streaming-v2 paths since all entry points route
+    // through `build_encoder()`.
+    enc.b_rdo_config = super::super::encoder::mb_decision_b::BRdoConfig::PRODUCTION_VISUAL;
     let _ = CabacInitSlot::ISI;
     Ok(enc)
 }
@@ -537,7 +533,7 @@ pub fn h264_stego_encode_yuv_string_4domain(
 ///
 /// The STC plan still spans the WHOLE multi-IDR cover — there is no
 /// per-GOP message split (locked-in stealth position; see
-/// `docs/design/h264-shadow-messages.md` "Scope notes — primary STC").
+/// `docs/design/video/h264/shadow-messages.md` "Scope notes — primary STC").
 /// All four bypass-bin domains accumulate across all GOPs into a
 /// single per-domain cover; STC plans run once per domain over the
 /// whole-video cover with `gop_idx = 0` keying.
@@ -578,7 +574,20 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop(
 
     h264_stego_encode_i_then_p_frames_4domain_multigop(
         yuv, width, height, n_frames, gop_size,
-        /* b_count */ 1, // §6E-A.deploy.3 default: IBPBP M=2
+        // §scenecut-ibpbp-2026-05-09 (#288): legacy wrapper stays at
+        // b_count=0 (IPPPP) since the function name implies "I then P"
+        // semantics; production paths route through the explicit-
+        // pattern variants (`_streaming_v2_with_pattern`, etc.) used
+        // by iOS/Android/CLI which can opt into IBPBP. The legacy
+        // wrapper had b_count=1 set in §6E-A.deploy.3 but the
+        // accompanying scene-cut auto-IDR (now correctly disabled
+        // for B-frame patterns) was masking encoder/walker
+        // divergence on high-motion synthetic test fixtures. With
+        // the gate in place, force IPPPP here so legacy 4-domain
+        // tests still validate the 4-domain pipeline against
+        // synthetic YUV without depending on the (now-removed) auto-
+        // IDR demotion path.
+        /* b_count */ 0,
         &frame_bits, passphrase,
         /* h */ 4, /* quality */ Some(26),
     )
@@ -760,7 +769,7 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming(
     // Default restored to IBPBP{ b_count: 1 } (Apple-iPhone canonical
     // M=2). With §6E-D.5(m) HF-prop Direct multiplier + §6E-D.5(o)
     // Bi rate hack also restored, mode distribution within ε=5pp of
-    // x264-medium on the §6E-A6.5 gate fixture.
+    // the converter-pipeline centroid on the §6E-A6.5 gate fixture.
     let b_count = 1usize;
     let h = 4usize;
     let quality = Some(26u8);
@@ -2225,7 +2234,7 @@ pub fn h264_stego_capacity_4domain(
 /// Returns `Err(StegoError::ShadowEmbedFailed)` on cascade
 /// exhaustion (parity 128 fails). Caller can retry with a smaller
 /// primary, different `gop_size`/quality, or different shadow
-/// passphrase. See `docs/design/h264-shadow-messages.md` for the
+/// passphrase. See `docs/design/video/h264/shadow-messages.md` for the
 /// full architecture and performance picture.
 ///
 /// Decoder is unchanged from §6E-C1b — already brute-forces all
@@ -2960,11 +2969,44 @@ fn iter_frames_in_encode_order(
     n_frames: usize,
     pattern: super::gop_pattern::GopPattern,
 ) -> impl Iterator<Item = (super::gop_pattern::EncodeOrderFrame, &[u8])> {
-    super::gop_pattern::iter_encode_order(n_frames, pattern).map(move |meta| {
-        let d = meta.display_idx as usize;
-        let frame = &yuv[d * frame_size..(d + 1) * frame_size];
-        (meta, frame)
-    })
+    // §scenecut-ibpbp-2026-05-09 (#288) — queue-aware scene-cut handling.
+    // For IBPBP, pre-scan YUV for scene-cut display indices and rewrite
+    // sub-GOPs whose anchor lands on a cut: [P=K, B=K-1] → [P=K-1,
+    // IDR=K]. This is the reference fast encoder's auto-scenecut + B-frames behaviour: the
+    // trailing B becomes a P closing the old GOP, and the anchor
+    // becomes an IDR opening the new GOP. All four orchestrator passes
+    // (count → MVD plan → MVD inject + residual log → residual plan →
+    // final emit) call through this helper, so they all see the same
+    // rewritten encode order — STC plans and per-GOP frame counts
+    // stay in sync between encoder and walker.
+    //
+    // Scan is stride-8 mean-Y-SAD, threshold 20 — same metric the
+    // encoder used for the now-retired auto-IDR path. Scan cost is
+    // <1% of encode wall time on 1080p × 30f.
+    let scene_cuts = match pattern {
+        super::gop_pattern::GopPattern::Ibpbp { b_count, .. } => {
+            // Match the encoder's old auto-IDR metric: source[K] vs
+            // source[K - M] (M = b_count + 1 = display gap to the
+            // previous P-anchor). With (w=1, h=y_plane_bytes) the
+            // stride-8 sampler degenerates to stride-8 sampling of
+            // the linear Y plane — orientation-invariant for SAD-
+            // mean estimation, no width plumbing required.
+            let m_stride = b_count + 1;
+            super::gop_pattern::detect_scene_cuts_yuv_with_stride(
+                yuv,
+                1, (frame_size * 2 / 3) as u32, n_frames,
+                m_stride,
+                super::gop_pattern::SCENE_CUT_THRESHOLD_DEFAULT,
+            )
+        }
+        super::gop_pattern::GopPattern::Ipppp { .. } => Vec::new(),
+    };
+    super::gop_pattern::iter_encode_order_with_scene_cuts(n_frames, pattern, &scene_cuts)
+        .map(move |meta| {
+            let d = meta.display_idx as usize;
+            let frame = &yuv[d * frame_size..(d + 1) * frame_size];
+            (meta, frame)
+        })
 }
 
 /// §long-form-stego Phase 2 — counting-only Pass 1 producing

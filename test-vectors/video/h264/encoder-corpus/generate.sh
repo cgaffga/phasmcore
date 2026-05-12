@@ -12,8 +12,8 @@
 #   ./generate.sh videotoolbox # regenerate only VideoToolbox outputs
 #
 # Phase 6.0c — see:
-#   docs/design/h264-encoder-algorithms/fingerprint-regression.md
-#   docs/design/h264-encoder-algorithms/oracle-harness.md
+#   docs/design/video/h264/encoder-algorithms/fingerprint-regression.md
+#   docs/design/video/h264/encoder-algorithms/oracle-harness.md
 #
 # Add new clips: extend the MATRIX table below. Use deterministic
 # lavfi sources, include pix_fmt yuv420p for Baseline compatibility,

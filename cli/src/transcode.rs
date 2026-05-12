@@ -286,7 +286,7 @@ pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
 /// §Stealth.L4.* — output container profile selection. Drives whether
 /// the CLI muxes via the phasm-owned HandBrake/x264-medium builder or
 /// via ffmpeg passthrough. Default is `HandbrakeX264` because the
-/// strategy doc (`docs/design/h264-stealth-strategy.md`) names it as
+/// strategy doc (`docs/design/video/h264/stealth-strategy.md`) names it as
 /// the v1.0 ship target — output lands inside the libx264 container
 /// metaclass instead of phasm's own (per Yang/EVA + Altinisik).
 #[cfg(feature = "cabac-stego")]

@@ -29,6 +29,6 @@ allow-dirty = ["ci"]
 # distribution does not distribute executable encoder code. Users who want
 # CLI video stego must opt in at source-build time:
 #     cargo install phasm-cli --features h264-encoder
-# See docs/design/h264-video-steganography.md § "Patent licensing —
+# See docs/design/video/h264/video-steganography.md § "Patent licensing —
 # distribution plan".
 # ═════════════════════════════════════════════════════════════════════════════

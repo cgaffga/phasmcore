@@ -47,12 +47,105 @@
 //! its median. The MVDs encoded against an "encoder predicted 0"
 //! will reconstruct against a "decoder predicted real" → drift.
 //!
-//! See `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+//! See `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`
 //! § 6E-A6.0 deliverable 5 for the architectural rationale.
 
 use super::motion_estimation::MotionVector;
 use super::partition_state::{predict_mv_for_partition, EncoderMvGrid, REF_IDX_NONE};
 use super::reference_buffer::ColocatedMvGrid;
+
+/// §B-cascade-real Phase 2.7 (#272) — per-MB spatial/temporal direct
+/// trace record. Captures the full input state of the derivation +
+/// the computed MVs so a separate analysis pass can correlate
+/// max-deviation MBs (from `enc.visual_recon` vs reference-decoder output)
+/// with their derivation inputs and identify where phasm diverges
+/// from spec § 8.4.1.2.2 / § 8.4.1.2.3.
+///
+/// Gated by env var `PHASM_B_SPATIAL_DIRECT_TRACE`. Drained via
+/// [`drain_spatial_direct_traces`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpatialDirectTrace {
+    pub frame_idx: u32,
+    pub mb_x: u16,
+    pub mb_y: u16,
+    /// 0 = spatial-direct, 1 = temporal-direct.
+    pub kind: u8,
+    pub ref_idx_l0: i8,
+    pub ref_idx_l1: i8,
+    // Neighbour A (left) state per list.
+    pub a_l0_mv_x: i16,
+    pub a_l0_mv_y: i16,
+    pub a_l0_ref: i8,
+    pub a_l1_mv_x: i16,
+    pub a_l1_mv_y: i16,
+    pub a_l1_ref: i8,
+    // Neighbour B (above).
+    pub b_l0_mv_x: i16,
+    pub b_l0_mv_y: i16,
+    pub b_l0_ref: i8,
+    pub b_l1_mv_x: i16,
+    pub b_l1_mv_y: i16,
+    pub b_l1_ref: i8,
+    // Neighbour C (above-right with D fallback).
+    pub c_l0_mv_x: i16,
+    pub c_l0_mv_y: i16,
+    pub c_l0_ref: i8,
+    pub c_l1_mv_x: i16,
+    pub c_l1_mv_y: i16,
+    pub c_l1_ref: i8,
+    /// Whether C was the C-position (true) or fell back to D (false).
+    pub c_was_c: bool,
+    // Colocated cell at (mb_x, mb_y) in L1 reference's motion grid.
+    pub col_ref_idx_l0: i8,
+    pub col_mv_l0_x: i16,
+    pub col_mv_l0_y: i16,
+    pub col_zero_flag: bool,
+    /// True when the colMb grid was supplied; false → check skipped.
+    pub col_grid_present: bool,
+    // Output MVs.
+    pub out_mv_l0_x: i16,
+    pub out_mv_l0_y: i16,
+    pub out_mv_l1_x: i16,
+    pub out_mv_l1_y: i16,
+}
+
+static SPATIAL_DIRECT_TRACES: std::sync::OnceLock<std::sync::Mutex<Vec<SpatialDirectTrace>>> =
+    std::sync::OnceLock::new();
+
+fn spatial_direct_traces() -> &'static std::sync::Mutex<Vec<SpatialDirectTrace>> {
+    SPATIAL_DIRECT_TRACES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Phase 2.7 — drain accumulated spatial/temporal direct traces.
+pub fn drain_spatial_direct_traces() -> Vec<SpatialDirectTrace> {
+    let mut guard = spatial_direct_traces().lock().unwrap();
+    std::mem::take(&mut *guard)
+}
+
+fn push_spatial_direct_trace(trace: SpatialDirectTrace) {
+    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_none() {
+        return;
+    }
+    if let Ok(mut guard) = spatial_direct_traces().lock() {
+        guard.push(trace);
+    }
+}
+
+/// Helper: read the current B-frame's display index from the
+/// instrumentation atomic. Falls back to 0 if not set.
+fn current_frame_idx() -> u32 {
+    super::mb_decision_b::B_INSTRUMENT_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Helper: collapse `Option<(mv, ref)>` into `(mv_x, mv_y, ref)` with
+/// sentinel `(0, 0, REF_IDX_NONE)` when the neighbour is unavailable
+/// / intra.
+fn neighbour_to_tuple(n: Option<(MotionVector, i8)>) -> (i16, i16, i8) {
+    match n {
+        Some((mv, r)) => (mv.mv_x, mv.mv_y, r),
+        None => (0, 0, REF_IDX_NONE),
+    }
+}
 
 /// Result of running spatial-direct MV derivation at one MB.
 ///
@@ -61,15 +154,41 @@ use super::reference_buffer::ColocatedMvGrid;
 /// caller is expected to populate `EncoderMvGrid` accordingly:
 /// `Some((mv, ref_idx))` for active lists, `None` (i.e. clear that
 /// list at the rect) for inactive ones.
+///
+/// **Phase 2.12 (#275, 2026-05-08)**: extended with per-8×8 sub-block
+/// MVs to support spec § 8.4.1.2.2 step 6's per-sub-block colZeroFlag
+/// override. A spec-compliant decoder writes per-8×8 different MVs to
+/// its motion cache after override; matching that requires per-sub-block
+/// MC at the encoder.
+///
+/// `mv_l0` / `mv_l1` are the median-predictor MV (whole-MB). They
+/// represent the SHAPE of the spatial-direct result for legacy
+/// callers (RDO SATD evaluator etc.) that don't need sub-block
+/// granularity.
+///
+/// `mv_l0_per_8x8` / `mv_l1_per_8x8` are the per-8×8 sub-block MVs
+/// AFTER colZeroFlag override. Index 0 = top-left, 1 = top-right,
+/// 2 = bottom-left, 3 = bottom-right (raster order). Each sub-block
+/// has either the median MV (if colMb's corresponding 8×8 was moving)
+/// or `(0, 0)` (if static AND ref_idx == 0). For backward compat,
+/// these arrays are filled with `mv_l0` / `mv_l1` when no override
+/// applies — so per-sub-block consumers can blindly iterate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BDirectSpatialResult {
     /// L0 MV + ref_idx for the whole MB. `ref_idx == -1` means L0 is
-    /// inactive and `mv` is meaningless.
+    /// inactive and `mv` is meaningless. Equals top-left 8×8 sub-block's
+    /// post-override MV (matches legacy uniform-MB callers' assumption).
     pub mv_l0: MotionVector,
     pub ref_idx_l0: i8,
     /// L1 MV + ref_idx for the whole MB.
     pub mv_l1: MotionVector,
     pub ref_idx_l1: i8,
+    /// Per-8×8 sub-block MVs for L0 list. Index = i8 in raster order
+    /// (TL/TR/BL/BR). Always populated; equal to `mv_l0` everywhere
+    /// when no per-sub-block override applies.
+    pub mv_l0_per_8x8: [MotionVector; 4],
+    /// Per-8×8 sub-block MVs for L1 list.
+    pub mv_l1_per_8x8: [MotionVector; 4],
 }
 
 impl BDirectSpatialResult {
@@ -84,6 +203,18 @@ impl BDirectSpatialResult {
     /// Convenience: bipred (both lists active).
     pub fn is_bipred(&self) -> bool {
         self.uses_l0() && self.uses_l1()
+    }
+    /// Phase 2.12 (#275) — true if any 8×8 sub-block's MV differs
+    /// from `mv_l0` (= colZeroFlag override fired on at least one
+    /// sub-block). When false, callers can treat this as legacy
+    /// uniform-MB result.
+    pub fn has_per_8x8_override_l0(&self) -> bool {
+        self.mv_l0_per_8x8.iter().any(|m| *m != self.mv_l0)
+    }
+    /// Phase 2.12 (#275) — true if any 8×8 sub-block's L1 MV differs
+    /// from `mv_l1`.
+    pub fn has_per_8x8_override_l1(&self) -> bool {
+        self.mv_l1_per_8x8.iter().any(|m| *m != self.mv_l1)
     }
 }
 
@@ -193,67 +324,207 @@ pub fn derive_b_direct_spatial_with_col(
             ref_idx_l0: 0,
             mv_l1: MotionVector::ZERO,
             ref_idx_l1: 0,
+            mv_l0_per_8x8: [MotionVector::ZERO; 4],
+            mv_l1_per_8x8: [MotionVector::ZERO; 4],
         };
     }
 
-    // Spec § 8.4.1.2.2 step 6: derive colZeroFlag from the L1
-    // reference's co-located MB. Only meaningful when the colMb
-    // grid is available (P-frame DPB snapshot via promote_with_motion).
-    let col_zero_flag = l1_motion_grid
-        .map(|g| {
-            // Out-of-bounds = treat as moving (conservative;
-            // shouldn't happen in practice as mb_x/mb_y are within
-            // the picture).
-            if mb_x as u32 >= g.mb_w || mb_y as u32 >= g.mb_h {
-                return false;
-            }
-            let cell = g.get(mb_x as u32, mb_y as u32);
-            // Intra colMb → colZeroFlag = 0 (= moving).
-            if cell.ref_idx_l0 < 0 {
-                return false;
-            }
-            // Static check: ref_idx_l0 == 0 AND
-            // |mv_l0| ≤ 1 quarter-pel unit. Per spec § 8.4.1.2.2:
-            // "the reference index … is equal to 0 … and the absolute
-            // value of any component of the motion vector … is not
-            // greater than 1 in quarter sample units".
-            cell.ref_idx_l0 == 0
-                && cell.mv_l0_x.abs() <= 1
-                && cell.mv_l0_y.abs() <= 1
-        })
-        .unwrap_or(false);
-
-    // For each active list, derive the MV via the standard median
-    // predictor over neighbours (§ 8.4.1.3). Then apply the
-    // colZeroFlag override per spec § 8.4.1.2.2 step 6: if
-    // refIdxLX == 0 AND colZeroFlag → mvLX = (0, 0).
+    // Compute the median predictor MV per list (whole-MB).
+    // Per spec § 8.4.1.2.2 step 5, this is the MV BEFORE colZeroFlag
+    // override. Then per-8×8 override may zero out specific sub-blocks
+    // per spec § 8.4.1.2.2 step 6.
     let tl_bx = mb_x * 4;
     let tl_by = mb_y * 4;
-    let mv_l0 = if ref_idx_l0 != REF_IDX_NONE {
-        if col_zero_flag && ref_idx_l0 == 0 {
-            MotionVector::ZERO
-        } else {
-            predict_mv_for_partition(grid, tl_bx, tl_by, /* part_w_4x4 */ 4, ref_idx_l0)
-        }
+    let median_mv_l0 = if ref_idx_l0 != REF_IDX_NONE {
+        predict_mv_for_partition(grid, tl_bx, tl_by, /* part_w_4x4 */ 4, ref_idx_l0)
     } else {
         MotionVector::ZERO
     };
-    let mv_l1 = if ref_idx_l1 != REF_IDX_NONE {
-        if col_zero_flag && ref_idx_l1 == 0 {
-            MotionVector::ZERO
-        } else {
-            predict_mv_for_partition_l1(grid, tl_bx, tl_by, ref_idx_l1)
-        }
+    let median_mv_l1 = if ref_idx_l1 != REF_IDX_NONE {
+        predict_mv_for_partition_l1(grid, tl_bx, tl_by, ref_idx_l1)
     } else {
         MotionVector::ZERO
     };
 
-    BDirectSpatialResult {
+    // Phase 2.12 (#275) — per-8×8 colZeroFlag check + override.
+    //
+    // Spec § 8.4.1.2.2 step 6: colZeroFlag is checked PER 8×8
+    // sub-block of the colocated MB. For each of 4 sub-blocks
+    // (raster order TL/TR/BL/BR):
+    //
+    //   if NOT INTRA(colMb sub-block i8) AND ref[L1][0] is NOT long_ref
+    //      AND ((l1ref0[xy8]==0 AND |l1mv0[xy4]|<=1 quarter-pel) OR
+    //           (l1ref0[xy8]<0 AND l1ref1[xy8]==0 AND |l1mv1[xy4]|<=1)):
+    //     // colZeroFlag fires for this sub-block
+    //     if ref_l0_b == 0: zero L0 MV at this sub-block
+    //     if ref_l1_b == 0: zero L1 MV at this sub-block
+    //
+    // We compute per-sub-block colZeroFlag bitmap, then build per-8×8
+    // MV arrays (zero where override fires, median elsewhere). The
+    // result struct's `mv_l0` / `mv_l1` are set to the TOP-LEFT
+    // sub-block's value for legacy callers (RDO SATD eval etc.).
+    let mut col_zero_flag_per_8x8 = [false; 4];
+    if let Some(g) = l1_motion_grid {
+        if (mb_x as u32) < g.mb_w && (mb_y as u32) < g.mb_h {
+            let mb_bx = mb_x as u32 * 4;
+            let mb_by = mb_y as u32 * 4;
+            for i8 in 0..4u32 {
+                // 8×8 sub-block i8 in raster: TL=0, TR=1, BL=2, BR=3.
+                //
+                // Phase 2.18 (#287, 2026-05-09) — sample at MB CORNERS
+                // (positions (0,0), (3,0), (0,3), (3,3) in colMb's 4×4
+                // grid) per the SUB_8X8 branch of the spec § 8.4.1.2.2
+                // colocated-MB scan:
+                //   xy4 = x8 * 3 + y8 * 3 * b4_stride
+                //
+                // For colMb encoded as P_8x8 with sub_mb_type∈{1,2,3}
+                // (SUB_8x4, SUB_4x8, SUB_4x4), 4×4 cells WITHIN an 8×8
+                // sub-block can have different MVs. The spec samples
+                // corner-of-each-8x8; phasm previously sampled
+                // TL-of-each-8x8 (= positions (0,0), (2,0), (0,2),
+                // (2,2)) — DIFFERENT cells in 3 of 4 sub-blocks. When
+                // colMb's per-4×4 MV varies within an 8×8, the
+                // override decision diverged from the spec → divergent
+                // grid → divergent bs at MB-edge deblock → visible
+                // cascade at rows 14-15 of B-Skip MBs.
+                let sub_bx = mb_bx + (i8 & 1) * 3;
+                let sub_by = mb_by + (i8 >> 1) * 3;
+                let cell = g.get_4x4(sub_bx, sub_by);
+                if cell.ref_idx_l0 < 0 {
+                    // Intra colMb sub-block → no override.
+                    continue;
+                }
+                if cell.ref_idx_l0 == 0
+                    && cell.mv_l0_x.abs() <= 1
+                    && cell.mv_l0_y.abs() <= 1
+                {
+                    col_zero_flag_per_8x8[i8 as usize] = true;
+                }
+                // Note: spec also has the L1-ref0-static branch but
+                // for our IBPBP M=2 the colMb is a P-frame which only
+                // has L0 motion (no L1). The L1-branch never fires.
+            }
+        }
+    }
+
+    // Build per-8×8 sub-block MV arrays: zero where override fires
+    // (and ref_idx == 0 for that list), median otherwise.
+    let mut mv_l0_per_8x8 = [median_mv_l0; 4];
+    let mut mv_l1_per_8x8 = [median_mv_l1; 4];
+    for i8 in 0..4 {
+        if col_zero_flag_per_8x8[i8] {
+            if ref_idx_l0 == 0 {
+                mv_l0_per_8x8[i8] = MotionVector::ZERO;
+            }
+            if ref_idx_l1 == 0 {
+                mv_l1_per_8x8[i8] = MotionVector::ZERO;
+            }
+        }
+    }
+
+    // Inactive lists: clear per-sub-block to zero (the ref will be
+    // REF_IDX_NONE so MC won't use them anyway).
+    if ref_idx_l0 == REF_IDX_NONE {
+        mv_l0_per_8x8 = [MotionVector::ZERO; 4];
+    }
+    if ref_idx_l1 == REF_IDX_NONE {
+        mv_l1_per_8x8 = [MotionVector::ZERO; 4];
+    }
+
+    // Legacy mv_l0 / mv_l1 fields reflect the TOP-LEFT (i8=0) sub-block's
+    // post-override MV. This matches the spec-compliant decoder behaviour
+    // for callers that only inspect the MB-level result (e.g., RDO SATD
+    // eval) — they see the same per-8×8-aware result as long as the MB is
+    // uniform (= no override). For mixed-override MBs the top-left value
+    // is the best single-MV approximation (= median if top-left wasn't
+    // overridden, zero if it was).
+    let mv_l0 = mv_l0_per_8x8[0];
+    let mv_l1 = mv_l1_per_8x8[0];
+
+    let result = BDirectSpatialResult {
         mv_l0,
         ref_idx_l0,
         mv_l1,
         ref_idx_l1,
+        mv_l0_per_8x8,
+        mv_l1_per_8x8,
+    };
+
+    // Phase 2.7 trace: keep a backward-compat `col_zero_flag` for
+    // the dump (true iff ANY sub-block fired override).
+    let col_zero_flag = col_zero_flag_per_8x8.iter().any(|&v| v);
+    let _ = col_zero_flag;
+
+    // Phase 2.7 (#272) — emit a trace row when env-gated. Captures
+    // the full input state (neighbour MVs/refs for A/B/C on both
+    // lists, colocated cell, colZeroFlag) plus the derived output
+    // so an analysis pass can correlate max-deviation MBs with the
+    // exact derivation inputs and locate where phasm's algorithm
+    // diverges from spec § 8.4.1.2.2.
+    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_some() {
+        let tl_bx_isize = (mb_x * 4) as isize;
+        let tl_by_isize = (mb_y * 4) as isize;
+        let a_l0 = neighbour_to_tuple(grid.get_l0(tl_bx_isize - 1, tl_by_isize));
+        let b_l0 = neighbour_to_tuple(grid.get_l0(tl_bx_isize, tl_by_isize - 1));
+        let c_was_c = grid.is_decoded(tl_bx_isize + 4, tl_by_isize - 1);
+        let c_l0 = if c_was_c {
+            neighbour_to_tuple(grid.get_l0(tl_bx_isize + 4, tl_by_isize - 1))
+        } else {
+            neighbour_to_tuple(grid.get_l0(tl_bx_isize - 1, tl_by_isize - 1))
+        };
+        let a_l1 = neighbour_to_tuple(grid.get_l1(tl_bx_isize - 1, tl_by_isize));
+        let b_l1 = neighbour_to_tuple(grid.get_l1(tl_bx_isize, tl_by_isize - 1));
+        let c_l1 = if c_was_c {
+            neighbour_to_tuple(grid.get_l1(tl_bx_isize + 4, tl_by_isize - 1))
+        } else {
+            neighbour_to_tuple(grid.get_l1(tl_bx_isize - 1, tl_by_isize - 1))
+        };
+        let (col_ref_idx_l0, col_mv_l0_x, col_mv_l0_y) = match l1_motion_grid {
+            Some(g) if (mb_x as u32) < g.mb_w && (mb_y as u32) < g.mb_h => {
+                let cell = g.get(mb_x as u32, mb_y as u32);
+                (cell.ref_idx_l0, cell.mv_l0_x, cell.mv_l0_y)
+            }
+            _ => (REF_IDX_NONE, 0, 0),
+        };
+        push_spatial_direct_trace(SpatialDirectTrace {
+            frame_idx: current_frame_idx(),
+            mb_x: mb_x as u16,
+            mb_y: mb_y as u16,
+            kind: 0, // spatial
+            ref_idx_l0,
+            ref_idx_l1,
+            a_l0_mv_x: a_l0.0,
+            a_l0_mv_y: a_l0.1,
+            a_l0_ref: a_l0.2,
+            a_l1_mv_x: a_l1.0,
+            a_l1_mv_y: a_l1.1,
+            a_l1_ref: a_l1.2,
+            b_l0_mv_x: b_l0.0,
+            b_l0_mv_y: b_l0.1,
+            b_l0_ref: b_l0.2,
+            b_l1_mv_x: b_l1.0,
+            b_l1_mv_y: b_l1.1,
+            b_l1_ref: b_l1.2,
+            c_l0_mv_x: c_l0.0,
+            c_l0_mv_y: c_l0.1,
+            c_l0_ref: c_l0.2,
+            c_l1_mv_x: c_l1.0,
+            c_l1_mv_y: c_l1.1,
+            c_l1_ref: c_l1.2,
+            c_was_c,
+            col_ref_idx_l0,
+            col_mv_l0_x,
+            col_mv_l0_y,
+            col_zero_flag,
+            col_grid_present: l1_motion_grid.is_some(),
+            out_mv_l0_x: mv_l0.mv_x,
+            out_mv_l0_y: mv_l0.mv_y,
+            out_mv_l1_x: mv_l1.mv_x,
+            out_mv_l1_y: mv_l1.mv_y,
+        });
     }
+
+    result
 }
 
 /// §B-direct-fix.v3 — temporal-direct MV derivation per spec
@@ -304,75 +575,143 @@ pub fn derive_b_direct_temporal(
         ref_idx_l0: 0,
         mv_l1: MotionVector::ZERO,
         ref_idx_l1: 0,
+        mv_l0_per_8x8: [MotionVector::ZERO; 4],
+        mv_l1_per_8x8: [MotionVector::ZERO; 4],
     };
 
-    let grid = match l1_motion_grid {
-        Some(g) => g,
-        None => return zero,
-    };
-    if mb_x as u32 >= grid.mb_w || mb_y as u32 >= grid.mb_h {
-        return zero;
+    // Collect inputs for the optional trace path (Phase 2.7 #272).
+    let mut col_ref_idx_l0_trace: i8 = REF_IDX_NONE;
+    let mut col_mv_l0_x_trace: i16 = 0;
+    let mut col_mv_l0_y_trace: i16 = 0;
+    let col_grid_present = l1_motion_grid.is_some();
+
+    let result = (|| {
+        let grid = match l1_motion_grid {
+            Some(g) => g,
+            None => return zero,
+        };
+        if mb_x as u32 >= grid.mb_w || mb_y as u32 >= grid.mb_h {
+            return zero;
+        }
+        let cell = grid.get(mb_x as u32, mb_y as u32);
+        col_ref_idx_l0_trace = cell.ref_idx_l0;
+        col_mv_l0_x_trace = cell.mv_l0_x;
+        col_mv_l0_y_trace = cell.mv_l0_y;
+        if cell.ref_idx_l0 < 0 {
+            return zero;
+        }
+
+        let mv_col_x = cell.mv_l0_x as i32;
+        let mv_col_y = cell.mv_l0_y as i32;
+
+        // §B-direct-fix.v3 2026-05-07 — near-zero colMb override.
+        // Spec § 8.4.1.2.2 step 6 (colZeroFlag) exists for spatial-direct
+        // but NOT for temporal-direct (§ 8.4.1.2.3 has no equivalent).
+        // Empirical: on motion boundaries, P-frame ME picks a spurious
+        // sub-pixel MV (|mv|≤1 quarter-pel = ≤0.25 px) for "static" wall
+        // MBs at the kid's silhouette — SAD/SATD finds a tiny win by
+        // aligning silhouette gradient slightly. Without this override,
+        // temporal-direct faithfully scales the noise → mvL0 ≈ ±mvCol/2
+        // → wall MB pulls 4-5 px of texture from the adjacent foreground
+        // → "pants pixels spill out onto the wall" (user 2026-05-07).
+        // Real-world consumer encoders sidestep this via aggressive RDO
+        // that picks L0/L1/Bi at motion boundaries; phasm currently picks
+        // Direct 99% of B-MBs and so MUST override the noise here.
+        // Match the spec colZeroFlag's |mv|≤1 quarter-pel threshold and
+        // ref_idx==0 condition (single-ref IBPBP M=2 always sees ref=0).
+        if cell.ref_idx_l0 == 0 && mv_col_x.abs() <= 1 && mv_col_y.abs() <= 1 {
+            return zero;
+        }
+
+        let td = (poc_l1 - poc_l0).clamp(-128, 127);
+        let tb = (poc_curr - poc_l0).clamp(-128, 127);
+        if td == 0 {
+            return zero;
+        }
+
+        // Spec § 8.4.1.2.3 eq 8-203 / 8-204 / 8-205:
+        //   tx = (16384 + Abs(td / 2)) / td
+        //   DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
+        //   mvLX = (DistScaleFactor * mvCol + 128) >> 8
+        let tx = (16384 + (td.abs() / 2)) / td;
+        let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
+
+        let mv_l0 = MotionVector {
+            mv_x: ((dsf * mv_col_x + 128) >> 8) as i16,
+            mv_y: ((dsf * mv_col_y + 128) >> 8) as i16,
+        };
+        let mv_l1 = MotionVector {
+            mv_x: (mv_l0.mv_x as i32 - mv_col_x) as i16,
+            mv_y: (mv_l0.mv_y as i32 - mv_col_y) as i16,
+        };
+
+        BDirectSpatialResult {
+            mv_l0,
+            ref_idx_l0: 0,
+            mv_l1,
+            ref_idx_l1: 0,
+            // Temporal-direct doesn't have a colZeroFlag override
+            // per spec § 8.4.1.2.3 (only spatial-direct has it).
+            // So per-8×8 MVs are uniform = mv_l0/mv_l1.
+            mv_l0_per_8x8: [mv_l0; 4],
+            mv_l1_per_8x8: [mv_l1; 4],
+        }
+    })();
+
+    // Phase 2.7 (#272) — temporal-direct trace. Neighbour fields
+    // are unused in the temporal path (no median over A/B/C); they
+    // are populated with REF_IDX_NONE sentinels.
+    if std::env::var_os("PHASM_B_SPATIAL_DIRECT_TRACE").is_some() {
+        push_spatial_direct_trace(SpatialDirectTrace {
+            frame_idx: current_frame_idx(),
+            mb_x: mb_x as u16,
+            mb_y: mb_y as u16,
+            kind: 1, // temporal
+            ref_idx_l0: result.ref_idx_l0,
+            ref_idx_l1: result.ref_idx_l1,
+            a_l0_mv_x: 0,
+            a_l0_mv_y: 0,
+            a_l0_ref: REF_IDX_NONE,
+            a_l1_mv_x: 0,
+            a_l1_mv_y: 0,
+            a_l1_ref: REF_IDX_NONE,
+            b_l0_mv_x: 0,
+            b_l0_mv_y: 0,
+            b_l0_ref: REF_IDX_NONE,
+            b_l1_mv_x: 0,
+            b_l1_mv_y: 0,
+            b_l1_ref: REF_IDX_NONE,
+            c_l0_mv_x: 0,
+            c_l0_mv_y: 0,
+            c_l0_ref: REF_IDX_NONE,
+            c_l1_mv_x: 0,
+            c_l1_mv_y: 0,
+            c_l1_ref: REF_IDX_NONE,
+            c_was_c: false,
+            col_ref_idx_l0: col_ref_idx_l0_trace,
+            col_mv_l0_x: col_mv_l0_x_trace,
+            col_mv_l0_y: col_mv_l0_y_trace,
+            col_zero_flag: false, // not applicable to temporal
+            col_grid_present,
+            out_mv_l0_x: result.mv_l0.mv_x,
+            out_mv_l0_y: result.mv_l0.mv_y,
+            out_mv_l1_x: result.mv_l1.mv_x,
+            out_mv_l1_y: result.mv_l1.mv_y,
+        });
     }
-    let cell = grid.get(mb_x as u32, mb_y as u32);
-    if cell.ref_idx_l0 < 0 {
-        return zero;
-    }
 
-    let mv_col_x = cell.mv_l0_x as i32;
-    let mv_col_y = cell.mv_l0_y as i32;
-
-    // §B-direct-fix.v3 2026-05-07 — near-zero colMb override.
-    // Spec § 8.4.1.2.2 step 6 (colZeroFlag) exists for spatial-direct
-    // but NOT for temporal-direct (§ 8.4.1.2.3 has no equivalent).
-    // Empirical: on motion boundaries, P-frame ME picks a spurious
-    // sub-pixel MV (|mv|≤1 quarter-pel = ≤0.25 px) for "static" wall
-    // MBs at the kid's silhouette — SAD/SATD finds a tiny win by
-    // aligning silhouette gradient slightly. Without this override,
-    // temporal-direct faithfully scales the noise → mvL0 ≈ ±mvCol/2
-    // → wall MB pulls 4-5 px of texture from the adjacent foreground
-    // → "pants pixels spill out onto the wall" (user 2026-05-07).
-    // Real-world consumer encoders sidestep this via aggressive RDO
-    // that picks L0/L1/Bi at motion boundaries; phasm currently picks
-    // Direct 99% of B-MBs and so MUST override the noise here.
-    // Match the spec colZeroFlag's |mv|≤1 quarter-pel threshold and
-    // ref_idx==0 condition (single-ref IBPBP M=2 always sees ref=0).
-    if cell.ref_idx_l0 == 0 && mv_col_x.abs() <= 1 && mv_col_y.abs() <= 1 {
-        return zero;
-    }
-
-    let td = (poc_l1 - poc_l0).clamp(-128, 127);
-    let tb = (poc_curr - poc_l0).clamp(-128, 127);
-    if td == 0 {
-        return zero;
-    }
-
-    // Spec § 8.4.1.2.3 eq 8-203 / 8-204 / 8-205:
-    //   tx = (16384 + Abs(td / 2)) / td
-    //   DistScaleFactor = Clip3(-1024, 1023, (tb*tx + 32) >> 6)
-    //   mvLX = (DistScaleFactor * mvCol + 128) >> 8
-    let tx = (16384 + (td.abs() / 2)) / td;
-    let dsf = ((tb * tx + 32) >> 6).clamp(-1024, 1023);
-
-    let mv_l0 = MotionVector {
-        mv_x: ((dsf * mv_col_x + 128) >> 8) as i16,
-        mv_y: ((dsf * mv_col_y + 128) >> 8) as i16,
-    };
-    let mv_l1 = MotionVector {
-        mv_x: (mv_l0.mv_x as i32 - mv_col_x) as i16,
-        mv_y: (mv_l0.mv_y as i32 - mv_col_y) as i16,
-    };
-
-    BDirectSpatialResult {
-        mv_l0,
-        ref_idx_l0: 0,
-        mv_l1,
-        ref_idx_l1: 0,
-    }
+    result
 }
 
 /// §6E-A6.1 — public wrapper over [`predict_mv_for_partition_l1`]
 /// so encoder.rs (and the §6E-A6.1 walker) can compute L1 MVD
 /// predictors without re-implementing the median logic.
+///
+/// Note: this hardcodes a 16×16 partition shape (no `mb_part_idx`,
+/// no per-shape C-block position). For partitioned mb_types
+/// (16×8 / 8×16 / 8×8) call [`predict_mv_for_mb_partition_l1`]
+/// instead, which mirrors L0's `predict_mv_for_mb_partition` with
+/// spec § 8.4.1.3.1 directional shortcuts.
 pub fn predict_mv_for_partition_l1_pub(
     grid: &EncoderMvGrid,
     tl_bx: usize,
@@ -380,6 +719,105 @@ pub fn predict_mv_for_partition_l1_pub(
     current_ref_idx: i8,
 ) -> MotionVector {
     predict_mv_for_partition_l1(grid, tl_bx, tl_by, current_ref_idx)
+}
+
+/// §B-cascade-real Phase 2 (#267) — L1-list MV predictor for a
+/// partitioned mb_type's partition (16×8 / 8×16 / 16×16).
+///
+/// Mirrors L0's [`super::partition_state::predict_mv_for_mb_partition`]
+/// with spec § 8.4.1.3.1 directional shortcuts (B for 16×8 idx=0,
+/// A for idx=1, A for 8×16 idx=0, C for idx=1) but reads `grid.get_l1`
+/// instead of `grid.get` (= `grid.get_l0`). Required for symmetric
+/// L0/L1 MVD emission in B-slice partitioned mb_types 12/13/16/17
+/// where partition 0 is single-list (L0 or L1) and partition 1 is
+/// Bi: previously the L1 emit used the 16×16-shape `predict_mv_for_partition_l1_pub`
+/// which has neither directional shortcuts nor per-partition C-block
+/// position, causing PMV asymmetry vs spec-compliant decoders
+/// (max|Δ|=199 on motion content per #266 mismatch_y measurement).
+pub fn predict_mv_for_mb_partition_l1(
+    grid: &EncoderMvGrid,
+    tl_bx: usize,
+    tl_by: usize,
+    part_w_4x4: usize,
+    part_h_4x4: usize,
+    mb_part_idx: u8,
+    current_ref_idx: i8,
+) -> MotionVector {
+    let x = tl_bx as isize;
+    let y = tl_by as isize;
+    let a = grid.get_l1(x - 1, y);
+    let b = grid.get_l1(x, y - 1);
+    // D-fallback only when C is not-yet-decoded / off-frame; in-frame
+    // intra C is "available" (contributes mv=(0,0) per spec § 8.4.1.3
+    // and fails the ref-match check in directional shortcuts). Mirrors
+    // L0 path's logic exactly (task #154 root cause).
+    let c_bx = x + part_w_4x4 as isize;
+    let c_by = y - 1;
+    let c = if grid.is_decoded(c_bx, c_by) {
+        grid.get_l1(c_bx, c_by)
+    } else {
+        grid.get_l1(x - 1, y - 1)
+    };
+
+    // Spec § 8.4.1.3.1 directional shortcuts — mirror of the L0
+    // path's logic. Only P_16x8 (4×2 in 4×4 units) and P_8x16 (2×4).
+    if part_w_4x4 == 4 && part_h_4x4 == 2 {
+        if mb_part_idx == 0 {
+            if let Some((mv, r)) = b
+                && r == current_ref_idx {
+                    return mv;
+                }
+        } else if let Some((mv, r)) = a
+            && r == current_ref_idx {
+                return mv;
+            }
+    } else if part_w_4x4 == 2 && part_h_4x4 == 4 {
+        if mb_part_idx == 0 {
+            if let Some((mv, r)) = a
+                && r == current_ref_idx {
+                    return mv;
+                }
+        } else if let Some((mv, r)) = c
+            && r == current_ref_idx {
+                return mv;
+            }
+    }
+
+    // Fall through to the general median predictor (mirrors L0's
+    // call to `predict_mv_for_partition`).
+    let availability = [a.is_some(), b.is_some(), c.is_some()];
+    let avail_count: u8 = availability.iter().map(|&v| v as u8).sum();
+    if avail_count == 1
+        && let Some((mv, _)) = a.or(b).or(c)
+    {
+        return mv;
+    }
+
+    // Single-matching-ref_idx special case.
+    let matches: [Option<MotionVector>; 3] = [
+        a.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+        b.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+        c.and_then(|(mv, r)| if r == current_ref_idx { Some(mv) } else { None }),
+    ];
+    let match_count: u8 = matches.iter().map(|m| m.is_some() as u8).sum();
+    if match_count == 1
+        && let Some(mv) = matches.iter().find_map(|m| *m)
+    {
+        return mv;
+    }
+
+    // General median over A/B/C with partition-aware C position.
+    // Use the canonical `median3` (sibling to L0's
+    // `predict_mv_for_partition`); the inline 3-element-median
+    // implementation that originally lived here was a buggy
+    // formula returning `p` whenever `p` was the maximum.
+    let la = a.map(|(m, _)| m).unwrap_or_default();
+    let lb = b.map(|(m, _)| m).unwrap_or_default();
+    let lc = c.map(|(m, _)| m).unwrap_or_default();
+    MotionVector {
+        mv_x: median3(la.mv_x, lb.mv_x, lc.mv_x),
+        mv_y: median3(la.mv_y, lb.mv_y, lc.mv_y),
+    }
 }
 
 /// L1-view median MV predictor for a 16x16 partition. Mirrors

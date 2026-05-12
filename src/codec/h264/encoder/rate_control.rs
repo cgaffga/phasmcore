@@ -18,7 +18,7 @@
 //!   - `RateController` — holds the chosen CRF + flag for auto-match.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/quality-model.md
+//!   docs/design/video/h264/encoder-algorithms/quality-model.md
 
 use crate::codec::h264::sps::{Pps, Sps};
 
@@ -173,7 +173,27 @@ impl RateController {
         match frame_type {
             FrameType::I => base,
             FrameType::P => (base as i32 + 1).clamp(0, 51) as u8,
-            FrameType::B => (base as i32 + 2).clamp(0, 51) as u8,
+            FrameType::B => {
+                // §B-quality-experiment 2026-05-09 — env override for the
+                // B-frame QP offset experiment (#290 follow-on). The +2
+                // default suppresses near-zero residual coefficients to
+                // hit skip-eligible MB share, but on textured-motion
+                // content it ALSO suppresses the texture-grain coefficients
+                // that perceptually matter. PHASM_B_QP=N overrides to
+                // absolute QP N (clamped 0..=51); PHASM_B_QP_OFFSET=±N
+                // adjusts the +2 default by ±N.
+                if let Some(qp) = std::env::var("PHASM_B_QP")
+                    .ok().and_then(|s| s.parse::<i32>().ok())
+                {
+                    qp.clamp(0, 51) as u8
+                } else if let Some(off) = std::env::var("PHASM_B_QP_OFFSET")
+                    .ok().and_then(|s| s.parse::<i32>().ok())
+                {
+                    (base as i32 + off).clamp(0, 51) as u8
+                } else {
+                    (base as i32 + 2).clamp(0, 51) as u8
+                }
+            }
         }
     }
 

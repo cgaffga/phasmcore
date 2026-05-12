@@ -5,7 +5,7 @@
 //! Rate-distortion optimization (RDO) primitives.
 //!
 //! Phase A.1 / B.2 of the H.264 encoder quality plan
-//! (`docs/design/h264-encoder-quality-plan.md`). Holds:
+//! (`docs/design/video/h264/encoder-quality-plan.md`). Holds:
 //!   - Lagrangian lambda tables for ME/SATD cost and for RDO mode
 //!     decision (Phase A.1),
 //!   - bit-accurate CAVLC size estimators (Phase B.2) — used by
@@ -1148,6 +1148,7 @@ mod tests {
 
         let choice = PMbChoice::P16x16 {
             mv: MotionVector { mv_x: 7, mv_y: -3 },
+            ref_idx_l0: 0,
         };
         let mut grid_a = EncoderMvGrid::new(4, 4);
         grid_a.fill(0, 0, 4, 4, MotionVector { mv_x: 1, mv_y: 1 }, 0);

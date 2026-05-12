@@ -16,7 +16,7 @@
 // > VPF specifically struggles when source GOP is a 1× multiple of
 // > second-pass GOP — matched GOP is the WEAKEST detection case.
 //
-// And the strategy doc (`docs/design/h264-stealth-strategy.md`):
+// And the strategy doc (`docs/design/video/h264/stealth-strategy.md`):
 //
 // > §Stealth.L3.4: encoder-fingerprint regression test. Run phasm
 // > output through (replicated) Yao 2017 SODB+skip-MB periodicity

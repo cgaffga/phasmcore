@@ -209,7 +209,7 @@ impl EncoderMvGrid {
     /// Snapshot the 4×4-block rectangle spanned by one macroblock so
     /// it can be restored after speculative writes (Phase A.2 scratch
     /// pattern for sub-MB median predictors — see
-    /// `docs/design/h264-encoder-quality-plan.md`). §6E-A6.0 captures
+    /// `docs/design/video/h264/encoder-quality-plan.md`). §6E-A6.0 captures
     /// both lists.
     pub fn snapshot_mb(&self, mb_x: usize, mb_y: usize) -> MbMvSnapshot {
         let base_bx = mb_x * 4;
@@ -318,25 +318,26 @@ impl EncoderMvGrid {
         self.decoded[by * self.width_4x4 + bx]
     }
 
-    /// §B-direct-fix — capture an MB-resolution snapshot of the L0
-    /// motion state for use as the next B-frame's `colMb` per spec
-    /// § 8.4.1.2.2.
+    /// §B-direct-fix — capture per-4×4 snapshot of the L0 motion
+    /// state for use as the next B-frame's `colMb` per spec § 8.4.1.2.2.
     ///
-    /// For each MB, samples the L0 MV+ref_idx at the top-left 4x4
-    /// block (= "MB partition 0, sub-MB 0" in spec terms — the
-    /// position spec uses for the colZeroFlag check at MB top-level).
-    /// Intra MBs (no L0 ref) → `ColocatedMvCell::INTRA`.
+    /// **Phase 2.11 (#272 follow-on, 2026-05-08)**: upgraded from
+    /// MB-level (top-left 4×4 only) to per-4×4 granularity. Required
+    /// for spec-compliant per-8×8 colZeroFlag check on B-frame
+    /// spatial-direct when P-frame has partitioned MBs (P_16x8 /
+    /// P_8x16 / P_8x8).
+    ///
+    /// For each 4×4 cell of each MB, samples the L0 MV+ref_idx from
+    /// the encoder's per-4×4 grid. Intra cells (no L0) → INTRA.
     pub fn to_colocated_grid(&self)
         -> super::reference_buffer::ColocatedMvGrid
     {
         let mb_w = (self.width_4x4 / 4) as u32;
         let mb_h = (self.height_4x4 / 4) as u32;
         let mut grid = super::reference_buffer::ColocatedMvGrid::new(mb_w, mb_h);
-        for mb_y in 0..mb_h {
-            for mb_x in 0..mb_w {
-                let bx = (mb_x * 4) as isize;
-                let by = (mb_y * 4) as isize;
-                let cell = match self.get_l0(bx, by) {
+        for by in 0..(mb_h * 4) {
+            for bx in 0..(mb_w * 4) {
+                let cell = match self.get_l0(bx as isize, by as isize) {
                     Some((mv, r)) => super::reference_buffer::ColocatedMvCell {
                         ref_idx_l0: r,
                         mv_l0_x: mv.mv_x,
@@ -344,7 +345,7 @@ impl EncoderMvGrid {
                     },
                     None => super::reference_buffer::ColocatedMvCell::INTRA,
                 };
-                grid.set(mb_x, mb_y, cell);
+                grid.set_4x4(bx, by, cell);
             }
         }
         grid
@@ -454,12 +455,41 @@ pub fn predict_mv_for_partition(
         grid.get(x - 1, y - 1) // D-fallback: C not available
     };
 
-    // Spec 8.4.1.3: if only one of A/B/C is available, that one is
-    // the predictor.
-    let availability = [a.is_some(), b.is_some(), c.is_some()];
+    // Spec 8.4.1.3: if only one of A/B/C is AVAILABLE (in-frame +
+    // decoded), that one is the predictor.
+    //
+    // v1.4 Phase 4.5 follow-up — distinguish "off-frame" (contributes
+    // nothing, triggers shortcut) from "in-frame intra / no L0"
+    // (contributes mv=(0,0) to median, does NOT trigger shortcut).
+    // Phasm previously conflated both via `grid.get(...).is_some()`
+    // because grid.get returns None for both; this matches phasm's
+    // walker but DIVERGES from spec § 8.4.1.3.1's partition-availability
+    // rule which checks PART_NOT_AVAILABLE separately from LIST_NOT_USED
+    // (intra/skip).
+    // Spec: in-frame intra is "available" with mvLX=(0,0), refIdxLX=-1.
+    let a_in_frame = grid.is_decoded(x - 1, y);
+    let b_in_frame = grid.is_decoded(x, y - 1);
+    // C-or-D in-frame iff D fallback site is decoded (D is at (x-1,
+    // y-1) — off-frame if x==0 OR y==0). For "C decoded directly",
+    // grid.is_decoded already covers this above (we pull C from D
+    // via grid.get, so c_in_frame inherits from the actual fallback
+    // target).
+    let cd_in_frame = if grid.is_decoded(c_bx, c_by) {
+        true
+    } else {
+        grid.is_decoded(x - 1, y - 1)
+    };
+    let availability = [a_in_frame, b_in_frame, cd_in_frame];
     let avail_count: u8 = availability.iter().map(|&v| v as u8).sum();
+    let trace = std::env::var_os("PHASM_PMV_TRACE").is_some();
     if avail_count == 1
         && let Some((mv, _)) = a.or(b).or(c) {
+            if trace {
+                eprintln!(
+                    "[pmv] tl=({},{}) pw4={} curr_ref={} a={:?} b={:?} c={:?} avail=1(in-frame) -> ({},{})",
+                    tl_bx, tl_by, part_w_4x4, current_ref_idx, a, b, c, mv.mv_x, mv.mv_y,
+                );
+            }
             return mv;
         }
 
@@ -472,6 +502,12 @@ pub fn predict_mv_for_partition(
     let match_count = matches.iter().filter(|m| m.is_some()).count();
     if match_count == 1
         && let Some(mv) = matches.iter().flatten().next() {
+            if trace {
+                eprintln!(
+                    "[pmv] tl=({},{}) pw4={} curr_ref={} a={:?} b={:?} c={:?} match=1 -> ({},{})",
+                    tl_bx, tl_by, part_w_4x4, current_ref_idx, a, b, c, mv.mv_x, mv.mv_y,
+                );
+            }
             return *mv;
         }
 
@@ -479,10 +515,17 @@ pub fn predict_mv_for_partition(
     let la = a.map(|(m, _)| m).unwrap_or_default();
     let tb = b.map(|(m, _)| m).unwrap_or_default();
     let tr = c.map(|(m, _)| m).unwrap_or_default();
-    MotionVector {
+    let pmv = MotionVector {
         mv_x: median3(la.mv_x, tb.mv_x, tr.mv_x),
         mv_y: median3(la.mv_y, tb.mv_y, tr.mv_y),
+    };
+    if trace {
+        eprintln!(
+            "[pmv] tl=({},{}) pw4={} curr_ref={} a={:?} b={:?} c={:?} match={} median -> ({},{})",
+            tl_bx, tl_by, part_w_4x4, current_ref_idx, a, b, c, match_count, pmv.mv_x, pmv.mv_y,
+        );
     }
+    pmv
 }
 
 /// MV predictor for a P_Skip macroblock per spec § 8.4.1.2.1.

@@ -1,0 +1,349 @@
+# Bit-exact cross-platform verification.
+#
+# Builds the phasm CLI on five platform/architecture targets, encodes a fixed
+# test corpus with a fixed message + passphrase on each, and verifies the
+# resulting stego JPEG bytes are byte-identical across all platforms.
+#
+# This is the paper-grade reproducibility artifact for the arXiv paper's
+# Section 6.6 ("Bit-exact reproducibility audit"). The deterministic-math
+# module (`core/src/det_math.rs`) replaces all f64 trig with pure-IEEE 754
+# Chebyshev polynomials so that the same Rust source produces identical
+# output on x86_64 / aarch64 / WASM regardless of FPU rounding behavior.
+#
+# Gated to manual `workflow_dispatch` so it does NOT run on every push. Run
+# it once after a release to produce the paper's reproducibility table, save
+# the artifact, and reference the GHA run URL in the paper.
+
+name: bit-exact-cross-platform
+
+on:
+  workflow_dispatch:
+    inputs:
+      message:
+        description: 'Fixed message to embed (must fit smallest fixture capacity)'
+        required: false
+        default: 'phasm-repro-2026'
+      passphrase:
+        description: 'Fixed passphrase for ChaCha20 key derivation'
+        required: false
+        default: 'phasm-reproducibility-test-passphrase'
+
+jobs:
+  encode:
+    name: encode (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Build phasm CLI (release, default features only)
+        shell: bash
+        run: cargo build --release -p phasm-cli
+
+      - name: Encode test corpus and hash output
+        shell: bash
+        env:
+          MSG: ${{ inputs.message }}
+          PASS: ${{ inputs.passphrase }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          mkdir -p out
+
+          # Locate phasm binary (`.exe` on Windows)
+          BIN=./target/release/phasm
+          [ ! -f "$BIN" ] && BIN="$BIN.exe"
+          echo "Using binary: $BIN"
+          $BIN --version || true
+
+          # Skip HEIC; phasm CLI is JPEG-focused.
+          FIXTURES=(test-vectors/image/*.jpg)
+
+          for cover in "${FIXTURES[@]}"; do
+            name=$(basename "$cover" .jpg)
+
+            # Ghost mode — lower capacity; nearly always fits short message.
+            if ! "$BIN" encode "$cover" --mode ghost \
+                  -m "$MSG" -p "$PASS" -o "out/${name}.ghost.jpg" --quiet 2>err.log; then
+              echo "skip ghost $name: $(cat err.log)"
+            fi
+
+            # Armor mode — higher capacity required; some tiny fixtures fail.
+            if ! "$BIN" encode "$cover" --mode armor \
+                  -m "$MSG" -p "$PASS" -o "out/${name}.armor.jpg" --quiet 2>err.log; then
+              echo "skip armor $name: $(cat err.log)"
+            fi
+          done
+
+          echo ""
+          echo "=== Generated stego files ==="
+          ls -la out/ || true
+
+          # Compute deterministic hash listing (sort by filename for
+          # cross-platform stability — Windows otherwise sorts case-
+          # insensitively which can shuffle order).
+          if [ ! "$(ls -A out/ 2>/dev/null)" ]; then
+            echo "ERROR: no stego outputs produced"
+            exit 1
+          fi
+
+          # Use Python (portable across all 3 OS) for canonical sha256 listing.
+          python3 -c "
+          import hashlib, os, sys
+          out = []
+          for f in sorted(os.listdir('out')):
+              p = os.path.join('out', f)
+              if not os.path.isfile(p):
+                  continue
+              h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+              out.append(f'{h}  {f}')
+          sys.stdout.write('\n'.join(out) + '\n')
+          " > "hashes-${TARGET}.txt"
+
+          echo ""
+          echo "=== Hashes for ${TARGET} ==="
+          cat "hashes-${TARGET}.txt"
+
+      - name: Upload per-platform hash listing
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashes-${{ matrix.target }}
+          path: hashes-${{ matrix.target }}.txt
+          if-no-files-found: error
+
+  encode-wasm:
+    name: encode (wasm32-nodejs)
+    runs-on: ubuntu-latest
+    env:
+      TARGET: wasm32-nodejs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build wasm-bridge for Node.js
+        shell: bash
+        run: |
+          # wasm-pack --target nodejs emits a CommonJS module + .wasm at
+          # pkg/phasm_wasm.js + pkg/phasm_wasm_bg.wasm.
+          cd wasm-bridge
+          wasm-pack build --target nodejs --release --out-dir ../target/wasm-out
+          echo "==> generated wasm-bridge artifacts:"
+          ls -la ../target/wasm-out/
+
+      - name: Encode test corpus via WASM in Node and hash output
+        shell: bash
+        env:
+          MSG: ${{ inputs.message }}
+          PASS: ${{ inputs.passphrase }}
+        run: |
+          set -e
+          mkdir -p out
+
+          # Inline Node.js script — same fixed corpus, same fixed message/
+          # passphrase, same mode codes (Ghost=1, Armor=2) as the native jobs.
+          node - <<'NODEJS'
+          const fs = require('fs');
+          const path = require('path');
+          const phasm = require('./target/wasm-out/phasm_wasm.js');
+
+          const MSG = process.env.MSG;
+          const PASS = process.env.PASS;
+          const FIXTURES_DIR = 'test-vectors/image';
+          const OUT_DIR = 'out';
+
+          const fixtures = fs.readdirSync(FIXTURES_DIR)
+            .filter(f => f.endsWith('.jpg'))
+            .sort();
+
+          for (const fname of fixtures) {
+            const stem = fname.replace(/\.jpg$/, '');
+            const cover = fs.readFileSync(path.join(FIXTURES_DIR, fname));
+
+            // Mode 1 = Ghost (matches CLI --mode ghost).
+            try {
+              const stego = phasm.encode(cover, MSG, PASS, 1);
+              fs.writeFileSync(path.join(OUT_DIR, `${stem}.ghost.jpg`), Buffer.from(stego));
+            } catch (e) {
+              console.log(`skip ghost ${stem}: ${e.message || e}`);
+            }
+            // Mode 2 = Armor (matches CLI --mode armor).
+            try {
+              const stego = phasm.encode(cover, MSG, PASS, 2);
+              fs.writeFileSync(path.join(OUT_DIR, `${stem}.armor.jpg`), Buffer.from(stego));
+            } catch (e) {
+              console.log(`skip armor ${stem}: ${e.message || e}`);
+            }
+          }
+          NODEJS
+
+          echo ""
+          echo "=== Generated stego files (WASM) ==="
+          ls -la out/ || true
+
+          if [ ! "$(ls -A out/ 2>/dev/null)" ]; then
+            echo "ERROR: no WASM stego outputs produced"
+            exit 1
+          fi
+
+          # Same canonical hash listing format as the native jobs.
+          python3 -c "
+          import hashlib, os, sys
+          out = []
+          for f in sorted(os.listdir('out')):
+              p = os.path.join('out', f)
+              if not os.path.isfile(p):
+                  continue
+              h = hashlib.sha256(open(p, 'rb').read()).hexdigest()
+              out.append(f'{h}  {f}')
+          sys.stdout.write('\n'.join(out) + '\n')
+          " > "hashes-${TARGET}.txt"
+
+          echo ""
+          echo "=== Hashes for ${TARGET} ==="
+          cat "hashes-${TARGET}.txt"
+
+      - name: Upload WASM hash listing
+        uses: actions/upload-artifact@v4
+        with:
+          name: hashes-wasm32-nodejs
+          path: hashes-wasm32-nodejs.txt
+          if-no-files-found: error
+
+  verify:
+    name: verify bit-exactness
+    needs: [encode, encode-wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all per-platform hash listings
+        uses: actions/download-artifact@v4
+        with:
+          pattern: hashes-*
+          path: hashes/
+
+      - name: Diff every pair against the reference
+        shell: bash
+        run: |
+          set -e
+          echo "=== Artifacts received ==="
+          ls -la hashes/
+          ls -la hashes/*/
+
+          # Each artifact unpacks to its own subdir: hashes/hashes-<target>/hashes-<target>.txt
+          mapfile -t FILES < <(find hashes -name "hashes-*.txt" | sort)
+          if [ "${#FILES[@]}" -lt 2 ]; then
+            echo "ERROR: need at least 2 platforms to compare; got ${#FILES[@]}"
+            exit 1
+          fi
+
+          REF="${FILES[0]}"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════"
+          echo "Reference platform:  $REF"
+          echo "═══════════════════════════════════════════════════════════"
+          cat "$REF"
+          echo "═══════════════════════════════════════════════════════════"
+
+          MISMATCH=0
+          for f in "${FILES[@]:1}"; do
+            echo ""
+            echo "── Compare $f against reference ──"
+            if diff -q "$REF" "$f" > /dev/null; then
+              echo "✅ identical to reference"
+            else
+              echo "❌ MISMATCH"
+              diff "$REF" "$f" || true
+              MISMATCH=1
+            fi
+          done
+
+          echo ""
+          if [ $MISMATCH -ne 0 ]; then
+            echo "═══════════════════════════════════════════════════════════"
+            echo "❌ BIT-EXACT VERIFICATION FAILED"
+            echo "   one or more platforms produced different stego bytes"
+            echo "═══════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          echo "═══════════════════════════════════════════════════════════"
+          echo "✅ All ${#FILES[@]} platforms produced byte-identical output"
+          echo "═══════════════════════════════════════════════════════════"
+
+      - name: Build markdown summary table for the paper
+        shell: bash
+        run: |
+          {
+            echo "# Phasm bit-exact cross-platform verification"
+            echo ""
+            echo "**Run:** ${{ github.run_id }}"
+            echo "**Commit:** ${{ github.sha }}"
+            echo "**Phasm-core:** $(grep '^version' Cargo.toml | head -1 || echo unknown)"
+            echo ""
+            echo "## Per-platform corpus rollup hash"
+            echo ""
+            echo "Each row shows the SHA-256 of the per-platform hash listing"
+            echo "(i.e. a hash-of-hashes that condenses the entire stego corpus"
+            echo "into a single value). Identical rollup ⇒ identical stego bytes"
+            echo "for every fixture × mode."
+            echo ""
+            echo "| Platform | Corpus rollup SHA-256 |"
+            echo "|---|---|"
+            for f in hashes/hashes-*/hashes-*.txt; do
+              target=$(basename "$(dirname "$f")" | sed 's/^hashes-//')
+              rollup=$(sha256sum "$f" | cut -d' ' -f1)
+              echo "| \`$target\` | \`$rollup\` |"
+            done
+            echo ""
+            echo "## Per-fixture detail (reference platform)"
+            echo ""
+            echo "\`\`\`"
+            cat "$(find hashes -name "hashes-*.txt" | sort | head -1)"
+            echo "\`\`\`"
+            echo ""
+            echo "## How to reproduce"
+            echo ""
+            echo "1. Trigger this workflow manually (Actions tab → \`bit-exact-cross-platform\` → Run workflow)."
+            echo "2. Wait for all matrix jobs to complete."
+            echo "3. Download the \`bit-exact-report\` artifact (includes raw hash listings + this summary)."
+            echo "4. Cite the run URL in the paper's §6.6 reproducibility audit."
+          } | tee summary.md
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bit-exact-report
+          path: |
+            hashes/
+            summary.md
+          if-no-files-found: error

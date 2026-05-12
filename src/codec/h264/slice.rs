@@ -331,7 +331,7 @@ pub fn parse_slice_header(
 /// For our 4:2:0 streams ChromaArrayType is always 1, so chroma fields
 /// are always present. The skipper does not apply any weights — phasm
 /// reconstruction uses the unweighted formula either way (the table is
-/// emitted purely as an L4 fingerprint match against x264-medium).
+/// emitted purely as an L4 fingerprint match against the converter-pipeline centroid).
 fn skip_pred_weight_table(
     r: &mut RbspReader<'_>,
     sps: &Sps,

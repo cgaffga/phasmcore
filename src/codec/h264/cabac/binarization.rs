@@ -20,7 +20,7 @@
 //! wrap these to produce `Vec<u8>` for spec-vector assertions.
 //!
 //! Algorithm note:
-//!   `docs/design/h264-encoder-algorithms/binarization.md`.
+//!   `docs/design/video/h264/encoder-algorithms/binarization.md`.
 
 /// Unary binarization (spec § 9.3.2.1). Emits `v` ones followed by
 /// a single zero.
@@ -327,7 +327,7 @@ const MB_TYPE_B_BINS: [&[u8]; 23] = [
     //  contributes [1,0,0,0]..[1,1,0,0] AFTER the leading [1,1] header.)
     //
     // §6E-A6.2 — entries 4..10 + 22 cover the §6E-A3 active set;
-    // entries 11..21 land here per OpenH264 `ParseMBTypeBSliceCabac`
+    // entries 11..21 land here per spec § 9.3.2.6 / Table 9-37 B-slice mb_type binarization
     // (cisco/openh264 master 2026-05-02). Spec mapping derived from
     // the inverse of the decoder's bin tree:
     //
@@ -380,8 +380,8 @@ pub fn sub_mb_type_p_bins(sub_mb_type: u32) -> &'static [u8] {
 /// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). Spec Table 9-38.
 ///
 /// **Scope**: §6E-A6.3 ships uniform B_8x8 only. Sub-sub partitions
-/// (sub_mb_type 4..=12) land in §6E-A6.4 (descoped per the x264-medium
-/// finding — see `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
+/// (sub_mb_type 4..=12) land in §6E-A6.4 (descoped per the the converter-pipeline centroid
+/// finding — see `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`
 /// § "B-slice sub_mb_type bin tree"). Use [`sub_mb_type_b_ctx_inc`]
 /// for the per-bin ctxIdxInc — it varies on bin 2 depending on bin 1.
 pub fn sub_mb_type_b_bins(sub_mb_type: u32) -> &'static [u8] {
@@ -700,7 +700,7 @@ mod tests {
     }
 
     /// §6E-A6.2 — partitioned 16x8/8x16 family bin sequences.
-    /// Verified against OpenH264 `ParseMBTypeBSliceCabac` 2026-05-02.
+    /// Verified against spec § 9.3.2.6 / Table 9-37 B-slice mb_type binarization 2026-05-02.
     #[test]
     fn mb_type_b_bins_partitioned_family_4_to_10() {
         // 16x16 L0/L1 (v=0..7) → 6 bins each, last 4 = v big-endian.

@@ -251,14 +251,48 @@ The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accep
 
 ## Video steganography (in development)
 
+> **⚠ Work-in-progress and experimental.** Video stego in this crate is
+> active development territory — APIs, default features, and the
+> on-wire stego format are still moving. Visual quality, stealth
+> posture, and round-trip robustness against real-world content all
+> have open follow-on tasks. Not production-ready. Published here for
+> transparency, review, and contributor onboarding; please don't rely
+> on it for anything important yet.
+
 Early implementation of H.264 video steganography lives in this crate.
 `stego/video/h264_pipeline.rs` embeds encrypted messages in CAVLC-coded
 Baseline H.264 streams across four domains (trailing-one signs,
 level-suffix magnitude LSBs, level-suffix sign LSBs, motion-vector
 difference LSBs). The pure-Rust H.264 encoder and its CABAC entropy
-coder are clean-room — no ffmpeg/x264/OpenH264 code derivation; numeric
-tables are transcribed from ITU-T H.264 or cited to published academic
-sources.
+coder are clean-room — derived from ITU-T H.264 spec / ISO/IEC 14496-10
+and published academic literature; numeric tables are transcribed from
+the spec or cited to published sources.
+
+### Optional OpenH264 backend (experimental)
+
+The `openh264-backend` Cargo feature provides a second H.264 path: the
+[phasm-openh264](https://github.com/cgaffga/phasm-openh264) fork of
+Cisco's OpenH264 codec (BSD-2-Clause), statically linked via the
+`core-openh264-sys` workspace member. The fork is pinned by SHA in
+`core/openh264-sys/build.rs` and reached via git submodule at
+`vendor/phasm-openh264`.
+
+The backend is **OFF by default**, **not production-wired** (still
+behind the pure-Rust path for `smart_decode`), and currently requires
+manually checking out the fork submodule before building because
+phasmcore's source mirror does not carry the submodule. To try:
+
+```bash
+git clone https://github.com/cgaffga/phasmcore.git
+cd phasmcore
+git clone https://github.com/cgaffga/phasm-openh264.git vendor/phasm-openh264
+git -C vendor/phasm-openh264 checkout phasm-stego-v0.1.0
+cargo build --features openh264-backend
+```
+
+A v1.x+ build-switch follow-on will make `cargo build --features
+openh264-backend` degrade gracefully (warn + stub) when the submodule
+is absent, rather than `panic!` in `build.rs`. Tracked internally.
 
 ### Source-only distribution (patent-pool posture)
 
@@ -286,15 +320,20 @@ publish through GitHub Releases or other free-tier-blind channels
 without first reviewing the Via LA AVC license terms.
 
 Not yet shipped in any phasm CLI or mobile-app build at production
-quality. The API and default feature set will change. Published here
-for transparency and review; production use is not recommended at this
-stage.
+quality. The API and default feature set will change. Both the
+pure-Rust `h264-encoder` path and the experimental `openh264-backend`
+path are work-in-progress. Published here for transparency and review;
+production use is not recommended at this stage.
 
 ## Cargo Features
 
 | Feature | Description |
 |---------|-------------|
 | `parallel` | Enables [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD cost computation, STC embedding, and Armor decode sweeps. Recommended for native builds. |
+| `video` | H.264 video stego pipeline (decoder + bitstream parsing). Experimental — see "Video steganography (in development)" above. |
+| `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. Experimental + source-only (AVC patent-pool). |
+| `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. Experimental. |
+| `openh264-backend` | **Experimental** second H.264 path via the `phasm-openh264` fork (BSD-2-Clause). Requires `vendor/phasm-openh264` submodule checkout. Not production-wired — pure-Rust path is the live extract today. |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
 
 ## CLI

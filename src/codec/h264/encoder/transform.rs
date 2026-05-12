@@ -17,7 +17,7 @@
 //! stages cannot overflow under any input.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/transform.md
+//!   docs/design/video/h264/encoder-algorithms/transform.md
 
 /// Forward 4×4 integer DCT (Phase 6A.1).
 ///

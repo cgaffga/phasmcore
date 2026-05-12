@@ -45,7 +45,7 @@ use super::syntax::{
     decode_intra_chroma_pred_mode, decode_mb_qp_delta, decode_mb_skip_flag,
     decode_mb_skip_flag_b,
     decode_mb_type_b, decode_mb_type_i, decode_mb_type_p,
-    decode_mvd_with_bin0_inc,
+    decode_mvd_with_bin0_inc, decode_ref_idx,
     decode_prev_intra4x4_pred_mode_flag, decode_rem_intra4x4_pred_mode,
     decode_residual_block_cabac, decode_residual_block_cabac_8x8,
     decode_sub_mb_type_b, decode_sub_mb_type_p,
@@ -488,15 +488,21 @@ fn walk_slice_mbs(
             }
         prev_mb_y = Some(mb_y);
 
+        // v1.4 (#305) — num_ref_idx_l0_active drives whether walker
+        // expects ref_idx_l0 unary bins per partition. At
+        // MultiRefConfig::SINGLE_REF (encoder default → slice header
+        // claims 1) the gate is closed and zero bins read (bit-
+        // identical to v1.3).
+        let num_active_l0 = header.num_ref_idx_l0_active;
         let is_last = if is_b_slice {
             walk_b_mb(
                 dec, pps, mb_x, mb_y, mb_w, &mut prev_mb_qp,
-                frame_idx, recorder, opts,
+                frame_idx, recorder, opts, num_active_l0,
             )?
         } else if is_p_slice {
             walk_p_mb(
                 dec, pps, mb_x, mb_y, mb_w, &mut prev_mb_qp,
-                frame_idx, recorder, opts,
+                frame_idx, recorder, opts, num_active_l0,
             )?
         } else {
             walk_i_mb(
@@ -545,6 +551,7 @@ fn walk_i_mb(
 
 /// P-slice MB dispatch. P_SKIP + intra-in-P routing. P_partition
 /// (mb_type 0..3) errors out — to be wired in §30A3+.
+#[allow(clippy::too_many_arguments)]
 fn walk_p_mb(
     dec: &mut CabacDecoder<'_>,
     pps: &Pps,
@@ -555,6 +562,7 @@ fn walk_p_mb(
     frame_idx: u32,
     recorder: &mut PositionRecorder,
     opts: &WalkOptions,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
     // 1. mb_skip_flag (encoder.rs:1553).
     let is_skip = decode_mb_skip_flag(dec, mb_x)?;
@@ -578,7 +586,7 @@ fn walk_p_mb(
         // P-partition: §30A3 (P_L0_16x16) + §30A4 (P_L0_16x8 / P_L0_8x16 / P_8x8).
         return walk_p_partition_mb(
             dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
-            mb_type_p, opts,
+            mb_type_p, opts, num_active_l0,
         );
     }
 
@@ -739,6 +747,7 @@ fn walk_i16x16_mb(
 ///   motion vectors from neighbors.
 /// - Encoder emits no MVD bits, no ref_idx, no residuals.
 /// - Stego coverage = zero (no bypass bins emitted by this MB).
+#[allow(clippy::too_many_arguments)]
 fn walk_b_mb(
     dec: &mut CabacDecoder<'_>,
     pps: &Pps,
@@ -749,6 +758,7 @@ fn walk_b_mb(
     frame_idx: u32,
     recorder: &mut PositionRecorder,
     _opts: &WalkOptions,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
     // 1. mb_skip_flag (B-slice ctxIdxOffset = 24).
     let is_skip = decode_mb_skip_flag_b(dec, mb_x)?;
@@ -775,20 +785,49 @@ fn walk_b_mb(
     // residuals via the shared `finish_b_inter` tail.
     match mb_type {
         0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
-        1 => walk_b_l0_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        1 => walk_b_l0_16x16(
+            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+        ),
         2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
-        3 => walk_b_bi_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        3 => walk_b_bi_16x16(
+            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+        ),
         4..=21 => walk_b_partitioned(
             dec, mb_x, prev_mb_qp, mb_type as u8,
-            frame_idx, mb_addr_u32, recorder, t8x8,
+            frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
-        22 => walk_b_8x8(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
-        23 => Err(WalkError::H264(H264Error::Unsupported(
-            "B-slice intra-in-B mb_type 23 (out of scope — see #154 \
-             intra-in-P parity bug; B inherits the same risk class)".into(),
+        22 => walk_b_8x8(
+            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+        ),
+        23..=47 => {
+            // §intra-in-B (#319) — Phase 1: walker un-reject.
+            // Spec § 7.4.5: B-slice mb_type ≥ 23 is intra. The
+            // I-suffix value is `mb_type - 23`, mapping to I-slice
+            // mb_type 0..24 per Table 7-11:
+            //   I-suffix 0 → I_NxN (I_4x4 / I_8x8 via t8x8 flag)
+            //   I-suffix 1..24 → I_16x16 variants (luma-pred + cbp combo)
+            //   I-suffix 25 → I_PCM (mb_type=48; out of scope)
+            // Re-uses `walk_inxn_mb` and `walk_i16x16_mb` from the
+            // I-slice walker since the per-MB intra syntax is
+            // identical between I-slice intra, intra-in-P, and
+            // intra-in-B (only the mb_type prefix differs).
+            let i_mb_type = mb_type - 23;
+            if i_mb_type == 0 {
+                walk_inxn_mb(
+                    dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+                )
+            } else {
+                walk_i16x16_mb(
+                    dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+                    i_mb_type,
+                )
+            }
+        }
+        48 => Err(WalkError::H264(H264Error::Unsupported(
+            "B-slice I_PCM (mb_type=48) not yet wired (#188 follow-on)".into(),
         ))),
         _ => Err(WalkError::H264(H264Error::Unsupported(format!(
-            "B-slice mb_type {mb_type} > 23 (spec invalid)"
+            "B-slice mb_type {mb_type} > 48 (spec invalid)"
         )))),
     }
 }
@@ -843,18 +882,24 @@ fn walk_b_direct_16x16(
     // neighbour state at decode time. Pass `None, None` for MVD
     // abs values; the neighbour commit will use the
     // `abs_mvd_comp* = 0` defaults (correct for Direct).
+    //
+    // v1.4 Phase 4.5 (#316) — Direct/Skip has no L0 ref_idx on the
+    // wire (derived from spatial-direct neighbour read). Commit 0
+    // for the entire MB; spec § 7.4.5.1 says inferred ref_idxs are
+    // not part of neighbour state lookup.
     finish_b_inter_with_mb_type(
         dec, mb_x, prev_mb_qp,
         /* l0_abs */ None, /* l1_abs */ None,
         frame_idx, mb_addr_u32, recorder, t8x8,
         MbTypeClass::BSkipOrDirect,
+        [0i8; 16],
     )
 }
 
 /// §6E-A6.1 — `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
-/// `ref_idx_l0` is inferred 0 (single-ref ship config; not on the
-/// wire). §6E-A6.1q.c (#152): non-zero CBP now decodes residuals
-/// (luma 4×4 + chroma DC/AC) via the shared `finish_b_inter` tail.
+/// v1.4 (#305) — `ref_idx_l0` decoded when num_active_l0 > 1.
+/// §6E-A6.1q.c (#152): non-zero CBP now decodes residuals (luma 4×4
+/// + chroma DC/AC) via the shared `finish_b_inter` tail.
 #[allow(clippy::too_many_arguments)]
 fn walk_b_l0_16x16(
     dec: &mut CabacDecoder<'_>,
@@ -864,12 +909,22 @@ fn walk_b_l0_16x16(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
+    // v1.4 Phase 4.5 (#316) — capture the decoded ref_idx_l0 so the
+    // neighbour commit uses the actual on-wire value (not 0).
+    let current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
+    let ref_idx_l0_dec = if num_active_l0 > 1 {
+        decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, (num_active_l0 - 1) as u32)? as u8
+    } else {
+        0
+    };
     let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 0)?;
     finish_b_inter(
         dec, mb_x, prev_mb_qp,
         /* l0 */ Some([[abs_x; 16], [abs_y; 16]]), /* l1 */ None,
         frame_idx, mb_addr_u32, recorder, t8x8,
+        [ref_idx_l0_dec as i8; 16],
     )
 }
 
@@ -887,16 +942,22 @@ fn walk_b_l1_16x16(
     t8x8: bool,
 ) -> Result<bool, WalkError> {
     let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
+    // v1.4 Phase 4.5 (#316) — L1_16x16 has no L0 ref_idx on the wire
+    // (partition is L1-only per Table 7-14). Commit [0;16].
     finish_b_inter(
         dec, mb_x, prev_mb_qp,
         None, Some([[abs_x; 16], [abs_y; 16]]),
         frame_idx, mb_addr_u32, recorder, t8x8,
+        [0i8; 16],
     )
 }
 
 /// §6E-A6.1 — `B_Bi_16x16` (mb_type = 3). Two MVD pairs (L0 then L1
 /// per spec § 7.3.5.1 mb_pred order). Each list uses its own
 /// neighbour state for bin0 ctxIdxInc.
+///
+/// v1.4 (#305) — `ref_idx_l0` decoded when num_active_l0 > 1 (Bi
+/// uses L0 list).
 #[allow(clippy::too_many_arguments)]
 fn walk_b_bi_16x16(
     dec: &mut CabacDecoder<'_>,
@@ -906,7 +967,15 @@ fn walk_b_bi_16x16(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
+    // v1.4 Phase 4.5 (#316) — capture decoded ref_idx_l0 (Bi uses L0).
+    let current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
+    let ref_idx_l0_dec = if num_active_l0 > 1 {
+        decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, (num_active_l0 - 1) as u32)? as u8
+    } else {
+        0
+    };
     let (l0_x, l0_y) = decode_b_16x16_mvd_pair(dec, mb_x, 0)?;
     let (l1_x, l1_y) = decode_b_16x16_mvd_pair(dec, mb_x, 1)?;
     finish_b_inter(
@@ -914,6 +983,7 @@ fn walk_b_bi_16x16(
         Some([[l0_x; 16], [l0_y; 16]]),
         Some([[l1_x; 16], [l1_y; 16]]),
         frame_idx, mb_addr_u32, recorder, t8x8,
+        [ref_idx_l0_dec as i8; 16],
     )
 }
 
@@ -935,6 +1005,7 @@ fn walk_b_partitioned(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
     use crate::codec::h264::encoder::b_partitioned::{
         partitioned_b_meta, BListUse,
@@ -945,6 +1016,36 @@ fn walk_b_partitioned(
             "walk_b_partitioned: mb_type {mb_type} not in 4..=21"
         )))
     })?;
+
+    // v1.4 (#305) — ref_idx_l0 per partition per spec § 7.3.5.1
+    // mb_pred(): all ref_idx_l0 BEFORE MVDs, in partition-index
+    // order, filtered by uses-L0 (skip if partition is L1-only).
+    //
+    // v1.4 Phase 4.5 (#316) — capture decoded values per partition
+    // for the neighbour commit fill below.
+    let mut ref_idx_l0_decoded = [0u8; 2];
+    let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
+    let (pw_ref_4x4, ph_ref_4x4) = meta.shape.part_dim_4x4();
+    if num_active_l0 > 1 {
+        for idx in 0..2usize {
+            let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+            let uses_l0 = matches!(usage, BListUse::L0 | BListUse::Bi);
+            if !uses_l0 {
+                continue;
+            }
+            let (off_x, off_y) = meta.shape.part_offset(idx);
+            let cur_bx = off_x as u8;
+            let cur_by = off_y as u8;
+            ref_idx_l0_decoded[idx] = decode_ref_idx(
+                dec, &current_ref_idx_mb, mb_x, cur_bx, cur_by,
+                (num_active_l0 - 1) as u32,
+            )? as u8;
+            current_ref_idx_mb.fill_region(
+                cur_bx, cur_by, pw_ref_4x4 as u8, ph_ref_4x4 as u8,
+                ref_idx_l0_decoded[idx] as i8,
+            );
+        }
+    }
 
     // §6E-A6.1q.e (#154) — within-MB MVD tracker per-list. Mirror of
     // the encoder's `emit_b_partitioned`. Partition 1's bin 0
@@ -995,9 +1096,15 @@ fn walk_b_partitioned(
     // max — CABAC desync at the bin level.
     let l0_for_finish = if any_uses_l0(meta) { Some(current_mvd.comp) } else { None };
     let l1_for_finish = if any_uses_l1(meta) { Some(current_mvd.comp_l1) } else { None };
+    // v1.4 Phase 4.5 (#316) — per-block ref_idx_l0 fill from
+    // partition geometry, mirroring the encoder's
+    // `fill_ref_idx_l0_partitioned` exactly so neighbour ctxIdxInc
+    // for the next MB matches encoder side AND a spec decoder.
+    let ref_idx_l0_array = walker_fill_ref_idx_l0_partitioned(meta, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_for_finish, l1_for_finish,
         frame_idx, mb_addr_u32, recorder, t8x8,
+        ref_idx_l0_array,
     )
 }
 
@@ -1029,6 +1136,7 @@ fn walk_b_8x8(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
     let mut sub_mb_types = [0u8; 4];
     for s in &mut sub_mb_types {
@@ -1038,6 +1146,32 @@ fn walk_b_8x8(
             "decode_sub_mb_type_b returned {value}; §6E-A6.3 supports 0..=3"
         );
         *s = value as u8;
+    }
+
+    // v1.4 (#305) — ref_idx_l0 per sub-MB per spec § 7.3.5.1
+    // mb_pred(): all ref_idx_l0 AFTER 4×sub_mb_type and BEFORE MVDs,
+    // in sub-MB-index order, filtered by sub-MB-uses-L0
+    // (Direct=0 + L1=2 skip; L0=1 + Bi=3 emit).
+    //
+    // v1.4 Phase 4.5 (#316) — capture decoded values per sub-MB +
+    // within-MB ref_idx tracker for spec § 6.4.11.7 ctxIdxInc lookups.
+    let mut ref_idx_l0_decoded = [0u8; 4];
+    let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
+    if num_active_l0 > 1 {
+        for s_idx in 0..4usize {
+            let sub = sub_mb_types[s_idx];
+            let uses_l0 = matches!(sub, 1 | 3);
+            if !uses_l0 {
+                continue;
+            }
+            let off_bx = ((s_idx & 1) * 2) as u8;
+            let off_by = ((s_idx >> 1) * 2) as u8;
+            ref_idx_l0_decoded[s_idx] = decode_ref_idx(
+                dec, &current_ref_idx_mb, mb_x, off_bx, off_by,
+                (num_active_l0 - 1) as u32,
+            )? as u8;
+            current_ref_idx_mb.fill_region(off_bx, off_by, 2, 2, ref_idx_l0_decoded[s_idx] as i8);
+        }
     }
 
     // §6E-A6.1q.e (#154) — within-MB MVD tracker. Mirror of
@@ -1086,9 +1220,13 @@ fn walk_b_8x8(
     let any_l1 = sub_mb_types.iter().any(|&s| matches!(s, 2 | 3));
     let l0_some = if any_l0 { Some(current_mvd.comp) } else { None };
     let l1_some = if any_l1 { Some(current_mvd.comp_l1) } else { None };
+    // v1.4 Phase 4.5 (#316) — per-block ref_idx_l0 fill from sub-MB
+    // geometry, mirroring encoder's `fill_ref_idx_l0_b8x8`.
+    let ref_idx_l0_array = walker_fill_ref_idx_l0_b8x8(sub_mb_types, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_some, l1_some,
         frame_idx, mb_addr_u32, recorder, t8x8,
+        ref_idx_l0_array,
     )
 }
 
@@ -1196,6 +1334,106 @@ fn decode_b_partition_mvd_pair(
 /// zero), the broadcast was overstating magnitude at zero positions
 /// → next-MB bin0 ctxIdxInc disagreed with encoder → CABAC desync.
 #[allow(clippy::too_many_arguments)]
+/// v1.4 Phase 4.5 (#316) — walker-side mirror of
+/// `fill_ref_idx_l0_partitioned` in encoder.rs. Builds a 16-entry
+/// per-4×4-block ref_idx_l0 array from per-partition decoded values.
+fn walker_fill_ref_idx_l0_partitioned(
+    meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta,
+    ref_idx_l0: [u8; 2],
+) -> [i8; 16] {
+    use crate::codec::h264::encoder::b_partitioned::BListUse;
+    let mut out = [0i8; 16];
+    let (pw, ph) = meta.shape.part_dim_4x4();
+    for idx in 0..2usize {
+        let usage = if idx == 0 { meta.part0 } else { meta.part1 };
+        if !matches!(usage, BListUse::L0 | BListUse::Bi) {
+            continue;
+        }
+        let (off_x, off_y) = meta.shape.part_offset(idx);
+        let val = ref_idx_l0[idx] as i8;
+        for dy in 0..ph {
+            for dx in 0..pw {
+                out[(off_y + dy) * 4 + (off_x + dx)] = val;
+            }
+        }
+    }
+    out
+}
+
+/// v1.4 Phase 4.5 (#316) — walker-side mirror of
+/// `fill_ref_idx_l0_b8x8`.
+fn walker_fill_ref_idx_l0_b8x8(
+    sub_mb_types: [u8; 4],
+    ref_idx_l0: [u8; 4],
+) -> [i8; 16] {
+    let mut out = [0i8; 16];
+    for s_idx in 0..4usize {
+        if !matches!(sub_mb_types[s_idx], 1 | 3) {
+            continue;
+        }
+        let off_x = (s_idx & 1) * 2;
+        let off_y = (s_idx >> 1) * 2;
+        let val = ref_idx_l0[s_idx] as i8;
+        for dy in 0..2usize {
+            for dx in 0..2usize {
+                out[(off_y + dy) * 4 + (off_x + dx)] = val;
+            }
+        }
+    }
+    out
+}
+
+/// v1.4 Phase 4.5 (#316) — walker-side helper for P-slice partition
+/// neighbour ref_idx_l0 fill. P-partitions all use L0.
+/// `ref_idx_l0`: P16x16/P_Skip = [v, _, _, _]; P16x8 = [top, bottom];
+/// P8x16 = [left, right]; P_8x8 = [s0, s1, s2, s3].
+fn walker_fill_ref_idx_l0_p(mb_type_p: u32, ref_idx_l0: [u8; 4]) -> [i8; 16] {
+    let mut out = [0i8; 16];
+    match mb_type_p {
+        // P_L0_16x16 (mb_type_p=0): uniform.
+        0 => out = [ref_idx_l0[0] as i8; 16],
+        // P_L0_16x8 (mb_type_p=1): top half / bottom half.
+        1 => {
+            for r in 0..2 {
+                for c in 0..4 {
+                    out[r * 4 + c] = ref_idx_l0[0] as i8;
+                }
+            }
+            for r in 2..4 {
+                for c in 0..4 {
+                    out[r * 4 + c] = ref_idx_l0[1] as i8;
+                }
+            }
+        }
+        // P_L0_8x16 (mb_type_p=2): left half / right half.
+        2 => {
+            for r in 0..4 {
+                for c in 0..2 {
+                    out[r * 4 + c] = ref_idx_l0[0] as i8;
+                }
+                for c in 2..4 {
+                    out[r * 4 + c] = ref_idx_l0[1] as i8;
+                }
+            }
+        }
+        // P_8x8 (mb_type_p=3): 4 sub-MBs, each covering a 2×2 cell region.
+        3 => {
+            for s_idx in 0..4usize {
+                let off_x = (s_idx & 1) * 2;
+                let off_y = (s_idx >> 1) * 2;
+                let val = ref_idx_l0[s_idx] as i8;
+                for dy in 0..2usize {
+                    for dx in 0..2usize {
+                        out[(off_y + dy) * 4 + (off_x + dx)] = val;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 fn finish_b_inter(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
@@ -1206,10 +1444,11 @@ fn finish_b_inter(
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
+    ref_idx_l0_array: [i8; 16],
 ) -> Result<bool, WalkError> {
     finish_b_inter_with_mb_type(
         dec, mb_x, prev_mb_qp, l0_abs, l1_abs, frame_idx, mb_addr_u32,
-        recorder, t8x8, MbTypeClass::PInter,
+        recorder, t8x8, MbTypeClass::PInter, ref_idx_l0_array,
     )
 }
 
@@ -1225,6 +1464,7 @@ fn finish_b_inter_with_mb_type(
     recorder: &mut PositionRecorder,
     t8x8: bool,
     mb_type_class: MbTypeClass,
+    ref_idx_l0_array: [i8; 16],
 ) -> Result<bool, WalkError> {
     let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
     let cbp_luma = cbp_byte & 0x0F;
@@ -1330,6 +1570,11 @@ fn finish_b_inter_with_mb_type(
         mb_skip_flag: false,
         cbp_luma,
         cbp_chroma,
+        // v1.4 Phase 4.5 (#316) — propagate the per-block ref_idx_l0
+        // captured from the wire so next MB's ref_idx ctxIdxInc
+        // matches what a spec-conforming decoder computes (the prior
+        // [0;16] hardcode desynced vs the reference decoder whenever ref_idx>0).
+        ref_idx_l0: ref_idx_l0_array,
         abs_mvd_comp: abs_mvd_l0,
         abs_mvd_comp_l1: abs_mvd_l1,
         ..CabacNeighborMB::default()
@@ -1546,6 +1791,7 @@ fn walk_inxn_mb(
 /// inline emissions so the decoder cover's mvd_*_bypass domains
 /// stay empty, matching the encoder's empty MVD cover.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn walk_p_partition_mb(
     dec: &mut CabacDecoder<'_>,
     pps: &Pps,
@@ -1557,6 +1803,7 @@ fn walk_p_partition_mb(
     recorder: &mut PositionRecorder,
     mb_type_p: u32,
     opts: &WalkOptions,
+    num_active_l0: u8,
 ) -> Result<bool, WalkError> {
     let mb_addr_u32 = (mb_y * mb_w + mb_x) as u32;
     let mut current_mvd = CurrentMbMvdAbs::new();
@@ -1573,7 +1820,52 @@ fn walk_p_partition_mb(
         None
     };
 
-    // 2. ref_idx — skipped under num_ref_idx_active_minus1=0 (default).
+    // 2. v1.4 (#305) — ref_idx_l0 per partition per spec § 7.3.5.1
+    // mb_pred(). At num_ref_idx_l0_active=1 (single-ref default) the
+    // gate is closed and zero bins read. P-slice partitions all use
+    // L0 by definition (B-slice list-usage filtering doesn't apply).
+    //
+    // v1.4 Phase 4.5 (#316) — capture decoded values per partition
+    // for the neighbour commit fill below.
+    let mut ref_idx_l0_p = [0u8; 4];
+    // v1.4 Phase 4.5 (#316) — within-MB tracker so partition 1+ reads
+    // partition 0's just-decoded ref_idx for ctxIdxInc lookups
+    // (spec § 6.4.11.7).
+    let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
+    if num_active_l0 > 1 {
+        let c_max = (num_active_l0 - 1) as u32;
+        match mb_type_p {
+            0 => {
+                ref_idx_l0_p[0] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, c_max)? as u8;
+                current_ref_idx_mb.fill_region(0, 0, 4, 4, ref_idx_l0_p[0] as i8);
+            }
+            1 => {
+                // P_16x8 — top + bottom 16x8 partitions.
+                ref_idx_l0_p[0] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, c_max)? as u8;
+                current_ref_idx_mb.fill_region(0, 0, 4, 2, ref_idx_l0_p[0] as i8);
+                ref_idx_l0_p[1] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 2, c_max)? as u8;
+                current_ref_idx_mb.fill_region(0, 2, 4, 2, ref_idx_l0_p[1] as i8);
+            }
+            2 => {
+                // P_8x16 — left + right 8x16 partitions.
+                ref_idx_l0_p[0] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, c_max)? as u8;
+                current_ref_idx_mb.fill_region(0, 0, 2, 4, ref_idx_l0_p[0] as i8);
+                ref_idx_l0_p[1] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 2, 0, c_max)? as u8;
+                current_ref_idx_mb.fill_region(2, 0, 2, 4, ref_idx_l0_p[1] as i8);
+            }
+            3 => {
+                // P_8x8 — per-sub-MB ref_idx_l0 (one per sub-MB,
+                // regardless of sub_mb_type internal partitioning).
+                const SUB_ORIGINS: [(u8, u8); 4] = [(0, 0), (2, 0), (0, 2), (2, 2)];
+                for (i, &(bx, by)) in SUB_ORIGINS.iter().enumerate() {
+                    ref_idx_l0_p[i] = decode_ref_idx(dec, &current_ref_idx_mb, mb_x, bx, by, c_max)? as u8;
+                    current_ref_idx_mb.fill_region(bx, by, 2, 2, ref_idx_l0_p[i] as i8);
+                }
+            }
+            _ => unreachable!("mb_type_p > 3 routed elsewhere"),
+        }
+    }
+    let ref_idx_l0_array = walker_fill_ref_idx_l0_p(mb_type_p, ref_idx_l0_p);
 
     // 3. MVDs per partition. Encoder pattern (emit_p_mvds_cabac):
     //    P16x16 → 1 part; P16x8 → 2 parts (top+bottom 16x8);
@@ -1600,6 +1892,7 @@ fn walk_p_partition_mb(
     decode_p_residuals_and_finish(
         dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx,
         mb_addr_u32, recorder, &current_mvd, no_sub_mb_part_size_lt_8x8,
+        ref_idx_l0_array,
     )
 }
 
@@ -1820,6 +2113,7 @@ fn decode_p_residuals_and_finish(
     recorder: &mut PositionRecorder,
     current_mvd: &CurrentMbMvdAbs,
     no_sub_mb_part_size_lt_8x8: bool,
+    ref_idx_l0_array: [i8; 16],
 ) -> Result<bool, WalkError> {
     let current_is_intra = false;
 
@@ -1959,6 +2253,10 @@ fn decode_p_residuals_and_finish(
     nb.cbp_chroma = cbp_chroma;
     nb.mb_qp_delta = qp_delta;
     nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
+    // v1.4 Phase 4.5 (#316) — propagate decoded ref_idx_l0 per
+    // partition geometry so spec-conforming decoders agree on the
+    // next MB's ref_idx ctxIdxInc.
+    nb.ref_idx_l0 = ref_idx_l0_array;
     nb.abs_mvd_comp = current_mvd.to_neighbor();
     nb.transform_size_8x8_flag = use_8x8;
     dec.neighbors.commit(mb_x, nb);

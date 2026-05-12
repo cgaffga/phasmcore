@@ -50,6 +50,12 @@ enum Knob {
     No8x8Transform,
     /// Disable B-RDO entirely (mode-decision via fast hash mix only).
     NoBRdo,
+    /// Phase 3 diagnostic: same as `BaselineV26` but with the
+    /// `skip_cbp_is_zero` early-Skip pre-check disabled. Forces every
+    /// B-MB through full RDO sweep. Used to measure how much of the
+    /// drift / mismatch on motion content is driven by Skip-without-
+    /// residual emission.
+    NoSkipPrecheck,
 }
 
 impl Knob {
@@ -63,6 +69,7 @@ impl Knob {
             Knob::ForceBiZero => "force_bi_zero",
             Knob::No8x8Transform => "no_8x8_transform",
             Knob::NoBRdo => "no_b_rdo",
+            Knob::NoSkipPrecheck => "no_skip_precheck",
         }
     }
 
@@ -77,6 +84,7 @@ impl Knob {
                 "PHASM_B_NO_DIRECT_MAGCLAMP",
                 "PHASM_B_NO_ME_RESULT_CLAMP",
                 "PHASM_B_INSTRUMENT",
+                "PHASM_B_SKIP_NO_CBP_PRECHECK",
             ] {
                 std::env::remove_var(k);
             }
@@ -97,6 +105,9 @@ impl Knob {
                 }
                 Knob::No8x8Transform => {} // applied via encoder field
                 Knob::NoBRdo => {} // applied via b_rdo_config
+                Knob::NoSkipPrecheck => {
+                    std::env::set_var("PHASM_B_SKIP_NO_CBP_PRECHECK", "1");
+                }
             }
         }
     }
@@ -128,6 +139,7 @@ const KNOBS: &[Knob] = &[
     Knob::ForceBiZero,
     Knob::No8x8Transform,
     Knob::NoBRdo,
+    Knob::NoSkipPrecheck,
 ];
 
 struct Fixture {
@@ -220,10 +232,20 @@ struct BisectMetrics {
     drift_uv: u32,
     mean_abs_y: f64,
     max_dev: u8,
+    /// Phase 1 (#266) — encoder/decoder agreement metric. Pixels in
+    /// `enc.visual_recon.y` that don't match `ffmpeg.decode` of the
+    /// same bitstream. mismatch_y > 0 = real divergence (Bug B class).
+    /// mismatch_y ≈ 0 with drift_y > 0 = mode-quality drift (Bug A).
+    mismatch_y: u64,
+    /// Worst per-pixel mismatch between visual_recon and ffmpeg.decode.
+    mismatch_max: u8,
 }
 
 fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
-    knob.apply_env();
+    // Knob env is applied ONCE per knob on the main thread in
+    // bisect_run before spawning the fixture-parallel workers.
+    // Re-applying here from each worker would race during the
+    // remove_var/set_var transition.
     let yuv = ensure_yuv(fixture);
     let frame_size = (fixture.encode_w * fixture.encode_h * 3 / 2) as usize;
     let n_frames = (yuv.len() / frame_size).min(N_FRAMES);
@@ -231,6 +253,11 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
     let mut enc = Encoder::new(fixture.encode_w, fixture.encode_h, Some(QP)).expect("encoder new");
     knob.configure_encoder(&mut enc);
     let pattern = knob.pattern();
+
+    // Phase 1 (#266): capture enc.visual_recon.y per frame. Index by
+    // display_idx so we can pair with ffmpeg.decode in display order.
+    let y_size = (fixture.encode_w * fixture.encode_h) as usize;
+    let mut visual_recon_per_display: Vec<Option<Vec<u8>>> = vec![None; n_frames];
 
     let t0 = std::time::Instant::now();
     let mut bs = Vec::new();
@@ -244,26 +271,38 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
         }
         .unwrap_or_else(|e| panic!("[{}/{}] encode error: {e}", fixture.name, knob.name()));
         bs.extend_from_slice(&bytes);
+        // Capture encoder's claim of post-flip recon for this frame.
+        // Only Y plane (we measure mismatch_y).
+        visual_recon_per_display[d] = Some(enc.visual_recon.y[..y_size].to_vec());
     }
     let encode_ms = t0.elapsed().as_millis();
 
     let timing = FrameTiming::FPS_30;
-    let mp4 = build_mp4_with_pattern(
-        MuxerProfile::HandbrakeX264,
-        &bs,
-        fixture.encode_w,
-        fixture.encode_h,
-        timing,
-        pattern,
-        n_frames,
-    )
-    .expect("mp4 mux");
-    let demo = format!(
-        "/Users/cgaffga/Desktop/phasm_bisect_{}_{}.mp4",
-        fixture.name,
-        knob.name()
-    );
-    std::fs::write(&demo, &mp4).expect("write demo");
+    // Gate the Desktop demo MP4 behind PHASM_BISECT_WRITE_DEMOS=1 so
+    // diagnostic bisect runs don't spam ~/Desktop/. Set this var when
+    // doing a visual-review pass; leave unset for metric-only runs.
+    let demo = if std::env::var("PHASM_BISECT_WRITE_DEMOS").is_ok() {
+        let mp4 = build_mp4_with_pattern(
+            MuxerProfile::HandbrakeX264,
+            &bs,
+            fixture.encode_w,
+            fixture.encode_h,
+            timing,
+            pattern,
+            n_frames,
+        )
+        .expect("mp4 mux");
+        let path = format!(
+            "/Users/cgaffga/Desktop/phasm_bisect_{}_{}.mp4",
+            fixture.name,
+            knob.name()
+        );
+        std::fs::write(&path, &mp4).expect("write demo");
+        path
+    } else {
+        "(demos gated; set PHASM_BISECT_WRITE_DEMOS=1)".to_string()
+    };
+    let _ = timing;
 
     let h264 = std::env::temp_dir().join(format!("phasm_bisect_{}_{}.h264", fixture.name, knob.name()));
     let dec = std::env::temp_dir().join(format!("phasm_bisect_{}_{}.dec.yuv", fixture.name, knob.name()));
@@ -341,6 +380,29 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
     }
     let mean_abs_y = total_abs_y as f64 / count_y.max(1) as f64;
 
+    // Phase 1 (#266) — encoder/decoder agreement metric. For each
+    // captured visual_recon, diff against the corresponding ffmpeg
+    // .decode frame (Y plane only). mismatch_y > 0 = real divergence
+    // (Bug B class). mismatch_y ≈ 0 with drift_y > 0 = mode-quality
+    // drift (Bug A — encoder + decoder agree on poor output).
+    let mut mismatch_y: u64 = 0;
+    let mut mismatch_max: u8 = 0;
+    for (display_idx, vr_opt) in visual_recon_per_display.iter().enumerate().take(audit_frames) {
+        let Some(vr) = vr_opt else { continue };
+        let off = display_idx * frame_size;
+        for i in 0..y_size.min(vr.len()) {
+            let v = vr[i] as i32;
+            let d = decoded[off + i] as i32;
+            let diff = (v - d).unsigned_abs() as u8;
+            if diff > 0 {
+                mismatch_y += 1;
+            }
+            if diff > mismatch_max {
+                mismatch_max = diff;
+            }
+        }
+    }
+
     // PSNR + SSIM via ffmpeg. Truncate src to audit frames.
     let need = audit_frames * frame_size;
     let src_path = std::env::temp_dir().join(format!("phasm_bisect_{}_{}_src.yuv", fixture.name, knob.name()));
@@ -399,6 +461,8 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
         drift_uv,
         mean_abs_y,
         max_dev,
+        mismatch_y,
+        mismatch_max,
     };
 
     let report_path = format!(
@@ -409,19 +473,21 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
     std::fs::write(
         &report_path,
         format!(
-            "fixture={}\tknob={}\tencode_ms={}\tbs={}\ty_psnr={:.2}\ty_psnr_min={:.2}\tssim_y={:.4}\tdrift_y={}\tdrift_uv={}\tmean_abs_y={:.2}\tmax_dev={}\n",
+            "fixture={}\tknob={}\tencode_ms={}\tbs={}\ty_psnr={:.2}\ty_psnr_min={:.2}\tssim_y={:.4}\tdrift_y={}\tdrift_uv={}\tmean_abs_y={:.2}\tmax_dev={}\tmismatch_y={}\tmismatch_max={}\n",
             fixture.name, knob.name(),
             m.encode_ms, m.bs_bytes, m.y_psnr_mean, m.y_psnr_min, m.ssim_y_mean,
-            m.drift_y, m.drift_uv, m.mean_abs_y, m.max_dev
+            m.drift_y, m.drift_uv, m.mean_abs_y, m.max_dev,
+            m.mismatch_y, m.mismatch_max,
         ),
     )
     .unwrap();
 
     eprintln!(
-        "[{}/{:>16}] enc={}ms y_psnr={:.2}/{:.2} ssim={:.4} drift y/uv={}/{} mean_abs_y={:.2} max_dev={} demo={}",
+        "[{}/{:>16}] enc={}ms y_psnr={:.2}/{:.2} ssim={:.4} drift y/uv={}/{} mean_abs_y={:.2} max_dev={} mismatch_y={} mismatch_max={} demo={}",
         fixture.name, knob.name(),
         m.encode_ms, m.y_psnr_mean, m.y_psnr_min, m.ssim_y_mean,
-        m.drift_y, m.drift_uv, m.mean_abs_y, m.max_dev, demo
+        m.drift_y, m.drift_uv, m.mean_abs_y, m.max_dev,
+        m.mismatch_y, m.mismatch_max, demo
     );
     m
 }
@@ -429,13 +495,27 @@ fn run_one(fixture: &Fixture, knob: Knob) -> BisectMetrics {
 #[test]
 #[ignore]
 fn bisect_run() {
-    eprintln!("=== Phase D bisect: {} fixtures × {} knobs ===", FIXTURES.len(), KNOBS.len());
+    eprintln!(
+        "=== bisect: {} fixtures × {} knobs (fixtures-within-knob parallel) ===",
+        FIXTURES.len(), KNOBS.len()
+    );
     let t0 = std::time::Instant::now();
-    for fixture in FIXTURES {
-        eprintln!("\n--- fixture {} ---", fixture.name);
-        for knob in KNOBS {
-            let _ = run_one(fixture, *knob);
-        }
+    // Knobs sequential (env vars are process-global; changing between
+    // knobs would race). Fixtures within a knob run in parallel —
+    // they share the SAME env state for that knob, so no race.
+    for knob in KNOBS {
+        eprintln!("--- knob {} ---", knob.name());
+        // Apply env once on the main thread before spawning workers.
+        knob.apply_env();
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(FIXTURES.len());
+            for fixture in FIXTURES {
+                handles.push(s.spawn(move || run_one(fixture, *knob)));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        });
     }
     eprintln!("\n=== bisect complete in {:?} ===", t0.elapsed());
 }
@@ -443,10 +523,10 @@ fn bisect_run() {
 #[test]
 #[ignore]
 fn bisect_summary() {
-    eprintln!("\n=== Phase D bisect summary ===");
+    eprintln!("\n=== Phase D bisect summary (with Phase 1 #266 mismatch_y) ===");
     eprintln!(
-        "{:<14} {:<18} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>8}",
-        "fixture", "knob", "y_psnr", "y_min", "ssim_y", "drift_y", "drift_uv", "mean_abs", "max_dev"
+        "{:<14} {:<18} {:>8} {:>8} {:>8} {:>8} {:>10} {:>11}",
+        "fixture", "knob", "y_psnr", "drift_y", "drift_uv", "max_dev", "mismatch_y", "mismatch_max"
     );
     for fixture in FIXTURES {
         for knob in KNOBS {
@@ -466,18 +546,24 @@ fn bisect_summary() {
             }
             let f = |k: &str| fields.get(k).cloned().unwrap_or_default();
             eprintln!(
-                "{:<14} {:<18} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>8}",
+                "{:<14} {:<18} {:>8} {:>8} {:>8} {:>8} {:>10} {:>11}",
                 fixture.name,
                 knob.name(),
                 f("y_psnr"),
-                f("y_psnr_min"),
-                f("ssim_y"),
                 f("drift_y"),
                 f("drift_uv"),
-                f("mean_abs_y"),
                 f("max_dev"),
+                f("mismatch_y"),
+                f("mismatch_max"),
             );
         }
         eprintln!("");
     }
+    eprintln!(
+        "Reframe predictions:\n\
+         - mismatch_y ≈ 0 with drift_y > 0 = Bug A (mode-quality, encoder/decoder agree)\n\
+         - mismatch_y > 0 = Bug B (real divergence)\n\
+         - force_skip / force_direct / no_b_rdo: predicted mismatch_y ≈ 0\n\
+         - baseline_v26 (RDO with partitioned modes): predicted mismatch_y > 0"
+    );
 }

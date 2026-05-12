@@ -1,0 +1,22 @@
+[package]
+name = "core-openh264-sys"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "FFI bindings for cgaffga/phasm-openh264 (phasm-stego fork of OpenH264)"
+publish = false
+links = "openh264"
+
+[lib]
+# The -sys crate exposes only FFI types + extern "C" symbols.
+# Higher-level Rust API lives in phasm-core's openh264 module.
+crate-type = ["rlib"]
+
+[dependencies]
+# Hand-written FFI bindings use core::ffi::c_void exclusively — no
+# libc dependency needed.
+
+[build-dependencies]
+# Compiles the phasm_encoder_shim.cc C++ shim that wraps OpenH264's
+# ISVCEncoder class for C-callable Rust FFI consumption (Phase B.5+).
+cc = "1"

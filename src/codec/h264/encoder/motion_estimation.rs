@@ -13,7 +13,7 @@
 //! tiled) for sub-pel.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/motion-estimation.md
+//!   docs/design/video/h264/encoder-algorithms/motion-estimation.md
 
 use super::motion_compensation::{apply_luma_mv_block, apply_luma_mv_block_bipred};
 use super::reference_buffer::ReconFrame;
@@ -233,6 +233,70 @@ impl MotionEstimator {
         MotionSearchResult { mv: qpel_mv, cost }
     }
 
+    /// v1.4 Phase 4.1 (#307) — multi-ref L0 search across an ordered
+    /// list of past references. Runs `search_block` per reference,
+    /// then picks the (mv, ref_idx) pair with minimum
+    /// SATD + λ·(mv_bits + ref_idx_bits).
+    ///
+    /// `references[i]` corresponds to ref_idx=i. Caller arranges the
+    /// list so closest-past-anchor is index 0 (matches
+    /// `MultiSlotDpb::ref_list_l0` POC ordering).
+    ///
+    /// Rate-cost note: ref_idx unary encoding (spec § 9.3.2 Table
+    /// 9-34) is N "1" bins followed by terminator "0", so
+    /// `ref_idx=N` takes `N+1` bins. The +1 baseline applies to all
+    /// when `num_active > 1`; the relative penalty for picking
+    /// ref_idx=1 over ref_idx=0 is +1 bin (~λ cost). Tiny but non-
+    /// zero — nudges ME toward the closer reference unless distant
+    /// reference is materially better.
+    ///
+    /// Returns `(MotionSearchResult, ref_idx)`. At a single-element
+    /// `references` slice, behaviour is identical to `search_block`
+    /// modulo a defensive ref_idx=0 return.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_block_multi_ref(
+        &mut self,
+        source: &[u8],
+        source_stride: usize,
+        references: &[&ReconFrame],
+        block_x: u32,
+        block_y: u32,
+        block_w: u32,
+        block_h: u32,
+        predicted_mv: MotionVector,
+    ) -> (MotionSearchResult, u8) {
+        debug_assert!(
+            !references.is_empty(),
+            "search_block_multi_ref requires at least one reference"
+        );
+        let lambda = me_lambda();
+        let mut best_total_cost = u32::MAX;
+        let mut best_result = MotionSearchResult {
+            mv: MotionVector::ZERO,
+            cost: 0,
+        };
+        let mut best_idx: u8 = 0;
+        for (idx, reference) in references.iter().enumerate() {
+            let r = self.search_block(
+                source, source_stride, reference,
+                block_x, block_y, block_w, block_h, predicted_mv,
+            );
+            // Total RD-cost = SATD + λ·(mv_bits + ref_idx_bits).
+            // search_block returns SATD only; add mv_bits +
+            // ref_idx_bits at this layer to make the multi-ref
+            // comparison rate-aware.
+            let mv_bits = mv_bit_cost(r.mv, predicted_mv);
+            let ref_idx_bits = (idx as u32) + 1; // unary: N → N+1 bins
+            let total = r.cost.saturating_add(lambda * (mv_bits + ref_idx_bits));
+            if total < best_total_cost {
+                best_total_cost = total;
+                best_result = r;
+                best_idx = idx as u8;
+            }
+        }
+        (best_result, best_idx)
+    }
+
     /// Back-compat wrapper for callers that pass a `[[u8; 16]; 16]`
     /// source and expect the 16×16 result.
     pub fn search_16x16(
@@ -259,11 +323,11 @@ impl MotionEstimator {
     ///
     /// After independent L0 / L1 ME has produced seed MVs, refine them
     /// jointly to minimise *bipred* SATD + λ × (mvbits_l0 + mvbits_l1).
-    /// Mirrors x264's `--subme 7+` joint refinement pass.
+    /// Joint bipred-refinement pass, subme≥7-style.
     ///
-    /// Algorithm (from x264 `me.c::x264_me_search_ref` Bi branch):
-    /// alternately hold one list fixed and search a small qpel diamond
-    /// around the other list's current best; iterate until both converge.
+    /// Algorithm: alternately hold one list fixed and search a small
+    /// qpel diamond around the other list's current best; iterate
+    /// until both converge.
     /// Total candidates per round = 5 (L0 diamond) + 5 (L1 diamond) = 10
     /// bipred SATDs + 2 anchor evaluations.
     ///
@@ -308,17 +372,27 @@ impl MotionEstimator {
         );
 
         // 5-point diamond (qpel offsets): center + N/S/E/W.
-        const DIAMOND: [(i16, i16); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        const DIAMOND_5: [(i16, i16); 5] = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)];
+        // 9-point diamond — adds 4 diagonals. PHASM_B_REFINE_BIPRED_WIDE=1
+        // selects this pattern + 4 iterations (vs 5-point cross / 2 iters).
+        const DIAMOND_9: [(i16, i16); 9] = [
+            (0, 0),
+            (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, 1), (1, -1), (-1, 1), (-1, -1),
+        ];
+        let wide = std::env::var_os("PHASM_B_REFINE_BIPRED_WIDE").is_some();
+        let max_iter = if wide { 4 } else { 2 };
+        let diamond: &[(i16, i16)] = if wide { &DIAMOND_9 } else { &DIAMOND_5 };
 
-        // Up to 2 alternating passes. Each pass refines one list with
-        // the other held fixed. Convergence check: if a pass produces
-        // no change to either list, stop early.
-        for _iter in 0..2 {
+        // Up to `max_iter` alternating passes. Each pass refines one
+        // list with the other held fixed. Convergence check: if a pass
+        // produces no change to either list, stop early.
+        for _iter in 0..max_iter {
             let prev_l0 = best_l0;
             let prev_l1 = best_l1;
 
             // Pass A — refine L0 with L1 fixed.
-            for (dx, dy) in DIAMOND.iter().copied() {
+            for (dx, dy) in diamond.iter().copied() {
                 if dx == 0 && dy == 0 { continue; }
                 let cand_l0_raw = MotionVector {
                     mv_x: best_l0.mv_x.saturating_add(dx),
@@ -339,7 +413,7 @@ impl MotionEstimator {
             }
 
             // Pass B — refine L1 with L0 fixed.
-            for (dx, dy) in DIAMOND.iter().copied() {
+            for (dx, dy) in diamond.iter().copied() {
                 if dx == 0 && dy == 0 { continue; }
                 let cand_l1_raw = MotionVector {
                     mv_x: best_l1.mv_x.saturating_add(dx),
@@ -531,7 +605,7 @@ const MAX_MULTI_HEX_ITER: usize = 4;
 /// the constant with a per-QP lookup against `super::rdo::LAMBDA_TAB`
 /// once QP is threaded through the partition decision.
 ///
-/// **Revisit in Phase C.5** (`docs/design/h264-encoder-quality-plan.md`):
+/// **Revisit in Phase C.5** (`docs/design/video/h264/encoder-quality-plan.md`):
 /// 2026-04-23 PSNR-only sweep showed monotonic PSNR loss as λ
 /// increases, but that's a flawed measure — higher λ biases toward
 /// shorter MVDs which costs match quality but earns fewer bits. The
@@ -547,6 +621,14 @@ fn me_lambda() -> u32 {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .map_or(LAMBDA_MOTION_DEFAULT, |v| v.clamp(1, 32))
+}
+
+/// v1.4 Phase 4.2 (#313) — pub-crate accessor for the ME λ used by
+/// multi-ref post-pass rate-cost calculations
+/// (`refine_p_choice_multi_ref` in `partition_decision.rs`).
+#[inline]
+pub(crate) fn me_lambda_pub() -> u32 {
+    me_lambda()
 }
 
 /// se(v) codeword length for signed Exp-Golomb, approximating the
@@ -1168,6 +1250,64 @@ mod tests {
         );
         assert_eq!(r.mv, MotionVector { mv_x: 16, mv_y: 0 });
         assert_eq!(r.cost, 0);
+    }
+
+    // -- v1.4 Phase 4.1 search_block_multi_ref tests -----------------------
+
+    #[test]
+    fn multi_ref_picks_idx_0_when_only_one_ref() {
+        // Single-ref slice: result identical to search_block + idx=0.
+        let reference = build_ref(64, 48, |x, y| ((x * 11 + y * 7) & 0xFF) as u8);
+        let source = extract_block(&reference, 16, 16);
+        let mut me = MotionEstimator::new();
+        let (r, idx) = me.search_block_multi_ref(
+            source.as_flattened(),
+            16,
+            &[&reference],
+            16, 16, 16, 16,
+            MotionVector::ZERO,
+        );
+        assert_eq!(idx, 0);
+        assert_eq!(r.mv, MotionVector::ZERO);
+        assert_eq!(r.cost, 0);
+    }
+
+    #[test]
+    fn multi_ref_picks_idx_1_when_second_ref_matches() {
+        // Two refs: ref_0 has noise, ref_1 matches source exactly.
+        // Multi-ref must prefer ref_1 despite +λ ref_idx penalty since
+        // ref_0's SATD is far from zero.
+        let ref_0 = build_ref(64, 48, |x, y| ((x * 17 + y * 13) & 0xFF) as u8);
+        let ref_1 = build_ref(64, 48, |x, y| ((x * 11 + y * 7) & 0xFF) as u8);
+        let source = extract_block(&ref_1, 16, 16);
+        let mut me = MotionEstimator::new();
+        let (r, idx) = me.search_block_multi_ref(
+            source.as_flattened(),
+            16,
+            &[&ref_0, &ref_1],
+            16, 16, 16, 16,
+            MotionVector::ZERO,
+        );
+        assert_eq!(idx, 1, "expected ref_idx=1 (second ref matches source)");
+        assert_eq!(r.mv, MotionVector::ZERO);
+        assert_eq!(r.cost, 0);
+    }
+
+    #[test]
+    fn multi_ref_prefers_idx_0_on_tie() {
+        // Both refs identical → both yield SATD=0 at MV=0, but ref_idx=0
+        // has fewer ref_idx bins so total cost is lower.
+        let reference = build_ref(64, 48, |x, y| ((x * 11 + y * 7) & 0xFF) as u8);
+        let source = extract_block(&reference, 16, 16);
+        let mut me = MotionEstimator::new();
+        let (_r, idx) = me.search_block_multi_ref(
+            source.as_flattened(),
+            16,
+            &[&reference, &reference],
+            16, 16, 16, 16,
+            MotionVector::ZERO,
+        );
+        assert_eq!(idx, 0, "tie should break toward closer reference (lower ref_idx)");
     }
 
     // -- §6E-D.5(c) refine_bipred tests -------------------------------------

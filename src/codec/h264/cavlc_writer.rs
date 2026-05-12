@@ -15,7 +15,7 @@
 //!   5. run_before — VLC per non-last coefficient.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/cavlc-encoder.md
+//!   docs/design/video/h264/encoder-algorithms/cavlc-encoder.md
 //!
 //! The single entry point `encode_cavlc_block` handles all four
 //! block variants (luma 4×4, I_16x16 luma AC, chroma AC, chroma DC)

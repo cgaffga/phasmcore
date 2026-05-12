@@ -5,7 +5,7 @@
 //! §6E-A6.0 — B-slice macroblock mode decision (encoder side).
 //!
 //! Driven by the algorithm note at
-//! `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`.
+//! `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`.
 //!
 //! ## Sub-phase activation
 //!
@@ -29,8 +29,8 @@
 //! ## Mode-decision strategy
 //!
 //! Cost-based selection over the candidate set with mode-preference
-//! penalties borrowed from ffmpeg's `ff_estimate_b_frame_motion`
-//! pattern (codec-agnostic, allowed per `memory/h264_clean_room_audit.md`):
+//! penalties from standard MPEG-style B-frame motion estimation
+//! (codec-agnostic, allowed per `memory/h264_clean_room_audit.md`):
 //!
 //! - Direct  ×0 (free; chosen when neighbours agree on a clean
 //!   predictor)
@@ -39,9 +39,10 @@
 //! - L0      ×3
 //! - Skip    handled via a separate up-front check (CBP-zero shortcut)
 //!
-//! See `docs/design/h264-encoder-algorithms/6E-A6-bslice-partitions.md`
-//! § "ffmpeg reference" for the rationale + the empirical x264-medium
-//! distribution we calibrate against in §6E-A6.5.
+//! See `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`
+//! § "Cost-penalty rationale" for the rationale + the empirical
+//! converter-pipeline-centroid distribution we calibrate against in
+//! §6E-A6.5.
 
 use super::motion_estimation::MotionVector;
 use super::partition_state::EncoderMvGrid;
@@ -95,6 +96,21 @@ pub fn drain_b_mb_records() -> Vec<BMbRecord> {
     std::mem::take(&mut *guard)
 }
 
+/// §intra-in-B (#319) Phase 2-diagnostic — counter of B-MBs whose
+/// best inter SATD exceeds [`INTRA_FALLBACK_SATD_THRESHOLD`].
+/// Incremented by `mb_decision_b_rdo` regardless of any env-var gate
+/// — pure observation, zero decision impact. Phase 3 (encoder emit)
+/// will switch this from observation to action.
+pub static B_INTRA_FALLBACK_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read + reset the intra-fallback candidate counter. Tests call this
+/// before encode + after to measure how many B-MBs in a fixture
+/// would benefit from intra-in-B.
+pub fn drain_b_intra_fallback_count() -> u64 {
+    B_INTRA_FALLBACK_COUNT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// §B-instrument v1 — internal pushd; gated by `PHASM_B_INSTRUMENT=1`.
 fn push_b_mb_record(record: BMbRecord) {
     if std::env::var_os("PHASM_B_INSTRUMENT").is_none() {
@@ -133,17 +149,24 @@ pub enum BMbDecision {
     /// derives the MV spatially.
     Direct16x16,
 
-    /// `mb_type = 1` (`B_L0_16x16`). One L0 MV, no L1. Single-ref
-    /// configuration locks `ref_idx_l0 = 0` (not emitted on the
-    /// wire — `num_ref_idx_l0_active_minus1 = 0` per §6E-A4 SPS).
-    L0_16x16 { mv: MotionVector },
+    /// `mb_type = 1` (`B_L0_16x16`). One L0 MV, no L1.
+    ///
+    /// v1.4 Phase 4.3 (#314): `ref_idx_l0` carries the L0 reference
+    /// index. Default 0 = closest past anchor (= `dpb.past_anchor`).
+    /// Path B post-pass `refine_b_choice_multi_ref` may upgrade it to
+    /// 1 (= `dpb.pre_past_anchor`) when ref_1 wins the SATD
+    /// comparison.
+    L0_16x16 { mv: MotionVector, ref_idx_l0: u8 },
 
-    /// `mb_type = 2` (`B_L1_16x16`). One L1 MV, no L0. `ref_idx_l1 = 0`.
+    /// `mb_type = 2` (`B_L1_16x16`). One L1 MV, no L0. `ref_idx_l1 = 0`
+    /// (L1 stays single-ref per Q1 design lock).
     L1_16x16 { mv: MotionVector },
 
     /// `mb_type = 3` (`B_Bi_16x16`). One L0 MV + one L1 MV.
-    /// `ref_idx_l0 = ref_idx_l1 = 0`.
-    Bi_16x16 { mv_l0: MotionVector, mv_l1: MotionVector },
+    ///
+    /// v1.4 Phase 4.3 (#314): `ref_idx_l0` per Path B post-pass
+    /// (default 0). `ref_idx_l1` stays implicit 0 (Q1 lock).
+    Bi_16x16 { mv_l0: MotionVector, mv_l1: MotionVector, ref_idx_l0: u8 },
 
     /// §6E-A6.2 — partitioned B mb_type. Covers all 18 variants
     /// 4..21 (both 16x8 and 8x16 shapes; the shape is encoded in the
@@ -157,9 +180,23 @@ pub enum BMbDecision {
         parts: [super::b_partitioned::BPartitionMv; 2],
     },
 
+    /// §intra-in-B (#319) — intra-fallback variant. v1.6 Phase 2-decision
+    /// scope: emitted when `min(satd_skip_or_direct, satd_l0, satd_l1,
+    /// satd_bi) > 25000` indicating ME couldn't find a usable reference
+    /// patch. Walker support shipped Phase 1 (commit 56d2d1b);
+    /// counter shipped Phase 2-diagnostic (commit 2843d5e). Encoder
+    /// emit path lands in Phase 3 — until then `mb_decision_b_rdo`
+    /// does NOT produce this variant, and the encoder match arm
+    /// returns an error if reached. See
+    /// `memory/h264_v16_intra_in_b_plan_2026_05_10.md`.
+    ///
+    /// `i16x16_mode`: 0=V, 1=H, 2=DC, 3=Plane (spec § 8.3.3).
+    /// `chroma_pred_mode`: 0=DC, 1=H, 2=V, 3=Plane (spec § 8.3.4).
+    IntraI16x16 { i16x16_mode: u8, chroma_pred_mode: u8 },
+
     /// §6E-A6.3 — `mb_type = 22` (`B_8x8`). Four 8x8 sub-MBs, each
     /// with its own `sub_mb_type` (0..=3 — uniform 8x8 family per
-    /// the x264-medium distribution finding):
+    /// the converter-pipeline-centroid distribution finding):
     ///
     /// - 0 = `B_Direct_8x8` (no MVDs, decoder spatial-direct)
     /// - 1 = `B_L0_8x8` (one L0 MV)
@@ -179,14 +216,32 @@ pub enum BMbDecision {
     },
 }
 
+impl BMbDecision {
+    /// v1.4 Phase 4.3 (#314, Path B) — uniform-per-MB ref_idx_l0
+    /// accessor. Reads the ref_idx_l0 from L0_16x16 or Bi_16x16 (the
+    /// only variants Path B post-pass currently upgrades). Returns 0
+    /// for variants without explicit ref_idx_l0 (Skip, Direct, L1,
+    /// Partitioned, B8x8 — those keep ref_idx=0 in v1.4-cut1).
+    pub fn ref_idx_l0_uniform(&self) -> u8 {
+        match self {
+            BMbDecision::L0_16x16 { ref_idx_l0, .. }
+            | BMbDecision::Bi_16x16 { ref_idx_l0, .. } => *ref_idx_l0,
+            // Partitioned + B8x8 carry ref_idx_l0 inside each
+            // BPartitionMv but Path B v1.4-cut1 doesn't upgrade them.
+            // Other variants don't use L0 at all.
+            _ => 0,
+        }
+    }
+}
+
 /// §6E-A6.0 — entry point for B-slice MB mode decision. The default
 /// implementation matches §6E-A4(c)-lite output exactly: deterministic
 /// ~50/50 hash-based mix of `Skip` and `Direct16x16`.
 ///
 /// **§6E-A6.1+ widens this** progressively: L0/L1/Bi 16x16 (§6E-A6.1),
 /// partitioned 16x8/8x16 (§6E-A6.2), B_8x8 (§6E-A6.3). Real cost-
-/// based selection (ffmpeg-MPEG-style ×0/×1/×2/×3 penalties) lands
-/// alongside ME extensions.
+/// based selection (MPEG-style ×0/×1/×2/×3 mode-preference penalties)
+/// lands alongside ME extensions.
 ///
 /// **Test override (§6E-A6.1)**: when the `PHASM_B_FORCE_MODE` env
 /// var is set, all B-MBs in the frame return the forced decision
@@ -244,16 +299,15 @@ pub fn mb_decision_b_with_mvs(
     // 14-mode probe, the §6E-A.deploy.4 baseline (50/35/6/5/4)
     // remains the lowest-Σ|Δ| variant tested:
     //
-    //   Distribution                              | Σ|Δ| from x264 |
-    //   ──────────────────────────────────────────|───────────────|
-    //   Original (50/35/6/5/4)                    |    38.9pp ✓   |
-    //   Calib v1 ( 8/5/39/37/4 + 3/2/2)           |   180.5pp     |
-    //   Calib v2 (30/30/16/15/2 + 3/2/2)          |   137.2pp     |
-    //   Calib v3 (50/30/6/5/1 + 4/3/1)            |   162.2pp     |
+    //   Distribution                              | Σ|Δ| from centroid |
+    //   ──────────────────────────────────────────|────────────────────|
+    //   Original (50/35/6/5/4)                    |    38.9pp ✓        |
+    //   Calib v1 ( 8/5/39/37/4 + 3/2/2)           |   180.5pp          |
+    //   Calib v2 (30/30/16/15/2 + 3/2/2)          |   137.2pp          |
+    //   Calib v3 (50/30/6/5/1 + 4/3/1)            |   162.2pp          |
     //
-    // Why every linear-math attempt fails: libavcodec's
-    // AVMotionVector exporter cascades non-linearly through
-    // mode mixing.
+    // Why every linear-math attempt fails: the reference decoder's
+    // MV-exporter labelling cascades non-linearly through mode mixing.
     //
     // Key empirical findings from the 1080p probe:
     //   - Probe (each mode 100% forced) gives clean per-mode
@@ -268,15 +322,14 @@ pub fn mb_decision_b_with_mvs(
     //     Direct's spatial-direct distribution). Skip's behaviour
     //     SWITCHES based on neighbouring modes.
     //   - B_8x8 in any sub_mb_type form (0/1/2/3 or mixed) emits
-    //     100% Bi labels — not L0 even when sub_mb_type=1
-    //     (B_L0_8x8). This appears to be a hard libavcodec
-    //     exporter behaviour.
+    //     100% Bi labels in the reference decoder's MV exporter —
+    //     a hard quirk of that exporter, not of the bitstream.
     //
     // Path to actually closing the gap (#156, post-#118 wider corpus):
-    //   (a) Patch libavcodec MV exporter with per-mb_type tracing,
+    //   (a) Trace the reference-decoder MV exporter per-mb_type to
     //       understand cascade rules empirically, OR
-    //   (b) Use a non-libavcodec reference parser (JM / OpenH264)
-    //       to disambiguate libavcodec-quirk vs phasm-encoder, OR
+    //   (b) Use an alternative reference parser to disambiguate
+    //       exporter-quirk vs phasm-encoder, OR
     //   (c) Iterative gradient descent on bucket sizes (each iter
     //       ~50s at 1080p × 10f). Not done in this session.
     //
@@ -429,19 +482,18 @@ pub fn b_rdo_enabled() -> bool {
 
 /// §6E-D.5b Track A — return `true` iff the spatial-direct
 /// prediction's luma residual would quantize to all zeros at QP
-/// (CBP_luma=0). x264-style Skip pre-check: when this returns true,
-/// the caller emits `BMbDecision::Skip` without scoring the RDO
-/// candidate set.
+/// (CBP_luma=0). Skip pre-check: when this returns true, the caller
+/// emits `BMbDecision::Skip` without scoring the RDO candidate set.
 ///
 /// Implementation: build the spatial-direct luma prediction, compute
 /// per-4×4-block residual = src − pred, run forward DCT + plain quant
 /// (no trellis — quant rounding under the dead-zone is what determines
 /// CBP=0), and check if every coefficient quantizes to 0.
 ///
-/// Chroma CBP is NOT checked here (x264 does check it separately, but
-/// a luma-zero MB nearly always implies chroma-zero at the same QP for
-/// realistic content). If false-Skip emissions show up in the gate,
-/// extend with chroma quantization.
+/// Chroma CBP is NOT checked here (the reference fast encoder checks
+/// it separately, but a luma-zero MB nearly always implies chroma-zero
+/// at the same QP for realistic content). If false-Skip emissions show
+/// up in the gate, extend with chroma quantization.
 fn skip_cbp_is_zero(
     direct: &super::b_direct_predictor::BDirectSpatialResult,
     src_y: &[[u8; 16]; 16],
@@ -456,24 +508,43 @@ fn skip_cbp_is_zero(
     use super::transform::forward_dct_4x4;
     use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 
-    // Build spatial-direct luma prediction (16x16).
-    let mut pred = [[0u8; 16]; 16];
-    let pred_flat = pred.as_flattened_mut();
-    let mb_px_x = (mb_x * 16) as u32;
-    let mb_px_y = (mb_y * 16) as u32;
-    match (direct.uses_l0(), direct.uses_l1()) {
-        (true, true) => apply_luma_mv_block_bipred(
-            l0_ref, direct.mv_l0, l1_ref, direct.mv_l1,
-            mb_px_x, mb_px_y, 16, 16, pred_flat, 16,
-        ),
-        (true, false) => apply_luma_mv_block(
-            l0_ref, mb_px_x, mb_px_y, 16, 16, direct.mv_l0, pred_flat, 16,
-        ),
-        (false, true) => apply_luma_mv_block(
-            l1_ref, mb_px_x, mb_px_y, 16, 16, direct.mv_l1, pred_flat, 16,
-        ),
-        (false, false) => return false, // pathological — fall through to RDO
+    if !direct.uses_l0() && !direct.uses_l1() {
+        return false; // pathological — fall through to RDO
     }
+
+    // Phase 2.12.f (#282, 2026-05-08) — when colZeroFlag override fires
+    // on at least one sub-block, the actual Skip-emit MC uses per-8x8
+    // MVs (Phase 2.12.e). The pre-check must mirror that: a uniform
+    // single-MV prediction here would say "all zero" while per-8x8
+    // emit produces a different (non-zero residual) prediction. Use
+    // the per-8x8 builder when override fires; legacy single-MV
+    // builder otherwise (preserves SIMD perf for non-static colMb).
+    let pred = if direct.has_per_8x8_override_l0() || direct.has_per_8x8_override_l1() {
+        super::b_inter_prediction::build_b_luma_prediction_per_8x8(
+            direct.mv_l0_per_8x8, direct.mv_l1_per_8x8,
+            direct.uses_l0(), direct.uses_l1(),
+            l0_ref, l1_ref, mb_x, mb_y,
+        )
+    } else {
+        let mut pred = [[0u8; 16]; 16];
+        let pred_flat = pred.as_flattened_mut();
+        let mb_px_x = (mb_x * 16) as u32;
+        let mb_px_y = (mb_y * 16) as u32;
+        match (direct.uses_l0(), direct.uses_l1()) {
+            (true, true) => apply_luma_mv_block_bipred(
+                l0_ref, direct.mv_l0, l1_ref, direct.mv_l1,
+                mb_px_x, mb_px_y, 16, 16, pred_flat, 16,
+            ),
+            (true, false) => apply_luma_mv_block(
+                l0_ref, mb_px_x, mb_px_y, 16, 16, direct.mv_l0, pred_flat, 16,
+            ),
+            (false, true) => apply_luma_mv_block(
+                l1_ref, mb_px_x, mb_px_y, 16, 16, direct.mv_l1, pred_flat, 16,
+            ),
+            (false, false) => unreachable!(),
+        }
+        pred
+    };
 
     // §B-Direct-distortion-validation v3 (2026-05-08, #251) —
     // raw-SAD sanity check before trusting the all-zero-coeff
@@ -556,6 +627,7 @@ fn skip_cbp_is_zero(
 ///
 /// Determinism: pure function of inputs + ME results. No RNG.
 /// Required for Pass 1 / Pass 3 stego mode parity.
+///
 #[allow(clippy::too_many_arguments)]
 pub fn mb_decision_b_rdo(
     grid: &EncoderMvGrid,
@@ -581,18 +653,56 @@ pub fn mb_decision_b_rdo(
 
     // §6E-D.5b Track A — Skip-CBP-zero pre-check.
     //
-    // Before running RDO over candidates, mirror x264's actual
-    // algorithm (encoder/macroblock.c::x264_macroblock_analyse_inter_b
-    // path): if the spatial-direct prediction's residual quantizes to
-    // ALL zeros at the current QP, emit Skip immediately and skip the
-    // RDO sweep entirely. This is the structural reason x264-medium
-    // emits ~50% of B-MBs as Skip; without the pre-check, RDO almost
-    // never picks Skip because the L0/L1/Bi candidates always score
-    // better on raw SATD (they use ME-derived MVs vs Skip's spatial-
-    // direct MVs). §6E-D.6 + §6E-D.5(a) measurements showed Skip
-    // share at 0.21% without this gate (target 50%+). Pre-check is
-    // not cosmetic calibration — it's exactly what real encoders do.
-    if skip_cbp_is_zero(&direct, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp) {
+    // Before running RDO over candidates, apply the standard fast
+    // B-frame analysis path: if the spatial-direct prediction's
+    // residual quantizes to ALL zeros at the current QP, emit Skip
+    // immediately and skip the RDO sweep entirely. This is the
+    // structural reason the converter-pipeline centroid emits ~50%
+    // of B-MBs as Skip; without the pre-check, RDO almost never
+    // picks Skip because the L0/L1/Bi candidates always score better
+    // on raw SATD (they use ME-derived MVs vs Skip's spatial-direct
+    // MVs). §6E-D.6 + §6E-D.5(a) measurements showed Skip share at
+    // 0.21% without this gate (target 50%+). Pre-check is not
+    // cosmetic calibration — it's the standard fast encoder pattern.
+    // Diagnostic env-gate: PHASM_B_SKIP_NO_CBP_PRECHECK=1 disables the
+    // early-Skip CBP-zero pre-check entirely, forcing every B-MB
+    // through the full RDO sweep. Used to measure how much of the
+    // visible drift on motion content is driven by Skip-without-
+    // residual emission. Default OFF (production behaviour unchanged).
+    if std::env::var_os("PHASM_B_SKIP_NO_CBP_PRECHECK").is_none()
+        && skip_cbp_is_zero(&direct, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp)
+    {
+        // Phase 2.7 (#272 follow-on) — Skip pre-check fires for many
+        // MBs in default RDO mix. Without instrumentation, the
+        // post-fix bisect harness shows them as "BMbRecord missing"
+        // and assumes Partitioned/B_8x8. Push a Skip-flavoured
+        // record so the harness can distinguish.
+        if std::env::var_os("PHASM_B_INSTRUMENT").is_some() {
+            let frame_idx = B_INSTRUMENT_FRAME_IDX
+                .load(std::sync::atomic::Ordering::Relaxed);
+            push_b_mb_record(BMbRecord {
+                frame_idx,
+                mb_x: mb_x as u16,
+                mb_y: mb_y as u16,
+                mode_id: 0, // Skip
+                mv_l0_x: direct.mv_l0.mv_x,
+                mv_l0_y: direct.mv_l0.mv_y,
+                mv_l1_x: direct.mv_l1.mv_x,
+                mv_l1_y: direct.mv_l1.mv_y,
+                direct_mv_l0_x: direct.mv_l0.mv_x,
+                direct_mv_l0_y: direct.mv_l0.mv_y,
+                direct_mv_l1_x: direct.mv_l1.mv_x,
+                direct_mv_l1_y: direct.mv_l1.mv_y,
+                satd_skip_or_direct: 0,
+                satd_l0: 0,
+                satd_l1: 0,
+                satd_bi: 0,
+                at_boundary: false,
+                src_mean: 0,
+                src_min: 0,
+                src_max: 0,
+            });
+        }
         return BMbDecision::Skip;
     }
 
@@ -601,12 +711,19 @@ pub fn mb_decision_b_rdo(
         mv_l1: direct.mv_l1,
         uses_l0: direct.uses_l0(),
         uses_l1: direct.uses_l1(),
+        mv_l0_per_8x8: direct.mv_l0_per_8x8,
+        mv_l1_per_8x8: direct.mv_l1_per_8x8,
     };
-    let l0 = BMbCandidate::L0_16x16 { mv_l0: me_mvs.0 };
+    // v1.4 Phase 2 (#305): single-ref default ref_idx_l0=0. Multi-ref
+    // wiring lands in Phase 4 (ME) + Phase 5 (RDO ref selection).
+    let l0 = BMbCandidate::L0_16x16 { mv_l0: me_mvs.0, ref_idx_l0: 0 };
     let l1 = BMbCandidate::L1_16x16 { mv_l1: me_mvs.1 };
-    let bi = BMbCandidate::Bi_16x16 { mv_l0: me_mvs.0, mv_l1: me_mvs.1 };
+    let bi = BMbCandidate::Bi_16x16 { mv_l0: me_mvs.0, mv_l1: me_mvs.1, ref_idx_l0: 0 };
 
-    // Score the explicit-MV candidates.
+    // Score the explicit-MV candidates with the SATD-domain fast path.
+    // The §6E-D.5(m) HF-proportional Direct multiplier + §6E-D.5(o) Bi
+    // discount inside `evaluate_b_mb_rdo` compensate for SATD being a
+    // distortion proxy.
     let r_skip_or_direct = evaluate_b_mb_rdo(&skip_or_direct, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp);
     let r_l0 = evaluate_b_mb_rdo(&l0, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp);
     let r_l1 = evaluate_b_mb_rdo(&l1, src_y, l0_ref, l1_ref, mb_x, mb_y, mb_qp);
@@ -626,13 +743,13 @@ pub fn mb_decision_b_rdo(
     // SATD improvements.
     //
     // The fix: Skip wire form is ONLY emitted by the CBP-zero
-    // pre-check (Track A above), which mirrors x264's actual
-    // algorithm. If the residual genuinely quantizes to zero,
-    // emit Skip. Otherwise, the encoder MUST emit a mode that
-    // includes residual — and Skip is not in that race. Removing
-    // the artificial `skip_cost` from the RDO comparison forces
-    // explicit-MV candidates to compete only with Direct, which
-    // is the correct rate-distortion tradeoff.
+    // pre-check (Track A above) — the standard fast B-frame
+    // analysis pattern. If the residual genuinely quantizes to
+    // zero, emit Skip. Otherwise, the encoder MUST emit a mode
+    // that includes residual — and Skip is not in that race.
+    // Removing the artificial `skip_cost` from the RDO comparison
+    // forces explicit-MV candidates to compete only with Direct,
+    // which is the correct rate-distortion tradeoff.
     //
     // Effect: when Track A returns false (CBP would be non-zero),
     // best is initialised to SkipOrDirect (Direct emit form, 6
@@ -641,25 +758,27 @@ pub fn mb_decision_b_rdo(
 
     // §6E-D.5(d) — Bi early-termination threshold.
     //
-    // Mirror x264's i_thresh_satd mechanism. On the same 10-frame
-    // IMG_4138 fixture, x264-medium emits Bi for only 1.10% of B-MBs;
-    // phasm RDO without this gate emits Bi 71.82% (memory:
-    // h264_phase6e_d_x264_same_fixture.md). Root cause: bipred
-    // averaging on real motion content has a 30-50% SATD advantage
-    // that beats single-list rate-cost most of the time. x264 short-
-    // circuits this by not even considering Bi unless its SATD
-    // advantage over the BEST single-list exceeds a meaningful
-    // margin. Below the margin, single-list "won" and Bi gets
-    // dropped from the candidate set entirely.
+    // Standard fast-encoder Bi SATD-threshold mechanism. On the same
+    // 10-frame IMG_4138 fixture, the converter-pipeline centroid
+    // emits Bi for only 1.10% of B-MBs; phasm RDO without this gate
+    // emits Bi 71.82% (see corresponding memory note on the same-fixture gate).
+    // Root cause: bipred averaging on real motion content has a
+    // 30-50% SATD advantage that beats single-list rate-cost most of
+    // the time. The standard pattern short-circuits this by not even
+    // considering Bi unless its SATD advantage over the BEST
+    // single-list exceeds a meaningful margin. Below the margin,
+    // single-list "won" and Bi gets dropped from the candidate set
+    // entirely.
     //
     // §6E-D.5(k) — Bi early-termination threshold REMOVED.
     //
     // The threshold was added in §6E-D.5(d) when Bi share was
     // 71.82% (clearly broken). It treated the symptom: Bi was
-    // over-emitting because of the libavcodec exporter labeling
-    // artifact (Skip+spatial-direct synthesized as Bi labels) and
-    // because the artificial skip_cost + missing Direct distortion
-    // penalty were giving Direct/Skip an unfair cost advantage.
+    // over-emitting because of a reference-decoder MV-exporter
+    // labelling artifact (Skip+spatial-direct synthesized as Bi
+    // labels) and because the artificial skip_cost + missing Direct
+    // distortion penalty were giving Direct/Skip an unfair cost
+    // advantage.
     //
     // §6E-D.5(e) (drop artificial skip_cost) + §6E-D.5(i)+(j)+(k)
     // (Direct distortion penalty) fixed the structural causes. With
@@ -671,9 +790,9 @@ pub fn mb_decision_b_rdo(
     // genuinely beats single-list by enough to overcome its rate
     // overhead. Per-MB defendable: each Bi emission means "bipred
     // SATD savings exceeded the 12-bin extra rate cost over single-
-    // list". x264 same-fixture emits 1.42% Bi — small but non-zero,
-    // exactly this content-driven pattern. Phasm should land in a
-    // similar low-single-digit range.
+    // list". The converter-pipeline centroid emits 1.42% Bi on the
+    // same fixture — small but non-zero, exactly this content-driven
+    // pattern. Phasm should land in a similar low-single-digit range.
     //
     // Always-true now (kept as identity for the diagnostic logging).
     let best_single_satd = r_l0.satd.min(r_l1.satd);
@@ -824,10 +943,78 @@ pub fn mb_decision_b_rdo(
         || direct.mv_l1.mv_x.abs() > DIRECT_MV_QPEL_THRESHOLD
         || direct.mv_l1.mv_y.abs() > DIRECT_MV_QPEL_THRESHOLD;
 
+    // Phase 2.19 (#288, 2026-05-09) — Path B' SATD-floor refusal of
+    // Direct.
+    //
+    // Diagnosis: at high-motion B-frames (e.g., carplane display=5,
+    // src delta 19 dB → MC error >> QP=26 noise floor), RDO picks
+    // Direct for every MB because Direct's rate cost is ~6 bins vs
+    // L0_16x16's 30+ bins, which dominates over the SATD difference
+    // when both modes have similar (high) SATD. The result is a B-
+    // frame with CBP=0 everywhere — bitstream collapses to ~1KB and
+    // recon = bipred MC at spatial-direct MV ≈ 21 dB PSNR vs source.
+    //
+    // Mode-count instrumentation 2026-05-09 confirmed: at carplane
+    // display=5, RDO picks 100% Skip+Direct (3936+4104=8040 MBs),
+    // ZERO L0/L1/Bi. the converter-pipeline centroid on identical content/QP gets 43 dB
+    // because it emits explicit-MV+residual when Direct's prediction
+    // is poor (real-world distribution).
+    //
+    // This is a fast-RDO approximation flaw: SATD on prediction
+    // error doesn't credit residual's distortion reduction. L0_16x16
+    // computed cost ≈ Skip cost (same SATD) + higher rate → Skip
+    // wins. But L0_16x16 EMITS residual that quantizes the error down
+    // to QP-noise level (~64 SAD post-quant ≈ 38 dB). Skip emits no
+    // residual → 21 dB PSNR.
+    //
+    // Fix: refuse Direct when its SATD exceeds the same SAD-quality
+    // floor used by `skip_cbp_is_zero` (3072 = 256 × 12 avg dev).
+    // Above the floor, Direct's no-residual emission cannot recover
+    // the prediction error, so route the MB to an explicit-MV
+    // candidate that includes residual emission. The residual
+    // closes the prediction-vs-source gap.
+    //
+    // Per-MB defendable: each Direct refusal corresponds to a real
+    // case where the spatial-direct prediction is too far from
+    // source for CBP=0 emission to produce visually correct output.
+    // Stealth-positive: real encoders also emit explicit-MV at high
+    // motion (the converter-pipeline centroid 1.10% Bi + 41% L0/L1 on carplane).
+    //
+    // Default ON. Disable via PHASM_B_NO_DIRECT_SATD_FLOOR=1.
+    const DIRECT_SATD_FLOOR: u32 = 3072;
+    let direct_satd_too_high = r_skip_or_direct.satd > DIRECT_SATD_FLOOR
+        && std::env::var_os("PHASM_B_NO_DIRECT_SATD_FLOOR").is_none();
+
+    // v1.5 §B-fast-motion (#317) — RELATIVE SATD gate. The absolute
+    // DIRECT_SATD_FLOOR (3072) misses MBs where Direct's SATD is
+    // moderate but explicit-ME modes have much lower distortion.
+    // Empirical observation on carplane road MBs (max|Δ|>20 cluster):
+    // Direct picked even when L0/L1's SATD was 1.5–3× lower because
+    // Direct's rate=0 dominates λ·R at QP=26. Result: visible block
+    // artifacts on flat-ish moving content where Direct's stale
+    // (0,0) prediction differs from source by a constant offset that
+    // the dead-zone-quantized residual fails to correct.
+    //
+    // Spec-aligned behaviour: the converter-pipeline centroid picks
+    // L0/L1 over Direct when SATD ratio >> 1, even at low rate cost.
+    // The phasm RDO undervalues Direct's distortion at low-HF MBs
+    // (multiplier ~1.0 there).
+    //
+    // Threshold 3/2 = 1.5×. Disable via PHASM_B_NO_DIRECT_SATD_RATIO=1.
+    let best_alt_satd = r_l0.satd
+        .min(r_l1.satd)
+        .min(r_bi.satd)
+        .max(1);
+    let direct_satd_ratio_too_high = (r_skip_or_direct.satd as u64) * 2
+        > (best_alt_satd as u64) * 3
+        && std::env::var_os("PHASM_B_NO_DIRECT_SATD_RATIO").is_none();
+
     let direct_cost_validated = if (at_boundary
         && std::env::var_os("PHASM_B_NO_BOUNDARY_REFUSE").is_none())
         || (direct_mv_too_large
             && std::env::var_os("PHASM_B_NO_DIRECT_MAGCLAMP").is_none())
+        || direct_satd_too_high
+        || direct_satd_ratio_too_high
     {
         u64::MAX
     } else {
@@ -858,6 +1045,53 @@ pub fn mb_decision_b_rdo(
     if r_l0.cost              < best.0 { best = (r_l0.cost, 2); }
     if r_l1.cost              < best.0 { best = (r_l1.cost, 3); }
     if bi_passes_threshold && bi_cost_validated < best.0 { best = (bi_cost_validated, 4); }
+
+    // §intra-in-B (#319) Phase 2-diagnostic — count B-MBs that would
+    // be candidates for intra-fallback under the v1.6 plan. A B-MB is
+    // a fallback candidate when ALL inter SATDs exceed the threshold,
+    // meaning ME couldn't find any reference patch that matches the
+    // source well. The dark-debris artifact in the user's screenshot
+    // is exactly this case: small high-contrast feature on uniform
+    // background, ME finds wrong-but-cheap match in the surrounding
+    // texture, all candidates have high residual energy.
+    //
+    // This counter is incremented but no decision is made yet —
+    // Phase 3 (encoder emit path) wires the actual intra emission.
+    // Read via [`drain_b_intra_fallback_count`].
+    //
+    // Threshold 25000 is calibrated from the v1.5 artifact harness:
+    // the worst MBs in the carplane Class B set had min(satd) in the
+    // 20k–30k range; setting the gate at 25k catches genuine ME
+    // failures without firing on normal high-residual content.
+    // Env-tunable for Phase 5-6 calibration: PHASM_B_INTRA_FALLBACK_SATD_MIN.
+    // Higher value → fewer intra emissions; lower → more. v1.6.0 default
+    // 25000 lands at 0.53% of B-MBs on carplane, matching the converter-pipeline centroid
+    // 0.1-2% range. Phase 5 visual A/B may revise this.
+    let intra_fallback_threshold: u32 = std::env::var("PHASM_B_INTRA_FALLBACK_SATD_MIN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25_000);
+    let best_inter_satd = r_skip_or_direct.satd
+        .min(r_l0.satd).min(r_l1.satd).min(r_bi.satd);
+    let intra_fallback_eligible = best_inter_satd > intra_fallback_threshold;
+    if intra_fallback_eligible {
+        B_INTRA_FALLBACK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // §intra-in-B (#319) Phase 2-decision — emit IntraI16x16 when
+    // PHASM_B_INTRA_FALLBACK=1 AND the threshold fires. The encoder
+    // emit path is currently a stub (Phase 3 pending), so the env var
+    // produces a clean error message rather than corrupted output.
+    // Intentional: the decision-side wiring exists so Phase 3 can
+    // light up the actual emit without further plumbing changes.
+    if intra_fallback_eligible
+        && std::env::var_os("PHASM_B_INTRA_FALLBACK").is_some()
+    {
+        return BMbDecision::IntraI16x16 {
+            i16x16_mode: 2,        // DC (works without neighbour pixels)
+            chroma_pred_mode: 0,   // DC chroma
+        };
+    }
 
     // §INVEST 2026-05-07 — dump per-MB decision when PHASM_INVEST_DUMP=1.
     // Only fires for source MBs that look like pure wall (uniform high
@@ -951,9 +1185,13 @@ pub fn mb_decision_b_rdo(
 
     match best.1 {
         1 => BMbDecision::Direct16x16,
-        2 => BMbDecision::L0_16x16 { mv: me_mvs.0 },
+        2 => BMbDecision::L0_16x16 { mv: me_mvs.0, ref_idx_l0: 0 },
         3 => BMbDecision::L1_16x16 { mv: me_mvs.1 },
-        4 => BMbDecision::Bi_16x16 { mv_l0: me_mvs.0, mv_l1: me_mvs.1 },
+        4 => BMbDecision::Bi_16x16 {
+            mv_l0: me_mvs.0,
+            mv_l1: me_mvs.1,
+            ref_idx_l0: 0,
+        },
         _ => unreachable!(),
     }
 }
@@ -1118,11 +1356,12 @@ pub fn forced_b_mode_from_env() -> Option<BMbDecision> {
     match var.to_ascii_lowercase().as_str() {
         "skip" => Some(BMbDecision::Skip),
         "direct" => Some(BMbDecision::Direct16x16),
-        "l0_16x16" => Some(BMbDecision::L0_16x16 { mv: forced_mv }),
+        "l0_16x16" => Some(BMbDecision::L0_16x16 { mv: forced_mv, ref_idx_l0: 0 }),
         "l1_16x16" => Some(BMbDecision::L1_16x16 { mv: forced_mv }),
         "bi_16x16" => Some(BMbDecision::Bi_16x16 {
             mv_l0: forced_mv,
             mv_l1: forced_mv_l1,
+            ref_idx_l0: 0,
         }),
         // §6E-A6.2 — partitioned variants. `partitioned_<mb_type>`
         // forces a specific 4..21 mb_type for round-trip testing.
@@ -1192,13 +1431,13 @@ fn b_8x8_part_for_subtype(
 ) -> super::b_partitioned::BPartitionMv {
     use super::b_partitioned::BPartitionMv;
     match sub {
-        0 => BPartitionMv { mv_l0: None, mv_l1: None },
-        1 => BPartitionMv { mv_l0: Some(mv_l0), mv_l1: None },
-        2 => BPartitionMv { mv_l0: None, mv_l1: Some(mv_l1) },
-        3 => BPartitionMv { mv_l0: Some(mv_l0), mv_l1: Some(mv_l1) },
+        0 => BPartitionMv { mv_l0: None, mv_l1: None, ref_idx_l0: 0 },
+        1 => BPartitionMv { mv_l0: Some(mv_l0), mv_l1: None, ref_idx_l0: 0 },
+        2 => BPartitionMv { mv_l0: None, mv_l1: Some(mv_l1), ref_idx_l0: 0 },
+        3 => BPartitionMv { mv_l0: Some(mv_l0), mv_l1: Some(mv_l1), ref_idx_l0: 0 },
         _ => {
             debug_assert!(false, "B_8x8 sub_mb_type {sub} out of §6E-A6.3 scope");
-            BPartitionMv { mv_l0: None, mv_l1: None }
+            BPartitionMv { mv_l0: None, mv_l1: None, ref_idx_l0: 0 }
         }
     }
 }
@@ -1219,12 +1458,110 @@ fn forced_partitioned_decision(
             BListUse::L1 => (None, Some(mv_l1)),
             BListUse::Bi => (Some(mv_l0), Some(mv_l1)),
         };
-        BPartitionMv { mv_l0: mv_l0_o, mv_l1: mv_l1_o }
+        BPartitionMv { mv_l0: mv_l0_o, mv_l1: mv_l1_o, ref_idx_l0: 0 }
     };
     Some(BMbDecision::Partitioned {
         mb_type,
         parts: [mv_for(meta.part0), mv_for(meta.part1)],
     })
+}
+
+/// v1.4 Phase 4.3 (#314, Path B) — B-side post-pass that re-searches
+/// the chosen B-MB's L0 MV against `ref_1` and upgrades `ref_idx_l0`
+/// when ref_1 wins by more than λ. Mirrors P-side
+/// `refine_p_choice_multi_ref` but for B-frames; only L0_16x16 +
+/// Bi_16x16 are upgraded in v1.4-cut1 (Partitioned + B8x8 deferred,
+/// plus Skip/Direct/L1 variants don't carry an L0 MV to upgrade).
+///
+/// Per-MB uniform: when an upgrade fires the whole BMbDecision gets
+/// `ref_idx_l0 = 1`. For Bi_16x16 only the L0 MV is re-searched; L1
+/// MV stays unchanged (Q1 lock — L1 is single-ref).
+///
+/// Cost comparison: same as P-side. SATD against ref_0 vs SATD
+/// against ref_1, plus λ for the +1 ref_idx bin delta. ref_0
+/// baseline is computed by re-running ME from the existing MV
+/// (converges fast since existing MV is already optimal there).
+///
+/// Returns true iff the MB was upgraded.
+pub fn refine_b_choice_multi_ref(
+    _src_y: &[[u8; 16]; 16],
+    _me: &mut super::motion_estimation::MotionEstimator,
+    _mb_x: usize,
+    _mb_y: usize,
+    _ref_0: &super::reference_buffer::ReconFrame,
+    _ref_1: &super::reference_buffer::ReconFrame,
+    _choice: &mut BMbDecision,
+) -> bool {
+    // v1.4 Phase 4.5 (#316) STRUCTURAL DISABLE — B-slice refine
+    // permanently off until RPLM (Reference Picture List Modification)
+    // is implemented in v1.5+.
+    //
+    // Spec § 8.2.4.2.3 says B-slice RefPicList0 = (past sorted POC
+    // descending) ++ (future sorted POC ascending). For IBPBP M=2:
+    // L0[0] = past_anchor, L0[1] = last_ref (= L1's picture). Phasm's
+    // `b_l0_ref_1 = pre_past_anchor` (2nd-closest past) does NOT
+    // match the spec's L0[1] without RPLM commands in the slice
+    // header. Since v1.4 doesn't emit RPLM, picking ref_idx_l0=1
+    // means the encoder reconstructs against pre_past_anchor while
+    // a spec-compliant decoder reconstructs against last_ref →
+    // catastrophic block-level visual divergence (cf. carplane demo
+    // 2026-05-10, -8.7 dB Y mean and -14.4 dB at frame 26).
+    //
+    // P-slice refine remains active because P-slice L0[1] = 2nd-
+    // closest past = `past_anchor` field, which matches phasm's
+    // `ref_1` mapping (P_8x8 deferred to v1.4-cut2).
+    //
+    // To re-enable B-side refine: emit RPLM in
+    // `build_b_slice_rbsp_cabac` to remap L0[1] from last_ref to
+    // pre_past_anchor, mirror the modification in walker
+    // `parse_b_slice_header`, then revert this stub. Tracking on
+    // task #318.
+    false
+    /*
+    use super::motion_estimation::me_lambda_pub;
+
+    // Path B v1.4-cut1: only 16x16 family L0/Bi gets refine.
+    let l0_mv = match choice {
+        BMbDecision::L0_16x16 { mv, .. } => *mv,
+        BMbDecision::Bi_16x16 { mv_l0, .. } => *mv_l0,
+        // Skip / Direct / L1 / Partitioned / B8x8: no upgrade.
+        _ => return false,
+    };
+
+    let lambda = me_lambda_pub();
+    let mb_px_x = (mb_x * 16) as u32;
+    let mb_px_y = (mb_y * 16) as u32;
+    let src_flat = src_y.as_flattened();
+
+    let r0 = me.search_block(
+        src_flat, 16, ref_0, mb_px_x, mb_px_y, 16, 16, l0_mv,
+    );
+    let r1 = me.search_block(
+        src_flat, 16, ref_1, mb_px_x, mb_px_y, 16, 16, l0_mv,
+    );
+
+    // Per-partition ref_idx_bits delta = 1 bin for 16x16. n_partitions=1.
+    let penalty = lambda;
+
+    if r1.cost.saturating_add(penalty) < r0.cost {
+        match choice {
+            BMbDecision::L0_16x16 { mv, ref_idx_l0 } => {
+                *mv = r1.mv;
+                *ref_idx_l0 = 1;
+            }
+            BMbDecision::Bi_16x16 { mv_l0, ref_idx_l0, .. } => {
+                *mv_l0 = r1.mv;
+                *ref_idx_l0 = 1;
+                // L1 MV unchanged — stays single-ref per Q1 lock.
+            }
+            _ => unreachable!("filtered above"),
+        }
+        return true;
+    }
+
+    false
+    }
+    */
 }
 
 #[cfg(test)]

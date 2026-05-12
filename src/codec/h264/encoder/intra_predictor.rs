@@ -15,7 +15,7 @@
 //!
 //! Psy-RD bias and CAVLC bit-cost adjustment are deferred — see the
 //! algorithm note for the staged plan:
-//!   docs/design/h264-encoder-algorithms/intra-prediction.md
+//!   docs/design/video/h264/encoder-algorithms/intra-prediction.md
 
 use crate::codec::h264::intra_pred::{
     predict_4x4, predict_16x16, predict_chroma_8x8, Intra16x16Mode, Intra4x4Mode,

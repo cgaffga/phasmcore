@@ -12,7 +12,7 @@
 //! diverges from what any real decoder will do.
 //!
 //! Algorithm note:
-//!   docs/design/h264-encoder-algorithms/reconstruction.md
+//!   docs/design/video/h264/encoder-algorithms/reconstruction.md
 
 use crate::codec::h264::transform::{
     dequant_4x4, inverse_4x4_integer, reconstruct_residual_4x4_with_dc,

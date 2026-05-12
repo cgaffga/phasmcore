@@ -12,7 +12,7 @@
 //! (partition-size distribution, QP deltas, skip-run lengths, etc.).
 //!
 //! Used by:
-//!   - `docs/design/h264-encoder-algorithms/fingerprint-regression.md`
+//!   - `docs/design/video/h264/encoder-algorithms/fingerprint-regression.md`
 //!   - `core/tests/h264_fingerprint_regression.rs` (Phase 6A+)
 //!
 //! **Intentionally NOT gated behind `h264-encoder`**: we need this

@@ -22,11 +22,12 @@ use super::binarization::{
 use super::context::{initialize_contexts, CabacContext, CabacInitSlot};
 use super::engine::CabacEngine;
 use super::neighbor::{
-    compute_cbp_luma_ctx_idx_inc_bin, ctx_idx_inc_cbp_chroma, ctx_idx_inc_coded_block_flag,
+    compute_cbp_luma_ctx_idx_inc_bin, compute_ref_idx_ctx_idx_inc_bin0,
+    ctx_idx_inc_cbp_chroma, ctx_idx_inc_coded_block_flag,
     ctx_idx_inc_coeff_abs_level, ctx_idx_inc_intra_chroma_pred_mode_bin0,
     ctx_idx_inc_mb_qp_delta_bin0, ctx_idx_inc_mb_skip_flag, ctx_idx_inc_mb_type_bin0,
-    ctx_idx_inc_mvd_bin0, ctx_idx_inc_prior_bin, ctx_idx_inc_ref_idx_bin0,
-    ctx_idx_inc_sig_4x4, ctx_idx_inc_sig_chroma_dc, CabacNeighborContext,
+    ctx_idx_inc_mvd_bin0, ctx_idx_inc_prior_bin,
+    ctx_idx_inc_sig_4x4, ctx_idx_inc_sig_chroma_dc, CabacNeighborContext, CurrentMbRefIdx,
 };
 
 // Phase 6F.1 follow-on tidy (Task #50, deferred-item #35) — these
@@ -186,12 +187,12 @@ fn ctx_idx_inc_mb_type_bin(
         (17, 5) => env_or("PHASM_IIP_CTX_17_5", 3),
         (17, 6) => env_or("PHASM_IIP_CTX_17_6", 3),
         // §6E-A6.1q.f (2026-05-02): B-slice mb_type prefix bin
-        // ctxIdxInc per spec Table 9-41 / ffmpeg
-        // `decode_cabac_mb_type_b_slice`. Bins 1, 3, 4, 5 were
+        // ctxIdxInc per spec Table 9-41 / the reference decoder
+        // spec Table 9-41 mb_type binarization. Bins 1, 3, 4, 5 were
         // defaulting to 0; per spec bin 1 = 3, bins 3-5 = 5. The
         // missing entries caused encoder/walker to land on a
-        // different CABAC context state from ffmpeg, breaking
-        // ffmpeg-conformance on every B-frame larger than 1 MB.
+        // different CABAC context state from the reference decoder, breaking
+        // the reference decoder-conformance on every B-frame larger than 1 MB.
         // Round-trip kept working because both sides mirrored the
         // wrong context. Bin 2 (multi-partition) is handled via
         // `ctx_idx_inc_prior_bin` (correctly: 4 if prior_bin[1]==1
@@ -202,9 +203,9 @@ fn ctx_idx_inc_mb_type_bin(
         (27, 5) => 5,
         // §B-encoder-decoder-divergence (2026-05-07, task #242). Bin 6
         // is only emitted by mb_types 12..21 (the v∈{8..12} branch of
-        // the spec table) and uses ctxIdxInc=5 per ffmpeg
-        // `decode_cabac_mb_type_b_slice` h264_cabac.c:1997 +
-        // openh264 / spec § 9.3.3.1.1.3. Was falling through to 0;
+        // the spec table) and uses ctxIdxInc=5 per spec Table 9-41
+        // mb_type binarization + spec § 9.3.3.1.1.3. Was falling
+        // through to 0;
         // caused a 1-bin CABAC desync that flipped mb_type 12↔13,
         // 14↔15, ..., 20↔21 on parse → wrong list-usage per partition
         // → visible artifacts across both halves of every B-MB the
@@ -751,23 +752,53 @@ pub fn encode_sub_mb_type_b(enc: &mut CabacEncoder, sub_mb_type: u32) {
     }
 }
 
-/// Encode `ref_idx_lX` as pure unary (spec § 9.3.2 Table 9-34).
+/// Encode `ref_idx_lX` as regular unary (spec § 9.3.2 Table 9-34 row
+/// "ref_idx_lX": type "U", terminator-based). the reference decoder's
+/// spec § 9.3.2.2 ref_idx binarization (spec § 9.3.2 / § 9.3.3) reads with the
+/// same terminator semantics — verified 2026-05-10. `c_max` retained
+/// for debug-assert only.
+///
+/// v1.4 Phase 4.5 (#316) — `current_mb` + `(cur_bx, cur_by)` replace
+/// the prior `(block_idx_in_mb_a, block_idx_in_mb_b)` pair so the
+/// ctxIdxInc derivation can pick within-MB vs cross-MB neighbours per
+/// spec § 6.4.11.7. Caller is responsible for filling `current_mb`'s
+/// region for this partition AFTER this fn returns (so subsequent
+/// partitions see it).
 pub fn encode_ref_idx(
     enc: &mut CabacEncoder,
     ref_idx: u32,
+    current_mb: &CurrentMbRefIdx,
     mb_x: usize,
-    block_idx_in_mb_a: usize,
-    block_idx_in_mb_b: usize,
+    cur_bx: u8,
+    cur_by: u8,
+    c_max: u32,
 ) {
+    let bin0_inc = compute_ref_idx_ctx_idx_inc_bin0(
+        current_mb,
+        &enc.neighbors,
+        mb_x,
+        cur_bx,
+        cur_by,
+    );
+    debug_assert!(
+        ref_idx <= c_max,
+        "encode_ref_idx: ref_idx {ref_idx} > cMax {c_max}"
+    );
+    if std::env::var_os("PHASM_REF_IDX_TRACE").is_some() {
+        let na = enc.neighbors.neighbor_a(mb_x);
+        let nb = enc.neighbors.neighbor_b(mb_x);
+        eprintln!(
+            "[enc-ref] mb_x={} cur=({},{}) ref={} bin0_inc={} \
+             na={:?} nb={:?}",
+            mb_x, cur_bx, cur_by, ref_idx, bin0_inc,
+            na.map(|n| n.mb_type),
+            nb.map(|n| n.mb_type),
+        );
+    }
     let mut bin_idx = 0u32;
     binarize_unary(ref_idx, &mut |bin| {
         let ctx_inc = match bin_idx {
-            0 => ctx_idx_inc_ref_idx_bin0(
-                &enc.neighbors,
-                mb_x,
-                block_idx_in_mb_a,
-                block_idx_in_mb_b,
-            ),
+            0 => bin0_inc,
             1 => 4,
             _ => 5,
         };
@@ -1084,7 +1115,8 @@ mod tests {
     #[test]
     fn encode_ref_idx_zero_emits_single_bin() {
         let mut enc = fresh_enc();
-        encode_ref_idx(&mut enc, 0, 0, 0, 0);
+        let cur = CurrentMbRefIdx::new();
+        encode_ref_idx(&mut enc, 0, &cur, 0, 0, 0, 1);
         assert_eq!(enc.engine.bin_count(), 1); // U(0) = "0"
     }
 
@@ -1199,11 +1231,12 @@ mod tests {
     #[test]
     fn encode_full_p_mb_inter_no_residual() {
         let mut enc = fresh_enc();
+        let cur = CurrentMbRefIdx::new();
         // Full P_L0_16x16 MB with 0 residual. Verifies the encoders
         // compose without interfering with each other.
         encode_mb_skip_flag(&mut enc, false, 0);
         encode_mb_type_p(&mut enc, 0, 0);           // P_L0_16x16
-        encode_ref_idx(&mut enc, 0, 0, 0, 0);        // ref_idx = 0
+        encode_ref_idx(&mut enc, 0, &cur, 0, 0, 0, 1);        // ref_idx = 0
         encode_mvd(&mut enc, 2, 0, 0, 0, 0);         // mvd_x = 2
         encode_mvd(&mut enc, -1, 1, 0, 0, 0);        // mvd_y = -1
         encode_coded_block_pattern(&mut enc, 0, 0);  // cbp = 0

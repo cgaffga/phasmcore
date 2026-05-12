@@ -26,6 +26,10 @@ use crate::codec::h264::transform::derive_chroma_qp;
 // and the per-edge QP. Our encoder always uses offset = 0, so these
 // are indexed directly by `qp`.
 
+// Phase 2.14 (#273) — debug call counter for PHASM_EDGE_TRACE.
+static EDGE_TRACE_CALL_COUNTER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 const ALPHA_TABLE: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
     22, 25, 28, 32, 36, 40, 45, 50, 56, 63, 71, 80, 90, 101, 113, 127, 144, 162, 182, 203, 226,
@@ -113,23 +117,38 @@ pub enum EdgeKind {
 /// - bs=3: either side is intra (not at MB boundary → internal).
 /// - bs=2: either side has nonzero transform coefficients.
 /// - bs=1: both sides inter AND (different refs OR |mv_diff|>=4 qpel
-///   on either axis).
-/// - bs=0: both sides inter AND same ref AND |mv_diff|<4 on both axes.
+///   on either axis), checked **per list** for B-slice bipred.
+/// - bs=0: both sides inter AND same ref + small MV in BOTH lists.
+///
+/// **Phase 2.8 fix (#274, 2026-05-08)**: Phasm previously took
+/// single-list (L0) refs/MVs. For B-slice partitioned mb_types
+/// 12/13/16/17 with asymmetric L0_Bi / Bi_L0 partitions, the L1
+/// ref availability differs between adjacent 4×4 sub-blocks
+/// (one side has L1 ref=0, the other has L1=NONE). Spec § 8.7.2.1
+/// then mandates bS=1; phasm computed bS=0 from L0-only check →
+/// no filter applied → reference-decoder output applied filter → divergence.
+/// Fixed by extending to per-list refs/MVs.
 ///
 /// `p_intra` / `q_intra`: true if the 4×4 block belongs to an intra MB.
 /// `p_has_coeff` / `q_has_coeff`: true if the block has any nonzero AC
-/// residual. `p_ref` / `q_ref`: ref-list index for each side
-/// (REF_IDX_NONE=-1 for intra). `p_mv` / `q_mv`: quarter-pel MVs.
+/// residual. `p_ref_l0/l1` / `q_ref_l0/l1`: ref-list index for each
+/// side (REF_IDX_NONE=-1 if list unused). `p_mv_l0/l1` / `q_mv_l0/l1`:
+/// quarter-pel MVs.
+#[allow(clippy::too_many_arguments)]
 pub fn boundary_strength(
     edge_kind: EdgeKind,
     p_intra: bool,
     q_intra: bool,
     p_has_coeff: bool,
     q_has_coeff: bool,
-    p_ref: i8,
-    q_ref: i8,
-    p_mv: MotionVector,
-    q_mv: MotionVector,
+    p_ref_l0: i8,
+    q_ref_l0: i8,
+    p_mv_l0: MotionVector,
+    q_mv_l0: MotionVector,
+    p_ref_l1: i8,
+    q_ref_l1: i8,
+    p_mv_l1: MotionVector,
+    q_mv_l1: MotionVector,
 ) -> u8 {
     if p_intra || q_intra {
         match edge_kind {
@@ -138,15 +157,32 @@ pub fn boundary_strength(
         }
     } else if p_has_coeff || q_has_coeff {
         2
-    } else if p_ref != q_ref
-        || (p_mv.mv_x as i32 - q_mv.mv_x as i32).abs() >= 4
-        || (p_mv.mv_y as i32 - q_mv.mv_y as i32).abs() >= 4
-    {
-        1
     } else {
-        // Both inter, same ref, MVs within ±3 qpel — smooth motion,
-        // no filter (bs=0 leaves pixels untouched).
-        0
+        // Per-list "differs" check. Spec § 8.7.2.1: bS=1 if EITHER list
+        // has refs differing OR (refs same and |MV diff|≥4 qpel).
+        let list_differs = |p_ref: i8, q_ref: i8, p_mv: MotionVector, q_mv: MotionVector| -> bool {
+            if p_ref != q_ref {
+                return true;
+            }
+            // Refs equal — including both REF_IDX_NONE (neither side uses
+            // this list, no MV to compare). Compare MVs only when both
+            // sides actually use the list.
+            if p_ref == super::partition_state::REF_IDX_NONE {
+                return false;
+            }
+            (p_mv.mv_x as i32 - q_mv.mv_x as i32).abs() >= 4
+                || (p_mv.mv_y as i32 - q_mv.mv_y as i32).abs() >= 4
+        };
+
+        if list_differs(p_ref_l0, q_ref_l0, p_mv_l0, q_mv_l0)
+            || list_differs(p_ref_l1, q_ref_l1, p_mv_l1, q_mv_l1)
+        {
+            1
+        } else {
+            // Both inter, same refs in BOTH lists, MVs within ±3 qpel
+            // in both lists — smooth motion, no filter.
+            0
+        }
     }
 }
 
@@ -388,13 +424,28 @@ pub fn filter_frame_with_transform(
     }
 }
 
-/// Fetch (ref_idx, mv) for the 4×4 block at absolute coords `(bx, by)`.
-/// Returns (REF_IDX_NONE, ZERO) when mv_grid is absent (I-slice) or
-/// the block is intra-coded.
+/// Fetch (ref_idx, mv) for L0 at the 4×4 block at absolute coords
+/// `(bx, by)`. Returns (REF_IDX_NONE, ZERO) when mv_grid is absent
+/// (I-slice) or the block doesn't use L0 (intra / B-slice L1-only).
 #[inline]
 fn mv_at(mv_grid: Option<&EncoderMvGrid>, bx: usize, by: usize) -> (i8, MotionVector) {
     use super::partition_state::REF_IDX_NONE;
-    match mv_grid.and_then(|g| g.get(bx as isize, by as isize)) {
+    match mv_grid.and_then(|g| g.get_l0(bx as isize, by as isize)) {
+        Some((mv, r)) => (r, mv),
+        None => (REF_IDX_NONE, MotionVector::ZERO),
+    }
+}
+
+/// Phase 2.8 (#274) — fetch (ref_idx, mv) for L1 at the 4×4 block at
+/// absolute coords `(bx, by)`. Returns (REF_IDX_NONE, ZERO) when
+/// mv_grid is absent or the block doesn't use L1 (intra / P-slice /
+/// B-slice L0-only). Required by `boundary_strength` to detect
+/// per-list ref-availability divergence on B-slice partitioned
+/// mb_types 12/13/16/17 (asymmetric L0_Bi / Bi_L0).
+#[inline]
+fn mv_at_l1(mv_grid: Option<&EncoderMvGrid>, bx: usize, by: usize) -> (i8, MotionVector) {
+    use super::partition_state::REF_IDX_NONE;
+    match mv_grid.and_then(|g| g.get_l1(bx as isize, by as isize)) {
         Some((mv, r)) => (r, mv),
         None => (REF_IDX_NONE, MotionVector::ZERO),
     }
@@ -476,10 +527,14 @@ fn filter_mb_edges(
             let q_by = p_by;
             let p_cof = coded(coded_flags, w4, p_bx, p_by);
             let q_cof = coded(coded_flags, w4, q_bx, q_by);
-            let (p_ref, p_mv) = mv_at(mv_grid, p_bx, p_by);
-            let (q_ref, q_mv) = mv_at(mv_grid, q_bx, q_by);
+            let (p_ref_l0, p_mv_l0) = mv_at(mv_grid, p_bx, p_by);
+            let (q_ref_l0, q_mv_l0) = mv_at(mv_grid, q_bx, q_by);
+            let (p_ref_l1, p_mv_l1) = mv_at_l1(mv_grid, p_bx, p_by);
+            let (q_ref_l1, q_mv_l1) = mv_at_l1(mv_grid, q_bx, q_by);
             let bs = boundary_strength(
-                edge_kind, p_intra, q_intra, p_cof, q_cof, p_ref, q_ref, p_mv, q_mv,
+                edge_kind, p_intra, q_intra, p_cof, q_cof,
+                p_ref_l0, q_ref_l0, p_mv_l0, q_mv_l0,
+                p_ref_l1, q_ref_l1, p_mv_l1, q_mv_l1,
             );
             for sample_row in 0..4 {
                 let y = origin_y + row4 * 4 + sample_row;
@@ -499,7 +554,28 @@ fn filter_mb_edges(
                 ];
                 // Order for filter: p[0] closest to edge.
                 let mut p_rev = [p[3], p[2], p[1], p[0]];
+                let trace_v = std::env::var_os("PHASM_EDGE_TRACE").is_some()
+                    && mb_x == 31 && mb_y == 49 && edge_x == 8 && row4 == 2;
+                let p_before = p_rev;
+                let q_before = q;
                 filter_luma_edge(&mut p_rev, &mut q, bs, qp_avg);
+                if trace_v {
+                    let alpha = ALPHA_TABLE[qp_avg as usize] as i32;
+                    let beta = BETA_TABLE[qp_avg as usize] as i32;
+                    let tc0 = if bs == 0 || bs >= 4 { 0i32 } else {
+                        TC0_TABLE[(bs - 1) as usize][qp_avg as usize] as i32
+                    };
+                    eprintln!(
+                        "[EDGE_V] mb=(31,49) edge_x={edge_x} row4={row4} sample_row={sample_row} \
+                         bS={bs} qp={qp_avg} alpha={alpha} beta={beta} tC0={tc0} \
+                         p_before=[{},{},{},{}] q_before=[{},{},{},{}] \
+                         p_after=[{},{},{},{}] q_after=[{},{},{},{}]",
+                        p_before[3], p_before[2], p_before[1], p_before[0],
+                        q_before[0], q_before[1], q_before[2], q_before[3],
+                        p_rev[3], p_rev[2], p_rev[1], p_rev[0],
+                        q[0], q[1], q[2], q[3],
+                    );
+                }
                 p[3] = p_rev[0];
                 p[2] = p_rev[1];
                 p[1] = p_rev[2];
@@ -531,18 +607,24 @@ fn filter_mb_edges(
                     let p_by = origin_y / 4 + (sample_row / 2);
                     let q_bx = p_bx + 1;
                     let q_by = p_by;
-                    let (p_ref_c, p_mv_c) = mv_at(mv_grid, p_bx, p_by);
-                    let (q_ref_c, q_mv_c) = mv_at(mv_grid, q_bx, q_by);
+                    let (p_ref_c_l0, p_mv_c_l0) = mv_at(mv_grid, p_bx, p_by);
+                    let (q_ref_c_l0, q_mv_c_l0) = mv_at(mv_grid, q_bx, q_by);
+                    let (p_ref_c_l1, p_mv_c_l1) = mv_at_l1(mv_grid, p_bx, p_by);
+                    let (q_ref_c_l1, q_mv_c_l1) = mv_at_l1(mv_grid, q_bx, q_by);
                     let bs = boundary_strength(
                         if edge_x == 0 { EdgeKind::MbBoundary } else { EdgeKind::Internal },
                         p_intra,
                         q_intra,
                         coded(coded_flags, w4, p_bx, p_by),
                         coded(coded_flags, w4, q_bx, q_by),
-                        p_ref_c,
-                        q_ref_c,
-                        p_mv_c,
-                        q_mv_c,
+                        p_ref_c_l0,
+                        q_ref_c_l0,
+                        p_mv_c_l0,
+                        q_mv_c_l0,
+                        p_ref_c_l1,
+                        q_ref_c_l1,
+                        p_mv_c_l1,
+                        q_mv_c_l1,
                     );
                     filter_chroma_edge(&mut p, &mut q, bs, qp_c_avg);
                     plane[y * stride + x - 1] = p[0];
@@ -588,18 +670,24 @@ fn filter_mb_edges(
             let p_by = (origin_y + edge_y) / 4 - 1;
             let q_bx = p_bx;
             let q_by = p_by + 1;
-            let (p_ref, p_mv) = mv_at(mv_grid, p_bx, p_by);
-            let (q_ref, q_mv) = mv_at(mv_grid, q_bx, q_by);
+            let (p_ref_l0, p_mv_l0) = mv_at(mv_grid, p_bx, p_by);
+            let (q_ref_l0, q_mv_l0) = mv_at(mv_grid, q_bx, q_by);
+            let (p_ref_l1, p_mv_l1) = mv_at_l1(mv_grid, p_bx, p_by);
+            let (q_ref_l1, q_mv_l1) = mv_at_l1(mv_grid, q_bx, q_by);
             let bs = boundary_strength(
                 edge_kind,
                 p_intra,
                 q_intra,
                 coded(coded_flags, w4, p_bx, p_by),
                 coded(coded_flags, w4, q_bx, q_by),
-                p_ref,
-                q_ref,
-                p_mv,
-                q_mv,
+                p_ref_l0,
+                q_ref_l0,
+                p_mv_l0,
+                q_mv_l0,
+                p_ref_l1,
+                q_ref_l1,
+                p_mv_l1,
+                q_mv_l1,
             );
             for sample_col in 0..4 {
                 let x = origin_x + col4 * 4 + sample_col;
@@ -617,7 +705,48 @@ fn filter_mb_edges(
                     recon.y[(y + 2) * stride + x],
                     recon.y[(y + 3) * stride + x],
                 ];
+                // Phase 2.14 (#273) — per-edge tracing for the cascade
+                // root MB. PHASM_EDGE_TRACE=1 dumps {bS, qp, alpha, beta,
+                // tC0, p, q} for MB (31, 49) horizontal edges. Match
+                // against the reference decoder a reference-decoder trace log output to find divergence.
+                let trace_active = std::env::var_os("PHASM_EDGE_TRACE").is_some()
+                    && mb_x == 31 && mb_y == 49;
+                if trace_active && col4 == 0 && sample_col == 0 {
+                    let p_cof_h = coded(coded_flags, w4, p_bx, p_by);
+                    let q_cof_h = coded(coded_flags, w4, q_bx, q_by);
+                    let call_n = EDGE_TRACE_CALL_COUNTER
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[EDGE_STATE call#{call_n}] mb=({mb_x},{mb_y}) edge_y={edge_y} \
+                         p_intra={p_intra} q_intra={q_intra} cur_intra={} \
+                         p_cof={p_cof_h} q_cof={q_cof_h} \
+                         p_ref_l0={p_ref_l0} q_ref_l0={q_ref_l0} \
+                         p_ref_l1={p_ref_l1} q_ref_l1={q_ref_l1}",
+                        intra_grid[cur_idx],
+                    );
+                }
+                let p_before = p_rev;
+                let q_before = q;
                 filter_luma_edge(&mut p_rev, &mut q, bs, qp_avg);
+                if trace_active {
+                    let alpha = ALPHA_TABLE[qp_avg as usize] as i32;
+                    let beta = BETA_TABLE[qp_avg as usize] as i32;
+                    let tc0 = if bs == 0 || bs >= 4 { 0i32 } else {
+                        TC0_TABLE[(bs - 1) as usize][qp_avg as usize] as i32
+                    };
+                    let call_n = EDGE_TRACE_CALL_COUNTER
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[EDGE_H call#{call_n}] mb=(31,49) edge_y={edge_y} col4={col4} sample_col={sample_col} \
+                         bS={bs} qp={qp_avg} alpha={alpha} beta={beta} tC0={tc0} \
+                         p_before=[{},{},{},{}] q_before=[{},{},{},{}] \
+                         p_after=[{},{},{},{}] q_after=[{},{},{},{}]",
+                        p_before[3], p_before[2], p_before[1], p_before[0],
+                        q_before[0], q_before[1], q_before[2], q_before[3],
+                        p_rev[3], p_rev[2], p_rev[1], p_rev[0],
+                        q[0], q[1], q[2], q[3],
+                    );
+                }
                 recon.y[(y - 1) * stride + x] = p_rev[0];
                 recon.y[(y - 2) * stride + x] = p_rev[1];
                 recon.y[(y - 3) * stride + x] = p_rev[2];
@@ -643,18 +772,24 @@ fn filter_mb_edges(
                     let p_by = (origin_y + edge_y) / 4 - 1;
                     let q_bx = p_bx;
                     let q_by = p_by + 1;
-                    let (p_ref_c, p_mv_c) = mv_at(mv_grid, p_bx, p_by);
-                    let (q_ref_c, q_mv_c) = mv_at(mv_grid, q_bx, q_by);
+                    let (p_ref_c_l0, p_mv_c_l0) = mv_at(mv_grid, p_bx, p_by);
+                    let (q_ref_c_l0, q_mv_c_l0) = mv_at(mv_grid, q_bx, q_by);
+                    let (p_ref_c_l1, p_mv_c_l1) = mv_at_l1(mv_grid, p_bx, p_by);
+                    let (q_ref_c_l1, q_mv_c_l1) = mv_at_l1(mv_grid, q_bx, q_by);
                     let bs = boundary_strength(
                         if edge_y == 0 { EdgeKind::MbBoundary } else { EdgeKind::Internal },
                         p_intra,
                         q_intra,
                         coded(coded_flags, w4, p_bx, p_by),
                         coded(coded_flags, w4, q_bx, q_by),
-                        p_ref_c,
-                        q_ref_c,
-                        p_mv_c,
-                        q_mv_c,
+                        p_ref_c_l0,
+                        q_ref_c_l0,
+                        p_mv_c_l0,
+                        q_mv_c_l0,
+                        p_ref_c_l1,
+                        q_ref_c_l1,
+                        p_mv_c_l1,
+                        q_mv_c_l1,
                     );
                     filter_chroma_edge(&mut p, &mut q, bs, qp_c_avg);
                     plane[(y - 1) * stride + x] = p[0];
@@ -809,6 +944,7 @@ mod tests {
             boundary_strength(
                 EdgeKind::MbBoundary, true, true, false, false,
                 -1, -1, MotionVector::ZERO, MotionVector::ZERO,
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             4
         );
@@ -819,6 +955,7 @@ mod tests {
         assert_eq!(
             boundary_strength(
                 EdgeKind::Internal, true, true, false, false,
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
                 -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             3
@@ -831,6 +968,7 @@ mod tests {
             boundary_strength(
                 EdgeKind::Internal, false, false, true, false,
                 0, 0, MotionVector::ZERO, MotionVector::ZERO,
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             2
         );
@@ -845,6 +983,7 @@ mod tests {
                 0, 0,
                 MotionVector { mv_x: 5, mv_y: 5 },
                 MotionVector { mv_x: 7, mv_y: 6 },
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             0
         );
@@ -859,6 +998,7 @@ mod tests {
                 0, 0,
                 MotionVector { mv_x: 0, mv_y: 0 },
                 MotionVector { mv_x: 4, mv_y: 0 },
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             1
         );
@@ -871,8 +1011,45 @@ mod tests {
             boundary_strength(
                 EdgeKind::Internal, false, false, false, false,
                 0, 1, MotionVector::ZERO, MotionVector::ZERO,
+                -1, -1, MotionVector::ZERO, MotionVector::ZERO,
             ),
             1
+        );
+    }
+
+    /// Phase 2.8 (#274) — B-slice asymmetric L1 ref availability:
+    /// p side has L1 (ref=0), q side doesn't (REF_IDX_NONE). Spec
+    /// § 8.7.2.1 mandates bS=1 since L1 refs differ. Pre-fix phasm
+    /// returned bS=0 (only checked L0).
+    #[test]
+    fn boundary_strength_b_slice_asymmetric_l1_ref_is_1() {
+        assert_eq!(
+            boundary_strength(
+                EdgeKind::Internal, false, false, false, false,
+                // L0: both ref=0, MVs match → no L0 diff
+                0, 0, MotionVector::ZERO, MotionVector::ZERO,
+                // L1: p has ref=0, q has REF_IDX_NONE → differs → bS=1
+                0, -1, MotionVector::ZERO, MotionVector::ZERO,
+            ),
+            1
+        );
+    }
+
+    /// Phase 2.8 (#274) — B-slice both-bipred path: both sides have
+    /// L0 + L1 with matching refs and small MVs → bS=0.
+    #[test]
+    fn boundary_strength_b_slice_both_bipred_match_is_0() {
+        assert_eq!(
+            boundary_strength(
+                EdgeKind::Internal, false, false, false, false,
+                0, 0,
+                MotionVector { mv_x: 1, mv_y: 1 },
+                MotionVector { mv_x: 2, mv_y: 1 },
+                0, 0,
+                MotionVector { mv_x: -1, mv_y: 0 },
+                MotionVector { mv_x: 0, mv_y: 1 },
+            ),
+            0
         );
     }
 
@@ -1060,5 +1237,175 @@ mod tests {
             changed,
             "legacy filter_frame should apply deblock at x=4 internal edge"
         );
+    }
+
+    /// Phase 2.17 (#286, 2026-05-09) — direct transcription of H.264
+    /// spec § 8.7.2.2 normal-filter formulas (bs∈{1,2,3}) + Table 8-17
+    /// for byte-exact differential testing against phasm's
+    /// `filter_luma_edge`. Used only inside `#[cfg(test)]`.
+    fn reference_filter_luma_one_sample(
+        p: [i32; 4],
+        q: [i32; 4],
+        bs: i32,
+        alpha: i32,
+        beta: i32,
+        tc0: i32,
+    ) -> ([i32; 4], [i32; 4]) {
+        let mut p_out = p;
+        let mut q_out = q;
+        let p0 = p[0];
+        let p1 = p[1];
+        let p2 = p[2];
+        let q0 = q[0];
+        let q1 = q[1];
+        let q2 = q[2];
+        // the reference decoder calls into separate _luma vs _luma_intra functions
+        // per bs=4. We mirror that split: bs=4 → strong filter (the reference decoder
+        // _intra path) ; bs ∈ {1, 2, 3} → normal _luma path with
+        // tc0 = TC0_TABLE[bs-1][indexA].
+        if (p0 - q0).abs() < alpha
+            && (p1 - p0).abs() < beta
+            && (q1 - q0).abs() < beta
+        {
+            if bs == 4 {
+                // Spec § 8.7.2.2 strong-filter branch (bs=4).
+                // Same formulas as phasm's filter_luma_bs4.
+                let small_gap = (p0 - q0).abs() < ((alpha >> 2) + 2);
+                if small_gap && (p2 - p0).abs() < beta {
+                    p_out[0] = (p2 + 2*p1 + 2*p0 + 2*q0 + q1 + 4) >> 3;
+                    p_out[1] = (p2 + p1 + p0 + q0 + 2) >> 2;
+                    p_out[2] = (2*p[3] + 3*p2 + p1 + p0 + q0 + 4) >> 3;
+                } else {
+                    p_out[0] = (2*p1 + p0 + q1 + 2) >> 2;
+                }
+                if small_gap && (q2 - q0).abs() < beta {
+                    q_out[0] = (q2 + 2*q1 + 2*q0 + 2*p0 + p1 + 4) >> 3;
+                    q_out[1] = (q2 + q1 + q0 + p0 + 2) >> 2;
+                    q_out[2] = (2*q[3] + 3*q2 + q1 + q0 + p0 + 4) >> 3;
+                } else {
+                    q_out[0] = (2*q1 + q0 + p1 + 2) >> 2;
+                }
+            } else {
+                // the reference decoder's normal spec § 8.7.2.2 normal-filter branch body.
+                let tc_orig = tc0;
+                let mut tc = tc_orig;
+                if (p2 - p0).abs() < beta {
+                    if tc_orig != 0 {
+                        let inner = ((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1;
+                        p_out[1] = p1 + inner.clamp(-tc_orig, tc_orig);
+                    }
+                    tc += 1;
+                }
+                if (q2 - q0).abs() < beta {
+                    if tc_orig != 0 {
+                        let inner = ((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1;
+                        q_out[1] = q1 + inner.clamp(-tc_orig, tc_orig);
+                    }
+                    tc += 1;
+                }
+                let i_delta = ((((q0 - p0) * 4) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
+                p_out[0] = (p0 + i_delta).clamp(0, 255);
+                q_out[0] = (q0 - i_delta).clamp(0, 255);
+            }
+        }
+        (p_out, q_out)
+    }
+
+    #[test]
+    fn deblock_luma_byte_exact_vs_reference_bs2() {
+        // Sweep bS = 2 across QP {26, 28, 30, 32, 34, 36, 38, 40} and
+        // a range of (p, q) input combinations spanning small-step,
+        // medium-step, and gate-failing-step content. Compare phasm's
+        // filter_luma_edge output against direct the reference decoder-formula
+        // transcription.
+        let mut diff_count = 0u32;
+        let mut max_abs = 0i32;
+        let mut first_failure: Option<(u8, u8, [u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
+        for bs in 1u8..=3 {
+            for qp in [20u8, 26, 28, 30, 32, 34, 36, 38, 40, 45, 50] {
+                let alpha = ALPHA_TABLE[qp as usize] as i32;
+                let beta = BETA_TABLE[qp as usize] as i32;
+                let tc0 = TC0_TABLE[(bs - 1) as usize][qp as usize] as i32;
+                // Sample varied input patterns.
+                let patterns: [[u8; 8]; 6] = [
+                    [100, 102, 104, 106, 110, 112, 114, 116], // smooth ramp
+                    [80, 82, 84, 86, 110, 112, 114, 116],     // medium step
+                    [70, 71, 72, 73, 100, 101, 102, 103],     // 30-step
+                    [200, 198, 196, 194, 100, 102, 104, 106], // big neg step
+                    [128, 128, 128, 128, 130, 130, 130, 130], // tiny step
+                    [60, 65, 70, 75, 130, 125, 120, 115],     // smooth-like
+                ];
+                for pat in patterns {
+                    let p_in = [pat[3], pat[2], pat[1], pat[0]];
+                    let q_in = [pat[4], pat[5], pat[6], pat[7]];
+                    let mut p_phasm = p_in;
+                    let mut q_phasm = q_in;
+                    filter_luma_edge(&mut p_phasm, &mut q_phasm, bs, qp);
+
+                    let p_i32 = [p_in[0] as i32, p_in[1] as i32, p_in[2] as i32, p_in[3] as i32];
+                    let q_i32 = [q_in[0] as i32, q_in[1] as i32, q_in[2] as i32, q_in[3] as i32];
+                    let (p_ff, q_ff) =
+                        reference_filter_luma_one_sample(p_i32, q_i32, bs as i32, alpha, beta, tc0);
+                    let p_ff_u8 = [p_ff[0] as u8, p_ff[1] as u8, p_ff[2] as u8, p_ff[3] as u8];
+                    let q_ff_u8 = [q_ff[0] as u8, q_ff[1] as u8, q_ff[2] as u8, q_ff[3] as u8];
+                    for k in 0..3usize {
+                        let dp = (p_phasm[k] as i32 - p_ff_u8[k] as i32).abs();
+                        let dq = (q_phasm[k] as i32 - q_ff_u8[k] as i32).abs();
+                        if dp > 0 || dq > 0 {
+                            diff_count += 1;
+                            if dp.max(dq) > max_abs { max_abs = dp.max(dq); }
+                            if first_failure.is_none() {
+                                first_failure = Some((bs, qp, p_in, q_in, p_phasm, q_phasm));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if diff_count > 0 {
+            let (bs, qp, p_in, q_in, p_p, q_p) = first_failure.unwrap();
+            panic!(
+                "deblock byte-exact FAILED: {} divergences, max|Δ|={}, first at \
+                 bs={bs} qp={qp} p_in={p_in:?} q_in={q_in:?} phasm_p={p_p:?} phasm_q={q_p:?}",
+                diff_count, max_abs,
+            );
+        }
+    }
+
+    #[test]
+    fn deblock_luma_byte_exact_vs_reference_bs4() {
+        // bS = 4 strong filter — separate code path in the reference decoder
+        // (spec § 8.7.2.2 strong-filter branch) with different formulas.
+        let mut diff_count = 0u32;
+        for qp in [20u8, 26, 30, 34, 38, 42] {
+            let alpha = ALPHA_TABLE[qp as usize] as i32;
+            let beta = BETA_TABLE[qp as usize] as i32;
+            let patterns: [[u8; 8]; 4] = [
+                [100, 102, 104, 106, 110, 112, 114, 116],
+                [80, 82, 84, 86, 110, 112, 114, 116],
+                [128, 128, 128, 128, 130, 130, 130, 130],
+                [60, 65, 70, 75, 130, 125, 120, 115],
+            ];
+            for pat in patterns {
+                let p_in = [pat[3], pat[2], pat[1], pat[0]];
+                let q_in = [pat[4], pat[5], pat[6], pat[7]];
+                let mut p_phasm = p_in;
+                let mut q_phasm = q_in;
+                filter_luma_edge(&mut p_phasm, &mut q_phasm, 4, qp);
+
+                let p_i32 = [p_in[0] as i32, p_in[1] as i32, p_in[2] as i32, p_in[3] as i32];
+                let q_i32 = [q_in[0] as i32, q_in[1] as i32, q_in[2] as i32, q_in[3] as i32];
+                let (p_ff, q_ff) =
+                    reference_filter_luma_one_sample(p_i32, q_i32, 4, alpha, beta, 0);
+                for k in 0..3usize {
+                    let dp = (p_phasm[k] as i32 - p_ff[k]).abs();
+                    let dq = (q_phasm[k] as i32 - q_ff[k]).abs();
+                    if dp > 0 || dq > 0 {
+                        diff_count += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(diff_count, 0, "bs=4 deblock divergences vs the reference decoder");
     }
 }

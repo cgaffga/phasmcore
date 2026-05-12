@@ -57,7 +57,7 @@ What did you run to validate the change? Be specific. Examples:
 <!--
 Required only if you touched files under core/src/codec/<format>/
 where <format> has a clean-room audit (currently: H.264 — see
-docs/design/h264-encoder-algorithms/).
+docs/design/video/h264/encoder-algorithms/).
 
 If applicable, confirm:
 -->

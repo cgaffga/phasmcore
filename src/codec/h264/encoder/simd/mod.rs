@@ -29,7 +29,7 @@
 //!
 //! All SIMD kernels in this module are **integer-only and FMA-free**.
 //! Per the cross-platform determinism audit
-//! (`docs/design/h264-encoder-determinism-audit.md`), integer SIMD ops
+//! (`docs/design/video/h264/encoder-determinism-audit.md`), integer SIMD ops
 //! are bit-exact across vendors and ISAs; floating-point and
 //! fused-multiply-add are NOT. This module's contract:
 //!

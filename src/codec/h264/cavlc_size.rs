@@ -29,7 +29,7 @@
 //! consult or modify encoder state. Phase B.3 unit tests compare
 //! their output against the real `BitWriter`-emitted length.
 //!
-//! Design doc: `docs/design/h264-encoder-quality-plan.md` § Phase B.
+//! Design doc: `docs/design/video/h264/encoder-quality-plan.md` § Phase B.
 
 use super::cavlc_writer::{encode_cavlc_block, CavlcBlockType};
 use super::encoder::bitstream_writer::{BitSink, BitSizer};

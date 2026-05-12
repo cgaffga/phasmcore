@@ -3,8 +3,8 @@
 Test vectors for Phase 6 encoder fingerprint regression + decode
 oracle harness. Used by:
 
-- `docs/design/h264-encoder-algorithms/fingerprint-regression.md`
-- `docs/design/h264-encoder-algorithms/oracle-harness.md`
+- `docs/design/video/h264/encoder-algorithms/fingerprint-regression.md`
+- `docs/design/video/h264/encoder-algorithms/oracle-harness.md`
 
 ## Regenerating
 
