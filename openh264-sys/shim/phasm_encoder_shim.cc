@@ -60,7 +60,25 @@ extern "C" int32_t phasm_encoder_initialize(
   param.uiIntraPeriod              = static_cast<uint32_t>(gop_size);
   param.iNumRefFrame               = 1;
   param.iEntropyCodingModeFlag     = 1;  // CABAC
-  param.iMultipleThreadIdc         = 1;  // single-threaded for determinism
+  // Task #339 (2026-05-12) — restore OpenH264's default
+  // multi-threading. iMultipleThreadIdc=0 means "auto" (encoder
+  // picks worker count from cpuid / DynamicDetectCpuCores).
+  //
+  // Hook ordering safety: all stego hooks (Phase A.5 HOOK-A..H7,
+  // B.9.2 decoder hooks) fire from inside WelsCodeOneSlice ->
+  // WelsCodeOneMb. With uiSliceMode=SM_SINGLE_SLICE there is
+  // exactly one slice per frame, so per-MB encoding stays on a
+  // single worker thread regardless of iMultipleThreadIdc. Other
+  // worker threads (parallel deblock filter, lookahead background)
+  // never fire stego hooks. The trampoline's user_data pointer is
+  // accessed from one thread only; no Mutex needed.
+  //
+  // bUseLoadBalancing stays false — codec_app_def.h documents it
+  // as "result of each run may be different", which would break
+  // deterministic stego output. It's also only consulted when
+  // uiSliceMode==1 or 3; SM_SINGLE_SLICE is uiSliceMode==0, so
+  // the flag is a no-op for us either way.
+  param.iMultipleThreadIdc         = 0;
   param.bEnableSceneChangeDetect   = false;
   param.bEnableBackgroundDetection = false;
   param.bEnableAdaptiveQuant       = false;
