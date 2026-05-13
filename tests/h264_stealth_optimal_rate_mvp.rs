@@ -99,7 +99,7 @@ fn cascade_safety_invariant_holds_against_optimal_rate_of_mvp() {
 
     // Walk both with record_mvd to populate cover.mvd_sign_bypass +
     // mvd_meta (per-position |value|, partition, axis).
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let stego_walk = walk_annex_b_for_cover_with_options(&stego, opts).expect("stego walk");
     let clean_walk = walk_annex_b_for_cover_with_options(&clean, opts).expect("clean walk");
 

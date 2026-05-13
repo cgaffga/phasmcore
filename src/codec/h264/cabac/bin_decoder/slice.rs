@@ -33,7 +33,7 @@ use crate::codec::h264::cabac::neighbor::{
     CabacNeighborMB, CurrentMbCbf, CurrentMbMvdAbs, MbTypeClass,
 };
 use crate::codec::h264::stego::{
-    Axis, DomainCover, MvdSlot, NullLogger, ResidualPathKind,
+    Axis, DomainCover, MvdSlot, NullLogger, PositionLogger, ResidualPathKind,
 };
 use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::slice::{parse_slice_header, SliceHeader, SliceType};
@@ -104,7 +104,7 @@ pub struct CoverWalkOutput {
     pub n_slices: usize,
     /// Phase 6F.2(j) — per-MVD-position metadata aligned by index
     /// with `cover.mvd_sign_bypass.positions`. Empty when
-    /// `WalkOptions { record_mvd: false }`.
+    /// `WalkOptions { record_mvd: false, record_offsets: false }`.
     pub mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
     /// Phase 6F.2(j) — frame dimensions in macroblocks, parsed
     /// from the first SPS encountered. Used by
@@ -112,6 +112,12 @@ pub struct CoverWalkOutput {
     /// 0/0 when no slice was walked (degenerate input).
     pub mb_w: u32,
     pub mb_h: u32,
+    /// Phase C.3.6.1 (task #428) — per-position RBSP byte+bit
+    /// offsets, aligned 1:1 with each domain's `bits` + `positions`
+    /// in `cover`. `None` when `WalkOptions::record_offsets` is
+    /// false (the default); `Some(_)` when offset capture is opted
+    /// into for the Option C bitstream-mod stego splicer.
+    pub offsets: Option<super::positions::DomainOffsets>,
 }
 
 /// Walker configuration knobs. Default-everything-off keeps
@@ -124,6 +130,14 @@ pub struct WalkOptions {
     /// encoder's `enable_mvd_stego_hook` flag — otherwise encoder
     /// + decoder MVD covers diverge.
     pub record_mvd: bool,
+    /// Phase C.3.6.1 (task #428) — when true, the walker captures
+    /// the RBSP bit offset of every bypass-coded stego bin into
+    /// `CoverWalkOutput::offsets`, aligned index-for-index with
+    /// `cover.{domain}.{bits,positions}`. Used by the Option C
+    /// bitstream-mod stego splicer to locate flip targets directly
+    /// in the encoded Annex-B stream. Default: false (zero-cost
+    /// NullLogger fast path).
+    pub record_offsets: bool,
 }
 
 /// Phase 6E-C0 streaming-walker callback verdict. Returned by the
@@ -158,13 +172,17 @@ pub struct GopContext {
     pub n_slices: usize,
     /// Phase 6F.2(j) — per-MVD-position metadata aligned by index
     /// with `cover.mvd_sign_bypass.positions`. Empty when
-    /// `WalkOptions { record_mvd: false }`.
+    /// `WalkOptions { record_mvd: false, record_offsets: false }`.
     pub mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
     /// Phase 6F.2(j) — frame dimensions in macroblocks (from the
     /// active SPS at the time this GOP was walked). Used by
     /// `cascade_safety::analyze_safe_mvd_subset`.
     pub mb_w: u32,
     pub mb_h: u32,
+    /// Phase C.3.6.1 (task #428) — per-bypass-bin RBSP byte+bit
+    /// offsets for this GOP, aligned 1:1 with `cover` domain bit
+    /// vectors. `None` when `WalkOptions::record_offsets` is false.
+    pub offsets: Option<super::positions::DomainOffsets>,
 }
 
 /// Phase 6E-C0 streaming-walker summary. Returned at end-of-stream
@@ -217,12 +235,29 @@ pub fn walk_nalus_for_cover_with_options(
         = Vec::new();
     let mut acc_mb_w = 0u32;
     let mut acc_mb_h = 0u32;
+    // Phase C.3.6.1 — opt-in offset accumulator. Pre-allocated as
+    // Some(empty) when offset capture is requested so per-GOP
+    // contributions can be extended in-place; remains None otherwise.
+    let mut acc_offsets: Option<super::positions::DomainOffsets> =
+        if opts.record_offsets {
+            Some(super::positions::DomainOffsets::default())
+        } else {
+            None
+        };
     let streaming_out = walk_nalus_streaming_with_options(
         nalus,
         opts,
         |gop_ctx| {
             acc_cover.extend_from(gop_ctx.cover);
             acc_mvd_meta.extend(gop_ctx.mvd_meta);
+            if let (Some(acc), Some(gop_off)) =
+                (acc_offsets.as_mut(), gop_ctx.offsets)
+            {
+                acc.coeff_sign_bypass.extend(gop_off.coeff_sign_bypass);
+                acc.coeff_suffix_lsb.extend(gop_off.coeff_suffix_lsb);
+                acc.mvd_sign_bypass.extend(gop_off.mvd_sign_bypass);
+                acc.mvd_suffix_lsb.extend(gop_off.mvd_suffix_lsb);
+            }
             // Frame dimensions are SPS-derived and stable across
             // GOPs in a single stream (any SPS change is treated
             // as an error elsewhere). Take the last seen value.
@@ -238,6 +273,7 @@ pub fn walk_nalus_for_cover_with_options(
         mvd_meta: acc_mvd_meta,
         mb_w: acc_mb_w,
         mb_h: acc_mb_h,
+        offsets: acc_offsets,
     })
 }
 
@@ -281,7 +317,11 @@ where
 {
     let mut active_sps: Option<Sps> = None;
     let mut active_pps: Option<Pps> = None;
-    let mut recorder = PositionRecorder::new();
+    let mut recorder = if opts.record_offsets {
+        PositionRecorder::with_offsets()
+    } else {
+        PositionRecorder::new()
+    };
     let mut frame_idx: u32 = 0;
     let mut current_gop_idx: u32 = 0;
     let mut gop_n_mb: usize = 0;
@@ -291,7 +331,8 @@ where
     let mut total_n_slices: usize = 0;
     let mut total_n_gops: usize = 0;
 
-    for nal in nalus {
+    for (nal_idx_usize, nal) in nalus.iter().enumerate() {
+        let nal_idx = nal_idx_usize as u32;
         match nal.nal_type {
             NalType::SPS => {
                 active_sps = Some(parse_sps(&nal.rbsp)?);
@@ -319,6 +360,7 @@ where
                 if t.is_idr() && had_vcl_in_current_gop {
                     let cover = recorder.take_cover();
                     let mvd_meta = recorder.take_mvd_meta();
+                    let offsets = recorder.take_offsets();
                     let (closing_mb_w, closing_mb_h) = active_sps
                         .as_ref()
                         .map(|s| (
@@ -335,6 +377,7 @@ where
                         mvd_meta,
                         mb_w: closing_mb_w,
                         mb_h: closing_mb_h,
+                        offsets,
                     })?;
                     total_n_gops += 1;
                     if matches!(action, WalkAction::StopWalk) {
@@ -373,7 +416,7 @@ where
 
                 let n_mb = walk_slice_mbs(
                     &mut dec, &header, pps, mb_count, frame_idx, mb_w,
-                    &mut recorder, &opts,
+                    nal_idx, &mut recorder, &opts,
                 )?;
 
                 gop_n_mb += n_mb;
@@ -391,6 +434,7 @@ where
     if had_vcl_in_current_gop {
         let cover = recorder.take_cover();
         let mvd_meta = recorder.take_mvd_meta();
+        let offsets = recorder.take_offsets();
         let (closing_mb_w, closing_mb_h) = active_sps
             .as_ref()
             .map(|s| (
@@ -407,6 +451,7 @@ where
             mvd_meta,
             mb_w: closing_mb_w,
             mb_h: closing_mb_h,
+            offsets,
         })?;
         total_n_gops += 1;
     }
@@ -442,7 +487,12 @@ fn pick_init_slot(header: &SliceHeader) -> CabacInitSlot {
 /// boundary. `data_bit_offset` is the bit position right after the
 /// slice header. Compute the byte-aligned position where the CABAC
 /// arithmetic engine starts reading (byte ceil of data_bit_offset).
-fn cabac_data_byte_offset(data_bit_offset: usize) -> usize {
+///
+/// Phase C.3.6.2 (#429) — exposed pub so the bitstream-mod splicer
+/// can convert a captured engine-local bit offset to NAL-RBSP-
+/// absolute coordinates: `rbsp_byte = cabac_data_byte_offset +
+/// engine_bit / 8`.
+pub fn cabac_data_byte_offset(data_bit_offset: usize) -> usize {
     data_bit_offset.div_ceil(8)
 }
 
@@ -461,6 +511,7 @@ fn walk_slice_mbs(
     mb_count: usize,
     frame_idx: u32,
     mb_w: usize,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
     opts: &WalkOptions,
 ) -> Result<usize, WalkError> {
@@ -497,17 +548,17 @@ fn walk_slice_mbs(
         let is_last = if is_b_slice {
             walk_b_mb(
                 dec, pps, mb_x, mb_y, mb_w, &mut prev_mb_qp,
-                frame_idx, recorder, opts, num_active_l0,
+                frame_idx, nal_idx, recorder, opts, num_active_l0,
             )?
         } else if is_p_slice {
             walk_p_mb(
                 dec, pps, mb_x, mb_y, mb_w, &mut prev_mb_qp,
-                frame_idx, recorder, opts, num_active_l0,
+                frame_idx, nal_idx, recorder, opts, num_active_l0,
             )?
         } else {
             walk_i_mb(
                 dec, pps, mb_x, mb_y, mb_w, &mut prev_mb_qp,
-                frame_idx, recorder,
+                frame_idx, nal_idx, recorder,
             )?
         };
 
@@ -530,6 +581,7 @@ fn walk_i_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
 ) -> Result<bool, WalkError> {
     let mb_type = decode_mb_type_i(dec, mb_x)?;
@@ -540,11 +592,11 @@ fn walk_i_mb(
     }
     if mb_type == 0 {
         return walk_inxn_mb(
-            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
         );
     }
     walk_i16x16_mb(
-        dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+        dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
         /* i_mb_type */ mb_type,
     )
 }
@@ -560,6 +612,7 @@ fn walk_p_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
     opts: &WalkOptions,
     num_active_l0: u8,
@@ -585,7 +638,7 @@ fn walk_p_mb(
     if mb_type_p <= 3 {
         // P-partition: §30A3 (P_L0_16x16) + §30A4 (P_L0_16x8 / P_L0_8x16 / P_8x8).
         return walk_p_partition_mb(
-            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
             mb_type_p, opts, num_active_l0,
         );
     }
@@ -601,11 +654,11 @@ fn walk_p_mb(
     }
     if i_mb_type == 0 {
         return walk_inxn_mb(
-            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+            dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
         );
     }
     walk_i16x16_mb(
-        dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+        dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
         i_mb_type,
     )
 }
@@ -620,6 +673,7 @@ fn walk_i16x16_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
     i_mb_type: u32,
 ) -> Result<bool, WalkError> {
@@ -641,9 +695,9 @@ fn walk_i16x16_mb(
 
     // Luma DC (Intra16x16DCLevel, ctx_block_cat=0).
     let dc_inc = compute_cbf_ctx_idx_inc_luma_dc(&dec.neighbors, mb_x);
-    let dc_scan = decode_residual_block_with_null_logger(
+    let dc_scan = decode_residual_block_with_offset_capture(
         dec, 0, 15, /* cat */ 0, dc_inc,
-        frame_idx, mb_addr_u32, ResidualPathKind::LumaDcIntra16x16,
+        frame_idx, mb_addr_u32, nal_idx, ResidualPathKind::LumaDcIntra16x16, recorder,
     )?;
     let dc_coded = dc_scan.iter().any(|&v| v != 0);
     current_cbf.set(0, 0, dc_coded);
@@ -661,9 +715,9 @@ fn walk_i16x16_mb(
                 mb_x, bx, by, current_is_intra,
             );
             let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-            let ac_scan = decode_residual_block_with_null_logger(
+            let ac_scan = decode_residual_block_with_offset_capture(
                 dec, 0, 14, /* cat */ 1, ac_inc,
-                frame_idx, mb_addr_u32, path,
+                frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
             let coded = ac_scan.iter().any(|&v| v != 0);
             current_cbf.set(1, k, coded);
@@ -680,9 +734,9 @@ fn walk_i16x16_mb(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_null_logger(
+            let dc_flat = decode_residual_block_with_offset_capture(
                 dec, 0, 3, /* cat */ 3, inc,
-                frame_idx, mb_addr_u32, path,
+                frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
             let coded = dc_flat.iter().any(|&v| v != 0);
             current_cbf.set(3, plane as usize, coded);
@@ -705,9 +759,9 @@ fn walk_i16x16_mb(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_null_logger(
+                let ac_scan = decode_residual_block_with_offset_capture(
                     dec, 0, 14, /* cat */ 4, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = ac_scan.iter().any(|&v| v != 0);
                 current_cbf.set(
@@ -756,6 +810,7 @@ fn walk_b_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
     _opts: &WalkOptions,
     num_active_l0: u8,
@@ -784,20 +839,20 @@ fn walk_b_mb(
     // L0/L1/Bi/partitioned/B_8x8 walkers now decode non-zero CBP
     // residuals via the shared `finish_b_inter` tail.
     match mb_type {
-        0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8),
         1 => walk_b_l0_16x16(
-            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+            dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
-        2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8),
+        2 => walk_b_l1_16x16(dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8),
         3 => walk_b_bi_16x16(
-            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+            dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
         4..=21 => walk_b_partitioned(
             dec, mb_x, prev_mb_qp, mb_type as u8,
-            frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+            frame_idx, nal_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
         22 => walk_b_8x8(
-            dec, mb_x, prev_mb_qp, frame_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
+            dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
         23..=47 => {
             // §intra-in-B (#319) — Phase 1: walker un-reject.
@@ -814,11 +869,11 @@ fn walk_b_mb(
             let i_mb_type = mb_type - 23;
             if i_mb_type == 0 {
                 walk_inxn_mb(
-                    dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+                    dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
                 )
             } else {
                 walk_i16x16_mb(
-                    dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, recorder,
+                    dec, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
                     i_mb_type,
                 )
             }
@@ -861,6 +916,7 @@ fn walk_b_direct_16x16(
     mb_x: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -890,7 +946,7 @@ fn walk_b_direct_16x16(
     finish_b_inter_with_mb_type(
         dec, mb_x, prev_mb_qp,
         /* l0_abs */ None, /* l1_abs */ None,
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         MbTypeClass::BSkipOrDirect,
         [0i8; 16],
     )
@@ -906,6 +962,7 @@ fn walk_b_l0_16x16(
     mb_x: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -923,7 +980,7 @@ fn walk_b_l0_16x16(
     finish_b_inter(
         dec, mb_x, prev_mb_qp,
         /* l0 */ Some([[abs_x; 16], [abs_y; 16]]), /* l1 */ None,
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         [ref_idx_l0_dec as i8; 16],
     )
 }
@@ -937,6 +994,7 @@ fn walk_b_l1_16x16(
     mb_x: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -947,7 +1005,7 @@ fn walk_b_l1_16x16(
     finish_b_inter(
         dec, mb_x, prev_mb_qp,
         None, Some([[abs_x; 16], [abs_y; 16]]),
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         [0i8; 16],
     )
 }
@@ -964,6 +1022,7 @@ fn walk_b_bi_16x16(
     mb_x: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -982,7 +1041,7 @@ fn walk_b_bi_16x16(
         dec, mb_x, prev_mb_qp,
         Some([[l0_x; 16], [l0_y; 16]]),
         Some([[l1_x; 16], [l1_y; 16]]),
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         [ref_idx_l0_dec as i8; 16],
     )
 }
@@ -1002,6 +1061,7 @@ fn walk_b_partitioned(
     prev_mb_qp: &mut i32,
     mb_type: u8,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -1103,7 +1163,7 @@ fn walk_b_partitioned(
     let ref_idx_l0_array = walker_fill_ref_idx_l0_partitioned(meta, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_for_finish, l1_for_finish,
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         ref_idx_l0_array,
     )
 }
@@ -1133,6 +1193,7 @@ fn walk_b_8x8(
     mb_x: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -1225,7 +1286,7 @@ fn walk_b_8x8(
     let ref_idx_l0_array = walker_fill_ref_idx_l0_b8x8(sub_mb_types, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_some, l1_some,
-        frame_idx, mb_addr_u32, recorder, t8x8,
+        frame_idx, nal_idx, mb_addr_u32, recorder, t8x8,
         ref_idx_l0_array,
     )
 }
@@ -1261,14 +1322,14 @@ fn decode_b_16x16_mvd_pair(
         &dec.neighbors, mb_x, 0, 0, /* component */ 0, list,
     );
     let mvd_x = {
-        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut null };
         decode_mvd_with_bin0_inc(dec, /* component */ 0, list, /* partition */ 0, bin0_inc_x, &mut pc)?
     };
     let bin0_inc_y = ctx_idx_inc_mvd_bin0_per_list(
         &dec.neighbors, mb_x, 0, 0, /* component */ 1, list,
     );
     let mvd_y = {
-        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut null };
         decode_mvd_with_bin0_inc(dec, 1, list, 0, bin0_inc_y, &mut pc)?
     };
     let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
@@ -1301,14 +1362,14 @@ fn decode_b_partition_mvd_pair(
         /* component */ 0, list,
     );
     let mvd_x = {
-        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut null };
         decode_mvd_with_bin0_inc(dec, 0, list, 0, bin0_inc_x, &mut pc)?
     };
     let bin0_inc_y = compute_mvd_ctx_idx_inc_bin0_per_list(
         current_mvd, &dec.neighbors, mb_x, cur_bx, cur_by, 1, list,
     );
     let mvd_y = {
-        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut null };
+        let mut pc = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut null };
         decode_mvd_with_bin0_inc(dec, 1, list, 0, bin0_inc_y, &mut pc)?
     };
     let abs_x = mvd_x.unsigned_abs().min(i16::MAX as u32) as i16;
@@ -1441,13 +1502,14 @@ fn finish_b_inter(
     l0_abs: Option<[[i16; 16]; 2]>,
     l1_abs: Option<[[i16; 16]; 2]>,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
     ref_idx_l0_array: [i8; 16],
 ) -> Result<bool, WalkError> {
     finish_b_inter_with_mb_type(
-        dec, mb_x, prev_mb_qp, l0_abs, l1_abs, frame_idx, mb_addr_u32,
+        dec, mb_x, prev_mb_qp, l0_abs, l1_abs, frame_idx, nal_idx, mb_addr_u32,
         recorder, t8x8, MbTypeClass::PInter, ref_idx_l0_array,
     )
 }
@@ -1460,6 +1522,7 @@ fn finish_b_inter_with_mb_type(
     l0_abs: Option<[[i16; 16]; 2]>,
     l1_abs: Option<[[i16; 16]; 2]>,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     t8x8: bool,
@@ -1502,9 +1565,9 @@ fn finish_b_inter_with_mb_type(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_null_logger(
+                let scan = decode_residual_block_with_offset_capture(
                     dec, 0, 15, /* cat */ 2, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = scan.iter().any(|&v| v != 0);
                 current_cbf.set(2, k, coded);
@@ -1520,9 +1583,9 @@ fn finish_b_inter_with_mb_type(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_null_logger(
+            let dc_flat = decode_residual_block_with_offset_capture(
                 dec, 0, 3, /* cat */ 3, inc,
-                frame_idx, mb_addr_u32, path,
+                frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
             let coded = dc_flat.iter().any(|&v| v != 0);
             current_cbf.set(3, plane as usize, coded);
@@ -1543,9 +1606,9 @@ fn finish_b_inter_with_mb_type(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_null_logger(
+                let ac_scan = decode_residual_block_with_offset_capture(
                     dec, 0, 14, /* cat */ 4, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = ac_scan.iter().any(|&v| v != 0);
                 current_cbf.set(
@@ -1603,6 +1666,7 @@ fn walk_inxn_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
 ) -> Result<bool, WalkError> {
     let mb_addr_u32 = (mb_y * mb_w + mb_x) as u32;
@@ -1662,17 +1726,29 @@ fn walk_inxn_mb(
                 let path_kind = ResidualPathKind::Luma8x8 {
                     block_idx: k as u8,
                 };
-                let mut logger = NullLogger;
-                let mut pos_ctx = PositionCtx {
-                    frame_idx,
-                    mb_addr: mb_addr_u32,
-                    logger: &mut logger,
+                // Phase C.3.6.1 — dispatch to offset-capturing logger
+                // when enabled; else NullLogger (zero-cost). Scoped so
+                // recorder is free for `on_residual_block` below.
+                let mut null = NullLogger;
+                let scan = {
+                    let logger: &mut dyn PositionLogger =
+                        if let Some(ol) = recorder.offset_logger.as_mut() {
+                            ol
+                        } else {
+                            &mut null
+                        };
+                    let mut pos_ctx = PositionCtx {
+                        frame_idx,
+                        mb_addr: mb_addr_u32,
+                        nal_idx,
+                        logger,
+                    };
+                    decode_residual_block_cabac_8x8(
+                        dec,
+                        &mut pos_ctx,
+                        |ci, kind| path_kind.path(ci, kind),
+                    )?
                 };
-                let scan = decode_residual_block_cabac_8x8(
-                    dec,
-                    &mut pos_ctx,
-                    |ci, kind| path_kind.path(ci, kind),
-                )?;
                 recorder.on_residual_block(
                     frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
                 );
@@ -1696,9 +1772,9 @@ fn walk_inxn_mb(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_null_logger(
+                let scan = decode_residual_block_with_offset_capture(
                     dec, 0, 15, /* cat */ 2, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = scan.iter().any(|&v| v != 0);
                 current_cbf.set(2, k, coded);
@@ -1716,9 +1792,9 @@ fn walk_inxn_mb(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_null_logger(
+            let dc_flat = decode_residual_block_with_offset_capture(
                 dec, 0, 3, /* cat */ 3, inc,
-                frame_idx, mb_addr_u32, path,
+                frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
             let coded = dc_flat.iter().any(|&v| v != 0);
             current_cbf.set(3, plane as usize, coded);
@@ -1741,9 +1817,9 @@ fn walk_inxn_mb(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_null_logger(
+                let ac_scan = decode_residual_block_with_offset_capture(
                     dec, 0, 14, /* cat */ 4, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = ac_scan.iter().any(|&v| v != 0);
                 current_cbf.set(
@@ -1800,6 +1876,7 @@ fn walk_p_partition_mb(
     mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     recorder: &mut PositionRecorder,
     mb_type_p: u32,
     opts: &WalkOptions,
@@ -1873,7 +1950,7 @@ fn walk_p_partition_mb(
     //    SUB_MB_ORIGINS_4X4 = [(0,0),(2,0),(0,2),(2,2)] each
     //    expanding by sub_mb_type into 1-4 partitions.
     decode_p_partition_mvds(
-        dec, &mut current_mvd, mb_x, mb_addr_u32, frame_idx,
+        dec, &mut current_mvd, mb_x, mb_addr_u32, frame_idx, nal_idx,
         mb_type_p, sub_types.as_ref(), recorder, opts,
     )?;
 
@@ -1890,7 +1967,7 @@ fn walk_p_partition_mb(
 
     // 4-9. Shared residual + neighbor commit.
     decode_p_residuals_and_finish(
-        dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx,
+        dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx,
         mb_addr_u32, recorder, &current_mvd, no_sub_mb_part_size_lt_8x8,
         ref_idx_l0_array,
     )
@@ -1905,6 +1982,7 @@ fn decode_p_partition_mvds(
     mb_x: usize,
     mb_addr_u32: u32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_type_p: u32,
     sub_types: Option<&[u32; 4]>,
     recorder: &mut PositionRecorder,
@@ -1915,27 +1993,27 @@ fn decode_p_partition_mvds(
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 4, 4,
                 /* partition */ 0,
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         1 => {
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 4, 2, 0,
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 2, 4, 2, 1,
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         2 => {
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 2, 4, 0,
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 2, 0, 2, 4, 1,
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         3 => {
@@ -1946,7 +2024,7 @@ fn decode_p_partition_mvds(
                 decode_sub_mb_mvds(
                     dec, current_mvd, mb_x, sub_bx, sub_by, sub_t,
                     /* sub_mb_idx */ i as u8,
-                    frame_idx, mb_addr_u32, recorder, opts,
+                    frame_idx, nal_idx, mb_addr_u32, recorder, opts,
                 )?;
             }
         }
@@ -1978,6 +2056,7 @@ fn decode_sub_mb_mvds(
     sub_mb_type: u32,
     sub_mb_idx: u8,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     opts: &WalkOptions,
@@ -1987,27 +2066,27 @@ fn decode_sub_mb_mvds(
         0 => {
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, sub_bx, sub_by, 2, 2, p(0),
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         1 => {
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, sub_bx, sub_by, 2, 1, p(0),
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, sub_bx, sub_by + 1, 2, 1, p(1),
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         2 => {
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, sub_bx, sub_by, 1, 2, p(0),
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, sub_bx + 1, sub_by, 1, 2, p(1),
-                frame_idx, mb_addr_u32, recorder, opts,
+                frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         3 => {
@@ -2017,7 +2096,7 @@ fn decode_sub_mb_mvds(
                     decode_one_mvd_pair_p(
                         dec, current_mvd, mb_x,
                         sub_bx + ox, sub_by + oy, 1, 1, p(sp),
-                        frame_idx, mb_addr_u32, recorder, opts,
+                        frame_idx, nal_idx, mb_addr_u32, recorder, opts,
                     )?;
                 }
             }
@@ -2046,6 +2125,7 @@ fn decode_one_mvd_pair_p(
     part_h4: u8,
     partition: u8,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     opts: &WalkOptions,
@@ -2054,9 +2134,16 @@ fn decode_one_mvd_pair_p(
     let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0(
         current_mvd, &dec.neighbors, mb_x, part_bx, part_by, 0,
     );
+    // Phase C.3.6.1 — dispatch to recorder's offset_logger when set.
     let mvd_x = {
+        let logger: &mut dyn PositionLogger =
+            if let Some(ol) = recorder.offset_logger.as_mut() {
+                ol
+            } else {
+                &mut null
+            };
         let mut pc = PositionCtx {
-            frame_idx, mb_addr: mb_addr_u32, logger: &mut null,
+            frame_idx, mb_addr: mb_addr_u32, nal_idx, logger,
         };
         decode_mvd_with_bin0_inc(
             dec, /* component */ 0, /* list */ 0,
@@ -2067,8 +2154,14 @@ fn decode_one_mvd_pair_p(
         current_mvd, &dec.neighbors, mb_x, part_bx, part_by, 1,
     );
     let mvd_y = {
+        let logger: &mut dyn PositionLogger =
+            if let Some(ol) = recorder.offset_logger.as_mut() {
+                ol
+            } else {
+                &mut null
+            };
         let mut pc = PositionCtx {
-            frame_idx, mb_addr: mb_addr_u32, logger: &mut null,
+            frame_idx, mb_addr: mb_addr_u32, nal_idx, logger,
         };
         decode_mvd_with_bin0_inc(
             dec, 1, 0, 0, bin0_inc_y, &mut pc,
@@ -2109,6 +2202,7 @@ fn decode_p_residuals_and_finish(
     _mb_w: usize,
     prev_mb_qp: &mut i32,
     frame_idx: u32,
+    nal_idx: u32,
     mb_addr_u32: u32,
     recorder: &mut PositionRecorder,
     current_mvd: &CurrentMbMvdAbs,
@@ -2152,17 +2246,29 @@ fn decode_p_residuals_and_finish(
                 let path_kind = ResidualPathKind::Luma8x8 {
                     block_idx: k as u8,
                 };
-                let mut logger = NullLogger;
-                let mut pos_ctx = PositionCtx {
-                    frame_idx,
-                    mb_addr: mb_addr_u32,
-                    logger: &mut logger,
+                // Phase C.3.6.1 — dispatch to offset-capturing logger
+                // when enabled; else NullLogger (zero-cost). Scoped so
+                // recorder is free for `on_residual_block` below.
+                let mut null = NullLogger;
+                let scan = {
+                    let logger: &mut dyn PositionLogger =
+                        if let Some(ol) = recorder.offset_logger.as_mut() {
+                            ol
+                        } else {
+                            &mut null
+                        };
+                    let mut pos_ctx = PositionCtx {
+                        frame_idx,
+                        mb_addr: mb_addr_u32,
+                        nal_idx,
+                        logger,
+                    };
+                    decode_residual_block_cabac_8x8(
+                        dec,
+                        &mut pos_ctx,
+                        |ci, kind| path_kind.path(ci, kind),
+                    )?
                 };
-                let scan = decode_residual_block_cabac_8x8(
-                    dec,
-                    &mut pos_ctx,
-                    |ci, kind| path_kind.path(ci, kind),
-                )?;
                 recorder.on_residual_block(
                     frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
                 );
@@ -2184,9 +2290,9 @@ fn decode_p_residuals_and_finish(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_null_logger(
+                let scan = decode_residual_block_with_offset_capture(
                     dec, 0, 15, /* cat */ 2, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = scan.iter().any(|&v| v != 0);
                 current_cbf.set(2, k, coded);
@@ -2202,9 +2308,9 @@ fn decode_p_residuals_and_finish(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_null_logger(
+            let dc_flat = decode_residual_block_with_offset_capture(
                 dec, 0, 3, /* cat */ 3, inc,
-                frame_idx, mb_addr_u32, path,
+                frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
             let coded = dc_flat.iter().any(|&v| v != 0);
             current_cbf.set(3, plane as usize, coded);
@@ -2225,9 +2331,9 @@ fn decode_p_residuals_and_finish(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_null_logger(
+                let ac_scan = decode_residual_block_with_offset_capture(
                     dec, 0, 14, /* cat */ 4, inc,
-                    frame_idx, mb_addr_u32, path,
+                    frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
                 let coded = ac_scan.iter().any(|&v| v != 0);
                 current_cbf.set(
@@ -2264,13 +2370,20 @@ fn decode_p_residuals_and_finish(
     Ok(is_last)
 }
 
-/// Helper: decode one residual block with a no-op `PositionLogger`.
-/// Position recording happens externally via `PositionRecorder`
-/// after-the-fact, since the recorder's enumerate-from-coeffs path
-/// gives identical positions to the inline decoder logger by
-/// construction (encoder-side parity gate, chunk 6A).
+/// Helper: decode one residual block. Position recording for cover
+/// bits + values happens externally via `PositionRecorder` after-the-
+/// fact (the recorder's enumerate-from-coeffs path gives identical
+/// positions to the inline decoder logger by construction; encoder-
+/// side parity gate, chunk 6A).
+///
+/// Phase C.3.6.1 (#428) — when the recorder has `offset_logger`
+/// enabled (`PositionRecorder::with_offsets()`), the inline logger
+/// passed to the syntax decoder captures RBSP bit offsets of every
+/// emitted bypass bin. Otherwise the inline logger is `NullLogger`
+/// (zero-cost). The offset-capturing path is the foundation of
+/// Option C bitstream-mod stego on the OpenH264 backend.
 #[allow(clippy::too_many_arguments)]
-fn decode_residual_block_with_null_logger(
+fn decode_residual_block_with_offset_capture(
     dec: &mut CabacDecoder<'_>,
     start_idx: usize,
     end_idx: usize,
@@ -2278,13 +2391,22 @@ fn decode_residual_block_with_null_logger(
     cbf_ctx_idx_inc: u32,
     frame_idx: u32,
     mb_addr: u32,
+    nal_idx: u32,
     path_kind: ResidualPathKind,
+    recorder: &mut PositionRecorder,
 ) -> Result<Vec<i32>, WalkError> {
-    let mut logger = NullLogger;
+    let mut null = NullLogger;
+    let logger: &mut dyn PositionLogger =
+        if let Some(ol) = recorder.offset_logger.as_mut() {
+            ol
+        } else {
+            &mut null
+        };
     let mut pos_ctx = PositionCtx {
         frame_idx,
         mb_addr,
-        logger: &mut logger,
+        nal_idx,
+        logger,
     };
     let coeffs = decode_residual_block_cabac(
         dec, start_idx, end_idx, ctx_block_cat, cbf_ctx_idx_inc,
@@ -2788,7 +2910,7 @@ mod tests {
     }
 
     /// **§30D-B parity gate**: encoder `enable_mvd_stego_hook=true`
-    /// + decoder `WalkOptions { record_mvd: true }` → byte-identical
+    /// + decoder `WalkOptions { record_mvd: true, record_offsets: false }` → byte-identical
     /// cover across MVD domains. Encoder side fires MVD hook for
     /// P_L0_16x16 partitions (§30D-A scope); decoder records the
     /// matching MvdSlot via PositionRecorder. Parity-by-
@@ -2828,7 +2950,7 @@ mod tests {
         let encoder_gop = hook.take_cover_if_logger().expect("logger");
 
         // Decoder: WalkOptions.record_mvd=true.
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
             .expect("walk");
 
@@ -2907,7 +3029,7 @@ mod tests {
         let mut hook = enc.take_stego_hook().expect("hook");
         let encoder_gop = hook.take_cover_if_logger().expect("logger");
 
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
             .expect("walk");
 
@@ -2983,7 +3105,7 @@ mod tests {
         // Walk the stego bytes (with MVD recording on, mirroring the
         // production decoder).
         let walk = walk_annex_b_for_cover_with_options(
-            &stego_bytes, WalkOptions { record_mvd: true },
+            &stego_bytes, WalkOptions { record_mvd: true, record_offsets: false },
         ).expect("walk Pass 3");
 
         // For diagnostic — print per-domain lengths. If the pipeline
@@ -3067,7 +3189,7 @@ mod tests {
 
         let walk = walk_annex_b_for_cover_with_options(
             &bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walk");
 
@@ -3219,7 +3341,7 @@ mod tests {
 
         let walk = walk_annex_b_for_cover_with_options(
             &bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walk");
 
@@ -3285,7 +3407,7 @@ mod tests {
 
         let walk = walk_annex_b_for_cover_with_options(
             &bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walk");
 

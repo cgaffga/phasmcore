@@ -104,6 +104,125 @@ fn main() {
             // bumped to 0x010100 for the dec_post_read additions.
             // Test now reads the macro from wels_stego.h directly.
             "6bf4565af7f2d827781cac180539a8c738b70ae4",
+            // 2026-05-12: C.8.1 pVisualRecPic per-DqLayer buffer
+            // allocator. Adds parallel SRefList::pVisualRef[] pool
+            // (1:1 with pRef[]) + pCtx->pVisualDecPic +
+            // SDqLayer::pVisualRecPic plumbing. Buffer-infra only --
+            // no dual-write hooks yet, encoder bit-identical (21/21
+            // openh264-backend lib tests including session_round_trip
+            // + b9_3_full_roundtrip + b10_cascade_safe_roundtrip).
+            "eda532623010a93da7a340d4c25d9713840b8d98",
+            // 2026-05-12: C.8.2 dual-recon hook ABI. Bumps
+            // PHASM_STEGO_ABI_VERSION 1.1.0 -> 1.2.0 (additive). Adds
+            // PhasmStegoDualReconFn + dual_recon_observe field +
+            // internal phasm_dual_recon_writeback helper. ABI-only
+            // change; encoder bit-identical, 22/22 openh264-backend
+            // lib tests + 4 new gtest cases for the writeback helper.
+            "a70255e8ca91f0b39d4cb6933b53a0f38d897c04",
+            // 2026-05-12: C.8.3 I_16x16 dual-recon. WelsEncRecI16x16Y
+            // snapshots post-quant clean coefficients before HOOK-A/B,
+            // reruns dequant+DC-reinject+IDCT after the existing stego
+            // recon writes pPred, then mirrors stego into pVisualRecPic
+            // via phasm_dual_recon_writeback. pDecPic = clean,
+            // pVisualRecPic = stego on I_16x16 MBs. Gated on
+            // PhasmStegoGetEncPreEmit()!=NULL so no-stego encodes stay
+            // byte-identical to upstream. 22/22 lib tests pass.
+            "d1b91289395e2f4892f7a140f5cac81c622df01b",
+            // 2026-05-13: C.8.4 I_4x4 dual-recon + C.8.3 sizeof bug fix
+            // in svc_encode_mb.cpp. WelsEncRecI4x4Y now snapshots
+            // post-quant clean per sub-block, reruns dequant+IDCT after
+            // the original IDCT writes stego, mirrors stego to
+            // pVisualRecPic. C.8.3 recompute previously used
+            // sizeof(ENFORCE_STACK_ALIGN_1D-name) which evaluates to
+            // pointer size (8B) instead of the array byte count -- pPred
+            // was being written with stack garbage; b10 passed via
+            // deterministic garbage. Fixed to sizeof(int16_t)*N. 22/22
+            // lib tests genuinely green now (including b10's seq-diverge
+            // check on real clean pixels).
+            "4497206d87fdb287a67598141cfd5ac020b55df1",
+            // 2026-05-13: C.8.5 chroma DC + AC dual-recon (stash +
+            // Pskip mirror only -- chroma intra + inter clean recompute
+            // was missing due to a silent Edit-failure in this session).
+            "eb94726fa79f5b66bba497653b1217b55a6a2896",
+            // 2026-05-13: C.8.5 completion -- chroma intra (Site C-3,
+            // WelsIMbChromaEncode) + chroma inter (Site C-4,
+            // OutputPMbWithoutConstructCsRsNoCopy) clean recompute now
+            // wired. With C.8.3/C.8.4 luma + this commit's chroma
+            // dual-recon active, the chroma cascade through MB N+1+'s
+            // intra-chroma prediction is broken (= visual_recon working
+            // as designed). The 1-byte stc_drives bitstream-differ
+            // signal that pre-C.8.5 carried the cascade leak is now
+            // absorbed -- 6 sign-bit flips compress to the same CABAC
+            // bytes in the 320x240 QP=18 fixture. b9_3 round-trip via
+            // decoder hook continues to verify wire-level override
+            // propagation rigorously. 22/22 openh264-backend lib tests
+            // + 1365/1365 total lib tests pass.
+            "f50fef5d52b85657bb80cf75631542794d25c91f",
+            // 2026-05-13: C.8.6 P-frame luma dual-recon. Closes the
+            // largest remaining cascade surface (P-frame in-place luma
+            // IDCT in OutputPMbWithoutConstructCsRsNoCopy was writing
+            // stego luma into pDecY after HOOK-F flipped coefficients).
+            // New phasm_stash_p_luma_clean_pres helper carries CLEAN
+            // post-quant + mirror-suppression+dequant luma residual
+            // from WelsEncInterY to the IDCT site. Pattern mirrors
+            // C.8.5 inter chroma: snapshot MC pred, live IDCT, snapshot
+            // stego, restore pred, re-IDCT with clean stash, mirror to
+            // pVisualRecPic[Y]. Residual-coefficient cascade now closed
+            // for all 4 shapes (I_16x16/I_4x4/intra chroma/inter Y+UV).
+            // Still leaking: MvdSign MC (C.8.7), deblock (C.8.8), ref
+            // promotion audit (C.8.9). 22/22 + 1365/1365 tests pass.
+            "54bf85afd1f40731acc80223ca6906d2f73fa4b8",
+            // 2026-05-13: C.8 observe-callback fix. All 5 dual-recon
+            // call sites (C.8.3-C.8.6) now pass compact clean snapshots
+            // to phasm_dual_recon_writeback so the observe callback
+            // actually fires (helper had `clean_pixels != NULL &&
+            // stego_pixels != NULL` guard; we previously passed NULL
+            // for clean). Enables the cascade-break probe test
+            // c8_pdecpic_clean_under_coeff_sign_overrides which
+            // captured 0 cascade_leak_blocks across 10727 observed
+            // blocks on a 2-frame 320x240 IDR+P fixture — direct
+            // evidence C.8.3-6 cascade-break works as intended.
+            "9b4f66df8ce7f80150be7db72d3cb4ba56f02869",
+            // C.8.7 (#440) — MvdSign cascade-break for P_16x16
+            // (HOOK-H1 luma + chroma). On MV-override MBs, HOOK-H1
+            // captures clean MC into a per-MB stash; OutputPMb shifts
+            // pDecPic by (CLEAN_MC − STEGO_MC) so encoder reference
+            // stays clean while pVisualRecPic mirrors the actual
+            // decoder reconstruction. Partitioned modes (H2..H7)
+            // remain pending.
+            "5505f3e0b2bf04d4b2c5eead8f8a6702b0f3dcc6",
+            // C.8.7 v1.1 (#453) — extends cascade-break to partitioned
+            // P modes: P_16x8 (H2), P_8x16 (H3), P_8x8/SUB_MB_TYPE_8x8
+            // (H4) — luma via the centralised partition helper +
+            // chroma inline at each site. H5/H6/H7 (sub-MB 4x4/8x4/4x8)
+            // closed-by-design: OpenH264 upstream itself disables
+            // sub-MB-partition selection at svc_mode_decision.cpp:628
+            // (#if 0 //Disable for sub8x8 modes for now), so those
+            // hooks can never fire.
+            "5bdca8b84a3e363e04b2bd0ac3726a507ee28756",
+            // C.8.8 (#441) — deblock dual-pass. After slice recon,
+            // run the deblock filter twice: once on pDecPic (encoder
+            // reference for ME), once on pVisualRecPic (decoder-
+            // equivalent reconstruction for mp4 output). Boundary
+            // strengths come from SMB syntax → identical for both.
+            // Only pixel content differs. ~2× deblock cost in stego
+            // mode; zero cost outside stego.
+            "e9988005c752db426bb55061a93e32f0bada9308",
+            // C.8.9 (#442) — cascade-safety runtime assertions at the
+            // two DPB promotion sites (ref_list_mgr_svc.cpp:403 short-
+            // ref + encoder_ext.cpp:2833 ME ref attachment). Both scan
+            // pVisualRef[] and abort if a stego-mirror pointer ever
+            // reaches the clean reference path. Structural decoupling
+            // argued in docs/design/video/h264/c89-cascade-safety-audit
+            // section 2.
+            "6588fb54cc906ef798cd6c3f752120e304007d6f",
+            // C.8.10 (#443) — fsnr redirect to pVisualDecPic for
+            // encoder-internal debug output paths (ENABLE_FRAME_DUMP +
+            // PSNR readback). The mp4 muxer is downstream of the
+            // encoder library, so it receives the wire bitstream and
+            // any decoder naturally produces stego pixels. Only the
+            // in-library debug output needed redirecting.
+            "e210d008c06775a507c79f390f96a58e38c26416",
         ];
         let head_output = Command::new("git")
             .arg("-C")

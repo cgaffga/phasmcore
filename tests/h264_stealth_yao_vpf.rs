@@ -111,7 +111,7 @@ fn yao_vpf_periodicity_test_no_double_encoding_signal() {
 
     let cover_walk = walk_annex_b_for_cover_with_options(
         &stego,
-        WalkOptions { record_mvd: true },
+        WalkOptions { record_mvd: true, record_offsets: false },
     )
     .expect("walk stego");
 
@@ -214,11 +214,11 @@ fn yao_vpf_phasm_activity_does_not_diverge_from_clean_baseline() {
     }
 
     let stego_walk = walk_annex_b_for_cover_with_options(
-        &stego, WalkOptions { record_mvd: true },
+        &stego, WalkOptions { record_mvd: true, record_offsets: false },
     )
     .expect("walk stego");
     let clean_walk = walk_annex_b_for_cover_with_options(
-        &clean, WalkOptions { record_mvd: true },
+        &clean, WalkOptions { record_mvd: true, record_offsets: false },
     )
     .expect("walk clean");
 

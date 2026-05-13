@@ -650,9 +650,16 @@ pub fn decode_sub_mb_type_b(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeErr
 /// Per-MB position context passed to decoders that emit stego
 /// positions. Carries the (frame, mb_addr) coordinate plus the
 /// PositionLogger to emit into.
+///
+/// Phase C.3.6.1 (task #428) — `nal_idx` identifies which slice NAL
+/// in the Annex-B stream contains this MB's bins, plumbed into
+/// `PositionLogger::register_with_offset` so the walker can capture
+/// per-position byte/bit offsets aligned to NAL boundaries (used by
+/// the Option C bitstream-mod splicer).
 pub struct PositionCtx<'a> {
     pub frame_idx: u32,
     pub mb_addr: u32,
+    pub nal_idx: u32,
     pub logger: &'a mut dyn PositionLogger,
 }
 
@@ -746,7 +753,9 @@ pub fn decode_mvd_with_bin0_inc(
                 kind: BinKind::Sign,
             },
         );
-        pos_ctx.logger.register(key);
+        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        let off = dec.next_rbsp_bit_offset();
+        pos_ctx.logger.register_with_offset(key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
         if sign_bin == 0 { abs_v as i32 } else { -(abs_v as i32) }
     };
@@ -788,7 +797,9 @@ fn decode_egk_suffix_emit_lsb(
                     lsb_domain,
                     path,
                 );
-                pos_ctx.logger.register(key);
+                // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+                let off = dec.next_rbsp_bit_offset();
+                pos_ctx.logger.register_with_offset(key, off, pos_ctx.nal_idx);
             }
             let bin = dec.decode_bypass()?;
             suffix_value |= (bin as u32) << i;
@@ -926,7 +937,9 @@ pub fn decode_residual_block_cabac(
             EmbedDomain::CoeffSignBypass,
             sign_path,
         );
-        pos_ctx.logger.register(sign_key);
+        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        let off = dec.next_rbsp_bit_offset();
+        pos_ctx.logger.register_with_offset(sign_key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
         coeffs[i] = if sign_bin == 0 { abs_level as i32 } else { -(abs_level as i32) };
 
@@ -1027,7 +1040,9 @@ pub fn decode_residual_block_cabac_8x8(
             EmbedDomain::CoeffSignBypass,
             sign_path,
         );
-        pos_ctx.logger.register(sign_key);
+        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        let off = dec.next_rbsp_bit_offset();
+        pos_ctx.logger.register_with_offset(sign_key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
         coeffs[i] = if sign_bin == 0 { abs_level as i32 } else { -(abs_level as i32) };
 
@@ -1523,7 +1538,7 @@ mod tests {
         let bytes = enc.finish();
         let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
         let mut recorder = crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
         assert_eq!(v, 0);
         // mvd=0 → no sign bin emitted, no positions logged.
@@ -1540,7 +1555,7 @@ mod tests {
             let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
             let mut recorder =
                 crate::codec::h264::stego::PositionRecorder::new();
-            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
             let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
             assert_eq!(v, mvd, "mvd={mvd}");
             // |mvd| < 9 → no suffix; only sign bypass emitted.
@@ -1563,7 +1578,7 @@ mod tests {
             let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
             let mut recorder =
                 crate::codec::h264::stego::PositionRecorder::new();
-            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
             let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
             assert_eq!(v, mvd, "mvd={mvd}");
             // 2 positions: SuffixLsb then SignBypass.
@@ -1585,7 +1600,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let _ = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
         let _ = decode_mvd(&mut dec, 1, 0, 0, 0, 0, 0, &mut ctx).unwrap();
         assert_eq!(recorder.positions.len(), 2);
@@ -1620,7 +1635,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -1648,7 +1663,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -1678,7 +1693,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -1708,7 +1723,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -1740,7 +1755,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -1768,7 +1783,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let coeffs = decode_residual_block_cabac_8x8(
             &mut dec, &mut ctx,
             |coeff_idx, kind| SyntaxPath::Luma8x8 {
@@ -1801,7 +1816,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 3, 0, 0, true,
         );
@@ -1831,7 +1846,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 0, 0, 0, true,
         );
@@ -1876,7 +1891,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 2, 0, 0, true,
         );
@@ -1909,7 +1924,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 4, 0, 0, true,
         );
@@ -1937,7 +1952,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let coeffs = decode_residual_block_cabac_8x8(
             &mut dec, &mut ctx,
             |coeff_idx, kind| SyntaxPath::Luma8x8 {
@@ -2010,7 +2025,7 @@ mod tests {
         // Decode + record positions.
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -2084,7 +2099,7 @@ mod tests {
         // Decode + record positions.
         let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
         let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         for s in &slots {
             let v = decode_mvd(&mut dec, 0, 0, 0, 0, s.list, s.partition, &mut ctx).unwrap();
             assert_eq!(v, s.value, "MVD roundtrip for slot {s:?}");
@@ -2154,7 +2169,7 @@ mod tests {
         let bytes = enc.finish();
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -2243,7 +2258,7 @@ mod tests {
         let bytes = enc.finish();
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
         let cbf_inc = ctx_idx_inc_coded_block_flag(
             &dec.neighbors, 0, 1, 0, 0, true,
         );
@@ -2294,7 +2309,7 @@ mod tests {
         let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
         let mut recorder =
             crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 5, mb_addr: 17, logger: &mut recorder };
+        let mut ctx = PositionCtx { frame_idx: 5, mb_addr: 17, nal_idx: 0, logger: &mut recorder };
 
         assert_eq!(decode_mb_type_i(&mut dec, 0).unwrap(), 1);
         assert_eq!(decode_intra_chroma_pred_mode(&mut dec, 0).unwrap(), 2);

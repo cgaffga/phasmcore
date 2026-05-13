@@ -181,7 +181,7 @@ fn stealth_measurement_real_world_64x48_5f() {
     // 3. Walk both streams. `record_mvd: true` matches the decoder's
     // walker config (decode_pixels.rs) so MVD bins land in the
     // recorded cover.
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let clean_walk = walk_annex_b_for_cover_with_options(&clean_bytes, opts)
         .expect("clean walk");
     let stego_walk = walk_annex_b_for_cover_with_options(&stego_bytes, opts)
@@ -287,7 +287,7 @@ fn stealth_measurement_real_world_128x80_10f() {
     assert_eq!(recovered, msg);
 
     let clean_bytes = encode_clean_reference(&yuv, width, height, n_frames, gop_size);
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let clean_walk = walk_annex_b_for_cover_with_options(&clean_bytes, opts)
         .expect("clean walk");
     let stego_walk = walk_annex_b_for_cover_with_options(&stego_bytes, opts)
@@ -403,7 +403,7 @@ fn shadow_stealth_measurement_real_world_64x48_5f() {
     let clean_bytes = encode_clean_reference(&yuv, width, height, n_frames, gop_size);
 
     // 3. Walk both streams.
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let clean_walk = walk_annex_b_for_cover_with_options(&clean_bytes, opts)
         .expect("clean walk");
     let stego_walk = walk_annex_b_for_cover_with_options(&stego_bytes, opts)
@@ -506,7 +506,7 @@ fn shadow_stealth_measurement_1080p_2gop() {
 
     let clean_bytes = encode_clean_reference(&yuv, width, height, n_frames, gop_size);
 
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let clean_walk = walk_annex_b_for_cover_with_options(&clean_bytes, opts)
         .expect("clean walk");
     let stego_walk = walk_annex_b_for_cover_with_options(&stego_bytes, opts)

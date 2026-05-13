@@ -1,0 +1,42 @@
+# H.264 mb-partition histogram
+# source: /tmp/openh264_baseline_dji_mini2.h264
+# resolution: 1920x1072 (8040 MBs/frame)
+
+## I-frame (1 frames, 8040 MBs)
+  no-MV (Skip / Direct / Intra) :       8040 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+  encoder mb_type (over 16080 MBs) [ffmpeg-debug ground truth]:
+        Intra_4x4 :     3942 ( 24.51%)
+      Intra_16x16 :    12138 ( 75.49%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :        0 (  0.00%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :    16080 (100.00%)
+  QP distribution: mean=26.00 min=26 max=26 (over 16080 MBs)
+    QP 22-26 :    16080 (100.00%)
+
+## P-frame (9 frames, 72360 MBs)
+  no-MV (Skip / Direct / Intra) :       4257 ( 5.88%)
+  emitted MVs                   :      68103 (94.12%)
+  partition shapes (over 69889 MV records):
+      16x16 :    67223 ( 96.19%)
+        8x8 :     1812 (  2.59%)
+       16x8 :      430 (  0.62%)
+       8x16 :      424 (  0.61%)
+  direction (over 69889 MV-anchors) [decoder-synthesized]:
+         L0 :    69889 (100.00%)
+  encoder mb_type (over 120600 MBs) [ffmpeg-debug ground truth]:
+             Skip :    90385 ( 74.95%)
+      Intra_16x16 :     7157 (  5.93%)
+        Inter_fwd :    23058 ( 19.12%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :    90385 ( 74.95%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :     7157 (  5.93%)
+  QP distribution: mean=26.00 min=26 max=26 (over 120600 MBs)
+    QP 22-26 :   120600 (100.00%)
+  MVD |Δ|∞ (over 69889 MV records, pel units):
+          0 :    69338 ( 99.21%)
+        1-2 :      465 (  0.67%)
+        3-7 :       81 (  0.12%)
+       8-15 :        5 (  0.01%)

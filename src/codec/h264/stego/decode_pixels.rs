@@ -134,7 +134,7 @@ pub fn h264_stego_decode_yuv_string_4domain(
     annex_b: &[u8],
     passphrase: &str,
 ) -> Result<String, StegoError> {
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
     decode_from_cover_4domain(walk.cover, passphrase)
@@ -157,7 +157,7 @@ pub fn h264_stego_decode_yuv_string_4domain_per_gop_v3(
 
     // Walk per-GOP, keep per-GOP DomainCover.
     let mut per_gop_covers: Vec<DomainCover> = Vec::new();
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     walk_annex_b_streaming(annex_b, opts, |gop_ctx| {
         per_gop_covers.push(gop_ctx.cover);
         Ok(WalkAction::Continue)
@@ -351,7 +351,7 @@ pub fn h264_stego_shadow_decode(
     annex_b: &[u8],
     passphrase: &str,
 ) -> Result<String, StegoError> {
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
     // §6E-A5(d).6 — derive the cascade-safe MvdSuffixLsb mask from
@@ -393,7 +393,7 @@ pub fn h264_stego_smart_decode_video_with_payload(
     annex_b: &[u8],
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
-    let opts = WalkOptions { record_mvd: true };
+    let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
 

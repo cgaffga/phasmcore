@@ -305,6 +305,25 @@ pub trait PositionLogger: Send {
 
     /// Drained at end of GOP for Pass 2 STC planning.
     fn capacity(&self) -> GopCapacity;
+
+    /// Phase C.3.6.1 (task #428) — register a position together with
+    /// the RBSP bit offset of the bypass-coded bin about to be
+    /// decoded, plus the NAL index containing that bin. Default impl
+    /// forwards to `register`, ignoring the offset — preserves
+    /// behavior for loggers that don't care (encoder side, trace
+    /// recorders, capacity counters).
+    ///
+    /// The walker side (bin_decoder) overrides this to capture
+    /// offsets needed by Option C bitstream-mod stego on the
+    /// OpenH264 backend.
+    fn register_with_offset(
+        &mut self,
+        key: PositionKey,
+        _rbsp_bit_offset: u64,
+        _nal_idx: u32,
+    ) -> bool {
+        self.register(key)
+    }
 }
 
 /// Pass 3 hook (entropy with injection). Encoder asks whether to

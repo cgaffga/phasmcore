@@ -57,6 +57,14 @@ pub mod stego;
 #[cfg(feature = "openh264-backend")]
 pub mod openh264;
 
+/// Phase C.8.13 — production stego orchestrator on top of the OpenH264
+/// backend. Single-domain (CoeffSign) STC encode + brute-force decode
+/// over walker-aligned cover, with passphrase-derived seeds. Relies on
+/// the C.8.3-11 dual-recon cascade-break to keep mode-decision stable
+/// across baseline ↔ stego encodes.
+#[cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+pub mod openh264_stego;
+
 use std::fmt;
 
 /// H.264/AVC parsing error.

@@ -2585,7 +2585,7 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files<'a>(
             yuv, width, height, n_frames, frame_size, quality, pattern,
             &combined_plan_prov, &per_gop_counts,
         )?;
-        let walk_opts = WalkOptions { record_mvd: true };
+        let walk_opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk_prov = walk_annex_b_for_cover_with_options(&bytes_prov, walk_opts)
             .map_err(|e| StegoError::InvalidVideo(format!("provisional walk: {e}")))?;
         // §6E-A5(d).6 — derive safe MvdSuffixLsb mask from the
@@ -2839,7 +2839,7 @@ pub fn h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files<'a>(
         // ── Verify: walk emitted bytes → 4-domain cover. Each
         //     shadow extracts independently with its own passphrase;
         //     ALL shadows must succeed for cascade to terminate. ──
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
             .map_err(|e| StegoError::InvalidVideo(format!("verify walk: {e}")))?;
         // §6E-A5(d).6 — encoder verify must use the same safe-mask
@@ -4124,7 +4124,7 @@ mod pass1b_streaming_diag {
             stream_bytes.len(),
         );
 
-        let walk_opts = WalkOptions { record_mvd: true };
+        let walk_opts = WalkOptions { record_mvd: true, record_offsets: false };
         let in_mem_walk =
             walk_annex_b_for_cover_with_options(&in_mem_bytes, walk_opts)
                 .expect("walk in-mem");

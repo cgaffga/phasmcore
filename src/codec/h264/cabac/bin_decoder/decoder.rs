@@ -71,6 +71,15 @@ impl<'a> CabacDecoder<'a> {
     pub fn bin_count(&self) -> u32 {
         self.engine.bin_count()
     }
+
+    /// RBSP bit offset of the next raw bit. See
+    /// [`CabacDecodeEngine::next_rbsp_bit_offset`]. Phase C.3.6.1
+    /// (task #428) — used by Option C bitstream-mod stego to capture
+    /// the position of each bypass-coded stego bin.
+    #[inline]
+    pub fn next_rbsp_bit_offset(&self) -> u64 {
+        self.engine.next_rbsp_bit_offset()
+    }
 }
 
 #[cfg(test)]

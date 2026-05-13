@@ -62,7 +62,7 @@ pub fn pass3_emit_provisional(
         yuv, width, height, n_frames, gop_size,
         primary_message, primary_passphrase,
     )?;
-    let walk_opts = WalkOptions { record_mvd: true };
+    let walk_opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(&bytes, walk_opts)
         .map_err(|e| StegoError::InvalidVideo(format!("provisional walk: {e}")))?;
     Ok((bytes, walk.cover))

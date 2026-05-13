@@ -108,6 +108,34 @@ impl<'a> CabacDecodeEngine<'a> {
         self.byte_idx + (if self.bit_ptr > 0 { 1 } else { 0 })
     }
 
+    /// Bit offset of the NEXT raw bit the engine will consume,
+    /// measured from the start of the engine's input buffer
+    /// (`byte_idx * 8 + bit_ptr`). For bypass-coded bins this is the
+    /// position the next `decode_bypass()` call will read. For
+    /// regular-coded bins the relationship to bin index is more
+    /// complex (arithmetic coding may consume 0 or many raw bits per
+    /// bin), so this is meaningful for **bypass-bin position capture**
+    /// only.
+    ///
+    /// **Coordinate space**: the engine sees the slice's CABAC byte
+    /// stream — i.e. `&nal.rbsp[cabac_byte_off..]` where
+    /// `cabac_byte_off = cabac_data_byte_offset(slice_header.
+    /// data_bit_offset)`. The returned offset is **engine-local**,
+    /// NOT NAL-RBSP-absolute. Consumers that need the absolute
+    /// position within `nal.rbsp` must add `cabac_byte_off * 8`; the
+    /// streaming walker passes that base alongside `nal_idx` on each
+    /// emit so downstream code (e.g. Option C bitstream-mod splicer
+    /// in C.3.6.3) can compose the two.
+    ///
+    /// Phase C.3.6.1 (task #428) — used by Option C bitstream-mod
+    /// stego: the walker captures this offset alongside each
+    /// stego-relevant bypass bin so a later post-encode pass can
+    /// locate + flip that bit in the encoded stream.
+    #[inline]
+    pub fn next_rbsp_bit_offset(&self) -> u64 {
+        (self.byte_idx as u64) * 8 + (self.bit_ptr as u64)
+    }
+
     /// Decode one regular (context-coded) bin. Spec § 9.3.3.2.1
     /// (Figure 9-6). Updates `ctx` per `transIdxLPS` / `transIdxMPS`.
     #[inline]

@@ -31,6 +31,7 @@
 //! § A3 for scope rationale and § 12 ("6D.2 — slice boundary handling")
 //! for the single-slice constraint that this decoder honours.
 
+pub mod bitstream_mod;
 pub mod decoder;
 pub mod engine;
 pub mod positions;
@@ -39,7 +40,14 @@ pub mod syntax;
 
 pub use decoder::CabacDecoder;
 pub use engine::{CabacDecodeEngine, DecodeError};
-pub use positions::PositionRecorder;
+pub use positions::{
+    DomainOffsets, OffsetCapturingLogger, PositionOffset, PositionRecorder,
+};
+pub use bitstream_mod::{
+    cabac_data_byte_offset, locate_nal_units_annexb, repack_emulation_prevention,
+    strip_emulation_prevention, strip_emulation_prevention_with_map,
+    EmulationPrevByteMap, LocateError, NalLocation,
+};
 pub use slice::{
     walk_annex_b_for_cover, walk_annex_b_for_cover_with_options,
     walk_nalus_for_cover, walk_nalus_for_cover_with_options,

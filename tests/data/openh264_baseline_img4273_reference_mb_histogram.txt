@@ -1,0 +1,45 @@
+# H.264 mb-partition histogram
+# source: /tmp/openh264_baseline_img4273.h264
+# resolution: 1920x1072 (8040 MBs/frame)
+
+## I-frame (1 frames, 8040 MBs)
+  no-MV (Skip / Direct / Intra) :       8040 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+  encoder mb_type (over 16080 MBs) [ffmpeg-debug ground truth]:
+        Intra_4x4 :     3554 ( 22.10%)
+      Intra_16x16 :    12526 ( 77.90%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :        0 (  0.00%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :    16080 (100.00%)
+  QP distribution: mean=26.00 min=26 max=26 (over 16080 MBs)
+    QP 22-26 :    16080 (100.00%)
+
+## P-frame (9 frames, 72360 MBs)
+  no-MV (Skip / Direct / Intra) :      11752 (16.24%)
+  emitted MVs                   :      60608 (83.76%)
+  partition shapes (over 63112 MV records):
+      16x16 :    59192 ( 93.79%)
+        8x8 :     2016 (  3.19%)
+       8x16 :     1110 (  1.76%)
+       16x8 :      794 (  1.26%)
+  direction (over 63112 MV-anchors) [decoder-synthesized]:
+         L0 :    63112 (100.00%)
+  encoder mb_type (over 120600 MBs) [ffmpeg-debug ground truth]:
+             Skip :    83993 ( 69.65%)
+        Intra_4x4 :      293 (  0.24%)
+      Intra_16x16 :    18207 ( 15.10%)
+        Inter_fwd :    18107 ( 15.01%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :    83993 ( 69.65%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :    18500 ( 15.34%)
+  QP distribution: mean=26.00 min=26 max=26 (over 120600 MBs)
+    QP 22-26 :   120600 (100.00%)
+  MVD |Δ|∞ (over 63112 MV records, pel units):
+          0 :    26485 ( 41.97%)
+        1-2 :    26237 ( 41.57%)
+        3-7 :     9119 ( 14.45%)
+       8-15 :     1201 (  1.90%)
+      16-31 :       62 (  0.10%)
+        32+ :        8 (  0.01%)

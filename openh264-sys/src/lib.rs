@@ -27,11 +27,15 @@ use core::ffi::c_void;
 /// ABI version this header was compiled against. Matches the value
 /// returned by `WelsStegoAbiVersion()` on a current build of the fork.
 ///
-/// 1.1.0 (Phase A.5(j)) wires `md_cost_capture` in the encoder. The
+/// 1.2.0 (Phase C.8.2) adds the `dual_recon_observe` callback that
+/// fires from the internal `phasm_dual_recon_writeback` helper once
+/// it commits clean pixels to pDecPic and stego pixels to
+/// pVisualRecPic. Used by cascade-verify + PSNR tests + visual debug.
+/// 1.1.0 (Phase A.5(j)) wired `md_cost_capture` in the encoder. The
 /// callback fires once per MB after mode decision finalizes, carrying
 /// a `PHASM_MB_TYPE_*` classification byte the consumer uses to filter
 /// pre-emit fires by `block_cat` ↔ `mb_type` consistency.
-pub const PHASM_STEGO_ABI_VERSION: u32 = 0x0001_0100;
+pub const PHASM_STEGO_ABI_VERSION: u32 = 0x0001_0200;
 
 /// PhasmStegoMdCost::mb_type classifications. Match the C
 /// `PHASM_MB_TYPE_*` defines in `wels_stego.h`. Each value names the
@@ -388,6 +392,32 @@ pub type PhasmStegoDecPostReadFn =
 pub type PhasmStegoMdCostFn =
     Option<unsafe extern "C" fn(cost: *const PhasmStegoMdCost, user_data: *mut c_void)>;
 
+/// Dual-recon observation callback (ABI 1.2.0+). Fires from the
+/// internal `phasm_dual_recon_writeback` helper after both clean and
+/// stego pixel blocks have been committed to their respective recon
+/// pictures (pDecPic + pVisualRecPic). Pure observation; no return.
+///
+/// The `clean_pixels` and `stego_pixels` pointers are valid for the
+/// duration of the callback only; copy if needed beyond.
+/// `src_stride` is the byte distance between consecutive rows of both
+/// source blocks (typically equals `block_w`).
+pub type PhasmStegoDualReconFn = Option<
+    unsafe extern "C" fn(
+        frame_num: u32,
+        mb_x: u16,
+        mb_y: u16,
+        plane: u8,
+        pixel_x: i32,
+        pixel_y: i32,
+        block_w: i32,
+        block_h: i32,
+        clean_pixels: *const u8,
+        stego_pixels: *const u8,
+        src_stride: i32,
+        user_data: *mut c_void,
+    ),
+>;
+
 // ---------------------------------------------------------------------
 // 7. Callback table
 //
@@ -403,6 +433,7 @@ pub struct PhasmStegoCallbacks {
     pub enc_pre_emit: PhasmStegoEncPreEmitFn,
     pub dec_post_read: PhasmStegoDecPostReadFn,
     pub md_cost_capture: PhasmStegoMdCostFn,
+    pub dual_recon_observe: PhasmStegoDualReconFn,
 }
 
 impl Default for PhasmStegoCallbacks {
@@ -412,6 +443,7 @@ impl Default for PhasmStegoCallbacks {
             enc_pre_emit: None,
             dec_post_read: None,
             md_cost_capture: None,
+            dual_recon_observe: None,
         }
     }
 }
@@ -655,6 +687,7 @@ mod tests {
         assert!(cbs.enc_pre_emit.is_none());
         assert!(cbs.dec_post_read.is_none());
         assert!(cbs.md_cost_capture.is_none());
+        assert!(cbs.dual_recon_observe.is_none());
     }
 
     #[test]

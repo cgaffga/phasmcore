@@ -33,6 +33,110 @@ use crate::codec::h264::stego::{
     Axis, BinKind, DomainCover, MvdSlot, ResidualPathKind,
 };
 use crate::codec::h264::stego::encoder_hook::MvdPositionMeta;
+use crate::codec::h264::stego::hook::{
+    EmbedDomain, GopCapacity, PositionKey, PositionLogger,
+};
+
+/// Phase C.3.6.1 (task #428) — RBSP bit offset + NAL index of a
+/// single bypass-coded bin. Captured by the walker before the bin is
+/// read, so a downstream caller can re-locate the exact byte+bit in
+/// the original (post-emulation-prevention-strip) RBSP. The Option C
+/// bitstream-mod stego splicer uses this to flip selected cover bits
+/// directly in the encoded Annex-B stream without re-encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PositionOffset {
+    /// RBSP bit position of the bypass-coded bin, measured from the
+    /// start of the NAL's RBSP (i.e. after the leading NAL header
+    /// byte is consumed and emulation-prevention triplets `0x000003`
+    /// have been stripped to `0x0000`).
+    pub rbsp_bit: u64,
+    /// Zero-based index into the input NALU sequence identifying
+    /// which slice NAL contains this bypass bin.
+    pub nal_idx: u32,
+}
+
+/// Phase C.3.6.1 — four parallel vectors of `PositionOffset`, one per
+/// stego domain, populated 1:1 with each domain's cover-bit vector in
+/// `DomainCover` when `WalkOptions::record_offsets` is set.
+///
+/// **Index alignment**: `offsets.coeff_sign_bypass[i]` is the byte+bit
+/// offset of `cover.coeff_sign_bypass.bits[i]`. The walker guarantees
+/// this by capturing offsets at the same syntax sites that the
+/// encoder's `PositionLoggerHook` + decoder's `enumerate_*_positions`
+/// derive cover bits from, in the same scan order.
+#[derive(Default, Debug, Clone)]
+pub struct DomainOffsets {
+    pub coeff_sign_bypass: Vec<PositionOffset>,
+    pub coeff_suffix_lsb: Vec<PositionOffset>,
+    pub mvd_sign_bypass: Vec<PositionOffset>,
+    pub mvd_suffix_lsb: Vec<PositionOffset>,
+}
+
+impl DomainOffsets {
+    pub fn total_len(&self) -> usize {
+        self.coeff_sign_bypass.len()
+            + self.coeff_suffix_lsb.len()
+            + self.mvd_sign_bypass.len()
+            + self.mvd_suffix_lsb.len()
+    }
+}
+
+/// Phase C.3.6.1 — `PositionLogger` impl that captures
+/// `(rbsp_bit_offset, nal_idx)` per domain into a `DomainOffsets`.
+/// Plugged into the 5 inner `PositionCtx` construction sites in the
+/// walker when `WalkOptions::record_offsets` is set; otherwise those
+/// sites use `NullLogger` and pay no per-bin cost.
+///
+/// Capacity tracking is not relevant here — the recorder's per-domain
+/// `cover` vectors already track length. `capacity()` returns the
+/// running per-domain offset count for diagnostic parity.
+#[derive(Default, Debug)]
+pub struct OffsetCapturingLogger {
+    pub offsets: DomainOffsets,
+}
+
+impl OffsetCapturingLogger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl PositionLogger for OffsetCapturingLogger {
+    #[inline]
+    fn register(&mut self, _key: PositionKey) -> bool {
+        // The walker-side recorder derives positions from enumerate_*
+        // post-decode, so the trait's register() is a no-op here — the
+        // log of cover bits is on `PositionRecorder`, not on us.
+        true
+    }
+
+    #[inline]
+    fn capacity(&self) -> GopCapacity {
+        GopCapacity {
+            coeff_sign_bypass: self.offsets.coeff_sign_bypass.len(),
+            coeff_suffix_lsb: self.offsets.coeff_suffix_lsb.len(),
+            mvd_sign_bypass: self.offsets.mvd_sign_bypass.len(),
+            mvd_suffix_lsb: self.offsets.mvd_suffix_lsb.len(),
+        }
+    }
+
+    #[inline]
+    fn register_with_offset(
+        &mut self,
+        key: PositionKey,
+        rbsp_bit_offset: u64,
+        nal_idx: u32,
+    ) -> bool {
+        let off = PositionOffset { rbsp_bit: rbsp_bit_offset, nal_idx };
+        match key.domain() {
+            EmbedDomain::CoeffSignBypass => self.offsets.coeff_sign_bypass.push(off),
+            EmbedDomain::CoeffSuffixLsb => self.offsets.coeff_suffix_lsb.push(off),
+            EmbedDomain::MvdSignBypass => self.offsets.mvd_sign_bypass.push(off),
+            EmbedDomain::MvdSuffixLsb => self.offsets.mvd_suffix_lsb.push(off),
+        }
+        true
+    }
+}
 
 /// Decode-side recorder. Mirrors `stego::PositionLoggerHook`
 /// but takes immutable inputs (decoded coefficients aren't mutated)
@@ -51,11 +155,36 @@ pub struct PositionRecorder {
     /// `PositionLoggerHook::mvd_meta`. Drained via `take_mvd_meta()`
     /// for the cascade-safety analysis at decode time.
     mvd_meta: Vec<MvdPositionMeta>,
+    /// Phase C.3.6.1 (task #428) — opt-in capture of RBSP bit
+    /// offsets, one entry per cover bit per domain. `None` keeps the
+    /// walker on the zero-cost NullLogger fast path; `Some(_)`
+    /// activates per-bin offset push at the 5 inner production sites
+    /// in slice.rs. Toggled by `WalkOptions::record_offsets` in the
+    /// top-level walker entry points.
+    pub offset_logger: Option<OffsetCapturingLogger>,
 }
 
 impl PositionRecorder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Phase C.3.6.1 — construct a recorder that captures RBSP bit
+    /// offsets in addition to cover bits. Equivalent to
+    /// `let mut r = PositionRecorder::new(); r.enable_offset_capture();`.
+    pub fn with_offsets() -> Self {
+        Self {
+            offset_logger: Some(OffsetCapturingLogger::new()),
+            ..Self::default()
+        }
+    }
+
+    /// Phase C.3.6.1 — opt-in to offset capture mid-stream. Idempotent
+    /// when capture is already enabled.
+    pub fn enable_offset_capture(&mut self) {
+        if self.offset_logger.is_none() {
+            self.offset_logger = Some(OffsetCapturingLogger::new());
+        }
     }
 
     /// Consume the recorder and return the accumulated cover.
@@ -76,6 +205,13 @@ impl PositionRecorder {
     /// `take_cover().mvd_sign_bypass.positions`.
     pub fn take_mvd_meta(&mut self) -> Vec<MvdPositionMeta> {
         std::mem::take(&mut self.mvd_meta)
+    }
+
+    /// Phase C.3.6.1 — drain captured offsets. Returns `None` if
+    /// offset capture was never enabled on this recorder; returns
+    /// `Some(empty)` if enabled but no bypass bins were emitted.
+    pub fn take_offsets(&mut self) -> Option<DomainOffsets> {
+        self.offset_logger.as_mut().map(|ol| std::mem::take(&mut ol.offsets))
     }
 
     /// Record a residual block's bypass-bin positions + bits across

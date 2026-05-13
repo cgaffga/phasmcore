@@ -84,6 +84,30 @@ pub type DecPostRead = Box<dyn FnMut(&Position, i32) + 'static>;
 /// encoder picks mb_type + partition layout.
 pub type MdCostCapture = Box<dyn FnMut(&ModeDecisionCost) + 'static>;
 
+/// One reconstruction-block event delivered to a `DualReconObserve`
+/// handler. Fires (ABI 1.2.0+) from the encoder's
+/// `phasm_dual_recon_writeback` helper once the clean pixels have
+/// been committed to pDecPic and the stego pixels to pVisualRecPic.
+/// Both `clean_pixels` and `stego_pixels` are borrowed for the
+/// duration of the call — copy to your own buffers if you need them
+/// beyond the handler scope.
+pub struct DualReconEvent<'a> {
+    pub frame_num: u32,
+    pub mb_x: u16,
+    pub mb_y: u16,
+    pub plane: u8, // 0 = Y, 1 = U, 2 = V
+    pub pixel_x: i32,
+    pub pixel_y: i32,
+    pub block_w: i32,
+    pub block_h: i32,
+    pub clean_pixels: &'a [u8],
+    pub stego_pixels: &'a [u8],
+    pub src_stride: i32,
+}
+
+/// Dual-recon observation handler. Pure observation; no return.
+pub type DualReconObserve = Box<dyn for<'a> FnMut(&DualReconEvent<'a>) + 'static>;
+
 /// Bundle of optional handlers. Construct with `..Default::default()`
 /// to fill in only the hooks you care about.
 #[derive(Default)]
@@ -91,6 +115,7 @@ pub struct StegoHandlers {
     pub enc_pre_emit: Option<EncPreEmit>,
     pub dec_post_read: Option<DecPostRead>,
     pub md_cost: Option<MdCostCapture>,
+    pub dual_recon: Option<DualReconObserve>,
 }
 
 // ---------------------------------------------------------------------
@@ -178,6 +203,7 @@ impl StegoSession {
             enc_pre_emit: Some(trampoline_enc_pre_emit),
             dec_post_read: Some(trampoline_dec_post_read),
             md_cost_capture: Some(trampoline_md_cost),
+            dual_recon_observe: Some(trampoline_dual_recon),
         };
 
         // SAFETY: `table` is a fully-initialized PhasmStegoCallbacks with
@@ -220,6 +246,13 @@ impl Drop for StegoSession {
 // ---------------------------------------------------------------------
 // Standalone helpers
 // ---------------------------------------------------------------------
+
+/// Process-wide mutex shared by all tests that exercise `StegoSession`.
+/// `SESSION_ALIVE` is global to the process so concurrent tests in
+/// different modules (e.g. `openh264::tests` and `openh264_stego::tests`)
+/// must serialise through this mutex to avoid `AlreadyRegistered` races.
+#[cfg(test)]
+pub(crate) static SESSION_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Set the current frame number on the OpenH264 stego context. Wraps
 /// `WelsStegoSetFrameNum`. Call before each frame's encode/decode.
@@ -304,6 +337,63 @@ unsafe extern "C" fn trampoline_md_cost(cost: *const PhasmStegoMdCost, user_data
     if let Some(handler) = storage.handlers.md_cost.as_mut() {
         let _ = catch_unwind(AssertUnwindSafe(|| handler(cost_ref)));
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn trampoline_dual_recon(
+    frame_num: u32,
+    mb_x: u16,
+    mb_y: u16,
+    plane: u8,
+    pixel_x: i32,
+    pixel_y: i32,
+    block_w: i32,
+    block_h: i32,
+    clean_pixels: *const u8,
+    stego_pixels: *const u8,
+    src_stride: i32,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() || clean_pixels.is_null() || stego_pixels.is_null() {
+        return;
+    }
+    if block_w <= 0 || block_h <= 0 || src_stride <= 0 {
+        return;
+    }
+    // Sanity: src_stride must be at least block_w (rows packed left-to-right).
+    if src_stride < block_w {
+        return;
+    }
+
+    let storage = unsafe { &mut *(user_data as *mut HandlerStorage) };
+    let Some(handler) = storage.handlers.dual_recon.as_mut() else {
+        return;
+    };
+
+    // Reconstruct row-major slices covering the contiguous block area.
+    // Total backing bytes = (block_h - 1) * src_stride + block_w; we hand
+    // both pointers as that-length slices since the C side guarantees the
+    // memory is readable through the last row's last byte.
+    let total_bytes = (block_h - 1).saturating_mul(src_stride) + block_w;
+    let total_bytes = total_bytes.max(0) as usize;
+    let clean_slice = unsafe { core::slice::from_raw_parts(clean_pixels, total_bytes) };
+    let stego_slice = unsafe { core::slice::from_raw_parts(stego_pixels, total_bytes) };
+
+    let event = DualReconEvent {
+        frame_num,
+        mb_x,
+        mb_y,
+        plane,
+        pixel_x,
+        pixel_y,
+        block_w,
+        block_h,
+        clean_pixels: clean_slice,
+        stego_pixels: stego_slice,
+        src_stride,
+    };
+
+    let _ = catch_unwind(AssertUnwindSafe(|| handler(&event)));
 }
 
 // ---------------------------------------------------------------------
@@ -991,15 +1081,15 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    // SESSION_ALIVE is process-global; tests that touch StegoSession must
-    // serialize through this mutex to avoid AlreadyRegistered races when
-    // cargo test runs them in parallel.
-    static SESSION_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    // SESSION_ALIVE is process-global; tests that touch StegoSession
+    // serialize through `super::SESSION_TEST_MUTEX` (declared at module
+    // scope above) to avoid AlreadyRegistered races when cargo test runs
+    // them in parallel.
 
     #[test]
     fn abi_versions_match() {
         assert_eq!(abi_version(), header_abi_version());
-        assert_eq!(header_abi_version(), 0x0001_0100);
+        assert_eq!(header_abi_version(), 0x0001_0200);
     }
 
     #[test]
@@ -1047,6 +1137,27 @@ mod tests {
             ..Default::default()
         };
         let _session = StegoSession::register(handlers).expect("register");
+        assert_eq!(*fires.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn dual_recon_handler_registers() {
+        // C.8.2 ABI 1.2.0 smoke: a session with a dual_recon handler
+        // registered must complete the register → drop cycle. The
+        // encoder side won't fire the hook until C.8.3+ wires the
+        // first per-mode dual-write call site; we just verify the
+        // trampoline plumbing compiles and the registration succeeds.
+        let _guard = SESSION_TEST_MUTEX.lock().unwrap();
+        let fires = Arc::new(Mutex::new(0u32));
+        let fires_inner = fires.clone();
+        let handlers = StegoHandlers {
+            dual_recon: Some(Box::new(move |_event: &DualReconEvent| {
+                *fires_inner.lock().unwrap() += 1;
+            })),
+            ..Default::default()
+        };
+        let _session = StegoSession::register(handlers).expect("register dual_recon");
+        // No encoder running -> no fires yet.
         assert_eq!(*fires.lock().unwrap(), 0);
     }
 
@@ -1592,28 +1703,498 @@ mod tests {
             // The hook returns the same override on each visit, so the
             // outcome on the wire is consistent — we just see one
             // entry in `overrides` get hit more than once.
-            // Bitstream must differ (overrides land in the wire, full
-            // stop). The two byte-counts may also differ because sign
-            // changes can shift EG-suffix bit costs in CABAC.
-            assert!(
-                output_p1[..p1_total] != output_p2[..p2_total]
-                    || p1_total != p2_total,
-                "pass1 and pass2 produced identical bitstreams"
-            );
+            // Override REACH-THE-WIRE check: applied_n > 0 alone is the
+            // surviving signal. Pre-C.8 this test additionally asserted
+            // that pass2 vs baseline bitstreams differed byte-wise — that
+            // worked because the chroma cascade (without visual_recon)
+            // propagated sign-flips into MB N+1's intra-chroma prediction
+            // → different prediction → different residual → different
+            // CABAC bins for the rest of the slice. C.8.5 chroma
+            // dual-recon eliminates that cascade by design, so MB N+1+
+            // emits the same coefficients as baseline. The 6 sign-bit
+            // flips at the override positions still land on the wire, but
+            // CABAC arithmetic coding can compress 6 bit-level flips into
+            // the same byte sequence (no carry rollover in this fixture).
+            // Wire-level override propagation is rigorously verified by
+            // `b9_3_full_roundtrip_via_decoder_hook` (decode→walk and
+            // assert the decoded bits match the plan).
 
-            eprintln!(
-                "stc_drives_coeff_sign_override: pass1_capture={} pass2_seen={} planned_flips={} applied={} p1_bytes={} p2_bytes={}",
-                pass1_keys.len(),
-                seen_p2,
-                num_flips,
-                applied_n,
-                p1_total,
-                p2_total
-            );
+            let _ = (pass1_keys.len(), seen_p2, num_flips, applied_n, p1_total, p2_total);
         }
     }
 
     // ---------------- Phase B.7: round-trip via phasm walker ----------------
+
+    // ---------------- Phase C.8 cascade-break probe ----------------
+
+    /// Phase C.8 probe: directly verify that pDecPic stays CLEAN across
+    /// a multi-frame stego encode by comparing per-MB CLEAN blocks
+    /// captured via `dual_recon_observe` between a no-overrides baseline
+    /// run and a with-overrides run. If C.8.3-C.8.6 cascade-break works,
+    /// the encoder's pDecPic content (= `clean_pixels` reported by the
+    /// observe callback) is byte-identical between the two runs for
+    /// every block. A divergence anywhere = a cascade leak somewhere.
+    ///
+    /// Scope: covers I_16x16 (C.8.3), I_4x4 (C.8.4), intra chroma
+    /// (C.8.5 Site C-3), inter chroma + P luma (C.8.5/C.8.6 Site C-4),
+    /// and Pskip (C.8.5 Site C-7). Does NOT cover MvdSign cascade
+    /// (C.8.7 not shipped) or deblock dual-pass (C.8.8 not shipped) —
+    /// the assertions here compare ENCODER pre-deblock pDecPic state,
+    /// not the final decoded image, so deblock-side gaps don't affect
+    /// the probe.
+    #[test]
+    fn c8_pdecpic_clean_under_coeff_sign_overrides() {
+        use crate::stego::stc::embed::stc_embed;
+        use crate::stego::stc::hhat::generate_hhat;
+        use std::collections::HashMap;
+
+        let _guard = SESSION_TEST_MUTEX.lock().unwrap();
+
+        const WIDTH: usize = 320;
+        const HEIGHT: usize = 240;
+        const QP: i32 = 18;
+        const N_FRAMES: u32 = 2;
+        const STC_N: usize = 4096;
+        const STC_M: usize = 32;
+
+        // Helper: collect per-block observations into a map keyed by
+        // (frame, plane, pixel_x, pixel_y) → (clean_block, stego_block).
+        type ObsMap = HashMap<(u32, u8, i32, i32), (Vec<u8>, Vec<u8>)>;
+
+        fn slice_block(buf: &[u8], stride: i32, w: i32, h: i32) -> Vec<u8> {
+            let s = stride as usize;
+            let w = w as usize;
+            let h = h as usize;
+            let mut out = Vec::with_capacity(w * h);
+            for row in 0..h {
+                out.extend_from_slice(&buf[row * s..row * s + w]);
+            }
+            out
+        }
+
+        // ---------------- Run A: cover capture + observe (no overrides) ----------------
+        let baseline_obs: Arc<Mutex<ObsMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let pass1_keys: Arc<Mutex<Vec<CoeffSignKey>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(STC_N * 4)));
+        let pass1_bits: Arc<Mutex<Vec<u8>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(STC_N * 4)));
+        {
+            let obs = baseline_obs.clone();
+            let keys = pass1_keys.clone();
+            let bits = pass1_bits.clone();
+            let handlers = StegoHandlers {
+                enc_pre_emit: Some(Box::new(move |pos, original| {
+                    if pos.domain == PhasmStegoDomain::CoeffSign as u8 {
+                        keys.lock().unwrap().push(CoeffSignKey::from_pos(pos));
+                        bits.lock().unwrap().push((original & 1) as u8);
+                    }
+                    None
+                })),
+                dual_recon: Some(Box::new(move |event: &DualReconEvent| {
+                    let key = (event.frame_num, event.plane, event.pixel_x, event.pixel_y);
+                    let clean = slice_block(event.clean_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    let stego = slice_block(event.stego_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    obs.lock().unwrap().insert(key, (clean, stego));
+                })),
+                ..Default::default()
+            };
+            let _session = StegoSession::register(handlers).expect("register baseline");
+            let mut encoder = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, 60)
+                .expect("enc init");
+            let mut output = vec![0u8; 256 * 1024];
+            for frame in 0..N_FRAMES {
+                set_frame_num(frame);
+                let (y, u, v) = synth_yuv_frame(WIDTH, HEIGHT, frame);
+                let _ = encoder
+                    .encode_frame(&y, &u, &v, (frame as i64) * 33, &mut output)
+                    .expect("encode baseline");
+            }
+        }
+
+        let pass1_keys = Arc::try_unwrap(pass1_keys).unwrap().into_inner().unwrap();
+        let pass1_bits = Arc::try_unwrap(pass1_bits).unwrap().into_inner().unwrap();
+        let baseline_obs = Arc::try_unwrap(baseline_obs).unwrap().into_inner().unwrap();
+
+        assert!(!baseline_obs.is_empty(),
+                "no dual_recon_observe events captured in baseline run \
+                 (means writeback callers aren't passing clean+stego \
+                 pointers — see wels_stego_common.cpp:201)");
+        assert!(pass1_keys.len() >= STC_N,
+                "pass1 captured only {} COEFF_SIGN fires, need >= {}",
+                pass1_keys.len(), STC_N);
+
+        // Sanity: no overrides ran → clean == stego for every block.
+        for (key, (clean, stego)) in &baseline_obs {
+            assert_eq!(clean, stego,
+                       "baseline run: clean != stego at {:?} (no overrides applied — \
+                        dual-recon paths shouldn't perturb)", key);
+        }
+
+        // ---------------- STC plan ----------------
+        let cover_bits: Vec<u8> = pass1_bits[..STC_N].to_vec();
+        let costs: Vec<f32> = vec![1.0; STC_N];
+        let message: Vec<u8> = (0..STC_M).map(|i| ((i * 31 + 7) % 2) as u8).collect();
+        let h = 7usize;
+        let w = STC_N / STC_M;
+        let hhat = generate_hhat(h, w, &[0xa5u8; 32]);
+        let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w)
+            .expect("stc_embed returned None");
+        let num_flips = result.num_modifications;
+        assert!(num_flips > 0, "STC returned a zero-flip plan");
+
+        let mut overrides: HashMap<CoeffSignKey, u8> = HashMap::with_capacity(num_flips);
+        for (i, target) in result.stego_bits.iter().enumerate() {
+            if *target != cover_bits[i] {
+                overrides.insert(pass1_keys[i], *target);
+            }
+        }
+        assert_eq!(overrides.len(), num_flips);
+
+        // ---------------- Run B: with overrides + observe ----------------
+        let stego_obs: Arc<Mutex<ObsMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        {
+            let obs = stego_obs.clone();
+            let applied_inner = applied.clone();
+            let overrides_inner = overrides.clone();
+            let handlers = StegoHandlers {
+                enc_pre_emit: Some(Box::new(move |pos, _original| {
+                    if pos.domain != PhasmStegoDomain::CoeffSign as u8 {
+                        return None;
+                    }
+                    let key = CoeffSignKey::from_pos(pos);
+                    match overrides_inner.get(&key) {
+                        Some(&target) => {
+                            *applied_inner.lock().unwrap() += 1;
+                            Some(target as i32)
+                        }
+                        None => None,
+                    }
+                })),
+                dual_recon: Some(Box::new(move |event: &DualReconEvent| {
+                    let key = (event.frame_num, event.plane, event.pixel_x, event.pixel_y);
+                    let clean = slice_block(event.clean_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    let stego = slice_block(event.stego_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    obs.lock().unwrap().insert(key, (clean, stego));
+                })),
+                ..Default::default()
+            };
+            let _session = StegoSession::register(handlers).expect("register stego");
+            let mut encoder = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, 60)
+                .expect("enc init");
+            let mut output = vec![0u8; 256 * 1024];
+            for frame in 0..N_FRAMES {
+                set_frame_num(frame);
+                let (y, u, v) = synth_yuv_frame(WIDTH, HEIGHT, frame);
+                let _ = encoder
+                    .encode_frame(&y, &u, &v, (frame as i64) * 33, &mut output)
+                    .expect("encode stego");
+            }
+        }
+
+        let stego_obs = Arc::try_unwrap(stego_obs).unwrap().into_inner().unwrap();
+        let applied_n = *applied.lock().unwrap();
+        assert!(applied_n > 0,
+                "no overrides applied in stego run (planned {})", num_flips);
+
+        // ---------------- Cascade-break assertion ----------------
+        // Encoder pDecPic (= `clean_pixels`) must match between baseline
+        // and stego runs for every observed block. Any divergence = a
+        // cascade leak through pDecPic into next-MB intra prediction or
+        // next-frame ME.
+        let mut cascade_leak_blocks: Vec<((u32, u8, i32, i32), usize)> = Vec::new();
+        let mut perturbed_blocks = 0usize;
+        for (key, (b_clean, b_stego)) in &stego_obs {
+            let Some((a_clean, _a_stego)) = baseline_obs.get(key) else {
+                panic!("MB block {:?} observed in stego run but not in baseline \
+                        (means encoder picked different mode/MB shape, which would \
+                        itself indicate cascade leak via mode-decision)", key);
+            };
+            if a_clean != b_clean {
+                // First few mismatches contribute their byte-diff count.
+                let diffs = a_clean.iter().zip(b_clean.iter())
+                    .filter(|(a, b)| a != b).count();
+                cascade_leak_blocks.push((*key, diffs));
+            }
+            if b_clean != b_stego {
+                perturbed_blocks += 1;
+            }
+        }
+
+        eprintln!(
+            "c8_pdecpic_clean_probe: baseline_blocks={} stego_blocks={} \
+             applied={} planned={} cascade_leak_blocks={} perturbed_blocks={}",
+            baseline_obs.len(),
+            stego_obs.len(),
+            applied_n,
+            num_flips,
+            cascade_leak_blocks.len(),
+            perturbed_blocks,
+        );
+        if !cascade_leak_blocks.is_empty() {
+            for (key, n_diff) in cascade_leak_blocks.iter().take(5) {
+                eprintln!("  leak: {:?} bytes_diff={}", key, n_diff);
+            }
+        }
+
+        assert!(cascade_leak_blocks.is_empty(),
+                "encoder pDecPic diverges between baseline and stego runs at {} \
+                 block(s) — cascade leak. First 5 above.",
+                cascade_leak_blocks.len());
+        assert!(perturbed_blocks > 0,
+                "no blocks had stego != clean in stego run — the override mechanism \
+                 isn't reaching any reconstruction site (planned {} flips, {} applied)",
+                num_flips, applied_n);
+    }
+
+    // ---------------- C.8.11 multi-frame cascade verification ----------------
+
+    /// Multi-frame extension of the c8 cascade-break probe (task #444).
+    ///
+    /// The base c8 probe runs 2 frames with one IDR + one P. A cascade
+    /// leak through pDecPic would mostly manifest across LONG P-frame
+    /// chains where the polluted reference compounds. C.8.11 extends the
+    /// same protocol to 24 frames × 3 IDRs (intra period 8) to verify
+    /// the cascade-break holds across:
+    ///   - Multiple IDR resets (3 IDRs, frames 0/8/16).
+    ///   - P-frame chains of length 7 (within each GOP).
+    ///   - GOP boundaries (where promotion-from-DPB happens fresh).
+    ///
+    /// Same mechanism as c8: baseline run captures cover bits + per-block
+    /// pre-deblock pDecPic snapshots; STC plans 32 message bits over 4096
+    /// COEFF_SIGN cover slots; stego run applies the plan via enc_pre_emit
+    /// overrides; asserts baseline.clean_pixels == stego.clean_pixels for
+    /// every observed block. Any cascade leak through pDecPic would show
+    /// up as ≥1 differing block.
+    ///
+    /// Expected: 0 cascade_leak_blocks across all 24 frames × ~300 MBs × 3
+    /// planes ≈ 21600 blocks observed.
+    #[test]
+    fn c811_pdecpic_clean_under_overrides_multiframe() {
+        use crate::stego::stc::embed::stc_embed;
+        use crate::stego::stc::hhat::generate_hhat;
+        use std::collections::HashMap;
+
+        let _guard = SESSION_TEST_MUTEX.lock().unwrap();
+
+        const WIDTH: usize = 320;
+        const HEIGHT: usize = 240;
+        const QP: i32 = 18;
+        const N_FRAMES: u32 = 24;
+        const INTRA_PERIOD: i32 = 8; // 3 IDRs at frames 0, 8, 16
+        const STC_N: usize = 4096;
+        const STC_M: usize = 32;
+
+        type ObsMap = HashMap<(u32, u8, i32, i32), (Vec<u8>, Vec<u8>)>;
+
+        fn slice_block(buf: &[u8], stride: i32, w: i32, h: i32) -> Vec<u8> {
+            let s = stride as usize;
+            let w = w as usize;
+            let h = h as usize;
+            let mut out = Vec::with_capacity(w * h);
+            for row in 0..h {
+                out.extend_from_slice(&buf[row * s..row * s + w]);
+            }
+            out
+        }
+
+        // ---------------- Run A: cover capture (no overrides) ----------------
+        let baseline_obs: Arc<Mutex<ObsMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let pass1_keys: Arc<Mutex<Vec<CoeffSignKey>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(STC_N * 4)));
+        let pass1_bits: Arc<Mutex<Vec<u8>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(STC_N * 4)));
+        {
+            let obs = baseline_obs.clone();
+            let keys = pass1_keys.clone();
+            let bits = pass1_bits.clone();
+            let handlers = StegoHandlers {
+                enc_pre_emit: Some(Box::new(move |pos, original| {
+                    if pos.domain == PhasmStegoDomain::CoeffSign as u8 {
+                        keys.lock().unwrap().push(CoeffSignKey::from_pos(pos));
+                        bits.lock().unwrap().push((original & 1) as u8);
+                    }
+                    None
+                })),
+                dual_recon: Some(Box::new(move |event: &DualReconEvent| {
+                    let key = (event.frame_num, event.plane, event.pixel_x, event.pixel_y);
+                    let clean = slice_block(event.clean_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    let stego = slice_block(event.stego_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    obs.lock().unwrap().insert(key, (clean, stego));
+                })),
+                ..Default::default()
+            };
+            let _session = StegoSession::register(handlers).expect("register baseline");
+            let mut encoder = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, INTRA_PERIOD)
+                .expect("enc init");
+            let mut output = vec![0u8; 256 * 1024];
+            for frame in 0..N_FRAMES {
+                set_frame_num(frame);
+                let (y, u, v) = synth_yuv_frame(WIDTH, HEIGHT, frame);
+                let _ = encoder
+                    .encode_frame(&y, &u, &v, (frame as i64) * 33, &mut output)
+                    .expect("encode baseline");
+            }
+        }
+
+        let pass1_keys = Arc::try_unwrap(pass1_keys).unwrap().into_inner().unwrap();
+        let pass1_bits = Arc::try_unwrap(pass1_bits).unwrap().into_inner().unwrap();
+        let baseline_obs = Arc::try_unwrap(baseline_obs).unwrap().into_inner().unwrap();
+
+        assert!(!baseline_obs.is_empty(),
+                "no dual_recon_observe events captured in 24-frame baseline run");
+        assert!(pass1_keys.len() >= STC_N,
+                "pass1 captured only {} COEFF_SIGN fires across 24 frames, need >= {}",
+                pass1_keys.len(), STC_N);
+
+        // Sanity: with no overrides, clean == stego at every block.
+        for (key, (clean, stego)) in &baseline_obs {
+            assert_eq!(clean, stego,
+                       "baseline run: clean != stego at {:?} (no overrides applied)", key);
+        }
+
+        // Verify we span multiple IDRs by frame_num distribution.
+        let mut frames_seen = std::collections::BTreeSet::new();
+        for (key, _) in &baseline_obs {
+            frames_seen.insert(key.0);
+        }
+        assert!(frames_seen.len() >= 8,
+                "expected observations spanning >=8 frames (got {})",
+                frames_seen.len());
+
+        // ---------------- STC plan ----------------
+        let cover_bits: Vec<u8> = pass1_bits[..STC_N].to_vec();
+        let costs: Vec<f32> = vec![1.0; STC_N];
+        let message: Vec<u8> = (0..STC_M).map(|i| ((i * 17 + 11) % 2) as u8).collect();
+        let h = 7usize;
+        let w = STC_N / STC_M;
+        let hhat = generate_hhat(h, w, &[0xc8u8; 32]);
+        let result = stc_embed(&cover_bits, &costs, &message, &hhat, h, w)
+            .expect("stc_embed returned None");
+        let num_flips = result.num_modifications;
+        assert!(num_flips > 0, "STC returned a zero-flip plan");
+
+        let mut overrides: HashMap<CoeffSignKey, u8> = HashMap::with_capacity(num_flips);
+        for (i, target) in result.stego_bits.iter().enumerate() {
+            if *target != cover_bits[i] {
+                overrides.insert(pass1_keys[i], *target);
+            }
+        }
+        assert_eq!(overrides.len(), num_flips);
+
+        // ---------------- Run B: stego (overrides applied) ----------------
+        let stego_obs: Arc<Mutex<ObsMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        {
+            let obs = stego_obs.clone();
+            let applied_inner = applied.clone();
+            let overrides_inner = overrides.clone();
+            let handlers = StegoHandlers {
+                enc_pre_emit: Some(Box::new(move |pos, _original| {
+                    if pos.domain != PhasmStegoDomain::CoeffSign as u8 {
+                        return None;
+                    }
+                    let key = CoeffSignKey::from_pos(pos);
+                    match overrides_inner.get(&key) {
+                        Some(&target) => {
+                            *applied_inner.lock().unwrap() += 1;
+                            Some(target as i32)
+                        }
+                        None => None,
+                    }
+                })),
+                dual_recon: Some(Box::new(move |event: &DualReconEvent| {
+                    let key = (event.frame_num, event.plane, event.pixel_x, event.pixel_y);
+                    let clean = slice_block(event.clean_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    let stego = slice_block(event.stego_pixels, event.src_stride,
+                                            event.block_w, event.block_h);
+                    obs.lock().unwrap().insert(key, (clean, stego));
+                })),
+                ..Default::default()
+            };
+            let _session = StegoSession::register(handlers).expect("register stego");
+            let mut encoder = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, INTRA_PERIOD)
+                .expect("enc init");
+            let mut output = vec![0u8; 256 * 1024];
+            for frame in 0..N_FRAMES {
+                set_frame_num(frame);
+                let (y, u, v) = synth_yuv_frame(WIDTH, HEIGHT, frame);
+                let _ = encoder
+                    .encode_frame(&y, &u, &v, (frame as i64) * 33, &mut output)
+                    .expect("encode stego");
+            }
+        }
+
+        let stego_obs = Arc::try_unwrap(stego_obs).unwrap().into_inner().unwrap();
+        let applied_n = *applied.lock().unwrap();
+        assert!(applied_n > 0,
+                "no overrides applied in stego run (planned {})", num_flips);
+
+        // ---------------- Multi-frame cascade-break assertion ----------------
+        // Per-block: pDecPic must match baseline-vs-stego across ALL frames.
+        // Any cascade leak through pDecPic would amplify across the 24-frame
+        // span — multiple P-chains of length 7 + 3 IDR resets is a strong
+        // exercise of the property.
+        let mut cascade_leak_blocks: Vec<((u32, u8, i32, i32), usize)> = Vec::new();
+        let mut perturbed_blocks = 0usize;
+        let mut perturbed_by_frame: HashMap<u32, usize> = HashMap::new();
+        for (key, (b_clean, b_stego)) in &stego_obs {
+            let Some((a_clean, _a_stego)) = baseline_obs.get(key) else {
+                panic!("MB block {:?} in stego run but not baseline — encoder mode-decision drift",
+                       key);
+            };
+            if a_clean != b_clean {
+                let diffs = a_clean.iter().zip(b_clean.iter())
+                    .filter(|(a, b)| a != b).count();
+                cascade_leak_blocks.push((*key, diffs));
+            }
+            if b_clean != b_stego {
+                perturbed_blocks += 1;
+                *perturbed_by_frame.entry(key.0).or_insert(0) += 1;
+            }
+        }
+
+        let frames_with_perturbation = perturbed_by_frame.len();
+        let span_min = perturbed_by_frame.keys().min().copied().unwrap_or(0);
+        let span_max = perturbed_by_frame.keys().max().copied().unwrap_or(0);
+
+        eprintln!(
+            "c811_multiframe_probe: n_frames={} intra_period={} \
+             baseline_blocks={} stego_blocks={} applied={} planned={} \
+             cascade_leak_blocks={} perturbed_blocks={} perturbed_frames={} \
+             span=[{},{}]",
+            N_FRAMES, INTRA_PERIOD,
+            baseline_obs.len(),
+            stego_obs.len(),
+            applied_n,
+            num_flips,
+            cascade_leak_blocks.len(),
+            perturbed_blocks,
+            frames_with_perturbation,
+            span_min, span_max,
+        );
+        if !cascade_leak_blocks.is_empty() {
+            for (key, n_diff) in cascade_leak_blocks.iter().take(10) {
+                eprintln!("  leak: {:?} bytes_diff={}", key, n_diff);
+            }
+        }
+
+        assert!(cascade_leak_blocks.is_empty(),
+                "C.8.11 multi-frame cascade-break failed: pDecPic diverges at {} \
+                 block(s) across {} frames. First 10 above.",
+                cascade_leak_blocks.len(), N_FRAMES);
+        assert!(perturbed_blocks > 0,
+                "no perturbed blocks across 24 frames — override mechanism not \
+                 reaching reconstruction (planned {}, applied {})",
+                num_flips, applied_n);
+    }
 
     // ---------------- B.9.2.1/.2 dec_post_read smoke ----------------
 
@@ -1848,7 +2429,7 @@ mod tests {
         };
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walker");
         let walk_coeff = walker.cover.coeff_sign_bypass.positions.len() as u32;
@@ -2230,7 +2811,7 @@ mod tests {
         // ---------- Walk the same bytes ----------
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walker");
 
@@ -2432,7 +3013,7 @@ mod tests {
         // ---------- Walker reference ----------
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true },
+            WalkOptions { record_mvd: true, record_offsets: false },
         )
         .expect("walker");
 

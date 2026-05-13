@@ -10197,7 +10197,7 @@ mod tests {
         all.extend_from_slice(&enc.encode_p_frame(&pattern_b).unwrap());
         all.extend_from_slice(&enc.encode_p_frame(&pattern_a).unwrap());
 
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&all, opts)
             .expect("walker accepts IPP stream under DUAL_REF_L0");
         assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + P)");
@@ -10234,7 +10234,7 @@ mod tests {
         all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
         all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
 
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&all, opts)
             .expect("walker accepts IBPBP stream under DUAL_REF_L0");
         assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
@@ -10261,7 +10261,7 @@ mod tests {
 
         // Walker reads it. The cover capture is meaningful only for
         // the I/P slices (B_Skip emits zero bypass-bins per MB).
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&all, opts)
             .expect("walker accepts IBPBP stream");
         assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
@@ -10373,7 +10373,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
 
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .expect("walker accepts B-slice with non-direct mb_type");
             assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
@@ -10405,7 +10405,7 @@ mod tests {
         all.extend_from_slice(&enc.encode_p_frame(&pixels).unwrap());
         all.extend_from_slice(&enc.encode_b_frame(&pixels).unwrap());
 
-        let opts = WalkOptions { record_mvd: true };
+        let opts = WalkOptions { record_mvd: true, record_offsets: false };
         let walk = walk_annex_b_for_cover_with_options(&all, opts)
             .expect("walker accepts mixed-mode B-slice");
         assert_eq!(walk.n_slices, 3);
@@ -10471,7 +10471,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_p_frame(&p_pixels).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&b_pixels).unwrap());
 
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .expect("walker accepts B-slice with non-zero MVDs from real ME");
             assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
@@ -10551,7 +10551,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_p_frame(&p_pixels).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&b_pixels).unwrap());
 
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .expect("walker accepts B-slice with non-zero CBP residuals");
             assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");
@@ -10627,7 +10627,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_p_frame(&p_pixels).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&b_pixels).unwrap());
 
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .unwrap_or_else(|e| panic!("walker rejected: {e:?}"));
             assert_eq!(walk.n_slices, 3);
@@ -10676,7 +10676,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_i_frame(&make_shifted(64, 64, 0)).unwrap());
             all.extend_from_slice(&enc.encode_p_frame(&make_shifted(64, 64, 2)).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&make_shifted(64, 64, 1)).unwrap());
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .unwrap_or_else(|e| panic!("walker rejected: {e:?}"));
             assert_eq!(walk.n_slices, 3);
@@ -10739,7 +10739,7 @@ mod tests {
             all.extend_from_slice(&enc.encode_p_frame(&p_pixels).unwrap());
             all.extend_from_slice(&enc.encode_b_frame(&b_pixels).unwrap());
 
-            let opts = WalkOptions { record_mvd: true };
+            let opts = WalkOptions { record_mvd: true, record_offsets: false };
             let walk = walk_annex_b_for_cover_with_options(&all, opts)
                 .unwrap_or_else(|e| panic!("walker rejected: {e:?}"));
             assert_eq!(walk.n_slices, 3, "expected 3 slices (I + P + B)");

@@ -1,0 +1,45 @@
+# H.264 mb-partition histogram
+# source: /tmp/openh264_baseline_carplane.h264
+# resolution: 1072x1920 (8040 MBs/frame)
+
+## I-frame (1 frames, 8040 MBs)
+  no-MV (Skip / Direct / Intra) :       8040 (100.00%)
+  emitted MVs                   :          0 ( 0.00%)
+  encoder mb_type (over 16080 MBs) [ffmpeg-debug ground truth]:
+        Intra_4x4 :     7052 ( 43.86%)
+      Intra_16x16 :     9028 ( 56.14%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :        0 (  0.00%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :    16080 (100.00%)
+  QP distribution: mean=26.00 min=26 max=26 (over 16080 MBs)
+    QP 22-26 :    16080 (100.00%)
+
+## P-frame (9 frames, 72360 MBs)
+  no-MV (Skip / Direct / Intra) :      39088 (54.02%)
+  emitted MVs                   :      33272 (45.98%)
+  partition shapes (over 44377 MV records):
+      16x16 :    27175 ( 61.24%)
+        8x8 :    11303 ( 25.47%)
+       8x16 :     3187 (  7.18%)
+       16x8 :     2712 (  6.11%)
+  direction (over 44377 MV-anchors) [decoder-synthesized]:
+         L0 :    44377 (100.00%)
+  encoder mb_type (over 120600 MBs) [ffmpeg-debug ground truth]:
+             Skip :    22490 ( 18.65%)
+        Intra_4x4 :     9564 (  7.93%)
+      Intra_16x16 :    54477 ( 45.17%)
+        Inter_fwd :    34069 ( 28.25%)
+  encoder Skip/Direct/Intra split:
+    Skip_count   :    22490 ( 18.65%)
+    Direct_count :        0 (  0.00%)
+    Intra_count  :    64041 ( 53.10%)
+  QP distribution: mean=26.00 min=26 max=26 (over 120600 MBs)
+    QP 22-26 :   120600 (100.00%)
+  MVD |Δ|∞ (over 44393 MV records, pel units):
+          0 :    10099 ( 22.75%)
+        1-2 :     5480 ( 12.34%)
+        3-7 :    17012 ( 38.32%)
+       8-15 :     8942 ( 20.14%)
+      16-31 :     2064 (  4.65%)
+        32+ :      796 (  1.79%)
