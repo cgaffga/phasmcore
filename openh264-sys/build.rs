@@ -223,6 +223,14 @@ fn main() {
             // any decoder naturally produces stego pixels. Only the
             // in-library debug output needed redirecting.
             "e210d008c06775a507c79f390f96a58e38c26416",
+            // 222457ce - C.8.13(b) fix HOOK-F coeff_idx — pass raster
+            // not scan. BC=2 canonical-key translation applies
+            // INV_ZZ_SCAN expecting raster (matches HOOK-E intra
+            // convention). HOOK-F (P-inter Luma 4x4) was passing
+            // scan, silently misrouting overrides on non-fixed-point
+            // scan indices. Root-caused via the 32-seed audit in
+            // `core/tests/openh264_cascade_gap_audit.rs`.
+            "222457ceebeaf9a5c72f09c7a46ba8a9419f5c2b",
         ];
         let head_output = Command::new("git")
             .arg("-C")
