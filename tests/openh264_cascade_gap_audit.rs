@@ -21,7 +21,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use core_openh264_sys::{
-    encoder_pos_to_phasm_position_key, PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
+    encoder_pos_to_phasm_position_key, phasm_get_hook_dual_applied,
+    phasm_get_hook_dual_bail_level_a_zero, phasm_get_hook_dual_bail_level_mismatch,
+    phasm_get_hook_dual_fires_total, phasm_reset_hook_dual_counters,
+    PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
 };
 use phasm_core::codec::h264::cabac::bin_decoder::slice::walk_annex_b_for_cover;
 use phasm_core::codec::h264::openh264::{
@@ -201,6 +204,9 @@ fn audit_b_cascade_gap_synth() {
     let mut by_path_total: HashMap<String, u32> = HashMap::new();
     let mut diverges_sample: Vec<(usize, u32, u32, EmbedDomain, SyntaxPath)> = Vec::new();
 
+    let mut total_bail_mismatch = 0u64;
+    let mut total_applied = 0u64;
+    let mut total_fires = 0u64;
     for (seed_idx, seed) in seeds.iter().enumerate() {
         let hhat = generate_hhat(STC_H, w, seed);
         let plan = stc_embed(&baseline_bits[..used], &costs, &frame_bits, &hhat, STC_H, w)
@@ -219,11 +225,22 @@ fn audit_b_cascade_gap_synth() {
                 m.insert(*k, *v);
             }
         }
+        // Reset fork-side counters right before the pass-2 encode so we
+        // attribute bail counts to THIS seed's overrides only.
+        unsafe { phasm_reset_hook_dual_counters() };
         let stego_bs = encode_once(
             &yuv, W, H, N, QP,
             override_map.clone(), mb_type_table.clone(),
             mb_width, mb_per_frame,
         );
+        let seed_fires = unsafe { phasm_get_hook_dual_fires_total() };
+        let seed_bail_zero = unsafe { phasm_get_hook_dual_bail_level_a_zero() };
+        let seed_bail_mismatch = unsafe { phasm_get_hook_dual_bail_level_mismatch() };
+        let seed_applied = unsafe { phasm_get_hook_dual_applied() };
+        total_fires += seed_fires;
+        total_bail_mismatch += seed_bail_mismatch;
+        total_applied += seed_applied;
+        let _ = seed_bail_zero;
         let p2_walk = walk_annex_b_for_cover(&stego_bs).expect("p2 walker");
         let p2_bits = &p2_walk.cover.coeff_sign_bypass.bits;
         let p2_positions = &p2_walk.cover.coeff_sign_bypass.positions;
@@ -259,6 +276,10 @@ fn audit_b_cascade_gap_synth() {
     eprintln!(
         "audit summary: seeds={} clean={} dirty={} total_diverge={}",
         seeds.len(), clean_seeds, dirty_seeds, total_diverge
+    );
+    eprintln!(
+        "hook_dual counters (summed across all seeds): fires_total={} applied={} bail_mismatch={}",
+        total_fires, total_applied, total_bail_mismatch
     );
     eprintln!("audit by SyntaxPath (across all dirty seeds):");
     let mut paths: Vec<_> = by_path_total.iter().collect();

@@ -479,6 +479,28 @@ unsafe extern "C" {
     /// Returns the wels_stego ABI version this library was built with.
     /// Format: `(MAJOR << 16) | (MINOR << 8) | PATCH`.
     pub fn WelsStegoAbiVersion() -> u32;
+
+    // ----- Phase C.8.13(b) debug counters (#455) ------------------------
+    // Read/reset atomic counters tracking phasm_apply_coeff_hooks_dual
+    // outcomes. Used by the cascade-gap audit to confirm whether the
+    // residual leak comes from the `*level_a != *level_b` precondition.
+    // -------------------------------------------------------------------
+
+    /// Total dual-write fires that entered the helper (passed null +
+    /// callback-registered gates).
+    pub fn phasm_get_hook_dual_fires_total() -> u64;
+
+    /// Bails on `*level_a == 0` (early-out for zero-coefficient positions).
+    pub fn phasm_get_hook_dual_bail_level_a_zero() -> u64;
+
+    /// Bails on `*level_a != *level_b` (precondition mismatch).
+    pub fn phasm_get_hook_dual_bail_level_mismatch() -> u64;
+
+    /// Successful applies (helper wrote a new_level).
+    pub fn phasm_get_hook_dual_applied() -> u64;
+
+    /// Reset all four counters to 0 atomically.
+    pub fn phasm_reset_hook_dual_counters();
 }
 
 // ---------------------------------------------------------------------

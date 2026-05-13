@@ -231,6 +231,13 @@ fn main() {
             // scan indices. Root-caused via the 32-seed audit in
             // `core/tests/openh264_cascade_gap_audit.rs`.
             "222457ceebeaf9a5c72f09c7a46ba8a9419f5c2b",
+            // fb550690 - C.8.13(b) debug counters for the dual-write
+            // helper. Exposes phasm_get_hook_dual_{fires_total,
+            // bail_level_a_zero, bail_level_mismatch, applied} + a
+            // reset, all extern "C" + atomic relaxed. Used by the
+            // cascade-gap audit to confirm whether the *level_a !=
+            // *level_b precondition is the residual leak.
+            "fb5506906b933c66885513b9030e724e1a21de32",
         ];
         let head_output = Command::new("git")
             .arg("-C")
