@@ -357,7 +357,6 @@ fn encode_once(
     *applied.lock().expect("applied lock") = 0;
 
     let map_for_hook = override_map.clone();
-    let mb_type_for_hook = mb_type_table.clone();
     let applied_for_hook = applied;
     let mb_type_for_md = mb_type_table;
     let handlers = StegoHandlers {
@@ -373,9 +372,20 @@ fn encode_once(
             if mb_addr >= mb_per_frame {
                 return None;
             }
-            let mt = mb_type_for_hook.lock().ok()?[mb_addr];
-            let mt_for_key = if mt == 0xff { PHASM_MB_TYPE_OTHER } else { mt };
-            let key = encoder_pos_to_phasm_position_key(pos, mt_for_key, mb_width)?;
+            // C.8.13(b) root-cause fix 2026-05-13: always pass
+            // `PHASM_MB_TYPE_OTHER` here. The mb_type filter inside
+            // `encoder_pos_to_phasm_position_key` would otherwise drop
+            // valid overrides because `md_cost` fires AFTER the hook
+            // (svc_encode_slice.cpp:2076 vs the hook in WelsEncInterY).
+            // For frame N+1, the table still holds frame N's mb_type;
+            // if that was I_16x16, `block_cat_matches_mb_type(I_16x16,
+            // BC=2)` returns false and silently filters out frame N+1's
+            // P-frame Luma 4×4 overrides. The walker's key set already
+            // gates overrides to actual wire positions, so the mb_type
+            // filter is redundant. See `audit_b_single_flip_probe` +
+            // `audit_b_single_flip_probe_filter_bypassed` in
+            // `core/tests/openh264_cascade_gap_audit.rs`.
+            let key = encoder_pos_to_phasm_position_key(pos, PHASM_MB_TYPE_OTHER, mb_width)?;
             map.get(&key).map(|&t| {
                 if let Ok(mut a) = applied_for_hook.lock() {
                     *a += 1;

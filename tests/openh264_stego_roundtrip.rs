@@ -4,20 +4,13 @@
 //
 // Phase C.8.13 (#446) — production orchestrator integration tests.
 //
-// **CURRENT STATE (2026-05-13)**: the capacity primitive (`c813_capacity_smoke`)
-// runs as the default lib-gate. The full round-trip tests are `#[ignore]`
-// for now — they flake on the residual cascade-leak (2 / 76 384 wire bits
-// at 124-flip plans) that breaks STC syndrome decode. Tracked as
-// follow-on alongside C.8.13 (b) / (c) per the module doc-comment.
-//
-// To reproduce the round-trip behaviour for the cascade-gap investigation:
-//   cargo test --release --features "h264-encoder openh264-backend" \
-//       --test openh264_stego_roundtrip -- --ignored --nocapture
+// **CURRENT STATE (2026-05-13)**: round-trip tests run by default after
+// C.8.13(b) #455 closed the cascade-leak root cause (mb_type filter
+// race between md_cost + HOOK-F — fix in `openh264_stego.rs:377`).
 //
 // Each round-trip test runs independently with a per-binary `SESSION_GUARD`
-// mutex so SESSION_ALIVE doesn't conflict with other openh264 integration
-// suites; the cascade leak persists across binary boundaries so this
-// mutex is necessary but insufficient.
+// mutex so `SESSION_ALIVE` doesn't conflict with other openh264 integration
+// suites.
 
 #![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
 
@@ -85,7 +78,6 @@ fn c813_capacity_smoke() {
 }
 
 #[test]
-#[ignore]
 fn c813_roundtrip_text_only_smoke() {
     let _g = session_guard().lock().unwrap();
     let yuv = ensure_yuv("iphone7_smoke", "IMG_4138.MOV", 640, 368, 8);
@@ -102,7 +94,6 @@ fn c813_roundtrip_text_only_smoke() {
 }
 
 #[test]
-#[ignore]
 fn c813_roundtrip_wrong_passphrase_fails() {
     let _g = session_guard().lock().unwrap();
     let yuv = ensure_yuv("iphone7_smoke", "IMG_4138.MOV", 640, 368, 8);
@@ -115,7 +106,6 @@ fn c813_roundtrip_wrong_passphrase_fails() {
 }
 
 #[test]
-#[ignore]
 fn c813_roundtrip_with_file_attachment() {
     let _g = session_guard().lock().unwrap();
     let yuv = ensure_yuv("iphone7_smoke", "IMG_4138.MOV", 640, 368, 8);
@@ -140,7 +130,6 @@ fn c813_roundtrip_with_file_attachment() {
 }
 
 #[test]
-#[ignore]
 fn c813_roundtrip_iphone7_1080p() {
     let _g = session_guard().lock().unwrap();
     let yuv = ensure_yuv("iphone7_landscape", "IMG_4138.MOV", 1920, 1072, 12);
