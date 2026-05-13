@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use core_openh264_sys::{
     encoder_pos_to_phasm_position_key, phasm_get_hook_dual_applied,
     phasm_get_hook_dual_bail_level_a_zero, phasm_get_hook_dual_bail_level_mismatch,
-    phasm_get_hook_dual_fires_total, phasm_reset_hook_dual_counters,
-    PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
+    phasm_get_hook_dual_fires_total, phasm_get_hook_single_applied,
+    phasm_get_hook_single_bail_level_zero, phasm_get_hook_single_fires_total,
+    phasm_reset_hook_dual_counters, PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
 };
 use phasm_core::codec::h264::cabac::bin_decoder::slice::walk_annex_b_for_cover;
 use phasm_core::codec::h264::openh264::{
@@ -155,6 +156,108 @@ fn syntax_path_name(sp: &SyntaxPath) -> String {
     }
 }
 
+/// Single-flip probe: pick one walker position that was diverging in
+/// the multi-seed audit, build an override map with ONLY that
+/// position, encode pass 2, walk, check if the override landed.
+///
+/// If it lands → bug is COMBINATORIAL (only manifests at high flip
+/// count, e.g. RDO interactions between multiple overrides).
+/// If it doesn't → bug is per-position structural (some property of
+/// that specific position prevents the override from reaching the wire).
+#[test]
+#[ignore]
+fn audit_b_single_flip_probe() {
+    let _g = session_guard().lock().unwrap();
+    const W: u32 = 320;
+    const H: u32 = 240;
+    const N: u32 = 2;
+    const QP: i32 = 22;
+
+    let yuv = synth_yuv(W, H, N);
+    let mb_width = W / 16;
+    let mb_per_frame = (mb_width * (H / 16)) as usize;
+    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+
+    // Baseline encode + walk.
+    let baseline_bs = encode_once(
+        &yuv, W, H, N, QP,
+        override_map.clone(), mb_type_table.clone(),
+        mb_width, mb_per_frame,
+    );
+    let baseline_walk = walk_annex_b_for_cover(&baseline_bs).expect("walker");
+    let baseline_positions = baseline_walk.cover.coeff_sign_bypass.positions.clone();
+    let baseline_bits = baseline_walk.cover.coeff_sign_bypass.bits.clone();
+
+    // Walker_idx values from the multi-seed audit's first dirty seed (seed#0).
+    // Each one was a missed flip at: frame=1, P-frame Luma 4x4 BC=2.
+    let probe_walker_indices: &[usize] = &[74764, 75025, 75315, 74762, 49434];
+
+    let mut summary = Vec::new();
+    for &widx in probe_walker_indices {
+        if widx >= baseline_positions.len() {
+            continue;
+        }
+        let key = baseline_positions[widx];
+        let target_bit = 1u8 ^ baseline_bits[widx];
+
+        // Build single-override map.
+        {
+            let mut map = override_map.lock().unwrap();
+            map.clear();
+            map.insert(key.raw(), target_bit);
+        }
+        unsafe { phasm_reset_hook_dual_counters() };
+        let stego_bs = encode_once(
+            &yuv, W, H, N, QP,
+            override_map.clone(), mb_type_table.clone(),
+            mb_width, mb_per_frame,
+        );
+        let dual_applied = unsafe { phasm_get_hook_dual_applied() };
+        let dual_bail = unsafe { phasm_get_hook_dual_bail_level_mismatch() };
+        let dual_fires = unsafe { phasm_get_hook_dual_fires_total() };
+        let single_applied = unsafe { phasm_get_hook_single_applied() };
+        let single_fires = unsafe { phasm_get_hook_single_fires_total() };
+
+        let p2_walk = walk_annex_b_for_cover(&stego_bs).expect("p2 walker");
+        let p2_bits = &p2_walk.cover.coeff_sign_bypass.bits;
+        let p2_positions = &p2_walk.cover.coeff_sign_bypass.positions;
+
+        let landed = if widx < p2_positions.len()
+            && p2_positions[widx].raw() == key.raw()
+        {
+            p2_bits[widx] == target_bit
+        } else {
+            false
+        };
+        // Also count any wire bit that differs in the entire stream.
+        let mut total_wire_changes = 0u32;
+        let cmp_len = baseline_bits.len().min(p2_bits.len());
+        for i in 0..cmp_len {
+            if p2_bits[i] != baseline_bits[i] {
+                total_wire_changes += 1;
+            }
+        }
+
+        let sp = key.syntax_path();
+        eprintln!(
+            "probe walker_idx={} mb_addr={} {}\n  baseline_bit={} target_bit={} → landed={} total_wire_changes={}\n  dual:   fires={} applied={} bail_mismatch={}\n  single: fires={} applied={}",
+            widx, key.mb_addr(), syntax_path_name(&sp),
+            baseline_bits[widx], target_bit, landed, total_wire_changes,
+            dual_fires, dual_applied, dual_bail,
+            single_fires, single_applied,
+        );
+        summary.push((widx, landed, dual_applied + single_applied, total_wire_changes));
+    }
+
+    let landed_count = summary.iter().filter(|(_, l, _, _)| *l).count();
+    let total = summary.len();
+    eprintln!(
+        "single-flip probe summary: {}/{} positions landed cleanly",
+        landed_count, total,
+    );
+}
+
 /// Reproduce the cascade-break gap with a deterministic seed and report
 /// which SyntaxPath the leaking positions belong to. This identifies
 /// the C.8.x hook (HOOK-A/B/C/D/E/F/G/H1) that should be cascade-
@@ -250,16 +353,32 @@ fn audit_b_cascade_gap_synth() {
         }
 
         let mut diverge_n = 0u32;
+        let mut missed_flip = 0u32;    // plan said flip, wire didn't change
+        let mut collateral = 0u32;     // plan said no flip, wire changed anyway
         for i in 0..used {
             if p2_bits[i] != plan.stego_bits[i] {
                 diverge_n += 1;
                 let k = p2_positions[i];
                 let sp = k.syntax_path();
                 *by_path_total.entry(syntax_path_name(&sp).to_string()).or_insert(0) += 1;
+                // Classify: was this position a planned flip?
+                let planned_flip = plan.stego_bits[i] != baseline_bits[i];
+                if planned_flip {
+                    missed_flip += 1;
+                } else {
+                    collateral += 1;
+                }
                 if diverges_sample.len() < 40 {
                     diverges_sample.push((i, k.frame_idx(), k.mb_addr(), k.domain(), sp));
                 }
             }
+        }
+        if diverge_n > 0 {
+            // augment per-seed report with the classification
+            eprintln!(
+                "  seed#{}: missed_flip={} collateral={}",
+                seed_idx, missed_flip, collateral
+            );
         }
         if diverge_n > 0 {
             dirty_seeds += 1;

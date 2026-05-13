@@ -238,6 +238,11 @@ fn main() {
             // cascade-gap audit to confirm whether the *level_a !=
             // *level_b precondition is the residual leak.
             "fb5506906b933c66885513b9030e724e1a21de32",
+            // ce820c5f - extend the C.8.13(b) counters to the
+            // single-write helper (HOOK-A/B/E). HOOK-E (I_4x4 intra)
+            // is the suspect for the residual missed-flip class; the
+            // dual-write counter alone can not see it.
+            "ce820c5f399f4842a0ca66f13d7b15ceb20f71cf",
         ];
         let head_output = Command::new("git")
             .arg("-C")

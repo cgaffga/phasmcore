@@ -499,8 +499,15 @@ unsafe extern "C" {
     /// Successful applies (helper wrote a new_level).
     pub fn phasm_get_hook_dual_applied() -> u64;
 
-    /// Reset all four counters to 0 atomically.
+    /// Reset all dual + single counters to 0 atomically.
     pub fn phasm_reset_hook_dual_counters();
+
+    /// Single-write helper (HOOK-A/B/E) — total fires.
+    pub fn phasm_get_hook_single_fires_total() -> u64;
+    /// Single-write helper — bails on `*level == 0`.
+    pub fn phasm_get_hook_single_bail_level_zero() -> u64;
+    /// Single-write helper — successful applies.
+    pub fn phasm_get_hook_single_applied() -> u64;
 }
 
 // ---------------------------------------------------------------------
