@@ -31,12 +31,18 @@ default = []
 # never enabled in cargo-dist GitHub-release builds. Forwards to
 # phasm-core's `h264-encoder` feature.
 h264-encoder = ["phasm-core/h264-encoder"]
-# Enable Phase 6.3 CABAC stego encode/decode (the production
-# 4-domain bypass-bin pipeline used by the iOS + Android bridges).
-# When ON, `phasm video-encode` and `phasm decode` route MP4 video
-# through ffmpeg → YUV → v2 streaming orchestrator → Annex-B →
-# ffmpeg → MP4. When OFF, they fall back to the legacy CAVLC
-# bitstream-mod path (`h264_ghost_encode/decode`). Implies
-# `h264-encoder`. Source-only; cargo-dist binary uses the legacy
-# path (no encoder bundled).
+# Enable Phase 6.3 CABAC stego encode/decode (the EXPERIMENTAL
+# pure-Rust 4-domain bypass-bin pipeline). D.0 ship-direction
+# (2026-05-14) demotes this to opt-in EXPERIMENTAL behind
+# `--encoder experimental-rust`; default `--encoder openh264`.
+# When this feature is ON, `phasm video-encode` exposes the
+# `--encoder` flag.
 cabac-stego = ["h264-encoder", "phasm-core/cabac-stego"]
+# D.0 (2026-05-14) — Production OpenH264-backend stego pipeline.
+# Default encoder for `phasm video-encode`. Links the vendored
+# OpenH264 fork via `core-openh264-sys` (meson+ninja build at
+# `vendor/phasm-openh264`). Source-only; cargo-dist binary
+# excludes this for AVC patent reasons.
+# Implies `cabac-stego` so the CLI shares the same MP4 demux +
+# remux infrastructure (ffmpeg → YUV → annex-B → ffmpeg → MP4).
+openh264-backend = ["cabac-stego", "phasm-core/openh264-backend"]

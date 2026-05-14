@@ -1,0 +1,125 @@
+# Phase C.6.2 (#416) — OpenH264 cross-arch determinism check.
+#
+# Runs `tests/openh264_cross_arch_determinism.rs` on macOS arm64,
+# Linux x86_64, and Linux arm64. The test computes SHA-256 of a
+# stego Annex-B output produced from a synthetic YUV fixture with
+# PHASM_DETERMINISTIC_SEED=42, prints the hash per-arch to stderr.
+# First-run logs reveal whether the OH264 fork is bit-identical
+# across these arches; a follow-up commit pins the per-arch (or
+# unified) hash and flips the test from RECORD to ASSERT mode.
+#
+# ─────────────────────────────────────────────────────────────────────
+# AVC patent posture — NO BINARY PERSISTENCE.
+# ─────────────────────────────────────────────────────────────────────
+#
+# Per project policy ("never build video on GitHub; don't ship
+# binaries on github.com/crates.io"), this workflow is structured so
+# the OH264-linked test binary exists ONLY transiently on the GitHub-
+# owned runner VM and is destroyed at job teardown along with the
+# VM itself. Specifically:
+#
+#   - permissions: contents: read  → workflow cannot create commits,
+#     releases, packages, or any persistent GitHub artifact.
+#   - NO actions/cache step        → target/ never persists to GH cache.
+#   - NO actions/upload-artifact   → build outputs never become
+#     downloadable artifacts.
+#   - NO if: always() / failure()  → no failure-handler upload pattern.
+#   - ulimit -c 0                  → no core dumps if a test segfaults.
+#   - Explicit rm -rf at job end   → belt-and-suspenders, even though
+#     the runner VM is destroyed regardless.
+#   - Test prints hash hex + size + arch tag ONLY                —
+#     NEVER binary content (no hexdump, no base64-of-bytes).
+#
+# What persists after the job: text-only stderr/stdout in the
+# GitHub Actions log (90-day retention, accessible to anyone who can
+# view the repo). No binary, no .a, no .so, no test binary.
+#
+# Trigger: workflow_dispatch only. Manual gating — the operator
+# decides when to spend the ~3-5 min of CI wall time and accept the
+# transient build on third-party infra.
+
+name: openh264-cross-arch-determinism
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hash-record:
+    name: hash-record (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macos-arm64
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout (with phasm-openh264 submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Native build deps for the phasm-openh264 fork via meson+ninja.
+      - name: Install meson + ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends meson ninja-build
+          ulimit -c 0     # disable core dumps; no crash binaries on disk
+
+      - name: Install meson + ninja (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install meson ninja
+          ulimit -c 0
+
+      - name: Show toolchain + matrix label
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          echo "matrix label: ${{ matrix.label }}"
+
+      # The actual test. cargo test --no-fail-fast keeps going if a
+      # test fails (we want hashes from all matrix legs even if one
+      # asserts). --nocapture prints the eprintln hash line into
+      # the job log.
+      - name: Run determinism hash-record
+        shell: bash
+        run: |
+          ulimit -c 0
+          cargo test --release \
+            --features "h264-encoder openh264-backend" \
+            --test openh264_cross_arch_determinism \
+            --no-fail-fast \
+            -- --nocapture
+
+      # Belt-and-suspenders: erase the build dir + meson static-lib
+      # build dir before the runner VM tears down. The VM destroys
+      # everything anyway; this is policy reinforcement.
+      - name: Erase build outputs (post-run cleanup)
+        if: always()
+        shell: bash
+        run: |
+          rm -rf core/target target
+          # Note: the meson static-lib build dir lives inside the
+          # cargo OUT_DIR (target/release/build/core-openh264-sys-*/out/openh264-static)
+          # so the rm above already covers it. Listed here for clarity.
+
+      # EXPLICITLY ABSENT:
+      #   - actions/upload-artifact (would persist build outputs)
+      #   - actions/cache (would persist target/ across runs)
+      #   - if: failure() upload step (would archive failure binaries)
+      #   - docker push / ghcr.io publish (would distribute the image)
+      # All of these were considered and intentionally omitted per the
+      # AVC patent posture documented at the top of this file.

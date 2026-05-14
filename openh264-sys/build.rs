@@ -243,6 +243,11 @@ fn main() {
             // is the suspect for the residual missed-flip class; the
             // dual-write counter alone can not see it.
             "ce820c5f399f4842a0ca66f13d7b15ceb20f71cf",
+            // 2026-05-14: README-only commit (C.8.13(b) status note);
+            // no code change, hook firing convention unchanged.
+            // b8_full_translation_validates re-verified green against
+            // this SHA before pinning.
+            "a3280294f04fae95c4f09e1fa37fa9b62a64054f",
         ];
         let head_output = Command::new("git")
             .arg("-C")
@@ -294,19 +299,27 @@ fn main() {
     check_tool_available("meson", "Install via `brew install meson` (macOS) or `pip install meson` (Linux).");
     check_tool_available("ninja", "Install via `brew install ninja` (macOS) or `apt install ninja-build` (Linux).");
 
+    // #457 (2026-05-14): for cross-targets (iOS / Android), generate a
+    // meson cross-file pointing at the right SDK or NDK toolchain. Host
+    // builds get None and meson auto-detects.
+    let cross_file = generate_meson_cross_file(&out_dir);
+
     let build_dir = out_dir.join("openh264-static");
 
     // Meson setup (skip if already configured).
     let needs_setup = !build_dir.join("build.ninja").exists();
     if needs_setup {
         std::fs::create_dir_all(&build_dir).expect("create build dir");
-        let status = Command::new("meson")
-            .arg("setup")
+        let mut cmd = Command::new("meson");
+        cmd.arg("setup")
             .arg("--default-library=static")
             .arg("--buildtype=release")
-            .arg("-Db_lto=false")  // LTO clashes with cargo's own LTO downstream
-            .arg(&build_dir)
-            .arg(&submodule_path)
+            .arg("-Db_lto=false");  // LTO clashes with cargo's own LTO downstream
+        if let Some(ref path) = cross_file {
+            cmd.arg(format!("--cross-file={}", path.display()));
+        }
+        cmd.arg(&build_dir).arg(&submodule_path);
+        let status = cmd
             .status()
             .expect("failed to spawn meson");
         if !status.success() {
@@ -362,13 +375,16 @@ fn main() {
         .compile("phasm_shims");
     println!("cargo:rerun-if-changed={}", shim_dir.display());
 
-    // C++ stdlib link.
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else if cfg!(target_os = "linux") {
-        println!("cargo:rustc-link-lib=stdc++");
-    } else if cfg!(target_os = "windows") {
-        // MSVC bundles its stdlib; nothing to do.
+    // C++ stdlib link. Use the cargo TARGET, not the host cfg, so cross-
+    // builds for iOS / Android / etc. pick the right one. macOS + iOS use
+    // libc++; Android also uses libc++ (NDK bundles it); Linux uses
+    // libstdc++; Windows MSVC bundles its stdlib.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "macos" | "ios" | "android" => println!("cargo:rustc-link-lib=c++"),
+        "linux" => println!("cargo:rustc-link-lib=stdc++"),
+        "windows" => {}
+        _ => {}
     }
 
     // Expose include path so phasm-core can #include wels_stego.h via
@@ -398,6 +414,272 @@ fn check_tool_available(tool: &str, install_hint: &str) {
             "Required build tool `{}` not found on PATH.\n{}",
             tool, install_hint
         ),
+    }
+}
+
+/// #457 (2026-05-14) — generate a meson cross-file for the current
+/// cargo target, when the target is a known cross-compile destination
+/// (iOS device / iOS simulator / Android arm64 / Android x86_64).
+///
+/// Returns `Some(path)` to a written `.ini` file when a cross-file is
+/// needed; returns `None` for host builds (meson auto-detects) and for
+/// unsupported cross-targets (meson tries host detection and probably
+/// fails loudly — not this crate's job to enable every cross combo).
+///
+/// The OpenH264 fork already understands `system = 'ios'` and
+/// `system = 'android'` in its meson.build (see `vendor/phasm-
+/// openh264/meson.build:60-114`) and the ARM ASM common macros branch
+/// on `__APPLE__` vs ELF — so producing the cross-file is the only
+/// piece of plumbing needed; no fork-side patches required.
+fn generate_meson_cross_file(out_dir: &std::path::Path) -> Option<PathBuf> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let host = std::env::var("HOST").unwrap_or_default();
+
+    // Host build — meson auto-detects.
+    if target == host || target.is_empty() {
+        return None;
+    }
+
+    let content = match target.as_str() {
+        // iOS device (arm64).
+        "aarch64-apple-ios" => ios_cross(/*sim=*/ false, "arm64", "aarch64"),
+        // iOS simulator on Apple Silicon (arm64).
+        "aarch64-apple-ios-sim" => ios_cross(/*sim=*/ true, "arm64", "aarch64"),
+        // iOS simulator on Intel mac (x86_64). Deprecated but still
+        // useful for CI matrices that haven't migrated yet.
+        "x86_64-apple-ios" => ios_cross(/*sim=*/ true, "x86_64", "x86_64"),
+        // Android arm64 (primary mobile target).
+        "aarch64-linux-android" => android_cross("aarch64-linux-android", "arm64", "aarch64"),
+        // Android x86_64 (emulator).
+        "x86_64-linux-android" => android_cross("x86_64-linux-android", "x86_64", "x86_64"),
+        _ => {
+            // Unsupported cross-target. Let meson try its own detection
+            // and surface a real error if it can't.
+            return None;
+        }
+    };
+
+    let path = out_dir.join("phasm-cross.ini");
+    std::fs::write(&path, content).expect("write meson cross-file");
+
+    println!("cargo:rerun-if-env-changed=TARGET");
+    println!("cargo:rerun-if-env-changed=HOST");
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_HOME");
+    println!("cargo:rerun-if-env-changed=ANDROID_NDK_ROOT");
+    println!("cargo:rerun-if-env-changed=NDK_HOME");
+
+    Some(path)
+}
+
+/// Build a meson cross-file for an iOS device or simulator target.
+///
+/// Uses `clang -target <triple>` for the deployment-target encoding,
+/// which avoids the `-mios-version-min` vs `-mios-simulator-version-min`
+/// split (clang derives both from the `-target` triple). Min iOS = 15.0
+/// (covers iPhone 6s+ from 2015; matches typical phasm-ios deployment
+/// target).
+fn ios_cross(simulator: bool, arch: &str, cpu_family: &str) -> String {
+    let sdk = if simulator { "iphonesimulator" } else { "iphoneos" };
+    let min_ver = "15.0";
+    let suffix = if simulator { "-simulator" } else { "" };
+    let triple = format!("{arch}-apple-ios{min_ver}{suffix}");
+    format!(
+        "[binaries]\n\
+         c = ['xcrun', '--sdk', '{sdk}', 'clang']\n\
+         cpp = ['xcrun', '--sdk', '{sdk}', 'clang++']\n\
+         ar = ['xcrun', '--sdk', '{sdk}', 'ar']\n\
+         strip = ['xcrun', '--sdk', '{sdk}', 'strip']\n\
+         \n\
+         [built-in options]\n\
+         c_args = ['-target', '{triple}']\n\
+         cpp_args = ['-target', '{triple}']\n\
+         c_link_args = ['-target', '{triple}']\n\
+         cpp_link_args = ['-target', '{triple}']\n\
+         \n\
+         [host_machine]\n\
+         system = 'ios'\n\
+         cpu_family = '{cpu_family}'\n\
+         cpu = '{arch}'\n\
+         endian = 'little'\n"
+    )
+}
+
+/// Build a meson cross-file for an Android NDK target.
+///
+/// Target API level: read from `PHASM_ANDROID_API` env var if set
+/// (override for unusual configs), otherwise auto-detect the highest
+/// API-versioned clang shim available in the NDK install. The NDK ships
+/// API-versioned clang binaries like `aarch64-linux-android36-clang`
+/// that bake `__ANDROID_API__={N}` for the static lib's own code.
+///
+/// Why auto-detect: NDK r27 maxes at API 35, r28+ ships API 36. The
+/// static lib's API level only constrains OpenH264's internal syscalls
+/// (none of which need anything new); the app's `targetSdk` is the
+/// thing Google's Aug 2026 enforcement gate actually checks, and that's
+/// set in `android/app/build.gradle`, not here.
+///
+/// Adds `-Wl,-z,max-page-size=16384` to link args. NDK r28+ defaults
+/// 16KB page alignment ON; r26/r27 needs the flag explicit. Harmless on
+/// older NDKs and on x86_64. Android 15+ on arm64 rejects native libs
+/// without it at upload time.
+fn android_cross(clang_prefix: &str, arch: &str, cpu_family: &str) -> String {
+    const MIN_API: u32 = 24;  // NDK ABI floor; phasm-android minSdk
+    let ndk = locate_android_ndk();
+    let host_tag = ndk_host_tag();
+    let toolchain = std::path::Path::new(&ndk)
+        .join("toolchains")
+        .join("llvm")
+        .join("prebuilt")
+        .join(&host_tag)
+        .join("bin");
+    let api = resolve_android_api(&toolchain, clang_prefix, MIN_API);
+    let cc = toolchain.join(format!("{clang_prefix}{api}-clang"));
+    let cxx = toolchain.join(format!("{clang_prefix}{api}-clang++"));
+    let ar = toolchain.join("llvm-ar");
+    let strip = toolchain.join("llvm-strip");
+
+    // Sanity-check the C compiler exists; an early error here is far
+    // friendlier than a meson failure mid-configure.
+    if !cc.exists() {
+        panic!(
+            "Android NDK clang not found at expected path:\n  {}\n\
+             ANDROID_NDK_HOME={}\n\
+             host_tag={}\n\
+             api={}\n\
+             Verify the NDK install includes API-{} clang shims. If the\n\
+             file is named differently in your NDK install, this build.rs\n\
+             needs updating.",
+            cc.display(), ndk, host_tag, api, api
+        );
+    }
+
+    // Also point cc::Build (which compiles the shim C++ files later in
+    // this build.rs) at the same toolchain. cc crate consults
+    // CC_<target> / CXX_<target> / AR_<target> env vars and falls back
+    // to a target-prefixed binary without API suffix
+    // (e.g. `aarch64-linux-android-clang`), which the NDK doesn't ship.
+    // Setting these explicitly is what `cargo-ndk` does for end users;
+    // we do the same in-process so raw `cargo build --target=...` works
+    // even outside cargo-ndk.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let target_underscored = target.replace('-', "_");
+    // SAFETY: set_var is single-threaded here — build.rs runs before
+    // cc::Build spawns its compiler subprocess. No concurrent reads.
+    unsafe {
+        std::env::set_var(format!("CC_{target}"), cc.as_os_str());
+        std::env::set_var(format!("CXX_{target}"), cxx.as_os_str());
+        std::env::set_var(format!("AR_{target}"), ar.as_os_str());
+        // Some cc-rs versions read the underscored form; set both.
+        std::env::set_var(format!("CC_{target_underscored}"), cc.as_os_str());
+        std::env::set_var(format!("CXX_{target_underscored}"), cxx.as_os_str());
+        std::env::set_var(format!("AR_{target_underscored}"), ar.as_os_str());
+    }
+
+    format!(
+        "[binaries]\n\
+         c = '{cc}'\n\
+         cpp = '{cxx}'\n\
+         ar = '{ar}'\n\
+         strip = '{strip}'\n\
+         \n\
+         [built-in options]\n\
+         c_link_args = ['-Wl,-z,max-page-size=16384']\n\
+         cpp_link_args = ['-Wl,-z,max-page-size=16384']\n\
+         \n\
+         [host_machine]\n\
+         system = 'android'\n\
+         cpu_family = '{cpu_family}'\n\
+         cpu = '{arch}'\n\
+         endian = 'little'\n",
+        cc = cc.display(),
+        cxx = cxx.display(),
+        ar = ar.display(),
+        strip = strip.display(),
+    )
+}
+
+/// Locate the Android NDK install root. Probes the standard env vars
+/// in priority order. Panics with a helpful message if none are set.
+fn locate_android_ndk() -> String {
+    for var in &["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"] {
+        if let Ok(p) = std::env::var(var) {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+    }
+    panic!(
+        "Android cross-compile needs the NDK install path. Set one of:\n\
+         \n  ANDROID_NDK_HOME=/path/to/android-ndk-r28\n\
+         \n  ANDROID_NDK_ROOT=...\n\
+         \n  NDK_HOME=...\n\
+         \nInstall via `sdkmanager 'ndk;28.0.13004108'` or download from\n\
+         https://developer.android.com/ndk/downloads ."
+    )
+}
+
+/// Pick the Android API level to compile the OpenH264 static lib against.
+///
+/// Resolution order:
+///   1. `PHASM_ANDROID_API` env var (explicit override).
+///   2. Highest API-versioned clang shim present in the NDK toolchain
+///      bin directory for the given target prefix, capped at the
+///      caller's `min_api` floor.
+///
+/// Panics if no shim ≥ `min_api` is found — that means the NDK install
+/// is too old or wrong host tag.
+fn resolve_android_api(toolchain_bin: &std::path::Path, clang_prefix: &str, min_api: u32) -> u32 {
+    println!("cargo:rerun-if-env-changed=PHASM_ANDROID_API");
+    if let Ok(s) = std::env::var("PHASM_ANDROID_API") {
+        if let Ok(n) = s.parse::<u32>() {
+            return n;
+        }
+    }
+
+    let needle = format!("{clang_prefix}");
+    let suffix = "-clang";
+    let mut best: Option<u32> = None;
+    if let Ok(rd) = std::fs::read_dir(toolchain_bin) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Match e.g. "aarch64-linux-android35-clang".
+            if let Some(rest) = name.strip_prefix(&needle) {
+                if let Some(api_str) = rest.strip_suffix(suffix) {
+                    if let Ok(n) = api_str.parse::<u32>() {
+                        if n >= min_api && best.is_none_or(|b| n > b) {
+                            best = Some(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    best.unwrap_or_else(|| {
+        panic!(
+            "No Android NDK clang shim found for prefix '{}' (API >= {}) in:\n  {}\n\
+             Override with PHASM_ANDROID_API=<N> or install a newer NDK.",
+            clang_prefix, min_api, toolchain_bin.display()
+        )
+    })
+}
+
+/// Map the cargo HOST triple to the NDK toolchain host-tag directory.
+/// NDK ships pre-built clang for darwin-x86_64 (works on Apple Silicon
+/// via Rosetta), linux-x86_64, and windows-x86_64. r26+ adds
+/// `darwin-arm64`, but `darwin-x86_64` is the long-stable path and is
+/// preferred unless someone explicitly opts in.
+fn ndk_host_tag() -> String {
+    let host = std::env::var("HOST").unwrap_or_default();
+    if host.contains("apple-darwin") {
+        "darwin-x86_64".to_string()
+    } else if host.contains("linux") {
+        "linux-x86_64".to_string()
+    } else if host.contains("windows") {
+        "windows-x86_64".to_string()
+    } else {
+        panic!("Unsupported NDK host triple: {host}")
     }
 }
 

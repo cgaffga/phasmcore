@@ -20,7 +20,43 @@ use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
+
+/// D.0.1 (2026-05-14) — encoder backend selection.
+///
+/// `open-h264` (default when `--features openh264-backend`) is the
+/// production v1.0 pipeline: vendored OpenH264 fork with visual_recon
+/// dual-recon hooks. Closed Phase C.
+///
+/// `rust-h264` is the pure-Rust 4-domain CABAC H.264 stego pipeline.
+/// EXPERIMENTAL: ~1000-4000× slower than OpenH264 at production
+/// resolutions (1080p × 30 ≈ 60 min). Kept as opt-in for research +
+/// patent-free distribution. Default when only `--features
+/// cabac-stego` is on.
+///
+/// (The legacy CAVLC bitstream-mod path is only present when neither
+/// stego feature is enabled, in which case this flag isn't exposed.)
+#[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum EncoderChoice {
+    /// Production OpenH264-backend (default). Phase C.8 visual_recon.
+    #[cfg(feature = "openh264-backend")]
+    #[clap(name = "open-h264")]
+    OpenH264,
+    /// EXPERIMENTAL pure-Rust H.264 4-domain CABAC stego. ~1000-4000× slower.
+    #[clap(name = "rust-h264")]
+    RustH264,
+}
+
+#[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
+impl Default for EncoderChoice {
+    fn default() -> Self {
+        #[cfg(feature = "openh264-backend")]
+        return EncoderChoice::OpenH264;
+        #[cfg(not(feature = "openh264-backend"))]
+        return EncoderChoice::RustH264;
+    }
+}
 
 #[derive(Parser)]
 pub struct VideoEncodeArgs {
@@ -137,6 +173,14 @@ pub struct VideoEncodeArgs {
     #[arg(long = "mux-profile", default_value = "handbrake-x264")]
     pub mux_profile: transcode::MuxProfile,
 
+    /// D.0.1 — encoder backend (default: `open-h264` when built with
+    /// `--features openh264-backend`, the production v1.0 path).
+    /// Override with `--encoder rust-h264` for the slow (EXPERIMENTAL)
+    /// pure-Rust pipeline.
+    #[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
+    #[arg(long = "encoder", value_enum, default_value_t = EncoderChoice::default())]
+    pub encoder: EncoderChoice,
+
     // Shadow attachments (attach2..attach9).
     #[cfg(feature = "cabac-stego")]
     #[arg(long, action = ArgAction::Append)] pub attach2: Vec<PathBuf>,
@@ -188,25 +232,35 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
     let file_bytes = std::fs::read(&args.video)?;
     match detect_video_codec(&file_bytes) {
         VideoCodec::H264 => {
-            #[cfg(feature = "cabac-stego")]
+            #[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
             {
-                let _ = file_bytes; // consumed by re-read inside run_cabac_encode
-                let primary_files = load_files(&args.attach)?;
-                let shadows = collect_shadows(&args)?;
-                let gop_override = args.gop_size;
-                if shadows.is_empty() {
-                    run_cabac_encode(
-                        &args.video, &message, &primary_files, &passphrase,
-                        gop_override, args.mux_profile, &output_path,
-                    )?;
-                } else {
-                    run_cabac_encode_with_shadows(
-                        &args.video, &message, &primary_files, &passphrase,
-                        &shadows, gop_override, args.mux_profile, &output_path,
-                    )?;
+                let encoder = args.encoder;
+                match encoder {
+                    #[cfg(feature = "openh264-backend")]
+                    EncoderChoice::OpenH264 => {
+                        drop(file_bytes); // re-read inside run_oh264_encode
+                        run_oh264_encode(&args.video, &message, &passphrase, &output_path)?;
+                    }
+                    EncoderChoice::RustH264 => {
+                        drop(file_bytes); // re-read inside run_cabac_encode
+                        let primary_files = load_files(&args.attach)?;
+                        let shadows = collect_shadows(&args)?;
+                        let gop_override = args.gop_size;
+                        if shadows.is_empty() {
+                            run_cabac_encode(
+                                &args.video, &message, &primary_files, &passphrase,
+                                gop_override, args.mux_profile, &output_path,
+                            )?;
+                        } else {
+                            run_cabac_encode_with_shadows(
+                                &args.video, &message, &primary_files, &passphrase,
+                                &shadows, gop_override, args.mux_profile, &output_path,
+                            )?;
+                        }
+                    }
                 }
             }
-            #[cfg(not(feature = "cabac-stego"))]
+            #[cfg(not(any(feature = "openh264-backend", feature = "cabac-stego")))]
             {
                 run_cavlc_encode(&args.video, &file_bytes, &message, &passphrase, &output_path)?;
             }
@@ -434,6 +488,87 @@ fn run_cabac_encode_with_shadows(
                 "warning: chosen --mux-profile dropped audio from input.",
             );
         }
+        Ok(())
+    })();
+
+    for p in cleanup_paths.drain(..) {
+        let _ = std::fs::remove_file(p);
+    }
+    result
+}
+
+/// D.0.1 — production OpenH264-backend stego encode path.
+///
+/// MP4 → ffmpeg → YUV → `openh264_stego_encode_yuv_text` (Phase C.8
+/// visual_recon) → Annex-B → ffmpeg copy-mux → MP4.
+///
+/// Sister of `run_cabac_encode`. Uses the same ffmpeg-based demux +
+/// remux infrastructure (`transcode::probe_video`,
+/// `transcode::decode_to_yuv`), but the encode step routes through
+/// `phasm_core::codec::h264::openh264_stego` instead of the pure-Rust
+/// multigop streaming v2 orchestrator — 1000-4000× faster (see
+/// `docs/design/video/h264/phase-c8-visual-recon-plan.md` §C.8.14).
+///
+/// v1.0 limitations:
+///  - single-domain (CoeffSign only); other 3 domains stay opt-in.
+///  - no file attachments yet (mirrors current `openh264_stego_encode_
+///    yuv_text` surface). Shadows + attachments arrive with D.0.4.
+///  - mux is a simple ffmpeg `-c copy` for now (no L4 stealth profile);
+///    HandBrake/x264 mux profile parity tracked as v1.1 polish.
+#[cfg(feature = "openh264-backend")]
+fn run_oh264_encode(
+    input: &PathBuf,
+    message: &str,
+    passphrase: &str,
+    output: &PathBuf,
+) -> Result<(), CliError> {
+    use phasm_core::codec::h264::openh264_stego::{
+        openh264_stego_encode_yuv_text, EncodeOpts,
+    };
+
+    transcode::ensure_ffmpeg_available()?;
+    let probe = transcode::probe_video(input)?;
+    eprintln!(
+        "Encoding via OpenH264 (production v1.0): {}x{} × {} frames @ {} fps{}",
+        probe.width, probe.height, probe.n_frames, probe.frame_rate,
+        if probe.has_audio { " (with audio)" } else { "" },
+    );
+
+    let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
+    let annex_b_temp = transcode::temp_path_with_ext(input, "h264");
+    let mut cleanup_paths = vec![yuv_temp.clone(), annex_b_temp.clone()];
+
+    let result = (|| -> Result<(), CliError> {
+        transcode::decode_to_yuv(input, &yuv_temp)?;
+        let yuv_bytes = std::fs::read(&yuv_temp)?;
+        let expected =
+            (probe.width as usize) * (probe.height as usize) * 3 / 2 * probe.n_frames;
+        if yuv_bytes.len() != expected {
+            return Err(CliError::InvalidArgs(format!(
+                "ffmpeg-decoded YUV is {} bytes; expected {} ({}x{} × 1.5 × {})",
+                yuv_bytes.len(), expected, probe.width, probe.height, probe.n_frames,
+            )));
+        }
+
+        let opts = EncodeOpts {
+            qp: 26,
+            intra_period: 60,
+        };
+        let annex_b = openh264_stego_encode_yuv_text(
+            &yuv_bytes, probe.width, probe.height, probe.n_frames as u32,
+            opts, message, passphrase,
+        )?;
+        std::fs::write(&annex_b_temp, &annex_b)?;
+
+        // Mux annex-B → MP4 via shared helper. Audio passthrough when
+        // the source has an audio track (§Stealth.L4.5 — parity with
+        // CABAC v2 path). v1.1 polish: route through
+        // `transcode::mux_annexb_to_mp4_with_profile` once the L4
+        // stealth profile is validated against OpenH264 output.
+        let audio_source = probe.has_audio.then_some(input.as_path());
+        transcode::mux_annexb_to_mp4(
+            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        )?;
         Ok(())
     })();
 

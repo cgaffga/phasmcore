@@ -128,10 +128,18 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Phase 6.5 wiring — CABAC v2 decoder path. ffmpeg demuxes MP4 →
-/// Annex-B; phasm-core's `h264_stego_smart_decode_video_with_payload`
-/// walks the CABAC bins for shadow + 4-domain primary recovery and
-/// returns full `PayloadData` (text + attached files).
+/// Phase 6.5 + D.0.1 — H.264 decode dispatch. ffmpeg demuxes MP4 →
+/// Annex-B; tries OpenH264-backend decode first (production v1.0
+/// path), falls back to pure-Rust CABAC v2 decode (`open-h264` +
+/// `rust-h264` produced files are bitstream-distinct — different
+/// stego cover sets — so the right decoder must be selected per-file).
+///
+/// Auto-detection rationale: the user shouldn't have to remember
+/// which encoder produced a file. Try OH264 first (default encoder
+/// in v1.0), then CABAC v2 if that fails with a FrameCorrupted /
+/// invalid-stego error. The decoders fail fast on cross-encoder
+/// input — wrong-cover walks always trip CRC well before any
+/// expensive work.
 #[cfg(feature = "cabac-stego")]
 fn decode_h264_cabac(
     input: &PathBuf,
@@ -142,6 +150,21 @@ fn decode_h264_cabac(
     let result = (|| -> Result<phasm_core::PayloadData, CliError> {
         transcode::extract_annexb_from_mp4(input, &annex_b_temp)?;
         let annex_b = std::fs::read(&annex_b_temp)?;
+
+        // D.0.1 — try OpenH264-backend decoder first (production
+        // default produces OH264 stego streams).
+        #[cfg(feature = "openh264-backend")]
+        {
+            use phasm_core::codec::h264::openh264_stego::openh264_stego_decode_yuv;
+            match openh264_stego_decode_yuv(&annex_b, passphrase) {
+                Ok(payload) => return Ok(payload),
+                Err(_) => {
+                    // Not an OH264-produced stego stream — fall through
+                    // to CABAC v2 decode.
+                }
+            }
+        }
+
         Ok(h264_stego_smart_decode_video_with_payload(&annex_b, passphrase)?)
     })();
     let _ = std::fs::remove_file(&annex_b_temp);

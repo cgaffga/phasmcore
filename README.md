@@ -30,7 +30,7 @@ cargo install phasm-cli
 | `parallel` | [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD costs, STC embedding, Armor decode sweeps. Recommended for native builds. |
 | `video` | H.264 video stego pipeline (decoder + bitstream parsing). |
 | `simd` | Hand-tuned SIMD intrinsics (NEON / AVX2 / WASM SIMD128) for H.264 motion compensation and SATD. |
-| `h264-encoder` | Pure-Rust clean-room H.264 encoder. **OFF by default — only enable when distributing per local jurisdiction's [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent-pool terms.** Source-only consumption is royalty-free; binary distribution above the free tier (currently 100,000 units/year) is not. |
+| `h264-encoder` | Pure-Rust clean-room H.264 encoder. **EXPERIMENTAL — research-only**; production default is OpenH264 (`openh264-backend`). **OFF by default — only enable when distributing per local jurisdiction's [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent-pool terms.** Source-only consumption is royalty-free; binary distribution above the free tier (currently 100,000 units/year) is not. |
 
 ```bash
 cargo add phasm-core --features parallel
@@ -249,17 +249,41 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 
 The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `pixel_width: u32`, `pixel_height: u32`). The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
 
-## Video steganography (in development)
+## Video steganography (H.264)
 
-> **⚠ Work-in-progress and experimental.** Video stego in this crate is
-> active development territory — APIs, default features, and the
-> on-wire stego format are still moving. Visual quality, stealth
-> posture, and round-trip robustness against real-world content all
-> have open follow-on tasks. Not production-ready. Published here for
-> transparency, review, and contributor onboarding; please don't rely
-> on it for anything important yet.
+Phase C (closed 2026-05-14) ships H.264 video stego with two encoder
+backends. The **OpenH264 backend is the v1.0 production default**; the
+pure-Rust encoder remains available as an opt-in EXPERIMENTAL path for
+research and source-only consumers who cannot ship the C++ backend.
 
-Early implementation of H.264 video steganography lives in this crate.
+### Encoder selection
+
+| Backend | CLI flag | Status | 1080p × 30f encode |
+|---------|----------|--------|--------------------|
+| OpenH264 (default) | `--encoder open-h264` | Production | 1.3 s |
+| Pure-Rust (experimental) | `--encoder rust-h264` | EXPERIMENTAL — research-only | ~60 min (extrapolated) |
+
+Per the C.8.14 perf benchmark, OpenH264 stego full is **1365× faster**
+than pure-Rust at 480p × 10f (86 ms vs 117 s), **4114× faster** at
+720p × 16f (370 ms vs 25.4 min), and extrapolates to ~60 min per encode
+at 1080p × 30f on the pure-Rust path versus 1.3 s on OpenH264.
+
+The pure-Rust encoder is shipped for transparency, reviewability, and
+WASM/no-FFI use cases. It is not appropriate for production workflows
+above smoke-test scale and carries known visual-quality and stealth-fingerprint
+gaps versus OpenH264. Use it only when you need a pure-Rust path and
+accept the perf + quality trade-off.
+
+### Bitstream interchange
+
+The two backends emit **bitstream-distinct stego** (different cover
+sets, different CABAC override domains), so files produced by one are
+not interchangeable across decoders. The CLI's `phasm decode`
+auto-detects via try-OH264-then-CABAC-v2 fallback (see
+`core/cli/src/decode.rs::decode_h264_cabac`).
+
+### Pure-Rust pipeline
+
 `stego/video/h264_pipeline.rs` embeds encrypted messages in CAVLC-coded
 Baseline H.264 streams across four domains (trailing-one signs,
 level-suffix magnitude LSBs, level-suffix sign LSBs, motion-vector
@@ -268,26 +292,21 @@ coder are clean-room — derived from ITU-T H.264 spec / ISO/IEC 14496-10
 and published academic literature; numeric tables are transcribed from
 the spec or cited to published sources.
 
-### Optional OpenH264 backend (experimental)
+### OpenH264 backend (v1.0 production default)
 
-The `openh264-backend` Cargo feature provides a second H.264 path: the
+The `openh264-backend` Cargo feature wires in the
 [phasm-openh264](https://github.com/cgaffga/phasm-openh264) fork of
 Cisco's OpenH264 codec (BSD-2-Clause), statically linked via the
 `core-openh264-sys` workspace member. The fork is pinned by SHA in
 `core/openh264-sys/build.rs` and reached via git submodule at
-`vendor/phasm-openh264`.
-
-The backend is **OFF by default** and **not production-wired** (still
-behind the pure-Rust path for `smart_decode`). The fork submodule is
-not carried by phasmcore's source mirror, so `cargo build --features
+`vendor/phasm-openh264`. The fork submodule is not carried by
+phasmcore's source mirror, so `cargo build --features
 openh264-backend` will **build against fail-fast stubs** unless you
 check out the fork separately:
 
 ```bash
 git clone https://github.com/cgaffga/phasmcore.git
 cd phasmcore
-# Optional — without this, openh264-backend builds with stubs that
-# return errors at runtime, and the pure-Rust path still works.
 git clone https://github.com/cgaffga/phasm-openh264.git vendor/phasm-openh264
 git -C vendor/phasm-openh264 checkout $(grep -m1 -oE '[a-f0-9]{40}' core/openh264-sys/build.rs)
 cargo build --features openh264-backend
@@ -326,21 +345,20 @@ explicit; do not enable `h264-encoder` for any binary you intend to
 publish through GitHub Releases or other free-tier-blind channels
 without first reviewing the Via LA AVC license terms.
 
-Not yet shipped in any phasm CLI or mobile-app build at production
-quality. The API and default feature set will change. Both the
-pure-Rust `h264-encoder` path and the experimental `openh264-backend`
-path are work-in-progress. Published here for transparency and review;
-production use is not recommended at this stage.
+Production-ready path (`openh264-backend`) ships with the v1.0 CLI and
+mobile builds; the pure-Rust `h264-encoder` path remains EXPERIMENTAL
+opt-in via `--encoder rust-h264`. The API and default feature set may
+still evolve; published here for transparency and review.
 
 ## Cargo Features
 
 | Feature | Description |
 |---------|-------------|
 | `parallel` | Enables [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD cost computation, STC embedding, and Armor decode sweeps. Recommended for native builds. |
-| `video` | H.264 video stego pipeline (decoder + bitstream parsing). Experimental — see "Video steganography (in development)" above. |
-| `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. Experimental + source-only (AVC patent-pool). |
-| `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. Experimental. |
-| `openh264-backend` | **Experimental** second H.264 path via the `phasm-openh264` fork (BSD-2-Clause). Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). Not production-wired — pure-Rust path is the live extract today. |
+| `video` | H.264 video stego pipeline (decoder + bitstream parsing). See "Video steganography (H.264)" above. |
+| `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. **EXPERIMENTAL — research-only**, ~1365× slower than OpenH264 at 480p × 10f; opt in via `--encoder rust-h264`. Source-only (AVC patent-pool). |
+| `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. EXPERIMENTAL. |
+| `openh264-backend` | **v1.0 production default**. Second H.264 path via the `phasm-openh264` fork (BSD-2-Clause), wired into `phasm decode` as the auto-detect first try. Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
 
 ## CLI
