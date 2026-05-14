@@ -8,20 +8,21 @@
 // should produce byte-identical Annex-B output across host
 // architectures (macOS arm64 / Linux x86_64 / Linux arm64).
 //
-// **Test mode**: this test currently runs in RECORD mode. It computes
-// SHA-256 of the stego Annex-B output and prints `target=<triple>
-// hash=<sha256> length=<bytes>` to stderr. It does NOT assert. The
-// first round of CI runs collects hashes from each arch; a follow-up
-// commit pins them (per-arch if they differ, single constant if they
-// match) and flips the test to ASSERT mode.
+// **Test mode**: ASSERT (since 2026-05-14). The CI matrix run at
+// https://github.com/cgaffga/phasmcore/actions/runs/25868497830
+// confirmed all three architectures (macOS aarch64, Linux x86_64,
+// Linux aarch64) produce a byte-identical 47118-byte Annex-B stream
+// with SHA-256 `35fd85a4...59c1f3e`. The test now asserts this hash
+// strictly; a hash mismatch on any arch is a real regression.
 //
-// **Why a record-then-pin flow**: OpenH264 mainline does NOT guarantee
-// bit-identical encode across architectures. Its SIMD kernels
-// (`codec/encoder/core/x86/` vs `arm64/`) compute motion-estimation
-// costs with different instruction-set widths, which can produce
-// slightly different MV choices on the same input. Whether phasm's
-// stego pipeline (STC + cover-set selection) amplifies or absorbs
-// those differences is an empirical question this test answers.
+// **The empirical answer to cross-arch determinism**: phasm OH264
+// stego output IS bit-identical across SSE/AVX and NEON for this
+// fixture. OpenH264's SIMD kernels (`codec/encoder/core/x86/` vs
+// `arm64/`) compute motion-estimation costs with different
+// instruction widths; on this 480×272 × 4-frame synthetic fixture
+// at QP=26, those differences either don't fire or compose to a
+// byte-identical cover set. C.6.3 (fork-side SIMD non-determinism
+// patches) is therefore not needed — closed as "not required".
 //
 // **Critical: the test must NEVER print binary content to stderr or
 // stdout.** Only text (hash hex, lengths, target triple, pass/fail).
@@ -114,19 +115,31 @@ fn cross_arch_determinism_record_hash() {
     let os = std::env::consts::OS;
 
     // INTENTIONALLY MINIMAL OUTPUT — text only, no binary content.
-    // The CI log captures this line per-arch; pinning happens off
-    // the log values in a follow-up commit.
     eprintln!("target={os}-{arch} stego_len={} sha256={hash_hex}", stego.len());
 
-    // C.6.1 RECORD mode: this test currently does NOT assert. Its job
-    // is to print the hash so the CI workflow log captures a record
-    // per-arch. After collecting hashes across the matrix, a follow-up
-    // commit will:
-    //   1. Add per-arch (or single) pinned hash constants below
-    //   2. Flip this test to ASSERT mode (check current == pinned)
+    // Pinned cross-arch hash. Established 2026-05-14 from a 3-arch
+    // matrix CI run (macOS aarch64 + Linux x86_64 + Linux aarch64);
+    // see workflow run id 25868497830. All three produced this
+    // identical hash + 47118-byte stego.
     //
-    // Until then, the test always passes; the only failure mode is
-    // the encode itself blowing up.
-    assert!(!hash_hex.is_empty(), "hash should be 64 hex chars");
-    assert_eq!(hash_hex.len(), 64);
+    // If this assert ever fires:
+    //   1. Print both hashes so the diff is captured in the log.
+    //   2. Check whether the encoder source has intentionally
+    //      changed (new OH264 fork SHA, new STC parameters, new
+    //      stego pipeline behaviour). If yes, re-record the hash.
+    //   3. If no intentional change, the encoder has become non-
+    //      deterministic on this arch — investigate before merging.
+    const PINNED_SHA256: &str =
+        "35fd85a47bab905d88c1fa96d8910e02d1248cbd17e9527809f5c4f9559c1f3e";
+    const PINNED_LEN: usize = 47118;
+    assert_eq!(
+        stego.len(), PINNED_LEN,
+        "stego length {} on {os}-{arch} differs from pinned {}",
+        stego.len(), PINNED_LEN,
+    );
+    assert_eq!(
+        hash_hex, PINNED_SHA256,
+        "cross-arch determinism regression on {os}-{arch}:\n  \
+         current:  {hash_hex}\n  pinned:   {PINNED_SHA256}",
+    );
 }
