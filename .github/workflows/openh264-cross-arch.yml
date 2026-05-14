@@ -61,9 +61,24 @@ jobs:
             label: linux-arm64
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout (with phasm-openh264 submodule)
+      # phasmcore mirror INTENTIONALLY does not carry the
+      # vendor/phasm-openh264 submodule (per #381 / Phase B.12 — the
+      # mirror is git-archive'd and a missing submodule triggers the
+      # graceful stub build path in core/openh264-sys/build.rs). For
+      # this workflow we need the real fork, so we check it out
+      # explicitly as a sibling at the path build.rs expects
+      # (`../../vendor/phasm-openh264` from `openh264-sys/build.rs`).
+      - name: Checkout phasmcore
         uses: actions/checkout@v4
         with:
+          path: phasmcore
+
+      - name: Checkout phasm-openh264 fork at phasm-stego HEAD
+        uses: actions/checkout@v4
+        with:
+          repository: cgaffga/phasm-openh264
+          ref: phasm-stego
+          path: vendor/phasm-openh264
           submodules: recursive
 
       - name: Toolchain
@@ -83,18 +98,24 @@ jobs:
           brew install meson ninja
           ulimit -c 0
 
-      - name: Show toolchain + matrix label
+      - name: Show toolchain + matrix label + layout
         shell: bash
         run: |
           rustc --version
           cargo --version
           echo "matrix label: ${{ matrix.label }}"
+          echo "fork pinned to: $(git -C vendor/phasm-openh264 rev-parse HEAD)"
+          ls -d phasmcore/openh264-sys vendor/phasm-openh264/codec >/dev/null \
+            && echo "layout: phasmcore/openh264-sys + vendor/phasm-openh264 ✓"
 
       # The actual test. cargo test --no-fail-fast keeps going if a
       # test fails (we want hashes from all matrix legs even if one
       # asserts). --nocapture prints the eprintln hash line into
-      # the job log.
+      # the job log. working-directory is phasmcore/ — build.rs
+      # then resolves `../../vendor/phasm-openh264` to the sibling
+      # checkout above.
       - name: Run determinism hash-record
+        working-directory: phasmcore
         shell: bash
         run: |
           ulimit -c 0
@@ -111,10 +132,12 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf core/target target
-          # Note: the meson static-lib build dir lives inside the
-          # cargo OUT_DIR (target/release/build/core-openh264-sys-*/out/openh264-static)
-          # so the rm above already covers it. Listed here for clarity.
+          rm -rf phasmcore/target vendor/phasm-openh264
+          # The meson static-lib build dir lives inside the cargo
+          # OUT_DIR (phasmcore/target/release/build/core-openh264-sys-*/
+          # out/openh264-static); the rm above covers it. We also wipe
+          # the fork checkout (no need to persist OH264 source between
+          # jobs, and the runner VM is destroyed regardless).
 
       # EXPLICITLY ABSENT:
       #   - actions/upload-artifact (would persist build outputs)
