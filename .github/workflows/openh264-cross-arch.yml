@@ -85,17 +85,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Native build deps for the phasm-openh264 fork via meson+ninja.
-      - name: Install meson + ninja (Linux)
+      # nasm is required on x86_64 (OpenH264 has hand-written assembly
+      # in codec/common/x86/); harmless extra package on arm64.
+      - name: Install meson + ninja + nasm (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends meson ninja-build
+          sudo apt-get install -y --no-install-recommends meson ninja-build nasm
           ulimit -c 0     # disable core dumps; no crash binaries on disk
 
-      - name: Install meson + ninja (macOS)
+      - name: Install meson + ninja + nasm (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install meson ninja
+          brew install meson ninja nasm
           ulimit -c 0
 
       - name: Show toolchain + matrix label + layout
