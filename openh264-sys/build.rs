@@ -266,6 +266,22 @@ fn main() {
             // via determinism SHA (PSNR is inherently nondeterministic
             // per crypto::encrypt's random salt/nonce). Closes #449.
             "9037076df60dab0e47fd7b69e61ad612a0708ef9",
+            // 2026-05-16: C.9.0 (#482) Pass-1 visual_recon disable + C.9.2
+            // (#450) Deblock skip-on-clean. Adds two new libcommon globals
+            // (`g_phasm_dual_recon_enabled` default 1, `g_phasm_slice_over
+            // ride_count`) with setters/getters exposed via wels_stego.h
+            // (public, for shim) and wels_stego_internal.h (internal). The
+            // setter `phasm_set_dual_recon_enabled(0)` BEFORE InitializeExt
+            // skips the InitDqLayers pVisualRef[] mirror-pool allocation —
+            // pVisualDecPic/pVisualRecPic stay NULL and every per-MB mirror
+            // site + the C.8.8 dual deblock pass short-circuits via the
+            // existing NULL guards. The override counter is incremented in
+            // the apply_*_hooks return-1 site and read in DeblockingFilter
+            // SliceAvcbase to skip the C.8.8 second pass on all-clean
+            // slices (counter==0). Bitstream byte-identical to baseline C.8
+            // in all operating modes — pVisualRecPic is encoder-internal
+            // and never participates in mode decision or CABAC emission.
+            "94539c43b594a8433b75f985361a3faa86f53bbb",
         ];
         let head_output = Command::new("git")
             .arg("-C")

@@ -43,7 +43,8 @@ use core_openh264_sys::{
     phasm_decoder_create, phasm_decoder_decode_frame, phasm_decoder_destroy,
     phasm_decoder_flush_frame, phasm_decoder_frames_remaining, phasm_decoder_initialize,
     phasm_decoder_initialize_with_options, phasm_encoder_create, phasm_encoder_destroy,
-    phasm_encoder_encode_frame, phasm_encoder_initialize, phasm_encoder_uninitialize,
+    phasm_encoder_encode_frame, phasm_encoder_initialize,
+    phasm_encoder_set_dual_recon_enabled, phasm_encoder_uninitialize,
     PhasmDecoderHandle, PhasmEncoderHandle, PhasmStegoCallbacks, PhasmStegoMdCost, PhasmStegoPos,
     WelsRegisterPhasmStegoCallbacks, WelsStegoAbiVersion, WelsStegoSetFrameNum, PHASM_FRAME_IDR,
     PHASM_FRAME_P, PHASM_STEGO_ABI_VERSION,
@@ -487,11 +488,43 @@ impl Encoder {
     /// frames; pass a value larger than your total frame count to get
     /// one IDR followed by P-frames only).
     pub fn new(width: i32, height: i32, qp: i32, gop_size: i32) -> Result<Self, EncoderError> {
+        Self::new_with_dual_recon(width, height, qp, gop_size, true)
+    }
+
+    /// C.9.0 (#482) — construct + initialize the encoder with optional
+    /// dual_recon (visual_recon mirror pool) disable.
+    ///
+    /// `dual_recon=false` skips the entire `pVisualRef[]` allocation in
+    /// `InitDqLayers` and leaves `pVisualRecPic` / `pVisualDecPic` NULL,
+    /// short-circuiting every per-MB mirror write and the C.8.8 second
+    /// deblock pass via the existing NULL guards. The bitstream is
+    /// byte-identical to the `dual_recon=true` run because the mirror is
+    /// purely encoder-internal — mode decision and bitstream emission
+    /// both run off `pDecPic`.
+    ///
+    /// Use this for the Pass-1 cover probe where the bitstream is walked
+    /// then discarded (no mp4 mux, no fsnr observation needed). Pass-2
+    /// production should leave `dual_recon=true` so visual_recon mirrors
+    /// are populated for the C.8 cascade-break.
+    pub fn new_with_dual_recon(
+        width: i32,
+        height: i32,
+        qp: i32,
+        gop_size: i32,
+        dual_recon: bool,
+    ) -> Result<Self, EncoderError> {
         let handle = unsafe { phasm_encoder_create() };
         if handle.is_null() {
             return Err(EncoderError::CreateFailed);
         }
+        // Toggle the fork's dual_recon flag BEFORE InitializeExt so
+        // InitDqLayers reads the new value. The flag is a process global;
+        // serialize concurrent encoder constructions externally.
+        unsafe { phasm_encoder_set_dual_recon_enabled(if dual_recon { 1 } else { 0 }) };
         let rv = unsafe { phasm_encoder_initialize(handle, width, height, qp, gop_size) };
+        // Restore default (enabled) so subsequent encoders don't inherit
+        // the disabled state by accident.
+        unsafe { phasm_encoder_set_dual_recon_enabled(1) };
         if rv != 0 {
             unsafe { phasm_encoder_destroy(handle) };
             return Err(EncoderError::InitializeFailed(rv));

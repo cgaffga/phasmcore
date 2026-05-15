@@ -82,6 +82,17 @@ int32_t phasm_encoder_encode_frame(
     int32_t out_buf_capacity,
     int32_t* out_bytes_written);
 
+/* C.9.0 (#482) — toggle the encoder fork's dual_recon (pVisualRef[] mirror
+ * pool) before InitializeExt. enabled=0 skips ALL visual_recon allocation
+ * and downstream mirror writes; the resulting bitstream is byte-identical
+ * to the dual_recon-enabled run (mirror is internal-only — encoder
+ * reference and bitstream emission both run off pDecPic). Used by the
+ * Pass-1 cover probe (whose bitstream is walked then discarded). Pass-2
+ * production encodes leave the flag at its default (enabled=1). The flag
+ * is a process global — set it BEFORE phasm_encoder_initialize so the
+ * fork's InitDqLayers reads the current value. */
+void phasm_encoder_set_dual_recon_enabled(int32_t enabled);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

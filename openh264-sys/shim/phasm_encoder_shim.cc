@@ -8,6 +8,7 @@
 #include "codec_api.h"
 #include "codec_app_def.h"
 #include "codec_def.h"
+#include "wels_stego.h"  // phasm: C.9.0 phasm_set_dual_recon_enabled (#482)
 
 #include <cstring>
 #include <new>
@@ -160,4 +161,12 @@ extern "C" int32_t phasm_encoder_encode_frame(
   }
   *out_bytes_written = total;
   return info.eFrameType;
+}
+
+extern "C" void phasm_encoder_set_dual_recon_enabled(int32_t enabled) {
+  /* Direct passthrough to the fork's libcommon global. No handle needed —
+   * the flag is a process-wide setting consulted by InitDqLayers on the
+   * NEXT encoder init. Caller must set it BEFORE phasm_encoder_initialize.
+   */
+  phasm_set_dual_recon_enabled(enabled);
 }

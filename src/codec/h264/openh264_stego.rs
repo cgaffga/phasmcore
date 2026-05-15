@@ -173,6 +173,10 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
+    // Pass 1: cover probe. No overrides will fire, pVisualRecPic is not
+    // needed (bitstream is walked then discarded). C.9.0 (#482) disables
+    // the entire visual_recon mirror pool for this pass — ~30-50% encode
+    // wall-clock savings, byte-identical bitstream.
     let baseline_bitstream = encode_once(
         yuv, width, height, n_frames, opts,
         override_map.clone(),
@@ -180,6 +184,7 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
         applied.clone(),
         mb_width,
         mb_per_frame,
+        /* dual_recon = */ false,
     )?;
     let baseline_walk = walk_annex_b_for_cover(&baseline_bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
@@ -225,11 +230,14 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
         }
     }
 
-    // Re-encode with overrides.
+    // Pass 2: stego encode with overrides. C.8 cascade-break needs the
+    // visual_recon mirror so pDecPic stays clean for next-frame ME —
+    // dual_recon=true here.
     encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
         mb_width, mb_per_frame,
+        /* dual_recon = */ true,
     )
 }
 
@@ -336,10 +344,14 @@ pub fn openh264_stego_capacity_yuv(
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
 
+    // C.9.0 (#482): capacity probe is a pure cover-walk; bitstream
+    // discarded immediately. Disable dual_recon to skip visual_recon
+    // mirror work — byte-identical bitstream.
     let bitstream = encode_once(
         yuv, width, height, n_frames, opts,
         empty_map, mb_type_table, applied,
         mb_width, mb_per_frame,
+        /* dual_recon = */ false,
     )?;
     let walk = walk_annex_b_for_cover(&bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
@@ -375,10 +387,14 @@ pub(crate) fn count_cover_bits_for_gop(
     let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    // C.9.0 (#482): per-GOP cover-bits probe — bitstream discarded after
+    // the walk. Disable dual_recon for the same reason as the capacity
+    // probe above.
     let bitstream = encode_once(
         gop_yuv, width, height, n_frames, opts,
         empty_map, mb_type_table, applied,
         mb_width, mb_per_frame,
+        /* dual_recon = */ false,
     )?;
     let walk = walk_annex_b_for_cover(&bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
@@ -415,6 +431,12 @@ fn encode_once(
     applied: Arc<Mutex<u32>>,
     mb_width: u32,
     mb_per_frame: usize,
+    // C.9.0 (#482): false on the Pass-1 cover probe (no overrides will
+    // fire; pVisualRecPic isn't needed because the bitstream is walked
+    // then discarded). true on Pass-2 stego where C.8 cascade-break needs
+    // the mirror to keep pDecPic clean. Bitstream is byte-identical
+    // either way — pVisualRecPic is encoder-internal.
+    dual_recon: bool,
 ) -> Result<Vec<u8>, StegoError> {
     // Reset per-encode state.
     {
@@ -476,7 +498,7 @@ fn encode_once(
         .map_err(|e| StegoError::InvalidVideo(format!("openh264 session: {e}")))?;
 
     let mut encoder =
-        Encoder::new(width as i32, height as i32, opts.qp, opts.intra_period)
+        Encoder::new_with_dual_recon(width as i32, height as i32, opts.qp, opts.intra_period, dual_recon)
             .map_err(encoder_err_to_stego)?;
 
     let frame_y = (width * height) as usize;

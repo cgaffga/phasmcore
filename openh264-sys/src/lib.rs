@@ -576,6 +576,14 @@ unsafe extern "C" {
         out_buf_capacity: i32,
         out_bytes_written: *mut i32,
     ) -> i32;
+
+    /// C.9.0 (#482) — toggle dual_recon (pVisualRef[] mirror pool) before
+    /// `phasm_encoder_initialize`. enabled=0 skips ALL visual_recon work
+    /// for the next encoder instance; the resulting bitstream is byte-
+    /// identical to the dual_recon-enabled run (mirror is encoder-internal
+    /// only). Used by the Pass-1 cover probe path. Process-global —
+    /// caller serializes encoder instances.
+    pub fn phasm_encoder_set_dual_recon_enabled(enabled: i32);
 }
 
 // ---------------------------------------------------------------------
