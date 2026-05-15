@@ -125,7 +125,6 @@ pub fn openh264_stego_encode_yuv_string(
     let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
     let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
     let frame_bits = bytes_to_bits_msb_first(&frame_bytes);
-    let m_total = frame_bits.len();
 
     // 2. Derive the per-domain hhat seed from passphrase.
     let keys = CabacStegoMasterKeys::derive(passphrase)?;
@@ -133,10 +132,43 @@ pub fn openh264_stego_encode_yuv_string(
         .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
         .hhat_seed;
 
-    // 3. Baseline encode + walker for cover capture.
+    // 3-6. Per-chunk 2-pass: baseline encode → walk → STC → stego encode.
+    encode_yuv_with_pre_framed_bits(yuv, width, height, n_frames, opts, &frame_bits, &hhat_seed)
+}
+
+/// D.0.7.2 — exposed core of the OH264 stego encode for the streaming
+/// session. Takes already-framed-and-encrypted payload bits + the
+/// passphrase-derived STC seed, runs the 2-pass (baseline encode →
+/// walker → STC plan → stego encode), returns the stego Annex-B.
+///
+/// The one-shot wrapper [`openh264_stego_encode_yuv_string`] computes
+/// `frame_bits` from a UTF-8 message + AES-256-GCM-SIV encryption +
+/// phasm v1 frame format. The streaming session (per-GOP) computes
+/// the same bits but with an additional `chunk_frame` header
+/// (`stego::chunk_frame`) wrapping the chunk-of-payload-bytes.
+///
+/// # Errors
+/// * [`StegoError::InvalidVideo`] — dims not 16-aligned, yuv length
+///   wrong, cover empty, or encoder failure.
+/// * [`StegoError::MessageTooLarge`] — `n_cover / m_total < 1`
+///   (chunk too big for this carrier).
+pub(crate) fn encode_yuv_with_pre_framed_bits(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    frame_bits: &[u8],
+    hhat_seed: &[u8; 32],
+) -> Result<Vec<u8>, StegoError> {
+    validate_dims(yuv, width, height, n_frames)?;
+    let m_total = frame_bits.len();
+
+    // Baseline encode + walker for cover capture.
     let mb_width = width / 16;
     let mb_height = height / 16;
     let mb_per_frame = (mb_width * mb_height) as usize;
+    let _ = mb_height; // dim sanity already done in validate_dims
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -172,13 +204,13 @@ pub fn openh264_stego_encode_yuv_string(
     let used_cover = m_total * w;
     let cover_slice: Vec<u8> = baseline_bits[..used_cover].to_vec();
 
-    // 4. STC plan.
+    // STC plan.
     let costs: Vec<f32> = vec![1.0; used_cover];
-    let hhat = generate_hhat(STC_H, w, &hhat_seed);
-    let plan = stc_embed(&cover_slice, &costs, &frame_bits, &hhat, STC_H, w)
+    let hhat = generate_hhat(STC_H, w, hhat_seed);
+    let plan = stc_embed(&cover_slice, &costs, frame_bits, &hhat, STC_H, w)
         .ok_or(StegoError::MessageTooLarge)?;
 
-    // 5. Build the override map keyed by canonical PositionKey::raw().
+    // Build the override map keyed by canonical PositionKey::raw().
     let mut overrides_map: HashMap<u64, u8> = HashMap::new();
     for i in 0..used_cover {
         if plan.stego_bits[i] != cover_slice[i] {
@@ -193,17 +225,20 @@ pub fn openh264_stego_encode_yuv_string(
         }
     }
 
-    // 6. Re-encode with overrides.
-    let stego_bitstream = encode_once(
+    // Re-encode with overrides.
+    encode_once(
         yuv, width, height, n_frames, opts,
-        override_map,
-        mb_type_table,
-        applied,
-        mb_width,
-        mb_per_frame,
-    )?;
+        override_map, mb_type_table, applied,
+        mb_width, mb_per_frame,
+    )
+}
 
-    Ok(stego_bitstream)
+/// D.0.7.2 — expose the MSB-first byte→bit helper for the streaming
+/// session to convert its per-chunk `chunk_frame` + inner-stego-frame
+/// concatenation into bits before calling
+/// [`encode_yuv_with_pre_framed_bits`].
+pub(crate) fn bytes_to_bits_msb_first_pub(bytes: &[u8]) -> Vec<u8> {
+    bytes_to_bits_msb_first(bytes)
 }
 
 /// Convenience entry: encode a text-only message (no file attachments).
@@ -314,6 +349,40 @@ pub fn openh264_stego_capacity_yuv(
         cover_bits,
         max_message_bytes,
     })
+}
+
+/// #424 D.0.6 — per-GOP cover-bits probe for the streaming capacity
+/// session. Encodes the given YUV chunk through the OH264 fork in
+/// baseline mode (no overrides applied) and walks the emitted Annex-B
+/// for CoeffSign cover positions. Returns the cover-bit count for the
+/// chunk.
+///
+/// Used by `StreamingProbeSession::push_frame` once per GOP. The
+/// emitted bitstream is discarded — only the position count matters.
+/// Cost is ~equal to the actual stego encode's first pass (the STC
+/// plan + override application is what makes the second pass slow,
+/// not the OH264 encode itself).
+pub(crate) fn count_cover_bits_for_gop(
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+) -> Result<usize, StegoError> {
+    validate_dims(gop_yuv, width, height, n_frames)?;
+    let mb_width = width / 16;
+    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let bitstream = encode_once(
+        gop_yuv, width, height, n_frames, opts,
+        empty_map, mb_type_table, applied,
+        mb_width, mb_per_frame,
+    )?;
+    let walk = walk_annex_b_for_cover(&bitstream)
+        .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
+    Ok(walk.cover.coeff_sign_bypass.bits.len())
 }
 
 // ---------- internals ----------

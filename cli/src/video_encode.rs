@@ -522,14 +522,15 @@ fn run_oh264_encode(
     passphrase: &str,
     output: &PathBuf,
 ) -> Result<(), CliError> {
-    use phasm_core::codec::h264::openh264_stego::{
-        openh264_stego_encode_yuv_text, EncodeOpts,
+    use phasm_core::{
+        ColorParams, EncodeEngineChoice, EncodeSessionParams,
+        StreamingEncodeSession, YuvFrameRef,
     };
 
     transcode::ensure_ffmpeg_available()?;
     let probe = transcode::probe_video(input)?;
     eprintln!(
-        "Encoding via OpenH264 (production v1.0): {}x{} × {} frames @ {} fps{}",
+        "Encoding via OpenH264 (streaming, production v1.0): {}x{} × {} frames @ {} fps{}",
         probe.width, probe.height, probe.n_frames, probe.frame_rate,
         if probe.has_audio { " (with audio)" } else { "" },
     );
@@ -539,6 +540,11 @@ fn run_oh264_encode(
     let mut cleanup_paths = vec![yuv_temp.clone(), annex_b_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
+        // ffmpeg writes the whole decoded YUV to a temp file. Memory-
+        // optimal streaming via stdin-pipe is tracked as a v1.1 polish;
+        // for v1.0 we mmap-read the YUV file once and iterate per-frame
+        // slices into the streaming session, which keeps the encoder's
+        // own working set bounded to O(gop_size × frame).
         transcode::decode_to_yuv(input, &yuv_temp)?;
         let yuv_bytes = std::fs::read(&yuv_temp)?;
         let expected =
@@ -550,14 +556,58 @@ fn run_oh264_encode(
             )));
         }
 
-        let opts = EncodeOpts {
-            qp: 26,
-            intra_period: 60,
+        // Parse fps string ("30/1", "30000/1001") into rational
+        // numerator/denominator for the SPS time_scale fields.
+        let (fps_num, fps_den) = transcode::parse_frame_rate(&probe.frame_rate);
+
+        // Per-GOP STC isolation. Match mobile's DEFAULT_GOP=30 so
+        // CLI- and mobile-encoded files have identical structure.
+        const QP: i32 = 26;
+        const GOP_SIZE: u32 = 30;
+
+        let params = EncodeSessionParams {
+            width: probe.width,
+            height: probe.height,
+            fps_num,
+            fps_den,
+            qp: QP,
+            gop_size: GOP_SIZE,
+            total_frames_hint: probe.n_frames as u32,
+            // Default BT.709 limited; CLI doesn't probe VUI from ffprobe
+            // yet — v1.1 polish to add `color_primaries` / `transfer` /
+            // `matrix` / `range` parsing from ffprobe output.
+            color: ColorParams::default(),
+            engine: EncodeEngineChoice::Oh264,
         };
-        let annex_b = openh264_stego_encode_yuv_text(
-            &yuv_bytes, probe.width, probe.height, probe.n_frames as u32,
-            opts, message, passphrase,
-        )?;
+        let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
+
+        let frame_bytes = (probe.width as usize) * (probe.height as usize) * 3 / 2;
+        let chroma_w = (probe.width as usize) / 2;
+        let chroma_h = (probe.height as usize) / 2;
+        let y_plane_size = (probe.width as usize) * (probe.height as usize);
+        let chroma_plane_size = chroma_w * chroma_h;
+
+        let mut annex_b: Vec<u8> = Vec::with_capacity(yuv_bytes.len() / 8);
+        for frame_idx in 0..probe.n_frames {
+            let frame_off = frame_idx * frame_bytes;
+            let y_start = frame_off;
+            let y_end = y_start + y_plane_size;
+            let u_end = y_end + chroma_plane_size;
+            let v_end = u_end + chroma_plane_size;
+            let frame = YuvFrameRef {
+                y: &yuv_bytes[y_start..y_end],
+                y_stride: probe.width as usize,
+                u: &yuv_bytes[y_end..u_end],
+                u_stride: chroma_w,
+                v: &yuv_bytes[u_end..v_end],
+                v_stride: chroma_w,
+            };
+            session.push_frame(frame, &mut annex_b)?;
+        }
+        // Drain the final partial GOP (consumes the session).
+        session.finish(&mut annex_b)?;
+        drop(yuv_bytes); // free YUV before mux
+
         std::fs::write(&annex_b_temp, &annex_b)?;
 
         // Mux annex-B → MP4 via shared helper. Audio passthrough when

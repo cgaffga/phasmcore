@@ -151,8 +151,33 @@ fn decode_h264_cabac(
         transcode::extract_annexb_from_mp4(input, &annex_b_temp)?;
         let annex_b = std::fs::read(&annex_b_temp)?;
 
-        // D.0.1 — try OpenH264-backend decoder first (production
-        // default produces OH264 stego streams).
+        // D.0.7.13 — try the streaming decode session first. This
+        // handles the new chunk_frame wire format produced by
+        // `run_oh264_encode` (and by the mobile bridges). Falls
+        // through to the legacy OH264 + CABAC v2 decoders on
+        // failure, so files produced by older versions or by the
+        // experimental `--encoder rust-h264` path still decode.
+        {
+            use phasm_core::StreamingDecodeSession;
+            if let Ok(mut session) = StreamingDecodeSession::create(passphrase) {
+                if session.push_annex_b(&annex_b).is_ok() {
+                    if let Ok(res) = session.finish() {
+                        // Streaming decode currently returns text +
+                        // mode_id; surface as a PayloadData with no
+                        // attachments. Attached-file streaming-decode
+                        // recovery tracked as v1.1 polish.
+                        return Ok(phasm_core::PayloadData {
+                            text: res.text,
+                            files: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // D.0.1 — fall back to the legacy OpenH264-backend decoder
+        // (handles older OH264-produced stego streams from before
+        // the streaming chunk_frame format landed).
         #[cfg(feature = "openh264-backend")]
         {
             use phasm_core::codec::h264::openh264_stego::openh264_stego_decode_yuv;

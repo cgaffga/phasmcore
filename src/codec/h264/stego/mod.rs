@@ -14,6 +14,7 @@
 //! and `cabac-bypass-bin-stego.md` for the bin-by-bin invariant proofs.
 
 pub mod cascade_safety;
+pub mod chunk_frame;
 pub mod cost_model;
 pub mod cover_replay;
 pub mod decode_pixels;

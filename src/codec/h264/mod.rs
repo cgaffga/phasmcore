@@ -65,6 +65,14 @@ pub mod openh264;
 #[cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
 pub mod openh264_stego;
 
+/// D.0.7 — streaming H.264 stego session API. Engine-agnostic surface
+/// that mobile bridges expose via FFI; internally dispatches to the
+/// OH264 backend or the pure-Rust encoder based on `EncodeEngineChoice`.
+/// Per-GOP STC, bounded memory, arbitrary clip length. Design memo
+/// at `docs/design/video/h264/d07-streaming-sessions.md`.
+#[cfg(feature = "h264-encoder")]
+pub mod streaming_session;
+
 use std::fmt;
 
 /// H.264/AVC parsing error.

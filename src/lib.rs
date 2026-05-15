@@ -64,6 +64,17 @@ pub use stego::video::{
 // `StreamingEncoder` is the per-frame stateful API used by the mobile
 // bridges; `transcode_yuv_to_baseline_cavlc_h264` is the one-shot
 // convenience wrapper for tests / CLI / batch contexts.
+// D.0.7 — streaming H.264 stego session API (engine-agnostic).
+// Mobile bridges + CLI consume these directly; they own the per-GOP
+// state machine + chunk_frame wire format. Design memo:
+// `docs/design/video/h264/d07-streaming-sessions.md`.
+#[cfg(feature = "h264-encoder")]
+pub use codec::h264::streaming_session::{
+    CapacityProbeResult, ColorParams, DecodeSessionResult, EncodeEngineChoice,
+    EncodeSessionParams, StreamingDecodeSession, StreamingEncodeSession,
+    StreamingProbeSession, YuvFrameRef,
+};
+
 #[cfg(feature = "h264-encoder")]
 pub use codec::h264::encoder::baseline_transcode::{
     BaselineTranscodeConfig, StreamingEncoder, transcode_yuv_to_baseline_cavlc_h264,
