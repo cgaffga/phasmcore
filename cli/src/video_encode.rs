@@ -7,6 +7,7 @@ use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
 use crate::transcode;
+#[cfg(not(any(feature = "openh264-backend", feature = "cabac-stego")))]
 use phasm_core::{detect_video_codec, VideoCodec};
 #[cfg(not(feature = "cabac-stego"))]
 use phasm_core::h264_ghost_encode;
@@ -224,59 +225,60 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
 
     let start = Instant::now();
 
-    // Phase 6.5 wiring: with `--features cabac-stego`, the CLI routes
-    // through the CABAC v2 streaming orchestrator (matches mobile
-    // bridges). Without that feature it stays on the legacy CAVLC
-    // bitstream-mod path. ffmpeg handles MP4 demux + remux for the
-    // CABAC path; phasm-core has no built-in H.264 → YUV decoder.
-    let file_bytes = std::fs::read(&args.video)?;
-    match detect_video_codec(&file_bytes) {
-        VideoCodec::H264 => {
-            #[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
-            {
-                let encoder = args.encoder;
-                match encoder {
-                    #[cfg(feature = "openh264-backend")]
-                    EncoderChoice::OpenH264 => {
-                        drop(file_bytes); // re-read inside run_oh264_encode
-                        run_oh264_encode(&args.video, &message, &passphrase, &output_path)?;
-                    }
-                    EncoderChoice::RustH264 => {
-                        drop(file_bytes); // re-read inside run_cabac_encode
-                        let primary_files = load_files(&args.attach)?;
-                        let shadows = collect_shadows(&args)?;
-                        let gop_override = args.gop_size;
-                        if shadows.is_empty() {
-                            run_cabac_encode(
-                                &args.video, &message, &primary_files, &passphrase,
-                                gop_override, args.mux_profile, &output_path,
-                            )?;
-                        } else {
-                            run_cabac_encode_with_shadows(
-                                &args.video, &message, &primary_files, &passphrase,
-                                &shadows, gop_override, args.mux_profile, &output_path,
-                            )?;
-                        }
-                    }
+    // D.0.7.14 — encoder routing.
+    //
+    // OH264 and CABAC v2 paths use ffmpeg to demux + decode the
+    // source to raw YUV before the encode pipeline ever sees it, so
+    // they accept any ffmpeg-decodable codec (H.264, HEVC, ProRes,
+    // VP9, AV1, …). The legacy CAVLC bitstream-mod path
+    // (`run_cavlc_encode`) edits the parsed Annex-B in place and
+    // therefore still requires an H.264 input.
+    #[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
+    {
+        let encoder = args.encoder;
+        match encoder {
+            #[cfg(feature = "openh264-backend")]
+            EncoderChoice::OpenH264 => {
+                run_oh264_encode(&args.video, &message, &passphrase, &output_path)?;
+            }
+            EncoderChoice::RustH264 => {
+                let primary_files = load_files(&args.attach)?;
+                let shadows = collect_shadows(&args)?;
+                let gop_override = args.gop_size;
+                if shadows.is_empty() {
+                    run_cabac_encode(
+                        &args.video, &message, &primary_files, &passphrase,
+                        gop_override, args.mux_profile, &output_path,
+                    )?;
+                } else {
+                    run_cabac_encode_with_shadows(
+                        &args.video, &message, &primary_files, &passphrase,
+                        &shadows, gop_override, args.mux_profile, &output_path,
+                    )?;
                 }
             }
-            #[cfg(not(any(feature = "openh264-backend", feature = "cabac-stego")))]
-            {
+        }
+    }
+    #[cfg(not(any(feature = "openh264-backend", feature = "cabac-stego")))]
+    {
+        let file_bytes = std::fs::read(&args.video)?;
+        match detect_video_codec(&file_bytes) {
+            VideoCodec::H264 => {
                 run_cavlc_encode(&args.video, &file_bytes, &message, &passphrase, &output_path)?;
             }
-        }
-        VideoCodec::Hevc => {
-            return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                format!(
-                    "HEVC/H.265 video stego is archived. Transcode first:\n  {}",
-                    transcode::TRANSCODE_SUGGESTION
-                ),
-            )));
-        }
-        VideoCodec::Unknown => {
-            return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                "unsupported or unrecognised video codec (expected H.264)".into(),
-            )));
+            VideoCodec::Hevc => {
+                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                    format!(
+                        "HEVC/H.265 video stego is archived. Transcode first:\n  {}",
+                        transcode::TRANSCODE_SUGGESTION
+                    ),
+                )));
+            }
+            VideoCodec::Unknown => {
+                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                    "unsupported or unrecognised video codec (expected H.264)".into(),
+                )));
+            }
         }
     }
     let elapsed = start.elapsed();

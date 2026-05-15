@@ -248,6 +248,24 @@ fn main() {
             // b8_full_translation_validates re-verified green against
             // this SHA before pinning.
             "a3280294f04fae95c4f09e1fa37fa9b62a64054f",
+            // 2026-05-15: C.9.1 Path A v1 — per-MB skip-on-clean for
+            // I_16x16 + I_4x4 dual-recon. `phasm_dr_dirty` OR-accumulates
+            // every coeff-hook return; non-dirty MBs skip the
+            // dequant+IDCT recompute branch (encoder pPred already holds
+            // the clean recon when no flip fired). Byte-exact via 3 gates
+            // (round-trip, cross-arch SHA, visual PSNR). P-frame inter
+            // sites deferred to Path A v2 in the same #449.
+            "e0db3d6a3a86d3f607dc1c382fefbbe80fde2253",
+            // 2026-05-15: C.9.1 Path A v2 — per-MB skip-on-clean extends
+            // to P-frame inter (HOOK-F) + chroma DC/AC (HOOK-C/G). New
+            // globals `g_phasm_p_luma_dirty` + `g_phasm_chroma_dirty[2]`
+            // in libcommon; consume site in svc_encode_slice.cpp's
+            // OutputPMbWithoutConstructCsRsNoCopy branch gates the
+            // snapshot/restore/re-IDCT/mirror dance on (luma_dirty ||
+            // chroma_cb || chroma_cr || mv_override_active). Byte-exact
+            // via determinism SHA (PSNR is inherently nondeterministic
+            // per crypto::encrypt's random salt/nonce). Closes #449.
+            "9037076df60dab0e47fd7b69e61ad612a0708ef9",
         ];
         let head_output = Command::new("git")
             .arg("-C")
