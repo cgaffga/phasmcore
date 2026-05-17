@@ -789,31 +789,24 @@ fn phase_1_1_d_v4_cascade_probe_30f() {
     // measurements showed -7.37 dB on V4 = (B_RDO=1, B_RES=1) at
     // 12f gop=12 (memory/h264_stego_b_cascade_2026_05_05.md).
     // §B-direct-fix Stage 2 ROOT-CAUSE FIX 2026-05-06 — also mux
-    // 1080p stego + clean to Desktop for visual inspection. Same
-    // pattern as 480p variant.
-    let stego_h264 = std::env::temp_dir().join("phasm_v4_probe_stego.h264");
-    let desktop_mp4 = std::path::Path::new(
-        "/Users/cgaffga/Desktop/phasm_v4_cascade_1080p_stego.mp4"
-    );
-    let _ = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-fflags", "+genpts", "-i"])
-        .arg(&stego_h264)
-        .args(["-c:v", "copy"])
-        .arg(desktop_mp4)
-        .status();
-    eprintln!("muxed stego mp4 → {}", desktop_mp4.display());
-
-    let clean_h264 = std::env::temp_dir().join("phasm_v4_probe_clean.h264");
-    let desktop_clean_mp4 = std::path::Path::new(
-        "/Users/cgaffga/Desktop/phasm_v4_cascade_1080p_clean.mp4"
-    );
-    let _ = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-fflags", "+genpts", "-i"])
-        .arg(&clean_h264)
-        .args(["-c:v", "copy"])
-        .arg(desktop_clean_mp4)
-        .status();
-    eprintln!("muxed clean mp4 → {}", desktop_clean_mp4.display());
+    // 1080p stego + clean to Desktop for visual inspection.
+    // #234 (2026-05-16): muxed through phasm's HandbrakeX264 profile
+    // for proper ctts box / display-order PTS (replacing the legacy
+    // bare `ffmpeg -c:v copy` which couldn't derive PTS from raw .h264).
+    use phasm_core::codec::mp4::build::{build_mp4_with_pattern, FrameTiming, MuxerProfile};
+    let timing = FrameTiming::FPS_30;
+    let stego_mp4 = build_mp4_with_pattern(
+        MuxerProfile::HandbrakeX264, &stego_bs, width, height, timing, pattern, n_frames,
+    ).expect("stego mp4 mux");
+    let clean_mp4 = build_mp4_with_pattern(
+        MuxerProfile::HandbrakeX264, &clean_bs, width, height, timing, pattern, n_frames,
+    ).expect("clean mp4 mux");
+    let stego_mp4_path = "/Users/cgaffga/Desktop/phasm_v4_cascade_1080p_stego.mp4";
+    let clean_mp4_path = "/Users/cgaffga/Desktop/phasm_v4_cascade_1080p_clean.mp4";
+    std::fs::write(stego_mp4_path, &stego_mp4).expect("write stego mp4");
+    std::fs::write(clean_mp4_path, &clean_mp4).expect("write clean mp4");
+    eprintln!("muxed stego mp4 → {}", stego_mp4_path);
+    eprintln!("muxed clean mp4 → {}", clean_mp4_path);
 
     eprintln!(
         "\nPhase 1.1.D verdict: avg cost = {:+.2} dB, target ≥ -2.00 dB, {}",
@@ -970,29 +963,24 @@ fn phase_1_1_d_v4_cascade_probe_480p_12f() {
         avg_stego, avg_clean, avg_cost,
     );
 
-    let stego_h264 = std::env::temp_dir().join("phasm_v4_probe_480p_stego.h264");
-    let desktop_mp4 = std::path::Path::new(
-        "/Users/cgaffga/Desktop/phasm_v4_cascade_480p_stego.mp4"
-    );
-    let _ = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-fflags", "+genpts", "-i"])
-        .arg(&stego_h264)
-        .args(["-c:v", "copy"])
-        .arg(desktop_mp4)
-        .status();
-    eprintln!("muxed stego mp4 → {}", desktop_mp4.display());
-
-    let clean_h264 = std::env::temp_dir().join("phasm_v4_probe_480p_clean.h264");
-    let desktop_clean_mp4 = std::path::Path::new(
-        "/Users/cgaffga/Desktop/phasm_v4_cascade_480p_clean.mp4"
-    );
-    let _ = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-fflags", "+genpts", "-i"])
-        .arg(&clean_h264)
-        .args(["-c:v", "copy"])
-        .arg(desktop_clean_mp4)
-        .status();
-    eprintln!("muxed clean mp4 → {}", desktop_clean_mp4.display());
+    // #234 (2026-05-16): mux through phasm's HandbrakeX264 profile so the
+    // Desktop demo gets proper ctts box / display-order PTS — the legacy
+    // bare `ffmpeg -c:v copy` couldn't derive PTS from raw .h264 and
+    // produced first-frame artifacts in players.
+    use phasm_core::codec::mp4::build::{build_mp4_with_pattern, FrameTiming, MuxerProfile};
+    let timing = FrameTiming::FPS_30;
+    let stego_mp4 = build_mp4_with_pattern(
+        MuxerProfile::HandbrakeX264, &stego_bs, width, height, timing, pattern, n_frames,
+    ).expect("stego mp4 mux");
+    let clean_mp4 = build_mp4_with_pattern(
+        MuxerProfile::HandbrakeX264, &clean_bs, width, height, timing, pattern, n_frames,
+    ).expect("clean mp4 mux");
+    let stego_mp4_path = "/Users/cgaffga/Desktop/phasm_v4_cascade_480p_stego.mp4";
+    let clean_mp4_path = "/Users/cgaffga/Desktop/phasm_v4_cascade_480p_clean.mp4";
+    std::fs::write(stego_mp4_path, &stego_mp4).expect("write stego mp4");
+    std::fs::write(clean_mp4_path, &clean_mp4).expect("write clean mp4");
+    eprintln!("muxed stego mp4 → {}", stego_mp4_path);
+    eprintln!("muxed clean mp4 → {}", clean_mp4_path);
 
     eprintln!(
         "\nPhase 1.1.D 480p verdict: avg cost = {:+.2} dB, target ≥ -2.00 dB, {}",
@@ -1011,11 +999,13 @@ fn phase_1_1_d_v4_cascade_probe_480p_12f() {
 /// orchestrator. Runs in seconds (debug build), unlike
 /// `phase_1_1_d_v4_cascade_probe_480p_12f` which takes 25+ min via
 /// the streaming-Viterbi path. Purpose: confirm that the per-frame
-/// PSNR for the CLEAN encoder is high (matches ffmpeg decode of source)
-/// regardless of how the resulting mp4 muxes — this isolates encoder
-/// bugs from mp4-mux artifacts (the user's `phasm_v4_cascade_480p_clean.mp4`
-/// first-frame glitches are expected to be the latter, since the V4
-/// probe muxes raw .h264 with `ffmpeg -c:v copy` which lacks ctts box).
+/// PSNR for the CLEAN encoder is high (matches ffmpeg decode of source).
+///
+/// Also writes a Desktop mp4 demo via HandbrakeX264 (#234) so visual
+/// inspection is artifact-free — the historical first-frame glitches
+/// in `phasm_v4_cascade_480p_clean.mp4` came from bare `ffmpeg -c:v copy`
+/// over raw .h264 (no PTS / no ctts box), which the V4 probe and this
+/// test now both bypass.
 ///
 /// Generate fixture once (writes to /tmp; ~2 MB):
 ///     ffmpeg -y -f rawvideo -pix_fmt yuv420p -s 1920x1072 \
@@ -1101,18 +1091,19 @@ fn phase_1_1_d_clean_480p_12f_psnr() {
         avg_psnr,
     );
 
-    // Note: NOT writing a Desktop mp4 from this test. ffmpeg's bare
-    // mux of raw .h264 + B-frames cannot derive proper display-order
-    // PTS (no source timestamps to work with) — the resulting mp4
-    // will have first-packet `pict_type=B` and "Timestamps are unset"
-    // warnings, causing visible artifacts on first-frame display in
-    // player. The V4 probe's mp4 mux command (`ffmpeg -c:v copy
-    // -fflags +genpts`) has the same issue. v1.0+ follow-up: route
-    // test mp4 muxing through phasm's MuxerProfile::HandbrakeX264 or
-    // MP4Box to emit proper ctts. For correctness verification, the
-    // per-frame PSNR above is the authoritative ground truth.
-    //
-    // Per-frame PSNR confirms encoder bitstream is correct.
+    // #234 (2026-05-16): mux Desktop demo through HandbrakeX264 so the
+    // resulting mp4 has proper ctts / display-order PTS. Pre-#234 this
+    // test deliberately skipped the mp4 write because bare `ffmpeg -c:v
+    // copy` over raw .h264 produced first-frame artifacts; the phasm
+    // muxer emits the right ctts box from the encoder's frame pattern.
+    use phasm_core::codec::mp4::build::{build_mp4_with_pattern, FrameTiming, MuxerProfile};
+    let timing = FrameTiming::FPS_30;
+    let clean_mp4 = build_mp4_with_pattern(
+        MuxerProfile::HandbrakeX264, &clean_bs, width, height, timing, pattern, n_frames,
+    ).expect("clean mp4 mux");
+    let clean_mp4_path = "/Users/cgaffga/Desktop/phasm_v4_cascade_480p_clean.mp4";
+    std::fs::write(clean_mp4_path, &clean_mp4).expect("write clean mp4");
+    eprintln!("muxed clean mp4 → {}", clean_mp4_path);
 }
 
 /// **§B-cascade-real bisect (2026-05-06)** — IDR-only single-frame stego cost.

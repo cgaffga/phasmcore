@@ -16,6 +16,7 @@
 pub mod cascade_safety;
 pub mod chunk_frame;
 pub mod cost_model;
+pub mod cost_weights;
 pub mod cover_replay;
 pub mod decode_pixels;
 pub mod encode_pixels;
@@ -32,6 +33,9 @@ pub mod shadow;
 pub mod validate;
 
 pub use cost_model::PositionCostCtx;
+pub use cost_weights::{
+    combine_cover_4domain, split_plan_4domain, CostWeights, DomainBoundaries,
+};
 pub use orchestrate::ResidualPathKind;
 
 pub use hook::{

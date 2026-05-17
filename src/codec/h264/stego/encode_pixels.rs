@@ -138,6 +138,64 @@ pub(crate) fn pass1_count(
         /* all_idr */ true)
 }
 
+/// #493.1 Phase 0 helper — capture Pass-1 cover AND emit clean
+/// Annex-B in one shot, for walker-symmetry parity testing.
+///
+/// Runs the same encoder loop as `pass1_count` (PositionLoggerHook
+/// records cover bits during emit) but retains every encoded frame's
+/// Annex-B bytes. The emitted bitstream is CLEAN (no stego overrides);
+/// PositionLoggerHook only reads, never injects.
+///
+/// Returns `(cover, annex_b)`:
+/// - `cover`: 4-domain Pass-1 cover (CS, CSL, MVDs, MVDsl, each with
+///   bits + positions).
+/// - `annex_b`: clean Annex-B byte stream the walker can re-parse.
+///
+/// Used by `h264_walker_parity_493.rs` to verify per-domain order
+/// equality between the encoder's internal capture and the walker's
+/// re-parse. ALL positions per domain compared, not selective —
+/// cost-vector-masked walker bugs surface here.
+///
+/// First frame is IDR; subsequent frames are P (production-shape).
+pub fn pass1_capture_and_emit_clean(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    quality: Option<u8>,
+) -> Result<(super::orchestrate::GopCover, Vec<u8>), StegoError> {
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {} ({n_frames} × {frame_size})",
+            yuv.len(), frame_size * n_frames,
+        )));
+    }
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
+
+    let mut annex_b = Vec::new();
+    for fi in 0..n_frames {
+        let frame = &yuv[fi * frame_size..(fi + 1) * frame_size];
+        let ft = if fi == 0 {
+            super::gop_pattern::FrameType::Idr
+        } else {
+            super::gop_pattern::FrameType::P
+        };
+        let bytes = encode_one_frame(&mut enc, frame, ft)
+            .map_err(|e| StegoError::InvalidVideo(format!(
+                "Pass-1 emit frame {fi}: {e}"
+            )))?;
+        annex_b.extend_from_slice(&bytes);
+    }
+    let mut hook = enc.take_stego_hook().ok_or_else(|| StegoError::InvalidVideo(
+        "Pass-1 stego hook missing".into()
+    ))?;
+    let cover = drain_position_logger(&mut hook)?;
+    Ok((cover, annex_b))
+}
+
 /// Variant of `pass1_count` that selects IDR vs P per frame:
 /// `all_idr=true` → every frame is IDR (chunk-5 default);
 /// `all_idr=false` → first frame IDR, rest P (§30C path).
@@ -442,6 +500,265 @@ pub fn h264_stego_encode_yuv_string_i_then_p(
         &frame_bits, passphrase,
         /* h */ 4, /* quality */ Some(26),
     )
+}
+
+/// D.0.7.3.b (#472.1) — pure-Rust per-GOP encode primitive with
+/// pre-framed CoeffSign-only chunk bits. Counterpart to
+/// `openh264_stego::encode_yuv_with_pre_framed_bits` for the
+/// pure-Rust streaming session.
+///
+/// One GOP = one IDR + (n_frames-1) P-frames. Caller supplies the
+/// already-chunk_framed bits (chunk_index + total_chunks header +
+/// chunk payload, MSB-first) and the global hhat_seed derived once
+/// at session create. STC operates only on the CoeffSign domain so
+/// the output is decode-compatible with `StreamingDecodeSession`.
+///
+/// Memory: encodes one GOP, returns its Annex-B bytes. Caller is
+/// expected to call this once per GOP from a session loop, freeing
+/// the YUV buffer between calls — that's the memory-bound property
+/// the streaming session needs.
+///
+/// Errors:
+/// * Cover too small (`n_cover < m_total` or `w < 1`) →
+///   `MessageTooLarge`. Caller's pre-flight via
+///   `pure_rust_count_cover_bits_for_gop` (see below) should
+///   prevent this.
+pub fn h264_stego_encode_one_gop_with_chunk_bits(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    chunk_bits: &[u8],
+    hhat_seed: &[u8; 32],
+    quality: Option<u8>,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::stc::hhat::generate_hhat;
+    use crate::stego::stc::embed::stc_embed;
+    use super::orchestrate::DomainPlan;
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}",
+            yuv.len(), frame_size * n_frames,
+        )));
+    }
+    if chunk_bits.is_empty() {
+        return Err(StegoError::InvalidVideo(
+            "chunk_bits must be non-empty".into(),
+        ));
+    }
+    const H: usize = 4;
+
+    // Pass 1 — cover capture (I + P frames).
+    let cover = pass1_count_with_mode(
+        yuv, width, height, n_frames, frame_size, quality,
+        /* all_idr */ false,
+    )?;
+
+    let cover_bits = &cover.cover.coeff_sign_bypass.bits;
+    let costs = cover.costs.coeff_sign_bypass.as_slice();
+    let n_cover = cover_bits.len();
+    let m_total = chunk_bits.len();
+    if n_cover == 0 {
+        return Err(StegoError::InvalidVideo(
+            "pure-Rust per-GOP encode: CoeffSign cover empty".into(),
+        ));
+    }
+    let w = n_cover / m_total;
+    if w == 0 {
+        return Err(StegoError::MessageTooLarge);
+    }
+
+    // STC plan on the CoeffSign domain only. Same seed semantics
+    // as the OH264 streaming path so the unified decoder works.
+    let hhat = generate_hhat(H, w, hhat_seed);
+    let used_cover = m_total * w;
+    let cover_slice = &cover_bits[..used_cover];
+    let cost_slice = &costs[..used_cover.min(costs.len())];
+    // Pad costs to full slice length if the cover's costs vec is short
+    // (some pass1 modes leave costs empty); use uniform 1.0 in that case.
+    let cost_owned: Vec<f32> = if cost_slice.len() < used_cover {
+        vec![1.0; used_cover]
+    } else {
+        cost_slice.to_vec()
+    };
+    let result = stc_embed(cover_slice, &cost_owned, chunk_bits, &hhat, H, w)
+        .ok_or(StegoError::MessageTooLarge)?;
+
+    // Build a DomainPlan with CoeffSign populated, others empty.
+    let plan = DomainPlan {
+        coeff_sign_bypass: result.stego_bits,
+        coeff_suffix_lsb: Vec::new(),
+        mvd_sign_bypass: Vec::new(),
+        mvd_suffix_lsb: Vec::new(),
+        total_modifications: result.num_modifications,
+        total_cost: result.total_cost,
+    };
+
+    // Pass 3 — inject overrides + re-encode (I + P).
+    pass3_inject_with_mode(
+        yuv, width, height, n_frames, frame_size, quality,
+        &cover.cover, &plan, /* all_idr */ false,
+    )
+}
+
+/// #493.3 Phase 2 — pure-Rust per-GOP 4-domain encode primitive.
+///
+/// Same shape as [`h264_stego_encode_one_gop_with_chunk_bits`] but
+/// embeds `chunk_bits` across **all 4 stego domains** (CoeffSign,
+/// CoeffSuffix, MvdSign, MvdSuffix) via a single combined-cover STC
+/// plan. Per-domain cost weights drive STC's natural allocation:
+/// at default weights `(1.0, 3.0, 10.0, 10.0)` STC concentrates flips
+/// in CoeffSign for small payloads and spills into other domains
+/// only as needed.
+///
+/// Compared to the CS-only primitive:
+/// - Cover size grows ~4× (typically) since CSL/MVDs/MVDsl positions
+///   add to the combined vector. STC parameter `w` (cover-per-message-
+///   bit) grows correspondingly, improving the syndrome's freedom.
+/// - WET rules (|coeff|∈{15,16}, MVD UEG boundaries, cascade-unsafe
+///   MVD) propagate from per-domain Pass-1 costs through the
+///   weight-multiplication automatically.
+/// - The matching decoder must apply the same combine in canonical
+///   order CS→CSL→MVDs→MVDsl (see Phase 4 / #493.5).
+///
+/// Phase 0.5 (#493.0b) measurement validates `CostWeights::default()`
+/// for v1.1 ship. Phase 5 (#493.6) gates the choice empirically.
+///
+/// Same seed convention as the OH264 streaming path
+/// (`per_gop_seeds(CoeffSignBypass, 0).hhat_seed`); the combined
+/// cover is engine-agnostic so decoder symmetry holds for both
+/// pure-Rust and OH264 outputs.
+///
+/// **WIRING STATUS (Phase 2 / 2026-05-16):** this primitive is
+/// callable directly but NOT yet wired into the streaming session
+/// (`drain_pure_rust_one_gop` still uses the CS-only primitive).
+/// Phase 4 / #493.5 swaps the call site once the matching combined-
+/// cover decoder lands. Round-trip tests until then must use the
+/// in-test extract path in `h264_4domain_primitive_493.rs`.
+pub fn h264_stego_encode_one_gop_with_chunk_bits_4domain(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    chunk_bits: &[u8],
+    hhat_seed: &[u8; 32],
+    quality: Option<u8>,
+    weights: &super::cost_weights::CostWeights,
+) -> Result<Vec<u8>, StegoError> {
+    use crate::stego::stc::hhat::generate_hhat;
+    use crate::stego::stc::embed::stc_embed;
+    use super::cost_weights::{combine_cover_4domain, split_plan_4domain};
+
+    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
+        return Err(StegoError::InvalidVideo(format!(
+            "dimensions must be 16-aligned, got {width}x{height}"
+        )));
+    }
+    let frame_size = (width * height * 3 / 2) as usize;
+    if yuv.len() != frame_size * n_frames {
+        return Err(StegoError::InvalidVideo(format!(
+            "yuv len {} != expected {}",
+            yuv.len(), frame_size * n_frames,
+        )));
+    }
+    if chunk_bits.is_empty() {
+        return Err(StegoError::InvalidVideo(
+            "chunk_bits must be non-empty".into(),
+        ));
+    }
+    const H: usize = 4;
+
+    // Pass 1 — cover capture with `enable_mvd_stego_hook = true` so
+    // the MvdSign + MvdSuffix domains populate (pass1_count_with_mode
+    // leaves them empty by default). Same loop shape as
+    // pass1_count_with_mode, with the MVD hook flag flipped on.
+    let pass1 = {
+        let mut enc = build_encoder(width, height, quality)?;
+        enc.enable_mvd_stego_hook = true;
+        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
+        for fi in 0..n_frames {
+            let frame = &yuv[fi * frame_size..(fi + 1) * frame_size];
+            let ft = if fi == 0 {
+                super::gop_pattern::FrameType::Idr
+            } else {
+                super::gop_pattern::FrameType::P
+            };
+            encode_one_frame(&mut enc, frame, ft)
+                .map_err(|e| StegoError::InvalidVideo(format!("Pass 1 frame {fi}: {e}")))?;
+        }
+        let mut hook = enc.take_stego_hook().ok_or_else(|| StegoError::InvalidVideo(
+            "Pass 1 stego hook missing".into()
+        ))?;
+        drain_position_logger(&mut hook)?
+    };
+
+    // Combine the 4-domain cover + cost vectors in canonical order
+    // (CS → CSL → MVDs → MVDsl). Per-position costs are multiplied
+    // by per-domain weight; WET-∞ propagates.
+    let (combined_cover, combined_costs, boundaries) =
+        combine_cover_4domain(&pass1.cover, &pass1.costs, weights);
+    let n_cover = combined_cover.len();
+    let m_total = chunk_bits.len();
+    if n_cover == 0 {
+        return Err(StegoError::InvalidVideo(
+            "pure-Rust per-GOP 4-domain encode: combined cover empty".into(),
+        ));
+    }
+    let w = n_cover / m_total;
+    if w == 0 {
+        return Err(StegoError::MessageTooLarge);
+    }
+
+    // STC plan on the combined vector with single hhat seed.
+    let hhat = generate_hhat(H, w, hhat_seed);
+    let used_cover = m_total * w;
+    let cover_slice = &combined_cover[..used_cover];
+    let cost_slice = &combined_costs[..used_cover];
+    let result = stc_embed(cover_slice, cost_slice, chunk_bits, &hhat, H, w)
+        .ok_or(StegoError::MessageTooLarge)?;
+
+    // Split the combined stego-bit vector back into a per-domain
+    // DomainPlan. STC operates on `used_cover` (= m × w) which may
+    // be less than `n_cover`. We extend the STC result by appending
+    // unchanged-cover bits past `used_cover` so split_plan_4domain
+    // sees the full combined length.
+    let mut full_stego_bits = Vec::with_capacity(n_cover);
+    full_stego_bits.extend_from_slice(&result.stego_bits);
+    full_stego_bits.extend_from_slice(&combined_cover[used_cover..]);
+    debug_assert_eq!(full_stego_bits.len(), n_cover);
+    let mut plan = split_plan_4domain(&full_stego_bits, &boundaries);
+    plan.total_modifications = result.num_modifications;
+    plan.total_cost = result.total_cost;
+
+    // Pass 3 — inject overrides + re-encode with `enable_mvd_stego_hook
+    // = true` so MVD positions actually get their planned bits
+    // applied. Same loop shape as pass3_inject_with_mode (I + P,
+    // IDR at frame 0) with MVD hook flag flipped on.
+    let injector = PlanInjector::from_plan(&pass1.cover, &plan);
+    let hook = InjectionHook::new(injector);
+    let mut enc = build_encoder(width, height, quality)?;
+    enc.enable_mvd_stego_hook = true;
+    enc.set_stego_hook(Some(Box::new(hook)));
+    let mut out = Vec::new();
+    for fi in 0..n_frames {
+        let frame = &yuv[fi * frame_size..(fi + 1) * frame_size];
+        let ft = if fi == 0 {
+            super::gop_pattern::FrameType::Idr
+        } else {
+            super::gop_pattern::FrameType::P
+        };
+        let bytes = encode_one_frame(&mut enc, frame, ft)
+            .map_err(|e| StegoError::InvalidVideo(format!("Pass 3 frame {fi}: {e}")))?;
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
 }
 
 /// Inner driver for I+P encode-time stego (§30C). Mirrors
@@ -1626,23 +1943,42 @@ pub fn h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_a
     let mut cover2: Option<H264GopReplayCover> = None;
     // domain 3 always inactive — no cover needed.
 
+    // #512 — shared per-GOP-range cover cache across all active
+    // domain covers. `H264GopReplayCover::fetch_segment` consults
+    // this before re-running `pass1_capture_4domain_for_gop_range`;
+    // sibling covers (one per active EmbedDomain) reuse the
+    // captured `GopCover` so the per-GOP encode is amortised across
+    // all active domains rather than running once per domain.
+    // Without this cache the per-GOP encode count was
+    // `3 active drivers × 2 Viterbi phases × num_segments`; with it
+    // the count is bounded by `num_distinct_ranges` (typically
+    // `num_gops`). Empirically ~2× speedup on the streaming-v2
+    // 1080p × 10f path. Memo: `memory/h264_phase5_perf_finding_500.md`.
+    let cover_cache = super::cover_replay::new_shared_gop_range_cache();
+
     if let Some(o) = &owned[0] {
-        cover0 = Some(H264GopReplayCover::from_counts(
+        let mut c = H264GopReplayCover::from_counts(
             yuv, width, height, n_frames, gop_size, b_count, quality,
             o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[0],
-        )?);
+        )?;
+        c.set_cache(cover_cache.clone());
+        cover0 = Some(c);
     }
     if let Some(o) = &owned[1] {
-        cover1 = Some(H264GopReplayCover::from_counts(
+        let mut c = H264GopReplayCover::from_counts(
             yuv, width, height, n_frames, gop_size, b_count, quality,
             o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[1],
-        )?);
+        )?;
+        c.set_cache(cover_cache.clone());
+        cover1 = Some(c);
     }
     if let Some(o) = &owned[2] {
-        cover2 = Some(H264GopReplayCover::from_counts(
+        let mut c = H264GopReplayCover::from_counts(
             yuv, width, height, n_frames, gop_size, b_count, quality,
             o.domain, &per_gop_counts, o.message.len(), o.w, k_per_domain[2],
-        )?);
+        )?;
+        c.set_cache(cover_cache.clone());
+        cover2 = Some(c);
     }
 
     let mut driver0: Option<StreamingViterbiPhaseB> = None;
@@ -2204,12 +2540,49 @@ pub fn h264_stego_capacity_4domain(
     )?;
     let cap_p1 = cover_p1.cover.capacity();
     // Post-#107: MvdSuffixLsb is excluded from the injectable pool.
+    // `cover_size_bits` is the RAW sum across 3 active domains; reported
+    // back so callers see the cover-bit volume independent of the
+    // allocator's per-domain balance. Capacity itself (below) uses the
+    // allocator, NOT this raw sum.
     let cover_size_bits =
         cap_p1.coeff_sign_bypass + cap_p1.coeff_suffix_lsb + cap_p1.mvd_sign_bypass;
 
-    // Primary: bytes available = bits/8, minus framing overhead.
+    // §501 / Phase 6 (#493.7) 2026-05-17 — binary-search via the SAME
+    // `stealth_weighted_allocation(m_total, cap_for_alloc, allocator)`
+    // call that the streaming-v2 orchestrator (encode_pixels.rs:1827-
+    // 1836) uses at encode time. The old formula `cover_size_bits / 8`
+    // over-estimated because it ignored the allocator's
+    // `mvd_drift_budget_frac` cap (MVD share ≤ 20% of m_total) and
+    // the per-domain weighted-headroom balance. With the calibration
+    // gap closed, "capacity says X bytes" → "encoder can fit X bytes"
+    // with no MessageTooLarge surprise at the edge.
+    //
+    // Shape of `cap_for_alloc` MUST match the orchestrator's: same
+    // 3-domain set (CS+CSL+MVDs, MVDsl hardcoded zero) so the
+    // allocator solves the same problem the encoder will solve.
+    let allocator = super::orchestrate::StealthAllocator::v1_default();
+    let cap_for_alloc = super::GopCapacity {
+        coeff_sign_bypass: cap_p1.coeff_sign_bypass,
+        coeff_suffix_lsb: cap_p1.coeff_suffix_lsb,
+        mvd_sign_bypass: cap_p1.mvd_sign_bypass,
+        mvd_suffix_lsb: 0,
+    };
+    // Binary search for the largest m_total (in bits) that the
+    // allocator can fit. Upper bound is the raw 3-domain sum; the
+    // allocator's `nw_sum` short-circuit returns None above that.
+    let mut lo: usize = 0;
+    let mut hi: usize = cover_size_bits;
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2;
+        if super::orchestrate::stealth_weighted_allocation(mid, &cap_for_alloc, &allocator).is_some() {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let m_total_bits_max = lo;
     let primary_max_message_bytes =
-        (cover_size_bits / 8).saturating_sub(FRAME_OVERHEAD);
+        (m_total_bits_max / 8).saturating_sub(FRAME_OVERHEAD);
 
     // Shadow: reuse the existing collision-limited formula at
     // n_shadows = 1.
@@ -3946,9 +4319,10 @@ mod pass1b_streaming_diag {
             info.primary_max_message_bytes > 0,
             "primary capacity must be > 0",
         );
-        // Primary uses cover_bits/8 - FRAME_OVERHEAD; shadow uses the
-        // collision-limited sqrt formula so it's typically smaller.
-        // At 128x80 we expect primary >= shadow at single-shadow load.
+        // Primary uses an allocator-driven binary search (§501);
+        // shadow uses the collision-limited sqrt formula so it's
+        // typically smaller. At 128x80 we expect primary >= shadow at
+        // single-shadow load.
         assert!(
             info.primary_max_message_bytes >= info.shadow_max_message_bytes,
             "primary {} should be >= shadow (n=1) {}",
@@ -3960,6 +4334,48 @@ mod pass1b_streaming_diag {
             info.cover_size_bits,
             info.primary_max_message_bytes,
             info.shadow_max_message_bytes,
+        );
+    }
+
+    /// §501 / Phase 6 (#493.7) 2026-05-17 — verify that the reported
+    /// primary capacity is actually encodable. Pre-fix the formula
+    /// `cover_size_bits / 8 - FRAME_OVERHEAD` could over-report
+    /// because it ignored the allocator's `mvd_drift_budget_frac`
+    /// cap; users would see "fits" and then hit `MessageTooLarge` at
+    /// encode time. Post-fix the binary-search via
+    /// `stealth_weighted_allocation` gives us "if capacity says X
+    /// bytes, encoder fits X bytes" — verified here.
+    #[cfg(feature = "cabac-stego")]
+    #[test]
+    fn h264_stego_capacity_4domain_round_trip_at_capacity() {
+        let yuv = match std::fs::read(
+            "test-vectors/video/h264/real-world/img4138_128x80_f10.yuv",
+        ) {
+            Ok(y) => y,
+            Err(_) => return,
+        };
+        let info = super::h264_stego_capacity_4domain(&yuv, 128, 80, 10, 5)
+            .expect("capacity_4domain");
+        let cap_bytes = info.primary_max_message_bytes;
+        assert!(cap_bytes > 0, "capacity must be positive");
+
+        // Build a message of exactly `cap_bytes` length (deterministic
+        // ASCII — stealth isn't the point here, encodability is).
+        let msg: String = (0..cap_bytes)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let pass = "phase6-capacity-roundtrip";
+
+        let stego = super::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
+            &yuv, 128, 80, 10, 5, &msg, pass,
+        )
+        .expect("encode at reported capacity must succeed");
+        let recovered = crate::h264_stego_smart_decode_video(&stego, pass)
+            .expect("decode at reported capacity must succeed");
+        assert_eq!(recovered, msg, "round-trip at reported capacity must match");
+        eprintln!(
+            "128x80 capacity round-trip OK: {} bytes encoded + decoded",
+            cap_bytes,
         );
     }
 

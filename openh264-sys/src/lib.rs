@@ -155,12 +155,15 @@ pub fn encoder_pos_to_phasm_position_key(
     mb_type: u8,
     mb_width: u32,
 ) -> Option<u64> {
-    // Only coefficient sign / suffix-LSB domains (MVD belongs to a
-    // different translation path with its own SyntaxPath::Mvd variant).
-    if pos.domain > 1 {
-        return None;
+    // MVD domains (2 = MvdSign, 3 = MvdSuffixLsb) take a separate
+    // packing path: the walker emits SyntaxPath::Mvd { list, partition,
+    // axis, kind } and the fork's HOOK-H1..H7 fire with mv_component
+    // + partition_idx populated, block_cat = 0xff (no residual block).
+    // Skip the coefficient block_cat filter and pack via the Mvd arm.
+    if pos.domain >= 2 {
+        return encoder_mvd_pos_to_phasm_position_key(pos, mb_width);
     }
-    // Domain enum value mapping:
+    // Domain enum value mapping (coefficient domains):
     //   PhasmStegoDomain::CoeffSuffixLsb = 0  →  phasm EmbedDomain::CoeffSuffixLsb  = 1
     //   PhasmStegoDomain::CoeffSign      = 1  →  phasm EmbedDomain::CoeffSignBypass = 0
     // BinKind: Sign = 0, SuffixLsb = 1.
@@ -271,6 +274,66 @@ pub fn encoder_pos_to_phasm_position_key(
         // See the CRITICAL CONTRACT header comment above.
         _ => return None,
     };
+
+    let mb_addr = (pos.mb_y as u32) * mb_width + (pos.mb_x as u32);
+    let frame_bits = (pos.frame_num as u64) & 0xFF_FFFF;
+    let mb_bits = ((mb_addr as u64) & 0xFF_FFFF) << 24;
+    let domain_bits = ((phasm_domain as u64) & 0xF) << 48;
+    let syntax_bits = ((syntax_packed as u64) & 0xFFF) << 52;
+    Some(frame_bits | mb_bits | domain_bits | syntax_bits)
+}
+
+/// MVD-domain canonical-key packer (`PhasmStegoDomain::MvdSign` /
+/// `MvdSuffixLsb`). Mirrors the walker's `SyntaxPath::Mvd { list,
+/// partition, axis, kind }` packing in `core/src/codec/h264/stego/hook.rs`.
+///
+/// Fork-side hook source (`codec/encoder/core/src/wels_stego.cpp::
+/// phasm_apply_mvd_hooks`) populates `PhasmStegoPos` per emitted
+/// MVD bin as follows:
+///
+/// - `mb_x`, `mb_y` — current MB scan position.
+/// - `partition_idx` — 0 for P_16x16, 0/8 (16x8), 0/2 (8x16), 0/2/8/10
+///   for P_8x8 sub-MBs (4×4-block top-left index, identical to the
+///   decoder hook fire convention at `parse_mb_syn_cabac.cpp:1247`).
+/// - `mv_component` — 0 = X axis, 1 = Y axis.
+/// - `domain` — 2 = MvdSign, 3 = MvdSuffixLsb.
+/// - `sub_block`, `coeff_idx`, `block_cat` — set to 0xff (MVD doesn't
+///   use these). `ref_idx` carries the L0 reference index but isn't
+///   part of the canonical key.
+///
+/// `mb_type` is not consulted: the encoder only fires MVD hooks from
+/// HOOK-H1..H7 after the MB's mb_type is decided, so the filter would
+/// always pass for the emitted positions.
+///
+/// OH264 fork is **P-slice only** for MVD writes — `list` is always 0
+/// (LIST_0). The function masks to 1 bit to stay future-proof if/when
+/// the fork grows B-slice support and the hook populates list_idx.
+fn encoder_mvd_pos_to_phasm_position_key(pos: &PhasmStegoPos, mb_width: u32) -> Option<u64> {
+    // Fork enum → walker enum is identity for MVD:
+    //   PhasmStegoDomain::MvdSign      = 2  →  EmbedDomain::MvdSignBypass = 2
+    //   PhasmStegoDomain::MvdSuffixLsb = 3  →  EmbedDomain::MvdSuffixLsb  = 3
+    let phasm_domain: u8 = pos.domain;
+    // BinKind: Sign = 0 (MvdSign), SuffixLsb = 1 (MvdSuffixLsb).
+    let bin_kind: u16 = if pos.domain == 2 { 0 } else { 1 };
+
+    // SyntaxPath::Mvd packing (walker, `hook.rs:148`):
+    //   payload = list(1) | partition(4) << 1 | axis(1) << 5 | kind(1) << 6
+    //   syntax_packed = 5 | (payload << 3)
+    //
+    // `list` is the high nibble of partition_idx on the decoder hook
+    // side per `parse_mb_syn_cabac.cpp:1246-1247`
+    // (`partition_idx = ((list << 4) | (index & 0x0F))`). Mirror that
+    // on encoder: low nibble = partition, high nibble = list. The
+    // fork's `phasm_apply_mvd_hooks` currently passes partition_idx
+    // raw (no list nibble) per `wels_stego.cpp:313`, so list = 0 for
+    // every P-slice fire. If a future fork patch adds B-slice MVD
+    // writes it should adopt the same `(list << 4) | partition`
+    // convention as the decoder hook.
+    let list = ((pos.partition_idx >> 4) & 0x1) as u16;
+    let partition = (pos.partition_idx & 0xF) as u16;
+    let axis = (pos.mv_component & 0x1) as u16;
+    let payload = list | (partition << 1) | (axis << 5) | ((bin_kind & 0x1) << 6);
+    let syntax_packed: u16 = 5 | (payload << 3);
 
     let mb_addr = (pos.mb_y as u32) * mb_width + (pos.mb_x as u32);
     let frame_bits = (pos.frame_num as u64) & 0xFF_FFFF;

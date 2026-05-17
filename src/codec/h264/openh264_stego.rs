@@ -38,10 +38,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use core_openh264_sys::{
-    encoder_pos_to_phasm_position_key, PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
+    encoder_pos_to_phasm_position_key, PHASM_MB_TYPE_OTHER,
 };
 
-use super::cabac::bin_decoder::slice::walk_annex_b_for_cover;
+use super::cabac::bin_decoder::slice::{
+    walk_annex_b_for_cover, walk_annex_b_for_cover_with_options, WalkOptions,
+};
+use super::stego::cost_weights::{
+    combine_cover_4domain, split_plan_4domain, CostWeights,
+};
+use super::stego::orchestrate::DomainCosts;
 use super::openh264::{
     set_frame_num, Encoder, EncoderError, StegoHandlers, StegoSession,
 };
@@ -233,6 +239,152 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
     // Pass 2: stego encode with overrides. C.8 cascade-break needs the
     // visual_recon mirror so pDecPic stays clean for next-frame ME —
     // dual_recon=true here.
+    encode_once(
+        yuv, width, height, n_frames, opts,
+        override_map, mb_type_table, applied,
+        mb_width, mb_per_frame,
+        /* dual_recon = */ true,
+    )
+}
+
+/// #493.4 Phase 3 — OH264 4-domain per-GOP encode primitive.
+///
+/// Same shape as [`encode_yuv_with_pre_framed_bits`] but embeds
+/// `frame_bits` across all 4 stego domains (CoeffSign, CoeffSuffix,
+/// MvdSign, MvdSuffix) via a single combined-cover STC plan. The
+/// override map is keyed by canonical `PositionKey::raw()` across
+/// all 4 domains; the OH264 fork's per-domain emit hooks look up
+/// by the same key and apply the planned bit.
+///
+/// Phase 0 walker-symmetry parity gates (#493.1) verified that the
+/// canonical keys match between OH264 fork emit + Rust walker for
+/// all 4 (engine, domain) pairs, so the override-map lookup works
+/// uniformly.
+///
+/// Cost vector: OH264 has no Pass-1-side per-position content-adaptive
+/// cost (unlike pure-Rust which gets J-UNIWARD-style costs from
+/// `pass1_count_with_mode`). We use uniform 1.0 baseline distortion
+/// here; per-domain `CostWeights` × 1.0 = the domain weight, so STC's
+/// allocation is driven purely by domain weight (per Phase 0.5
+/// finding: cascade is binary, so domain weight is the right lever
+/// at this resolution). v1.2 research can layer in content-adaptive
+/// distortion costs if Phase 5 stealth gates require finer control.
+///
+/// **WIRING STATUS (Phase 3 / 2026-05-16):** primitive is callable
+/// directly but NOT yet wired into the streaming session
+/// (`oh264_finish` still uses the CS-only `encode_yuv_with_pre_framed_bits`).
+/// Phase 4 / #493.5 swaps the call site once the matching combined-
+/// cover decoder lands.
+pub fn encode_yuv_with_pre_framed_bits_4domain(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    frame_bits: &[u8],
+    hhat_seed: &[u8; 32],
+    weights: &CostWeights,
+) -> Result<Vec<u8>, StegoError> {
+    validate_dims(yuv, width, height, n_frames)?;
+    let m_total = frame_bits.len();
+    if m_total == 0 {
+        return Err(StegoError::InvalidVideo("empty frame bits".into()));
+    }
+
+    let mb_width = width / 16;
+    let mb_height = height / 16;
+    let mb_per_frame = (mb_width * mb_height) as usize;
+    let _ = mb_height;
+    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    // Pass 1 — clean encode + walker for 4-domain cover capture.
+    // record_mvd: true (Phase 0 finding: walker default leaves MVD
+    // cover empty otherwise).
+    let baseline_bitstream = encode_once(
+        yuv, width, height, n_frames, opts,
+        override_map.clone(),
+        mb_type_table.clone(),
+        applied.clone(),
+        mb_width,
+        mb_per_frame,
+        /* dual_recon = */ false,
+    )?;
+    let baseline_walk = walk_annex_b_for_cover_with_options(
+        &baseline_bitstream,
+        WalkOptions { record_mvd: true, ..Default::default() },
+    )
+    .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
+
+    // Combine 4-domain cover. Costs are dummy (1.0 baseline before
+    // weight multiplication) since OH264 doesn't expose per-position
+    // distortion costs. Per-domain weight drives allocation.
+    let dummy_costs = DomainCosts::default();
+    let (combined_cover, combined_costs, boundaries) =
+        combine_cover_4domain(&baseline_walk.cover, &dummy_costs, weights);
+    let n_cover = combined_cover.len();
+    if n_cover == 0 {
+        return Err(StegoError::InvalidVideo(
+            "openh264 4-domain encode: combined cover empty".into(),
+        ));
+    }
+    let w = n_cover / m_total;
+    if w == 0 {
+        return Err(StegoError::MessageTooLarge);
+    }
+    let used_cover = m_total * w;
+
+    // STC plan on combined cover.
+    let cover_slice: Vec<u8> = combined_cover[..used_cover].to_vec();
+    let cost_slice: Vec<f32> = combined_costs[..used_cover].to_vec();
+    let hhat = generate_hhat(STC_H, w, hhat_seed);
+    let plan = stc_embed(&cover_slice, &cost_slice, frame_bits, &hhat, STC_H, w)
+        .ok_or(StegoError::MessageTooLarge)?;
+
+    // Extend STC result to full combined cover length (positions past
+    // `used_cover` stay unchanged) so split_plan_4domain sees the
+    // full vector.
+    let mut full_stego_bits = Vec::with_capacity(n_cover);
+    full_stego_bits.extend_from_slice(&plan.stego_bits);
+    full_stego_bits.extend_from_slice(&combined_cover[used_cover..]);
+    debug_assert_eq!(full_stego_bits.len(), n_cover);
+    let domain_plan = split_plan_4domain(&full_stego_bits, &boundaries);
+
+    // Build per-domain override entries keyed by canonical
+    // PositionKey::raw(). All 4 domains contribute; OH264's per-
+    // domain emit hooks look up by the same key.
+    let mut overrides_map: HashMap<u64, u8> = HashMap::new();
+    for (positions, bits, cover_bits) in [
+        (&baseline_walk.cover.coeff_sign_bypass.positions,
+         &domain_plan.coeff_sign_bypass,
+         &baseline_walk.cover.coeff_sign_bypass.bits),
+        (&baseline_walk.cover.coeff_suffix_lsb.positions,
+         &domain_plan.coeff_suffix_lsb,
+         &baseline_walk.cover.coeff_suffix_lsb.bits),
+        (&baseline_walk.cover.mvd_sign_bypass.positions,
+         &domain_plan.mvd_sign_bypass,
+         &baseline_walk.cover.mvd_sign_bypass.bits),
+        (&baseline_walk.cover.mvd_suffix_lsb.positions,
+         &domain_plan.mvd_suffix_lsb,
+         &baseline_walk.cover.mvd_suffix_lsb.bits),
+    ] {
+        let n = positions.len().min(bits.len()).min(cover_bits.len());
+        for i in 0..n {
+            if bits[i] != cover_bits[i] {
+                overrides_map.insert(positions[i].raw(), bits[i]);
+            }
+        }
+    }
+    {
+        let mut map = override_map.lock().expect("override map lock");
+        map.clear();
+        for (k, v) in overrides_map.iter() {
+            map.insert(*k, *v);
+        }
+    }
+
+    // Pass 2 — re-encode with overrides + C.8 dual_recon cascade-break.
     encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
@@ -452,9 +604,18 @@ fn encode_once(
     let mb_type_for_md = mb_type_table;
     let handlers = StegoHandlers {
         enc_pre_emit: Some(Box::new(move |pos, _orig| {
-            if pos.domain != PhasmStegoDomain::CoeffSign as u8 {
-                return None;
-            }
+            // #493 Phase 4.5 (#504): accept all 4 stego domains. The fork's
+            // `phasm_apply_mvd_hooks` (`wels_stego.cpp:301`, called from
+            // HOOK-H1..H7 in `svc_base_layer_md.cpp`) fires this callback
+            // with `pos.domain ∈ {MvdSign=2, MvdSuffixLsb=3}` per MVD
+            // component when |MVD|>0 / >=9; `encoder_pos_to_phasm_position_key`
+            // dispatches those through the MVD packing branch
+            // (`encoder_mvd_pos_to_phasm_position_key`). The override is
+            // applied by the fork mutating the qpel MV in place + re-running
+            // MC; C.8.7 cascade-break handles pDecPic/pVisualRecPic
+            // correctness for next-frame ME. CoeffSign + CoeffSuffixLsb
+            // domains continue to route through the residual `block_cat`
+            // packing path.
             let map = map_for_hook.lock().ok()?;
             if map.is_empty() {
                 return None;

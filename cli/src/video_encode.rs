@@ -525,7 +525,7 @@ fn run_oh264_encode(
     output: &PathBuf,
 ) -> Result<(), CliError> {
     use phasm_core::{
-        ColorParams, EncodeEngineChoice, EncodeSessionParams,
+        ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
         StreamingEncodeSession, YuvFrameRef,
     };
 
@@ -580,6 +580,7 @@ fn run_oh264_encode(
             // `matrix` / `range` parsing from ffprobe output.
             color: ColorParams::default(),
             engine: EncodeEngineChoice::Oh264,
+            cost_weights: CostWeights::default(),
         };
         let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
 

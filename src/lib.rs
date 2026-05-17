@@ -74,6 +74,8 @@ pub use codec::h264::streaming_session::{
     EncodeSessionParams, StreamingDecodeSession, StreamingEncodeSession,
     StreamingProbeSession, YuvFrameRef,
 };
+#[cfg(feature = "h264-encoder")]
+pub use codec::h264::stego::CostWeights;
 
 #[cfg(feature = "h264-encoder")]
 pub use codec::h264::encoder::baseline_transcode::{

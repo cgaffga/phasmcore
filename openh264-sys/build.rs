@@ -282,6 +282,34 @@ fn main() {
             // in all operating modes — pVisualRecPic is encoder-internal
             // and never participates in mode decision or CABAC emission.
             "94539c43b594a8433b75f985361a3faa86f53bbb",
+            // 2026-05-16: PHASM-STEGO.md README correction — describe
+            // the two-layer hook architecture accurately (CABAC bin
+            // pre-emit hooks at CS+CSL residual sites; ME-time
+            // mutation hooks at MVD partition sites). No code change.
+            // Documented during phasm #504 audit when MVD path was
+            // mis-investigated due to imprecise old wording.
+            "a96e43920a43276c8b48b6ef0bebf6a8e0f59ae7",
+            // 2026-05-16: #505 chroma DC CoeffSuffixLsb threshold
+            // alignment — apply_coeff_hooks_to_level gates at
+            // `abs_level >= 16` (was `>= 15`) so the hook fires
+            // only at the walker's COEFF_SUFFIX_LSB_THRESHOLD = 16
+            // cutoff. apply_suffix_lsb_coeff forces `mag = 17` at
+            // the `mag == 16` boundary instead of decrementing to
+            // 15. Closes a chroma cascade-break leak where a Pass-2
+            // SuffixLsb override could drop a position below the
+            // walker's enrollment cutoff, shifting cover layout and
+            // breaking STC syndrome extraction. Bisected via
+            // openh264_4domain_primitive_493_3 uniform_weights round
+            // -trip at MB(17,5) Cb DC coeff_idx=1. Full analysis in
+            // memory/h264_chroma_csl_cascade_gap_504.md.
+            "dca9afe6741742946fd72cc229d8876e0417197d",
+            // 2026-05-17: #505 follow-on. Update PhasmCoeffHooks
+            // gtests in test/encoder/EncUT_PhasmStegoHelpers.cpp to
+            // reflect the new threshold semantics (4 tests were
+            // asserting the pre-#505 behaviour and went red on
+            // phasm-stego CI). No source change; just unblocks
+            // downstream consumers that run the bundled gtests.
+            "4bbc174f67ea7cc58dd0b66c48fb330599174ad7",
         ];
         let head_output = Command::new("git")
             .arg("-C")
