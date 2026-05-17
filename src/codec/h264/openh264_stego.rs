@@ -56,12 +56,22 @@ use super::stego::keys::CabacStegoMasterKeys;
 use crate::stego::{crypto, frame, payload};
 use crate::stego::error::StegoError;
 use crate::stego::stc::embed::stc_embed;
-use crate::stego::stc::extract::stc_extract;
+use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
 use crate::stego::stc::hhat::generate_hhat;
 
 /// STC constraint length. Must match between encode and decode (decoder
 /// brute-forces `m_total` but treats `STC_H` as fixed).
 const STC_H: usize = 4;
+
+/// Cheap env-var check for `PHASM_PERF_TRACE=1`. When set, the 4-domain
+/// encode path prints per-phase wall-clock timing to stderr. Off by
+/// default — single `env::var` call per encode (negligible cost).
+#[inline]
+fn perf_trace() -> bool {
+    std::env::var("PHASM_PERF_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
 
 /// Encoder configuration knobs for the production stego path. The
 /// `qp` / `intra_period` defaults track the OpenH264 fork's recommended
@@ -170,6 +180,9 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
     validate_dims(yuv, width, height, n_frames)?;
     let m_total = frame_bits.len();
 
+    let trace = perf_trace();
+    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+
     // Baseline encode + walker for cover capture.
     let mb_width = width / 16;
     let mb_height = height / 16;
@@ -183,6 +196,7 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
     // needed (bitstream is walked then discarded). C.9.0 (#482) disables
     // the entire visual_recon mirror pool for this pass — ~30-50% encode
     // wall-clock savings, byte-identical bitstream.
+    let t_pass1 = if trace { Some(std::time::Instant::now()) } else { None };
     let baseline_bitstream = encode_once(
         yuv, width, height, n_frames, opts,
         override_map.clone(),
@@ -192,8 +206,13 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
         mb_per_frame,
         /* dual_recon = */ false,
     )?;
+    let dt_pass1 = t_pass1.map(|t| t.elapsed());
+    let pass1_bytes = baseline_bitstream.len();
+
+    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
     let baseline_walk = walk_annex_b_for_cover(&baseline_bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
+    let dt_walk = t_walk.map(|t| t.elapsed());
     let baseline_positions = baseline_walk.cover.coeff_sign_bypass.positions;
     let baseline_bits = baseline_walk.cover.coeff_sign_bypass.bits;
     let n_cover = baseline_bits.len();
@@ -216,18 +235,22 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
     let cover_slice: Vec<u8> = baseline_bits[..used_cover].to_vec();
 
     // STC plan.
+    let t_stc = if trace { Some(std::time::Instant::now()) } else { None };
     let costs: Vec<f32> = vec![1.0; used_cover];
     let hhat = generate_hhat(STC_H, w, hhat_seed);
     let plan = stc_embed(&cover_slice, &costs, frame_bits, &hhat, STC_H, w)
         .ok_or(StegoError::MessageTooLarge)?;
+    let dt_stc = t_stc.map(|t| t.elapsed());
 
     // Build the override map keyed by canonical PositionKey::raw().
+    let t_overrides = if trace { Some(std::time::Instant::now()) } else { None };
     let mut overrides_map: HashMap<u64, u8> = HashMap::new();
     for i in 0..used_cover {
         if plan.stego_bits[i] != cover_slice[i] {
             overrides_map.insert(baseline_positions[i].raw(), plan.stego_bits[i]);
         }
     }
+    let n_flips = overrides_map.len();
     {
         let mut map = override_map.lock().expect("override map lock");
         map.clear();
@@ -235,16 +258,46 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
             map.insert(*k, *v);
         }
     }
+    let dt_overrides = t_overrides.map(|t| t.elapsed());
 
     // Pass 2: stego encode with overrides. C.8 cascade-break needs the
     // visual_recon mirror so pDecPic stays clean for next-frame ME —
     // dual_recon=true here.
-    encode_once(
+    let t_pass2 = if trace { Some(std::time::Instant::now()) } else { None };
+    let result = encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
         mb_width, mb_per_frame,
         /* dual_recon = */ true,
-    )
+    );
+    let dt_pass2 = t_pass2.map(|t| t.elapsed());
+
+    if trace {
+        let dt_total = t_start.unwrap().elapsed();
+        eprintln!(
+            "[PHASM_PERF_TRACE oh264_1domain] {w}x{h} f={f} n_cover={nc} m_total={mt} w={ww} flips={nf} pass1_bs={pb}",
+            w = width, h = height, f = n_frames,
+            nc = n_cover, mt = m_total, ww = w, nf = n_flips, pb = pass1_bytes,
+        );
+        let report = |label: &str, dt: Option<std::time::Duration>| {
+            if let Some(d) = dt {
+                let ms = d.as_secs_f64() * 1000.0;
+                let pct = ms / (dt_total.as_secs_f64() * 1000.0) * 100.0;
+                eprintln!("[PHASM_PERF_TRACE]   {label:<22} {ms:>9.1} ms  ({pct:>5.1}%)");
+            }
+        };
+        report("Pass 1 OH264 encode", dt_pass1);
+        report("walker (1-domain)", dt_walk);
+        report("STC plan", dt_stc);
+        report("override map build", dt_overrides);
+        report("Pass 2 OH264 stego", dt_pass2);
+        eprintln!(
+            "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)",
+            "TOTAL", dt_total.as_secs_f64() * 1000.0,
+        );
+    }
+
+    result
 }
 
 /// #493.4 Phase 3 — OH264 4-domain per-GOP encode primitive.
@@ -291,6 +344,9 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
         return Err(StegoError::InvalidVideo("empty frame bits".into()));
     }
 
+    let trace = perf_trace();
+    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+
     let mb_width = width / 16;
     let mb_height = height / 16;
     let mb_per_frame = (mb_width * mb_height) as usize;
@@ -302,6 +358,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     // Pass 1 — clean encode + walker for 4-domain cover capture.
     // record_mvd: true (Phase 0 finding: walker default leaves MVD
     // cover empty otherwise).
+    let t_pass1 = if trace { Some(std::time::Instant::now()) } else { None };
     let baseline_bitstream = encode_once(
         yuv, width, height, n_frames, opts,
         override_map.clone(),
@@ -311,15 +368,21 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
         mb_per_frame,
         /* dual_recon = */ false,
     )?;
+    let dt_pass1 = t_pass1.map(|t| t.elapsed());
+    let pass1_bytes = baseline_bitstream.len();
+
+    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
     let baseline_walk = walk_annex_b_for_cover_with_options(
         &baseline_bitstream,
         WalkOptions { record_mvd: true, ..Default::default() },
     )
     .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
+    let dt_walk = t_walk.map(|t| t.elapsed());
 
     // Combine 4-domain cover. Costs are dummy (1.0 baseline before
     // weight multiplication) since OH264 doesn't expose per-position
     // distortion costs. Per-domain weight drives allocation.
+    let t_stc = if trace { Some(std::time::Instant::now()) } else { None };
     let dummy_costs = DomainCosts::default();
     let (combined_cover, combined_costs, boundaries) =
         combine_cover_4domain(&baseline_walk.cover, &dummy_costs, weights);
@@ -341,10 +404,12 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     let hhat = generate_hhat(STC_H, w, hhat_seed);
     let plan = stc_embed(&cover_slice, &cost_slice, frame_bits, &hhat, STC_H, w)
         .ok_or(StegoError::MessageTooLarge)?;
+    let dt_stc = t_stc.map(|t| t.elapsed());
 
     // Extend STC result to full combined cover length (positions past
     // `used_cover` stay unchanged) so split_plan_4domain sees the
     // full vector.
+    let t_overrides = if trace { Some(std::time::Instant::now()) } else { None };
     let mut full_stego_bits = Vec::with_capacity(n_cover);
     full_stego_bits.extend_from_slice(&plan.stego_bits);
     full_stego_bits.extend_from_slice(&combined_cover[used_cover..]);
@@ -376,6 +441,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
             }
         }
     }
+    let n_flips = overrides_map.len();
     {
         let mut map = override_map.lock().expect("override map lock");
         map.clear();
@@ -383,14 +449,44 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
             map.insert(*k, *v);
         }
     }
+    let dt_overrides = t_overrides.map(|t| t.elapsed());
 
     // Pass 2 — re-encode with overrides + C.8 dual_recon cascade-break.
-    encode_once(
+    let t_pass2 = if trace { Some(std::time::Instant::now()) } else { None };
+    let result = encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
         mb_width, mb_per_frame,
         /* dual_recon = */ true,
-    )
+    );
+    let dt_pass2 = t_pass2.map(|t| t.elapsed());
+
+    if trace {
+        let dt_total = t_start.unwrap().elapsed();
+        eprintln!(
+            "[PHASM_PERF_TRACE oh264_4domain] {w}x{h} f={f} n_cover={nc} m_total={mt} w={ww} flips={nf}",
+            w = width, h = height, f = n_frames,
+            nc = n_cover, mt = m_total, ww = w, nf = n_flips,
+        );
+        let report = |label: &str, dt: Option<std::time::Duration>| {
+            if let Some(d) = dt {
+                let ms = d.as_secs_f64() * 1000.0;
+                let pct = ms / (dt_total.as_secs_f64() * 1000.0) * 100.0;
+                eprintln!("[PHASM_PERF_TRACE]   {label:<22} {ms:>9.1} ms  ({pct:>5.1}%)");
+            }
+        };
+        report("Pass 1 OH264 encode", dt_pass1);
+        report("walker (4-domain)", dt_walk);
+        report("combine + STC plan", dt_stc);
+        report("override map build", dt_overrides);
+        report("Pass 2 OH264 stego", dt_pass2);
+        eprintln!(
+            "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)  pass1_bs={} bytes",
+            "TOTAL", dt_total.as_secs_f64() * 1000.0, pass1_bytes,
+        );
+    }
+
+    result
 }
 
 /// D.0.7.2 — expose the MSB-first byte→bit helper for the streaming
@@ -425,8 +521,13 @@ pub fn openh264_stego_decode_yuv(
     annex_b: &[u8],
     passphrase: &str,
 ) -> Result<payload::PayloadData, StegoError> {
+    let trace = perf_trace();
+    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+
+    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
     let walk = walk_annex_b_for_cover(annex_b)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
+    let dt_walk = t_walk.map(|t| t.elapsed());
     let cover_bits = walk.cover.coeff_sign_bypass.bits;
     let n_cover = cover_bits.len();
     if n_cover == 0 {
@@ -441,9 +542,54 @@ pub fn openh264_stego_decode_yuv(
     let min_m = frame::FRAME_OVERHEAD * 8;
     let max_m = frame::MAX_FRAME_BITS.min(n_cover);
 
+    let t_search = if trace { Some(std::time::Instant::now()) } else { None };
+
+    // Brute-force m_total search. Sequential with early termination.
+    //
+    // #516.B NEGATIVE (3 strategies tried 2026-05-17):
+    //   1. naive par_iter().find_map_any: 49 → 56 ms (rayon default
+    //      chunks too large, cancellation lag)
+    //   2. par_chunks(8) + find_map_any: 49 → 51 ms (overhead at
+    //      8000+ chunks)
+    //   3. explicit outer-batched parallel: 49 → 51 ms (rayon batch
+    //      setup overhead)
+    //
+    // Root cause: after #516.2's length-prefix early-reject, wrong-
+    // try cost dropped to ~290 µs each, so parallel can shrink the
+    // 16 ms of wrong-try work to ~2 ms. But the WINNING try with
+    // full extract + Argon2id (key derive) + AES-GCM-SIV decrypt is
+    // ~5-8 ms by itself and runs single-threaded by security design
+    // (Argon2id is intentionally slow). Parallel wall is bounded
+    // below by the winning-try sequential cost.
+    //
+    // Parallel gains would only emerge for LONG messages (1000+
+    // tries) where wrong-try work dominates. Filed as deferred
+    // follow-on if message-length distribution shifts.
     let mut m_total = min_m;
+    let mut tries = 0usize;
     while m_total <= max_m {
+        tries += 1;
         if let Some(plaintext) = try_decode_at(&cover_bits, &hhat_seed, m_total, passphrase) {
+            if trace {
+                let dt_search = t_search.unwrap().elapsed();
+                let dt_total = t_start.unwrap().elapsed();
+                eprintln!(
+                    "[PHASM_PERF_TRACE oh264_decode] annex_b={} bytes n_cover={} tries={} m_hit={}",
+                    annex_b.len(), n_cover, tries, m_total,
+                );
+                eprintln!(
+                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms",
+                    "walker", dt_walk.unwrap().as_secs_f64() * 1000.0,
+                );
+                eprintln!(
+                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  ({} tries)",
+                    "STC search + decrypt", dt_search.as_secs_f64() * 1000.0, tries,
+                );
+                eprintln!(
+                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)",
+                    "TOTAL", dt_total.as_secs_f64() * 1000.0,
+                );
+            }
             return Ok(plaintext);
         }
         m_total += 8;
@@ -705,6 +851,53 @@ fn try_decode_at(
     }
     let used = m_total * w;
     let hhat = generate_hhat(STC_H, w, hhat_seed);
+
+    // #516.2 perf — length-prefix early-reject.
+    //
+    // The phasm v1 frame's first 2 bytes are `plaintext_len: u16 BE`.
+    // For ANY candidate `m_total`, only ONE specific u16 makes the
+    // identity `(FRAME_OVERHEAD + plaintext_len) * 8 == m_total`
+    // hold. For wrong `m_total`, the partial syndrome is essentially
+    // random → prob(consistent) ≈ 1/65536. Almost every wrong
+    // candidate rejects after just 16 partial-extract message bits
+    // (= 16 * w syndrome XORs) instead of the full m_total * w.
+    //
+    // v2 sentinel (`first u16 == 0`, plaintext > 64 KB): extend
+    // partial extract to 48 bits and check u32 length identity
+    // `(FRAME_OVERHEAD_EXT + plaintext_len) * 8 == m_total`. Rare
+    // path; the 16-bit fast path covers all messages ≤ 65535 bytes.
+    let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 16);
+    if prefix_bits.len() < 16 {
+        return None;
+    }
+    let prefix_bytes = bits_to_bytes_msb_first(&prefix_bits);
+    let v1_len = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]) as usize;
+    let mut len_consistent =
+        (frame::FRAME_OVERHEAD + v1_len) * 8 == m_total;
+
+    if !len_consistent && v1_len == 0 {
+        // v2 sentinel — pull more bits for u32 length field
+        let ext = stc_extract_prefix(&cover_bits[..used], &hhat, w, 48);
+        if ext.len() >= 48 {
+            let ext_bytes = bits_to_bytes_msb_first(&ext);
+            let v2_len = u32::from_be_bytes([
+                ext_bytes[2], ext_bytes[3], ext_bytes[4], ext_bytes[5],
+            ]) as usize;
+            if v2_len > u16::MAX as usize
+                && (frame::FRAME_OVERHEAD_EXT + v2_len) * 8 == m_total
+            {
+                len_consistent = true;
+            }
+        }
+    }
+
+    if !len_consistent {
+        return None;
+    }
+
+    // Length-prefix consistent: do the full extract + CRC + decrypt
+    // path. CRC kills the rare 1/65536 false-positive that snuck
+    // past the length filter; AEAD then verifies key + integrity.
     let extracted = stc_extract(&cover_bits[..used], &hhat, w);
     let frame_bits = &extracted[..m_total.min(extracted.len())];
     let frame_bytes = bits_to_bytes_msb_first(frame_bits);

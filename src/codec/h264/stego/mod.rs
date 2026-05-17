@@ -49,5 +49,6 @@ pub use inject::{
     enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
     extract_coeff_sign_bits, extract_coeff_suffix_lsb_bits,
     extract_mvd_sign_bits, extract_mvd_suffix_lsb_bits,
+    record_residual_block_into_cover,
     DomainBits, DomainCover, MvdSlot,
 };

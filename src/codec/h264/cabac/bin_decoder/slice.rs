@@ -211,8 +211,39 @@ pub fn walk_annex_b_for_cover_with_options(
     annex_b: &[u8],
     opts: WalkOptions,
 ) -> Result<CoverWalkOutput, WalkError> {
+    let trace = std::env::var("PHASM_PERF_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let t_nal = if trace { Some(std::time::Instant::now()) } else { None };
     let nalus = parse_nal_units_annexb(annex_b)?;
-    walk_nalus_for_cover_with_options(&nalus, opts)
+    let dt_nal = t_nal.map(|t| t.elapsed());
+
+    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
+    let result = walk_nalus_for_cover_with_options(&nalus, opts);
+    let dt_walk = t_walk.map(|t| t.elapsed());
+
+    if trace {
+        if let (Some(d_nal), Some(d_walk)) = (dt_nal, dt_walk) {
+            let total_us = (d_nal.as_micros() + d_walk.as_micros()).max(1) as f64;
+            eprintln!(
+                "[PHASM_PERF_TRACE walker] annex_b={} bytes nalus={}",
+                annex_b.len(), nalus.len(),
+            );
+            eprintln!(
+                "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  ({:>5.1}%)",
+                "parse_nal_units_annexb",
+                d_nal.as_secs_f64() * 1000.0,
+                d_nal.as_micros() as f64 / total_us * 100.0,
+            );
+            eprintln!(
+                "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  ({:>5.1}%)",
+                "walk_nalus + slice MBs",
+                d_walk.as_secs_f64() * 1000.0,
+                d_walk.as_micros() as f64 / total_us * 100.0,
+            );
+        }
+    }
+    result
 }
 
 /// Walk an already-parsed NAL unit list. Same semantics as
@@ -227,6 +258,27 @@ pub fn walk_nalus_for_cover(nalus: &[NalUnit]) -> Result<CoverWalkOutput, WalkEr
 /// that accumulates per-GOP covers into a single whole-stream cover
 /// — preserves all current parity gates as regression tests.
 pub fn walk_nalus_for_cover_with_options(
+    nalus: &[NalUnit],
+    opts: WalkOptions,
+) -> Result<CoverWalkOutput, WalkError> {
+    // #516.A perf — the parallel walker handles the default cover-walk
+    // case (record_offsets=false, no callback). Offset capture has
+    // shared mutable state across slices (bit-offset accumulator)
+    // that doesn't trivially merge per-slice → route to legacy
+    // streaming path which preserves bit-offset semantics.
+    if !opts.record_offsets {
+        return walk_nalus_for_cover_parallel(nalus, opts);
+    }
+    walk_nalus_for_cover_sequential(nalus, opts)
+}
+
+/// Legacy sequential cover walk via the streaming-callback path.
+/// Retained for `record_offsets=true` consumers (bitstream-mod
+/// splicer in `core/src/codec/h264/cabac/bin_decoder/bitstream_mod.rs`)
+/// since the per-bin RBSP offset accumulator threads mutable state
+/// through every slice and can't be safely parallelised without a
+/// post-hoc renumber pass.
+pub(crate) fn walk_nalus_for_cover_sequential(
     nalus: &[NalUnit],
     opts: WalkOptions,
 ) -> Result<CoverWalkOutput, WalkError> {
@@ -277,6 +329,243 @@ pub fn walk_nalus_for_cover_with_options(
     })
 }
 
+/// #516.A — Parallel cover walk via per-slice rayon `par_iter`.
+///
+/// **Two-pass design:**
+/// 1. **Linear pre-pass**: scan nalus, parse SPS/PPS, build a
+///    `Vec<SliceCtx>` with each slice's frame_idx, nal_idx, parsed
+///    header, active SPS/PPS clones. Cheap (~30 slices × ~50 µs
+///    each at 1080p × 30f).
+/// 2. **Parallel walk**: each slice walks its own MBs into a local
+///    `PositionRecorder` (with `reserve_for_mb_count` pre-sized).
+///    CABAC arithmetic engine resets per slice (slice header starts
+///    fresh state) + neighbours are slice-local → no cross-slice
+///    dependency.
+/// 3. **Sequential merge**: concat per-slice covers in original slice
+///    order. Preserves the byte-identical position+bit emit order of
+///    the sequential walker.
+///
+/// Memory: per-thread local recorder ≈ 200 KB × N_threads. Well inside
+/// the streaming-Viterbi per-GOP bound from #472.
+///
+/// WASM target falls back to sequential (`rayon::par_iter` requires
+/// threading; WASM threading is opt-in via `Atomics` proposal which
+/// most consumers don't enable). Same for builds without the
+/// `parallel` Cargo feature.
+///
+/// **Not for `record_offsets=true` callers** — RBSP bit-offset
+/// accumulator has cross-slice state that doesn't trivially merge.
+/// `walk_nalus_for_cover_with_options` routes those to the legacy
+/// sequential path automatically.
+pub fn walk_nalus_for_cover_parallel(
+    nalus: &[NalUnit],
+    opts: WalkOptions,
+) -> Result<CoverWalkOutput, WalkError> {
+    debug_assert!(
+        !opts.record_offsets,
+        "parallel walker doesn't support offset capture",
+    );
+
+    // Pre-pass: gather per-slice ctxs.
+    let prepared = prepare_slice_ctxs(nalus)?;
+    if prepared.slices.is_empty() {
+        return Err(WalkError::NoSlices);
+    }
+
+    // Parallel slice walk. Each slice writes into a local recorder.
+    let slice_results: Vec<SliceWalkResult> = {
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+        {
+            use rayon::prelude::*;
+            prepared
+                .slices
+                .par_iter()
+                .map(|ctx| walk_one_slice_into_local(ctx, &opts))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+        {
+            prepared
+                .slices
+                .iter()
+                .map(|ctx| walk_one_slice_into_local(ctx, &opts))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+
+    // Sequential merge in slice order. The `extend_from` calls walk
+    // each per-slice cover Vec once; merge cost ≈ same as the
+    // sequential walker's incremental push (we just move the
+    // ordering boundary).
+    let n_slices = slice_results.len();
+    let mut acc_cover = DomainCover::default();
+    let mut acc_mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>
+        = Vec::new();
+    let mut total_n_mb = 0usize;
+    // Pre-size the merged Vecs to avoid log2 reallocations during the
+    // concat phase.
+    let total_cs_bypass: usize = slice_results
+        .iter()
+        .map(|r| r.cover.coeff_sign_bypass.len())
+        .sum();
+    let total_cs_lsb: usize = slice_results
+        .iter()
+        .map(|r| r.cover.coeff_suffix_lsb.len())
+        .sum();
+    let total_mvd_sign: usize = slice_results
+        .iter()
+        .map(|r| r.cover.mvd_sign_bypass.len())
+        .sum();
+    let total_mvd_lsb: usize = slice_results
+        .iter()
+        .map(|r| r.cover.mvd_suffix_lsb.len())
+        .sum();
+    let total_mvd_meta: usize = slice_results.iter().map(|r| r.mvd_meta.len()).sum();
+    acc_cover.coeff_sign_bypass.reserve(total_cs_bypass);
+    acc_cover.coeff_suffix_lsb.reserve(total_cs_lsb);
+    acc_cover.mvd_sign_bypass.reserve(total_mvd_sign);
+    acc_cover.mvd_suffix_lsb.reserve(total_mvd_lsb);
+    acc_mvd_meta.reserve(total_mvd_meta);
+
+    for r in slice_results {
+        acc_cover.extend_from(r.cover);
+        acc_mvd_meta.extend(r.mvd_meta);
+        total_n_mb += r.n_mb;
+    }
+
+    Ok(CoverWalkOutput {
+        cover: acc_cover,
+        n_mb: total_n_mb,
+        n_slices,
+        mvd_meta: acc_mvd_meta,
+        mb_w: prepared.mb_w as u32,
+        mb_h: prepared.mb_h as u32,
+        offsets: None,
+    })
+}
+
+/// Per-slice context built by the linear pre-pass. Each entry owns
+/// the parsed header + cloned SPS/PPS so parallel slice walks need
+/// no shared state.
+struct SliceCtx {
+    nal_idx: u32,
+    frame_idx: u32,
+    rbsp: Vec<u8>,
+    header: SliceHeader,
+    pps: Pps,
+    mb_w: usize,
+    mb_count: usize,
+}
+
+struct PreparedSlices {
+    slices: Vec<SliceCtx>,
+    mb_w: usize,
+    mb_h: usize,
+}
+
+struct SliceWalkResult {
+    cover: DomainCover,
+    mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
+    n_mb: usize,
+}
+
+/// Linear pre-pass: parse SPS/PPS as they arrive, build a per-slice
+/// context list. Frame indices are assigned in VCL-NAL order
+/// (matches the streaming walker's `frame_idx.wrapping_add(1)`
+/// semantics), nal indices match the original `nalus[]` position.
+fn prepare_slice_ctxs(nalus: &[NalUnit]) -> Result<PreparedSlices, WalkError> {
+    let mut active_sps: Option<Sps> = None;
+    let mut active_pps: Option<Pps> = None;
+    let mut slices = Vec::new();
+    let mut frame_idx: u32 = 0;
+    let mut last_mb_w = 0usize;
+    let mut last_mb_h = 0usize;
+
+    for (nal_idx_usize, nal) in nalus.iter().enumerate() {
+        let nal_idx = nal_idx_usize as u32;
+        match nal.nal_type {
+            NalType::SPS => {
+                active_sps = Some(parse_sps(&nal.rbsp)?);
+            }
+            NalType::PPS => {
+                active_pps = Some(parse_pps(&nal.rbsp)?);
+            }
+            t if t.is_vcl() => {
+                let sps = active_sps.as_ref().ok_or(WalkError::MissingParameterSet)?;
+                let pps = active_pps.as_ref().ok_or(WalkError::MissingParameterSet)?;
+                if !pps.entropy_coding_mode_flag {
+                    return Err(WalkError::NotCabac);
+                }
+                let header = parse_slice_header(&nal.rbsp, sps, pps, t, nal.nal_ref_idc)?;
+                let mb_w = sps.pic_width_in_mbs as usize;
+                let mb_h = sps.pic_height_in_map_units as usize
+                    * if sps.frame_mbs_only_flag { 1 } else { 2 };
+                let mb_count = mb_w * mb_h;
+                last_mb_w = mb_w;
+                last_mb_h = mb_h;
+
+                slices.push(SliceCtx {
+                    nal_idx,
+                    frame_idx,
+                    rbsp: nal.rbsp.clone(),
+                    header,
+                    pps: pps.clone(),
+                    mb_w,
+                    mb_count,
+                });
+                frame_idx = frame_idx.wrapping_add(1);
+            }
+            _ => { /* AUD, SEI, filler — skip */ }
+        }
+    }
+
+    Ok(PreparedSlices {
+        slices,
+        mb_w: last_mb_w,
+        mb_h: last_mb_h,
+    })
+}
+
+/// Per-slice CABAC walk — mirrors the body of the VCL branch in
+/// `walk_nalus_streaming_with_options`. Writes into a thread-local
+/// `PositionRecorder` that the caller takes ownership of.
+fn walk_one_slice_into_local(
+    ctx: &SliceCtx,
+    opts: &WalkOptions,
+) -> Result<SliceWalkResult, WalkError> {
+    let mut recorder = PositionRecorder::new();
+    // #516.1 perf — pre-size cover Vecs from per-slice mb_count.
+    recorder.reserve_for_mb_count(ctx.mb_count);
+
+    let cabac_byte_off = cabac_data_byte_offset(ctx.header.data_bit_offset);
+    if cabac_byte_off > ctx.rbsp.len() {
+        return Err(WalkError::H264(H264Error::UnexpectedEof));
+    }
+    let cabac_bytes = &ctx.rbsp[cabac_byte_off..];
+
+    let slot = pick_init_slot(&ctx.header);
+    let mut dec =
+        CabacDecoder::new_slice(cabac_bytes, slot, ctx.header.slice_qp, ctx.mb_w)?;
+
+    let n_mb = walk_slice_mbs(
+        &mut dec,
+        &ctx.header,
+        &ctx.pps,
+        ctx.mb_count,
+        ctx.frame_idx,
+        ctx.mb_w,
+        ctx.nal_idx,
+        &mut recorder,
+        opts,
+    )?;
+
+    Ok(SliceWalkResult {
+        cover: recorder.take_cover(),
+        mvd_meta: recorder.take_mvd_meta(),
+        n_mb,
+    })
+}
+
 /// Phase 6E-C0 — per-GOP streaming walker (Annex-B input). Parses
 /// the byte stream, emits one `GopContext` per GOP via the
 /// `on_gop` callback. Memory bound is per-GOP (the swap-out
@@ -315,6 +604,13 @@ pub fn walk_nalus_streaming_with_options<F>(
 where
     F: FnMut(GopContext) -> Result<WalkAction, WalkError>,
 {
+    let trace = std::env::var("PHASM_PERF_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let mut t_setup_total = std::time::Duration::ZERO;
+    let mut t_walk_mbs_total = std::time::Duration::ZERO;
+    let mut t_gop_extract_total = std::time::Duration::ZERO;
+
     let mut active_sps: Option<Sps> = None;
     let mut active_pps: Option<Pps> = None;
     let mut recorder = if opts.record_offsets {
@@ -322,6 +618,12 @@ where
     } else {
         PositionRecorder::new()
     };
+    // #516.1 perf — pre-size the cover Vecs once after the first SPS
+    // arrives, eliminating the ~log2(N) doubling reallocs on hot
+    // fixtures (1080p × 30f IPPPP has ~514k CoeffSign positions).
+    // `reserved_for` tracks the largest mb_count we've sized for so
+    // multi-GOP streams don't down-size or re-reserve needlessly.
+    let mut reserved_for: usize = 0;
     let mut frame_idx: u32 = 0;
     let mut current_gop_idx: u32 = 0;
     let mut gop_n_mb: usize = 0;
@@ -358,9 +660,11 @@ where
                 // GOP boundary detection: an IDR after at least one
                 // VCL NAL in the current GOP closes the prior GOP.
                 if t.is_idr() && had_vcl_in_current_gop {
+                    let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
                     let cover = recorder.take_cover();
                     let mvd_meta = recorder.take_mvd_meta();
                     let offsets = recorder.take_offsets();
+                    if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
                     let (closing_mb_w, closing_mb_h) = active_sps
                         .as_ref()
                         .map(|s| (
@@ -394,10 +698,22 @@ where
                     // next VCL NAL (line ~382); no explicit reset needed.
                 }
 
+                let t_setup = if trace { Some(std::time::Instant::now()) } else { None };
                 let mb_w = sps.pic_width_in_mbs as usize;
                 let mb_h = sps.pic_height_in_map_units as usize
                     * if sps.frame_mbs_only_flag { 1 } else { 2 };
                 let mb_count = mb_w * mb_h;
+
+                // #516.1 perf — first-slice cover Vec pre-sizing. The
+                // recorder starts with zero-cap Vecs; without this, the
+                // per-MB CABAC loop pushes into doubling Vecs and pays
+                // ~24 MB cumulative memcopy across log2(514k) ≈ 19
+                // reallocs at 1080p × 30f. Idempotent: re-arms only on
+                // larger mb_count (multi-resolution streams).
+                if mb_count > reserved_for {
+                    recorder.reserve_for_mb_count(mb_count);
+                    reserved_for = mb_count;
+                }
 
                 // Slice data begins at `header.data_bit_offset` in
                 // the RBSP. For CABAC, consume cabac_alignment_one_bit
@@ -413,11 +729,14 @@ where
                 let mut dec = CabacDecoder::new_slice(
                     cabac_bytes, slot, header.slice_qp, mb_w,
                 )?;
+                if let Some(t) = t_setup { t_setup_total += t.elapsed(); }
 
+                let t_mbs = if trace { Some(std::time::Instant::now()) } else { None };
                 let n_mb = walk_slice_mbs(
                     &mut dec, &header, pps, mb_count, frame_idx, mb_w,
                     nal_idx, &mut recorder, &opts,
                 )?;
+                if let Some(t) = t_mbs { t_walk_mbs_total += t.elapsed(); }
 
                 gop_n_mb += n_mb;
                 gop_n_slices += 1;
@@ -432,9 +751,11 @@ where
 
     // End-of-stream: emit the final GOP if any VCL was processed.
     if had_vcl_in_current_gop {
+        let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
         let cover = recorder.take_cover();
         let mvd_meta = recorder.take_mvd_meta();
         let offsets = recorder.take_offsets();
+        if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
         let (closing_mb_w, closing_mb_h) = active_sps
             .as_ref()
             .map(|s| (
@@ -458,6 +779,25 @@ where
 
     if total_n_slices == 0 {
         return Err(WalkError::NoSlices);
+    }
+
+    if trace {
+        let total_us = (t_setup_total.as_micros()
+            + t_walk_mbs_total.as_micros()
+            + t_gop_extract_total.as_micros())
+            .max(1) as f64;
+        eprintln!(
+            "[PHASM_PERF_TRACE walker_inner] n_mb={} n_slices={} n_gops={}",
+            total_n_mb, total_n_slices, total_n_gops,
+        );
+        let report = |label: &str, d: std::time::Duration| {
+            let ms = d.as_secs_f64() * 1000.0;
+            let pct = d.as_micros() as f64 / total_us * 100.0;
+            eprintln!("[PHASM_PERF_TRACE]   {label:<22} {ms:>9.1} ms  ({pct:>5.1}%)");
+        };
+        report("slice header + cabac init", t_setup_total);
+        report("walk_slice_mbs (per-MB)", t_walk_mbs_total);
+        report("GOP record extract", t_gop_extract_total);
     }
 
     Ok(StreamingWalkOutput {

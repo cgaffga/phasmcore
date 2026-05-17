@@ -26,6 +26,7 @@
 // scan_coeffs the encoder entropy-coded), inputs match.
 
 use crate::codec::h264::stego::{
+    record_residual_block_into_cover,
     enumerate_coeff_sign_positions, enumerate_coeff_suffix_lsb_positions,
     enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
     extract_coeff_sign_bits, extract_coeff_suffix_lsb_bits,
@@ -187,6 +188,39 @@ impl PositionRecorder {
         }
     }
 
+    /// #516.1 perf — pre-size cover Vecs from MB count.
+    ///
+    /// Called by the walker after SPS parse, once `mb_count = mb_w *
+    /// mb_h` is known for the slice. Per-domain heuristics based on
+    /// the 2026-05-17 1080p × 30f IPPPP IMG_4138 baseline (`memory/
+    /// h264_perf_baseline_2026_05_17.md`):
+    ///
+    /// - CoeffSign:       ~2.13 positions per MB on real-world IPPPP
+    ///                    @ QP=26 → pre-size to `2 * mb_count` for
+    ///                    ~0-1 reallocs even on dense content.
+    /// - CoeffSuffixLsb:  sparse (~0.4/MB) → pre-size to mb_count / 2.
+    /// - MvdSignBypass:   only fires with `record_mvd=true`; rate
+    ///                    depends on slice type. Pre-size to mb_count
+    ///                    / 4 — overshoots on intra slices, undershoots
+    ///                    moderately on high-motion P/B (1 realloc).
+    /// - MvdSuffixLsb:    very sparse (~0.02/MB on real-world motion)
+    ///                    → pre-size to mb_count / 8.
+    ///
+    /// Idempotent: calling multiple times only widens capacity, never
+    /// shrinks. Safe to call before each GOP if the walker wants to
+    /// reset per-GOP caps after `take_cover()`.
+    ///
+    /// Total upfront cap at 1080p (241k MBs): ~482k + 121k + 60k + 30k
+    /// = 693k entries × ~25 bytes avg = ~17 MB. At 60-frame GOP
+    /// long-form (482k MBs): ~34 MB worst case. Stays well under the
+    /// per-GOP memory bound from `streaming-Viterbi` (#472).
+    pub fn reserve_for_mb_count(&mut self, mb_count: usize) {
+        self.cover.coeff_sign_bypass.reserve(mb_count * 2);
+        self.cover.coeff_suffix_lsb.reserve(mb_count / 2);
+        self.cover.mvd_sign_bypass.reserve(mb_count / 4);
+        self.cover.mvd_suffix_lsb.reserve(mb_count / 8);
+    }
+
     /// Consume the recorder and return the accumulated cover.
     pub fn into_cover(self) -> DomainCover {
         self.cover
@@ -230,25 +264,24 @@ impl PositionRecorder {
         end_idx: usize,
         path_kind: ResidualPathKind,
     ) {
-        // CoeffSignBypass.
-        let positions = enumerate_coeff_sign_positions(
-            scan_coeffs, start_idx, end_idx, frame_idx, mb_addr,
-            |ci| path_kind.path(ci, BinKind::Sign),
+        // #516.1.b perf — fused single-pass walker that pushes
+        // CoeffSign + CoeffSuffixLsb (bit, position) directly into
+        // the cover Vecs. The legacy implementation built 4
+        // intermediate Vecs per call (sig indices, positions, sig
+        // indices again, bits) — at ~16 residual blocks per MB ×
+        // 241k MBs (1080p × 30f) = ~3.86M small alloc/free pairs
+        // per cover walk. The fused walker eliminates them; output
+        // is byte-identical (verified by the lib parity tests at
+        // bottom of this file + 98 walker tests).
+        record_residual_block_into_cover(
+            &mut self.cover,
+            scan_coeffs,
+            start_idx,
+            end_idx,
+            frame_idx,
+            mb_addr,
+            |ci, kind| path_kind.path(ci, kind),
         );
-        let bits = extract_coeff_sign_bits(scan_coeffs, start_idx, end_idx);
-        for (p, b) in positions.iter().zip(bits.iter()) {
-            self.cover.coeff_sign_bypass.push(*b, *p);
-        }
-
-        // CoeffSuffixLsb.
-        let positions = enumerate_coeff_suffix_lsb_positions(
-            scan_coeffs, start_idx, end_idx, frame_idx, mb_addr,
-            |ci| path_kind.path(ci, BinKind::SuffixLsb),
-        );
-        let bits = extract_coeff_suffix_lsb_bits(scan_coeffs, start_idx, end_idx);
-        for (p, b) in positions.iter().zip(bits.iter()) {
-            self.cover.coeff_suffix_lsb.push(*b, *p);
-        }
     }
 
     /// Record an MVD slot's bypass-bin positions + bits across the

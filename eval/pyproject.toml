@@ -1,0 +1,86 @@
+[project]
+name = "phasm-eval"
+version = "0.1.0"
+description = "Steganalysis evaluation for Phasm — SRNet/EfficientNet PE curves, calibration vs J-UNIWARD reference"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+
+# Hard runtime deps. Do NOT add anything that doesn't have an arm64 macOS wheel
+# or a clean fallback — keep the local-first compute path frictionless. Cloud
+# Linux installs are a side path, not the default.
+dependencies = [
+    # Core ML
+    "torch>=2.5,<3",                    # PyTorch with MPS backend on Apple Silicon
+    "torchvision>=0.20,<1",
+    # Numerics
+    "numpy>=1.26,<3",
+    "scipy>=1.13,<2",
+    # Image I/O — Pillow uses libjpeg-turbo by default on modern installs
+    "pillow>=10.4,<12",
+    "imageio>=2.34,<3",                 # PGM read; useful complement to Pillow
+    # JPEG DCT-coefficient access + steganography algorithms (pure Python +
+    # optional Rust backend). conseal ships J-UNIWARD with both the original
+    # MATLAB-canonical implementation AND the Butora 2023 off-by-one fix —
+    # so we can run both and report which we used. Replaces the earlier
+    # plan to use aletheia (Octave) which had a brittle TF/Keras dep chain
+    # on Apple Silicon and required a 365 MB clone we mostly didn't need.
+    "conseal>=2025.4",
+    "jpeglib>=1.0,<2",                  # transitive of conseal but pinned for clarity
+    # Data wrangling + result store
+    "pandas>=2.2,<3",
+    "duckdb>=1.0,<2",
+    # Plotting
+    "matplotlib>=3.9,<4",
+    # Progress + CLI ergonomics
+    "tqdm>=4.66,<5",
+    "click>=8.1,<9",
+    # Hashing for dataset manifests (stdlib hashlib is enough; no extra dep)
+]
+
+[project.optional-dependencies]
+notebook = [
+    "jupyterlab>=4.2,<5",
+    "ipykernel>=6.29,<7",
+    "seaborn>=0.13,<1",                 # nicer chart defaults inside notebooks
+]
+# Path 1a (pretrained EffNet B0 J-UNIWARD detector from aletheia) — TF stack
+# only needed for inference. tensorflow-metal pinned out: 1.2.0 expects
+# TF 2.18 and breaks against TF 2.21 with a missing-_pywrap-symlink error;
+# CPU inference is fast enough (~140 ms/image batch-8 on M-series).
+tf-inference = [
+    "tensorflow>=2.21,<3",
+    "efficientnet>=1.1,<2",             # community Keras EfficientNet (aletheia uses this)
+    "scikit-image>=0.25,<1",            # natural-image samples for smoke testing
+]
+# Phase 4e: hand-crafted feature attack (SPAM/SRMQ1/GFR + XGBoost). Adds
+# scikit-learn (already a transitive dep of conseal but listed here for
+# clarity) and XGBoost.
+classifier = [
+    "scikit-learn>=1.5,<2",
+    "xgboost>=2.1,<3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.6,<1",
+]
+
+# uv lockfile-driven; no constraint files needed.
+
+[build-system]
+# This is an application, not a library — no wheel build needed. Marking it
+# explicitly so uv doesn't try to package it.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prep", "detectors"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]                       # long lines OK; we use line-length softly

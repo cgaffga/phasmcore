@@ -23,11 +23,43 @@ pub fn stc_extract(stego_bits: &[u8], hhat: &[Vec<u32>], w: usize) -> Vec<u8> {
 
     let n = stego_bits.len();
     let m = n.div_ceil(w); // ceil(n / w)
+    stc_extract_prefix(stego_bits, hhat, w, m)
+}
 
-    let mut message = Vec::with_capacity(m);
+/// Partial extraction — compute only the first `k_msg_bits` message
+/// bits and stop early. Same syndrome-walking logic as
+/// [`stc_extract`] but bounded.
+///
+/// **Use case (#516.2):** brute-force `m_total` decoders try many
+/// candidate message lengths. For each candidate, the first 16
+/// syndrome bits encode the phasm v1 frame's `u16 plaintext_len`
+/// header. The decoder can verify
+/// `(FRAME_OVERHEAD + plaintext_len) * 8 == m_total` after just
+/// 16-bit partial extract — for the WRONG `m_total` the prefix is
+/// essentially random and the equality holds with probability
+/// 1/65536. Almost every wrong candidate rejects in `O(16 * w)`
+/// work instead of the full `O(m_total * w)`.
+///
+/// On a 1080p × 30f IPPPP cover with 55 candidate tries, this drops
+/// the brute-force search from ~106 ms (55 full extracts) to ~4 ms
+/// (55 prefix extracts + 1 full extract on the winner).
+pub fn stc_extract_prefix(
+    stego_bits: &[u8],
+    hhat: &[Vec<u32>],
+    w: usize,
+    k_msg_bits: usize,
+) -> Vec<u8> {
+    if w == 0 || k_msg_bits == 0 {
+        return Vec::new();
+    }
+
+    let n = stego_bits.len();
+    let max_i = k_msg_bits.min(n.div_ceil(w));
+
+    let mut message = Vec::with_capacity(max_i);
     let mut state = 0u32;
 
-    for i in 0..m {
+    for i in 0..max_i {
         let start = i * w;
         let end = (start + w).min(n);
 

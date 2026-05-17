@@ -1,0 +1,66 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# uv / venv
+.venv/
+.python-version
+# uv.lock IS tracked — it's the paper-repro pin for every Python dep
+# (Appendix D references it). Do not re-ignore.
+
+# Datasets, stego corpora, extracted features, model weights — never
+# commit any of this. Everything under data/ is purely a runtime
+# workspace: covers are fetched from upstream sources (BOSSbase,
+# ALASKA-2, Wikimedia), stegos are regenerable via prep/ scripts,
+# features are regenerable via detectors/extract_*.py, model weights
+# are fetched from aletheia or trained via detectors/train_*.py.
+#
+# Track URLs + SHAs in prep/ + detectors/ source rather than the
+# binaries themselves. If you ever need to ship a small manifest
+# from inside data/ (unusual), `git add -f path/to/file`.
+data/
+
+# Built phasm CLI binaries — ~5 MB each; track via filename convention
+# (phasm-<sha>-<date>) and bin/MANIFEST.md, not the binary itself
+bin/phasm-*
+
+# Project-local secret store — credentials, API tokens, etc.
+# Files live here gitignored; ~/.kaggle/kaggle.json is the canonical
+# location for the kaggle CLI itself.
+.secrets/
+
+# Run outputs — selective: commit small result manifests + RESULTS.md,
+# ignore large model checkpoints and intermediate caches
+runs/*/checkpoints/
+runs/*/checkpoints.7z
+runs/*/cache/
+runs/*/predictions/
+runs/*/cover_subset/
+runs/*/stego_si/
+runs/*/pgms/
+runs/*/pngs/
+runs/*/*.pth
+runs/*/*.ckpt
+runs/*/*.h5
+
+# Vendored external repos — clone fresh per environment, pin via
+# third_party/README.md not git submodules (avoids submodule churn for
+# a single-developer workflow)
+third_party/Deep-Steganalysis/
+third_party/aletheia/
+third_party/*/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

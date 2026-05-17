@@ -1,0 +1,22 @@
+# Pinned Rust toolchain for the Phasm crate.
+#
+# The paper's reproducibility claim (Appendix D) pins this version. The
+# bit-exact CI at core/.github/workflows/bit-exact.yml must also pass on
+# this toolchain across all five platforms. Bumping the channel requires
+# re-triggering the CI and updating Appendix D.
+#
+# Why a specific channel and not "stable"? Reproducibility — `stable` is a
+# moving target that floats over time. Pinning freezes the compiler so
+# anyone who clones at paper-v1.0 builds with the same toolchain the paper
+# was written against.
+#
+# Channel choice: matches the local environment the paper was developed on
+# (rustc 1.93.1 / 2026-02-11). When tagging paper-v1.0, re-trigger the
+# bit-exact CI workflow with this pin honored (the CI workflow currently
+# uses dtolnay/rust-toolchain@stable; switching to @1.93.1 on the paper-v1.0
+# ref makes the pin binding).
+
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

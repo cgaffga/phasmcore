@@ -25,11 +25,13 @@
 //!
 //! # Thread safety
 //!
-//! The OpenH264 encoder is configured for single-threaded operation
-//! during Phase A (`iMultipleThreadIdc=1`) for determinism. All
-//! callbacks therefore fire from the encoder's single thread; the
-//! handlers don't need `Send + Sync`. We still require `'static` on
-//! the boxed closures so the session can be moved freely.
+//! The OpenH264 encoder runs with `iMultipleThreadIdc=0` (auto worker
+//! count from CPUID, restored in Task #339 2026-05-12). Stego callbacks
+//! still fire from a single worker thread because `uiSliceMode =
+//! SM_SINGLE_SLICE` forces per-MB encoding sequential — parallel work
+//! (deblock filter, lookahead background) never invokes stego hooks.
+//! Handlers therefore don't need `Send + Sync`. We still require
+//! `'static` on the boxed closures so the session can be moved freely.
 //!
 //! Process-global registration: only one `StegoSession` may exist at a
 //! time per process. Constructing a second while the first is alive
@@ -461,10 +463,12 @@ impl std::error::Error for EncoderError {}
 /// resources.
 ///
 /// # Concurrency
-/// The encoder is single-threaded internally (`iMultipleThreadIdc=1`
-/// per phasm's deterministic defaults). The Rust wrapper is `!Sync`
-/// by virtue of the raw pointer; an `Encoder` is moveable across
-/// threads but only one thread at a time should call `encode_frame`.
+/// The encoder runs with `iMultipleThreadIdc=0` (auto). Parallel work
+/// is confined to deblock filter + lookahead; per-MB encoding (and
+/// every stego hook) stays sequential on one worker because
+/// `uiSliceMode = SM_SINGLE_SLICE`. The Rust wrapper is `!Sync` by
+/// virtue of the raw pointer; an `Encoder` is moveable across threads
+/// but only one thread at a time should call `encode_frame`.
 pub struct Encoder {
     handle: *mut PhasmEncoderHandle,
     width: i32,
@@ -1537,7 +1541,8 @@ mod tests {
     /// well-defined for the COEFF_SIGN domain. Identical fires from two
     /// independent encode passes of the same input should produce the
     /// same key, provided the encoder is deterministic (which it is
-    /// under phasm's `iMultipleThreadIdc=1` config).
+    /// under phasm's `SM_SINGLE_SLICE` config — all stego hooks fire on
+    /// one worker thread regardless of `iMultipleThreadIdc`).
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct CoeffSignKey {
         frame_num: u32,

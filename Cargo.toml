@@ -35,7 +35,7 @@ video = ["memmap2"]
 # (ios-bridge, android-bridge) enable this feature explicitly. CLI
 # users wanting video stego must build from source with
 # `cargo install phasm-cli --features h264-encoder`.
-h264-encoder = ["video"]
+h264-encoder = ["video", "parallel", "simd"]
 # `cabac-stego` enables the encode-time CABAC stego pipeline at
 # H.264 High Profile + CABAC (Phase 6D). Implies `h264-encoder`.
 # When OFF, the Rust core's video stego routes through the
