@@ -44,10 +44,20 @@ fn full_pass1(
     n_frames: usize,
     pattern: GopPattern,
 ) -> GopCover {
+    use phasm_core::codec::h264::encoder::mb_decision_b::BRdoConfig;
     let frame_size = (width * height * 3 / 2) as usize;
     let mut enc = Encoder::new(width, height, Some(26)).expect("encoder");
     enc.entropy_mode = EntropyMode::Cabac;
-    enc.enable_transform_8x8 = false;
+    // #513 fix 2026-05-17: mirror production `build_encoder()` in
+    // core/src/codec/h264/stego/encode_pixels.rs:299, which
+    // H264GopReplayCover uses internally for its per-segment Pass 1
+    // replays. Without these two knobs the test's full-clip Pass 1
+    // counts diverge from the replay path's per-GOP counts (clean
+    // n=24016 vs replay total 23878 on the 64x48x6 ipppp fixture),
+    // and the m*w sanity check in H264GopReplayCover::new bails.
+    // Same root cause as #511.
+    enc.enable_transform_8x8 = true;
+    enc.b_rdo_config = BRdoConfig::PRODUCTION_VISUAL;
     enc.enable_mvd_stego_hook = true;
     enc.enable_b_frames = pattern.has_b_frames();
     enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));

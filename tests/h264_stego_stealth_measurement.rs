@@ -66,6 +66,7 @@ fn encode_clean_reference(
     n_frames: usize,
     gop_size: usize,
 ) -> Vec<u8> {
+    use phasm_core::codec::h264::encoder::mb_decision_b::BRdoConfig;
     use phasm_core::codec::h264::stego::gop_pattern::{
         iter_encode_order, FrameType, GopPattern,
     };
@@ -74,9 +75,23 @@ fn encode_clean_reference(
     let mut enc = Encoder::new(width, height, quality)
         .expect("clean encoder");
     enc.entropy_mode = EntropyMode::Cabac;
-    enc.enable_transform_8x8 = false;
+    // #511 fix 2026-05-17: mirror `build_encoder()` in
+    // core/src/codec/h264/stego/encode_pixels.rs:299 so the clean
+    // reference and stego encode walk byte-for-byte equivalent cover
+    // shapes. Two divergences caused 517 vs 653 pre-fix:
+    //   1. `enable_transform_8x8`: false (clean) vs true (stego, per
+    //      §Stealth.L3.1 follow-on #145 High profile). I_8x8 enrolls
+    //      different walker positions than I_4x4.
+    //   2. `b_rdo_config`: default (clean) vs PRODUCTION_VISUAL
+    //      (stego). PRODUCTION_VISUAL gates `b_residual_emit`,
+    //      `safe_l0_zero=false` etc — affects B-MB mode mix.
+    // GOP pattern: legacy entry `h264_stego_encode_yuv_string_4domain
+    // _multigop` was pinned to IPPPP (b_count=0) by
+    // §scenecut-ibpbp-2026-05-09 (#288). Match here.
+    enc.enable_transform_8x8 = true;
+    enc.b_rdo_config = BRdoConfig::PRODUCTION_VISUAL;
     enc.enable_mvd_stego_hook = true; // disable P_SKIP for shape parity
-    let pattern = GopPattern::Ibpbp { gop: gop_size, b_count: 1 };
+    let pattern = GopPattern::Ipppp { gop: gop_size };
     enc.enable_b_frames = pattern.has_b_frames();
     let mut out = Vec::new();
     for meta in iter_encode_order(n_frames, pattern) {

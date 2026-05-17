@@ -1,6 +1,6 @@
 [package]
 name = "phasm-cli"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "CLI for phasm-core steganography"
@@ -38,11 +38,3 @@ h264-encoder = ["phasm-core/h264-encoder"]
 # When this feature is ON, `phasm video-encode` exposes the
 # `--encoder` flag.
 cabac-stego = ["h264-encoder", "phasm-core/cabac-stego"]
-# D.0 (2026-05-14) — Production OpenH264-backend stego pipeline.
-# Default encoder for `phasm video-encode`. Links the vendored
-# OpenH264 fork via `core-openh264-sys` (meson+ninja build at
-# `vendor/phasm-openh264`). Source-only; cargo-dist binary
-# excludes this for AVC patent reasons.
-# Implies `cabac-stego` so the CLI shares the same MP4 demux +
-# remux infrastructure (ffmpeg → YUV → annex-B → ffmpeg → MP4).
-openh264-backend = ["cabac-stego", "phasm-core/openh264-backend"]
