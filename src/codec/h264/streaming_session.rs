@@ -42,7 +42,7 @@ use super::stego::orchestrate::DomainCosts;
 use super::stego::chunk_frame::{assemble_chunks, parse_chunk_frame, CHUNK_HEADER_LEN};
 use super::stego::hook::EmbedDomain;
 use super::stego::keys::CabacStegoMasterKeys;
-use crate::stego::stc::extract::stc_extract;
+use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
 use crate::stego::stc::hhat::generate_hhat;
 use crate::stego::{crypto, frame, payload};
 
@@ -1139,22 +1139,72 @@ fn try_extract_chunk_from_gop(
     // useful anyway.
     let min_m = CHUNK_HEADER_LEN * 8;
     let max_m = n_cover;
+
+    // #519 / #516.3 — chunk-idx early-reject. Same shape as the
+    // single-GOP `try_decode_at` length-prefix early-reject (#516.2):
+    // the chunk_frame's first 2 bytes are `chunk_idx: u16 BE`. For
+    // the right m_total the prefix matches `expected_chunk_idx`; for
+    // wrong m_total the prefix is essentially random and the equality
+    // holds with probability 1/65536. Almost every wrong candidate
+    // rejects after a 16-bit partial extract (O(16 * w) ops) instead
+    // of the full m_total * w STC extract.
+    //
+    // At 1080p × 30f IBPBP the combined 4-domain cover is ~100k+
+    // bits → ~12k brute-force candidates. Without this filter each
+    // candidate does an O(n_cover) extract = O(n_cover²) total work
+    // which is multi-second on a phone. With this filter, total work
+    // drops from O(n_cover²) to O(n_cover · n_tries / 65536) plus
+    // ~1 full extract on the winner.
+    let trace = std::env::var("PHASM_PERF_TRACE").map(|v| v == "1").unwrap_or(false);
+    let mut tries = 0usize;
+    let mut idx_match = 0usize;
+    let mut parse_ok = 0usize;
+    let mut promoted = 0usize;
+
     let mut m_total = min_m;
     while m_total <= max_m {
+        tries += 1;
         let w = n_cover / m_total;
         if w == 0 {
             break;
         }
         let used = m_total * w;
         let hhat = generate_hhat(STC_H, w, hhat_seed);
+
+        // Partial extract — first 16 syndrome bits = chunk_idx u16 BE.
+        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 16);
+        if prefix_bits.len() < 16 {
+            m_total += 8;
+            continue;
+        }
+        let prefix_bytes = bits_to_bytes_msb_first(&prefix_bits);
+        let candidate_chunk_idx = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]);
+        if candidate_chunk_idx != expected_chunk_idx {
+            m_total += 8;
+            continue;
+        }
+        idx_match += 1;
+
+        // chunk_idx matches — promote to full extract + parse +
+        // total_chunks sanity check. False-positive probability is
+        // 1/65536; the total_chunks bound + caller's CRC/AEAD filter
+        // catches those.
+        promoted += 1;
         let extracted = stc_extract(&cover_bits[..used], &hhat, w);
         let bits = &extracted[..m_total.min(extracted.len())];
         let bytes = bits_to_bytes_msb_first(bits);
         if let Some((chunk_idx, total_chunks, payload)) = parse_chunk_frame(&bytes) {
+            parse_ok += 1;
             if total_chunks > 0
                 && total_chunks <= MAX_REASONABLE_CHUNKS
                 && chunk_idx == expected_chunk_idx
             {
+                if trace {
+                    eprintln!(
+                        "[PHASM_PERF_TRACE chunk_gop] expected={} n_cover={} tries={} idx_match={} parse_ok={} → HIT m_total={} total_chunks={}",
+                        expected_chunk_idx, n_cover, tries, idx_match, parse_ok, m_total, total_chunks,
+                    );
+                }
                 return Some(ChunkCandidate {
                     chunk_idx,
                     total_chunks,
@@ -1163,6 +1213,12 @@ fn try_extract_chunk_from_gop(
             }
         }
         m_total += 8;
+    }
+    if trace {
+        eprintln!(
+            "[PHASM_PERF_TRACE chunk_gop] expected={} n_cover={} tries={} idx_match={} promoted={} parse_ok={} → MISS",
+            expected_chunk_idx, n_cover, tries, idx_match, promoted, parse_ok,
+        );
     }
     None
 }

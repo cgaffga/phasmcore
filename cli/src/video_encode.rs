@@ -580,7 +580,12 @@ fn run_oh264_encode(
             // `matrix` / `range` parsing from ffprobe output.
             color: ColorParams::default(),
             engine: EncodeEngineChoice::Oh264,
-            cost_weights: CostWeights::default(),
+            cost_weights: match std::env::var("PHASM_DEBUG_DOMAIN").as_deref() {
+                Ok("mvd_sign") => CostWeights::debug_mvd_sign_only(),
+                Ok("coeff_sign") => CostWeights::debug_coeff_sign_only(),
+                Ok("cs_csl") => CostWeights::conservative_cs_csl_only(),
+                _ => CostWeights::default(),
+            },
         };
         let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
 

@@ -310,6 +310,240 @@ fn main() {
             // phasm-stego CI). No source change; just unblocks
             // downstream consumers that run the bundled gtests.
             "4bbc174f67ea7cc58dd0b66c48fb330599174ad7",
+            // 2026-05-18: #533.1 (Option A Phase 1). ABI 1.3.0 adds
+            // PhasmStegoMbDecision + PhasmStegoPassMode + capture /
+            // replay callbacks for the Pass-2 replay architecture
+            // (docs/design/video/h264/pass2-replay-architecture.md).
+            // Closes #530 by replacing cascade-safety mitigations
+            // with structural Pass-1-capture / Pass-2-replay.
+            "b180f9de3482c5e3d568efd350572274f2b3d1e5",
+            // 2026-05-18: #533.1 strip pre-1.3.0 backwards-compat
+            // (no shipped consumers). PhasmStegoCallbacks now requires
+            // strict struct_size == sizeof. Phasm ships fork+bindings
+            // together so version-tolerance was dead weight.
+            "c6585cfdd324e94b366b760f3d5819ddb71a6672",
+            // 2026-05-18: #533.2 ABI 1.3.1 — schema fix on
+            // PhasmStegoMbDecision. ui_mb_type widened uint8_t → uint16_t
+            // (couldn't hold MB_TYPE_SKIP=0x100 in 1.3.0). Reorder
+            // keeps struct at 180 bytes. Adds phasm_emit_mb_decision()
+            // dispatcher for Phase 2 capture wiring.
+            "4eec7331c8a5c50d4c3b0f71d3bf55bfe17f80ca",
+            // 2026-05-18: #533.2 Phase 2 — Pass-1 capture wiring at
+            // the 4 svc_encode_slice.cpp fire sites where md_cost
+            // already fires. Builds PhasmStegoMbDecision from
+            // pCurMb + pMbCache, fires phasm_emit_mb_decision.
+            // No behavioural change on PASSTHROUGH.
+            "cf56187ec635b80838b9a48d2358e54e1570800e",
+            // 2026-05-18: #533.3 Phase 3 Stage 1 — REPLAY entry
+            // check at WelsMdInterMb. Stage 1 covers SKIP only.
+            // phasm_fetch_replay_decision dispatcher.
+            "168fa383a4a49783280f5da147e16f0f503f62a9",
+            // 2026-05-18: #533.3 Phase 3 Stage 2A — P_16x16 replay
+            // (single-MV, single-ref). MC luma+chroma at cached MV,
+            // PredMv → sMbMvp, UpdateP16x16MotionInfo, then
+            // WelsMdInterEncode. Byte-identical to natural decision
+            // on a clean P-frame fixture (test:
+            // pass2_replay_stage2a_p16x16_exercises_dispatch).
+            "a0eb4b14bb11d1657f445da7163b131a8ebe5467",
+            // 2026-05-18: #533.3 Phase 3 Stage 2B — partitioned replay
+            // branches (16x8 / 8x16 / 8x8 uniform). Per-partition MC at
+            // cached MV with g_kuiMbCountScan4Idx for raster sMv lookup
+            // + UpdateP*MotionInfo + WelsMdInterEncode. Multi-frame
+            // CAPTURE→REPLAY diverges from frame 3+ due to a separate
+            // state-leak issue with Stage 1+2A aux-function bypass;
+            // tracked in the fork commit and the #[ignore]'d
+            // pass2_replay_stage2b_multi_frame_byte_identity test.
+            "269b012360e75e56cec512241d12a67d4a3bd89d",
+            // 2026-05-18: #533.3 Stage 2B.b — relocate REPLAY override
+            // from top of WelsMdInterMb to between Refinement and
+            // InterEncode in WelsMdInterSecondaryModesEnc, so aux
+            // mode-decision functions (BGD/SCDP/JudgePskip/P16x16/
+            // FirstIntraMode/Refinement) run their natural code path
+            // and state updates propagate correctly. Plus integer-MV
+            // pre-shift fix for McLuma_c / McChroma_c (require pSrc
+            // pre-shifted by integer part of MV). Multi-frame
+            // CAPTURE→REPLAY now byte-identical across all 4 P-frames.
+            "e305985672f972fd4bdb7498a06355c1088c84b5",
+            // 2026-05-18: #538 Phase 4.1 — wire-only bypass-bin override
+            // dispatch stub + design memo. Adds the public
+            // `phasm_apply_bypass_bin_override(domain, pos, orig_bin)`
+            // function; stub returns `orig_bin` unconditionally. No
+            // behaviour change; subsequent micro-commits (4.2-4.6)
+            // patch the 4 CABAC emit sites and migrate the mutating
+            // hooks to populate scratch instead. Full plan at
+            // docs/design/video/h264/pass2-replay-phase4-plan.md.
+            "e316bf3f6926e8363448583257a60ad3a0c82c1c",
+            // 2026-05-18: #538 Phase 4.2 — wire stub into the first of
+            // the 4 emit sites (CoeffSign at svc_set_mb_syn_cabac.cpp:
+            // 515). Byte-identical to pre-Phase-4.2 (stub returns
+            // orig_bin). Indexing-correctness deferred to Phase 4.5
+            // when scratch is wired.
+            "edb7e49da54404f8f56ae8d679eb92f7cff3916b",
+            // 2026-05-18: #538 Phase 4.3 — wire stub into both MvdSign
+            // emit sites (short-MVD :326 + long-MVD :336 inside
+            // WelsCabacMbMvdLx). Signature extended with mb_x/mb_y/
+            // partition_idx/mv_component to thread position context
+            // from the WelsCabacMbMvd caller. Byte-identical to
+            // pre-Phase-4.3.
+            "b7dad8464564876f005f44bf343baee990542796",
+            // 2026-05-18: #538 Phase 4.4 — inline UEG3/UEG0 suffix LSB
+            // override at the 2 stego-relevant `WelsCabacEncodeUeBypass`
+            // call sites. Adds `WelsCabacEncodeUeBypassWithPhasmLsbOverride`
+            // helper (static inline, anonymous namespace in
+            // svc_set_mb_syn_cabac.cpp) that emits identical bins to the
+            // common-code version but routes the LSB (the k==0 iteration
+            // of the inner suffix loop) through `phasm_apply_bypass_bin_override`.
+            // Wires MvdSuffixLsb (long-MVD suffix inside
+            // WelsCabacMbMvdLx) + CoeffSuffixLsb (|coeff|>=15 path
+            // inside WelsWriteBlockResidualCabac). Common-code
+            // `WelsCabacEncodeUeBypass` untouched. Stub returns
+            // orig_bin → byte-identical to pre-Phase-4.4.
+            "dca569b753fe7a2bc11ab50f5285bbabc9f149c1",
+            // 2026-05-18: #538 Phase 4.5.a — dense per-MB scratch table
+            // in wels_stego.cpp. `phasm_apply_bypass_bin_override` now
+            // reads from the table; new `phasm_reset_bypass_overrides`
+            // + `phasm_set_bypass_override` exported via
+            // wels_stego_internal.h for the Phase 4.5.b+ migrations.
+            // Slot encoding 0/1/2 = none/override-0/override-1 so
+            // static zero-init = "no override". No populate-side
+            // callers wired yet → byte-identical to Phase 4.4.
+            "04d2d347644cf58553a051c16f84881e7ae784c9",
+            // 2026-05-18: #538 Phase 4.5.b — wire-only flag + first
+            // hook migration (MVD). New `phasm_set_use_wire_only_overrides`
+            // / `_get_*` gate at file scope in wels_stego.cpp + declared
+            // in wels_stego_internal.h. `phasm_apply_mvd_hooks` branches
+            // on the flag: OFF (default) → original mutation path
+            // unchanged; ON → populate scratch via phasm_set_bypass_override
+            // and do NOT mutate MV state. Suffix-LSB magnitude check
+            // reads ORIGINAL |MVD| in wire-only mode so the wire's
+            // prefix-vs-suffix split matches the bins actually emitted.
+            // 7/7 integration + 24/24 openh264 lib tests still green
+            // (flag stays OFF → byte-identical to Phase 4.5.a).
+            "50c49d913eb7b441ef8a8190737b42e5ba33d0ba",
+            // 2026-05-18: #538 Phase 4.5.c — apply_coeff_hooks_to_level
+            // branches on the wire-only flag. OFF (default) → unchanged
+            // mutate-state path; ON → phasm_set_bypass_override per
+            // domain, *level returned unchanged so the encoder's
+            // quantized coefficient stays at the pre-flip value.
+            // Affects all 7 coeff hook sites (A/B/C/D/E/F/G) via the
+            // shared inner helper. KNOWN GAP: only HOOK-A's coeff_idx=0
+            // aligns with emit-side iNonZeroIdx; HOOK-B/E/F/G slot
+            // population uses RASTER coeff_idx and silently won't fire
+            // on the wire until Phase 4.5.d ships raster↔scan
+            // translation. 7/7 + 24/24 still green (flag stays OFF).
+            "02ae388291b4590e0f1120c04b18983661af654c",
+            // 2026-05-18: #538 Phase 4.5.e — auto per-MB scratch reset
+            // via populate-hook entry. apply_coeff_hooks_to_level and
+            // phasm_apply_mvd_hooks call a new
+            // `phasm_maybe_reset_for_mb` static-inline that clears
+            // scratch when (frame_num, mb_x, mb_y) differs from the
+            // last seen — first hook fire of each MB triggers a reset.
+            // Gated on g_phasm_use_wire_only_overrides so flag OFF
+            // (default) path is unchanged, no overhead. Sentinel
+            // initial values guarantee a startup reset.
+            "0c0bc926f55366860e47e2b4b498d72f96dec87c",
+            // 2026-05-18: #538 Phase 4.5.f — promote
+            // `phasm_set_use_wire_only_overrides` / `_get_*` to the
+            // public wels_stego.h ABI so Rust FFI can call it.
+            // Also closes HOOK-H2..H7 verification (by inspection):
+            // phasm_apply_h_partition_hook wraps phasm_apply_mvd_hooks
+            // which is already migrated, partition_idx 0..15 fits the
+            // scratch [16] dimension, C.8.7 cascade-break tail is a
+            // no-op under flag ON because MV isn't mutated.
+            "7209d34bf097c3eef3bbf813f942032fbf8a374d",
+            // 2026-05-18: #538 Phase 4.5.d.1 — emit-side scan-position
+            // tracking. Adds `int32_t iLevelScanPos[16]` parallel to
+            // `iLevel[]` in WelsWriteBlockResidualCabac; both emit
+            // hook sites (CoeffSign + CoeffSuffixLsb) now key on the
+            // canonical scan position `iLevelScanPos[iNonZeroIdx]`
+            // rather than the compressed `iNonZeroIdx`. Populate-side
+            // migrations follow in 4.5.d.2+. Byte-identical (7/7 + 24/24
+            // still green) — emit reads scratch at scan but no populate
+            // writes there yet under flag ON, so coeff overrides remain
+            // dead until per-hook raster→scan rewrites ship.
+            "a27edfe6df17a5454c536e15d318407f77993806",
+            // 2026-05-18: #538 Phase 4.5.d.1b — per-block_cat canonical
+            // key at emit. DC types (LUMA_DC, CHROMA_DC) now compute
+            // sub_block = g_zigzag[scan_pos] (raster sub-MB idx the DC
+            // entry represents) and coeff_idx = 0. AC types keep
+            // sub_block = iIdx, coeff_idx = scan_pos. Implicitly closes
+            // 4.5.d.2 (HOOK-A) since populate side already keys by
+            // raster sub_block + coeff_idx=0 — emit-side conversion
+            // makes the keys align. CHROMA_DC half-closed similarly.
+            // AC types still need populate raster→scan migration in
+            // 4.5.d.3/d.5/d.6. 7/7 green (flag OFF, byte-identical).
+            "487bff596c29401eb2af3fc093e7cdbdf3b86b2b",
+            // 2026-05-18: #538 Phase 4.5.d.3 — raster→scan conversion
+            // in apply_coeff_hooks_to_level. Closes all remaining AC +
+            // intra-4x4 hook migrations (HOOK-B/D/E/F/G) in a single
+            // helper-side change. Populate-side coeff_idx_scanned
+            // (raster) is converted to scan position before populating
+            // the scratch table; pos passed to dispatch_hook keeps
+            // raster (Rust callback contract unchanged). inv_zigzag_full_4x4
+            // table derived from WelsScan4x4DcAc_c. Phase 4.5.d
+            // COMPLETE — all 4 domains × all 5 block_cats now align
+            // under flag ON. 7/7 + 24/24 still green (flag stays OFF).
+            "cdb7061be4c2fd78c2d1eac9446ce75f60300c81",
+            // 2026-05-18: #538 Phase 4.6 diagnostic counters — atomic
+            // counters on populate-side writes + emit-side reads/hits
+            // + reset_calls for the bypass-scratch path. Exposed via
+            // FFI (phasm_diag_get_*). Diagnostic only; remove once
+            // Phase 4.6 closes positively.
+            "1b55ea544f6b607d07e0b08b771bd39c5b805462",
+            // 2026-05-18: #538 Phase 4.6 ROOT-CAUSE FIX — cache offset
+            // → raster sub-block conversion in WelsWriteBlockResidualCabac.
+            // For LUMA_AC / LUMA_4x4 / CHROMA_AC the emit-side iIdx is
+            // g_kuiCache48CountScan4Idx[i] (a 6x8 cache offset, e.g. 9,
+            // 10, 17, 18, ...), not raster 0..15. Populate-side hooks
+            // (HOOK-B/E/F) pass raster. The wire-only scratch is keyed
+            // by raster, so emit must convert. New helper
+            // phasm_cache_offset_to_raster_subblock(iIdx, eCtxBlockCat)
+            // handles luma 4x4 and chroma AC. LUMA_DC/CHROMA_DC paths
+            // unchanged. CHROMA_AC Cb↔Cr collision remains (no
+            // partition_idx in scratch key) — TODO for v1.1 follow-on.
+            "b8366067011163e00d91c60da83cd781543761ba",
+            // 2026-05-18: #538.4.7 chroma scratch-key fixes (3 bugs).
+            // (a) HOOK-G coeff_idx changed phasm_s (scan) → phasm_r
+            //     (raster) so 4.5.d.3 inv_zigzag conversion is correct
+            //     (same fix HOOK-F got in C.8.13(b)).
+            // (b) HOOK-C populate/emit key swap: populate moved from
+            //     (sb=0, ci=phasm_c) → (sb=phasm_c, ci=0) to match
+            //     emit's CHROMA_DC branch (sb=g_zigzag_2x2[scan_pos],
+            //     ci=0). Previously 3 of 4 CHROMA_DC writes missed.
+            // (c) Cb↔Cr collision fix: encode plane in sub_block
+            //     (Cb=0..3, Cr=4..7) on both populate (HOOK-C/G add
+            //     (iUV-1)*4 offset) and emit (CHROMA_DC branches read
+            //     plane from iIdx=1/2; CHROMA_AC helper adds plane
+            //     offset from cache row >= 4). Closes the 158
+            //     walker-vs-plan diffs measured post-Phase-4.6.
+            "ecc9dd33771e3a8ccaca7199c152872e74611f65",
+            // #533.4.9 2026-05-18 — fork-side CSL walker_bit ↔ wire LSB
+            // inversion fix. apply_coeff_hooks_to_level wire_only path
+            // was storing walker_bit to scratch but emit reads scratch
+            // AS the wire LSB; for CSL wire LSB = walker_bit XOR 1
+            // (UEG0 encodes |coeff|&1 in suffix LSB). XOR-1 at scratch
+            // write closes the residual 1-bit walker-vs-plan diff that
+            // persisted through Phase 4.5–4.7.
+            "bb7f91faf5954b57083ee69c885933085dbcab69",
+            // #548 2026-05-18 — fork-side per-session state reset.
+            // Adds `phasm_reset_encoder_session_state()` entry point
+            // called from the Rust orchestrator at the top of every
+            // `encode_yuv_with_pre_framed_bits_4domain` to clear the
+            // bypass scratch + last-MB sentinels + wire-only flag
+            // between sequential calls. Closes the 541-diff
+            // cross-call cascade observed in
+            // `oh264_wire_only_two_sequential_calls_bisect`.
+            "1b1205adeac045512c00b734a88378be4ac03b2a",
+            // #539 2026-05-18 — delete C.8.7 MvdSign cascade-break.
+            // The producer-side clean-MV captures (HOOK-H1 + the
+            // partitioned HOOK-H2..H4 helpers in svc_base_layer_md)
+            // and the consumer-side (CLEAN_MC − STEGO_MC) shift in
+            // OutputPMb were both dead under wire_only=1 (#538 +
+            // 14ad952 default flip): encoder state never carries the
+            // stego MV, so the shift was always a no-op. -293 LOC
+            // net. PHASM_USE_WIRE_ONLY=0 is now a transitional knob
+            // without cascade-break safety.
+            "e3629e013b6e9a9b14be3423a03ca3ce0775be73",
         ];
         let head_output = Command::new("git")
             .arg("-C")

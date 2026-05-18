@@ -33,7 +33,7 @@
 
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, FRAME_OVERHEAD};
-use crate::stego::stc::extract::stc_extract;
+use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
 use crate::stego::stc::hhat::generate_hhat;
 use crate::stego::{crypto, payload};
 use crate::stego::payload::PayloadData;
@@ -286,6 +286,47 @@ fn try_decode_at_per_gop(
     let m_cl_per_gop = alloc_per_gop(m_cl, 1);
     let m_ms_per_gop = alloc_per_gop(m_ms, 2);
 
+    // #529 — length-prefix early-reject. Message order across GOPs:
+    // all GOPs' mvd_sign concat, then all GOPs' coeff_sign concat,
+    // then all GOPs' coeff_suffix. Build the PrefixDomain list to
+    // match that exact emission order. Per-GOP seeds materialise
+    // lazily (only consumed if the helper actually walks that far).
+    let mvd_sign_seeds: Vec<_> = (0..per_gop_covers.len())
+        .map(|g| keys.per_gop_seeds(EmbedDomain::MvdSignBypass, g as u32).hhat_seed)
+        .collect();
+    let coeff_sign_seeds: Vec<_> = (0..per_gop_covers.len())
+        .map(|g| keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, g as u32).hhat_seed)
+        .collect();
+    let coeff_suffix_seeds: Vec<_> = (0..per_gop_covers.len())
+        .map(|g| keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, g as u32).hhat_seed)
+        .collect();
+    let mut prefix_domains: Vec<PrefixDomain<'_>> =
+        Vec::with_capacity(per_gop_covers.len() * 3);
+    for (g, cover) in per_gop_covers.iter().enumerate() {
+        prefix_domains.push(PrefixDomain {
+            cover_bits: &cover.mvd_sign_bypass.bits,
+            seed: &mvd_sign_seeds[g],
+            m_d: m_ms_per_gop[g],
+        });
+    }
+    for (g, cover) in per_gop_covers.iter().enumerate() {
+        prefix_domains.push(PrefixDomain {
+            cover_bits: &cover.coeff_sign_bypass.bits,
+            seed: &coeff_sign_seeds[g],
+            m_d: m_cs_per_gop[g],
+        });
+    }
+    for (g, cover) in per_gop_covers.iter().enumerate() {
+        prefix_domains.push(PrefixDomain {
+            cover_bits: &cover.coeff_suffix_lsb.bits,
+            seed: &coeff_suffix_seeds[g],
+            m_d: m_cl_per_gop[g],
+        });
+    }
+    if !m_total_passes_length_prefix(&prefix_domains, 4, m_total) {
+        return None;
+    }
+
     // Per-GOP STC extract → concat per-domain bits across GOPs.
     let mut all_mvd_sign = Vec::with_capacity(m_mvd);
     let mut all_coeff_sign = Vec::with_capacity(m_cs);
@@ -530,6 +571,36 @@ fn try_decode_at_4domain(
     let stub_residual = vec![0u8; m_residual];
     let split_b = split_message_per_domain(&stub_residual, &cap_coeff)?;
 
+    // #529 — length-prefix early-reject. Message emission order
+    // (see concat below) is mvd_sign, mvd_suffix, coeff_sign,
+    // coeff_suffix; the plaintext_len header lives at the start of
+    // the first non-empty domain.
+    let prefix_domains = [
+        PrefixDomain {
+            cover_bits: &cover.mvd_sign_bypass.bits,
+            seed: &seeds[2].1,
+            m_d: split_a.mvd_sign_bypass.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.mvd_suffix_lsb.bits,
+            seed: &seeds[3].1,
+            m_d: split_a.mvd_suffix_lsb.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.coeff_sign_bypass.bits,
+            seed: &seeds[0].1,
+            m_d: split_b.coeff_sign_bypass.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.coeff_suffix_lsb.bits,
+            seed: &seeds[1].1,
+            m_d: split_b.coeff_suffix_lsb.len(),
+        },
+    ];
+    if !m_total_passes_length_prefix(&prefix_domains, h, m_total_bits) {
+        return None;
+    }
+
     // Per-domain STC extract.
     let mvd_sign = extract_one_domain(
         &cover.mvd_sign_bypass.bits,
@@ -588,6 +659,36 @@ fn try_decode_at(
     let stub: Vec<u8> = vec![0u8; m_total_bits];
     let capacities = cover.capacity();
     let split: DomainMessages = split_message_per_domain(&stub, &capacities)?;
+
+    // #529 — length-prefix early-reject. Message emission order
+    // (see concat below) is coeff_sign, coeff_suffix, mvd_sign,
+    // mvd_suffix; the v1 plaintext_len u16 lives at the start of
+    // the first non-empty domain.
+    let prefix_domains = [
+        PrefixDomain {
+            cover_bits: &cover.coeff_sign_bypass.bits,
+            seed: &seeds[0].1,
+            m_d: split.coeff_sign_bypass.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.coeff_suffix_lsb.bits,
+            seed: &seeds[1].1,
+            m_d: split.coeff_suffix_lsb.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.mvd_sign_bypass.bits,
+            seed: &seeds[2].1,
+            m_d: split.mvd_sign_bypass.len(),
+        },
+        PrefixDomain {
+            cover_bits: &cover.mvd_suffix_lsb.bits,
+            seed: &seeds[3].1,
+            m_d: split.mvd_suffix_lsb.len(),
+        },
+    ];
+    if !m_total_passes_length_prefix(&prefix_domains, h, m_total_bits) {
+        return None;
+    }
 
     // Per-domain STC extract.
     let coeff_sign = extract_one_domain(
@@ -663,6 +764,118 @@ fn extract_one_domain(
     // m_d * w_d bits of cover).
     let cover_slice = &cover_bits[..m_d * w_d];
     Some(stc_extract(cover_slice, &hhat, w_d))
+}
+
+/// #529 — descriptor for one domain's contribution to the message
+/// prefix, in message-emission order.
+struct PrefixDomain<'a> {
+    cover_bits: &'a [u8],
+    seed: &'a [u8; 32],
+    m_d: usize,
+}
+
+/// #529 — extract the first `k_msg_bits` bits of the concatenated
+/// message via per-domain [`stc_extract_prefix`] calls. Walks
+/// `domains` in message order, taking up to `m_d` bits from each.
+///
+/// Pairs with [`length_prefix_consistent`] to give the same
+/// brute-force m_total search the early-reject speed-up that
+/// `decode_legacy_via_walker` (single-domain OpenH264 path) and the
+/// streaming session (chunk-idx) already enjoy via #516.2 / #519.
+fn extract_message_prefix(
+    domains: &[PrefixDomain<'_>],
+    h: usize,
+    k_msg_bits: usize,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(k_msg_bits);
+    for d in domains {
+        if out.len() >= k_msg_bits {
+            break;
+        }
+        if d.m_d == 0 {
+            continue;
+        }
+        let n_d = d.cover_bits.len();
+        if d.m_d > n_d {
+            return None;
+        }
+        let w_d = n_d / d.m_d;
+        if w_d == 0 {
+            return None;
+        }
+        let take = (k_msg_bits - out.len()).min(d.m_d);
+        let hhat = generate_hhat(h, w_d, d.seed);
+        let cover_slice = &d.cover_bits[..d.m_d * w_d];
+        let prefix = stc_extract_prefix(cover_slice, &hhat, w_d, take);
+        if prefix.len() < take {
+            return None;
+        }
+        out.extend_from_slice(&prefix);
+    }
+    if out.len() < k_msg_bits {
+        return None;
+    }
+    Some(out)
+}
+
+/// #529 — verify the message prefix's length header is consistent
+/// with the candidate `m_total_bits`. The phasm frame's first 2
+/// bytes are `plaintext_len: u16 BE` (v1) or 0x0000 sentinel
+/// followed by `u32 BE` plaintext length (v2). For ANY candidate
+/// m_total, only ONE specific length value satisfies
+/// `(FRAME_OVERHEAD + plaintext_len) * 8 == m_total` — wrong
+/// candidates pass with ≈1/65536 probability for v1, much less for
+/// v2. The full extract + CRC then kills the false-positive tail.
+fn length_prefix_consistent(prefix_bytes: &[u8], m_total_bits: usize) -> bool {
+    if prefix_bytes.len() < 2 {
+        return false;
+    }
+    let v1_len = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]) as usize;
+    if (FRAME_OVERHEAD + v1_len) * 8 == m_total_bits {
+        return true;
+    }
+    if v1_len == 0 && prefix_bytes.len() >= 6 {
+        let v2_len = u32::from_be_bytes([
+            prefix_bytes[2], prefix_bytes[3], prefix_bytes[4], prefix_bytes[5],
+        ]) as usize;
+        if v2_len > u16::MAX as usize
+            && (frame::FRAME_OVERHEAD_EXT + v2_len) * 8 == m_total_bits
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// #529 — gate `m_total` against the 16-bit (or 48-bit fallback)
+/// length prefix without doing the full per-domain extract. Returns
+/// `true` if this m_total candidate is consistent with the recovered
+/// length header (caller proceeds to full extract + CRC + decrypt),
+/// `false` if it can be skipped.
+fn m_total_passes_length_prefix(
+    domains: &[PrefixDomain<'_>],
+    h: usize,
+    m_total_bits: usize,
+) -> bool {
+    let Some(prefix16) = extract_message_prefix(domains, h, 16) else {
+        // Degenerate per-domain config (e.g. w_d=0): don't reject; let
+        // the full extract path handle the edge case.
+        return true;
+    };
+    let prefix_bytes = bits_to_bytes_msb_first(&prefix16);
+    if length_prefix_consistent(&prefix_bytes, m_total_bits) {
+        return true;
+    }
+    let v1_len = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]);
+    if v1_len != 0 {
+        return false;
+    }
+    // v2 sentinel — pull 48 bits and check the u32 length field.
+    let Some(prefix48) = extract_message_prefix(domains, h, 48) else {
+        return true;
+    };
+    let ext_bytes = bits_to_bytes_msb_first(&prefix48);
+    length_prefix_consistent(&ext_bytes, m_total_bits)
 }
 
 /// Pack bits (one bit per byte, MSB-first per byte) into bytes.

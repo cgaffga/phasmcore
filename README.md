@@ -276,11 +276,21 @@ accept the perf + quality trade-off.
 
 ### Bitstream interchange
 
-The two backends emit **bitstream-distinct stego** (different cover
-sets, different CABAC override domains), so files produced by one are
-not interchangeable across decoders. The CLI's `phasm decode`
-auto-detects via try-OH264-then-CABAC-v2 fallback (see
-`core/cli/src/decode.rs::decode_h264_cabac`).
+Since the streaming session landed (`StreamingEncodeSession` /
+`StreamingDecodeSession`, see `src/codec/h264/streaming_session.rs`),
+both backends converge on a unified wire format: same 4-domain
+canonical cover ordering (CS → CSL → MVDs → MVDsl), same per-GOP
+`chunk_frame` protocol, same STC seed derivation, same `CostWeights`.
+`StreamingDecodeSession` runs a pure-Rust walker on any Annex-B input
+and decodes output from either encoder — OH264 reaches the wire via
+Phase 4 wire_only scratch-table overrides at CABAC emit (encoder
+state untouched), pure-Rust reaches the same wire via residual
+mutation with a cascade-safety filter, but the wire shape is
+identical at the bin level. The CLI's `phasm decode` (in
+`cli/src/decode.rs::decode_h264_cabac`) tries `StreamingDecodeSession`
+first, then falls back to `openh264_stego_decode_yuv` and
+`h264_stego_smart_decode_video_with_payload` for files produced by
+pre-streaming versions.
 
 ### Pure-Rust pipeline
 

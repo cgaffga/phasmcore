@@ -48,8 +48,8 @@ use core_openh264_sys::{
     phasm_encoder_encode_frame, phasm_encoder_initialize,
     phasm_encoder_set_dual_recon_enabled, phasm_encoder_uninitialize,
     PhasmDecoderHandle, PhasmEncoderHandle, PhasmStegoCallbacks, PhasmStegoMdCost, PhasmStegoPos,
-    WelsRegisterPhasmStegoCallbacks, WelsStegoAbiVersion, WelsStegoSetFrameNum, PHASM_FRAME_IDR,
-    PHASM_FRAME_P, PHASM_STEGO_ABI_VERSION,
+    WelsRegisterPhasmStegoCallbacks, WelsStegoAbiVersion, WelsStegoSetFrameNum,
+    WelsStegoSetPassMode, PHASM_FRAME_IDR, PHASM_FRAME_P, PHASM_STEGO_ABI_VERSION,
 };
 
 pub use core_openh264_sys::{PhasmStegoDomain, PHASM_DOMAIN_COUNT};
@@ -65,6 +65,14 @@ pub type Position = PhasmStegoPos;
 
 /// Stable Rust-side view of the C `PhasmStegoMdCost`.
 pub type ModeDecisionCost = PhasmStegoMdCost;
+
+/// Stable Rust-side view of the C `PhasmStegoMbDecision` — the per-MB
+/// cache record for the Pass-2 replay architecture (#533).
+pub type MbDecision = core_openh264_sys::PhasmStegoMbDecision;
+
+/// Re-export of the encoder pass-mode enum. Caller sets via
+/// `set_pass_mode` before each encode pass.
+pub use core_openh264_sys::PhasmStegoPassMode as PassMode;
 
 // ---------------------------------------------------------------------
 // Handler type aliases
@@ -111,6 +119,17 @@ pub struct DualReconEvent<'a> {
 /// Dual-recon observation handler. Pure observation; no return.
 pub type DualReconObserve = Box<dyn for<'a> FnMut(&DualReconEvent<'a>) + 'static>;
 
+/// Pass-1 capture handler. Fires per-MB after mode decision finalizes.
+/// Consumer copies the decision into its own cache.
+pub type CaptureMbDecision = Box<dyn FnMut(&MbDecision) + 'static>;
+
+/// Pass-2 replay handler. Fires at start of each MB's mode decision.
+/// Returns `Some(decision)` if the cache has an entry for this MB —
+/// encoder populates state from the returned decision and skips
+/// RDO/ME. Returns `None` on cache miss → encoder falls back to
+/// running RDO/ME normally.
+pub type ReplayMbDecision = Box<dyn FnMut(u32, u16, u16) -> Option<MbDecision> + 'static>;
+
 /// Bundle of optional handlers. Construct with `..Default::default()`
 /// to fill in only the hooks you care about.
 #[derive(Default)]
@@ -119,6 +138,8 @@ pub struct StegoHandlers {
     pub dec_post_read: Option<DecPostRead>,
     pub md_cost: Option<MdCostCapture>,
     pub dual_recon: Option<DualReconObserve>,
+    pub capture_mb_decision: Option<CaptureMbDecision>,
+    pub replay_mb_decision: Option<ReplayMbDecision>,
 }
 
 // ---------------------------------------------------------------------
@@ -207,6 +228,8 @@ impl StegoSession {
             dec_post_read: Some(trampoline_dec_post_read),
             md_cost_capture: Some(trampoline_md_cost),
             dual_recon_observe: Some(trampoline_dual_recon),
+            capture_mb_decision: Some(trampoline_capture_mb_decision),
+            replay_mb_decision: Some(trampoline_replay_mb_decision),
         };
 
         // SAFETY: `table` is a fully-initialized PhasmStegoCallbacks with
@@ -262,6 +285,17 @@ pub(crate) static SESSION_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::n
 pub fn set_frame_num(frame_num: u32) {
     // SAFETY: extern "C" with no pointer args; always safe to call.
     unsafe { WelsStegoSetFrameNum(frame_num) };
+}
+
+/// Select the encoder pass mode for the next encode() call (#533).
+/// Default is `PASSTHROUGH` (no capture/replay; encoder runs normally).
+/// Caller flips to `CAPTURE` for Pass-1 (decisions stream into the
+/// registered `capture_mb_decision` closure) and `REPLAY` for Pass-2
+/// (encoder fetches decisions from `replay_mb_decision`; cache miss
+/// falls back to RDO/ME).
+pub fn set_pass_mode(mode: PassMode) {
+    // SAFETY: extern "C" with a plain enum (repr u32) arg.
+    unsafe { WelsStegoSetPassMode(mode) };
 }
 
 /// Get the wels_stego ABI version the linked library was built with.
@@ -397,6 +431,49 @@ unsafe extern "C" fn trampoline_dual_recon(
     };
 
     let _ = catch_unwind(AssertUnwindSafe(|| handler(&event)));
+}
+
+unsafe extern "C" fn trampoline_capture_mb_decision(
+    decision: *const MbDecision,
+    user_data: *mut c_void,
+) {
+    if decision.is_null() || user_data.is_null() {
+        return;
+    }
+    let storage = unsafe { &mut *(user_data as *mut HandlerStorage) };
+    let dec_ref = unsafe { &*decision };
+
+    if let Some(handler) = storage.handlers.capture_mb_decision.as_mut() {
+        let _ = catch_unwind(AssertUnwindSafe(|| handler(dec_ref)));
+    }
+}
+
+unsafe extern "C" fn trampoline_replay_mb_decision(
+    frame_num: u32,
+    mb_x: u16,
+    mb_y: u16,
+    out_decision: *mut MbDecision,
+    user_data: *mut c_void,
+) -> i32 {
+    if out_decision.is_null() || user_data.is_null() {
+        return 0;
+    }
+    let storage = unsafe { &mut *(user_data as *mut HandlerStorage) };
+
+    let Some(handler) = storage.handlers.replay_mb_decision.as_mut() else {
+        return 0;
+    };
+
+    match catch_unwind(AssertUnwindSafe(|| handler(frame_num, mb_x, mb_y))) {
+        Ok(Some(decision)) => {
+            // SAFETY: out_decision is non-null per check above; caller owns
+            // it and guarantees writable for size_of::<MbDecision>().
+            unsafe { core::ptr::write(out_decision, decision) };
+            1
+        }
+        Ok(None) => 0,
+        Err(_) => 0,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1126,7 +1203,7 @@ mod tests {
     #[test]
     fn abi_versions_match() {
         assert_eq!(abi_version(), header_abi_version());
-        assert_eq!(header_abi_version(), 0x0001_0200);
+        assert_eq!(header_abi_version(), 0x0001_0301);
     }
 
     #[test]

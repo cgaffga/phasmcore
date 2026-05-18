@@ -27,6 +27,17 @@ use core::ffi::c_void;
 /// ABI version this header was compiled against. Matches the value
 /// returned by `WelsStegoAbiVersion()` on a current build of the fork.
 ///
+/// 1.3.1 (#533.2) widens `PhasmStegoMbDecision::ui_mb_type` from u8
+/// to u16 so the field can faithfully hold OH264's `Mb_Type`
+/// bitfield (values up to MB_TYPE_DIRECT=0x800, MB_TYPE_P1L1=0x8000).
+/// Reorder keeps the struct at 180 bytes. Phasm 1.3.0 had a u8
+/// field that couldn't represent MB_TYPE_SKIP=0x100 — caught before
+/// any consumer shipped against 1.3.0.
+/// 1.3.0 (#533 Phase 1) adds Pass-2 replay: `capture_mb_decision` +
+/// `replay_mb_decision` callbacks + `WelsStegoSetPassMode()`. Pass-1
+/// streams per-MB mode decisions into a phasm-side cache; Pass-2
+/// fetches them back, bypassing the encoder's RDO/ME and locking the
+/// two passes onto the same mode-decision domain.
 /// 1.2.0 (Phase C.8.2) adds the `dual_recon_observe` callback that
 /// fires from the internal `phasm_dual_recon_writeback` helper once
 /// it commits clean pixels to pDecPic and stego pixels to
@@ -35,7 +46,7 @@ use core::ffi::c_void;
 /// callback fires once per MB after mode decision finalizes, carrying
 /// a `PHASM_MB_TYPE_*` classification byte the consumer uses to filter
 /// pre-emit fires by `block_cat` ↔ `mb_type` consistency.
-pub const PHASM_STEGO_ABI_VERSION: u32 = 0x0001_0200;
+pub const PHASM_STEGO_ABI_VERSION: u32 = 0x0001_0301;
 
 /// PhasmStegoMdCost::mb_type classifications. Match the C
 /// `PHASM_MB_TYPE_*` defines in `wels_stego.h`. Each value names the
@@ -455,9 +466,9 @@ pub type PhasmStegoDecPostReadFn =
 pub type PhasmStegoMdCostFn =
     Option<unsafe extern "C" fn(cost: *const PhasmStegoMdCost, user_data: *mut c_void)>;
 
-/// Dual-recon observation callback (ABI 1.2.0+). Fires from the
-/// internal `phasm_dual_recon_writeback` helper after both clean and
-/// stego pixel blocks have been committed to their respective recon
+/// Dual-recon observation callback. Fires from the internal
+/// `phasm_dual_recon_writeback` helper after both clean and stego
+/// pixel blocks have been committed to their respective recon
 /// pictures (pDecPic + pVisualRecPic). Pure observation; no return.
 ///
 /// The `clean_pixels` and `stego_pixels` pointers are valid for the
@@ -482,11 +493,88 @@ pub type PhasmStegoDualReconFn = Option<
 >;
 
 // ---------------------------------------------------------------------
+// 6.7 Pass-2 replay architecture
+//
+// `PhasmStegoMbDecision` is the per-MB cache record. Pass-1 captures
+// the encoder's finalized mode decisions; Pass-2 replays from this
+// cache and skips RDO/ME entirely. Layout must match the C
+// `PhasmStegoMbDecision` struct byte-for-byte.
+// See: docs/design/video/h264/pass2-replay-architecture.md
+// ---------------------------------------------------------------------
+
+/// Encoder pass mode. CAPTURE = Pass-1 (RDO/ME runs, capture
+/// callback fires per MB). REPLAY = Pass-2 (replay callback supplies
+/// cached decision per MB, encoder skips RDO/ME).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhasmStegoPassMode {
+    Passthrough = 0,
+    Capture = 1,
+    Replay = 2,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PhasmStegoMbDecision {
+    pub frame_num: u32,
+    pub mb_x: u16,
+    pub mb_y: u16,
+
+    /// OH264-internal `Mb_Type` bitfield value (lower 16 bits). For
+    /// baseline + Main-profile flags through MB_TYPE_P1L1 (0x8000),
+    /// this field captures the encoder's MB type verbatim — Pass-2
+    /// replay writes it back to `pCurMb->uiMbType` directly.
+    pub ui_mb_type: u16,
+    pub mb_type: u8,
+    pub qp_delta: i8,
+    pub sub_mb_type: [u8; 4],
+
+    pub mv_x: [[i16; 2]; 16],
+    pub mv_y: [[i16; 2]; 16],
+    pub ref_idx: [[i8; 2]; 4],
+    pub bipred_dir: [u8; 4],
+
+    pub intra16_pred_mode: u8,
+    pub i4x4_pred_mode: [u8; 16],
+    pub chroma_pred_mode: u8,
+
+    pub _reserved: [u8; 6],
+}
+
+// Compile-time guarantee that the Rust layout matches the C side's
+// fixed record. Catches accidental field reorders / type changes.
+// Size = 8 (id) + 8 (top-level) + 128 (motion) + 12 (ref+bipred) + 18
+// (intra) + 6 (reserved) = 180 bytes (max field align = 4, no tail pad).
+const _: () = assert!(core::mem::size_of::<PhasmStegoMbDecision>() == 180);
+
+/// Pass-1 capture callback. Fires per MB after mode decision
+/// finalizes. Consumer copies `decision` into its own cache keyed
+/// by (frame_num, mb_x, mb_y). The pointer is valid only for the
+/// call duration.
+pub type PhasmStegoCaptureMbDecisionFn =
+    Option<unsafe extern "C" fn(decision: *const PhasmStegoMbDecision, user_data: *mut c_void)>;
+
+/// Pass-2 replay callback. Fires at the start of each MB's mode
+/// decision. Consumer fills `*out_decision` with the cached decision
+/// and returns 1; returns 0 on cache miss (encoder falls back to
+/// running RDO/ME).
+pub type PhasmStegoReplayMbDecisionFn = Option<
+    unsafe extern "C" fn(
+        frame_num: u32,
+        mb_x: u16,
+        mb_y: u16,
+        out_decision: *mut PhasmStegoMbDecision,
+        user_data: *mut c_void,
+    ) -> i32,
+>;
+
+// ---------------------------------------------------------------------
 // 7. Callback table
 //
-// `struct_size` MUST be set to `size_of::<PhasmStegoCallbacks>()` by the
-// caller; the library uses it to detect old callers if the struct grows
-// in future ABI revisions.
+// `struct_size` MUST equal `size_of::<PhasmStegoCallbacks>()`. The
+// fork registration function rejects mismatches outright — phasm
+// owns both sides of this boundary (fork + bindings ship together)
+// so there is no version-tolerance path.
 // ---------------------------------------------------------------------
 
 #[repr(C)]
@@ -497,6 +585,8 @@ pub struct PhasmStegoCallbacks {
     pub dec_post_read: PhasmStegoDecPostReadFn,
     pub md_cost_capture: PhasmStegoMdCostFn,
     pub dual_recon_observe: PhasmStegoDualReconFn,
+    pub capture_mb_decision: PhasmStegoCaptureMbDecisionFn,
+    pub replay_mb_decision: PhasmStegoReplayMbDecisionFn,
 }
 
 impl Default for PhasmStegoCallbacks {
@@ -507,6 +597,8 @@ impl Default for PhasmStegoCallbacks {
             dec_post_read: None,
             md_cost_capture: None,
             dual_recon_observe: None,
+            capture_mb_decision: None,
+            replay_mb_decision: None,
         }
     }
 }
@@ -539,9 +631,55 @@ unsafe extern "C" {
     /// to 0 at the start of each new encode/decode session.
     pub fn WelsStegoSetFrameNum(frame_num: u32);
 
-    /// Returns the wels_stego ABI version this library was built with.
-    /// Format: `(MAJOR << 16) | (MINOR << 8) | PATCH`.
+    /// Build-time sanity check that the linked fork matches these
+    /// bindings. Returns `PHASM_STEGO_ABI_VERSION` from the fork.
     pub fn WelsStegoAbiVersion() -> u32;
+
+    /// Set the encoder's pass mode for the next encode() call.
+    /// Caller selects per-pass: PASSTHROUGH (default, no
+    /// capture/replay), CAPTURE (Pass-1, capture callback fires),
+    /// REPLAY (Pass-2, replay callback fetches cached decisions).
+    pub fn WelsStegoSetPassMode(mode: PhasmStegoPassMode);
+
+    /// Phase 4.5.b (#538) — wire-only override mode gate.
+    ///
+    /// When enabled (non-zero), the mutating-hook helpers route
+    /// stego override decisions into the per-MB bypass-bin scratch
+    /// table (read by `phasm_apply_bypass_bin_override` at CABAC
+    /// emit) and DO NOT mutate the encoder's stored `*level` / MV
+    /// state. Pass-2's pDecPic stays byte-identical to Pass-1's,
+    /// and the stego override only manifests on the wire via the
+    /// bypass-bin emit hooks. Phase 4.5.d aligns populate-side and
+    /// emit-side keys via raster↔scan reconciliation so all 4
+    /// stego domains × all 5 block_cats fire correctly under
+    /// flag ON.
+    ///
+    /// Default OFF. Set to non-zero before encoding to opt into
+    /// the wire-only path. Phase 5 (#539) flips the default once
+    /// the C.8.x dual-recon machinery is deleted.
+    pub fn phasm_set_use_wire_only_overrides(enabled: i32);
+
+    /// Read the current wire-only flag state.
+    pub fn phasm_get_use_wire_only_overrides() -> i32;
+
+    /// #548 v1.0 BLOCKER fix (2026-05-18) — Reset libencoder-side
+    /// phasm statics at the start of a new encode session. Resets the
+    /// bypass scratch table, the last-MB sentinels, and the
+    /// wire-only flag. Call at the top of every
+    /// `encode_yuv_with_pre_framed_bits_4domain` invocation so two
+    /// consecutive calls don't share fork state.
+    pub fn phasm_reset_encoder_session_state();
+
+    /* Phase 4.6 NEGATIVE-result diagnostic counters (#538). Track
+     * scratch writes / reads / hits / resets to bisect the
+     * forged-flip-doesn't-propagate bug. Removed once 4.6 closes. */
+    pub fn phasm_diag_get_set_calls() -> u64;
+    pub fn phasm_diag_get_set_writes() -> u64;
+    pub fn phasm_diag_get_set_rejected_oob() -> u64;
+    pub fn phasm_diag_get_apply_calls() -> u64;
+    pub fn phasm_diag_get_apply_hits() -> u64;
+    pub fn phasm_diag_get_reset_calls() -> u64;
+    pub fn phasm_diag_reset_counters();
 
     // ----- Phase C.8.13(b) debug counters (#455) ------------------------
     // Read/reset atomic counters tracking phasm_apply_coeff_hooks_dual

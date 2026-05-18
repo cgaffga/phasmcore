@@ -82,6 +82,32 @@ impl CostWeights {
             mvd_suffix: f32::INFINITY,
         }
     }
+
+    /// Bisect-only helper (#530 debugging): MvdSign domain receives
+    /// all STC overrides, every other domain is WET-∞ excluded.
+    /// Used to isolate whether the OH264 fork's MV-cache mutation
+    /// in `phasm_apply_mvd_hooks` is the primary Pass-1↔Pass-2 drift
+    /// source. Not for production use.
+    pub fn debug_mvd_sign_only() -> Self {
+        Self {
+            coeff_sign: f32::INFINITY,
+            coeff_suffix: f32::INFINITY,
+            mvd_sign: 1.0,
+            mvd_suffix: f32::INFINITY,
+        }
+    }
+
+    /// Bisect-only helper (#530 debugging): CoeffSign domain receives
+    /// all STC overrides, every other domain WET-∞. Counterpart to
+    /// `debug_mvd_sign_only` for isolating the CS cascade class.
+    pub fn debug_coeff_sign_only() -> Self {
+        Self {
+            coeff_sign: 1.0,
+            coeff_suffix: f32::INFINITY,
+            mvd_sign: f32::INFINITY,
+            mvd_suffix: f32::INFINITY,
+        }
+    }
 }
 
 /// Per-domain length offsets within the concatenated combined cover.

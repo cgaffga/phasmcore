@@ -57,6 +57,14 @@ pub mod stego;
 #[cfg(feature = "openh264-backend")]
 pub mod openh264;
 
+/// Per-MB decision cache for the Pass-2 replay architecture (#533).
+/// Pass-1 streams decisions into the cache via `StegoSession`'s
+/// `capture_mb_decision` closure; Pass-2 fetches them via
+/// `replay_mb_decision`. Scope is per-GOP — caller drops the cache
+/// at GOP boundaries to keep memory bounded on long clips.
+#[cfg(feature = "openh264-backend")]
+pub mod pass2_cache;
+
 /// Phase C.8.13 — production stego orchestrator on top of the OpenH264
 /// backend. Single-domain (CoeffSign) STC encode + brute-force decode
 /// over walker-aligned cover, with passphrase-derived seeds. Relies on

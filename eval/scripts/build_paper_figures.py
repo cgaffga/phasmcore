@@ -362,23 +362,20 @@ def fig_eval_singlemsg_pe() -> None:
     # 0.40 floor was a known training collapse without curriculum init).
     juni_native = {
         0.05: 0.449,   # E9 from-scratch (2026-05-14)
-        0.10: 0.410,   # Phase 1c curriculum 2 (2026-05-11)
+        0.10: 0.404,   # Phase 1c curriculum 2 (2026-05-11) — actual test.pe
         0.20: 0.293,   # E9 from-scratch (2026-05-15)
         0.30: 0.204,   # E9 from-scratch (2026-05-15, landed overnight)
         0.40: 0.148,   # Phase 1c original (2026-05-10)
         0.50: 0.080,   # E9 from-scratch (2026-05-16, deferred handler)
     }
 
-    # Phasm Ghost vs same detector. 0.10/0.40 from Phase 1c eval runs;
-    # 0.05/0.20/0.30 from the 2026-05-16 cross-stego inference (auto-loaded
-    # below). The 0.20 value here also gets overwritten by the newer
-    # E9-trained pf020 detector eval if its JSONs exist.
-    phasm_eval: dict[float, float] = {
-        0.10: 0.410,   # path1c-trained-srnet-pf010-eval
-        0.20: 0.297,   # path1c-curriculum-pf020-eval (overwritten by 2026-05-16 if present)
-        0.40: 0.160,   # path1c-trained-srnet-pf040-eval
-    }
-    # Try to load fresh values from the 2026-05-16 cross-stego inference run.
+    # Phasm Ghost vs same detector at matched payload, n=1000 paired.
+    # All six cells now come from cross_eval_pe.py with the cover/stego
+    # scores written out as results.json {FA, MD, PE, AUC} in each run dir.
+    phasm_eval: dict[float, float] = {}
+
+    # 0.05 / 0.20 / 0.30 / 0.50 cells live as per-image score JSONs in the
+    # 2026-05-16 cross-stego inference run (PE computed inline below).
     cross_stego_dir = EVAL / "runs/2026-05-16-e9-eval-vs-phasm"
     if cross_stego_dir.exists():
         for p in (0.05, 0.20, 0.30, 0.50):
@@ -393,6 +390,24 @@ def fig_eval_singlemsg_pe() -> None:
                 fa = float((cs > 0.5).mean())
                 md = float((ps <= 0.5).mean())
                 phasm_eval[p] = (fa + md) / 2
+
+    # 0.10 / 0.40 cells live as canonical results.json (regenerated 2026-05-17
+    # after the paper review found the legacy path1c-eval cells were
+    # mislabeled; see 2026-05-17 paper-review-findings doc).
+    for p, run in [(0.10, "2026-05-17-e9-eval-vs-phasm-pf010"),
+                   (0.40, "2026-05-17-e9-eval-vs-phasm-pf040")]:
+        results_f = EVAL / f"runs/{run}/results.json"
+        if results_f.exists():
+            phasm_eval[p] = float(json.loads(results_f.read_text())["PE"])
+
+    # Hardcoded fallbacks if the dirs aren't present (reviewer flow on a
+    # data-less phasmcore checkout).
+    phasm_eval.setdefault(0.05, 0.404)
+    phasm_eval.setdefault(0.10, 0.352)
+    phasm_eval.setdefault(0.20, 0.245)
+    phasm_eval.setdefault(0.30, 0.234)
+    phasm_eval.setdefault(0.40, 0.220)
+    phasm_eval.setdefault(0.50, 0.165)
 
     fig, ax = plt.subplots(figsize=(5.6, 3.6))
     payloads_juni = sorted(juni_native.keys())
@@ -426,14 +441,14 @@ def fig_eval_singlemsg_pe() -> None:
 
 
 def fig_eval_shadowN_pe() -> None:
-    """E10 — SRNet PE vs shadow-count N on BOSSbase QF75.
+    """E10 SRNet + E15 EfficientNet PE vs shadow-count N on BOSSbase QF75.
 
-    Two series:
-      - Universal subset (n=40 paired covers, same across N): clean
-        within-subjects comparison.
-      - Per-N max (n varies 40-100): larger sample, slightly different
-        cover subsets per N.
-    Detector: J-UNI@QF75@0.20 from-scratch SRNet (test PE 0.293 native).
+    Per-N max series (n varies 40-100 per N):
+      - SRNet J-UNI@QF75@0.20 from-scratch  (E10, native test PE 0.293)
+      - EfficientNet-B0 ImageNet-pretrained (E15, F7 follow-up; only plotted
+        if the E15 per_n_pe.json file is present — drops the curve
+        automatically if E15 has not run yet)
+    Plus the SRNet universal-subset (n=40) curve.
     """
     src = EVAL / "runs/2026-05-17-e10-shadow-pe-curve/per_n_pe.json"
     d = json.loads(src.read_text())
@@ -443,28 +458,47 @@ def fig_eval_shadowN_pe() -> None:
     n_max        = [d["per_N"][str(n)]["per_n_max"]["n_stego"] for n in ns]
     n_universal  = d["n_universal_subset"]
 
+    # E15 EfficientNet — load if present
+    e15_path = EVAL / "runs/2026-05-17-e15-effnet-shadow-pe-curve/per_n_pe.json"
+    eff_pe_max = None
+    if e15_path.exists():
+        eff_d = json.loads(e15_path.read_text())
+        eff_pe_max = [eff_d["per_N"][str(n)]["per_n_max"]["PE"] for n in ns]
+
     fig, ax = plt.subplots(figsize=(5.6, 3.6))
-    # Wong blue (universal subset, primary series) + vermilion (per-N max)
+    # Wong blue (SRNet universal), vermilion (SRNet per-N max),
+    # bluish-green (EffNet per-N max) — colorblind-safe palette.
     ax.plot(ns, pe_universal, marker="o", linestyle="-",
             color="#0072B2", linewidth=1.8, markersize=8,
-            label=f"Universal subset ($n_{{paired}}={n_universal}$)")
+            label=f"SRNet (univ.\\ subset, $n_{{paired}}={n_universal}$)")
     ax.plot(ns, pe_max, marker="^", linestyle="--",
             color="#D55E00", linewidth=1.4, markersize=7,
-            label=f"Per-$N$ max ($n_{{paired}}=$" +
+            label=f"SRNet (per-$N$ max, $n_{{paired}}=$" +
                   ",".join(str(x) for x in n_max) + ")")
+    if eff_pe_max is not None:
+        ax.plot(ns, eff_pe_max, marker="s", linestyle="-.",
+                color="#009E73", linewidth=1.6, markersize=7,
+                label=f"EffNet pretrained (per-$N$ max)")
     ax.axhline(0.5, color="black", linestyle=":", linewidth=0.8,
                label="chance ($P_E = 0.5$)")
     ax.set_xlabel(r"Shadow count $N$")
-    ax.set_ylabel(r"SRNet detection error $P_E$")
+    ax.set_ylabel(r"Detection error $P_E$")
     ax.set_xticks(ns)
     ax.set_xticklabels(["0\n(primary only)", "1", "2", "3", "4"])
-    ax.set_ylim(0.45, 0.60)
+    # Expand y-range slightly to accommodate EffNet curve (may go below 0.45 if
+    # pretrained detector sees through wash-out)
+    y_lo, y_hi = 0.45, 0.60
+    if eff_pe_max is not None:
+        y_lo = min(y_lo, min(eff_pe_max) - 0.02)
+        y_hi = max(y_hi, max(eff_pe_max) + 0.02)
+    ax.set_ylim(y_lo, y_hi)
     ax.set_xlim(-0.3, 4.3)
     ax.grid(linestyle="--", alpha=0.3)
-    ax.set_title(("Shadow-message security: detection error vs shadow count\n"
-                  "BOSSbase QF75, J-UNI@QF75@0.20 SRNet detector"),
-                 fontsize=9)
-    ax.legend(fontsize=8, loc="lower right", framealpha=0.95)
+    title = ("Shadow-message security: detection error vs shadow count\n"
+             "BOSSbase QF75; SRNet@p=0.20 detector"
+             + (" + EffNet pretrained" if eff_pe_max is not None else ""))
+    ax.set_title(title, fontsize=9)
+    ax.legend(fontsize=7, loc="upper left", framealpha=0.95)
     fig.tight_layout()
     out = OUT / "fig_eval_shadowN_pe.pdf"
     fig.savefig(out, bbox_inches="tight")

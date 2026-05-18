@@ -49,8 +49,10 @@ use super::stego::cost_weights::{
 };
 use super::stego::orchestrate::DomainCosts;
 use super::openh264::{
-    set_frame_num, Encoder, EncoderError, StegoHandlers, StegoSession,
+    set_frame_num, set_pass_mode, Encoder, EncoderError, MbDecision, PassMode,
+    StegoHandlers, StegoSession,
 };
+use super::pass2_cache::DecisionCache;
 use super::stego::hook::EmbedDomain;
 use super::stego::keys::CabacStegoMasterKeys;
 use crate::stego::{crypto, frame, payload};
@@ -205,6 +207,8 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
         mb_width,
         mb_per_frame,
         /* dual_recon = */ false,
+        PassMode::Passthrough,
+        None,
     )?;
     let dt_pass1 = t_pass1.map(|t| t.elapsed());
     let pass1_bytes = baseline_bitstream.len();
@@ -269,6 +273,8 @@ pub(crate) fn encode_yuv_with_pre_framed_bits(
         override_map, mb_type_table, applied,
         mb_width, mb_per_frame,
         /* dual_recon = */ true,
+        PassMode::Passthrough,
+        None,
     );
     let dt_pass2 = t_pass2.map(|t| t.elapsed());
 
@@ -344,6 +350,18 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
         return Err(StegoError::InvalidVideo("empty frame bits".into()));
     }
 
+    // #548 v1.0 BLOCKER fix (2026-05-18) — Reset libencoder-side fork
+    // statics before every encode session. Without this, two
+    // sequential `encode_yuv_with_pre_framed_bits_4domain` calls
+    // share fork-side state across the encoder-instance teardown:
+    // Call 2 produces 541 ChromaAc CS Sign diffs vs Call 1's 0
+    // diffs on the same YUV. The bypass scratch + last-MB sentinels
+    // + wire-only flag all carry state that breaks REPLAY-byte-
+    // identity guarantees on subsequent calls. Reproducer:
+    // `oh264_wire_only_two_sequential_calls_bisect` in
+    // `core/tests/oh264_streaming_530_repro.rs`.
+    unsafe { core_openh264_sys::phasm_reset_encoder_session_state() };
+
     let trace = perf_trace();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
 
@@ -354,6 +372,34 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    // #533.4.8: Pass-2 replay cache. Pass 1 streams per-MB mode
+    // decisions in; Pass 2 reads them back so the encoder takes
+    // bit-identical mode-decision paths across the two encodes. This
+    // closes the inter-pass OH264 non-determinism (~200-byte first_diff
+    // observed between two clean encodes of the same YUV) that landed
+    // the last residual walker-vs-plan diff on the streaming fixture.
+    // Gated on wire_only — the C.8 dual_recon path has its own drift
+    // handling, and capture/replay adds cost we only need under
+    // wire_only's mode-decision-sensitive scratch override.
+    //
+    // 2026-05-18: default flipped ON after Phase 4 closure (#538). The
+    // wire_only path is now the production v1.0 ship default —
+    // single-GOP + multi-GOP green at 1072×1920 × 30f (#530 + #548
+    // closed via fork commits bb7f91fa + 1b1205ad). Set
+    // `PHASM_USE_WIRE_ONLY=0` to opt back into the legacy mutating
+    // + C.8 dual_recon path during the #539 deletion-window
+    // transition (the legacy path will be removed in #539).
+    let wire_only = std::env::var("PHASM_USE_WIRE_ONLY")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
+    let decision_cache: Option<Arc<Mutex<DecisionCache>>> = if wire_only {
+        Some(Arc::new(Mutex::new(DecisionCache::with_capacity(
+            mb_per_frame * n_frames as usize,
+        ))))
+    } else {
+        None
+    };
 
     // Pass 1 — clean encode + walker for 4-domain cover capture.
     // record_mvd: true (Phase 0 finding: walker default leaves MVD
@@ -367,6 +413,8 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
         mb_width,
         mb_per_frame,
         /* dual_recon = */ false,
+        if wire_only { PassMode::Capture } else { PassMode::Passthrough },
+        decision_cache.clone(),
     )?;
     let dt_pass1 = t_pass1.map(|t| t.elapsed());
     let pass1_bytes = baseline_bitstream.len();
@@ -452,14 +500,292 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     let dt_overrides = t_overrides.map(|t| t.elapsed());
 
     // Pass 2 — re-encode with overrides + C.8 dual_recon cascade-break.
+    //
+    // #538 Phase 4.6 EXPERIMENT: setting `PHASM_USE_WIRE_ONLY=1` flips
+    // the OH264 fork into wire-only override mode for Pass 2. In that
+    // mode `apply_coeff_hooks_to_level` + `phasm_apply_mvd_hooks`
+    // populate a per-MB scratch table instead of mutating *level / MV
+    // state. The CABAC emit reads the scratch at the bypass-bin site
+    // and writes the override bin directly to the wire. Encoder's
+    // pDecPic stays clean by construction — no C.8.x cascade-break
+    // needed for that mode, so `dual_recon` is also forced false.
+    //
+    // Default OFF: Pass 2 keeps the mutating + dual_recon path. This
+    // gate is the measurement step for #530 — once validated, the
+    // default flips and C.8.x machinery can be deleted (#539 Phase 5).
     let t_pass2 = if trace { Some(std::time::Instant::now()) } else { None };
+    // Keep an Arc clone of `applied` so the probe below can read the fired count.
+    let applied_for_probe = applied.clone();
+    if wire_only {
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(1) };
+        if trace {
+            eprintln!(
+                "[PHASM_PERF_TRACE wire_only] enabled for Pass 2; dual_recon disabled; pass2 replay from cache (len={})",
+                decision_cache.as_ref().map(|c| c.lock().map(|g| g.len()).unwrap_or(0)).unwrap_or(0),
+            );
+        }
+    }
     let result = encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
         mb_width, mb_per_frame,
-        /* dual_recon = */ true,
+        /* dual_recon = */ !wire_only,
+        if wire_only { PassMode::Replay } else { PassMode::Passthrough },
+        decision_cache.clone(),
     );
+    if wire_only {
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(0) };
+    }
     let dt_pass2 = t_pass2.map(|t| t.elapsed());
+
+    // #530 PROBE — verify encoder/walker symmetry on Pass-2 output.
+    // For round-trip to work, walker on Pass-2 must recover
+    // combined_cover == STC plan's full_stego_bits.
+    if trace {
+        let applied_count = *applied_for_probe.lock().expect("applied lock");
+        eprintln!(
+            "[PHASM_PERF_TRACE applied] override entries={} fired={}",
+            n_flips, applied_count,
+        );
+        // Determinism check: re-encode WITHOUT overrides + dual_recon=false
+        // (same args as Pass 1). Expect byte-identical to baseline_bitstream.
+        let empty_om: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+        let det_mbt: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+        let det_app: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        if let Ok(re_bitstream) = encode_once(
+            yuv, width, height, n_frames, opts,
+            empty_om, det_mbt, det_app,
+            mb_width, mb_per_frame,
+            /* dual_recon = */ false,
+            PassMode::Passthrough,
+            None,
+        ) {
+            let cmp = baseline_bitstream.len().min(re_bitstream.len());
+            let mut first_det_diff: Option<usize> = None;
+            for i in 0..cmp {
+                if baseline_bitstream[i] != re_bitstream[i] {
+                    first_det_diff = Some(i);
+                    break;
+                }
+            }
+            eprintln!(
+                "[PHASM_PERF_TRACE determinism] pass1_bytes={} re_bytes={} first_diff={:?} (None=byte-identical)",
+                baseline_bitstream.len(), re_bitstream.len(), first_det_diff,
+            );
+        }
+        // Bisect A: empty overrides + dual_recon=TRUE. Isolates whether
+        // dual_recon flag alone changes output even when no flips are
+        // applied. If this matches Pass-1, dual_recon is byte-clean; the
+        // drift must come from override-application.
+        let empty_om_a: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+        let det_mbt_a: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+        let det_app_a: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        if let Ok(re_a) = encode_once(
+            yuv, width, height, n_frames, opts,
+            empty_om_a, det_mbt_a, det_app_a,
+            mb_width, mb_per_frame,
+            /* dual_recon = */ true,
+            PassMode::Passthrough,
+            None,
+        ) {
+            let cmp = baseline_bitstream.len().min(re_a.len());
+            let mut first_a_diff: Option<usize> = None;
+            for i in 0..cmp {
+                if baseline_bitstream[i] != re_a[i] {
+                    first_a_diff = Some(i);
+                    break;
+                }
+            }
+            eprintln!(
+                "[PHASM_PERF_TRACE bisect-A] empty_overrides + dual_recon=TRUE: bytes={} first_diff={:?} (None=matches Pass-1)",
+                re_a.len(), first_a_diff,
+            );
+        }
+        // Bisect B: ONE override entry + dual_recon=TRUE. Isolates whether
+        // any single override fire alone triggers drift past the override
+        // site. If yes → C.8 dual-recon doesn't fully restore pDecPic to
+        // clean. If no → drift is N>1 cumulative.
+        if let Some((&one_k, &one_v)) = overrides_map.iter().next() {
+            let one_om: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new({
+                let mut m = HashMap::new();
+                m.insert(one_k, one_v);
+                m
+            }));
+            let det_mbt_b: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+            let det_app_b: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+            if let Ok(re_b) = encode_once(
+                yuv, width, height, n_frames, opts,
+                one_om, det_mbt_b, det_app_b.clone(),
+                mb_width, mb_per_frame,
+                /* dual_recon = */ true,
+                PassMode::Passthrough,
+                None,
+            ) {
+                let cmp = baseline_bitstream.len().min(re_b.len());
+                let mut first_b_diff: Option<usize> = None;
+                let mut total_b_diff = 0usize;
+                for i in 0..cmp {
+                    if baseline_bitstream[i] != re_b[i] {
+                        if first_b_diff.is_none() { first_b_diff = Some(i); }
+                        total_b_diff += 1;
+                    }
+                }
+                let fired_b = *det_app_b.lock().expect("app b lock");
+                eprintln!(
+                    "[PHASM_PERF_TRACE bisect-B] ONE override (key=0x{:016x} bit={}): bytes={} diff_bytes={} first_diff={:?} fired={}",
+                    one_k, one_v, re_b.len(),
+                    (re_b.len() as i64) - (baseline_bitstream.len() as i64),
+                    first_b_diff, fired_b,
+                );
+                eprintln!(
+                    "[PHASM_PERF_TRACE bisect-B] total_b_diff_bytes_in_common_prefix={}",
+                    total_b_diff,
+                );
+            }
+        }
+        if let Ok(ref stego_bytes) = result {
+            // Bitstream byte-level diff first — tells us whether Pass-1
+            // and Pass-2 diverge before or after the first override
+            // position. Pass-1 bytes already on hand as
+            // `baseline_bitstream`.
+            let p1_len = baseline_bitstream.len();
+            let p2_len = stego_bytes.len();
+            let cmp_bytes = p1_len.min(p2_len);
+            let mut byte_first_diff: Option<usize> = None;
+            for i in 0..cmp_bytes {
+                if baseline_bitstream[i] != stego_bytes[i] {
+                    byte_first_diff = Some(i);
+                    break;
+                }
+            }
+            eprintln!(
+                "[PHASM_PERF_TRACE bitstream] p1_bytes={} p2_bytes={} (diff_bytes={}) first_byte_diff={:?}",
+                p1_len, p2_len, (p2_len as i64) - (p1_len as i64), byte_first_diff,
+            );
+
+            if let Ok(p2_walk) = walk_annex_b_for_cover_with_options(
+                stego_bytes,
+                WalkOptions { record_mvd: true, ..Default::default() },
+            ) {
+                let (p2_combined, _, p2_boundaries) =
+                    combine_cover_4domain(&p2_walk.cover, &dummy_costs, weights);
+                let p1_n = boundaries.total();
+                let p2_n = p2_boundaries.total();
+                eprintln!(
+                    "[PHASM_PERF_TRACE symmetry] p1_total={} p2_total={} (diff={})",
+                    p1_n, p2_n, (p2_n as i64) - (p1_n as i64),
+                );
+                // Per-domain position-count delta — if any domain count
+                // changes, Pass-2 emits different MB structure than Pass-1
+                // and the index-wise diff below is artifically inflated
+                // by misalignment, not necessarily real bit divergence.
+                eprintln!(
+                    "[PHASM_PERF_TRACE symmetry] per-domain p1 CS={} CSL={} MVDs={} MVDsl={}",
+                    boundaries.n_coeff_sign, boundaries.n_coeff_suffix,
+                    boundaries.n_mvd_sign, boundaries.n_mvd_suffix,
+                );
+                eprintln!(
+                    "[PHASM_PERF_TRACE symmetry] per-domain p2 CS={} CSL={} MVDs={} MVDsl={}",
+                    p2_boundaries.n_coeff_sign, p2_boundaries.n_coeff_suffix,
+                    p2_boundaries.n_mvd_sign, p2_boundaries.n_mvd_suffix,
+                );
+                let cmp_n = p1_n.min(p2_n);
+                let plan_slice = &full_stego_bits[..cmp_n];
+                let recover_slice = &p2_combined[..cmp_n];
+                let mut diff = 0usize;
+                let mut first_diff = None;
+                let cs_end = boundaries.n_coeff_sign;
+                let csl_end = cs_end + boundaries.n_coeff_suffix;
+                let mvds_end = csl_end + boundaries.n_mvd_sign;
+                let mut diff_cs = 0;
+                let mut diff_csl = 0;
+                let mut diff_mvds = 0;
+                let mut diff_mvdsl = 0;
+                for i in 0..cmp_n {
+                    if plan_slice[i] != recover_slice[i] {
+                        diff += 1;
+                        if first_diff.is_none() { first_diff = Some(i); }
+                        if i < cs_end { diff_cs += 1; }
+                        else if i < csl_end { diff_csl += 1; }
+                        else if i < mvds_end { diff_mvds += 1; }
+                        else { diff_mvdsl += 1; }
+                    }
+                }
+                let domain_of = |i: usize| -> &'static str {
+                    if i < cs_end { "CS" }
+                    else if i < csl_end { "CSL" }
+                    else if i < mvds_end { "MVDs" }
+                    else { "MVDsl" }
+                };
+                eprintln!(
+                    "[PHASM_PERF_TRACE symmetry] plan vs walker diffs={diff} of {cmp_n} (CS={diff_cs} CSL={diff_csl} MVDs={diff_mvds} MVDsl={diff_mvdsl}) first_diff={:?} domain={}",
+                    first_diff, first_diff.map(domain_of).unwrap_or("--"),
+                );
+                // #538.4.7 diag: dump first ~20 diffs with their position
+                // keys so we can map them back to encoder hooks.
+                let mut dumped = 0usize;
+                for i in 0..cmp_n {
+                    if dumped >= 20 { break; }
+                    if plan_slice[i] != recover_slice[i] {
+                        // Domain-local index = i - domain_start
+                        let (domain, local_idx) = if i < cs_end {
+                            ("CS", i)
+                        } else if i < csl_end {
+                            ("CSL", i - cs_end)
+                        } else if i < mvds_end {
+                            ("MVDs", i - csl_end)
+                        } else {
+                            ("MVDsl", i - mvds_end)
+                        };
+                        let p1_pos = match domain {
+                            "CS" => p2_walk.cover.coeff_sign_bypass.positions.get(local_idx).copied(),
+                            "CSL" => p2_walk.cover.coeff_suffix_lsb.positions.get(local_idx).copied(),
+                            "MVDs" => p2_walk.cover.mvd_sign_bypass.positions.get(local_idx).copied(),
+                            "MVDsl" => p2_walk.cover.mvd_suffix_lsb.positions.get(local_idx).copied(),
+                            _ => None,
+                        };
+                        // Decode the PositionKey to identify which encoder
+                        // hook produced it. PositionKey layout:
+                        //   bits 0..23: frame_idx
+                        //   bits 24..47: mb_addr
+                        //   bits 48..51: domain enum
+                        //   bits 52..63: syntax_path packed (3-bit tag + 9-bit payload)
+                        // SyntaxPath payload:
+                        //   tag 0 Luma4x4:        block_idx(4) | coeff_idx(4)<<4 | kind(1)<<8
+                        //   tag 1 LumaAcIntra16x16: block_idx(4) | coeff_idx(4)<<4 | kind(1)<<8
+                        //   tag 2 ChromaAc:       plane(1) | block_idx(2)<<1 | coeff_idx(4)<<3 | kind(1)<<7
+                        //   tag 3 ChromaDc:       plane(1) | coeff_idx(2)<<1 | kind(1)<<3
+                        //   tag 4 LumaDcIntra16x16: coeff_idx(4) | kind(1)<<4
+                        let pk_decoded = p1_pos.map(|p| {
+                            let raw = p.raw();
+                            let frame_idx = (raw & 0xFFFFFF) as u32;
+                            let mb_addr = ((raw >> 24) & 0xFFFFFF) as u32;
+                            let domain_id = ((raw >> 48) & 0xF) as u8;
+                            let syntax = ((raw >> 52) & 0xFFF) as u16;
+                            let tag = (syntax & 0x7) as u8;
+                            let payload = (syntax >> 3) as u16;
+                            let tag_name = match tag {
+                                0 => "Luma4x4",
+                                1 => "LumaAcI16",
+                                2 => "ChromaAc",
+                                3 => "ChromaDc",
+                                4 => "LumaDcI16",
+                                _ => "Unknown",
+                            };
+                            format!(
+                                "tag={tag_name} payload=0x{payload:03X} dom={domain_id} mb={mb_addr} frame={frame_idx}"
+                            )
+                        }).unwrap_or_default();
+                        eprintln!(
+                            "[PHASM_PERF_TRACE diff#{dumped}] cmp_i={i} domain={domain} local={local_idx} plan_bit={} walker_bit={} :: {pk_decoded}",
+                            plan_slice[i], recover_slice[i],
+                        );
+                        dumped += 1;
+                    }
+                }
+            }
+        }
+    }
 
     if trace {
         let dt_total = t_start.unwrap().elapsed();
@@ -650,6 +976,8 @@ pub fn openh264_stego_capacity_yuv(
         empty_map, mb_type_table, applied,
         mb_width, mb_per_frame,
         /* dual_recon = */ false,
+        PassMode::Passthrough,
+        None,
     )?;
     let walk = walk_annex_b_for_cover(&bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
@@ -693,6 +1021,8 @@ pub(crate) fn count_cover_bits_for_gop(
         empty_map, mb_type_table, applied,
         mb_width, mb_per_frame,
         /* dual_recon = */ false,
+        PassMode::Passthrough,
+        None,
     )?;
     let walk = walk_annex_b_for_cover(&bitstream)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
@@ -735,6 +1065,15 @@ fn encode_once(
     // the mirror to keep pDecPic clean. Bitstream is byte-identical
     // either way — pVisualRecPic is encoder-internal.
     dual_recon: bool,
+    // #533.4.8: Pass-2 replay wiring. `pass_mode` selects encoder
+    // behaviour: Passthrough (default; encoder runs RDO/ME normally),
+    // Capture (encoder streams per-MB mode decisions into `decision_cache`),
+    // Replay (encoder fetches decisions from `decision_cache`; cache
+    // miss falls back to RDO/ME). When `decision_cache` is `Some` and
+    // `pass_mode` is Capture, the cache is cleared and populated; when
+    // Replay, it's read-only.
+    pass_mode: PassMode,
+    decision_cache: Option<Arc<Mutex<DecisionCache>>>,
 ) -> Result<Vec<u8>, StegoError> {
     // Reset per-encode state.
     {
@@ -744,24 +1083,37 @@ fn encode_once(
         }
     }
     *applied.lock().expect("applied lock") = 0;
+    if matches!(pass_mode, PassMode::Capture) {
+        if let Some(ref cache) = decision_cache {
+            cache.lock().expect("cache lock").clear();
+        }
+    }
 
     let map_for_hook = override_map.clone();
     let applied_for_hook = applied;
     let mb_type_for_md = mb_type_table;
+    let capture_cache = match pass_mode {
+        PassMode::Capture => decision_cache.clone(),
+        _ => None,
+    };
+    let replay_cache = match pass_mode {
+        PassMode::Replay => decision_cache.clone(),
+        _ => None,
+    };
     let handlers = StegoHandlers {
+        capture_mb_decision: capture_cache.map(|cache| {
+            Box::new(move |d: &MbDecision| {
+                if let Ok(mut c) = cache.lock() {
+                    c.insert(*d);
+                }
+            }) as Box<dyn FnMut(&MbDecision) + 'static>
+        }),
+        replay_mb_decision: replay_cache.map(|cache| {
+            Box::new(move |fnum, mx, my| {
+                cache.lock().ok().and_then(|c| c.get(fnum, mx, my))
+            }) as Box<dyn FnMut(u32, u16, u16) -> Option<MbDecision> + 'static>
+        }),
         enc_pre_emit: Some(Box::new(move |pos, _orig| {
-            // #493 Phase 4.5 (#504): accept all 4 stego domains. The fork's
-            // `phasm_apply_mvd_hooks` (`wels_stego.cpp:301`, called from
-            // HOOK-H1..H7 in `svc_base_layer_md.cpp`) fires this callback
-            // with `pos.domain ∈ {MvdSign=2, MvdSuffixLsb=3}` per MVD
-            // component when |MVD|>0 / >=9; `encoder_pos_to_phasm_position_key`
-            // dispatches those through the MVD packing branch
-            // (`encoder_mvd_pos_to_phasm_position_key`). The override is
-            // applied by the fork mutating the qpel MV in place + re-running
-            // MC; C.8.7 cascade-break handles pDecPic/pVisualRecPic
-            // correctness for next-frame ME. CoeffSign + CoeffSuffixLsb
-            // domains continue to route through the residual `block_cat`
-            // packing path.
             let map = map_for_hook.lock().ok()?;
             if map.is_empty() {
                 return None;
@@ -814,16 +1166,25 @@ fn encode_once(
 
     let mut out = vec![0u8; 4 * 1024 * 1024];
     let mut bitstream = Vec::with_capacity(2 * 1024 * 1024);
+    set_pass_mode(pass_mode);
+    let mut frame_err: Option<StegoError> = None;
     for frame in 0..n_frames {
         set_frame_num(frame);
         let base = (frame as usize) * frame_total;
         let y = &yuv[base..base + frame_y];
         let u = &yuv[base + frame_y..base + frame_y + frame_uv];
         let v = &yuv[base + frame_y + frame_uv..base + frame_total];
-        let (_, n) = encoder
-            .encode_frame(y, u, v, (frame as i64) * 33, &mut out)
-            .map_err(encoder_err_to_stego)?;
-        bitstream.extend_from_slice(&out[..n]);
+        match encoder.encode_frame(y, u, v, (frame as i64) * 33, &mut out) {
+            Ok((_, n)) => bitstream.extend_from_slice(&out[..n]),
+            Err(e) => {
+                frame_err = Some(encoder_err_to_stego(e));
+                break;
+            }
+        }
+    }
+    set_pass_mode(PassMode::Passthrough);
+    if let Some(e) = frame_err {
+        return Err(e);
     }
     Ok(bitstream)
 }
