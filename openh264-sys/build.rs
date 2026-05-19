@@ -544,6 +544,18 @@ fn main() {
             // net. PHASM_USE_WIRE_ONLY=0 is now a transitional knob
             // without cascade-break safety.
             "e3629e013b6e9a9b14be3423a03ca3ce0775be73",
+            // #549 2026-05-19 — bypass phasm_replay_inter_override
+            // cache-application path. Closed-loop walker test in
+            // `core/tests/openh264_pass2_replay.rs` confirmed Pass 1's
+            // normal RDO and Pass 2's cache-application produce
+            // different encoder state (4193 walker diffs from 1 planted
+            // flip → exactly 1 diff after this patch). The override
+            // function now returns 0 immediately in REPLAY mode; Pass
+            // 2 falls through to normal RDO. Loses REPLAY perf;
+            // recovers correctness. Paired with the asymmetric
+            // wire_only_global flag fix in
+            // `core/src/codec/h264/openh264_stego.rs` (#549 Bug 2).
+            "48d0480fd2904b57c5cb1ca622cd3449ce48091f",
         ];
         let head_output = Command::new("git")
             .arg("-C")

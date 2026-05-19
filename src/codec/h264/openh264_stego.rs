@@ -34,8 +34,26 @@
 // that test (≤ 3 flips); higher-flip-count plans intermittently observe
 // the residual leak described above.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+// #549 Phase C diagnostic — thread-local pass index, set by
+// `encode_yuv_with_pre_framed_bits_4domain` before each `encode_once`
+// call. Read by the `md_cost` callback in encode_once when
+// `PHASM_549_MD_DUMP=1` is set, to tag dumped MB-decision records as
+// Pass 1 vs Pass 2 so a downstream diff can find the first divergent MB.
+thread_local! {
+    static PHASM_549_PASS_IDX: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(crate) fn set_549_pass_idx(idx: u32) {
+    PHASM_549_PASS_IDX.with(|c| c.set(idx));
+}
+
+fn get_549_pass_idx() -> u32 {
+    PHASM_549_PASS_IDX.with(|c| c.get())
+}
 
 use core_openh264_sys::{
     encoder_pos_to_phasm_position_key, PHASM_MB_TYPE_OTHER,
@@ -405,6 +423,20 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     // record_mvd: true (Phase 0 finding: walker default leaves MVD
     // cover empty otherwise).
     let t_pass1 = if trace { Some(std::time::Instant::now()) } else { None };
+    set_549_pass_idx(1);
+    /* #549 v1.0 fix (2026-05-19): set wire_only_global before Pass 1 too.
+     * The fork's `apply_coeff_hooks_to_level` selects mutation vs scratch
+     * path based on `g_phasm_use_wire_only_overrides`. If Pass 1 runs
+     * with flag=0 (mutation path) and Pass 2 runs with flag=1 (scratch
+     * path), the two passes take structurally different code paths
+     * through the encoder even with empty override_map. That asymmetry
+     * — not the override application itself — drives the cascade.
+     * Closed-loop walker test `pass2_walker_sees_N_cs_flips_real_carplane_480p`
+     * has symmetric wire_only across passes and shows zero positional
+     * drift; orchestrator without this line has +95 CS drift. */
+    if wire_only {
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(1); }
+    }
     let baseline_bitstream = encode_once(
         yuv, width, height, n_frames, opts,
         override_map.clone(),
@@ -525,6 +557,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
             );
         }
     }
+    set_549_pass_idx(2);
     let result = encode_once(
         yuv, width, height, n_frames, opts,
         override_map, mb_type_table, applied,
@@ -536,6 +569,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     if wire_only {
         unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(0) };
     }
+    set_549_pass_idx(0);
     let dt_pass2 = t_pass2.map(|t| t.elapsed());
 
     // #530 PROBE — verify encoder/walker symmetry on Pass-2 output.
@@ -1114,6 +1148,18 @@ fn encode_once(
             }) as Box<dyn FnMut(u32, u16, u16) -> Option<MbDecision> + 'static>
         }),
         enc_pre_emit: Some(Box::new(move |pos, _orig| {
+            // #549 Phase C — dump every emit-side hook fire when
+            // PHASM_549_HOOK_DUMP=1, so the per-MB encoder-internal
+            // emission sequence can be diff'd between Pass 1 and Pass 2.
+            if std::env::var("PHASM_549_HOOK_DUMP").as_deref() == Ok("1") {
+                eprintln!(
+                    "[PHASM_549_HOOK pass={} frame={} mb=({},{}) dom={} bc={} sb={} ci={} part={} ref={} mvc={} orig={}]",
+                    get_549_pass_idx(),
+                    pos.frame_num, pos.mb_x, pos.mb_y,
+                    pos.domain, pos.block_cat, pos.sub_block, pos.coeff_idx,
+                    pos.partition_idx, pos.ref_idx, pos.mv_component, _orig,
+                );
+            }
             let map = map_for_hook.lock().ok()?;
             if map.is_empty() {
                 return None;
@@ -1149,6 +1195,17 @@ fn encode_once(
                 if let Ok(mut t) = mb_type_for_md.lock() {
                     t[mb_addr] = cost.mb_type;
                 }
+            }
+            // #549 Phase C — env-var-gated per-MB decision dump.
+            // Tagged by thread-local pass index so a downstream diff
+            // can find the first divergent MB between Pass 1 and Pass 2.
+            // No-op when PHASM_549_MD_DUMP isn't "1".
+            if std::env::var("PHASM_549_MD_DUMP").as_deref() == Ok("1") {
+                eprintln!(
+                    "[PHASM_549_MD pass={} frame={} mb=({},{}) type={} cbp={}]",
+                    get_549_pass_idx(),
+                    cost.frame_num, cost.mb_x, cost.mb_y, cost.mb_type, cost.cbp,
+                );
             }
         })),
         ..Default::default()
