@@ -3071,5 +3071,255 @@ fn pass2_walker_sees_N_cs_flips_real_carplane_480p() {
     }
 }
 
+/// #549 Bug 3 isolation: extend closed-loop walker test to flip ALL FOUR
+/// domains (CS, CSL, MvdSign, MvdSuffixLsb) at the same density. If this
+/// shows walker drift on the CS axis when MVD domains are flipped, the
+/// bug is fork-level MVD cascade. If it stays symmetric, the bug is in
+/// the orchestrator wrapper code, not the fork.
+#[test]
+fn pass2_walker_sees_N_4domain_flips_real_carplane_480p() {
+    use phasm_core::codec::h264::openh264::extract_cover_bits_via_decoder;
+
+    let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    const WIDTH: usize = 480;
+    const HEIGHT: usize = 272;
+    const QP: i32 = 26;
+    const N_P_FRAMES: u32 = 11;
+    const N_FRAMES: u32 = N_P_FRAMES + 1;
+    const FLIP_EVERY: usize = 50;
+
+    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv = match std::fs::read(yuv_path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
+    };
+    let frame_size = WIDTH * HEIGHT * 3 / 2;
+    if yuv.len() < frame_size * (N_FRAMES as usize) {
+        eprintln!("fixture too short — skipping"); return;
+    }
+    let read_frame = |fi: u32| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let base = (fi as usize) * frame_size;
+        let y = yuv[base..base + WIDTH * HEIGHT].to_vec();
+        let uv_base = base + WIDTH * HEIGHT;
+        let uv_size = (WIDTH * HEIGHT) / 4;
+        let u = yuv[uv_base..uv_base + uv_size].to_vec();
+        let v = yuv[uv_base + uv_size..uv_base + 2 * uv_size].to_vec();
+        (y, u, v)
+    };
+
+    let cache_rc = Rc::new(RefCell::new(DecisionCache::with_capacity(8192)));
+
+    let encode_with = |pass: PassMode, handlers: StegoHandlers| -> Vec<u8> {
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(1); }
+        let _sess = StegoSession::register(handlers).expect("register");
+        let mut enc = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, 60).expect("enc");
+        set_pass_mode(PassMode::Passthrough);
+        let mut all = Vec::new();
+        for fi in 0..N_FRAMES {
+            set_frame_num(fi);
+            if fi == 1 { set_pass_mode(pass); }
+            let (y, u, v) = read_frame(fi);
+            let mut out = vec![0u8; 1024 * 1024];
+            let (_, n) = enc.encode_frame(&y, &u, &v, fi as i64, &mut out).expect("encode");
+            all.extend_from_slice(&out[..n]);
+        }
+        set_pass_mode(PassMode::Passthrough);
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(0); }
+        all
+    };
+
+    let cap_cache = Rc::clone(&cache_rc);
+    let p1_handlers = StegoHandlers {
+        capture_mb_decision: Some(Box::new(move |d: &MbDecision| {
+            cap_cache.borrow_mut().insert(*d);
+        })),
+        ..Default::default()
+    };
+    let p1_bytes = encode_with(PassMode::Capture, p1_handlers);
+    let cover_p1 = extract_cover_bits_via_decoder(&p1_bytes).expect("walk p1");
+    eprintln!("[4-dom N-flip] pass1 walk: CS={} CSL={} MvdSign={} MSL={}",
+        cover_p1.coeff_sign_bypass.len(),
+        cover_p1.coeff_suffix_lsb.len(),
+        cover_p1.mvd_sign_bypass.len(),
+        cover_p1.mvd_suffix_lsb.len(),
+    );
+
+    // Per-domain counter; flip every FLIP_EVERY-th occurrence per domain.
+    let rep_cache = Rc::clone(&cache_rc);
+    let per_dom_counter = Rc::new(RefCell::new([0usize; 4]));
+    let per_dom_flips = Rc::new(RefCell::new([0usize; 4]));
+    let per_dom_counter_cb = Rc::clone(&per_dom_counter);
+    let per_dom_flips_cb = Rc::clone(&per_dom_flips);
+    let p2_handlers = StegoHandlers {
+        replay_mb_decision: Some(Box::new(move |fnum, mx, my| {
+            rep_cache.borrow().get(fnum, mx, my)
+        })),
+        enc_pre_emit: Some(Box::new(move |pos, original| -> Option<i32> {
+            let d = pos.domain as usize;
+            if d >= 4 { return None; }
+            let idx = per_dom_counter_cb.borrow()[d];
+            per_dom_counter_cb.borrow_mut()[d] += 1;
+            if idx % FLIP_EVERY == 0 && idx > 0 {
+                per_dom_flips_cb.borrow_mut()[d] += 1;
+                Some(1 - original)
+            } else {
+                None
+            }
+        })),
+        ..Default::default()
+    };
+    let p2_bytes = encode_with(PassMode::Replay, p2_handlers);
+    let cover_p2 = extract_cover_bits_via_decoder(&p2_bytes).expect("walk p2");
+    let flips = *per_dom_flips.borrow();
+    eprintln!("[4-dom N-flip] pass2 flips per-domain: CSL={} CS={} MvdSign={} MSL={} | total={}",
+        flips[0], flips[1], flips[2], flips[3], flips.iter().sum::<usize>());
+    eprintln!("[4-dom N-flip] pass2 walk: CS={} CSL={} MvdSign={} MSL={}",
+        cover_p2.coeff_sign_bypass.len(),
+        cover_p2.coeff_suffix_lsb.len(),
+        cover_p2.mvd_sign_bypass.len(),
+        cover_p2.mvd_suffix_lsb.len(),
+    );
+
+    // Compare counts per domain
+    let cs_delta = cover_p2.coeff_sign_bypass.len() as i64 - cover_p1.coeff_sign_bypass.len() as i64;
+    let csl_delta = cover_p2.coeff_suffix_lsb.len() as i64 - cover_p1.coeff_suffix_lsb.len() as i64;
+    let mvds_delta = cover_p2.mvd_sign_bypass.len() as i64 - cover_p1.mvd_sign_bypass.len() as i64;
+    let msl_delta = cover_p2.mvd_suffix_lsb.len() as i64 - cover_p1.mvd_suffix_lsb.len() as i64;
+    eprintln!("[4-dom N-flip] domain count delta p2-p1: CS={cs_delta:+} CSL={csl_delta:+} MvdSign={mvds_delta:+} MSL={msl_delta:+}");
+
+    if cs_delta == 0 && csl_delta == 0 && mvds_delta == 0 && msl_delta == 0 {
+        eprintln!("[4-dom N-flip] STRUCTURALLY SYMMETRIC — encoder visited same positions in both passes ✓");
+    } else {
+        eprintln!("[4-dom N-flip] STRUCTURAL DRIFT — encoder visited DIFFERENT positions. \
+            This is the orchestrator gate failure mode reproduced on the closed-loop test.");
+    }
+
+    // Walker diff count on CS only (most numerous)
+    let n_cs = cover_p1.coeff_sign_bypass.len().min(cover_p2.coeff_sign_bypass.len());
+    let mut cs_walker_diffs = 0;
+    for i in 0..n_cs {
+        if cover_p1.coeff_sign_bypass[i] != cover_p2.coeff_sign_bypass[i] {
+            cs_walker_diffs += 1;
+        }
+    }
+    eprintln!("[4-dom N-flip] CS walker diffs (p1 vs p2): {} of {} (CS-domain flips: {})",
+        cs_walker_diffs, n_cs, flips[1]);
+}
+
+/// #549 Bug 3 per-domain isolation: flip ONLY MvdSign (dom=2). If this
+/// causes CS positions to drift in Pass 2 vs Pass 1, MvdSign is the
+/// cascade source. (CS-only N-flip test already showed zero CS drift
+/// up to 11k flips — so any drift seen here is MvdSign-caused.)
+#[test]
+fn pass2_walker_sees_mvdsign_only_real_carplane_480p() {
+    use phasm_core::codec::h264::openh264::extract_cover_bits_via_decoder;
+
+    let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+    const WIDTH: usize = 480;
+    const HEIGHT: usize = 272;
+    const QP: i32 = 26;
+    const N_P_FRAMES: u32 = 11;
+    const N_FRAMES: u32 = N_P_FRAMES + 1;
+
+    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv = match std::fs::read(yuv_path) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
+    };
+    let frame_size = WIDTH * HEIGHT * 3 / 2;
+    if yuv.len() < frame_size * (N_FRAMES as usize) {
+        eprintln!("fixture too short — skipping"); return;
+    }
+    let read_frame = |fi: u32| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let base = (fi as usize) * frame_size;
+        let y = yuv[base..base + WIDTH * HEIGHT].to_vec();
+        let uv_base = base + WIDTH * HEIGHT;
+        let uv_size = (WIDTH * HEIGHT) / 4;
+        let u = yuv[uv_base..uv_base + uv_size].to_vec();
+        let v = yuv[uv_base + uv_size..uv_base + 2 * uv_size].to_vec();
+        (y, u, v)
+    };
+
+    let cache_rc = Rc::new(RefCell::new(DecisionCache::with_capacity(8192)));
+    let encode_with = |pass: PassMode, handlers: StegoHandlers| -> Vec<u8> {
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(1); }
+        let _sess = StegoSession::register(handlers).expect("register");
+        let mut enc = Encoder::new(WIDTH as i32, HEIGHT as i32, QP, 60).expect("enc");
+        set_pass_mode(PassMode::Passthrough);
+        let mut all = Vec::new();
+        for fi in 0..N_FRAMES {
+            set_frame_num(fi);
+            if fi == 1 { set_pass_mode(pass); }
+            let (y, u, v) = read_frame(fi);
+            let mut out = vec![0u8; 1024 * 1024];
+            let (_, n) = enc.encode_frame(&y, &u, &v, fi as i64, &mut out).expect("encode");
+            all.extend_from_slice(&out[..n]);
+        }
+        set_pass_mode(PassMode::Passthrough);
+        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(0); }
+        all
+    };
+
+    // Pass 1: CAPTURE no flips
+    let cap_cache = Rc::clone(&cache_rc);
+    let p1_handlers = StegoHandlers {
+        capture_mb_decision: Some(Box::new(move |d: &MbDecision| {
+            cap_cache.borrow_mut().insert(*d);
+        })),
+        ..Default::default()
+    };
+    let p1_bytes = encode_with(PassMode::Capture, p1_handlers);
+    let cover_p1 = extract_cover_bits_via_decoder(&p1_bytes).expect("walk p1");
+
+    // Pass 2: REPLAY with ONLY MvdSign (dom=2) flips, every Nth
+    let rep_cache = Rc::clone(&cache_rc);
+    let mvd_counter = Rc::new(RefCell::new(0usize));
+    let mvd_flips = Rc::new(RefCell::new(0usize));
+    let mvd_counter_cb = Rc::clone(&mvd_counter);
+    let mvd_flips_cb = Rc::clone(&mvd_flips);
+    let p2_handlers = StegoHandlers {
+        replay_mb_decision: Some(Box::new(move |fnum, mx, my| {
+            rep_cache.borrow().get(fnum, mx, my)
+        })),
+        enc_pre_emit: Some(Box::new(move |pos, original| -> Option<i32> {
+            if pos.domain != 2 { return None; } // 2=MvdSign
+            let idx = *mvd_counter_cb.borrow();
+            *mvd_counter_cb.borrow_mut() += 1;
+            if idx % 50 == 0 && idx > 0 {
+                *mvd_flips_cb.borrow_mut() += 1;
+                Some(1 - original)
+            } else {
+                None
+            }
+        })),
+        ..Default::default()
+    };
+    let p2_bytes = encode_with(PassMode::Replay, p2_handlers);
+    let cover_p2 = extract_cover_bits_via_decoder(&p2_bytes).expect("walk p2");
+    let n_flips = *mvd_flips.borrow();
+
+    eprintln!("[MvdSign-only] p1: CS={} CSL={} MvdSign={} MSL={}",
+        cover_p1.coeff_sign_bypass.len(), cover_p1.coeff_suffix_lsb.len(),
+        cover_p1.mvd_sign_bypass.len(), cover_p1.mvd_suffix_lsb.len());
+    eprintln!("[MvdSign-only] p2: CS={} CSL={} MvdSign={} MSL={} | flipped: {} MvdSign positions",
+        cover_p2.coeff_sign_bypass.len(), cover_p2.coeff_suffix_lsb.len(),
+        cover_p2.mvd_sign_bypass.len(), cover_p2.mvd_suffix_lsb.len(),
+        n_flips);
+
+    let cs_delta = cover_p2.coeff_sign_bypass.len() as i64 - cover_p1.coeff_sign_bypass.len() as i64;
+    let csl_delta = cover_p2.coeff_suffix_lsb.len() as i64 - cover_p1.coeff_suffix_lsb.len() as i64;
+    let mvds_delta = cover_p2.mvd_sign_bypass.len() as i64 - cover_p1.mvd_sign_bypass.len() as i64;
+    let msl_delta = cover_p2.mvd_suffix_lsb.len() as i64 - cover_p1.mvd_suffix_lsb.len() as i64;
+    eprintln!("[MvdSign-only] domain count delta p2-p1: CS={cs_delta:+} CSL={csl_delta:+} MvdSign={mvds_delta:+} MSL={msl_delta:+}");
+
+    if cs_delta == 0 && csl_delta == 0 {
+        eprintln!("[MvdSign-only] CS+CSL DOMAIN COUNTS UNCHANGED — MvdSign flips do NOT cascade into coefficient mode-decision ✓");
+    } else {
+        eprintln!("[MvdSign-only] CS+CSL DRIFT — MvdSign flips DO cascade. Confirmed Bug 3 source.");
+    }
+}
+
+
+
 
 

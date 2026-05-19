@@ -566,9 +566,19 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
         if wire_only { PassMode::Replay } else { PassMode::Passthrough },
         decision_cache.clone(),
     );
-    if wire_only {
-        unsafe { core_openh264_sys::phasm_set_use_wire_only_overrides(0) };
-    }
+    /* #549 Bug 4 fix (2026-05-19): do NOT flip wire_only_global back to 0
+     * here. The determinism check + bisect-A/B below re-run encode_once
+     * to validate that empty-override re-encodes match Pass 1 byte-for-
+     * byte. With wire_only=1 in Pass 1 (Bug 2 fix) but wire_only=0 here,
+     * those re-encodes take a STRUCTURALLY DIFFERENT code path through
+     * `apply_coeff_hooks_to_level` (the wire_only branch computes
+     * scratch keys + calls dispatch_hook + skips level mutation; the
+     * !wire_only branch calls dispatch_hook only). With empty overrides,
+     * neither branch fires any flips, but the encoder appears to drift
+     * tiny accumulating differences across many frames that compound to
+     * `first_diff=Some(995)` at 6f, `Some(5870)` at 12f, etc. Keeping
+     * wire_only=1 for the rest of the orchestrator preserves Pass-1↔
+     * Pass-1-redo symmetry, closing the determinism gap. */
     set_549_pass_idx(0);
     let dt_pass2 = t_pass2.map(|t| t.elapsed());
 

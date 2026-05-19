@@ -556,6 +556,12 @@ fn main() {
             // wire_only_global flag fix in
             // `core/src/codec/h264/openh264_stego.rs` (#549 Bug 2).
             "48d0480fd2904b57c5cb1ca622cd3449ce48091f",
+            // #549 Bug 3 fix (2026-05-19): phasm_apply_mvd_hooks returns 0
+            // in wire_only=1. Caller-side redundant MC via pMcLumaFunc was
+            // overwriting trellis-refined predictions, perturbing residuals
+            // and cascading mode-decision drift. Closed-loop MvdSign-only
+            // test: +1817 CS drift -> 0 drift after patch.
+            "3c217ff72aa0fa1c5be3579e0b7b7139c9cdb3e9",
         ];
         let head_output = Command::new("git")
             .arg("-C")

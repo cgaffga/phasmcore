@@ -118,8 +118,13 @@ COPY tests/ ./tests/
 COPY cli/ ./cli/
 COPY examples/ ./examples/
 COPY test-vectors/ ./test-vectors/
+# openh264-sys is a phasm-core workspace member, so cargo needs its
+# Cargo.toml to parse the workspace even when we build only -p phasm-cli.
+# We deliberately do NOT copy vendor/phasm-openh264/ — openh264-sys's
+# build.rs has a graceful stub-compile fallback when the submodule is
+# absent, which is the same posture a reviewer fresh-cloning phasmcore
+# sees (phasmcore intentionally does not mirror vendor/).
 COPY openh264-sys/ ./openh264-sys/
-COPY vendor/ ./vendor/
 
 # Trigger toolchain download via a no-op (gives clearer error if pin
 # is unsatisfiable than discovering it during the build below).
