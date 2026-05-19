@@ -45,6 +45,15 @@ runs/*/pngs/
 runs/*/*.pth
 runs/*/*.ckpt
 runs/*/*.h5
+runs/*/train.log
+
+# Top-level pipeline-orchestration scratch logs (alaska-dl.log,
+# e16.master.log, e17.master.log, etc.). The per-experiment
+# results.json + RESULTS.md inside each run dir are the actual
+# artifacts; the master logs at runs/ root are wrapper-script
+# stdout/stderr and aren't useful for a reviewer.
+runs/*.log
+runs/*.master.log
 
 # Vendored external repos — clone fresh per environment, pin via
 # third_party/README.md not git submodules (avoids submodule churn for

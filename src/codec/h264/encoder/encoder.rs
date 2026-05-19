@@ -2036,6 +2036,47 @@ impl Encoder {
         }
     }
 
+    /// #540.1 — query the planned MvdSuffixLsb magnitude overrides
+    /// for one partition's (X, Y) MVD pair. Returns `(ax, ay)` where
+    /// each is `Some(target_abs)` if the position has a stego plan
+    /// flip in the wire-only path; the encoder emits a UEG3 prefix +
+    /// suffix for `target_abs` instead of `|mvd|` AND uses
+    /// `target_abs` for `current_mvd.fill_region` so within-MB
+    /// downstream bin0 `ctxIdxInc` stays symmetric with the walker.
+    ///
+    /// Like [`Self::mvd_sign_overrides_for_partition`], slot.value
+    /// itself is NOT mutated. `mv_grid` + MC + neighbor predictors
+    /// all see the natural MV → no cascade.
+    ///
+    /// Returns `(None, None)` for slots whose `|mvd|` is below the
+    /// suffix-LSB threshold (= 9), zero, or not in the plan.
+    /// Shadow path (gate-set InjectionHook) also returns `(None,
+    /// None)` — shadow uses the legacy `on_mvd_slot` mutation path.
+    #[inline]
+    fn mvd_suffix_lsb_abs_overrides_for_partition(
+        &mut self,
+        mb_x: usize,
+        mb_y: usize,
+        partition: u8,
+        mvd_x: i32,
+        mvd_y: i32,
+    ) -> (Option<u32>, Option<u32>) {
+        let mb_w = (self.width / 16) as usize;
+        let mb_addr = (mb_y * mb_w + mb_x) as u32;
+        let frame = self.stego_frame_idx;
+        if let Some(hook) = self.stego_hook.as_mut() {
+            use super::super::stego::inject::MvdSlot;
+            use super::super::stego::Axis;
+            let slot_x = MvdSlot { list: 0, partition, axis: Axis::X, value: mvd_x };
+            let slot_y = MvdSlot { list: 0, partition, axis: Axis::Y, value: mvd_y };
+            let ax = hook.mvd_suffix_lsb_abs_override(frame, mb_addr, &slot_x);
+            let ay = hook.mvd_suffix_lsb_abs_override(frame, mb_addr, &slot_y);
+            (ax, ay)
+        } else {
+            (None, None)
+        }
+    }
+
     /// Phase 6D.8 §30D-A/A2: fire MVD stego hook for each partition's
     /// (x, y) MVDs BEFORE motion compensation. Updates `choice` in
     /// place if the hook modified MVD values, recomputing per-
@@ -5278,10 +5319,13 @@ impl Encoder {
 
         let base_bx = mb_x * 4;
         let base_by = mb_y * 4;
-        // Phase 6F.2(k).2 — closure now takes optional sign
-        // overrides (ox, oy) for the X / Y MVD bypass sign bins.
-        // Magnitude bins are always natural; only the sign bit
-        // gets overridden when stego plan dictates.
+        // Phase 6F.2(k).2 — closure takes optional sign overrides
+        // (ox, oy) for the X / Y MVD bypass sign bins. #540.1 —
+        // closure now also takes optional abs overrides (ax, ay)
+        // for the magnitude (prefix + UEG3 suffix). The encoder's
+        // `current_mvd.fill_region` uses the OVERRIDDEN abs (when
+        // present) to match the walker's view, so within-MB
+        // downstream bin0 `ctxIdxInc` stays symmetric.
         let emit = |cabac_: &mut CabacEncoder,
                         current: &mut super::super::cabac::neighbor::CurrentMbMvdAbs,
                         part_bx_in_mb: u8,
@@ -5291,8 +5335,10 @@ impl Encoder {
                         mv: MotionVector,
                         pred: MotionVector,
                         ox: Option<u8>,
-                        oy: Option<u8>| {
-            use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_sign_override;
+                        oy: Option<u8>,
+                        ax: Option<u32>,
+                        ay: Option<u32>| {
+            use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_overrides;
             let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
             let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
             let inc_x = compute_mvd_ctx_idx_inc_bin0(
@@ -5303,7 +5349,7 @@ impl Encoder {
                 part_by_in_mb,
                 0,
             );
-            encode_mvd_with_bin0_inc_sign_override(cabac_, mvd_x, 0, inc_x, ox);
+            encode_mvd_with_bin0_inc_overrides(cabac_, mvd_x, 0, inc_x, ox, ax);
             let inc_y = compute_mvd_ctx_idx_inc_bin0(
                 current,
                 &cabac_.neighbors,
@@ -5312,14 +5358,20 @@ impl Encoder {
                 part_by_in_mb,
                 1,
             );
-            encode_mvd_with_bin0_inc_sign_override(cabac_, mvd_y, 1, inc_y, oy);
+            encode_mvd_with_bin0_inc_overrides(cabac_, mvd_y, 1, inc_y, oy, ay);
+            // For walker symmetry: when abs is overridden, the walker
+            // reads the overridden abs from the wire and uses it for
+            // downstream bin0 ctxIdxInc lookups. The encoder must
+            // match.
+            let abs_x = ax.unwrap_or_else(|| mvd_x.unsigned_abs());
+            let abs_y = ay.unwrap_or_else(|| mvd_y.unsigned_abs());
             current.fill_region(
                 part_bx_in_mb,
                 part_by_in_mb,
                 part_w4,
                 part_h4,
-                mvd_x.unsigned_abs().min(i16::MAX as u32) as i16,
-                mvd_y.unsigned_abs().min(i16::MAX as u32) as i16,
+                abs_x.min(i16::MAX as u32) as i16,
+                abs_y.min(i16::MAX as u32) as i16,
             );
         };
         // v1.4 Phase 4.5 (#316) — thread the chosen ref_idx_l0 into
@@ -5335,7 +5387,10 @@ impl Encoder {
                 let (ox, oy) = self.mvd_sign_overrides_for_partition(
                     mb_x, mb_y, /* partition */ 0, mvd_x, mvd_y,
                 );
-                emit(cabac, current_mvd, 0, 0, 4, 4, mv, pred, ox, oy);
+                let (ax, ay) = self.mvd_suffix_lsb_abs_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd_x, mvd_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 4, 4, mv, pred, ox, oy, ax, ay);
                 self.mv_grid.fill(base_bx, base_by, 4, 4, mv, r);
             }
             PMbChoice::P16x8 { mvs, ref_idx_l0 } => {
@@ -5349,7 +5404,10 @@ impl Encoder {
                 let (ox0, oy0) = self.mvd_sign_overrides_for_partition(
                     mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
                 );
-                emit(cabac, current_mvd, 0, 0, 4, 2, mvs[0], pred0, ox0, oy0);
+                let (ax0, ay0) = self.mvd_suffix_lsb_abs_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 4, 2, mvs[0], pred0, ox0, oy0, ax0, ay0);
                 self.mv_grid.fill(base_bx, base_by, 4, 2, mvs[0], r0);
                 let pred1 = predict_mv_for_mb_partition(
                     &self.mv_grid,
@@ -5366,7 +5424,10 @@ impl Encoder {
                 let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
                     mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
                 );
-                emit(cabac, current_mvd, 0, 2, 4, 2, mvs[1], pred1, ox1, oy1);
+                let (ax1, ay1) = self.mvd_suffix_lsb_abs_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
+                );
+                emit(cabac, current_mvd, 0, 2, 4, 2, mvs[1], pred1, ox1, oy1, ax1, ay1);
                 self.mv_grid.fill(base_bx, base_by + 2, 4, 2, mvs[1], r1);
             }
             PMbChoice::P8x16 { mvs, ref_idx_l0 } => {
@@ -5380,7 +5441,10 @@ impl Encoder {
                 let (ox0, oy0) = self.mvd_sign_overrides_for_partition(
                     mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
                 );
-                emit(cabac, current_mvd, 0, 0, 2, 4, mvs[0], pred0, ox0, oy0);
+                let (ax0, ay0) = self.mvd_suffix_lsb_abs_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 0, mvd0_x, mvd0_y,
+                );
+                emit(cabac, current_mvd, 0, 0, 2, 4, mvs[0], pred0, ox0, oy0, ax0, ay0);
                 self.mv_grid.fill(base_bx, base_by, 2, 4, mvs[0], r0);
                 let pred1 = predict_mv_for_mb_partition(
                     &self.mv_grid,
@@ -5397,7 +5461,10 @@ impl Encoder {
                 let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
                     mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
                 );
-                emit(cabac, current_mvd, 2, 0, 2, 4, mvs[1], pred1, ox1, oy1);
+                let (ax1, ay1) = self.mvd_suffix_lsb_abs_overrides_for_partition(
+                    mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
+                );
+                emit(cabac, current_mvd, 2, 0, 2, 4, mvs[1], pred1, ox1, oy1, ax1, ay1);
                 self.mv_grid.fill(base_bx + 2, base_by, 2, 4, mvs[1], r1);
             }
             PMbChoice::P8x8 { sub } => {
@@ -5562,6 +5629,12 @@ impl Encoder {
     /// (frame_idx, mb_addr, partition, axis) coordinates. The
     /// `partition` parameter encodes the position-key partition
     /// field (`sub_mb_idx * 4 + sub_part_idx` for sub-MB callers).
+    ///
+    /// #540.1 — Also queries `mvd_suffix_lsb_abs_override` and
+    /// applies wire-only magnitude overrides. The encoder's
+    /// `current_mvd.fill_region` uses the overridden abs to keep
+    /// within-MB downstream bin0 `ctxIdxInc` symmetric with the
+    /// walker.
     #[allow(clippy::too_many_arguments)]
     fn emit_one_mvd_pair_cabac(
         &mut self,
@@ -5577,11 +5650,14 @@ impl Encoder {
         mv: MotionVector,
         pred: MotionVector,
     ) {
-        use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_sign_override;
+        use crate::codec::h264::cabac::encoder::encode_mvd_with_bin0_inc_overrides;
         use crate::codec::h264::cabac::neighbor::compute_mvd_ctx_idx_inc_bin0;
         let mvd_x = mv.mv_x as i32 - pred.mv_x as i32;
         let mvd_y = mv.mv_y as i32 - pred.mv_y as i32;
         let (ox, oy) = self.mvd_sign_overrides_for_partition(
+            mb_x, mb_y, partition, mvd_x, mvd_y,
+        );
+        let (ax, ay) = self.mvd_suffix_lsb_abs_overrides_for_partition(
             mb_x, mb_y, partition, mvd_x, mvd_y,
         );
         let inc_x = compute_mvd_ctx_idx_inc_bin0(
@@ -5592,7 +5668,7 @@ impl Encoder {
             part_by_in_mb,
             0,
         );
-        encode_mvd_with_bin0_inc_sign_override(cabac, mvd_x, 0, inc_x, ox);
+        encode_mvd_with_bin0_inc_overrides(cabac, mvd_x, 0, inc_x, ox, ax);
         let inc_y = compute_mvd_ctx_idx_inc_bin0(
             current_mvd,
             &cabac.neighbors,
@@ -5601,14 +5677,19 @@ impl Encoder {
             part_by_in_mb,
             1,
         );
-        encode_mvd_with_bin0_inc_sign_override(cabac, mvd_y, 1, inc_y, oy);
+        encode_mvd_with_bin0_inc_overrides(cabac, mvd_y, 1, inc_y, oy, ay);
+        // Walker-symmetry: when abs is overridden the walker reads
+        // the overridden value from the wire and uses it for
+        // downstream bin0 ctxIdxInc lookups within the MB.
+        let abs_x = ax.unwrap_or_else(|| mvd_x.unsigned_abs());
+        let abs_y = ay.unwrap_or_else(|| mvd_y.unsigned_abs());
         current_mvd.fill_region(
             part_bx_in_mb,
             part_by_in_mb,
             part_w4,
             part_h4,
-            mvd_x.unsigned_abs().min(i16::MAX as u32) as i16,
-            mvd_y.unsigned_abs().min(i16::MAX as u32) as i16,
+            abs_x.min(i16::MAX as u32) as i16,
+            abs_y.min(i16::MAX as u32) as i16,
         );
     }
 
@@ -10905,14 +10986,14 @@ mod tests {
                 .join("phasm_194_l0_residual_1080p.h264");
             std::fs::write(&path, &all).expect("write temp h264");
 
-            let out = Command::new("the reference decoder")
+            let out = Command::new("ffmpeg")
                 .args([
                     "-loglevel", "info",
                     "-i", path.to_str().unwrap(),
                     "-f", "null", "-",
                 ])
                 .output()
-                .expect("the reference decoder in PATH");
+                .expect("ffmpeg in PATH");
             let stderr = String::from_utf8_lossy(&out.stderr);
             let conceal_lines: Vec<&str> = stderr.lines()
                 .filter(|l| l.contains("concealing"))
@@ -10995,14 +11076,14 @@ mod tests {
                 .join("phasm_194_l0_residual_iphone7_1080p.h264");
             std::fs::write(&path, &all).expect("write temp h264");
 
-            let out = Command::new("the reference decoder")
+            let out = Command::new("ffmpeg")
                 .args([
                     "-loglevel", "info",
                     "-i", path.to_str().unwrap(),
                     "-f", "null", "-",
                 ])
                 .output()
-                .expect("the reference decoder in PATH");
+                .expect("ffmpeg in PATH");
             let stderr = String::from_utf8_lossy(&out.stderr);
             let conceal_lines: Vec<&str> = stderr.lines()
                 .filter(|l| l.contains("concealing"))
@@ -11107,14 +11188,14 @@ mod tests {
             // even on error-concealed B-frames. Use `info` + scan
             // stderr for `concealing` so this gate genuinely catches
             // the L0/L1/Bi 16x16 B-residual spec divergence.
-            let out = Command::new("the reference decoder")
+            let out = Command::new("ffmpeg")
                 .args([
                     "-loglevel", "info",
                     "-i", path.to_str().unwrap(),
                     "-f", "null", "-",
                 ])
                 .output()
-                .expect("the reference decoder in PATH");
+                .expect("ffmpeg in PATH");
             let stderr = String::from_utf8_lossy(&out.stderr);
 
             let _ = std::fs::remove_file(&path);
@@ -11173,14 +11254,14 @@ mod tests {
         let path = std::env::temp_dir().join("phasm_6ea5_reference_compliance.h264");
         std::fs::write(&path, &all).expect("write temp h264");
 
-        let out = Command::new("the reference decoder")
+        let out = Command::new("ffmpeg")
             .args([
                 "-loglevel", "error",
                 "-i", path.to_str().unwrap(),
                 "-f", "null", "-",
             ])
             .output()
-            .expect("the reference decoder in PATH");
+            .expect("ffmpeg in PATH");
         let stderr = String::from_utf8_lossy(&out.stderr);
 
         assert!(

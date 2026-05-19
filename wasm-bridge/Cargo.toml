@@ -26,7 +26,21 @@ getrandom = { version = "0.2", features = ["js"] }
 # by all modern browsers (Chrome 75+, Firefox 79+, Safari 15+).
 wasm-opt = false
 
+# WASM ship profile — same mobile-ship knobs as the iOS/Android bridges,
+# but inlined into `[profile.release]` because wasm-pack 0.14 only honors
+# `[package.metadata.wasm-pack.profile.release]` for its wasm-opt config.
+# opt-level=s balances browser-download size vs. encode speed.
+# See `docs/design/build-optimization.md`.
 [profile.release]
-lto = true
-strip = "symbols"
 opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+incremental = false
+overflow-checks = false
+
+[profile.release.package."*"]
+opt-level = "s"
+codegen-units = 1

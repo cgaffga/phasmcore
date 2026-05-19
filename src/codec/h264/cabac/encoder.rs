@@ -842,26 +842,9 @@ pub fn encode_mvd_with_bin0_inc(
 /// Phase 6F.2(k).1 — variant of [`encode_mvd_with_bin0_inc`] that
 /// optionally overrides the sign bypass bin written to the bitstream.
 ///
-/// `sign_override`:
-/// - `None`  → write `0` for `mvd > 0`, `1` for `mvd < 0` (natural).
-/// - `Some(b)` → write `b` regardless of `mvd`'s sign.
-///
-/// Magnitude (prefix + suffix) bins are unaffected — they always
-/// reflect `|mvd|`. The sign override is the entry point for
-/// inline bitstream-mod MVD stego (§6F.2(k)): the encoder's
-/// internal `slot.value` and `mv_grid` stay at the natural
-/// pre-injection values (no cascade), but the bin written to the
-/// emitted Annex-B bytes carries the planned stego bit.
-///
-/// The decoder reading the bitstream sees the overridden bit at
-/// the bypass-bin offset and reconstructs `MV = predictor +
-/// (-mvd)` instead of `predictor + mvd` (spec § 9.3.2.3 +
-/// § 8.4.1.4). Decoded pixel drift at the flipped position is
-/// `≈ 2·|mvd|·local_gradient`. Constrained by the v1.0 drift
-/// budget + |mvd| cap in the orchestrator.
-///
-/// `sign_override` is ignored when `mvd == 0` (no sign bin emitted
-/// by spec; the position isn't a stego candidate anyway).
+/// Forwards to [`encode_mvd_with_bin0_inc_overrides`] with
+/// `abs_override = None`. Kept as a thin wrapper for call sites that
+/// only need sign override.
 pub fn encode_mvd_with_bin0_inc_sign_override(
     enc: &mut CabacEncoder,
     mvd: i32,
@@ -869,8 +852,56 @@ pub fn encode_mvd_with_bin0_inc_sign_override(
     bin0_ctx_idx_inc: u32,
     sign_override: Option<u8>,
 ) {
+    encode_mvd_with_bin0_inc_overrides(enc, mvd, component, bin0_ctx_idx_inc, sign_override, None);
+}
+
+/// #540.1 — variant of [`encode_mvd_with_bin0_inc_sign_override`]
+/// that also accepts a magnitude override.
+///
+/// `sign_override`:
+/// - `None`  → write `0` for `mvd > 0`, `1` for `mvd < 0` (natural).
+/// - `Some(b)` → write `b` regardless of `mvd`'s sign.
+///
+/// `abs_override`:
+/// - `None` → emit prefix + suffix for `mvd.unsigned_abs()` (natural).
+/// - `Some(target_abs)` → emit prefix + suffix for `target_abs`
+///   instead. The walker reading the wire decodes `target_abs`. The
+///   encoder's `slot.value` / `mv_grid` / motion compensation stay at
+///   the natural pre-injection MVD — no cascade.
+///
+/// Caller responsibilities when `abs_override` is `Some`:
+/// 1. **Walker-symmetry**: `target_abs >= 9` (= MvdSuffixLsb emit
+///    threshold). If `target_abs < 9` the wire emits no UEG3 suffix
+///    and the walker doesn't see a suffix-LSB position at this slot,
+///    desyncing the cover.
+/// 2. **Within-MB ctx symmetry**: the encoder's
+///    `current_mvd.fill_region` MUST be called with `target_abs`
+///    (NOT `mvd.unsigned_abs()`) so the next partition's bin0
+///    `ctxIdxInc` stays symmetric with the walker (which also reads
+///    `target_abs` from the wire).
+/// 3. **Cross-MB ctx symmetry**: `cabac.neighbors.commit(...)` at
+///    end-of-MB carries `current_mvd.to_neighbor()`, which inherits
+///    `target_abs` from step 2. No extra action needed.
+///
+/// `sign_override` is ignored when `mvd == 0` (no sign bin emitted).
+/// `abs_override` SHOULD NOT be used when `mvd == 0` (the natural
+/// path emits no suffix at all; overriding would create a phantom
+/// suffix-LSB position).
+pub fn encode_mvd_with_bin0_inc_overrides(
+    enc: &mut CabacEncoder,
+    mvd: i32,
+    component: u8,
+    bin0_ctx_idx_inc: u32,
+    sign_override: Option<u8>,
+    abs_override: Option<u32>,
+) {
     debug_assert!(component <= 1);
-    let abs_v = mvd.unsigned_abs();
+    let natural_abs = mvd.unsigned_abs();
+    let emit_abs = abs_override.unwrap_or(natural_abs);
+    debug_assert!(
+        abs_override.map_or(true, |a| a >= 9),
+        "abs_override below MvdSuffixLsb threshold (9) breaks walker symmetry"
+    );
     let u_coff = 9u32;
     let base_offset = if component == 0 {
         ctx_offset::MVD_L0_X
@@ -878,7 +909,7 @@ pub fn encode_mvd_with_bin0_inc_sign_override(
         ctx_offset::MVD_L0_Y
     };
 
-    let prefix_val = abs_v.min(u_coff);
+    let prefix_val = emit_abs.min(u_coff);
     let mut bin_idx = 0u32;
     binarize_tu(prefix_val, u_coff, &mut |bin| {
         let ctx_inc = match bin_idx {
@@ -892,8 +923,8 @@ pub fn encode_mvd_with_bin0_inc_sign_override(
         bin_idx += 1;
     });
 
-    if abs_v >= u_coff {
-        let suf_s = abs_v - u_coff;
+    if emit_abs >= u_coff {
+        let suf_s = emit_abs - u_coff;
         binarize_egk_suffix(suf_s, 3, &mut |bin| enc.encode_bypass(bin));
     }
     if mvd != 0 {
@@ -1205,6 +1236,76 @@ mod tests {
 
         assert_eq!(bytes_a, bytes_b,
             "override at mvd=0 must be a no-op (no sign bin emitted)");
+    }
+
+    /// **#540.1** — `encode_mvd_with_bin0_inc_overrides` with
+    /// `abs_override=None` and `sign_override=None` must produce
+    /// byte-identical output to the baseline `encode_mvd_with_bin0_inc`.
+    #[test]
+    fn encode_mvd_overrides_none_matches_baseline() {
+        for &mvd in &[1i32, 5, 9, 10, 15, 25, -7, -12] {
+            let mut a = fresh_enc();
+            encode_mvd_with_bin0_inc(&mut a, mvd, 0, 0);
+            let bytes_a = a.finish();
+
+            let mut b = fresh_enc();
+            encode_mvd_with_bin0_inc_overrides(&mut b, mvd, 0, 0, None, None);
+            let bytes_b = b.finish();
+
+            assert_eq!(bytes_a, bytes_b,
+                "overrides=(None,None) for mvd={mvd} must be byte-identical to baseline");
+        }
+    }
+
+    /// **#540.1** — `abs_override` emits the prefix + suffix bins for
+    /// the OVERRIDE magnitude, not the encoder's natural `|mvd|`. The
+    /// resulting wire is what a CABAC decoder would decode as
+    /// `target_abs * sign(mvd)`, while the encoder's `slot.value` is
+    /// untouched.
+    #[test]
+    fn encode_mvd_abs_override_emits_target_magnitude() {
+        // Natural emit at abs=15: prefix TU(9) ones + terminator + UEG3 suffix for suf_s=6.
+        let mut natural_15 = fresh_enc();
+        encode_mvd_with_bin0_inc_overrides(&mut natural_15, 15, 0, 0, None, None);
+        let bytes_15 = natural_15.finish();
+
+        // Natural emit at abs=14: same prefix structure, suffix for suf_s=5.
+        let mut natural_14 = fresh_enc();
+        encode_mvd_with_bin0_inc_overrides(&mut natural_14, 14, 0, 0, None, None);
+        let bytes_14 = natural_14.finish();
+
+        // Override path: mvd=15, abs_override=Some(14). Must equal natural_14's bytes.
+        let mut override_to_14 = fresh_enc();
+        encode_mvd_with_bin0_inc_overrides(
+            &mut override_to_14, 15, 0, 0, None, Some(14),
+        );
+        let bytes_override = override_to_14.finish();
+
+        assert_eq!(bytes_override, bytes_14,
+            "abs_override=Some(14) on mvd=15 must produce the same wire as natural mvd=14");
+        assert_ne!(bytes_override, bytes_15,
+            "abs_override must actually CHANGE the wire (not no-op)");
+    }
+
+    /// **#540.1** — abs_override preserves the sign bin from
+    /// `mvd`'s natural sign (or `sign_override`). Test: mvd=-15
+    /// with abs_override=Some(14) → wire decodes to -14 (NOT +14).
+    #[test]
+    fn encode_mvd_abs_override_keeps_natural_sign() {
+        // Natural -14: prefix + suffix for abs=14, sign=1 (negative).
+        let mut natural_neg14 = fresh_enc();
+        encode_mvd_with_bin0_inc_overrides(&mut natural_neg14, -14, 0, 0, None, None);
+        let bytes_neg14 = natural_neg14.finish();
+
+        // Override mvd=-15 → abs=14 (still negative on wire).
+        let mut override_to_neg14 = fresh_enc();
+        encode_mvd_with_bin0_inc_overrides(
+            &mut override_to_neg14, -15, 0, 0, None, Some(14),
+        );
+        let bytes_override = override_to_neg14.finish();
+
+        assert_eq!(bytes_override, bytes_neg14,
+            "abs_override=Some(14) on mvd=-15 must produce wire for -14, preserving negative sign");
     }
 
     // ─── Phase 6C.5b P-slice orchestration tests ────────────────────

@@ -275,7 +275,10 @@ def fig_capacity_sweep() -> None:
     axes[0].set_xticklabels([bucket_labels[b] for b in buckets])
     axes[0].set_ylabel("Payload rate (bits per nzAC)")
     axes[0].set_title("(a) Mean ± std bpnzAC rate per mode", fontsize=10)
-    axes[0].legend(fontsize=7, loc="upper left")
+    # Legend at center-left (y≈0.5) — clear of Ghost bars near 0.18 and
+    # Shadow bars near 0.97. Upper-left would overlap the Shadow bar top
+    # at BOSSbase QF75 (~0.97); lower-right would overlap Ghost bars.
+    axes[0].legend(fontsize=7, loc="center left", framealpha=0.95)
     axes[0].grid(axis="y", linestyle="--", alpha=0.3)
     axes[0].set_ylim(0, 1.1)
 
@@ -297,7 +300,9 @@ def fig_capacity_sweep() -> None:
     axes[1].set_ylabel("Shadow / Ghost capacity ratio")
     axes[1].set_title("(b) Shadow capacity is ≈5× Ghost across buckets",
                        fontsize=10)
-    axes[1].legend(fontsize=8)
+    # Legend at lower-right (clear of the Real-world bucket's tall error
+    # bar that reaches y≈7.5 in the upper-right area).
+    axes[1].legend(fontsize=8, loc="lower right", framealpha=0.95)
     axes[1].set_ylim(0, 8)
     axes[1].grid(axis="y", linestyle="--", alpha=0.3)
 

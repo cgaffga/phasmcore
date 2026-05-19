@@ -655,7 +655,21 @@ unsafe fn nonzero_mask_neon_16(scan: &[i32]) -> u16 {
 // magnitudes ≥ 9 (the threshold at which the encoder emits an
 // EGk-3 suffix).
 
-const MVD_SUFFIX_LSB_THRESHOLD: u32 = 9;
+pub(super) const MVD_SUFFIX_LSB_THRESHOLD: u32 = 9;
+
+/// Direction-aware ±1 flip for an MvdSuffixLsb position, mirror of
+/// the local `flipped_magnitude(abs, MVD_SUFFIX_LSB_THRESHOLD)` call
+/// in [`apply_mvd_suffix_lsb_overrides`]. Exposed for the wire-only
+/// path (#540.1, `InjectionHook::mvd_suffix_lsb_abs_override`) so
+/// both mutation and wire-only code share one direction policy.
+///
+/// Prefers `abs - 1` (smaller MV perturbation) when safe. At the
+/// eligibility boundary (`abs == 9`), must return `abs + 1` to keep
+/// the target magnitude in the UEG3 suffix-emitting range.
+#[inline]
+pub(super) fn mvd_flipped_magnitude(abs: u32) -> u32 {
+    flipped_magnitude(abs, MVD_SUFFIX_LSB_THRESHOLD)
+}
 
 /// Enumerate `MvdSuffixLsb` positions for the given slots.
 pub fn enumerate_mvd_suffix_lsb_positions(

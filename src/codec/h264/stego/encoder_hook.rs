@@ -136,6 +136,42 @@ pub trait StegoMbHook: Send + std::fmt::Debug {
     ) -> Option<u8> {
         None
     }
+
+    /// #540.1 — query the planned MvdSuffixLsb magnitude override at
+    /// CABAC emit time. Returns `Some(target_abs)` when the position
+    /// has a stego plan flip; the encoder emits a UEG3 prefix +
+    /// suffix for `target_abs` (NOT `|slot.value|`). Returns `None`
+    /// for unplanned positions.
+    ///
+    /// Like [`Self::mvd_sign_override`], this DOES NOT mutate
+    /// `slot.value`. The encoder's `mv_grid` + motion compensation +
+    /// neighbor predictors all see the natural pre-injection MVD →
+    /// no cascade. The walker reading the wire decodes `target_abs`
+    /// (with `slot.value`'s natural sign) → MV differs by ±1 on the
+    /// flipped axis. This is the wire-only counterpart of the
+    /// `apply_mvd_suffix_lsb_overrides` / `on_mvd_slot` mutation
+    /// path; both achieve the same wire output but the wire-only
+    /// path avoids the encoder-state cascade that the mutation path
+    /// would otherwise create (which forced the cascade-safety
+    /// criterion-C filter).
+    ///
+    /// Caller (encoder MVD emit site) MUST:
+    /// 1. Pass `Some(target_abs)` as `abs_override` to
+    ///    `encode_mvd_with_bin0_inc_overrides`.
+    /// 2. Use `target_abs` (NOT `|slot.value|`) when calling
+    ///    `current_mvd.fill_region` so within-MB downstream bin0
+    ///    `ctxIdxInc` stays symmetric with the walker.
+    ///
+    /// Default returns `None` (non-injection hooks): the encoder
+    /// emits natural MVD magnitudes.
+    fn mvd_suffix_lsb_abs_override(
+        &mut self,
+        _frame_idx: u32,
+        _mb_addr: u32,
+        _slot: &MvdSlot,
+    ) -> Option<u32> {
+        None
+    }
 }
 
 /// Pass 3 implementation: forwards every emit-site call to the
@@ -217,74 +253,29 @@ impl<I: BitInjector + Send> StegoMbHook for InjectionHook<I> {
 
     fn on_mvd_slot(
         &mut self,
-        frame_idx: u32,
-        mb_addr: u32,
-        slot: &mut MvdSlot,
+        _frame_idx: u32,
+        _mb_addr: u32,
+        _slot: &mut MvdSlot,
     ) {
-        // §6E-A5(d).4 — magnitude-LSB MVD override at plan-overridden
-        // positions only. PlanInjector returns Some(plan_bit) for
-        // shadow-selected MvdSuffixLsb positions; upstream
-        // `priority_slots_all4_safe` only includes such positions
-        // when `safe_msl[i] = true` (cascade-safe per criterion C of
-        // `cascade_safety::analyze_safe_mvd_subset`). For default
-        // primary STC (no safe_msl supplied), this hook is a no-op
-        // because PlanInjector contains no MvdSuffixLsb keys.
+        // #540.2 — RETIRED. Pre-port behavior:
         //
-        // Mechanic: read current LSB of |slot.value|; if it differs
-        // from the planned bit, mutate slot.value by ±1 to match,
-        // preserving sign. By construction the cascade-safety greedy
-        // bounded the downstream propagation, so the encoder's
-        // mv_grid + MC + neighbor predictor see a magnitude-shifted
-        // MV but downstream MVDs stay nonzero AND keep their
-        // magnitudes invariant under the cumulative shift bound.
+        //   if gate_set: mutate slot.value by ±1 to align magnitude
+        //   LSB with planned bit. This propagated through `mv_grid` +
+        //   MC + neighbor predictor (cascade), requiring the
+        //   cascade-safety predicate to bound the propagation.
         //
-        // Sign-bypass override remains in `mvd_sign_override`
-        // (purely bitstream-mod, doesn't touch slot.value).
-        if slot.value == 0 {
-            return;
-        }
-        // §6E-A5(d).4 — gate: skip when no safe-set installed
-        // (default for primary STC + post-#107 shadow path).
-        let Some(gate) = self.mvd_msl_safe_gate.as_ref() else {
-            return;
-        };
-        use super::hook::{EmbedDomain, PositionKey, SyntaxPath, BinKind};
-        let path = SyntaxPath::Mvd {
-            list: slot.list,
-            partition: slot.partition,
-            axis: slot.axis,
-            kind: BinKind::SuffixLsb,
-        };
-        let key = PositionKey::new(frame_idx, mb_addr, EmbedDomain::MvdSuffixLsb, path);
-        if !gate.contains(&key) {
-            return;
-        }
-        let Some(plan_bit) = self.injector.override_bit(key) else {
-            return;
-        };
-        let abs = slot.value.unsigned_abs();
-        let cur_lsb = (abs & 1) as u8;
-        if cur_lsb == plan_bit {
-            return;
-        }
-        // Pick ±1 direction that keeps |MVD| nonzero AND in the
-        // UEG3 suffix-LSB-emitting range (|MVD| ≥ 9). Caller
-        // (cascade-safety filter) is responsible for excluding
-        // positions where the boundary cases bite.
-        let new_abs: u32 = if cur_lsb == 1 && plan_bit == 0 {
-            // Odd → even. Prefer abs-1 (smaller MV change) when
-            // abs ≥ 10 (so abs-1 ≥ 9, suffix-LSB still emitted).
-            // Otherwise abs+1.
-            if abs >= 10 { abs - 1 } else { abs + 1 }
-        } else {
-            // cur_lsb == 0 && plan_bit == 1 → even → odd.
-            // abs ≥ 2 here (slot.value != 0 + even). Prefer abs-1
-            // when abs > 10 (so abs-1 ≥ 10 stays comfortably in
-            // emit range). Otherwise abs+1.
-            if abs > 10 { abs - 1 } else { abs + 1 }
-        };
-        let signed = new_abs as i32;
-        slot.value = if slot.value < 0 { -signed } else { signed };
+        // Post-port behavior (wire-only): MvdSuffixLsb flips happen
+        // exclusively at CABAC emit via [`Self::mvd_suffix_lsb_abs_override`]
+        // (analogous to the existing `mvd_sign_override` path).
+        // `slot.value` is now NEVER mutated by InjectionHook, so
+        // `mv_grid` always sees the natural pre-injection MV — no
+        // cascade. The walker reads the override magnitude from the
+        // wire and reconstructs its own (different) MV; this is the
+        // visual quality cost of MvdSuffixLsb stego, identical to
+        // OH264 post-#539 (cascade-break deletion).
+        //
+        // No-op kept to satisfy trait + preserve existing call sites
+        // in `invoke_stego_mvd_hook`.
     }
 
     fn mvd_sign_override(
@@ -309,6 +300,55 @@ impl<I: BitInjector + Send> StegoMbHook for InjectionHook<I> {
         };
         let key = PositionKey::new(frame_idx, mb_addr, EmbedDomain::MvdSignBypass, path);
         self.injector.override_bit(key)
+    }
+
+    /// #540.1 + #540.2 — wire-only MvdSuffixLsb path. Mirror of
+    /// `mvd_sign_override` for the magnitude domain.
+    ///
+    /// Returns the target magnitude (NOT a bit) the wire should emit
+    /// for this slot. Walker convention: plan bit is computed against
+    /// `suffix_lsb_bit_for_magnitude(abs) = (abs & 1) ^ 1`.
+    ///
+    /// Fires for ALL planned positions (primary STC + shadow). The
+    /// retired [`Self::on_mvd_slot`] mutation path is no longer
+    /// active — both paths converge on emit-time abs override, which
+    /// keeps `slot.value` + `mv_grid` clean (= no cascade).
+    fn mvd_suffix_lsb_abs_override(
+        &mut self,
+        frame_idx: u32,
+        mb_addr: u32,
+        slot: &MvdSlot,
+    ) -> Option<u32> {
+        if slot.value == 0 {
+            return None;
+        }
+        let abs = slot.value.unsigned_abs();
+        // MvdSuffixLsb is only emitted on the wire when |MVD| >= 9.
+        // Below this threshold, there's no suffix-LSB position to
+        // override and the walker doesn't enumerate one.
+        if abs < super::inject::MVD_SUFFIX_LSB_THRESHOLD {
+            return None;
+        }
+        use super::hook::{EmbedDomain, PositionKey, SyntaxPath, BinKind};
+        let path = SyntaxPath::Mvd {
+            list: slot.list,
+            partition: slot.partition,
+            axis: slot.axis,
+            kind: BinKind::SuffixLsb,
+        };
+        let key = PositionKey::new(frame_idx, mb_addr, EmbedDomain::MvdSuffixLsb, path);
+        let plan_bit = self.injector.override_bit(key)?;
+        // Walker convention: cover_bit = (abs & 1) ^ 1.
+        let cover_bit = ((abs & 1) ^ 1) as u8;
+        if plan_bit == cover_bit {
+            return None;
+        }
+        // Direction: prefer abs-1 (smaller perturbation), except at
+        // the eligibility boundary (abs == threshold = 9) where
+        // we must go +1 to keep target_abs >= 9. Mirror of
+        // `flipped_magnitude` in `apply_mvd_suffix_lsb_overrides`.
+        let new_abs = super::inject::mvd_flipped_magnitude(abs);
+        Some(new_abs)
     }
 }
 
@@ -824,21 +864,18 @@ mod tests {
         assert_eq!(scan[0].unsigned_abs(), 19, "suffix LSB flip ±1");
     }
 
-    /// §6E-A5(d).4 — InjectionHook::on_mvd_slot mutates slot.value
-    /// by ±1 at gate-allowed plan-overridden positions to align the
-    /// magnitude LSB with the planned bit. Gate defaults to None
-    /// (no_op for primary STC + post-#107 shadow). When installed
-    /// via `set_mvd_msl_safe_gate`, only PositionKeys in the set
-    /// fire the flip.
+    /// #540.2 — `on_mvd_slot` is now a NO-OP. MvdSuffixLsb flips
+    /// happen via emit-time abs override
+    /// ([`InjectionHook::mvd_suffix_lsb_abs_override`]), not by
+    /// mutating `slot.value`. This keeps `mv_grid` clean (= no
+    /// cascade), so the cascade-safety filter is no longer required
+    /// for primary STC.
     ///
-    /// Test scenarios (gate populated with the test position key):
-    /// - cur_lsb==plan_bit → no mutation
-    /// - cur_lsb!=plan_bit, |MVD|<10 → +1 magnitude (preserve sign)
-    /// - cur_lsb!=plan_bit, |MVD|>10 → -1 magnitude (preserve sign)
-    /// - slot.value==0 → no mutation (zero MVD has no sign emit)
-    /// - gate not installed → no mutation regardless of plan_bit
+    /// Pre-port behavior tested mutation at gate-allowed positions;
+    /// this test now verifies the no-op contract across the same
+    /// scenarios.
     #[test]
-    fn injection_hook_mvd_slot_magnitude_lsb_flip() {
+    fn injection_hook_on_mvd_slot_is_noop() {
         use super::super::hook::{EmbedDomain, PositionKey, SyntaxPath, BinKind};
         let test_key = || PositionKey::new(
             0, 0, EmbedDomain::MvdSuffixLsb,
@@ -850,45 +887,67 @@ mod tests {
             hook.set_mvd_msl_safe_gate(set);
         };
 
-        // value=-5 (abs=5, cur_lsb=1), plan=0 → odd→even.
-        // abs<10 → abs+1=6 → value=-6.
+        // Pre-port: would mutate -5 → -6. Post-port: no-op.
         let mut hook = InjectionHook::new(ForceBit(0));
         install_gate(&mut hook);
         let mut slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: -5 };
         hook.on_mvd_slot(0, 0, &mut slot);
-        assert_eq!(slot.value, -6,
-            "abs<10 + cur_lsb!=plan_bit → +1 magnitude flip (preserve sign)");
+        assert_eq!(slot.value, -5, "on_mvd_slot must NOT mutate slot.value (#540.2)");
 
-        // value=-12 (abs=12, cur_lsb=0), plan=1 → even→odd.
-        // abs>10 → abs-1=11 → value=-11.
+        // Pre-port: would mutate -12 → -11. Post-port: no-op.
         let mut hook = InjectionHook::new(ForceBit(1));
         install_gate(&mut hook);
         let mut slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: -12 };
         hook.on_mvd_slot(0, 0, &mut slot);
-        assert_eq!(slot.value, -11,
-            "abs>10 + cur_lsb!=plan_bit → -1 magnitude flip (preserve sign)");
+        assert_eq!(slot.value, -12, "on_mvd_slot must NOT mutate slot.value (#540.2)");
 
-        // value=15 (abs=15, cur_lsb=1), plan=1 → no flip needed.
-        let mut hook = InjectionHook::new(ForceBit(1));
-        install_gate(&mut hook);
-        let mut slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 15 };
-        hook.on_mvd_slot(0, 0, &mut slot);
-        assert_eq!(slot.value, 15, "cur_lsb==plan_bit → no mutation");
-
-        // value=0 → no mutation (zero MVD has no sign emit).
-        let mut hook = InjectionHook::new(ForceBit(1));
-        install_gate(&mut hook);
-        let mut slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 0 };
-        hook.on_mvd_slot(0, 0, &mut slot);
-        assert_eq!(slot.value, 0, "zero MVD stays zero");
-
-        // Gate NOT installed → no mutation regardless of plan_bit
-        // (matches pre-d.4 production behavior).
+        // Gate not installed: still no-op (unchanged).
         let mut hook = InjectionHook::new(ForceBit(0));
         let mut slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: -5 };
         hook.on_mvd_slot(0, 0, &mut slot);
         assert_eq!(slot.value, -5,
-            "no gate installed → on_mvd_slot is no-op (matches pre-d.4 production)");
+            "no gate installed → on_mvd_slot is no-op");
+    }
+
+    /// #540.2 — Now exercise the new wire-only emit path. With a
+    /// planned MvdSuffixLsb override, `mvd_suffix_lsb_abs_override`
+    /// returns the target abs (slot.value untouched).
+    #[test]
+    fn injection_hook_mvd_suffix_lsb_abs_override_returns_target() {
+        // value=12 (abs=12, walker=1, plan walker=0 from ForceBit(0)).
+        // walker_bit != plan_bit → flip. flipped_magnitude(12) at
+        // threshold 9: 12 != 9 → abs-1 = 11. Returns Some(11).
+        let mut hook = InjectionHook::new(ForceBit(0));
+        let slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 12 };
+        let r = hook.mvd_suffix_lsb_abs_override(0, 0, &slot);
+        assert_eq!(r, Some(11),
+            "plan_bit=0 (walker) on abs=12 (walker=1) → target=11");
+
+        // value=11 (abs=11, walker=0). plan walker=0 → no flip.
+        let mut hook = InjectionHook::new(ForceBit(0));
+        let slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 11 };
+        let r = hook.mvd_suffix_lsb_abs_override(0, 0, &slot);
+        assert_eq!(r, None, "walker_bit == plan_bit → no override");
+
+        // abs=9 boundary: walker=0, plan=1 → flip. flipped_magnitude(9)
+        // at threshold 9 → abs+1 = 10. Returns Some(10).
+        let mut hook = InjectionHook::new(ForceBit(1));
+        let slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 9 };
+        let r = hook.mvd_suffix_lsb_abs_override(0, 0, &slot);
+        assert_eq!(r, Some(10),
+            "boundary abs=9 must flip +1 to keep target in emit range");
+
+        // abs < threshold → no override (no suffix bin emitted).
+        let mut hook = InjectionHook::new(ForceBit(1));
+        let slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 5 };
+        let r = hook.mvd_suffix_lsb_abs_override(0, 0, &slot);
+        assert_eq!(r, None, "abs < threshold(9) → no override");
+
+        // value=0 → no override.
+        let mut hook = InjectionHook::new(ForceBit(1));
+        let slot = MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 0 };
+        let r = hook.mvd_suffix_lsb_abs_override(0, 0, &slot);
+        assert_eq!(r, None, "zero MVD → no override");
     }
 
     #[test]
