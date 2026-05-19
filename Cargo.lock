@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "phasm-cli"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "clap",
  "image",
@@ -645,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "phasm-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aes-gcm-siv",
  "argon2",

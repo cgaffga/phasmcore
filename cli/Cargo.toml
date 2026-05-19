@@ -1,6 +1,6 @@
 [package]
 name = "phasm-cli"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "CLI for phasm-core steganography"
@@ -12,14 +12,14 @@ name = "phasm"
 path = "src/main.rs"
 
 [dependencies]
-# IMPORTANT: do NOT add `h264-encoder` to phasm-core's features here.
-# The GitHub-release CLI binary distributed via cargo-dist must NOT
-# bundle the H.264 encoder (Via LA AVC patent obligations — see
-# `docs/design/video/h264/video-steganography.md` § "Patent licensing —
-# distribution plan"). Users wanting CLI video stego rebuild from
-# source themselves with:
-#     cargo install phasm-cli --features h264-encoder
-phasm-core = { path = "..", features = ["parallel", "video"] }
+# IMPORTANT: do NOT add `h264-encoder` or `video` to phasm-core's
+# features here. The GitHub-release CLI binary distributed via
+# cargo-dist must NOT bundle ANY H.264 code (Via LA AVC patent
+# obligations — see `docs/design/video/h264/video-steganography.md`
+# § "Patent licensing — distribution plan"). Users wanting CLI
+# video stego rebuild from source themselves with:
+#     cargo install phasm-cli --features video,h264-encoder
+phasm-core = { path = "..", features = ["parallel"] }
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
 indicatif = "0.17"
@@ -27,10 +27,17 @@ rpassword = "7"
 
 [features]
 default = []
+# v0.2.9 — `video` is now opt-in at the CLI level too. Default
+# builds (and the cargo-dist GitHub-release binary) compile zero
+# H.264 code: no parser, no walker, no streaming session, no
+# `video-encode` / `video-capacity` subcommands. Forwards to
+# phasm-core's `video` feature.
+video = ["phasm-core/video"]
 # Enable Phase 6 H.264 encoder for CLI video stego. Source-only —
 # never enabled in cargo-dist GitHub-release builds. Forwards to
-# phasm-core's `h264-encoder` feature.
-h264-encoder = ["phasm-core/h264-encoder"]
+# phasm-core's `h264-encoder` feature (which transitively pulls
+# `video` in phasm-core).
+h264-encoder = ["video", "phasm-core/h264-encoder"]
 # Enable Phase 6.3 CABAC stego encode/decode (the EXPERIMENTAL
 # pure-Rust 4-domain bypass-bin pipeline). D.0 ship-direction
 # (2026-05-14) demotes this to opt-in EXPERIMENTAL behind

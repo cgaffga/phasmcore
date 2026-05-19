@@ -35,21 +35,22 @@
 # ===========================================================
 # The phasm CLI in this image is built with default features only —
 # the SAME invocation cargo-dist uses for the public GitHub-release
-# binary. Specifically the pure-Rust H.264 encoder + CABAC stego paths
-# (`h264-encoder` and `cabac-stego` features under
-# core/src/codec/h264/encoder/) are OFF.
+# binary. ALL H.264 code paths — pure-Rust encoder, CABAC stego, the
+# Baseline CAVLC parser/walker, OpenH264 FFI — are gated behind opt-in
+# Cargo features (`video`, `h264-encoder`, `cabac-stego`,
+# `openh264-backend`) and are OFF in this image.
 #
-# Caveat — be aware of the partial posture: the upstream cli/Cargo.toml
-# enables phasm-core's `video` feature unconditionally (image-stego CLI
-# does not currently cfg-gate its video imports), so the H.264 Baseline
-# CAVLC code IS compiled into the binary and `video-encode` /
-# `video-capacity` subcommands appear in `phasm --help`. For §6 paper
-# reproduction (image steganography only) those subcommands are unused;
-# tightening this further requires refactoring CLI source to make
-# video imports conditional, which is a separate task.
+# v0.2.9 (2026-05-19) tightened the posture: the `video` feature is
+# now opt-in at the CLI level. Default `cargo build -p phasm-cli`
+# compiles zero H.264 code, links zero H.264 dependencies (no
+# memmap2 from phasm-core's `video`, no `core-openh264-sys`), and
+# the binary's `phasm --help` does not list `video-encode` /
+# `video-capacity` subcommands. Verify with `cargo tree -p phasm-cli`
+# (post-build) — phasm-core appears, openh264-sys does not.
 #
-# DO NOT add `--features h264-encoder` or `--features cabac-stego` to
-# the cargo build invocation below. If video stego repro is ever needed
+# DO NOT add `--features video`, `--features h264-encoder`,
+# `--features cabac-stego`, or `--features openh264-backend` to the
+# cargo build invocation below. If video stego repro is ever needed
 # in v2, build from the monorepo with explicit feature flags — not
 # from this image.
 # ===========================================================
@@ -131,25 +132,17 @@ COPY openh264-sys/ ./openh264-sys/
 RUN cargo --version && rustc --version
 
 # ----------------------------------------------------------------
-# Build phasm CLI — DEFAULT FEATURES ONLY (no h264-encoder).
+# Build phasm CLI — DEFAULT FEATURES ONLY.
 # ----------------------------------------------------------------
-# This is the same invocation cargo-dist uses for GitHub-release CLI
-# binaries. The resulting binary is image-stego-only with respect to
-# the patent-risky `h264-encoder` feature (pure-Rust ITU-T encoder under
-# core/src/codec/h264/encoder/) — that feature is OFF.
+# Same invocation as cargo-dist's GitHub-release CLI build. With v0.2.9
+# the resulting binary is *strictly* image-stego-only: zero H.264 code
+# compiled in, no `video-encode` / `video-capacity` subcommands in
+# `phasm --help`, no `core-openh264-sys` linkage.
 #
-# Caveat (documented for transparency): the upstream cli/Cargo.toml
-# pulls in phasm-core's `video` feature unconditionally, which includes
-# the H.264 Baseline CAVLC pipeline. The video-encode and video-capacity
-# subcommands therefore appear in `phasm --help`. Making the CLI build
-# *strictly* video-free requires refactoring CLI source files to
-# cfg-gate their video imports + subcommand registrations behind a
-# new opt-in feature; that change is intentionally NOT in this image
-# (it would diverge from the cargo-dist GitHub release binary).
-#
-# For the §6 paper repro, the video subcommands are simply unused.
-# DO NOT add `--features video,h264-encoder` here — that would
-# additionally bring in the pure-Rust encoder + CABAC stego paths.
+# DO NOT add `--features video`, `--features h264-encoder`,
+# `--features cabac-stego`, or `--features openh264-backend` here — any
+# of those would re-introduce H.264 code and diverge from the public
+# cargo-dist GitHub-release binary.
 RUN cargo build --release -p phasm-cli && \
     cp target/release/phasm /usr/local/bin/phasm && \
     phasm --version

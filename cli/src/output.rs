@@ -8,6 +8,7 @@ use phasm_core::{DecodeQuality, EncodeQuality, PayloadData};
 /// `phasm_core::VideoCapacity` which was HEVC-specific and is now archived
 /// behind `hevc-archive`. Phase 4b will replace this with the H.264
 /// position-count report once the CLI is rewritten.
+#[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub struct CliVideoCapacityInfo {
     pub num_i_frames: usize,
@@ -194,6 +195,7 @@ pub fn print_capacity(
 
 // ── Video encode output ──
 
+#[cfg(feature = "video")]
 pub fn print_video_encode_result(
     output_path: &str,
     elapsed: Duration,
@@ -221,6 +223,7 @@ pub fn print_video_encode_result(
 
 // ── Video capacity output ──
 
+#[cfg(feature = "video")]
 pub fn print_video_capacity(info: &CliVideoCapacityInfo, json: bool) {
     if json {
         let frames_json: Vec<String> = info

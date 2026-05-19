@@ -10,8 +10,11 @@ mod image_conv;
 mod output;
 mod passphrase;
 mod progress;
+#[cfg(feature = "video")]
 mod transcode;
+#[cfg(feature = "video")]
 mod video_capacity;
+#[cfg(feature = "video")]
 mod video_encode;
 
 use clap::{Parser, Subcommand};
@@ -33,11 +36,11 @@ enum Commands {
     /// Show how much message data fits in an image
     Capacity(capacity::CapacityArgs),
     /// Encode a secret message into an MP4 video (H.264 Baseline CAVLC)
+    #[cfg(feature = "video")]
     VideoEncode(video_encode::VideoEncodeArgs),
     /// Show video embedding capacity
+    #[cfg(feature = "video")]
     VideoCapacity(video_capacity::VideoCapacityArgs),
-    // Phase 4a: `VideoTranscode` (HEVC pixel-domain transcode) removed.
-    // Phase 4b will add an ffmpeg-based transcode flow on `VideoEncode`.
 }
 
 fn main() {
@@ -46,7 +49,9 @@ fn main() {
         Commands::Encode(args) => encode::run(args),
         Commands::Decode(args) => decode::run(args),
         Commands::Capacity(args) => capacity::run(args),
+        #[cfg(feature = "video")]
         Commands::VideoEncode(args) => video_encode::run(args),
+        #[cfg(feature = "video")]
         Commands::VideoCapacity(args) => video_capacity::run(args),
     };
 

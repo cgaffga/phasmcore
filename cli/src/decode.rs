@@ -6,10 +6,10 @@ use crate::error::CliError;
 use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
-use phasm_core::{
-    detect_video_codec, is_mp4, smart_decode, DecodeQuality, VideoCodec,
-};
-#[cfg(not(feature = "cabac-stego"))]
+use phasm_core::smart_decode;
+#[cfg(feature = "video")]
+use phasm_core::{detect_video_codec, is_mp4, DecodeQuality, VideoCodec};
+#[cfg(all(feature = "video", not(feature = "cabac-stego")))]
 use phasm_core::h264_ghost_decode;
 #[cfg(feature = "cabac-stego")]
 use phasm_core::h264_stego_smart_decode_video_with_payload;
@@ -17,6 +17,17 @@ use phasm_core::h264_stego_smart_decode_video_with_payload;
 use crate::transcode;
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// v0.2.9 — `is_mp4` lives behind the `video` feature on phasm-core,
+/// so when this binary is built image-only we need a tiny local
+/// magic-byte sniff to give a clean "rebuild with --features video"
+/// error instead of letting `smart_decode` fail with a confusing
+/// not-a-valid-JPEG error.
+#[cfg(not(feature = "video"))]
+fn looks_like_mp4(bytes: &[u8]) -> bool {
+    // ISO BMFF: bytes 4..8 are the `ftyp` box type marker.
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
+}
 
 use clap::Parser;
 
@@ -67,30 +78,54 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     // stego videos on decode — transcoding re-encodes pixels which destroys
     // the embedded message. The stego must already be Baseline CAVLC
     // (which it would be, since it was produced by `phasm video-encode`).
-    let (payload, quality) = if is_mp4(&file_bytes) {
-        let payload = match detect_video_codec(&file_bytes) {
-            VideoCodec::H264 => {
-                #[cfg(feature = "cabac-stego")]
-                { decode_h264_cabac(&args.image, &passphrase)? }
-                #[cfg(not(feature = "cabac-stego"))]
-                { h264_ghost_decode(&file_bytes, &passphrase)? }
+    //
+    // v0.2.9 — when this binary is built without `video`, video-stego
+    // decoding is unreachable code; we sniff the MP4 magic and return a
+    // clean rebuild-instruction error instead of letting smart_decode
+    // emit a confusing "not a valid JPEG" message.
+    #[cfg(not(feature = "video"))]
+    if looks_like_mp4(&file_bytes) {
+        return Err(CliError::UnsupportedFormat(
+            "MP4 / video stego decoding is not built into this binary. \
+             The public CLI release ships image-stego-only for AVC patent \
+             reasons. To decode video stego, rebuild from source: \
+             `cargo install phasm-cli --features video`."
+                .into(),
+        ));
+    }
+    let (payload, quality) = {
+        #[cfg(feature = "video")]
+        {
+            if is_mp4(&file_bytes) {
+                let payload = match detect_video_codec(&file_bytes) {
+                    VideoCodec::H264 => {
+                        #[cfg(feature = "cabac-stego")]
+                        { decode_h264_cabac(&args.image, &passphrase)? }
+                        #[cfg(not(feature = "cabac-stego"))]
+                        { h264_ghost_decode(&file_bytes, &passphrase)? }
+                    }
+                    VideoCodec::Hevc => {
+                        return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                            "HEVC/H.265 decode is not supported. This file was encoded outside \
+                             Phasm's H.264 pipeline — no hidden message will be recoverable."
+                                .into(),
+                        )));
+                    }
+                    VideoCodec::Unknown => {
+                        return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                            "unsupported or unrecognised video codec (expected H.264)".into(),
+                        )));
+                    }
+                };
+                (payload, DecodeQuality::ghost())
+            } else {
+                smart_decode(&file_bytes, &passphrase)?
             }
-            VideoCodec::Hevc => {
-                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                    "HEVC/H.265 decode is not supported. This file was encoded outside \
-                     Phasm's H.264 pipeline — no hidden message will be recoverable."
-                        .into(),
-                )));
-            }
-            VideoCodec::Unknown => {
-                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                    "unsupported or unrecognised video codec (expected H.264)".into(),
-                )));
-            }
-        };
-        (payload, DecodeQuality::ghost())
-    } else {
-        smart_decode(&file_bytes, &passphrase)?
+        }
+        #[cfg(not(feature = "video"))]
+        {
+            smart_decode(&file_bytes, &passphrase)?
+        }
     };
 
     let elapsed = start.elapsed();
