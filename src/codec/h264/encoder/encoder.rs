@@ -2073,6 +2073,10 @@ impl Encoder {
                 self.mv_grid.fill(base_bx, base_by, 4, 4, *mv, 0);
             }
             PMbChoice::P16x8 { mvs, .. } => {
+                // H.264-spec partition_id = mbPartIdx*4 + subMbPartIdx.
+                // P_16x8 has 2 mbParts (top=0, bottom=1) and subMb=0,
+                // so id ∈ {0, 4}. Per #549 Bug 5 (2026-05-19); walker
+                // emits the same value in slice.rs::decode_mvd_pairs_p.
                 // Partition 0 (top): (base_bx, base_by, 4, 2).
                 self.fire_mvd_hook_one_partition(
                     mb_x, mb_y, base_bx, base_by, 4, 2,
@@ -2082,11 +2086,13 @@ impl Encoder {
                 // Partition 1 (bottom): (base_bx, base_by+2, 4, 2).
                 self.fire_mvd_hook_one_partition(
                     mb_x, mb_y, base_bx, base_by + 2, 4, 2,
-                    Some(1), 1, &mut mvs[1],
+                    Some(1), 4, &mut mvs[1],
                 );
                 self.mv_grid.fill(base_bx, base_by + 2, 4, 2, mvs[1], 0);
             }
             PMbChoice::P8x16 { mvs, .. } => {
+                // H.264-spec partition_id = mbPartIdx*4 (subMb=0).
+                // P_8x16: left=0, right=4. Per #549 Bug 5 (2026-05-19).
                 // Partition 0 (left): (base_bx, base_by, 2, 4).
                 self.fire_mvd_hook_one_partition(
                     mb_x, mb_y, base_bx, base_by, 2, 4,
@@ -2096,7 +2102,7 @@ impl Encoder {
                 // Partition 1 (right): (base_bx+2, base_by, 2, 4).
                 self.fire_mvd_hook_one_partition(
                     mb_x, mb_y, base_bx + 2, base_by, 2, 4,
-                    Some(1), 1, &mut mvs[1],
+                    Some(1), 4, &mut mvs[1],
                 );
                 self.mv_grid.fill(base_bx + 2, base_by, 2, 4, mvs[1], 0);
             }
@@ -5356,8 +5362,9 @@ impl Encoder {
                 );
                 let mvd1_x = mvs[1].mv_x as i32 - pred1.mv_x as i32;
                 let mvd1_y = mvs[1].mv_y as i32 - pred1.mv_y as i32;
+                // #549 Bug 5 — spec partition_id mbPartIdx*4 = 1*4 = 4.
                 let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
-                    mb_x, mb_y, /* partition */ 1, mvd1_x, mvd1_y,
+                    mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
                 );
                 emit(cabac, current_mvd, 0, 2, 4, 2, mvs[1], pred1, ox1, oy1);
                 self.mv_grid.fill(base_bx, base_by + 2, 4, 2, mvs[1], r1);
@@ -5386,8 +5393,9 @@ impl Encoder {
                 );
                 let mvd1_x = mvs[1].mv_x as i32 - pred1.mv_x as i32;
                 let mvd1_y = mvs[1].mv_y as i32 - pred1.mv_y as i32;
+                // #549 Bug 5 — spec partition_id mbPartIdx*4 = 1*4 = 4.
                 let (ox1, oy1) = self.mvd_sign_overrides_for_partition(
-                    mb_x, mb_y, /* partition */ 1, mvd1_x, mvd1_y,
+                    mb_x, mb_y, /* partition */ 4, mvd1_x, mvd1_y,
                 );
                 emit(cabac, current_mvd, 2, 0, 2, 4, mvs[1], pred1, ox1, oy1);
                 self.mv_grid.fill(base_bx + 2, base_by, 2, 4, mvs[1], r1);

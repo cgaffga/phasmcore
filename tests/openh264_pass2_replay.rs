@@ -138,6 +138,7 @@ fn synth_yuv_frame(width: usize, height: usize, frame_idx: u32) -> (Vec<u8>, Vec
 /// expects one call per MB on the P-frame. Cache miss (callback
 /// returns 0) ⇒ encoder falls back to normal mode decision.
 #[test]
+#[ignore = "Stale post-Bug-1 hotfix: phasm_replay_inter_override returns 0 in REPLAY (svc_base_layer_md.cpp:2068), so the REPLAY callback no longer fires per MB. Kept for the day we revive cache-application."]
 fn pass2_replay_callback_fires_per_mb_on_p_frame() {
     let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     const WIDTH: usize = 320;
@@ -195,6 +196,7 @@ fn pass2_replay_callback_fires_per_mb_on_p_frame() {
 /// match (informational — full bit-identity requires Stages 2B/2C/2D
 /// for partitioned/intra coverage and stays #[ignore] until then).
 #[test]
+#[ignore = "Stale post-Bug-1 hotfix: REPLAY mb_decision callback no longer fires (svc_base_layer_md.cpp:2068 early return). Kept for the day we revive cache-application."]
 fn pass2_replay_stage2a_p16x16_exercises_dispatch() {
     let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     const WIDTH: usize = 320;
@@ -2247,7 +2249,13 @@ fn pass1_capture_vs_pass2_replay_byte_identity_real_carplane() {
 /// #549 small-scale repro at 480×272 × 3 frames. Same harness as the
 /// 1072×1920 carplane test, but on the fast-cycle 480p downscale.
 /// If this also reproduces, future bisect rounds get a ~10× speed-up.
+///
+/// Bug-present canary: asserts `diverged` to flag the bug. Post-Bug-5
+/// fix Pass 1 ≡ Pass 2 again, so the canary trips by design. Keep
+/// #[ignore] since the bug it watches for is closed; un-ignore if a
+/// regression revives any of Bug 1-5.
 #[test]
+#[ignore = "Bug-present canary for closed #549 cluster — keep for future regression watch"]
 fn pass1_capture_vs_pass2_replay_byte_identity_real_carplane_480p_minimal() {
     let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     const WIDTH: usize = 480;

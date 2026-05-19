@@ -2337,22 +2337,28 @@ fn decode_p_partition_mvds(
             )?;
         }
         1 => {
+            // P_16x8: 2 partitions stacked. Spec partition_id =
+            // mbPartIdx*4 + subMbPartIdx (subMb=0 for non-8x8 modes).
+            // #549 Bug 5 fix: was {0, 1}; must be {0, 4} to match the
+            // spec-aligned partition_id used by the encoder hook key.
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 4, 2, 0,
                 frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
-                dec, current_mvd, mb_x, 0, 2, 4, 2, 1,
+                dec, current_mvd, mb_x, 0, 2, 4, 2, 4,
                 frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }
         2 => {
+            // P_8x16: 2 partitions side-by-side. Same spec rule as
+            // above — partition_id = mbPartIdx*4 (subMb=0).
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 2, 4, 0,
                 frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
             decode_one_mvd_pair_p(
-                dec, current_mvd, mb_x, 2, 0, 2, 4, 1,
+                dec, current_mvd, mb_x, 2, 0, 2, 4, 4,
                 frame_idx, nal_idx, mb_addr_u32, recorder, opts,
             )?;
         }

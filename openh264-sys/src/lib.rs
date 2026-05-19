@@ -303,9 +303,19 @@ pub fn encoder_pos_to_phasm_position_key(
 /// MVD bin as follows:
 ///
 /// - `mb_x`, `mb_y` — current MB scan position.
-/// - `partition_idx` — 0 for P_16x16, 0/8 (16x8), 0/2 (8x16), 0/2/8/10
-///   for P_8x8 sub-MBs (4×4-block top-left index, identical to the
-///   decoder hook fire convention at `parse_mb_syn_cabac.cpp:1247`).
+/// - `partition_idx` — H.264-spec partition_id =
+///   mbPartIdx*4 + subMbPartIdx (per #549 Bug 5, 2026-05-19). The
+///   walker emits the same convention in `decode_sub_mb_mvds`'s `p()`
+///   helper (and after the slice.rs fix for the P_16x8 / P_8x16 sites)
+///   so the encoder and walker key on identical values.
+///   Examples:
+///     - P_16x16:  0
+///     - P_16x8:   0 (top),     4 (bottom)
+///     - P_8x16:   0 (left),    4 (right)
+///     - P_8x8 SUB_8x8: i*4  ∈ {0, 4, 8, 12}
+///     - P_8x8 SUB_8x4: i*4+j ∈ {0,1, 4,5, 8,9, 12,13}
+///     - P_8x8 SUB_4x8: i*4+j ∈ {0,1, 4,5, 8,9, 12,13}
+///     - P_8x8 SUB_4x4: i*4+j ∈ {0..15}
 /// - `mv_component` — 0 = X axis, 1 = Y axis.
 /// - `domain` — 2 = MvdSign, 3 = MvdSuffixLsb.
 /// - `sub_block`, `coeff_idx`, `block_cat` — set to 0xff (MVD doesn't

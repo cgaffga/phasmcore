@@ -562,6 +562,13 @@ fn main() {
             // and cascading mode-decision drift. Closed-loop MvdSign-only
             // test: +1817 CS drift -> 0 drift after patch.
             "3c217ff72aa0fa1c5be3579e0b7b7139c9cdb3e9",
+            // #549 Bug 5 fix (2026-05-19): spec-aligned MVD partition_id in
+            // WelsCabacMbMvd + HOOK-H1..H7. Encoder now emits the H.264-spec
+            // partition_id = mbPartIdx*4 + subMbPartIdx, matching the
+            // walker's `decode_one_mvd_pair_p` partition arg. Closes
+            // OVERRIDE_DIDNT_FIRE on 16x8 / 8x16 / SUB_8x4 partitions.
+            // v1.0 real-content streaming round-trip GREEN.
+            "bd8dd8da53cc0237921054074eefd3abe29f59a3",
         ];
         let head_output = Command::new("git")
             .arg("-C")

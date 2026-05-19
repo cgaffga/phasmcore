@@ -173,12 +173,15 @@ fn run_real_content_streaming(spec: &RealContentSpec) {
     );
 }
 
-/// PRIMARY SHIP GATE — must go green for v1.0.
+/// PRIMARY SHIP GATE (production resolution + length).
 ///
 /// Real-content carplane (high motion, real coefficient distribution),
-/// 1072×1920 × 30f × 1 GOP. Matches CLI repro at gop_size=30.
+/// 1072×1920 × 30f × 1 GOP. Matches CLI repro at gop_size=30. Green
+/// post-2026-05-19 (#549 Bug 5 closed). Stays #[ignore] to keep
+/// default cargo-test wall-clock short; the lighter 480p_12f variant
+/// below is un-ignored as the default-suite gate.
 #[test]
-#[ignore = "Phase A regression — fails today on real-content 4-domain drift"]
+#[ignore = "Heavy ship-gate; default suite runs the 480p_12f variant"]
 fn oh264_streaming_real_carplane_1080p_30f() {
     run_real_content_streaming(&RealContentSpec {
         name: "carplane_1080p_30f",
@@ -432,10 +435,13 @@ fn phase_c_pass1_bytewise_parity() {
     if let Err(p) = result { std::panic::resume_unwind(p); }
 }
 
-/// Smaller fixture for fast iteration in Phase D fix attempts.
-/// 480×272 (16-aligned 480p) × 12f.
+/// DEFAULT-SUITE SHIP GATE for #549 real-content streaming round-trip.
+/// 480×272 (16-aligned 480p) × 12f — ~500 ms wall-clock, exercises
+/// all four override domains end-to-end on real motion content.
+/// Green post-2026-05-19 (#549 Bug 5 closed). Requires
+/// `core/test-vectors/video/h264/real-world/source/Artlist_CarPlane.mp4`
+/// (gitignored — provide locally for CI).
 #[test]
-#[ignore = "Phase B.2 bisect — 480p × 12f fast cycle"]
 fn oh264_streaming_real_carplane_480p_12f() {
     run_real_content_streaming(&RealContentSpec {
         name: "carplane_480p_12f",
@@ -469,7 +475,7 @@ fn oh264_streaming_real_carplane_480p_12f() {
 /// is exclusively in the MVD/CSL override-side path mutating encoder
 /// state in a way that changes mode decisions.
 #[test]
-#[ignore = "Phase B.4 — streaming session + CS-only STC plan"]
+#[ignore = "Phase B.4 bisect harness (obsolete post-Bug-5 fix); restricted-cover plans hit MessageTooLarge with the original test message because accurate post-fix cover counts revealed pre-fix over-counting"]
 fn oh264_streaming_real_carplane_1080p_12f_cs_only_plan() {
     run_real_content_streaming(&RealContentSpec {
         name: "carplane_1080p_12f_cs_only_plan",
@@ -487,7 +493,7 @@ fn oh264_streaming_real_carplane_1080p_12f_cs_only_plan() {
 /// source. If it FAILS, CSL is also a contributor (less likely given
 /// CSL has only 522 diffs in trace).
 #[test]
-#[ignore = "Phase B.4 — streaming session + CS+CSL only STC plan"]
+#[ignore = "Phase B.4 bisect harness (obsolete post-Bug-5 fix); see _cs_only_plan note"]
 fn oh264_streaming_real_carplane_1080p_12f_cs_csl_only() {
     run_real_content_streaming(&RealContentSpec {
         name: "carplane_1080p_12f_cs_csl_only",
@@ -505,7 +511,7 @@ fn oh264_streaming_real_carplane_1080p_12f_cs_csl_only() {
 /// content. Pure smoking-gun isolation test for the MV-cache mutation
 /// hypothesis.
 #[test]
-#[ignore = "Phase B.4 — streaming session + MvdSign-only STC plan"]
+#[ignore = "Phase B.4 bisect harness (obsolete post-Bug-5 fix); see _cs_only_plan note"]
 fn oh264_streaming_real_carplane_1080p_12f_mvd_sign_only() {
     run_real_content_streaming(&RealContentSpec {
         name: "carplane_1080p_12f_mvd_sign_only",
@@ -554,7 +560,7 @@ fn oh264_legacy_1domain_real_carplane_1080p_12f() {
 /// FAILS, the 4-domain cover *enumeration* itself (cover positions
 /// walked differently in 4-domain mode vs 1-domain mode) is broken.
 #[test]
-#[ignore = "Phase B.4 — CS-only STC + wire_only=0 isolation"]
+#[ignore = "Phase B.4 bisect harness (obsolete post-Bug-5 fix); see _cs_only_plan note"]
 fn oh264_streaming_real_carplane_1080p_12f_cs_only_wire_off() {
     unsafe { std::env::set_var("PHASM_USE_WIRE_ONLY", "0") };
     let result = std::panic::catch_unwind(|| {
