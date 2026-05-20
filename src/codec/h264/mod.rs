@@ -81,6 +81,14 @@ pub mod openh264_stego;
 #[cfg(feature = "h264-encoder")]
 pub mod streaming_session;
 
+/// #474 — engine-agnostic encode + decode progress event vocabulary.
+/// Optional callback on the streaming session params; mobile bridges
+/// marshal events across FFI into per-platform smoothing engines that
+/// drive the HUD progress bar + ETA text. Design memo at
+/// `docs/design/video/h264/progress-indicator.md`.
+#[cfg(feature = "h264-encoder")]
+pub mod progress;
+
 use std::fmt;
 
 /// H.264/AVC parsing error.

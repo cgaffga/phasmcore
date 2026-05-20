@@ -9,6 +9,8 @@ Pure-Rust steganography engine for hiding encrypted text messages in JPEG photos
 
 This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm-steganography/id6759446274), Android, and the [web](https://phasm.app).
 
+> **Name**: original etymology = *phasmid* (stick-insect family — hide-in-plain-sight, hence the green mascot). Technical backronym: **PHASM = Plausibly-deniable Hidden Adaptive Shadow Messaging** — each word maps to a property of the engine in this crate.
+
 ## Install
 
 Add the library to your Cargo.toml with default features (no H.264 encoder, per [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent obligations):

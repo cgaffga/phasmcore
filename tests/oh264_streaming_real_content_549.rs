@@ -120,6 +120,7 @@ fn run_real_content_streaming(spec: &RealContentSpec) {
         color: ColorParams::default(),
         engine: EncodeEngineChoice::Oh264,
         cost_weights: spec.cost_weights,
+        progress_callback: None,
     };
     let mut enc =
         StreamingEncodeSession::create(params, spec.msg, spec.pass).expect("encode session");

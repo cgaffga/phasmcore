@@ -264,25 +264,50 @@ pub fn apply_shadow_to_plan_residual(
     }
 }
 
-/// Try one (lsbs, fdl, parity, passphrase) candidate. Returns
+/// Try one (rs_bytes, fdl, parity, passphrase) candidate. Returns
 /// `Some(Ok(payload))` on success, `None` on any failure (RS,
 /// frame parse, or AES-GCM-SIV authentication).
+///
+/// **#532 perf**: takes the pre-byte-packed cover (computed once
+/// per `shadow_extract*` call) rather than re-converting bits to
+/// bytes on every brute-force iteration. Adds an O(1)
+/// `plaintext_len` consistency gate (compare `decoded[0..4]` u32 BE
+/// to `fdl - SHADOW_FRAME_OVERHEAD`) before AES-GCM-SIV; rejects
+/// every wrong-fdl candidate without running the AES path.
 fn try_single_fdl(
-    lsbs: &[u8],
+    rs_bytes: &[u8],
     fdl: usize,
     parity_len: usize,
     passphrase: &str,
 ) -> Option<Result<PayloadData, StegoError>> {
     let rs_encoded_len = ecc::rs_encoded_len_with_parity(fdl, parity_len);
-    let rs_bits_needed = rs_encoded_len * 8;
-    if rs_bits_needed > lsbs.len() {
+    if rs_encoded_len > rs_bytes.len() {
         return None;
     }
-    let rs_bytes = frame::bits_to_bytes(&lsbs[..rs_bits_needed]);
-    let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
+    let decoded = match ecc::rs_decode_blocks_with_parity(
+        &rs_bytes[..rs_encoded_len],
+        fdl,
+        parity_len,
+    ) {
         Ok((data, _)) => data,
         Err(_) => return None,
     };
+    // #532 — O(1) plaintext_len consistency gate. Encoder writes
+    // `fdl - SHADOW_FRAME_OVERHEAD` into the first 4 bytes of the
+    // frame (u32 BE). If RS-decoded `decoded[0..4]` disagrees with
+    // the brute-force `fdl` candidate, this candidate is wrong
+    // regardless of whether AES would accept the ciphertext, so
+    // reject early. Cuts wrong-fdl rejection from O(plaintext_len)
+    // AES work to a single integer compare.
+    if decoded.len() < 4 {
+        return None;
+    }
+    let expected_plaintext_len = fdl.saturating_sub(SHADOW_FRAME_OVERHEAD) as u32;
+    let observed_plaintext_len =
+        u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
+    if observed_plaintext_len != expected_plaintext_len {
+        return None;
+    }
     let fr = parse_shadow_frame(&decoded).ok()?;
     match crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce) {
         Ok(plaintext) => {
@@ -299,22 +324,33 @@ fn try_single_fdl(
 /// First-block peek: decode the first 255 RS bytes to read the
 /// `plaintext_len` prefix and derive the exact `fdl`. Returns the
 /// candidate `fdl` if it's plausible (>= k, within capacity).
+///
+/// **#532 fix**: video shadow frames use the WIDE format
+/// (`SHADOW_FRAME_OVERHEAD = 48`, u32 BE plaintext_len). Pre-#532
+/// this function read `u16::from_be_bytes(data[0..2])`, which for
+/// every real (non-empty) shadow returned the top two bytes of the
+/// u32 BE — always zero — so peek returned `fdl = SHADOW_FRAME_OVERHEAD`
+/// (header-only). That made the brute-force fallback the actual
+/// decode path for every shadow, and worse: shadows with
+/// `fdl > k - 1` (typically `plaintext_len > ~200 bytes`) couldn't
+/// decode at all because brute-force only scans `..=k-1`. The fix
+/// reads u32 BE — matching `parse_shadow_frame_wide`.
 fn peek_fdl_from_first_block(
-    lsbs: &[u8],
+    rs_bytes: &[u8],
     parity_len: usize,
     max_fdl: usize,
 ) -> Option<usize> {
     let k = 255usize.saturating_sub(parity_len);
-    if k < 2 || lsbs.len() < 255 * 8 {
+    if k < 4 || rs_bytes.len() < 255 {
         return None;
     }
-    let first_block_bytes = frame::bits_to_bytes(&lsbs[..255 * 8]);
     let (data, _) =
-        ecc::rs_decode_blocks_with_parity(&first_block_bytes, k, parity_len).ok()?;
-    if data.len() < 2 {
+        ecc::rs_decode_blocks_with_parity(&rs_bytes[..255], k, parity_len).ok()?;
+    if data.len() < 4 {
         return None;
     }
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let plaintext_len =
+        u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
     let fdl = SHADOW_FRAME_OVERHEAD + plaintext_len;
     if fdl >= k && fdl <= max_fdl {
         Some(fdl)
@@ -711,20 +747,31 @@ pub fn shadow_extract_all4_safe(
         })
         .collect();
 
+    // #532 perf — bit-pack the full LSB stream ONCE (not per parity tier
+    // nor per fdl candidate); try_single_fdl + peek slice into this buffer.
+    let max_rs_bytes = all_lsbs.len() / 8;
+    let all_rs_bytes = frame::bits_to_bytes(&all_lsbs[..max_rs_bytes * 8]);
+
     for &parity_len in &SHADOW_PARITY_TIERS {
         let k = 255usize.saturating_sub(parity_len);
-        if k < 2 {
+        // #532 — need ≥4 bytes recovered from first RS block to read the
+        // u32 BE plaintext_len prefix. With k<4 the peek can't function;
+        // skip the tier (also unreachable for SHADOW_PARITY_TIERS — even
+        // parity=128 gives k=127).
+        if k < 4 {
             continue;
         }
-        let max_rs_bytes = all_lsbs.len() / 8;
         let max_fdl = compute_max_shadow_fdl(max_rs_bytes, parity_len)
             .min(MAX_SHADOW_FRAME_BYTES);
         if SHADOW_FRAME_OVERHEAD > max_fdl {
             continue;
         }
 
-        if let Some(fdl) = peek_fdl_from_first_block(&all_lsbs, parity_len, max_fdl)
-            && let Some(result) = try_single_fdl(&all_lsbs, fdl, parity_len, passphrase)
+        // #532 — peek path (works for fdl ≥ k, covers most real shadows
+        // including the >250-byte payloads that brute-force can't reach).
+        let peeked = peek_fdl_from_first_block(&all_rs_bytes, parity_len, max_fdl);
+        if let Some(fdl) = peeked
+            && let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase)
         {
             return result;
         }
@@ -734,7 +781,13 @@ pub fn shadow_extract_all4_safe(
             continue;
         }
         for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
-            if let Some(result) = try_single_fdl(&all_lsbs, fdl, parity_len, passphrase) {
+            // #532 — skip the peek-tried fdl in the brute-force fallback.
+            // If peek returned Some(fdl) and try_single_fdl rejected it,
+            // re-trying gains nothing.
+            if Some(fdl) == peeked {
+                continue;
+            }
+            if let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase) {
                 return result;
             }
         }
@@ -782,12 +835,16 @@ pub fn shadow_extract(
         })
         .collect();
 
+    // #532 perf — bit-pack the full LSB stream ONCE; see
+    // `shadow_extract_all4_safe` for rationale.
+    let max_rs_bytes = all_lsbs.len() / 8;
+    let all_rs_bytes = frame::bits_to_bytes(&all_lsbs[..max_rs_bytes * 8]);
+
     for &parity_len in &SHADOW_PARITY_TIERS {
         let k = 255usize.saturating_sub(parity_len);
-        if k < 2 {
+        if k < 4 {
             continue;
         }
-        let max_rs_bytes = all_lsbs.len() / 8;
         let max_fdl = compute_max_shadow_fdl(max_rs_bytes, parity_len)
             .min(MAX_SHADOW_FRAME_BYTES);
         if SHADOW_FRAME_OVERHEAD > max_fdl {
@@ -795,8 +852,9 @@ pub fn shadow_extract(
         }
 
         // First-block peek (works for fdl >= k — most messages).
-        if let Some(fdl) = peek_fdl_from_first_block(&all_lsbs, parity_len, max_fdl)
-            && let Some(result) = try_single_fdl(&all_lsbs, fdl, parity_len, passphrase)
+        let peeked = peek_fdl_from_first_block(&all_rs_bytes, parity_len, max_fdl);
+        if let Some(fdl) = peeked
+            && let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase)
         {
             return result;
         }
@@ -807,7 +865,10 @@ pub fn shadow_extract(
             continue;
         }
         for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
-            if let Some(result) = try_single_fdl(&all_lsbs, fdl, parity_len, passphrase) {
+            if Some(fdl) == peeked {
+                continue;
+            }
+            if let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase) {
                 return result;
             }
         }

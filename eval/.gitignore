@@ -73,3 +73,9 @@ third_party/*/
 .vscode/
 .idea/
 *.swp
+
+# e9-srnet-queue's wrapper-script logs (master/queue/curriculum)
+# were committed before the broader runs/*.log rule was thought
+# through and kept showing as live-modified while the queue ran.
+# Queue is done; untracked + ignored.
+runs/2026-05-14-e9-srnet-queue/*.log

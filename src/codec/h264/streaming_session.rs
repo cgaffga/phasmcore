@@ -23,6 +23,12 @@
 
 use crate::stego::error::StegoError;
 
+// #474.1 — progress event types. Streaming sessions accept an optional
+// callback on creation; emission sites wired in #474.2.
+use super::progress::{
+    DecodePhase, DecodeProgressCallback, EncodePhase, EncodeProgressCallback,
+};
+
 // OH264 path imports — gated by the openh264-backend feature.
 #[cfg(feature = "openh264-backend")]
 use super::openh264_stego::{
@@ -114,7 +120,11 @@ impl Default for ColorParams {
 }
 
 /// Encoder session creation parameters.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is implemented but `Debug` is not derived: the optional
+/// `progress_callback` holds an `Arc<dyn Fn>` which can't be debug-
+/// formatted. The struct's `Debug` impl below skips the callback.
+#[derive(Clone)]
 pub struct EncodeSessionParams {
     /// Encoded width. Must be 16-aligned (callers pad on the app side).
     pub width: u32,
@@ -144,6 +154,32 @@ pub struct EncodeSessionParams {
     /// by Phase 0.5 (#493.0b) on real-corpus MvdSign cascade
     /// measurement. See `docs/design/video/h264/d07-streaming-4domain.md`.
     pub cost_weights: super::stego::CostWeights,
+    /// #474.1 — optional progress callback. When `Some`, the session
+    /// emits `EncodePhase` events at phase transitions + throttled
+    /// per-unit ticks (≤30 Hz). Emission sites are wired in #474.2;
+    /// in #474.1 this field is stored on the session but no events
+    /// fire yet. Default is `None` for backwards compatibility — all
+    /// existing call sites that build params struct-literally just
+    /// add `progress_callback: None`.
+    pub progress_callback: Option<EncodeProgressCallback>,
+}
+
+impl std::fmt::Debug for EncodeSessionParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodeSessionParams")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("fps_num", &self.fps_num)
+            .field("fps_den", &self.fps_den)
+            .field("qp", &self.qp)
+            .field("gop_size", &self.gop_size)
+            .field("total_frames_hint", &self.total_frames_hint)
+            .field("color", &self.color)
+            .field("engine", &self.engine)
+            .field("cost_weights", &self.cost_weights)
+            .field("progress_callback", &self.progress_callback.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 /// One raw I420 planar frame pushed into a streaming encode session.
@@ -283,6 +319,11 @@ impl StreamingEncodeSession {
                 SessionImpl::PureRust(build_pure_rust_state(&params, message_text, passphrase)?)
             }
         };
+        // #474.2 — emit Setup once after all initialisation succeeds.
+        // Disabled engines never reach this path because build_*_state
+        // already errored above; this event always corresponds to a
+        // usable session.
+        emit_encode(&params, EncodePhase::Setup);
         Ok(Self { params, inner })
     }
 
@@ -322,6 +363,27 @@ impl StreamingEncodeSession {
     /// Snapshot the session parameters.
     pub fn params(&self) -> &EncodeSessionParams {
         &self.params
+    }
+
+    /// #474.2 — install or replace the progress callback after the
+    /// session was created. Lets FFI callers attach a callback after
+    /// `create()` (the create entry points carry enough arguments
+    /// already; threading a function-pointer + context through is
+    /// cleaner as a separate call).
+    pub fn set_progress_callback(&mut self, callback: Option<EncodeProgressCallback>) {
+        self.params.progress_callback = callback;
+    }
+}
+
+/// #474.2 — invoke the progress callback if one is installed on these
+/// params. Cheap no-op when `progress_callback` is `None`. Boundary
+/// events bypass the 30 Hz throttle by definition (Setup, Mux, Done
+/// fire once each); per-unit events are emitted at the natural
+/// granularity of push_frame / drain_one_gop, well below 30 Hz on real
+/// content, so no per-call throttle is needed.
+fn emit_encode(params: &EncodeSessionParams, phase: EncodePhase) {
+    if let Some(cb) = &params.progress_callback {
+        cb(phase);
     }
 }
 
@@ -388,6 +450,22 @@ fn oh264_push_frame(
     pack_frame_into_buffer(params.width, params.height, &frame, &mut state.gop_buffer)?;
     state.frames_buffered += 1;
 
+    // #474.2 — Pass1Capture event per buffered frame. The actual Pass-1
+    // CABAC capture happens inside the C encoder at drain time, but
+    // emitting here gives the smoothing engine 1 event per pushed
+    // frame so the bar advances smoothly across the YUV-marshalling
+    // phase. `frame_idx` is the cumulative count (chunks finalised so
+    // far × gop_size + current buffer count); `total_frames` is the
+    // session-level hint.
+    let cumulative = state.chunk_idx as u32 * params.gop_size + state.frames_buffered;
+    emit_encode(
+        params,
+        EncodePhase::Pass1Capture {
+            frame_idx: cumulative,
+            total_frames: params.total_frames_hint,
+        },
+    );
+
     if state.frames_buffered == params.gop_size {
         drain_one_gop(params, state, out)?;
     }
@@ -409,6 +487,13 @@ fn oh264_finish(
             state.chunk_idx, state.total_chunks,
         )));
     }
+    // #474.2 — Mux + Done. OH264 path doesn't currently run a separate
+    // HandBrake mux step (mp4 muxing is the bridge's responsibility),
+    // but we still emit Mux for parity with the design doc so the
+    // mobile-side smoothing engine sees a Mux→Done transition even
+    // when the underlying mux is a no-op at this layer.
+    emit_encode(params, EncodePhase::Mux);
+    emit_encode(params, EncodePhase::Done);
     Ok(())
 }
 
@@ -422,6 +507,19 @@ fn drain_one_gop(
     if frames_in_gop == 0 {
         return Ok(());
     }
+    // #474.2 — StcPlan fires BEFORE the C encoder call. The OH264
+    // backend performs Pass-1 capture + STC compute + Pass-2 replay
+    // inside a single call, so we synthesise one StcPlan event per GOP
+    // at the natural boundary.
+    let total_gops = state.total_chunks as u32;
+    emit_encode(
+        params,
+        EncodePhase::StcPlan {
+            gop_idx: state.chunk_idx as u32,
+            total_gops,
+        },
+    );
+
     let chunk_payload = &state.chunks[state.chunk_idx as usize];
     let framed = build_chunk_frame(state.chunk_idx, state.total_chunks, chunk_payload)?;
     let frame_bits = bytes_to_bits_msb_first_pub(&framed);
@@ -445,6 +543,19 @@ fn drain_one_gop(
     state.chunk_idx += 1;
     state.frames_buffered = 0;
     state.gop_buffer.clear();
+
+    // #474.2 — Pass2Replay fires AFTER the encoder returns. Reports
+    // cumulative frames encoded so far so the smoothing engine can
+    // close the per-GOP wall-clock fraction.
+    let cumulative_done = state.chunk_idx as u32 * params.gop_size;
+    let frame_idx = cumulative_done.min(params.total_frames_hint);
+    emit_encode(
+        params,
+        EncodePhase::Pass2Replay {
+            frame_idx,
+            total_frames: params.total_frames_hint,
+        },
+    );
     Ok(())
 }
 
@@ -515,6 +626,15 @@ fn pure_rust_push_frame(
     state.frames_buffered_in_gop += 1;
     state.frames_seen_total += 1;
 
+    // #474.2 — Pass1Capture per pushed frame (pure-Rust path).
+    emit_encode(
+        params,
+        EncodePhase::Pass1Capture {
+            frame_idx: state.frames_seen_total,
+            total_frames: params.total_frames_hint,
+        },
+    );
+
     if state.frames_buffered_in_gop == params.gop_size {
         drain_pure_rust_one_gop(params, state, out)?;
     }
@@ -540,6 +660,9 @@ fn pure_rust_finish(
             state.chunk_idx, state.total_chunks,
         )));
     }
+    // #474.2 — Mux + Done (mirror the OH264 finish path).
+    emit_encode(params, EncodePhase::Mux);
+    emit_encode(params, EncodePhase::Done);
     Ok(())
 }
 
@@ -552,6 +675,16 @@ fn drain_pure_rust_one_gop(
     if frames_in_gop == 0 {
         return Ok(());
     }
+    // #474.2 — StcPlan before the per-GOP encoder call.
+    let total_gops = state.total_chunks as u32;
+    emit_encode(
+        params,
+        EncodePhase::StcPlan {
+            gop_idx: state.chunk_idx as u32,
+            total_gops,
+        },
+    );
+
     let chunk_payload = &state.chunks[state.chunk_idx as usize];
     let framed = build_chunk_frame(state.chunk_idx, state.total_chunks, chunk_payload)?;
     let chunk_bits = bytes_to_bits_msb_first(&framed);
@@ -571,6 +704,17 @@ fn drain_pure_rust_one_gop(
     state.chunk_idx += 1;
     state.frames_buffered_in_gop = 0;
     state.gop_buffer.clear();
+
+    // #474.2 — Pass2Replay after the per-GOP encoder returns.
+    let cumulative_done = state.chunk_idx as u32 * params.gop_size;
+    let frame_idx = cumulative_done.min(params.total_frames_hint);
+    emit_encode(
+        params,
+        EncodePhase::Pass2Replay {
+            frame_idx,
+            total_frames: params.total_frames_hint,
+        },
+    );
     Ok(())
 }
 
@@ -746,6 +890,10 @@ pub struct StreamingProbeSession {
     inner: ProbeImpl,
     cover_bits: usize,
     n_gops: u32,
+    /// #475 — fires once per GOP completion so the caller can render
+    /// a refining estimated-capacity in the HUD. `None` when no
+    /// progressive estimate is wanted (e.g. CLI batch use).
+    progress_callback: Option<super::progress::CapacityProbeCallback>,
 }
 
 enum ProbeImpl {
@@ -820,7 +968,44 @@ impl StreamingProbeSession {
             inner,
             cover_bits: 0,
             n_gops: 0,
+            progress_callback: None,
         })
+    }
+
+    /// #475 — install a callback that fires after each GOP probe
+    /// completes, with `(gops_done, gops_total, cover_bits_so_far)`.
+    /// Caller computes the estimated total cover_bits as
+    /// `cover_bits_so_far * gops_total / gops_done`. `gops_total` is
+    /// derived from `params.total_frames_hint / gop_size`.
+    pub fn set_progress_callback(
+        &mut self,
+        callback: Option<super::progress::CapacityProbeCallback>,
+    ) {
+        self.progress_callback = callback;
+    }
+
+    pub fn with_progress_callback(
+        mut self,
+        callback: super::progress::CapacityProbeCallback,
+    ) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// Emit one progress event. Called from `push_frame`/`finish`
+    /// after each GOP drain. No-op when no callback is installed.
+    fn emit_estimate(&self) {
+        if let Some(cb) = self.progress_callback.as_ref() {
+            // Total GOPs target = ceil(total_frames_hint / gop_size).
+            // The final partial GOP (if any) bumps `n_gops` past
+            // this target on the last drain — that's fine, the
+            // mobile UI clamps the displayed denominator at the
+            // running max anyway.
+            let total_gops = self.params.total_frames_hint
+                .div_ceil(self.params.gop_size)
+                .max(1);
+            cb(self.n_gops, total_gops, self.cover_bits);
+        }
     }
 
     /// Push one YUV frame. When the in-flight GOP fills, runs the
@@ -834,6 +1019,7 @@ impl StreamingProbeSession {
                 state.frames_buffered += 1;
                 if state.frames_buffered == self.params.gop_size {
                     drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.n_gops)?;
+                    self.emit_estimate();
                 }
                 Ok(())
             }
@@ -864,6 +1050,10 @@ impl StreamingProbeSession {
             ProbeImpl::Oh264(state) => {
                 if state.frames_buffered > 0 {
                     drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.n_gops)?;
+                    // Emit one final per-GOP event before returning so
+                    // listeners that race a final-state read can see
+                    // the full count rather than the second-last one.
+                    self.emit_estimate();
                 }
                 Ok(CapacityProbeResult {
                     cover_bits: self.cover_bits,
@@ -934,6 +1124,12 @@ pub struct StreamingDecodeSession {
     /// (same as the encoder default); callers using non-default
     /// weights should use `create_with_weights`.
     cost_weights: CostWeights,
+    /// #474.1 — optional progress callback. Emit sites in `finish`
+    /// invoke this on each `DecodePhase` transition. Wrapped in
+    /// `Arc<dyn Fn>` so the session itself stays Send + Sync without
+    /// constraining the callback shape (e.g. a mobile bridge marshals
+    /// to the main thread asynchronously).
+    progress_callback: Option<DecodeProgressCallback>,
 }
 
 /// Per-decode-session result returned by `finish`.
@@ -960,7 +1156,33 @@ impl StreamingDecodeSession {
             passphrase: passphrase.to_string(),
             accumulator: Vec::new(),
             cost_weights,
+            progress_callback: None,
         })
+    }
+
+    /// #474.1 — install a progress callback on this session. See
+    /// [`DecodePhase`] for the event vocabulary; events fire from
+    /// `push_annex_b` (Demux), the per-GOP brute-force loop in
+    /// `finish` (Walker / ShadowExtract), and the decrypt step.
+    pub fn with_progress_callback(mut self, callback: DecodeProgressCallback) -> Self {
+        self.progress_callback = Some(callback);
+        self
+    }
+
+    /// #474.2 — mutator variant of `with_progress_callback` for FFI
+    /// callers that own the handle and want to attach a callback after
+    /// `create()`.
+    pub fn set_progress_callback(&mut self, callback: Option<DecodeProgressCallback>) {
+        self.progress_callback = callback;
+    }
+
+    /// Internal helper — invoke the progress callback if installed.
+    /// Cheap no-op when no callback is registered.
+    #[allow(dead_code)]
+    pub(crate) fn emit_progress(&self, phase: DecodePhase) {
+        if let Some(cb) = &self.progress_callback {
+            cb(phase);
+        }
     }
 
     pub fn push_annex_b(&mut self, nals: &[u8]) -> Result<(), StegoError> {
@@ -976,6 +1198,10 @@ impl StreamingDecodeSession {
     /// assembles chunks by `chunk_index`, runs `parse_frame` on the
     /// concatenated payload, decrypts, and returns the message text.
     pub fn finish(self) -> Result<DecodeSessionResult, StegoError> {
+        // #474.2 — Demux boundary event. Fires once after the buffered
+        // Annex-B has been split into per-GOP slabs.
+        self.emit_progress(DecodePhase::Demux);
+
         let slabs = split_annex_b_into_gops(&self.accumulator);
         if slabs.is_empty() {
             return Err(StegoError::InvalidVideo(
@@ -992,6 +1218,7 @@ impl StreamingDecodeSession {
         let mut collected: Vec<(u16, Vec<u8>)> = Vec::with_capacity(slabs.len());
         let mut seen_total_chunks: Option<u16> = None;
 
+        let total_slabs = slabs.len() as u32;
         for (gop_idx, slab) in slabs.iter().enumerate() {
             let candidate = try_extract_chunk_from_gop(
                 slab, &hhat_seed, gop_idx as u16, &self.cost_weights,
@@ -1013,6 +1240,17 @@ impl StreamingDecodeSession {
                 }
             }
             collected.push((candidate.chunk_idx, candidate.payload));
+
+            // #474.2 — Walker progress event per slab. Streaming decode
+            // doesn't expose per-frame walker granularity (each slab is
+            // walked + STC-extracted as one unit), so we report at slab
+            // granularity. `total_frames` here means "total slabs" for
+            // the smoothing engine's fraction math — it doesn't care
+            // whether the unit is a frame or a GOP.
+            self.emit_progress(DecodePhase::Walker {
+                frame_idx: (gop_idx as u32) + 1,
+                total_frames: total_slabs,
+            });
         }
 
         let total_chunks = seen_total_chunks.expect("at least one GOP processed");
@@ -1030,7 +1268,18 @@ impl StreamingDecodeSession {
             )
         })?;
 
+        // #474.2 — StcExtract: brute-force STC retrieval already
+        // happened inside `try_extract_chunk_from_gop` (combined walk
+        // + STC extract per slab). Fire StcExtract once here as the
+        // boundary marker between Walker and Decrypt — gives the
+        // smoothing engine a clean phase transition.
+        self.emit_progress(DecodePhase::StcExtract);
+
         let parsed = frame::parse_frame(&frame_bytes)?;
+        // #474.2 — Decrypt fires immediately before crypto::decrypt.
+        // Always a single event (decrypt is sub-millisecond on short
+        // messages and not worth per-chunk granularity).
+        self.emit_progress(DecodePhase::Decrypt);
         let plaintext = crypto::decrypt(
             &parsed.ciphertext,
             &self.passphrase,
@@ -1038,6 +1287,9 @@ impl StreamingDecodeSession {
             &parsed.nonce,
         )?;
         let payload_data = payload::decode_payload(&plaintext)?;
+        // #474.2 — Done boundary fires AFTER the message text is ready
+        // so the UI sees the final state before this function returns.
+        self.emit_progress(DecodePhase::Done);
         Ok(DecodeSessionResult {
             text: payload_data.text,
             mode_id: 1, // Ghost = H.264 stego path
@@ -1250,6 +1502,7 @@ mod tests {
             color: ColorParams::default(),
             engine: EncodeEngineChoice::Oh264,
             cost_weights: CostWeights::default(),
+            progress_callback: None,
         }
     }
 
@@ -1295,6 +1548,47 @@ mod tests {
         s.push_annex_b(nal).unwrap();
         assert_eq!(s.buffered_bytes(), nal.len());
         assert!(s.finish().is_err());
+    }
+
+    #[test]
+    fn encode_params_accept_progress_callback() {
+        use std::sync::{Arc, Mutex};
+        let recorded: Arc<Mutex<Vec<EncodePhase>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let cb: EncodeProgressCallback = Arc::new(move |phase| {
+            recorded_clone.lock().unwrap().push(phase);
+        });
+
+        let mut p = ok_params();
+        p.progress_callback = Some(Arc::clone(&cb));
+        assert!(p.progress_callback.is_some());
+
+        // Debug impl tolerates the unprintable Arc<dyn Fn>.
+        let dbg = format!("{:?}", p);
+        assert!(dbg.contains("<callback>"), "Debug should show placeholder, got {dbg}");
+
+        // Cloning the params clones the Arc, both still call.
+        let p2 = p.clone();
+        (p.progress_callback.as_ref().unwrap())(EncodePhase::Setup);
+        (p2.progress_callback.as_ref().unwrap())(EncodePhase::Done);
+        let got = recorded.lock().unwrap().clone();
+        assert_eq!(got, vec![EncodePhase::Setup, EncodePhase::Done]);
+    }
+
+    #[test]
+    fn decode_session_with_progress_callback_round_trip() {
+        use std::sync::{Arc, Mutex};
+        let recorded: Arc<Mutex<Vec<DecodePhase>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let cb: DecodeProgressCallback = Arc::new(move |phase| {
+            recorded_clone.lock().unwrap().push(phase);
+        });
+
+        let s = StreamingDecodeSession::create("pw").unwrap().with_progress_callback(cb);
+        s.emit_progress(DecodePhase::Demux);
+        s.emit_progress(DecodePhase::Done);
+        let got = recorded.lock().unwrap().clone();
+        assert_eq!(got, vec![DecodePhase::Demux, DecodePhase::Done]);
     }
 
     #[cfg(feature = "openh264-backend")]
@@ -1344,6 +1638,7 @@ mod tests {
                 color: ColorParams::default(),
                 engine: EncodeEngineChoice::Oh264,
                 cost_weights: CostWeights::default(),
+                progress_callback: None,
             };
             let mut sess =
                 StreamingEncodeSession::create(params, "hi", "pw").expect("create");
@@ -1382,6 +1677,7 @@ mod tests {
                 color: ColorParams::default(),
                 engine: EncodeEngineChoice::Oh264,
                 cost_weights: CostWeights::default(),
+                progress_callback: None,
             };
             let mut sess =
                 StreamingEncodeSession::create(params, "hi", "pw").expect("create");
@@ -1427,6 +1723,7 @@ mod tests {
                 color: ColorParams::default(),
                 engine: EncodeEngineChoice::PureRust,
                 cost_weights: CostWeights::default(),
+                progress_callback: None,
             };
             let mut sess =
                 StreamingEncodeSession::create(params, "hi", "pw").expect("create");
@@ -1483,6 +1780,7 @@ mod tests {
                 color: ColorParams::default(),
                 engine: EncodeEngineChoice::Oh264,
                 cost_weights: CostWeights::default(),
+                progress_callback: None,
             };
             let mut enc = StreamingEncodeSession::create(params, MSG, PASS).expect("encode create");
             let mut annex_b = Vec::new();
@@ -1532,6 +1830,7 @@ mod tests {
                 color: ColorParams::default(),
                 engine: EncodeEngineChoice::PureRust,
                 cost_weights: CostWeights::default(),
+                progress_callback: None,
             };
             let mut enc = StreamingEncodeSession::create(params, MSG, PASS).expect("encode create");
             let mut annex_b = Vec::new();
@@ -1554,6 +1853,101 @@ mod tests {
                 "round-trip text mismatch: got {:?}", result.text
             );
             assert_eq!(result.mode_id, 1);
+        }
+
+        #[test]
+        fn streaming_session_emits_progress_events_round_trip() {
+            // #474.2 — end-to-end: install encode + decode progress
+            // callbacks, run a 2-GOP pure-Rust round-trip, verify the
+            // event sequences are well-formed (Setup first, Done last,
+            // monotonic frame_idx / gop_idx). Pure-Rust path is used
+            // because OH264 needs the SESSION_TEST_MUTEX and the encode
+            // session lifecycle here is identical between backends.
+            const W: u32 = 128;
+            const H: u32 = 80;
+            const GOP: u32 = 2;
+            const N: u32 = 4;
+            const MSG: &str = "progress probe";
+            const PASS: &str = "pw";
+
+            use std::sync::{Arc, Mutex};
+            let enc_events: Arc<Mutex<Vec<EncodePhase>>> = Arc::new(Mutex::new(Vec::new()));
+            let enc_clone = Arc::clone(&enc_events);
+            let enc_cb: EncodeProgressCallback = Arc::new(move |phase| {
+                enc_clone.lock().unwrap().push(phase);
+            });
+
+            let params = EncodeSessionParams {
+                width: W, height: H,
+                fps_num: 30, fps_den: 1,
+                qp: 26, gop_size: GOP, total_frames_hint: N,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::PureRust,
+                cost_weights: CostWeights::default(),
+                progress_callback: Some(enc_cb),
+            };
+            let mut enc = StreamingEncodeSession::create(params, MSG, PASS).expect("create");
+            let mut annex_b = Vec::new();
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                let frame = YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                };
+                enc.push_frame(frame, &mut annex_b).expect("push");
+            }
+            enc.finish(&mut annex_b).expect("finish encode");
+
+            let got = enc_events.lock().unwrap().clone();
+            // Sanity-check the shape of the encode event stream.
+            assert_eq!(got.first(), Some(&EncodePhase::Setup), "first event must be Setup");
+            assert_eq!(got.last(), Some(&EncodePhase::Done), "last event must be Done");
+            assert!(
+                got.iter().filter(|p| matches!(p, EncodePhase::Pass1Capture { .. })).count() as u32 == N,
+                "expected {N} Pass1Capture events (one per push_frame), got {:?}", got
+            );
+            assert!(
+                got.iter().filter(|p| matches!(p, EncodePhase::StcPlan { .. })).count() as u32 == N / GOP,
+                "expected {} StcPlan events (one per GOP)", N / GOP
+            );
+            assert!(
+                got.iter().filter(|p| matches!(p, EncodePhase::Pass2Replay { .. })).count() as u32 == N / GOP,
+                "expected {} Pass2Replay events (one per GOP)", N / GOP
+            );
+            assert_eq!(
+                got.iter().filter(|p| matches!(p, EncodePhase::Mux)).count(), 1,
+                "Mux fires once at finish"
+            );
+
+            // Decode side.
+            let dec_events: Arc<Mutex<Vec<DecodePhase>>> = Arc::new(Mutex::new(Vec::new()));
+            let dec_clone = Arc::clone(&dec_events);
+            let dec_cb: DecodeProgressCallback = Arc::new(move |phase| {
+                dec_clone.lock().unwrap().push(phase);
+            });
+            let mut dec = StreamingDecodeSession::create(PASS)
+                .expect("decode create")
+                .with_progress_callback(dec_cb);
+            dec.push_annex_b(&annex_b).expect("push annex");
+            let result = dec.finish().expect("finish decode");
+            assert_eq!(result.text, MSG);
+
+            let dec_got = dec_events.lock().unwrap().clone();
+            assert_eq!(dec_got.first(), Some(&DecodePhase::Demux), "first decode event must be Demux");
+            assert_eq!(dec_got.last(), Some(&DecodePhase::Done), "last decode event must be Done");
+            assert!(
+                dec_got.iter().any(|p| matches!(p, DecodePhase::Walker { .. })),
+                "decode must emit at least one Walker event"
+            );
+            assert_eq!(
+                dec_got.iter().filter(|p| matches!(p, DecodePhase::StcExtract)).count(), 1,
+                "StcExtract fires once"
+            );
+            assert_eq!(
+                dec_got.iter().filter(|p| matches!(p, DecodePhase::Decrypt)).count(), 1,
+                "Decrypt fires once"
+            );
         }
     }
 }

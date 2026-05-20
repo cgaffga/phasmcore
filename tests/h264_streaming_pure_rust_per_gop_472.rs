@@ -64,6 +64,7 @@ fn run_roundtrip(width: u32, height: u32, gop_size: u32, n_frames: u32, msg: &st
         color: ColorParams::default(),
         engine: EncodeEngineChoice::PureRust,
         cost_weights: CostWeights::default(),
+        progress_callback: None,
     };
     let mut enc =
         StreamingEncodeSession::create(params, msg, pass).expect("encode session create");

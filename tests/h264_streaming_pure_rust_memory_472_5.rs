@@ -112,6 +112,7 @@ fn measure_pure_rust_peak_kb(width: u32, height: u32, gop_size: u32, n_frames: u
         color: ColorParams::default(),
         engine: EncodeEngineChoice::PureRust,
         cost_weights: CostWeights::default(),
+        progress_callback: None,
     };
 
     let (handle, stop, peak) = start_rss_sampler(20);
@@ -201,6 +202,7 @@ fn pure_rust_streaming_peak_within_oh264_band() {
         color: ColorParams::default(),
         engine: EncodeEngineChoice::Oh264,
         cost_weights: CostWeights::default(),
+        progress_callback: None,
     };
     let (handle, stop, peak) = start_rss_sampler(20);
     let mut enc = StreamingEncodeSession::create(oh264_params, "memprobe", "pw")

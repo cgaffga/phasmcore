@@ -586,6 +586,7 @@ fn run_oh264_encode(
                 Ok("cs_csl") => CostWeights::conservative_cs_csl_only(),
                 _ => CostWeights::default(),
             },
+                progress_callback: None,
         };
         let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
 

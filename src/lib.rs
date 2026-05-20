@@ -77,6 +77,14 @@ pub use codec::h264::streaming_session::{
 #[cfg(feature = "h264-encoder")]
 pub use codec::h264::stego::CostWeights;
 
+// #474 — video stego progress event vocabulary. Mobile bridges re-export
+// these to wire C/JNI callbacks; see `docs/design/video/h264/progress-indicator.md`.
+#[cfg(feature = "h264-encoder")]
+pub use codec::h264::progress::{
+    decode_phase_codes, encode_phase_codes, DecodePhase, DecodeProgressCallback, EncodePhase,
+    EncodeProgressCallback, PROGRESS_MIN_INTERVAL, ProgressThrottle,
+};
+
 #[cfg(feature = "h264-encoder")]
 pub use codec::h264::encoder::baseline_transcode::{
     BaselineTranscodeConfig, StreamingEncoder, transcode_yuv_to_baseline_cavlc_h264,

@@ -65,6 +65,7 @@ fn run_oh264_streaming(
         color: ColorParams::default(),
         engine: EncodeEngineChoice::Oh264,
         cost_weights: CostWeights::default(),
+        progress_callback: None,
     };
     let mut enc =
         StreamingEncodeSession::create(params, msg, pass).expect("encode session create");
