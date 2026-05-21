@@ -39,6 +39,8 @@ pub use error::StegoError;
 pub use ghost::quality;
 pub use ghost::quality::EncodeQuality;
 pub use ghost::optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
+#[doc(hidden)]
+pub use ghost::optimizer::optimizer_test_hash_hex;
 
 // Backward-compatible re-exports at original paths
 pub use ghost::capacity;

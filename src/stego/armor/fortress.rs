@@ -183,16 +183,20 @@ fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     #[cfg(not(feature = "parallel"))]
     let ac_energies: Vec<f64> = block_indices.iter().map(compute_energy).collect();
 
-    let mut sorted = ac_energies.clone();
-    #[cfg(feature = "parallel")]
-    sorted.par_sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    #[cfg(not(feature = "parallel"))]
-    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
+    // T2.16 — `select_nth_unstable_by` is O(N) (Quickselect) vs
+    // `sort_unstable_by`'s O(N log N). We only need the median value,
+    // not a fully sorted array. The leading/trailing partition is
+    // irrelevant; selecting the middle element gives the median in
+    // expected linear time.
     let median = if total_blocks == 0 {
         1.0
     } else {
-        sorted[total_blocks / 2].max(1.0)
+        let mut scratch = ac_energies.clone();
+        let mid = total_blocks / 2;
+        let (_, m, _) = scratch.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        (*m).max(1.0)
     };
 
     let ratios = ac_energies.iter().map(|&e| e / median).collect();
@@ -205,6 +209,21 @@ fn watson_factors(ratios: &EnergyRatios, watson_lo: f64, watson_hi: f64) -> Vec<
         .ratios
         .iter()
         .map(|&r| remap_watson(watson_base_factor(r), watson_lo, watson_hi))
+        .collect()
+}
+
+/// T2.15 — Watson factors from pre-computed base factors + adaptive range.
+///
+/// `base_factors[i] = watson_base_factor(energy.ratios[i])` is image-
+/// dependent only — same for every candidate during a Fortress decode
+/// brute-force. Computing it once outside the per-candidate loop
+/// saves the piecewise-linear `watson_base_factor` work on every
+/// retry; only the cheap linear `remap_watson(base, lo, hi)` runs
+/// per candidate.
+fn watson_factors_from_base(base_factors: &[f64], watson_lo: f64, watson_hi: f64) -> Vec<f64> {
+    base_factors
+        .iter()
+        .map(|&b| remap_watson(b, watson_lo, watson_hi))
         .collect()
 }
 
@@ -518,6 +537,15 @@ pub fn fortress_decode(
 
     // Pre-compute energy ratios once for reuse across adaptive candidates.
     let energy = compute_energy_ratios(grid);
+    // T2.15 — Pre-compute Watson base factors once per image. These
+    // depend only on the energy ratios; only the (lo, hi) remap is
+    // per-candidate. Eliminates ~30 redundant runs of the piecewise-
+    // linear watson_base_factor across the candidate brute-force.
+    let base_factors: Vec<f64> = energy
+        .ratios
+        .iter()
+        .map(|&r| watson_base_factor(r))
+        .collect();
     let remaining_perm = &perm[FORTRESS_HEADER_BLOCKS..];
     let payload_blocks = remaining_perm.len();
 
@@ -550,7 +578,8 @@ pub fn fortress_decode(
     // Try each candidate with per-r Watson factors (continuous adaptive).
     let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality)> {
         let params = adaptive_params(r);
-        let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
+        // T2.15 — remap the pre-computed base factors per candidate.
+        let factors = watson_factors_from_base(&base_factors, params.watson_lo, params.watson_hi);
         let reference_llr = params.base_step / 2.0;
 
         let payload_llrs: Vec<f64> = remaining_perm

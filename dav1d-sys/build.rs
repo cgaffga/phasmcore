@@ -92,6 +92,11 @@ fn main() {
             // attribution gap. Paired with phasm-rav1e 6254b700
             // (replay() resets dest tag).
             "619908efee1279c99f2fe56bc0d226848085ea3a",
+            // 2026-05-21: README update — Phasm-fork-specific
+            // overview replacing upstream README. Phase A status
+            // (W3.D shipped), license posture, sibling-fork links.
+            // No source change.
+            "8966e7226ed4380cb04e2b517db56d5c1d4e83d3",
         ];
 
         // phasm-rav1e PINNED_SHAS (parallel pin list — documentation
@@ -293,6 +298,14 @@ fn generate_meson_cross_file(out_dir: &std::path::Path) -> Option<PathBuf> {
         "aarch64-linux-android" => android_cross("aarch64-linux-android", "arm64", "aarch64"),
         // Android x86_64 (emulator).
         "x86_64-linux-android" => android_cross("x86_64-linux-android", "x86_64", "x86_64"),
+        // macOS x86_64 cross from Apple Silicon host — used by W7
+        // (cross-arch determinism check via Rosetta 2). Apple's
+        // bundled clang accepts `-arch x86_64` natively on aarch64
+        // hosts; the macOS SDK serves both arches.
+        "x86_64-apple-darwin" => macos_cross("x86_64", "x86_64"),
+        // macOS aarch64 cross from x86_64 host (less common; CI
+        // matrices that build Apple Silicon binaries from Intel).
+        "aarch64-apple-darwin" => macos_cross("arm64", "aarch64"),
         _ => return None,
     };
 
@@ -335,6 +348,32 @@ fn ios_cross(simulator: bool, arch: &str, cpu_family: &str) -> String {
          \n\
          [host_machine]\n\
          system = 'ios'\n\
+         cpu_family = '{cpu_family}'\n\
+         cpu = '{arch}'\n\
+         endian = 'little'\n"
+    )
+}
+
+/// Build a meson cross-file for a same-OS (macOS) different-arch
+/// target. Apple's bundled clang accepts `-arch <arch>` natively
+/// without needing `xcrun --sdk`; the macOS SDK serves both arm64
+/// and x86_64. Used by W7 (cross-arch determinism via Rosetta 2).
+fn macos_cross(arch: &str, cpu_family: &str) -> String {
+    format!(
+        "[binaries]\n\
+         c = ['clang', '-arch', '{arch}']\n\
+         cpp = ['clang++', '-arch', '{arch}']\n\
+         ar = ['ar']\n\
+         strip = ['strip']\n\
+         \n\
+         [built-in options]\n\
+         c_args = []\n\
+         cpp_args = []\n\
+         c_link_args = []\n\
+         cpp_link_args = []\n\
+         \n\
+         [host_machine]\n\
+         system = 'darwin'\n\
          cpu_family = '{cpu_family}'\n\
          cpu = '{arch}'\n\
          endian = 'little'\n"

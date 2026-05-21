@@ -245,11 +245,17 @@ pub fn av1_stego_extract(
 
     // 4. Brute-force w candidates. Mirrors phasm-core's Ghost decode
     // pattern (pipeline.rs:1108). The encoder picks w =
-    // ceil(n / m_bits); decoder doesn't know m, so tries common
-    // values. First w that yields a valid CRC + decryption wins.
-    let w_candidates: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 32, 64];
+    // floor(n / m_bits); decoder doesn't know m, so tries every
+    // value in the plausible range. Each STC extract is cheap; CRC
+    // gates a wrong w from passing through.
+    //
+    // Cover capacity at common dims (256×144 q30 .. 1080p q30) yields
+    // w in [10..400] for typical short messages. Cap at 1000 to
+    // accommodate larger covers / smaller messages.
+    let max_w = n.min(1000);
+    let w_candidates: Vec<usize> = (1..=max_w).collect();
     let mut seen_decrypt_fail = false;
-    for &w in w_candidates {
+    for &w in &w_candidates {
         if w == 0 || w > n {
             continue;
         }
@@ -335,16 +341,23 @@ mod tests {
         // smoke test in phasm-rav1e).
         fi.enable_segmentation = false;
         let mut frame = make_frame::<u8>(128, 128, ChromaSampling::Cs420);
+        // CRITICAL: use `Plane::copy_from_raw_u8` to write into the
+        // visible region. Manual chunks_mut iterates raw plane.data
+        // bytes including filter-tap padding rows, so synthetic
+        // content lands in padding while visible stays default-init
+        // neutral gray. See feedback_visual_fidelity_is_correctness.
         for (plane_idx, plane) in frame.planes.iter_mut().enumerate() {
-            let stride = plane.cfg.stride;
-            for (row_idx, row) in plane.data.chunks_mut(stride).enumerate() {
-                for (col_idx, pixel) in row.iter_mut().enumerate() {
-                    *pixel = ((row_idx.wrapping_mul(7)
+            let (w, h) = (plane.cfg.width, plane.cfg.height);
+            let mut buf = vec![0u8; w * h];
+            for row_idx in 0..h {
+                for col_idx in 0..w {
+                    buf[row_idx * w + col_idx] = ((row_idx.wrapping_mul(7)
                         + col_idx.wrapping_mul(3)
                         + plane_idx * 13)
                         & 0xff) as u8;
                 }
             }
+            plane.copy_from_raw_u8(&buf, w, 1);
         }
         let mut fs = FrameState::new_with_frame(&fi, Arc::new(frame));
         let inter_cfg = make_inter_config(&config);

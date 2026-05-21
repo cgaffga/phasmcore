@@ -1,4 +1,4 @@
-Last updated: 2026-05-12.
+Last updated: 2026-05-21.
 
 This file lists the licenses of third-party Rust crate dependencies of
 phasm-core (and its companion phasm-cli). The list reflects the
@@ -24,7 +24,7 @@ the choices are summarized.
 ===============================================================================
 GROUP 1 — MIT OR Apache-2.0 (used under the MIT license)
 
-The following 104 crates are dual-licensed MIT OR Apache-2.0 (or
+The following 105 crates are dual-licensed MIT OR Apache-2.0 (or
 equivalent variants like "Apache-2.0 OR MIT", "MIT/Apache-2.0", or
 MIT-only). Used here under the MIT license. See
 https://opensource.org/licenses/MIT for the canonical MIT text.
@@ -40,14 +40,15 @@ half, heck, hmac, image, image-webp, indicatif, inout,
 is_terminal_polyfill, js-sys, libc, memmap2, num-complex, num-traits,
 number_prefix, once_cell, once_cell_polyfill, opaque-debug,
 password-hash, png, polyval, portable-atomic, ppv-lite86, proc-macro2,
-quick-error, quote, rand, rand_chacha, rand_core, rayon, rayon-core,
-rustversion, sha2, shlex, simd-adler32, strsim, syn, tiff, typenum,
-unicode-width, universal-hash, utf8parse, version_check, wasm-bindgen,
-wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
-web-time, weezl, windows-link, windows-sys, windows-targets,
-windows_aarch64_gnullvm, windows_aarch64_msvc, windows_i686_gnu,
-windows_i686_gnullvm, windows_i686_msvc, windows_x86_64_gnu,
-windows_x86_64_gnullvm, windows_x86_64_msvc, zeroize.
+quick-error, quote, radsort, rand, rand_chacha, rand_core, rayon,
+rayon-core, rustversion, sha2, shlex, simd-adler32, strsim, syn, tiff,
+typenum, unicode-width, universal-hash, utf8parse, version_check,
+wasm-bindgen, wasm-bindgen-macro, wasm-bindgen-macro-support,
+wasm-bindgen-shared, web-time, weezl, windows-link, windows-sys,
+windows-targets, windows_aarch64_gnullvm, windows_aarch64_msvc,
+windows_i686_gnu, windows_i686_gnullvm, windows_i686_msvc,
+windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_msvc,
+zeroize.
 
 ===============================================================================
 GROUP 2 — MIT OR Apache-2.0 OR Zlib

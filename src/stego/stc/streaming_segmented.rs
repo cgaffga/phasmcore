@@ -457,6 +457,28 @@ impl<'a> StreamingViterbiPhaseB<'a> {
         self.entry_state
     }
 
+    // T2.6 accessors — used by `stc_embed_streaming_segmented_parallel`
+    // to drive Phase B segments via rayon without going through `step()`.
+
+    pub(crate) fn checkpoints(&self) -> &[Vec<f64>] {
+        &self.checkpoints
+    }
+    pub(crate) fn columns(&self) -> &[usize] {
+        &self.columns
+    }
+    pub(crate) fn num_states_(&self) -> usize {
+        self.num_states
+    }
+    pub(crate) fn k(&self) -> usize {
+        self.k
+    }
+    pub(crate) fn w_(&self) -> usize {
+        self.w
+    }
+    pub(crate) fn m_(&self) -> usize {
+        self.m
+    }
+
     /// Process one Phase B segment in reverse order. Returns
     /// `Ok(Some(emission))` for each segment, or `Ok(None)` once
     /// every segment has been emitted.
@@ -612,26 +634,173 @@ pub fn stc_embed_streaming_segmented(
     h: usize,
     w: usize,
 ) -> Result<EmbedResult, &'static str> {
-    let mut driver =
+    #[cfg(feature = "parallel")]
+    {
+        return stc_embed_streaming_segmented_parallel(
+            cover,
+            message,
+            hhat_matrix,
+            h,
+            w,
+        );
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut driver =
+            StreamingViterbiPhaseB::new(cover, message, hhat_matrix, h, w)?;
+        let total_cost = driver.total_cost();
+        let n = driver.total_positions();
+        let m = message.len();
+
+        let mut stego_bits = vec![0u8; n];
+        let mut num_modifications = 0usize;
+
+        while let Some(em) = driver.step()? {
+            let end = em.j_start + em.stego_bits.len();
+            stego_bits[em.j_start..end].copy_from_slice(&em.stego_bits);
+            num_modifications += em.num_modifications;
+        }
+
+        debug_assert_eq!(
+            driver.final_state(),
+            0,
+            "traceback did not return to initial state 0",
+        );
+        debug_assert_eq!(stc_extract(&stego_bits, hhat_matrix, w)[..m], message[..m],);
+
+        Ok(EmbedResult {
+            stego_bits,
+            total_cost,
+            num_modifications,
+        })
+    }
+}
+
+/// T2.6 — Rayon-parallelized Phase B for image-stego callers.
+///
+/// Phase A (forward Viterbi with checkpointing) is intrinsically
+/// sequential — each Viterbi step depends on the previous cost
+/// vector, so it stays in the driver. Phase B is the parallelism
+/// target:
+///
+///   * Forward Viterbi within each segment (which rebuilds the
+///     segment's back-pointer table from its checkpoint) is
+///     independent across segments — every segment starts from
+///     its own checkpoint and reads only its own (seg_bits, seg_costs).
+///     We pre-fetch all segments serially (because `CoverFetch::
+///     fetch_segment` takes `&mut self`), then run all segment
+///     forwards in parallel via `par_iter`.
+///
+///   * Traceback DOES chain `entry_state` across segments (reverse
+///     order), so it must remain sequential. The traceback is
+///     O(seg_len) per segment with one shift + one xor per j — far
+///     cheaper than the forward pass, so doing it serially is fine.
+///
+/// Output is bit-identical to the serial wrapper:
+///   - Phase A is unchanged (sequential, same code).
+///   - Phase B forward is a literal copy of the per-segment loop
+///     body from `StreamingViterbiPhaseB::step()`, just hoisted into
+///     a free helper so rayon can drive it across segments.
+///   - Traceback is identical to the serial path.
+///
+/// Memory: pre-fetching all segments doubles the cover working set
+/// (n × 5 bytes for u8 + f32) but is constant w.r.t. STC's own
+/// O(num_segments × num_states) checkpoint memory. Acceptable for
+/// image-stego where cover already lives in memory; video uses
+/// `step()` directly (not this wrapper) to preserve streaming.
+#[cfg(feature = "parallel")]
+pub fn stc_embed_streaming_segmented_parallel(
+    cover: &mut dyn CoverFetch,
+    message: &[u8],
+    hhat_matrix: &[Vec<u32>],
+    h: usize,
+    w: usize,
+) -> Result<EmbedResult, &'static str> {
+    use rayon::prelude::*;
+
+    // Phase A: sequential, builds checkpoints.
+    let driver =
         StreamingViterbiPhaseB::new(cover, message, hhat_matrix, h, w)?;
     let total_cost = driver.total_cost();
     let n = driver.total_positions();
+    let num_segments = driver.num_segments();
+    let num_states = driver.num_states_();
+    let k = driver.k();
+    let final_state = driver.final_state();
+    let columns: Vec<usize> = driver.columns().to_vec();
+    let checkpoints: Vec<Vec<f64>> = driver.checkpoints().to_vec();
     let m = message.len();
+    drop(driver);
 
+    // Pre-fetch all segments. `fetch_segment` is `&mut self`, so this
+    // is necessarily serial. For InMemoryCoverFetch (the only impl
+    // used through this wrapper) it's a cheap O(K×w) slice + copy.
+    let segments: Vec<(Vec<u8>, Vec<f32>)> = (0..num_segments)
+        .map(|seg| cover.fetch_segment(seg))
+        .collect();
+
+    // Phase B forward in parallel: rebuild each segment's back-pointer
+    // table from its checkpoint. Independent across segments.
+    let seg_back_ptrs: Vec<Vec<u128>> = (0..num_segments)
+        .into_par_iter()
+        .map(|seg| {
+            phase_b_segment_forward(
+                seg,
+                &checkpoints[seg],
+                &segments[seg].0,
+                &segments[seg].1,
+                message,
+                &columns,
+                num_states,
+                k,
+                w,
+                m,
+            )
+        })
+        .collect();
+
+    // Sequential traceback in reverse segment order. Updates
+    // `entry_state` across segments via the chain.
     let mut stego_bits = vec![0u8; n];
     let mut num_modifications = 0usize;
+    let mut s = final_state;
 
-    while let Some(em) = driver.step()? {
-        let end = em.j_start + em.stego_bits.len();
-        stego_bits[em.j_start..end].copy_from_slice(&em.stego_bits);
-        num_modifications += em.num_modifications;
+    for seg in (0..num_segments).rev() {
+        let block_start = seg * k;
+        let block_end = ((seg + 1) * k).min(m);
+        let seg_blocks = block_end - block_start;
+        let seg_len = seg_blocks * w;
+        if seg_len == 0 {
+            continue;
+        }
+        let j_start = block_start * w;
+        let seg_bits = &segments[seg].0;
+        let seg_back_ptr = &seg_back_ptrs[seg];
+
+        for local_j in (0..seg_len).rev() {
+            let j = j_start + local_j;
+            let col_idx = j % w;
+
+            if col_idx == w - 1 && (j / w) < m {
+                let msg_bit = message[j / w] as usize;
+                s = ((s << 1) | msg_bit) & (num_states - 1);
+            }
+
+            let bit = ((seg_back_ptr[local_j] >> s) & 1) as u8;
+            stego_bits[j_start + local_j] = bit;
+
+            if bit != (seg_bits[local_j] & 1) {
+                num_modifications += 1;
+            }
+
+            if bit == 1 {
+                s ^= columns[col_idx];
+            }
+        }
     }
 
-    debug_assert_eq!(
-        driver.final_state(),
-        0,
-        "traceback did not return to initial state 0",
-    );
+    debug_assert_eq!(s, 0, "traceback did not return to initial state 0");
     debug_assert_eq!(stc_extract(&stego_bits, hhat_matrix, w)[..m], message[..m],);
 
     Ok(EmbedResult {
@@ -639,6 +808,93 @@ pub fn stc_embed_streaming_segmented(
         total_cost,
         num_modifications,
     })
+}
+
+/// T2.6 — Phase B per-segment forward Viterbi.
+///
+/// Bit-exact copy of the forward loop in `StreamingViterbiPhaseB::step`
+/// (lines 489-551), hoisted into a free fn so rayon can call it from
+/// multiple workers in parallel. Each invocation owns its own scratch
+/// buffers (`prev_cost`, `curr_cost`, `shifted_cost`) — no shared
+/// state with other workers.
+#[cfg(feature = "parallel")]
+fn phase_b_segment_forward(
+    seg: usize,
+    checkpoint: &[f64],
+    seg_bits: &[u8],
+    seg_costs: &[f32],
+    message: &[u8],
+    columns: &[usize],
+    num_states: usize,
+    k: usize,
+    w: usize,
+    m: usize,
+) -> Vec<u128> {
+    let block_start = seg * k;
+    let block_end = ((seg + 1) * k).min(m);
+    let seg_blocks = block_end - block_start;
+    let seg_len = seg_blocks * w;
+    if seg_len == 0 {
+        return Vec::new();
+    }
+    let j_start = block_start * w;
+    let inf = f64::INFINITY;
+
+    let mut prev_cost = checkpoint.to_vec();
+    let mut curr_cost = vec![0.0f64; num_states];
+    let mut shifted_cost = vec![inf; num_states];
+    let mut seg_back_ptr: Vec<u128> = Vec::with_capacity(seg_len);
+    let mut seg_msg_idx = block_start;
+
+    for local_j in 0..seg_len {
+        let j = j_start + local_j;
+        let col_idx = j % w;
+        let col = columns[col_idx];
+        let flip_cost = seg_costs[local_j] as f64;
+        let cover_bit = seg_bits[local_j] & 1;
+
+        let (cost_s0, cost_s1) = if cover_bit == 0 {
+            (0.0, flip_cost)
+        } else {
+            (flip_cost, 0.0)
+        };
+
+        let mut packed_bp = 0u128;
+        for s in 0..num_states {
+            let cost_0 = prev_cost[s] + cost_s0;
+            let cost_1 = prev_cost[s ^ col] + cost_s1;
+            if cost_1 < cost_0 {
+                curr_cost[s] = cost_1;
+                packed_bp |= 1u128 << s;
+            } else {
+                curr_cost[s] = cost_0;
+            }
+        }
+        seg_back_ptr.push(packed_bp);
+
+        if col_idx == w - 1 && seg_msg_idx < m {
+            let required_bit = message[seg_msg_idx] as usize;
+            shifted_cost.fill(inf);
+            for s in 0..num_states {
+                if curr_cost[s] == inf {
+                    continue;
+                }
+                if (s & 1) != required_bit {
+                    continue;
+                }
+                let s_shifted = s >> 1;
+                if curr_cost[s] < shifted_cost[s_shifted] {
+                    shifted_cost[s_shifted] = curr_cost[s];
+                }
+            }
+            std::mem::swap(&mut prev_cost, &mut shifted_cost);
+            seg_msg_idx += 1;
+        } else {
+            std::mem::swap(&mut prev_cost, &mut curr_cost);
+        }
+    }
+
+    seg_back_ptr
 }
 
 #[cfg(test)]

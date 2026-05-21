@@ -115,6 +115,66 @@ fn next_pow2(n: usize) -> usize {
     p
 }
 
+/// T2.14 — Process-wide cache of per-stage radix-2 twiddle tables,
+/// keyed by `(size, sign_is_negative)`. Twiddles depend only on
+/// (n, sign, stage), so the FIRST `fft_radix2_f32` call for any (n,
+/// sign) builds the full set of stage twiddles via `det_sincos` and
+/// inserts under a brief write lock; subsequent calls (typically
+/// thousands per 2D FFT × 2 directions × many rows / cols) acquire
+/// a shared read lock and clone the `Arc<TwiddleStages>`.
+///
+/// Built deterministically via `det_sincos`, so cross-platform
+/// reproducibility is preserved — the `fft2d_cross_platform`
+/// SHA256 hash 17995f36... must remain unchanged.
+type TwiddleStages = Vec<Vec<Complex32>>;
+
+fn twiddle_cache() -> &'static std::sync::RwLock<
+    std::collections::HashMap<(usize, bool), std::sync::Arc<TwiddleStages>>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::RwLock<
+            std::collections::HashMap<(usize, bool), std::sync::Arc<TwiddleStages>>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+fn get_or_build_twiddles(n: usize, sign: f64) -> std::sync::Arc<TwiddleStages> {
+    let key = (n, sign < 0.0);
+
+    // Hot path: shared read lock.
+    {
+        let cache = twiddle_cache().read().expect("twiddle cache poisoned");
+        if let Some(table) = cache.get(&key) {
+            return std::sync::Arc::clone(table);
+        }
+    }
+
+    // Cold path: exclusive write lock + double-checked insert.
+    let mut cache = twiddle_cache().write().expect("twiddle cache poisoned");
+    if let Some(table) = cache.get(&key) {
+        return std::sync::Arc::clone(table);
+    }
+    let mut stages: TwiddleStages = Vec::new();
+    let mut len = 2;
+    while len <= n {
+        let half = len / 2;
+        let angle_step = sign * PI / half as f64;
+        let stage: Vec<Complex32> = (0..half)
+            .map(|k| {
+                let angle = angle_step * k as f64;
+                let (s, c) = det_sincos(angle);
+                Complex32::new(c as f32, s as f32)
+            })
+            .collect();
+        stages.push(stage);
+        len <<= 1;
+    }
+    let arc = std::sync::Arc::new(stages);
+    cache.insert(key, std::sync::Arc::clone(&arc));
+    arc
+}
+
 /// In-place radix-2 Cooley-Tukey FFT for f32.  `data.len()` must be a power of 2.
 /// `sign`: -1.0 for forward FFT, +1.0 for inverse FFT.
 fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
@@ -138,28 +198,18 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
         }
     }
 
-    // Pre-allocate the twiddle buffer once; largest stage needs n/2 entries.
-    let mut twiddles: Vec<Complex32> = Vec::with_capacity(n / 2);
+    // T2.14 — pull cached per-stage twiddle tables for (n, sign).
+    // Built once per unique (n, sign) at first call; thousands of
+    // subsequent calls during a 2D FFT pass share the same table via
+    // an Arc reference (no det_sincos cost, no per-call allocation).
+    let stage_twiddles = get_or_build_twiddles(n, sign);
 
     // Butterfly stages
     let mut len = 2;
+    let mut stage_idx: usize = 0;
     while len <= n {
         let half = len / 2;
-        let angle_step = sign * PI / half as f64;
-
-        // Pre-compute twiddles for this stage. The previous code recomputed
-        // (s, c) for every (start, k) pair, but the values depend only on
-        // (half, k) — within a stage of width `len`, each twiddle was being
-        // recomputed `n / len` times. With this cache, det_sincos is called
-        // `half` times per stage instead of `(n / len) * half = n / 2`. Total
-        // det_sincos calls across all stages drop from `~(n / 2) · log2(n)`
-        // to `~n` — a `log2(n)` reduction (≈12× on 4096-point row FFTs).
-        twiddles.clear();
-        twiddles.extend((0..half).map(|k| {
-            let angle = angle_step * k as f64;
-            let (s, c) = det_sincos(angle);
-            Complex32::new(c as f32, s as f32)
-        }));
+        let twiddles: &[Complex32] = &stage_twiddles[stage_idx];
 
         // T2.3 — SIMD-accelerated butterfly chunks for half >= 4.
         // butterfly_chunk_4 dispatches to NEON / SSE / WASM SIMD128 by
@@ -193,6 +243,7 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
             }
         }
         len <<= 1;
+        stage_idx += 1;
     }
 }
 

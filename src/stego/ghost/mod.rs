@@ -10,6 +10,7 @@
 
 pub mod capacity;
 pub mod optimizer;
+pub(crate) mod optimizer_simd;
 pub mod permute;
 pub mod pipeline;
 pub mod quality;

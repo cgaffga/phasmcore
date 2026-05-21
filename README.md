@@ -362,6 +362,31 @@ mobile builds; the pure-Rust `h264-encoder` path remains EXPERIMENTAL
 opt-in via `--encoder rust-h264`. The API and default feature set may
 still evolve; published here for transparency and review.
 
+## Video steganography (AV1 — Phase A, EXPERIMENTAL)
+
+Phase A landed 2026-05-21 (v0.3-AV1 architectural ship: W2 dav1d hook
+foundation, W3 rav1e WriterStego + cursor parity, W4 real-content
+corpus round-trip, W5 regression-bound drift gate, W6 self-steganalyzer
+v0.3, W7 cross-arch determinism via Rosetta 2). End-to-end stego
+round-trip via the **dav1d** decoder (`av1-backend`) and **rav1e**
+encoder (`av1-encoder`) through the
+[phasm-dav1d](https://github.com/cgaffga/phasm-dav1d) and
+[phasm-rav1e](https://github.com/cgaffga/phasm-rav1e) forks. Both
+codecs are royalty-free per the
+[AOM AV1 patent license](https://aomedia.org/license/patent-license/) —
+no Via LA-style patent-pool constraint, unlike H.264.
+
+The full AV1 architecture is source-visible in this mirror under
+`src/codec/av1/` + `dav1d-sys/` + `docs/design/video/av1/` for
+transparency and review. The `av1-encoder` and `av1-backend` Cargo
+features themselves are **stripped from the crates.io distribution
+for v0.3** because the build needs the `phasm-rav1e` and `phasm-dav1d`
+forks resolvable as crates, plus the `dav1d-sys/build.rs` stub
+forward-declared instead of including the vendor header. Both unblocks
+are tracked for v0.4+; until then, AV1 features are available when
+building the monorepo with the submodules checked out. Stealth
+calibration vs the H.264 production path is still maturing.
+
 ## Cargo Features
 
 | Feature | Description |
@@ -371,6 +396,8 @@ still evolve; published here for transparency and review.
 | `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. **EXPERIMENTAL — research-only**, ~1365× slower than OpenH264 at 480p × 10f; opt in via `--encoder rust-h264`. Source-only (AVC patent-pool). |
 | `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. EXPERIMENTAL. |
 | `openh264-backend` | **v1.0 production default**. Second H.264 path via the `phasm-openh264` fork (BSD-2-Clause), wired into `phasm decode` as the auto-detect first try. Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). |
+| `av1-backend` | dav1d decoder backend via the [`phasm-dav1d`](https://github.com/cgaffga/phasm-dav1d) fork (BSD-2-Clause, royalty-free per AOM AV1). EXPERIMENTAL — **Phase A 2026-05-21**, stripped from the crates.io distribution for v0.3; available when building the monorepo with `vendor/phasm-dav1d` checked out. |
+| `av1-encoder` | rav1e encoder via the [`phasm-rav1e`](https://github.com/cgaffga/phasm-rav1e) fork (BSD-2-Clause, royalty-free per AOM AV1). EXPERIMENTAL — **Phase A 2026-05-21**, same posture as `av1-backend`. |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
 
 ## CLI

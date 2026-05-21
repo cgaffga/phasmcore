@@ -833,6 +833,18 @@ fn run_stc_pass(
 }
 
 /// Apply STC LSB changes to the DctGrid.
+///
+/// The STC inline path emits `stego_bits.len() == cover_bits.len() ==
+/// positions.len()` (the standard case for images under
+/// `SEGMENTED_THRESHOLD = 1_000_000` cover bits). The streaming-
+/// segmented path (n > 1_000_000) emits only `stego_bits.len() == m * w`
+/// — `positions[m*w..]` are not exercised by the Viterbi walk and stay
+/// at their original LSB. Iterating only the intersection avoids an
+/// index-out-of-bounds panic on 12 MP+ images that go through shadows
+/// (which route through `run_stc_pass` → `apply_stc_changes`).
+///
+/// This mirrors the same defensive iteration in `ghost_encode_impl`
+/// (the no-shadow path).
 fn apply_stc_changes(
     img: &mut JpegImage,
     positions: &[permute::CoeffPos],
@@ -841,7 +853,8 @@ fn apply_stc_changes(
     si: &Option<SideInfo>,
 ) {
     let grid_mut = img.dct_grid_mut(0);
-    for (idx, pos) in positions.iter().enumerate() {
+    let n_modified = stego_bits.len();
+    for (idx, pos) in positions.iter().take(n_modified).enumerate() {
         if cover_bits[idx] != stego_bits[idx] {
             let fi = pos.flat_idx as usize;
             let coeff = flat_get(grid_mut, fi);

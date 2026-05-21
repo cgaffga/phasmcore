@@ -569,6 +569,10 @@ fn main() {
             // OVERRIDE_DIDNT_FIRE on 16x8 / 8x16 / SUB_8x4 partitions.
             // v1.0 real-content streaming round-trip GREEN.
             "bd8dd8da53cc0237921054074eefd3abe29f59a3",
+            // 2026-05-21: README update — Phase D / v0.3 production
+            // status + sibling AV1 fork pointers (phasm-rav1e +
+            // phasm-dav1d). No source change.
+            "41cd8251464183f3348ee5783be0bc0936a1e137",
         ];
         let head_output = Command::new("git")
             .arg("-C")

@@ -51,7 +51,31 @@ struct Fixture {
     /// AV1 quantizer (rav1e EncoderConfig::quantizer). 30 ≈ visually
     /// transparent for 8-bit content.
     quantizer: usize,
+    /// W5 regression baseline (recorded 2026-05-21 against phasm-rav1e
+    /// 6254b700 + phasm-dav1d 619908ef). Test asserts measured values
+    /// are within ±BYTE_TOLERANCE / ±BIT_TOLERANCE of these. If the
+    /// fork SHAs change, re-baseline by running the test, copying the
+    /// new measured values here + into `manifest.toml`, then committing.
+    baseline_natural_bytes: usize,
+    baseline_cover_bits_ac_sign: usize,
+    baseline_cover_bits_total: usize,
 }
+
+/// Allowable ±drift on the natural packet byte count. rav1e is
+/// deterministic given the same fork SHA + config + input, so any
+/// drift means the fork patched something (or our config changed).
+/// 5% leaves slack for harmless rav1e patch evolution while still
+/// catching real divergence.
+const BYTE_TOLERANCE_PCT: f64 = 5.0;
+/// Same tolerance for cover-bit counts. AC_COEFF_SIGN count is a
+/// function of coefficient distribution — drifts symmetrically with
+/// natural_bytes when the fork or config changes.
+const BIT_TOLERANCE_PCT: f64 = 5.0;
+/// Absolute ceiling on encode wall-time. Far above the 41-43 ms
+/// baseline measured on aarch64 — catches a real algorithmic
+/// slowdown (e.g., 10×) without false-firing on a thermally-throttled
+/// laptop. Tighten if real encode-time regressions slip past this.
+const ENCODE_MS_CEILING: u128 = 500;
 
 fn corpus_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -130,18 +154,19 @@ fn encode_natural(yuv: &[u8], spec: &Fixture) -> (Vec<u8>, PhasmFrameRecording) 
 
     let mut frame = make_frame::<u8>(w, h, ChromaSampling::Cs420);
 
-    for (plane_idx, plane) in frame.planes.iter_mut().enumerate() {
-        let (src, src_stride) = match plane_idx {
-            0 => (&yuv[..y_size], w),
-            1 => (&yuv[y_size..y_size + uv_size], w / 2),
-            2 => (&yuv[y_size + uv_size..y_size + 2 * uv_size], w / 2),
-            _ => unreachable!(),
-        };
-        let dst_stride = plane.cfg.stride;
-        for (dst_row, src_row) in plane.data.chunks_mut(dst_stride).zip(src.chunks(src_stride)) {
-            dst_row[..src_row.len()].copy_from_slice(src_row);
-        }
-    }
+    // CRITICAL: use `Plane::copy_from_raw_u8` — handles rav1e's
+    // filter-tap padding rows (xorigin/yorigin in plane.cfg).
+    // Manual `chunks_mut(stride)` iterates raw bytes including
+    // padding, so source content lands in the padding region while
+    // the actual visible pixels stay at default-init neutral gray.
+    // See feedback_visual_fidelity_is_correctness for the diagnostic.
+    frame.planes[0].copy_from_raw_u8(&yuv[..y_size], w, 1);
+    frame.planes[1].copy_from_raw_u8(&yuv[y_size..y_size + uv_size], w / 2, 1);
+    frame.planes[2].copy_from_raw_u8(
+        &yuv[y_size + uv_size..y_size + 2 * uv_size],
+        w / 2,
+        1,
+    );
 
     let mut fs = FrameState::new_with_frame(&fi, Arc::new(frame));
     let inter_cfg = make_inter_config(&config);
@@ -217,7 +242,52 @@ fn run_corpus_roundtrip(spec: &Fixture, message: &[u8], passphrase: &str) -> Cor
         metrics.cover_bits_ac_sign,
         metrics.cover_bits_total
     );
+
+    // W5 regression-bound assertions. Catch encoder/tagging drift
+    // when fork SHAs change or rav1e/dav1d configs diverge.
+    assert_within_pct(
+        spec.name,
+        "natural_bytes",
+        metrics.natural_bytes as f64,
+        spec.baseline_natural_bytes as f64,
+        BYTE_TOLERANCE_PCT,
+    );
+    assert_within_pct(
+        spec.name,
+        "cover_bits_ac_sign",
+        metrics.cover_bits_ac_sign as f64,
+        spec.baseline_cover_bits_ac_sign as f64,
+        BIT_TOLERANCE_PCT,
+    );
+    assert_within_pct(
+        spec.name,
+        "cover_bits_total",
+        metrics.cover_bits_total as f64,
+        spec.baseline_cover_bits_total as f64,
+        BIT_TOLERANCE_PCT,
+    );
+    assert!(
+        metrics.encode_ms <= ENCODE_MS_CEILING,
+        "{}: encode_ms {} exceeded ceiling {} — perf regression?",
+        spec.name,
+        metrics.encode_ms,
+        ENCODE_MS_CEILING
+    );
+
     metrics
+}
+
+/// Fail with a clear message when `measured` is more than `pct_tol`%
+/// away from `baseline`. Includes the relative drift in the panic.
+fn assert_within_pct(fixture: &str, field: &str, measured: f64, baseline: f64, pct_tol: f64) {
+    let drift_pct = ((measured - baseline) / baseline) * 100.0;
+    if drift_pct.abs() > pct_tol {
+        panic!(
+            "{}: {} drifted {:.0} → {:.0} ({:+.2}%, tolerance ±{:.0}%). \
+             Fork SHA change? Re-baseline by updating the constants in Fixture + manifest.toml.",
+            fixture, field, baseline, measured, drift_pct, pct_tol
+        );
+    }
 }
 
 /// Mid-clip frame from iPhone-shot footage. Natural noise + real
@@ -231,6 +301,9 @@ fn corpus_av1_iphone_img4138() {
         height: 144,
         seek_s: 1.0,
         quantizer: 30,
+        baseline_natural_bytes: 8914,
+        baseline_cover_bits_ac_sign: 12183,
+        baseline_cover_bits_total: 16913,
     };
     run_corpus_roundtrip(&spec, b"hi from av1 stego (iphone)", "corpus-pass-1");
 }
@@ -247,6 +320,9 @@ fn corpus_av1_carplane() {
         height: 144,
         seek_s: 2.0,
         quantizer: 30,
+        baseline_natural_bytes: 12220,
+        baseline_cover_bits_ac_sign: 17880,
+        baseline_cover_bits_total: 24725,
     };
     run_corpus_roundtrip(&spec, b"hi from av1 stego (carplane)", "corpus-pass-2");
 }
@@ -262,6 +338,9 @@ fn corpus_av1_iphone5_1080p() {
         height: 144,
         seek_s: 1.0,
         quantizer: 30,
+        baseline_natural_bytes: 19496,
+        baseline_cover_bits_ac_sign: 30544,
+        baseline_cover_bits_total: 39484,
     };
     run_corpus_roundtrip(&spec, b"hi from av1 stego (iphone5)", "corpus-pass-3");
 }

@@ -6,9 +6,20 @@
 # H.264 corpus — see that directory's README for provenance and the
 # regen scripts. Files are gitignored.)
 #
-# W5 (CI visual gate) consumes this manifest to assert per-fixture
-# regression bounds. W4 (this file) is the baseline snapshot from
-# the 2026-05-21 v0.3-AV1 architectural ship.
+# Baselines re-recorded 2026-05-21 after the plane-fill fix (see
+# `feedback_visual_fidelity_is_correctness`). Pre-fix values were
+# measured on a broken encode where only ~25% of every frame got
+# real content and the rest was default-init neutral gray — natural
+# packet sizes were 4-6× smaller and Y-PSNR was 11-16 dB. After the
+# fix (canonical `Plane::copy_from_raw_u8` instead of manual
+# `chunks_mut`), Y-PSNR is ~46-48 dB across the corpus, packet sizes
+# match rav1e CLI baseline, and AV1 round-trip survives clean.
+#
+# W5 reframed local-only: regression-bound assertions live in
+# `core/tests/av1_corpus_validation.rs` (`Fixture` struct's
+# `baseline_*` fields + `assert_within_pct` helper at ±5% tolerance).
+# Y-PSNR gate at `core/tests/av1_visual_psnr.rs` with floor 25 dB.
+# This TOML mirrors the test's inline baselines; keep both in sync.
 
 schema_version = "0.3"
 recorded = "2026-05-21"
@@ -26,10 +37,11 @@ width = 256
 height = 144
 seek_s = 1.0
 quantizer = 30
-natural_bytes = 2285
-cover_bits_ac_sign = 2937
-cover_bits_total = 4380
-encode_ms_p50 = 41
+natural_bytes = 8914
+cover_bits_ac_sign = 12183
+cover_bits_total = 16913
+encode_ms_p50 = 115
+y_psnr_db = 48.07
 notes = "iPhone-shot footage. Natural sensor noise. Reference for real camera-grain content."
 
 [[fixture]]
@@ -39,11 +51,12 @@ width = 256
 height = 144
 seek_s = 2.0
 quantizer = 30
-natural_bytes = 2242
-cover_bits_ac_sign = 2947
-cover_bits_total = 4439
-encode_ms_p50 = 41
-notes = "Pro-camera Artlist footage. High motion, foliage + sky + vehicle texture mix."
+natural_bytes = 12220
+cover_bits_ac_sign = 17880
+cover_bits_total = 24725
+encode_ms_p50 = 113
+y_psnr_db = 46.71
+notes = "Pro-camera Artlist footage. High motion, foliage + sky + vehicle texture mix. Source is 1080×1920 PORTRAIT (1:0.5625); scaling to 256×144 landscape introduces aspect distortion. v0.4 hygiene: re-baseline with aspect-preserving dims."
 
 [[fixture]]
 name = "iphone5_1080p"
@@ -52,8 +65,9 @@ width = 256
 height = 144
 seek_s = 1.0
 quantizer = 30
-natural_bytes = 4493
-cover_bits_ac_sign = 6491
-cover_bits_total = 9147
-encode_ms_p50 = 43
+natural_bytes = 19496
+cover_bits_ac_sign = 30544
+cover_bits_total = 39484
+encode_ms_p50 = 138
+y_psnr_db = 45.74
 notes = "Older iPhone 5 sensor. Different noise profile + ISP generation. ~2x more cover capacity than newer-iPhone / Artlist fixtures at the same dims, attributable to richer sensor-noise residuals."

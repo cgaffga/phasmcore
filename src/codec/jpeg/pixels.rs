@@ -196,21 +196,38 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
     let height = bh * 8;
     let mut pixels = vec![0.0f64; width * height];
 
-    for br in 0..bh {
+    let qt_values = qt.values;
+
+    // T2.5 — each block-row writes a disjoint 8-row strip of `pixels`,
+    // and reads `grid.block(br, bc)` (immutable). Parallelize across br
+    // via par_chunks_mut over the 8*width pixel strips.
+    let process_strip = |br: usize, strip: &mut [f64]| {
         for bc in 0..bw {
             let block = grid.block(br, bc);
             let quantized: [i16; 64] = block.try_into().unwrap();
-            let block_pixels = idct_block(&quantized, &qt.values);
-
+            let block_pixels = idct_block(&quantized, &qt_values);
             for row in 0..8 {
                 for col in 0..8 {
-                    let py = br * 8 + row;
                     let px = bc * 8 + col;
-                    pixels[py * width + px] = block_pixels[row * 8 + col];
+                    strip[row * width + px] = block_pixels[row * 8 + col];
                 }
             }
         }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        pixels
+            .par_chunks_mut(8 * width)
+            .enumerate()
+            .for_each(|(br, strip)| process_strip(br, strip));
     }
+    #[cfg(not(feature = "parallel"))]
+    pixels
+        .chunks_mut(8 * width)
+        .enumerate()
+        .for_each(|(br, strip)| process_strip(br, strip));
 
     Some((pixels, width, height))
 }
@@ -235,26 +252,40 @@ pub fn rgb_to_luma_blocks(rgb: &[u8], width: u32, height: u32) -> Vec<[f64; 64]>
     let bw = w.div_ceil(8);
     let bh = h.div_ceil(8);
 
-    let mut blocks = Vec::with_capacity(bw * bh);
+    // T2.5 — pre-allocate then fill blocks in parallel. Each block is
+    // an independent computation over disjoint output slots.
+    let mut blocks = vec![[0.0f64; 64]; bw * bh];
 
-    for br in 0..bh {
-        for bc in 0..bw {
-            let mut block = [0.0f64; 64];
-            for row in 0..8 {
-                for col in 0..8 {
-                    // Edge-replicate if past the image boundary
-                    let py = (br * 8 + row).min(h - 1);
-                    let px = (bc * 8 + col).min(w - 1);
-                    let idx = (py * w + px) * 3;
-                    let r = rgb[idx] as f64;
-                    let g = rgb[idx + 1] as f64;
-                    let b = rgb[idx + 2] as f64;
-                    block[row * 8 + col] = 0.299 * r + 0.587 * g + 0.114 * b;
-                }
+    let fill_block = |idx: usize, block: &mut [f64; 64]| {
+        let br = idx / bw;
+        let bc = idx % bw;
+        for row in 0..8 {
+            for col in 0..8 {
+                // Edge-replicate if past the image boundary
+                let py = (br * 8 + row).min(h - 1);
+                let px = (bc * 8 + col).min(w - 1);
+                let rgb_idx = (py * w + px) * 3;
+                let r = rgb[rgb_idx] as f64;
+                let g = rgb[rgb_idx + 1] as f64;
+                let b = rgb[rgb_idx + 2] as f64;
+                block[row * 8 + col] = 0.299 * r + 0.587 * g + 0.114 * b;
             }
-            blocks.push(block);
         }
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        blocks
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, block)| fill_block(idx, block));
     }
+    #[cfg(not(feature = "parallel"))]
+    blocks
+        .iter_mut()
+        .enumerate()
+        .for_each(|(idx, block)| fill_block(idx, block));
 
     blocks
 }
@@ -274,22 +305,40 @@ pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut J
     assert_eq!(width, bw * 8);
     assert_eq!(height, bh * 8);
 
-    for br in 0..bh {
-        for bc in 0..bw {
-            let mut block_pixels = [0.0f64; 64];
-            for row in 0..8 {
-                for col in 0..8 {
-                    let py = br * 8 + row;
-                    let px = bc * 8 + col;
-                    block_pixels[row * 8 + col] = pixels[py * width + px];
-                }
-            }
+    // T2.5 — coeffs is a flat Vec<i16> with stride 64 per block. Each
+    // 64-element chunk corresponds to one (br, bc). par_chunks_mut(64)
+    // lets each worker DCT+quantize one block independently.
+    let coeffs = grid.coeffs_mut();
 
-            let quantized = dct_block(&block_pixels, &qt_values);
-            let block = grid.block_mut(br, bc);
-            block.copy_from_slice(&quantized);
+    let process_block = |idx: usize, block_coeffs: &mut [i16]| {
+        let br = idx / bw;
+        let bc = idx % bw;
+        let mut block_pixels = [0.0f64; 64];
+        for row in 0..8 {
+            for col in 0..8 {
+                let py = br * 8 + row;
+                let px = bc * 8 + col;
+                block_pixels[row * 8 + col] = pixels[py * width + px];
+            }
         }
+        let quantized = dct_block(&block_pixels, &qt_values);
+        block_coeffs.copy_from_slice(&quantized);
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        coeffs
+            .par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(idx, block_coeffs)| process_block(idx, block_coeffs));
     }
+    #[cfg(not(feature = "parallel"))]
+    coeffs
+        .chunks_mut(64)
+        .enumerate()
+        .for_each(|(idx, block_coeffs)| process_block(idx, block_coeffs));
+
     Some(())
 }
 
