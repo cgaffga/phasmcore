@@ -17,7 +17,7 @@ use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame::{self, MAX_FRAME_BITS};
 use crate::stego::payload::{self, FileEntry, PayloadData};
-use crate::stego::permute;
+use crate::stego::permute::{self, CoeffPos};
 use crate::stego::progress;
 use crate::stego::side_info::{self, SideInfo};
 use crate::stego::shadow;
@@ -491,7 +491,11 @@ fn ghost_encode_with_shadows_impl(
 
     // Restore raster order (sort by flat_idx) for STC permutation.
     // The raster order matches compute_positions_streaming output.
-    positions.sort_by_key(|p| p.flat_idx);
+    // T1.9 — flat_idx is unique per position (grid coordinate), so
+    // sort_unstable_by_key produces bit-identical output to sort_by_key
+    // (no ties to break stably). ~30% faster on multi-million-element
+    // vectors.
+    positions.sort_unstable_by_key(|p| p.flat_idx);
 
     // Save original Y grid for restoration before embedding.
     let original_y = img.dct_grid(0).clone();
@@ -855,20 +859,35 @@ fn apply_stc_changes(
 ///
 /// Uses stego-image UNIWARD costs to select positions (simulating what the
 /// decoder will do), then checks RS decode + AES-GCM decrypt.
+///
+/// T1.11 — parallelized via `par_iter().all(...)` (short-circuits on first
+/// failure). Verifying N shadows used to be sequential; now N-way concurrent
+/// up to the first failure. Each verify call does RS decode + AES decrypt
+/// for one shadow, so N-shadow encodes get N× verify-phase speedup on the
+/// happy path.
 fn verify_all_shadows_decoder_side(
     img: &JpegImage,
     shadow_states: &[shadow::ShadowState],
     shadows: &[&ShadowLayer],
     stego_y_positions_sorted: &[permute::CoeffPos],
 ) -> bool {
-    for (i, state) in shadow_states.iter().enumerate() {
-        if shadow::verify_shadow_decoder_side(
-            img, state, &shadows[i].passphrase, stego_y_positions_sorted,
-        ).is_err() {
-            return false;
-        }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        shadow_states.par_iter().enumerate().all(|(i, state)| {
+            shadow::verify_shadow_decoder_side(
+                img, state, &shadows[i].passphrase, stego_y_positions_sorted,
+            ).is_ok()
+        })
     }
-    true
+    #[cfg(not(feature = "parallel"))]
+    {
+        shadow_states.iter().enumerate().all(|(i, state)| {
+            shadow::verify_shadow_decoder_side(
+                img, state, &shadows[i].passphrase, stego_y_positions_sorted,
+            ).is_ok()
+        })
+    }
 }
 
 /// Build the ∞-cost HashSet for shadow positions (used when w >= 2).
@@ -1010,8 +1029,17 @@ fn ghost_encode_impl(
     });
 
     // 11. Apply LSB changes to DctGrid.
+    //
+    // The STC inline path emits `stego_bits.len() == cover_bits.len() == n_used`,
+    // but the streaming-segmented path (n > 1_000_000) emits only
+    // `stego_bits.len() == m * w` — positions[m*w..n_used] are not exercised
+    // by the Viterbi walk and stay at their original LSB. Iterate the
+    // intersection to avoid an index-out-of-bounds on big images (which
+    // tests miss because test fixtures stay under the 1 M threshold and
+    // route through the inline path).
     let grid_mut = img.dct_grid_mut(0);
-    for (idx, pos) in positions.iter().enumerate() {
+    let n_modified = result.stego_bits.len();
+    for (idx, pos) in positions.iter().take(n_modified).enumerate() {
         let old_bit = cover_bits[idx];
         let new_bit = result.stego_bits[idx];
         if old_bit != new_bit {
@@ -1057,13 +1085,24 @@ pub fn ghost_decode(
 ) -> Result<PayloadData, StegoError> {
     let img = JpegImage::from_bytes(stego_bytes)?;
     progress::advance_by(PARSE_STEPS);
+    ghost_decode_from_image(&img, passphrase)
+}
 
+/// Ghost decode against an already-parsed JPEG. Used by `smart_decode`'s
+/// shared-parse path (T1.5) to avoid re-parsing the same JPEG across
+/// the Ghost / Armor / Fortress / Shadow attempt sequence.
+pub fn ghost_decode_from_image(
+    img: &JpegImage,
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
     // Overlap Argon2id structural key derivation (~200ms) with UNIWARD (1-10s).
+    // Argon2 result discarded — `_with_positions` re-derives with T1.1
+    // thread-local cache (worker stays warm across smart_decode calls).
     #[cfg(feature = "parallel")]
     let key_thread = {
         let pass = passphrase.to_string();
@@ -1072,26 +1111,40 @@ pub fn ghost_decode(
 
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let mut positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
+    let positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
 
+    #[cfg(feature = "parallel")]
+    let _ = key_thread.join();
+
+    ghost_decode_from_image_with_positions(img, passphrase, positions)
+}
+
+/// Ghost decode given pre-computed positions (T1.8). Used by `smart_decode`
+/// to share Y-channel UNIWARD positions between Ghost primary and Ghost
+/// shadow — both consumers take ownership of their own clone since both
+/// mutate (permute vs sort).
+///
+/// The Argon2id structural-key derivation uses T1.1's thread-local cache;
+/// the overlap-with-UNIWARD pattern in the public wrapper above is for
+/// the standalone-call path where the cache may be cold.
+pub fn ghost_decode_from_image_with_positions(
+    img: &JpegImage,
+    passphrase: &str,
+    mut positions: Vec<CoeffPos>,
+) -> Result<PayloadData, StegoError> {
     progress::check_cancelled()?;
 
-    // 2. Derive structural key.
-    #[cfg(feature = "parallel")]
-    let structural_key = key_thread.join().expect("key derivation thread")?;
-    #[cfg(not(feature = "parallel"))]
+    // Derive structural key (T1.1 cache).
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
-    // 3. Permute positions.
+    // Permute positions.
     permute::permute_positions(&mut positions, &perm_seed);
     let n = positions.len();
-
-    // Step: permutation complete.
     progress::advance();
 
-    // 4. Extract all stego LSBs (full n, reused across w candidates).
+    // Extract all stego LSBs (full n, reused across w candidates).
     let all_stego_bits: Vec<u8> = {
         let grid = img.dct_grid(0);
         positions.iter().map(|p| {
@@ -1099,9 +1152,9 @@ pub fn ghost_decode(
             (coeff.unsigned_abs() & 1) as u8
         }).collect()
     };
-    // Free positions and parsed image — no longer needed after bit extraction.
+    // Drop positions immediately — only stego_bits + hhat_seed needed
+    // for the brute-force `w` loop below. Frees ~50 MB on 200 MP.
     drop(positions);
-    drop(img);
 
     // 5. Brute-force w: try the natural w first (backward compat), then dynamic candidates.
     let w_natural = compute_stc_params(n).map(|(w, _, _)| w).unwrap_or(1);
@@ -1138,6 +1191,13 @@ pub fn ghost_decode(
 
             let stego_bits = &all_stego_bits[..n_used];
             let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+
+            // T1.4 — length-prefix gate. Skip wrong-w candidates after
+            // ~16 syndrome XORs instead of the full m_max × w.
+            if !w_length_prefix_consistent(stego_bits, &hhat_matrix, w, m_max) {
+                return None;
+            }
+
             let extracted_bits = extract::stc_extract(stego_bits, &hhat_matrix, w);
 
             let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
@@ -1170,6 +1230,13 @@ pub fn ghost_decode(
 
             let stego_bits = &all_stego_bits[..n_used];
             let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
+
+            // T1.4 — length-prefix gate. Skip wrong-w candidates after
+            // ~16 syndrome XORs instead of the full m_max × w.
+            if !w_length_prefix_consistent(stego_bits, &hhat_matrix, w, m_max) {
+                continue;
+            }
+
             let extracted_bits = extract::stc_extract(stego_bits, &hhat_matrix, w);
 
             let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
@@ -1198,6 +1265,68 @@ pub fn ghost_decode(
     progress::advance();
 
     Err(StegoError::FrameCorrupted)
+}
+
+/// T1.4 — length-prefix early-reject for the brute-force `w` loop.
+///
+/// Reads the first 16 (and if needed 48) STC syndrome bits via
+/// [`extract::stc_extract_prefix`] and checks the v1/v2 length-field
+/// against the candidate `m_max` (= `n / w`). For wrong `w` the
+/// partial extract is essentially random; the gate rejects most
+/// wrong candidates in `O(16 × w)` syndrome XORs instead of the
+/// full `O(m_max × w)` of a full extract + frame parse + AES.
+///
+/// **Inequality (≤), not equality, vs the H.264 reference**: Ghost's
+/// encoder picks `w = (n / m).clamp(1, 10)`, so when `w` is clamped
+/// at 10 (short messages on large covers), `m_max = n/10 > m`. The
+/// encoder embeds only `m` syndrome rows; decoder always extracts
+/// `m_max`. Frame fits in `m_max` ⇔
+/// `(FRAME_OVERHEAD + plaintext_len) * 8 <= m_max`. For wrong-`w`
+/// candidates the random prefix gives `pt_len` uniform in [1, u16::MAX];
+/// fraction passing the inequality scales with `m_max / max_frame_bits`
+/// ≈ 1-10% on typical 1080p–12MP covers — still a meaningful gate.
+///
+/// Mirrors the H.264 #516.2 pattern in `openh264_stego.rs` /
+/// `streaming_session.rs` (same call to `stc_extract_prefix`, weaker
+/// identity to accommodate Ghost's `m < m_max` slack).
+fn w_length_prefix_consistent(
+    stego_bits: &[u8],
+    hhat_matrix: &[Vec<u32>],
+    w: usize,
+    m_max: usize,
+) -> bool {
+    let prefix = extract::stc_extract_prefix(stego_bits, hhat_matrix, w, 16);
+    if prefix.len() < 16 {
+        return false;
+    }
+    let prefix_bytes = frame::bits_to_bytes(&prefix);
+    let v1_len = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]) as usize;
+    if v1_len > 0 && (frame::FRAME_OVERHEAD + v1_len) * 8 <= m_max {
+        return true;
+    }
+    // v2 sentinel: first u16 == 0 → read u32 length at bits 16..48.
+    // Rare (>64 KB plaintext); the 16-bit fast path covers all
+    // messages ≤ 65535 bytes. v2_len > u16::MAX disambiguates from a
+    // legitimate v1 plaintext_len = 0 (which encoder shouldn't emit
+    // anyway).
+    if v1_len == 0 {
+        let ext = extract::stc_extract_prefix(stego_bits, hhat_matrix, w, 48);
+        if ext.len() >= 48 {
+            let ext_bytes = frame::bits_to_bytes(&ext);
+            let v2_len = u32::from_be_bytes([
+                ext_bytes[2],
+                ext_bytes[3],
+                ext_bytes[4],
+                ext_bytes[5],
+            ]) as usize;
+            if v2_len > u16::MAX as usize
+                && (frame::FRAME_OVERHEAD_EXT + v2_len) * 8 <= m_max
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Helper: parse frame, decrypt, and decode payload. Used by brute-force w loop.
@@ -1246,11 +1375,21 @@ pub fn ghost_shadow_decode_from_image(
     // Compute Y-channel UNIWARD costs for cost-pool selection.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let mut positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
+    let positions = compute_positions_streaming(img.dct_grid(0), qt, None)?;
+    ghost_shadow_decode_from_image_with_positions(img, passphrase, positions)
+}
 
+/// Decode a shadow message given pre-computed positions (T1.8). Used by
+/// `smart_decode` to share Y-channel UNIWARD positions with Ghost primary.
+/// Takes ownership of `positions` since the cost-sort mutates them in
+/// place.
+pub fn ghost_shadow_decode_from_image_with_positions(
+    img: &JpegImage,
+    passphrase: &str,
+    mut positions: Vec<CoeffPos>,
+) -> Result<PayloadData, StegoError> {
     // Sort by cost (cheapest first) for cost-pool tier selection.
     positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
-
     shadow::shadow_extract(img, &positions, passphrase)
 }
 

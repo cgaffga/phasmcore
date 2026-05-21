@@ -857,7 +857,7 @@ impl CapacityProbeResult {
     /// For `n_shadows == 1`, no inter-shadow collisions; capacity is
     /// the raw cover budget minus parity + per-shadow envelope.
     pub fn shadow_max_message_bytes(&self, n_shadows: u32) -> usize {
-        use crate::stego::shadow_layer::SHADOW_FRAME_OVERHEAD_WIDE;
+        use crate::stego::shadow_layer::max_shadow_plaintext_bytes;
         if n_shadows == 0 {
             return 0;
         }
@@ -868,9 +868,10 @@ impl CapacityProbeResult {
         let m_max_bits = (m_max_bits_sq as f64).sqrt() as usize;
         let m_max_bits = m_max_bits.min(self.cover_bits);
         let m_max_bytes = m_max_bits / 8;
-        m_max_bytes
-            .saturating_sub(128) // worst-case RS parity tier
-            .saturating_sub(SHADOW_FRAME_OVERHEAD_WIDE)
+        // 2026-05-21 — picks v1 or v2 frame overhead automatically
+        // (v2 gives 4 fewer bytes capacity but unlocks >64KB
+        // plaintext).
+        max_shadow_plaintext_bytes(m_max_bytes.saturating_sub(128))
     }
 }
 

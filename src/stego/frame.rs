@@ -275,14 +275,23 @@ pub fn bytes_to_bits(bytes: &[u8]) -> Vec<u8> {
 /// Pads the last byte with zero bits if `bits.len()` is not a multiple of 8.
 pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(bits.len().div_ceil(8));
+    bits_to_bytes_into(bits, &mut bytes);
+    bytes
+}
+
+/// Same as [`bits_to_bytes`] but writes into a caller-provided buffer
+/// (clears it first). Used by hot brute-force loops with thread-local
+/// scratch to avoid per-iteration Vec allocations (T1.10).
+pub fn bits_to_bytes_into(bits: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(bits.len().div_ceil(8));
     for chunk in bits.chunks(8) {
         let mut byte = 0u8;
         for (i, &bit) in chunk.iter().enumerate() {
             byte |= (bit & 1) << (7 - i);
         }
-        bytes.push(byte);
+        out.push(byte);
     }
-    bytes
 }
 
 #[cfg(test)]

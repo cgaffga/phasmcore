@@ -59,17 +59,26 @@
 
 use crate::codec::jpeg::JpegImage;
 use crate::stego::armor::ecc;
-use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
+use crate::stego::crypto;
+#[cfg(test)]
+use crate::stego::crypto::{NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute::CoeffPos;
 use super::pipeline::{flat_get, flat_set};
+use crate::stego::shadow_layer::{
+    build_shadow_frame, parse_shadow_frame, peek_shadow_fdl, SHADOW_FRAME_OVERHEAD_V1,
+};
 use crate::stego::side_info::nsf5_modify_coefficient;
 
-/// Frame overhead inside the RS-encoded payload:
-/// plaintext_len(2) + salt(16) + nonce(12) + tag(16) = 46 bytes.
-const SHADOW_FRAME_OVERHEAD: usize = 2 + SALT_LEN + NONCE_LEN + 16;
+/// Frame overhead lower bound (= v1 overhead, 46 bytes). The
+/// brute-force decoder scans `[SHADOW_FRAME_OVERHEAD..=k-1]` which
+/// always lives in v1 territory — v2 frames are inherently large
+/// (≥65586 bytes) and reach the decoder via the peek path, not
+/// brute-force. Image-side encoder picks v1 for plaintexts
+/// ≤ u16::MAX (matches `shadow_layer::build_shadow_frame`).
+const SHADOW_FRAME_OVERHEAD: usize = SHADOW_FRAME_OVERHEAD_V1;
 
 /// RS parity tiers. Brute-forced at decode.
 const SHADOW_PARITY_TIERS: [usize; 6] = [4, 8, 16, 32, 64, 128];
@@ -82,6 +91,16 @@ const COST_FRACTIONS: [usize; 5] = [20, 10, 5, 2, 1];
 
 /// Maximum RS-encoded frame bytes to prevent unreasonable allocations.
 const MAX_SHADOW_FRAME_BYTES: usize = 256 * 1024;
+
+// T1.10 — thread-local scratch buffer for the brute-force loop's
+// bits_to_bytes step. Phase 2b can call try_single_fdl ~6000× per
+// smart_decode no-match path; reusing a per-thread Vec eliminates
+// the per-iteration allocation churn. Each rayon worker gets its
+// own scratch via thread_local.
+thread_local! {
+    static RS_BYTES_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(256));
+}
 
 /// Try a single (lsbs, fdl, parity, passphrase) combination.
 /// Returns `Some(Ok(payload))` on success, `None` on failure.
@@ -97,11 +116,35 @@ fn try_single_fdl(
         return None;
     }
 
-    let rs_bytes = frame::bits_to_bytes(&lsbs[..rs_bits_needed]);
-    let decoded = match ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, parity_len) {
+    RS_BYTES_SCRATCH.with(|scratch| {
+        let mut rs_bytes = scratch.borrow_mut();
+        frame::bits_to_bytes_into(&lsbs[..rs_bits_needed], &mut rs_bytes);
+        try_single_fdl_with_rs_bytes(&rs_bytes, fdl, parity_len, passphrase)
+    })
+}
+
+/// Inner body of [`try_single_fdl`] given pre-packed RS bytes (T1.10).
+fn try_single_fdl_with_rs_bytes(
+    rs_bytes: &[u8],
+    fdl: usize,
+    parity_len: usize,
+    passphrase: &str,
+) -> Option<Result<PayloadData, StegoError>> {
+    let decoded = match ecc::rs_decode_blocks_with_parity(rs_bytes, fdl, parity_len) {
         Ok((data, _stats)) => data,
         Err(_) => return None,
     };
+
+    // O(1) format-aware consistency gate (port of the #532 video
+    // shadow fix to the image side). peek_shadow_fdl reads the
+    // first 2-6 bytes, dispatches v1 vs v2, returns the producer's
+    // total frame length. If that doesn't equal the brute-force fdl
+    // candidate, reject without parse + AES. Skips ~99% of bad
+    // candidates' Argon2 + AES-GCM-SIV work.
+    let expected_total = peek_shadow_fdl(&decoded)?;
+    if expected_total != fdl {
+        return None;
+    }
 
     let fr = match parse_shadow_frame(&decoded) {
         Ok(f) => f,
@@ -123,6 +166,10 @@ fn try_single_fdl(
 /// Peek at the first RS block to read `plaintext_len` and derive the exact fdl.
 /// Returns the candidate fdl if the first block decodes and the resulting fdl
 /// is plausible (>= k, within pool capacity).
+///
+/// 2026-05-21 unification — delegates v1/v2 dispatch to the shared
+/// [`peek_shadow_fdl`] helper in `shadow_layer`. Same dispatch logic
+/// for image + video shadow.
 fn peek_fdl_from_first_block(
     lsbs: &[u8],
     parity_len: usize,
@@ -137,11 +184,7 @@ fn peek_fdl_from_first_block(
     let first_block_bytes = frame::bits_to_bytes(&lsbs[..255 * 8]);
     let (data, _) = ecc::rs_decode_blocks_with_parity(&first_block_bytes, k, parity_len).ok()?;
 
-    if data.len() < 2 {
-        return None;
-    }
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let fdl = SHADOW_FRAME_OVERHEAD + plaintext_len;
+    let fdl = peek_shadow_fdl(&data)?;
 
     // Only valid if fdl >= k (multi-block, so first block IS a full 255-byte block)
     // and within pool capacity.
@@ -398,20 +441,23 @@ pub fn shadow_extract(
         // Phase 2a: First-block peek — decode first RS block to read plaintext_len
         // and derive the exact fdl. Handles messages where fdl >= k (most cases).
         // This is O(30) RS block decodes — very fast.
-        for (_, lsbs) in &fraction_lsbs {
-            for &parity_len in &SHADOW_PARITY_TIERS {
-                let k = 255usize.saturating_sub(parity_len);
-                if k == 0 { continue; }
-                let max_rs_bytes = lsbs.len() / 8;
-                let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
-                    .min(MAX_SHADOW_FRAME_BYTES);
-                if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
-
-                if let Some(fdl) = peek_fdl_from_first_block(lsbs, parity_len, max_fdl)
-                    && let Some(result) = try_single_fdl(lsbs, fdl, parity_len, passphrase) {
-                        return result;
-                    }
-            }
+        // T1.11 — parallelized across (fraction, parity) combos with
+        // find_map_first short-circuit on first hit. Was sequential.
+        let combos_2a: Vec<(usize, usize)> = (0..fraction_lsbs.len())
+            .flat_map(|fi| SHADOW_PARITY_TIERS.iter().map(move |&p| (fi, p)))
+            .collect();
+        if let Some(result) = combos_2a.par_iter().find_map_first(|&(fi, parity_len)| {
+            let lsbs = &fraction_lsbs[fi].1;
+            let k = 255usize.saturating_sub(parity_len);
+            if k == 0 { return None; }
+            let max_rs_bytes = lsbs.len() / 8;
+            let max_fdl = compute_max_fdl(max_rs_bytes, parity_len)
+                .min(MAX_SHADOW_FRAME_BYTES);
+            if SHADOW_FRAME_OVERHEAD > max_fdl { return None; }
+            let fdl = peek_fdl_from_first_block(lsbs, parity_len, max_fdl)?;
+            try_single_fdl(lsbs, fdl, parity_len, passphrase)
+        }) {
+            return result;
         }
 
         // Phase 2b: Small-fdl fallback — for tiny messages where fdl < k (single
@@ -548,60 +594,10 @@ pub fn shadow_capacity(y_nzac: usize) -> usize {
 }
 
 // --- Internal helpers ---
-
-/// Build the shadow inner frame (before RS encoding).
-///
-/// Layout: [plaintext_len: 2B] [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
-fn build_shadow_frame(
-    plaintext_len: usize,
-    salt: &[u8; SALT_LEN],
-    nonce: &[u8; NONCE_LEN],
-    ciphertext: &[u8],
-) -> Vec<u8> {
-    assert!(plaintext_len <= u16::MAX as usize, "shadow frame plaintext exceeds u16::MAX");
-    let mut fr = Vec::with_capacity(SHADOW_FRAME_OVERHEAD + plaintext_len);
-    fr.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
-    fr.extend_from_slice(salt);
-    fr.extend_from_slice(nonce);
-    fr.extend_from_slice(ciphertext);
-    fr
-}
-
-/// Parsed shadow frame.
-struct ParsedShadowFrame {
-    plaintext_len: u16,
-    salt: [u8; SALT_LEN],
-    nonce: [u8; NONCE_LEN],
-    ciphertext: Vec<u8>,
-}
-
-/// Parse a shadow inner frame (after RS decoding).
-fn parse_shadow_frame(data: &[u8]) -> Result<ParsedShadowFrame, StegoError> {
-    if data.len() < SHADOW_FRAME_OVERHEAD {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
-    let expected_len = SHADOW_FRAME_OVERHEAD + plaintext_len as usize;
-    if data.len() < expected_len {
-        return Err(StegoError::FrameCorrupted);
-    }
-
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&data[2..2 + SALT_LEN]);
-
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&data[2 + SALT_LEN..2 + SALT_LEN + NONCE_LEN]);
-
-    let ciphertext = data[2 + SALT_LEN + NONCE_LEN..expected_len].to_vec();
-
-    Ok(ParsedShadowFrame {
-        plaintext_len,
-        salt,
-        nonce,
-        ciphertext,
-    })
-}
+//
+// `build_shadow_frame`, `parse_shadow_frame`, and `ParsedShadowFrame`
+// now live in `crate::stego::shadow_layer` (unified v1/v2 dispatch
+// for image + video). Imported at the top of this file.
 
 /// Two-tier position selection for shadow channels.
 ///
@@ -638,7 +634,10 @@ fn select_shadow_positions(
         let priority = rng.next_u64();
         (priority, p.clone())
     }).collect();
-    candidates.sort_by_key(|(priority, _)| *priority);
+    // T1.9 — priorities are ChaCha20-derived u64 values; collision
+    // probability ~1/2^64 means sort_unstable produces identical
+    // output to sort_by_key in practice. ~30% faster.
+    candidates.sort_unstable_by_key(|(priority, _)| *priority);
 
     candidates.into_iter().map(|(_, p)| p).take(n_total).collect()
 }

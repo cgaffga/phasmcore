@@ -17,36 +17,43 @@
 //! - **Video H.264** (4 bypass-bin domains, hash priority + additive
 //!   bias for N>1): `core/src/codec/h264/stego/shadow.rs`
 //!
-//! ## Frame formats (no header, fdl recovered via first-block peek)
+//! ## Frame format — v1 + v2 sentinel dispatch (matches `frame.rs`)
 //!
-//! Two variants exist, distinguished by the width of the
-//! plaintext-length prefix:
+//! Single unified shadow frame format with size-driven v1/v2
+//! selection, mirroring the primary frame format in `frame.rs`:
 //!
-//! **Standard (image)** — `SHADOW_FRAME_OVERHEAD = 46 bytes`:
+//! **v1 (small, ≤ 65535-byte plaintext)** — 46-byte overhead:
 //! ```text
 //! [plaintext_len: 2B u16 BE] [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
 //! ```
-//! Used by image stego (`core/src/stego/ghost/shadow.rs`). Hard
-//! cap: 65,535-byte plaintext per shadow. Adequate for image
-//! covers (Y-channel JPEG nzAC capacity ≈ tens of KB).
 //!
-//! **Wide (video)** — `SHADOW_FRAME_OVERHEAD_WIDE = 48 bytes`:
+//! **v2 (large, > 65535-byte plaintext)** — 50-byte overhead:
 //! ```text
-//! [plaintext_len: 4B u32 BE] [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
+//! [sentinel: 2B = 0x0000] [plaintext_len: 4B u32 BE]
+//! [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
 //! ```
-//! Used by H.264 video stego
-//! (`core/src/codec/h264/stego/shadow.rs`). Hard cap:
-//! 4,294,967,295-byte plaintext per shadow. Required because
-//! video covers can support much larger payloads (file
-//! attachments, multi-MB shadows). The two formats are wire-
-//! incompatible by design — image stego has been released and the
-//! u16 layout is locked; video stego is pre-release and uses the
-//! wider layout natively.
 //!
-//! No magic byte; AES-256-GCM-SIV authentication is the only
-//! validator. Decoders brute-force `(parity, fdl)` combinations
-//! using a first-block-peek heuristic to derive `fdl` from the
-//! plaintext-length prefix once the first 255-byte RS block decodes.
+//! Encoder picks v1 or v2 by plaintext size. Parser dispatches on
+//! the first two bytes: `header_u16 == 0` + `data.len() >= 6` +
+//! `v2_len > u16::MAX` selects v2; otherwise v1. The
+//! `v2_len > u16::MAX` tie-breaker protects the legitimate
+//! `plaintext_len == 0` v1 case (same logic as `frame::parse_frame`).
+//!
+//! **Backward compatibility**: image stego v0.x decoders use the v1
+//! parse logic. v1 byte layout is unchanged. v2 frames cleanly fail
+//! v0.x decoders (parser reads `[0x00, 0x00]` as `plaintext_len = 0`,
+//! salt/nonce slots misalign, AES-GCM-SIV tag rejects → smart_decode
+//! falls through). Video stego is pre-release (opt-in in v0.2.9), so
+//! v2 lands greenfield — no v0.x video shadow stego exists in the
+//! wild that depended on the old u32-only WIDE format.
+//!
+//! No magic byte beyond the v2 sentinel; AES-256-GCM-SIV
+//! authentication is the only validator. Decoders brute-force
+//! `(parity, fdl)` combinations using a first-block-peek heuristic
+//! to derive `fdl` from the plaintext-length prefix once the first
+//! 255-byte RS block decodes. Brute-force fdl range covers v1 only
+//! (v2 frames are always ≥ 65586 bytes — handled exclusively by the
+//! peek path).
 
 use crate::stego::crypto::{NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
@@ -61,85 +68,59 @@ pub struct ShadowLayer<'a> {
     pub files: &'a [FileEntry],
 }
 
-/// Standard (image) frame overhead inside the RS-encoded payload:
-/// `plaintext_len(2) + salt(16) + nonce(12) + tag(16) = 46 bytes`.
-/// Used by image stego (`stego::ghost::shadow`); locked at u16 to
-/// preserve compatibility with released app versions.
-pub const SHADOW_FRAME_OVERHEAD: usize = 2 + SALT_LEN + NONCE_LEN + 16;
+/// v1 frame overhead (`plaintext_len(2) + salt(16) + nonce(12) +
+/// tag(16) = 46 bytes`). Picked when `plaintext_len ≤ u16::MAX`.
+pub const SHADOW_FRAME_OVERHEAD_V1: usize = 2 + SALT_LEN + NONCE_LEN + 16;
 
-/// Wide (video) frame overhead — same fields but with a u32
-/// plaintext-length prefix:
-/// `plaintext_len(4) + salt(16) + nonce(12) + tag(16) = 48 bytes`.
-/// Used by H.264 video stego — covers can support multi-MB
-/// shadows (file attachments) so the u16 cap is too tight.
-pub const SHADOW_FRAME_OVERHEAD_WIDE: usize = 4 + SALT_LEN + NONCE_LEN + 16;
+/// v2 frame overhead (`sentinel(2) + plaintext_len(4) + salt(16) +
+/// nonce(12) + tag(16) = 50 bytes`). Picked when `plaintext_len >
+/// u16::MAX`. Sentinel = `[0x00, 0x00]` distinguishes from v1.
+pub const SHADOW_FRAME_OVERHEAD_V2: usize = 2 + 4 + SALT_LEN + NONCE_LEN + 16;
+
+/// Back-compat alias — points at v1 (the smallest, most common
+/// shape). Callers that need the exact overhead for a given
+/// plaintext size should use [`shadow_frame_overhead_for`].
+pub const SHADOW_FRAME_OVERHEAD: usize = SHADOW_FRAME_OVERHEAD_V1;
 
 /// RS parity tiers. Brute-forced at decode.
 pub const SHADOW_PARITY_TIERS: [usize; 6] = [4, 8, 16, 32, 64, 128];
 
-/// Maximum RS-encoded frame bytes for the standard (image) format
-/// — guards against unreasonable allocations during decode
-/// brute-force. Implies plaintext ≤ ~256 KB before RS expansion;
-/// in practice u16 caps it at 65,535 bytes.
-pub const MAX_SHADOW_FRAME_BYTES: usize = 256 * 1024;
-
-/// Maximum RS-encoded frame bytes for the wide (video) format.
-/// Bumped to 16 MB to accommodate plausible large attachments
+/// Maximum RS-encoded shadow frame bytes — bumped to 16 MB to
+/// accommodate v2 frames with plausible large attachments
 /// (e.g., embedded photos as shadows in long videos). Decoder
 /// brute-force scan is bounded; this is the safety upper bound.
-pub const MAX_SHADOW_FRAME_BYTES_WIDE: usize = 16 * 1024 * 1024;
+/// Image v1 frames are still naturally capped at ~64 KB by the u16
+/// length field; v2 is what this larger bound exists for.
+pub const MAX_SHADOW_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// Build the shadow inner frame (before RS encoding).
-///
-/// Layout: `[plaintext_len: 2B] [salt: 16B] [nonce: 12B]
-///          [ciphertext: N+16B]`
+/// Compute the per-format header overhead for a given plaintext
+/// length. Use when computing capacity / fdl ranges where the
+/// caller already knows the plaintext size.
+pub fn shadow_frame_overhead_for(plaintext_len: usize) -> usize {
+    if plaintext_len > u16::MAX as usize {
+        SHADOW_FRAME_OVERHEAD_V2
+    } else {
+        SHADOW_FRAME_OVERHEAD_V1
+    }
+}
+
+/// Maximum shadow plaintext bytes that fit in `available_bytes` of
+/// pre-RS frame space, accounting for v1 vs v2 dispatch. Picks
+/// whichever format gives more capacity at that buffer size.
+/// Use this when computing user-facing "max message size" — the
+/// encoder will automatically pick the right format at build time.
+pub fn max_shadow_plaintext_bytes(available_bytes: usize) -> usize {
+    let v1_max = available_bytes
+        .saturating_sub(SHADOW_FRAME_OVERHEAD_V1)
+        .min(u16::MAX as usize);
+    let v2_max = available_bytes.saturating_sub(SHADOW_FRAME_OVERHEAD_V2);
+    v1_max.max(v2_max)
+}
+
+/// Build the shadow inner frame (before RS encoding). Picks v1 or
+/// v2 layout based on `plaintext_len` (matches the `frame.rs`
+/// primary-frame pattern).
 pub fn build_shadow_frame(
-    plaintext_len: usize,
-    salt: &[u8; SALT_LEN],
-    nonce: &[u8; NONCE_LEN],
-    ciphertext: &[u8],
-) -> Vec<u8> {
-    assert!(
-        plaintext_len <= u16::MAX as usize,
-        "shadow frame plaintext exceeds u16::MAX",
-    );
-    let mut fr = Vec::with_capacity(SHADOW_FRAME_OVERHEAD + plaintext_len);
-    fr.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
-    fr.extend_from_slice(salt);
-    fr.extend_from_slice(nonce);
-    fr.extend_from_slice(ciphertext);
-    fr
-}
-
-/// Parsed shadow frame — output of [`parse_shadow_frame`].
-pub struct ParsedShadowFrame {
-    pub plaintext_len: u16,
-    pub salt: [u8; SALT_LEN],
-    pub nonce: [u8; NONCE_LEN],
-    pub ciphertext: Vec<u8>,
-}
-
-/// Parse a shadow inner frame (after RS decoding).
-pub fn parse_shadow_frame(data: &[u8]) -> Result<ParsedShadowFrame, StegoError> {
-    if data.len() < SHADOW_FRAME_OVERHEAD {
-        return Err(StegoError::FrameCorrupted);
-    }
-    let plaintext_len = u16::from_be_bytes([data[0], data[1]]);
-    let expected_len = SHADOW_FRAME_OVERHEAD + plaintext_len as usize;
-    if data.len() < expected_len {
-        return Err(StegoError::FrameCorrupted);
-    }
-    let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&data[2..2 + SALT_LEN]);
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&data[2 + SALT_LEN..2 + SALT_LEN + NONCE_LEN]);
-    let ciphertext = data[2 + SALT_LEN + NONCE_LEN..expected_len].to_vec();
-    Ok(ParsedShadowFrame { plaintext_len, salt, nonce, ciphertext })
-}
-
-/// Build the wide shadow inner frame (u32 plaintext_len) — see
-/// module docs for layout. Used by video stego.
-pub fn build_shadow_frame_wide(
     plaintext_len: usize,
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -149,42 +130,109 @@ pub fn build_shadow_frame_wide(
         plaintext_len <= u32::MAX as usize,
         "shadow frame plaintext exceeds u32::MAX",
     );
-    let mut fr = Vec::with_capacity(SHADOW_FRAME_OVERHEAD_WIDE + plaintext_len);
-    fr.extend_from_slice(&(plaintext_len as u32).to_be_bytes());
+    debug_assert_eq!(
+        ciphertext.len(),
+        plaintext_len + 16,
+        "ciphertext length must equal plaintext_len + 16 (AES-GCM-SIV tag)",
+    );
+
+    let is_v2 = plaintext_len > u16::MAX as usize;
+    let header_len = if is_v2 { 6 } else { 2 };
+    let mut fr = Vec::with_capacity(header_len + SALT_LEN + NONCE_LEN + ciphertext.len());
+
+    if is_v2 {
+        fr.extend_from_slice(&0u16.to_be_bytes());
+        fr.extend_from_slice(&(plaintext_len as u32).to_be_bytes());
+    } else {
+        fr.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+    }
     fr.extend_from_slice(salt);
     fr.extend_from_slice(nonce);
     fr.extend_from_slice(ciphertext);
     fr
 }
 
-/// Parsed wide shadow frame — output of [`parse_shadow_frame_wide`].
-pub struct ParsedShadowFrameWide {
+/// Parsed shadow frame — output of [`parse_shadow_frame`].
+/// `plaintext_len` is u32 to cover both v1 (≤ u16::MAX) and v2 (full
+/// u32 range). `header_overhead` tells callers which layout was
+/// decoded (46 = v1, 50 = v2) — used by the brute-force consistency
+/// gate to cross-check the candidate `fdl`.
+pub struct ParsedShadowFrame {
     pub plaintext_len: u32,
     pub salt: [u8; SALT_LEN],
     pub nonce: [u8; NONCE_LEN],
     pub ciphertext: Vec<u8>,
+    /// Bytes consumed by the layout (46 for v1, 50 for v2). Equals
+    /// `total_frame_len - plaintext_len - 16(tag)`.
+    pub header_overhead: usize,
 }
 
-/// Parse a wide shadow inner frame (u32 plaintext_len). Used by
-/// video stego.
-pub fn parse_shadow_frame_wide(data: &[u8]) -> Result<ParsedShadowFrameWide, StegoError> {
-    if data.len() < SHADOW_FRAME_OVERHEAD_WIDE {
+/// Parse a shadow inner frame (after RS decoding). Dispatches v1
+/// vs v2 on the first 2-6 bytes (same logic as
+/// `frame::parse_frame`).
+pub fn parse_shadow_frame(data: &[u8]) -> Result<ParsedShadowFrame, StegoError> {
+    if data.len() < SHADOW_FRAME_OVERHEAD_V1 {
         return Err(StegoError::FrameCorrupted);
     }
-    let plaintext_len =
-        u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    let expected_len =
-        SHADOW_FRAME_OVERHEAD_WIDE + plaintext_len as usize;
+
+    let header_u16 = u16::from_be_bytes([data[0], data[1]]);
+    let (plaintext_len, header_overhead): (usize, usize) = if header_u16 == 0 && data.len() >= 6 {
+        let v2_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if v2_len > u16::MAX as usize {
+            (v2_len, SHADOW_FRAME_OVERHEAD_V2)
+        } else {
+            (0, SHADOW_FRAME_OVERHEAD_V1)
+        }
+    } else {
+        (header_u16 as usize, SHADOW_FRAME_OVERHEAD_V1)
+    };
+
+    let expected_len = header_overhead + plaintext_len;
     if data.len() < expected_len {
         return Err(StegoError::FrameCorrupted);
     }
+
+    let header_len = header_overhead - SALT_LEN - NONCE_LEN - 16;
     let mut salt = [0u8; SALT_LEN];
-    salt.copy_from_slice(&data[4..4 + SALT_LEN]);
+    salt.copy_from_slice(&data[header_len..header_len + SALT_LEN]);
     let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&data[4 + SALT_LEN..4 + SALT_LEN + NONCE_LEN]);
-    let ciphertext =
-        data[4 + SALT_LEN + NONCE_LEN..expected_len].to_vec();
-    Ok(ParsedShadowFrameWide { plaintext_len, salt, nonce, ciphertext })
+    nonce.copy_from_slice(&data[header_len + SALT_LEN..header_len + SALT_LEN + NONCE_LEN]);
+    let ciphertext = data[header_len + SALT_LEN + NONCE_LEN..expected_len].to_vec();
+    Ok(ParsedShadowFrame {
+        plaintext_len: plaintext_len as u32,
+        salt,
+        nonce,
+        ciphertext,
+        header_overhead,
+    })
+}
+
+/// Peek at the first 6 bytes of a candidate RS-decoded shadow frame
+/// to derive `fdl` (total frame length) without doing the full
+/// parse. Returns `None` if the data is too short or the format
+/// can't be determined. Caller is responsible for plausibility
+/// bounds (`fdl <= max_fdl`).
+///
+/// This is the first half of the decoder fast-path: peek → compute
+/// fdl → run one RS-decode at that fdl → AES-GCM-SIV verify. The
+/// consistency gate inside [`parse_shadow_frame`] catches mismatch
+/// when the brute-force tries the wrong fdl.
+pub fn peek_shadow_fdl(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 {
+        return None;
+    }
+    let header_u16 = u16::from_be_bytes([data[0], data[1]]);
+    if header_u16 == 0 && data.len() >= 6 {
+        let v2_len = u32::from_be_bytes([data[2], data[3], data[4], data[5]]) as usize;
+        if v2_len > u16::MAX as usize {
+            return Some(SHADOW_FRAME_OVERHEAD_V2 + v2_len);
+        }
+        // header_u16 == 0 + v2_len <= u16::MAX = legitimate v1 with
+        // plaintext_len = 0. Empty shadows are pointless but
+        // structurally valid.
+        return Some(SHADOW_FRAME_OVERHEAD_V1);
+    }
+    Some(SHADOW_FRAME_OVERHEAD_V1 + header_u16 as usize)
 }
 
 /// Compute the maximum `frame_data_len` (bytes before RS encoding)
@@ -209,62 +257,193 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_roundtrip() {
+    fn frame_v1_roundtrip_small() {
         let salt = [1u8; SALT_LEN];
         let nonce = [2u8; NONCE_LEN];
         let ciphertext = vec![0xAAu8; 20];
         let fr = build_shadow_frame(4, &salt, &nonce, &ciphertext);
+        assert_eq!(fr.len(), SHADOW_FRAME_OVERHEAD_V1 + 4);
         let parsed = parse_shadow_frame(&fr).unwrap();
         assert_eq!(parsed.plaintext_len, 4);
         assert_eq!(parsed.salt, salt);
         assert_eq!(parsed.nonce, nonce);
         assert_eq!(parsed.ciphertext, ciphertext);
+        assert_eq!(parsed.header_overhead, SHADOW_FRAME_OVERHEAD_V1);
     }
 
     #[test]
-    fn frame_wide_roundtrip() {
-        let salt = [3u8; SALT_LEN];
-        let nonce = [4u8; NONCE_LEN];
-        let ciphertext = vec![0xBBu8; 20];
-        let fr = build_shadow_frame_wide(4, &salt, &nonce, &ciphertext);
-        assert_eq!(fr.len(), SHADOW_FRAME_OVERHEAD_WIDE + ciphertext.len() - 16);
-        let parsed = parse_shadow_frame_wide(&fr).unwrap();
-        assert_eq!(parsed.plaintext_len, 4);
+    fn frame_v1_roundtrip_max_u16() {
+        // Boundary: plaintext_len == u16::MAX stays v1
+        let salt = [11u8; SALT_LEN];
+        let nonce = [12u8; NONCE_LEN];
+        let ciphertext = vec![0xCCu8; u16::MAX as usize + 16];
+        let fr = build_shadow_frame(u16::MAX as usize, &salt, &nonce, &ciphertext);
+        assert_eq!(fr.len(), SHADOW_FRAME_OVERHEAD_V1 + u16::MAX as usize);
+        let parsed = parse_shadow_frame(&fr).unwrap();
+        assert_eq!(parsed.plaintext_len, u16::MAX as u32);
+        assert_eq!(parsed.header_overhead, SHADOW_FRAME_OVERHEAD_V1);
+    }
+
+    #[test]
+    fn frame_v2_roundtrip_first_byte_above_u16() {
+        // Boundary: plaintext_len == u16::MAX + 1 switches to v2
+        let salt = [21u8; SALT_LEN];
+        let nonce = [22u8; NONCE_LEN];
+        let pt_len = u16::MAX as usize + 1;
+        let ciphertext = vec![0xDDu8; pt_len + 16];
+        let fr = build_shadow_frame(pt_len, &salt, &nonce, &ciphertext);
+        assert_eq!(fr.len(), SHADOW_FRAME_OVERHEAD_V2 + pt_len);
+        assert_eq!(&fr[..2], &[0x00, 0x00], "v2 sentinel must be 0x0000");
+        let parsed = parse_shadow_frame(&fr).unwrap();
+        assert_eq!(parsed.plaintext_len, pt_len as u32);
         assert_eq!(parsed.salt, salt);
         assert_eq!(parsed.nonce, nonce);
         assert_eq!(parsed.ciphertext, ciphertext);
+        assert_eq!(parsed.header_overhead, SHADOW_FRAME_OVERHEAD_V2);
     }
 
-    /// The wide format must be wire-incompatible with the standard
-    /// format (different overhead, different length-field width).
-    /// Sanity-check that constants reflect the expected byte counts.
     #[test]
-    fn wide_overhead_two_bytes_more_than_standard() {
-        assert_eq!(SHADOW_FRAME_OVERHEAD, 46);
-        assert_eq!(SHADOW_FRAME_OVERHEAD_WIDE, 48);
-        assert_eq!(SHADOW_FRAME_OVERHEAD_WIDE - SHADOW_FRAME_OVERHEAD, 2);
+    fn frame_v2_roundtrip_large() {
+        // 200 KB plaintext — comfortably v2
+        let salt = [31u8; SALT_LEN];
+        let nonce = [32u8; NONCE_LEN];
+        let pt_len = 200_000usize;
+        let ciphertext = vec![0xEEu8; pt_len + 16];
+        let fr = build_shadow_frame(pt_len, &salt, &nonce, &ciphertext);
+        let parsed = parse_shadow_frame(&fr).unwrap();
+        assert_eq!(parsed.plaintext_len, pt_len as u32);
+        assert_eq!(parsed.header_overhead, SHADOW_FRAME_OVERHEAD_V2);
+        assert_eq!(parsed.ciphertext.len(), pt_len + 16);
     }
 
-    /// A frame written via the standard builder must NOT parse via
-    /// the wide parser (they're distinct formats; mixing decoders
-    /// would silently produce garbage).
     #[test]
-    fn wide_parser_rejects_standard_frame_layout() {
-        let salt = [5u8; SALT_LEN];
-        let nonce = [6u8; NONCE_LEN];
-        let ciphertext = vec![0xCCu8; 100];
-        let fr_standard = build_shadow_frame(84, &salt, &nonce, &ciphertext);
-        let parsed = parse_shadow_frame_wide(&fr_standard);
-        // Either the length field decodes to a huge u32 (rejected
-        // for being > data.len() - WIDE_OVERHEAD) or the plaintext
-        // bytes match by accident — but the salt/nonce slots will
-        // be misaligned and any subsequent crypto step will fail.
-        if let Ok(p) = parsed {
-            // If parse "succeeds", the salt/nonce slots are shifted
-            // by 2 bytes, so they don't match the original salt/nonce.
-            // The point of the test is that you can't mix the two.
-            assert_ne!(p.salt, salt);
-        }
+    fn frame_v1_with_zero_plaintext_len_low_salt() {
+        // Legitimate v1 edge case: plaintext_len = 0 with a salt
+        // whose first 4 bytes interpret as u32 ≤ u16::MAX. The v2
+        // disambiguator's `v2_len > u16::MAX` tie-breaker correctly
+        // falls back to v1 with plaintext_len = 0.
+        let salt = [0u8; SALT_LEN]; // first 4 bytes = 0x00000000
+        let nonce = [43u8; NONCE_LEN];
+        let ciphertext = vec![0u8; 16]; // tag only, no plaintext
+        let fr = build_shadow_frame(0, &salt, &nonce, &ciphertext);
+        assert_eq!(fr.len(), SHADOW_FRAME_OVERHEAD_V1);
+        let parsed = parse_shadow_frame(&fr).unwrap();
+        assert_eq!(parsed.plaintext_len, 0);
+        assert_eq!(parsed.header_overhead, SHADOW_FRAME_OVERHEAD_V1);
+        assert_eq!(parsed.salt, salt);
+    }
+
+    #[test]
+    fn frame_v1_zero_plaintext_high_salt_is_known_edge_case() {
+        // **Known edge case** (identical behavior to `frame.rs`
+        // primary-frame parser): a v1 frame with plaintext_len=0
+        // AND salt[0..4] interpreting as u32 > u16::MAX will be
+        // mis-dispatched as v2 by the sentinel disambiguator. The
+        // resulting `expected_len` won't match `data.len()` and
+        // parse fails with `FrameCorrupted`. Documented here so
+        // future readers don't think this is a bug.
+        //
+        // In practice the encoder never emits plaintext_len=0
+        // (empty shadow messages are rejected upstream), so this
+        // code path is unreachable from real callers.
+        let salt = [0x42u8; SALT_LEN]; // 0x42424242 > u16::MAX
+        let nonce = [43u8; NONCE_LEN];
+        let ciphertext = vec![0u8; 16];
+        let fr = build_shadow_frame(0, &salt, &nonce, &ciphertext);
+        // Built frame is structurally valid v1, but the parser
+        // mis-dispatches → returns FrameCorrupted.
+        assert!(parse_shadow_frame(&fr).is_err());
+    }
+
+    #[test]
+    fn overheads_match_spec() {
+        assert_eq!(SHADOW_FRAME_OVERHEAD_V1, 46);
+        assert_eq!(SHADOW_FRAME_OVERHEAD_V2, 50);
+        assert_eq!(SHADOW_FRAME_OVERHEAD_V2 - SHADOW_FRAME_OVERHEAD_V1, 4);
+        assert_eq!(SHADOW_FRAME_OVERHEAD, SHADOW_FRAME_OVERHEAD_V1);
+    }
+
+    #[test]
+    fn shadow_frame_overhead_for_sizes() {
+        assert_eq!(shadow_frame_overhead_for(0), SHADOW_FRAME_OVERHEAD_V1);
+        assert_eq!(shadow_frame_overhead_for(1), SHADOW_FRAME_OVERHEAD_V1);
+        assert_eq!(
+            shadow_frame_overhead_for(u16::MAX as usize),
+            SHADOW_FRAME_OVERHEAD_V1
+        );
+        assert_eq!(
+            shadow_frame_overhead_for(u16::MAX as usize + 1),
+            SHADOW_FRAME_OVERHEAD_V2
+        );
+        assert_eq!(shadow_frame_overhead_for(1_000_000), SHADOW_FRAME_OVERHEAD_V2);
+    }
+
+    #[test]
+    fn peek_v1() {
+        let salt = [1u8; SALT_LEN];
+        let nonce = [2u8; NONCE_LEN];
+        let ciphertext = vec![0xAAu8; 200 + 16];
+        let fr = build_shadow_frame(200, &salt, &nonce, &ciphertext);
+        // Pass at least the header bytes to peek.
+        let fdl = peek_shadow_fdl(&fr).unwrap();
+        assert_eq!(fdl, SHADOW_FRAME_OVERHEAD_V1 + 200);
+    }
+
+    #[test]
+    fn peek_v2() {
+        let salt = [1u8; SALT_LEN];
+        let nonce = [2u8; NONCE_LEN];
+        let pt_len = 100_000usize;
+        let ciphertext = vec![0xBBu8; pt_len + 16];
+        let fr = build_shadow_frame(pt_len, &salt, &nonce, &ciphertext);
+        let fdl = peek_shadow_fdl(&fr[..6]).unwrap();
+        assert_eq!(fdl, SHADOW_FRAME_OVERHEAD_V2 + pt_len);
+    }
+
+    #[test]
+    fn peek_too_short() {
+        // Only 1 byte — can't determine format
+        assert!(peek_shadow_fdl(&[0x00]).is_none());
+        // 2 bytes is enough for v1
+        assert!(peek_shadow_fdl(&[0x00, 0x05]).is_some());
+        // 2 bytes of 0x0000 + insufficient for v2 — falls back to v1 with len=0
+        assert_eq!(peek_shadow_fdl(&[0x00, 0x00]).unwrap(), SHADOW_FRAME_OVERHEAD_V1);
+    }
+
+    /// v2 frame fed to a hypothetical v0.x decoder (one that does
+    /// `u16::from_be_bytes` blindly): reads `plaintext_len = 0`,
+    /// expects 46-byte total frame. Frame is actually 50+ bytes →
+    /// `data.len() >= 46` succeeds, but salt/nonce slots are
+    /// misaligned. Downstream AES-GCM-SIV tag check rejects.
+    ///
+    /// This test simulates that path: parse a v2 frame using the
+    /// OLD u16-only logic and confirm the salt slot ends up wrong.
+    #[test]
+    fn v0x_decoder_fails_cleanly_on_v2_frame() {
+        let salt = [42u8; SALT_LEN];
+        let nonce = [43u8; NONCE_LEN];
+        let pt_len = 100_000usize;
+        let ciphertext = vec![0xCCu8; pt_len + 16];
+        let fr = build_shadow_frame(pt_len, &salt, &nonce, &ciphertext);
+
+        // Simulate the old u16-only parser:
+        let old_plaintext_len = u16::from_be_bytes([fr[0], fr[1]]) as usize;
+        // Old parser sees plaintext_len = 0 (the v2 sentinel)
+        assert_eq!(old_plaintext_len, 0);
+        let old_expected_len = SHADOW_FRAME_OVERHEAD_V1 + old_plaintext_len; // 46
+        // Buffer is large enough, so the old length check passes:
+        assert!(fr.len() >= old_expected_len);
+        // But the salt slot would read 4 bytes too early (bytes 2..18
+        // instead of 6..22), so the "salt" the old parser extracts
+        // is actually [u32_len_high_bytes, salt[0..14]]:
+        let old_salt = &fr[2..2 + SALT_LEN];
+        assert_ne!(
+            old_salt, &salt[..],
+            "old decoder's salt slot is misaligned vs the real salt",
+        );
+        // Result: downstream AES-GCM-SIV would derive the wrong key
+        // (wrong salt → wrong Argon2 output) and reject the tag.
+        // Clean failure, no garbage decode.
     }
 
     #[test]

@@ -75,19 +75,17 @@ use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
-// §6E-C2 polish — video shadow uses the WIDE frame format (u32
-// plaintext_len, 48-byte overhead) instead of the standard image
-// format (u16, 46-byte overhead). Video covers can support multi-MB
-// shadows (e.g., file attachments); the u16 cap was too tight.
-// Image-side image stego stays on the standard format to preserve
-// compatibility with released apps.
+// 2026-05-21 — Video shadow now uses the unified v1/v2 dispatch
+// shadow frame (see `crate::stego::shadow_layer` and the
+// `frame.rs` primary-frame pattern). v1 (46-byte overhead, u16
+// plaintext_len) for small payloads; v2 (50-byte overhead,
+// `[0x0000][u32]` sentinel) for plaintexts > u16::MAX. The previous
+// u32-only WIDE format was a wire-format change that landed
+// pre-release (v0.2.9 ships video stego opt-in) so no back-compat
+// burden. Image stego shares the same unified API.
 use crate::stego::shadow_layer::{
-    build_shadow_frame_wide as build_shadow_frame,
-    compute_max_shadow_fdl,
-    parse_shadow_frame_wide as parse_shadow_frame,
-    MAX_SHADOW_FRAME_BYTES_WIDE as MAX_SHADOW_FRAME_BYTES,
-    SHADOW_FRAME_OVERHEAD_WIDE as SHADOW_FRAME_OVERHEAD,
-    SHADOW_PARITY_TIERS,
+    build_shadow_frame, compute_max_shadow_fdl, parse_shadow_frame, peek_shadow_fdl,
+    MAX_SHADOW_FRAME_BYTES, SHADOW_FRAME_OVERHEAD, SHADOW_PARITY_TIERS,
 };
 
 use rand::{RngCore, SeedableRng};
@@ -270,10 +268,10 @@ pub fn apply_shadow_to_plan_residual(
 ///
 /// **#532 perf**: takes the pre-byte-packed cover (computed once
 /// per `shadow_extract*` call) rather than re-converting bits to
-/// bytes on every brute-force iteration. Adds an O(1)
-/// `plaintext_len` consistency gate (compare `decoded[0..4]` u32 BE
-/// to `fdl - SHADOW_FRAME_OVERHEAD`) before AES-GCM-SIV; rejects
-/// every wrong-fdl candidate without running the AES path.
+/// bytes on every brute-force iteration. Format-aware O(1) gate via
+/// [`peek_shadow_fdl`]: dispatches v1 vs v2 on the decoded prefix,
+/// computes expected total frame length, rejects every wrong-fdl
+/// candidate before running AES.
 fn try_single_fdl(
     rs_bytes: &[u8],
     fdl: usize,
@@ -292,20 +290,15 @@ fn try_single_fdl(
         Ok((data, _)) => data,
         Err(_) => return None,
     };
-    // #532 — O(1) plaintext_len consistency gate. Encoder writes
-    // `fdl - SHADOW_FRAME_OVERHEAD` into the first 4 bytes of the
-    // frame (u32 BE). If RS-decoded `decoded[0..4]` disagrees with
-    // the brute-force `fdl` candidate, this candidate is wrong
-    // regardless of whether AES would accept the ciphertext, so
-    // reject early. Cuts wrong-fdl rejection from O(plaintext_len)
-    // AES work to a single integer compare.
-    if decoded.len() < 4 {
-        return None;
-    }
-    let expected_plaintext_len = fdl.saturating_sub(SHADOW_FRAME_OVERHEAD) as u32;
-    let observed_plaintext_len =
-        u32::from_be_bytes([decoded[0], decoded[1], decoded[2], decoded[3]]);
-    if observed_plaintext_len != expected_plaintext_len {
+    // O(1) format-aware consistency gate. peek_shadow_fdl reads the
+    // first 2-6 bytes, dispatches v1 (u16 len at bytes 0..2) vs v2
+    // (sentinel 0x0000 at bytes 0..2 + u32 len at bytes 2..6), and
+    // returns the total frame length the producer encoded. If that
+    // doesn't equal the brute-force fdl candidate, reject without
+    // running parse + AES. (2026-05-21 unification; supersedes the
+    // u32-only #532 gate.)
+    let expected_total = peek_shadow_fdl(&decoded)?;
+    if expected_total != fdl {
         return None;
     }
     let fr = parse_shadow_frame(&decoded).ok()?;
@@ -325,33 +318,21 @@ fn try_single_fdl(
 /// `plaintext_len` prefix and derive the exact `fdl`. Returns the
 /// candidate `fdl` if it's plausible (>= k, within capacity).
 ///
-/// **#532 fix**: video shadow frames use the WIDE format
-/// (`SHADOW_FRAME_OVERHEAD = 48`, u32 BE plaintext_len). Pre-#532
-/// this function read `u16::from_be_bytes(data[0..2])`, which for
-/// every real (non-empty) shadow returned the top two bytes of the
-/// u32 BE — always zero — so peek returned `fdl = SHADOW_FRAME_OVERHEAD`
-/// (header-only). That made the brute-force fallback the actual
-/// decode path for every shadow, and worse: shadows with
-/// `fdl > k - 1` (typically `plaintext_len > ~200 bytes`) couldn't
-/// decode at all because brute-force only scans `..=k-1`. The fix
-/// reads u32 BE — matching `parse_shadow_frame_wide`.
+/// 2026-05-21 unification — delegates v1/v2 dispatch to the shared
+/// [`peek_shadow_fdl`] helper in `shadow_layer`. Same dispatch
+/// logic for image + video shadow.
 fn peek_fdl_from_first_block(
     rs_bytes: &[u8],
     parity_len: usize,
     max_fdl: usize,
 ) -> Option<usize> {
     let k = 255usize.saturating_sub(parity_len);
-    if k < 4 || rs_bytes.len() < 255 {
+    if k < 2 || rs_bytes.len() < 255 {
         return None;
     }
     let (data, _) =
         ecc::rs_decode_blocks_with_parity(&rs_bytes[..255], k, parity_len).ok()?;
-    if data.len() < 4 {
-        return None;
-    }
-    let plaintext_len =
-        u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    let fdl = SHADOW_FRAME_OVERHEAD + plaintext_len;
+    let fdl = peek_shadow_fdl(&data)?;
     if fdl >= k && fdl <= max_fdl {
         Some(fdl)
     } else {

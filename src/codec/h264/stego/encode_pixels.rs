@@ -2410,10 +2410,10 @@ pub fn h264_stego_shadow_capacity(
     gop_size: usize,
     n_shadows: usize,
 ) -> Result<H264ShadowCapacityInfo, StegoError> {
-    // Video shadow uses the wide frame format (u32 plaintext_len,
-    // 48-byte overhead). See `crate::stego::shadow_layer` module docs.
-    use crate::stego::shadow_layer::SHADOW_FRAME_OVERHEAD_WIDE
-        as SHADOW_FRAME_OVERHEAD;
+    // 2026-05-21 — Video shadow now uses the unified v1/v2 dispatch
+    // frame format. `max_shadow_plaintext_bytes` picks whichever
+    // format gives more capacity at the given buffer size.
+    use crate::stego::shadow_layer::max_shadow_plaintext_bytes;
 
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(StegoError::InvalidVideo(format!(
@@ -2453,10 +2453,9 @@ pub fn h264_stego_shadow_capacity(
         // Also bound by raw cover capacity (single-shadow case dominates).
         let m_max_bits = m_max_bits.min(cover_size_bits);
         let m_max_bytes = m_max_bits / 8;
-        // Subtract worst-case parity (max tier) + per-shadow frame overhead.
-        m_max_bytes
-            .saturating_sub(128)
-            .saturating_sub(SHADOW_FRAME_OVERHEAD)
+        // Subtract worst-case parity (max tier), then map remaining
+        // pre-RS bytes to max user plaintext via v1/v2-aware helper.
+        max_shadow_plaintext_bytes(m_max_bytes.saturating_sub(128))
     };
 
     Ok(H264ShadowCapacityInfo {

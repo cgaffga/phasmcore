@@ -157,59 +157,95 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 
 /// Serial smart_decode implementation (default path and WASM).
 ///
-/// Tries Armor first (default mode, most common), then Ghost.
-/// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) + 1 (phase3)
-///   + GHOST_DECODE_STEPS (102: 100 UNIWARD + 2 STC/decrypt).
-/// Actual total is set by try_armor_decode once candidate count is known.
+/// Tries Armor first (default mode, most common), then Ghost, then
+/// Ghost shadow. T1.5 (2026-05-21): parses the JPEG ONCE at the top
+/// and threads `&JpegImage` into all four mode attempts via the
+/// `_from_image` variants. Previously each mode re-parsed the same
+/// bytes — 2-3× wasted work on the failure path (Armor → Ghost →
+/// Ghost shadow), each parse 100s of ms on large iPhone JPEGs.
+///
+/// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) +
+///   1 (phase3) + GHOST_DECODE_STEPS (102). Actual total set by
+/// try_armor_decode once candidate count is known.
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    progress::init(0); // reset; try_armor_decode sets real total
+    use crate::codec::jpeg::JpegImage;
+    use crate::stego::armor::fortress;
+    use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
+    progress::init(0); // reset; try_armor_decode sets real total
     progress::check_cancelled()?;
 
+    // T1.5 — parse JPEG once and share across all mode attempts.
+    let img = JpegImage::from_bytes(stego_bytes)?;
     let mut saw_decryption_failed = false;
 
-    // Try Armor first (default mode, most likely)
-    match armor_decode(stego_bytes, passphrase) {
-        Ok((payload, quality)) => return Ok((payload, quality)),
+    // Try Fortress (fast, runs first inside armor_decode in pre-T1.5 path).
+    if img.num_components() > 0
+        && let Ok(result) = fortress::fortress_decode(&img, passphrase)
+    {
+        return Ok(result);
+    }
+
+    // Try Armor STDM + Phase 3 (Phase 3 still re-parses internally for
+    // geometric recovery — that path resamples the image, so it can't
+    // reuse the original parse).
+    match armor_decode_no_fortress(&img, stego_bytes, passphrase) {
+        Ok(result) => return Ok(result),
         Err(StegoError::DecryptionFailed) => {
             saw_decryption_failed = true;
-            // Could be wrong passphrase for Armor — still try Ghost
         }
-        Err(StegoError::FrameCorrupted) => {
-            // Likely not Armor — try Ghost
-        }
-        Err(e) => {
-            // Fundamental error (bad JPEG, too small, etc.) — try Ghost anyway
-            // in case Armor fails for mode-specific reasons
-            match ghost_decode(stego_bytes, passphrase) {
-                Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-                Err(_) => return Err(e), // Return original Armor error
-            }
+        Err(_) => {
+            // Not Armor — try Ghost.
         }
     }
 
     // Try Ghost — extend progress total instead of resetting to avoid the
-    // bar jumping back to 0%.  The bar continues smoothly from the Armor
+    // bar jumping back to 0%. The bar continues smoothly from the Armor
     // phase into the Ghost phase.
     let (armor_done, _) = progress::get();
     progress::set_total(armor_done + GHOST_DECODE_STEPS);
-    let ghost_result = ghost_decode(stego_bytes, passphrase);
-    match ghost_result {
-        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-        Err(StegoError::DecryptionFailed) => {
-            saw_decryption_failed = true;
-        }
-        Err(_) => {}
+
+    // T1.8 — compute Y-channel UNIWARD positions ONCE and share with
+    // both Ghost branches (each takes ownership of its own clone since
+    // both mutate: permute vs sort). Saves one compute_positions
+    // (~1-10s, ~170MB-1GB scratch) on the dominant
+    // "neither-Fortress-nor-Armor-matched" path. Falls back to per-mode
+    // compute if shared compute fails (NoLuminanceChannel etc).
+    let shared_positions = if img.num_components() > 0 {
+        let qt_id = img.frame_info().components[0].quant_table_id as usize;
+        img.quant_table(qt_id)
+            .and_then(|qt| cost::uniward::compute_positions_streaming(img.dct_grid(0), qt, None).ok())
+    } else {
+        None
+    };
+    let positions_for_shadow = shared_positions.as_ref().map(|p| p.clone());
+
+    match shared_positions {
+        Some(p) => match ghost::pipeline::ghost_decode_from_image_with_positions(&img, passphrase, p) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+            Err(_) => {}
+        },
+        None => match ghost::pipeline::ghost_decode_from_image(&img, passphrase) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+            Err(_) => {}
+        },
     }
 
-    // Try Ghost shadow (Y-channel direct LSB + RS)
-    match ghost::pipeline::ghost_shadow_decode(stego_bytes, passphrase) {
-        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-        Err(StegoError::DecryptionFailed) => {
-            saw_decryption_failed = true;
-        }
-        Err(_) => {}
+    // Try Ghost shadow (Y-channel direct LSB + RS).
+    match positions_for_shadow {
+        Some(p) => match ghost::pipeline::ghost_shadow_decode_from_image_with_positions(&img, passphrase, p) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+            Err(_) => {}
+        },
+        None => match ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+            Err(_) => {}
+        },
     }
 
     if saw_decryption_failed {
@@ -239,6 +275,27 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let img = JpegImage::from_bytes(stego_bytes)?;
 
+    // T1.8 — compute shared Y-channel UNIWARD positions ONCE before the
+    // rayon::join and clone for shadow. Avoids the 2× concurrent
+    // compute_positions_streaming runs in the previous parallel
+    // structure (each peaking at ~170MB-1GB scratch on big images).
+    // Net: 1 × compute scratch instead of 2 × concurrent (~1GB savings
+    // on 200MP), plus 50% CPU saved. Falls back to per-mode compute
+    // when shared compute fails (NoLuminanceChannel etc).
+    //
+    // Trade-off: compute_positions now runs *before* rayon::join, so it
+    // doesn't overlap with Fortress / Armor work. Same wall-clock
+    // overall (Ghost branches were the bottleneck) but slightly less
+    // parallelism on the "neither matched" path.
+    let shared_positions = if img.num_components() > 0 {
+        let qt_id = img.frame_info().components[0].quant_table_id as usize;
+        img.quant_table(qt_id)
+            .and_then(|qt| cost::uniward::compute_positions_streaming(img.dct_grid(0), qt, None).ok())
+    } else {
+        None
+    };
+    let positions_for_shadow = shared_positions.as_ref().map(|p| p.clone());
+
     let (fortress_result, (stdm_result, (ghost_result, shadow_result))) = rayon::join(
         || {
             if img.num_components() > 0 {
@@ -250,8 +307,14 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         || rayon::join(
             || armor_decode_no_fortress(&img, stego_bytes, passphrase),
             || rayon::join(
-                || ghost_decode(stego_bytes, passphrase),
-                || ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase),
+                || match shared_positions {
+                    Some(p) => ghost::pipeline::ghost_decode_from_image_with_positions(&img, passphrase, p),
+                    None => ghost::pipeline::ghost_decode_from_image(&img, passphrase),
+                },
+                || match positions_for_shadow {
+                    Some(p) => ghost::pipeline::ghost_shadow_decode_from_image_with_positions(&img, passphrase, p),
+                    None => ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase),
+                },
             ),
         ),
     );

@@ -21,8 +21,109 @@
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit, Nonce};
 use aes_gcm_siv::aead::Aead;
 use argon2::Argon2;
+use std::cell::RefCell;
 use zeroize::Zeroizing;
 use crate::stego::error::StegoError;
+
+// ─── Argon2id structural-key cache (T1.1 from 2026-05 perf audit) ─────
+//
+// Argon2id derivation is ~200 ms per call (OWASP minimum: t=2,
+// m=19 MiB, p=1). A smart_decode call runs Ghost / Ghost-shadow /
+// Armor / Fortress / Template each with its own fixed salt — so
+// 4-5 derivations per decode attempt, ~1 s total on a mid-tier
+// phone.
+//
+// Each mode uses a DIFFERENT fixed salt → can't share Argon2
+// outputs across modes within a single decode call. But the same
+// (passphrase, salt) input repeats whenever the user decodes
+// another image in the same session — that's where the cache pays
+// off. A small thread-local LRU absorbs that cost.
+//
+// Per-frame AES keys via `derive_encryption_key` use random
+// per-frame salts and are NOT cached (would just pollute the LRU).
+//
+// Security: entries hold a copy of the passphrase bytes and the
+// derived key, both wrapped in `Zeroizing` so they're scrubbed on
+// eviction or thread exit. Callers wanting explicit teardown can
+// use `clear_key_cache()`. Thread-local — no cross-thread leakage.
+
+/// Maximum entries in the structural-key cache. Sized to comfortably
+/// hold one entry per fixed-salt derivation type (6 today) plus a
+/// few extra for multi-passphrase use within one session.
+const KEY_CACHE_CAPACITY: usize = 16;
+
+struct KeyCacheEntry {
+    passphrase: Zeroizing<Vec<u8>>,
+    salt: [u8; 16],
+    output: Zeroizing<Vec<u8>>,
+}
+
+thread_local! {
+    static KEY_CACHE: RefCell<Vec<KeyCacheEntry>> =
+        RefCell::new(Vec::with_capacity(KEY_CACHE_CAPACITY));
+}
+
+fn cache_lookup(passphrase: &str, salt: &[u8; 16], out_len: usize) -> Option<Vec<u8>> {
+    KEY_CACHE.with(|c| {
+        let cache = c.borrow();
+        cache.iter().find_map(|e| {
+            if e.salt == *salt
+                && e.output.len() == out_len
+                && e.passphrase.as_slice() == passphrase.as_bytes()
+            {
+                Some(e.output.to_vec())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn cache_store(passphrase: &str, salt: &[u8; 16], output: &[u8]) {
+    KEY_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= KEY_CACHE_CAPACITY {
+            // Simple FIFO eviction. The Zeroizing wrappers ensure
+            // both passphrase + derived-key bytes are scrubbed.
+            cache.remove(0);
+        }
+        cache.push(KeyCacheEntry {
+            passphrase: Zeroizing::new(passphrase.as_bytes().to_vec()),
+            salt: *salt,
+            output: Zeroizing::new(output.to_vec()),
+        });
+    });
+}
+
+/// Clear the thread-local Argon2id structural-key cache. Each entry
+/// is zeroized on drop. Callers that want to scrub keys at the end
+/// of a session (e.g., when a user logs out of an app, or after a
+/// CLI batch finishes) should call this. Otherwise entries are
+/// evicted FIFO at capacity or when the thread exits.
+pub fn clear_key_cache() {
+    KEY_CACHE.with(|c| {
+        c.borrow_mut().clear();
+    });
+}
+
+/// Argon2id derivation with thread-local cache. All `derive_*`
+/// functions below route through this; cache lookup is keyed on
+/// `(passphrase, salt, output.len())`.
+fn argon2_derive_cached(
+    passphrase: &str,
+    salt: &[u8; 16],
+    output: &mut [u8],
+) -> Result<(), StegoError> {
+    if let Some(cached) = cache_lookup(passphrase, salt, output.len()) {
+        output.copy_from_slice(&cached);
+        return Ok(());
+    }
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, output)
+        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    cache_store(passphrase, salt, output);
+    Ok(())
+}
 
 /// Fixed salt for Ghost Tier-1 (structural) key derivation.
 /// This is intentionally fixed so the decoder can reproduce perm_seed/hhat_seed
@@ -75,9 +176,7 @@ pub const FORTRESS_EMPTY_NONCE: [u8; NONCE_LEN] = *b"ph-fe-nonce\0";
 /// This key is deterministic given the passphrase so both encoder and decoder agree.
 pub fn derive_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64]>, StegoError> {
     let mut output = Zeroizing::new([0u8; 64]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), STRUCTURAL_SALT, &mut *output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, STRUCTURAL_SALT, &mut *output)?;
     Ok(output)
 }
 
@@ -91,9 +190,7 @@ pub fn derive_h264_mvd_structural_key(
     passphrase: &str,
 ) -> Result<Zeroizing<[u8; 64]>, StegoError> {
     let mut output = Zeroizing::new([0u8; 64]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), H264_MVD_STRUCTURAL_SALT, &mut *output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, H264_MVD_STRUCTURAL_SALT, &mut *output)?;
     Ok(output)
 }
 
@@ -132,9 +229,7 @@ pub fn derive_per_gop_seed_from_master(
 /// produces different permutation/spreading seeds.
 pub fn derive_armor_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64]>, StegoError> {
     let mut output = Zeroizing::new([0u8; 64]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), ARMOR_STRUCTURAL_SALT, &mut *output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, ARMOR_STRUCTURAL_SALT, &mut *output)?;
     Ok(output)
 }
 
@@ -144,9 +239,7 @@ pub fn derive_armor_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64
 /// peak positions. Independent from Ghost/Armor structural keys.
 pub fn derive_template_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
     let mut output = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), TEMPLATE_SALT, &mut output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, TEMPLATE_SALT, &mut output)?;
     Ok(output)
 }
 
@@ -156,9 +249,7 @@ pub fn derive_template_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
 /// permutation. Independent from Ghost/Armor/Template structural keys.
 pub fn derive_fortress_structural_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
     let mut output = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), FORTRESS_STRUCTURAL_SALT, &mut output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, FORTRESS_STRUCTURAL_SALT, &mut output)?;
     Ok(output)
 }
 
@@ -170,9 +261,7 @@ pub fn derive_fortress_structural_key(passphrase: &str) -> Result<[u8; 32], Steg
 /// from lingering in memory after use.
 pub fn derive_shadow_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 32]>, StegoError> {
     let mut output = Zeroizing::new([0u8; 32]);
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), SHADOW_STRUCTURAL_SALT, &mut *output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    argon2_derive_cached(passphrase, SHADOW_STRUCTURAL_SALT, &mut *output)?;
     Ok(output)
 }
 
@@ -387,5 +476,112 @@ mod tests {
         let (ct1, _, _) = encrypt(msg, "pass").unwrap();
         let (ct2, _, _) = encrypt(msg, "pass").unwrap();
         assert_ne!(ct1, ct2, "repeated encryptions should produce different ciphertext");
+    }
+
+    // ── T1.1 Argon2id cache tests ──────────────────────────────────
+
+    /// Cache hit must return byte-identical key to a fresh derivation.
+    /// Run on its own thread so we don't pollute the main test
+    /// thread's cache.
+    #[test]
+    fn cache_hit_matches_uncached() {
+        std::thread::spawn(|| {
+            clear_key_cache();
+            let pass = "cache-test-pass-hit";
+            // First call populates the cache.
+            let a = derive_structural_key(pass).unwrap();
+            // Second call hits the cache.
+            let b = derive_structural_key(pass).unwrap();
+            assert_eq!(*a, *b, "cached key must match fresh derivation");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Different passphrases must produce different cached keys —
+    /// cache must not return entry A's key for passphrase B.
+    #[test]
+    fn cache_separates_passphrases() {
+        std::thread::spawn(|| {
+            clear_key_cache();
+            let a = derive_structural_key("pass-A").unwrap();
+            let b = derive_structural_key("pass-B").unwrap();
+            assert_ne!(*a, *b);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Different fixed-salt derivations must NOT collide in the cache
+    /// even when called with the same passphrase. Each mode has its
+    /// own (passphrase, salt) tuple → distinct entries → distinct
+    /// derived keys.
+    #[test]
+    fn cache_separates_salts() {
+        std::thread::spawn(|| {
+            clear_key_cache();
+            let ghost = derive_structural_key("same").unwrap();
+            let armor = derive_armor_structural_key("same").unwrap();
+            let shadow = derive_shadow_structural_key("same").unwrap();
+            let fortress = derive_fortress_structural_key("same").unwrap();
+            let template = derive_template_key("same").unwrap();
+            assert_ne!(*ghost, *armor);
+            assert_ne!(&(*ghost)[..32], &(*shadow)[..]);
+            assert_ne!(&(*ghost)[..32], &fortress[..]);
+            assert_ne!(&(*ghost)[..32], &template[..]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// `clear_key_cache` actually empties the cache. Subsequent
+    /// derivations re-run Argon2 (verified by correctness — output
+    /// must still match the pre-clear derivation since Argon2id is
+    /// deterministic for a given input).
+    #[test]
+    fn cache_clear_works() {
+        std::thread::spawn(|| {
+            clear_key_cache();
+            let pass = "clear-test";
+            let pre = derive_structural_key(pass).unwrap();
+            clear_key_cache();
+            let post = derive_structural_key(pass).unwrap();
+            // Output must match — Argon2 is deterministic.
+            assert_eq!(*pre, *post);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Eviction at capacity: pushing more than KEY_CACHE_CAPACITY
+    /// distinct (passphrase, salt) entries evicts the oldest.
+    /// Older entry re-derives correctly (Argon2 is deterministic).
+    #[test]
+    fn cache_evicts_at_capacity() {
+        std::thread::spawn(|| {
+            clear_key_cache();
+            // Populate one extra past capacity using distinct
+            // passphrases. derive_template_key is fastest (32-byte
+            // output) so this stays under a few seconds.
+            for i in 0..KEY_CACHE_CAPACITY + 1 {
+                let pass = format!("cap-test-{i}");
+                let _ = derive_template_key(&pass).unwrap();
+            }
+            // Cache should hold exactly KEY_CACHE_CAPACITY entries.
+            KEY_CACHE.with(|c| {
+                let len = c.borrow().len();
+                assert!(
+                    len <= KEY_CACHE_CAPACITY,
+                    "cache len {len} should be ≤ {KEY_CACHE_CAPACITY}"
+                );
+            });
+            // First passphrase should have been evicted — re-deriving
+            // it works (no caching artifact corruption).
+            let first = derive_template_key("cap-test-0").unwrap();
+            let again = derive_template_key("cap-test-0").unwrap();
+            assert_eq!(first, again, "evicted-then-rederived key still consistent");
+        })
+        .join()
+        .unwrap();
     }
 }

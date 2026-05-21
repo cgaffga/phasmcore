@@ -468,8 +468,15 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<(Vec<u8>, usize), R
     let mut full_block = vec![0u8; N_MAX];
     full_block[padding..].copy_from_slice(received);
 
-    // Compute syndromes on the full block
-    let syndromes = compute_syndromes(&full_block);
+    // T1.7 — skip leading-zero padding in syndrome compute. Padding
+    // bytes contribute 0 to every term of poly_eval (Horner's rule:
+    // `result = result * x + 0` is `result * x`, no information
+    // added), so `&full_block[padding..]` is mathematically identical
+    // to `&full_block` for all syndrome evaluation points. Saves
+    // `padding × parity_len` poly_eval iterations per block — up to
+    // ~30× speedup on tiny shortened codes during brute-force RS
+    // candidate sweeps (data_len ≈ 4 → padding 219 of 255).
+    let syndromes = compute_syndromes(&full_block[padding..]);
 
     if syndromes_are_zero(&syndromes) {
         return Ok((received[..data_len].to_vec(), 0));
@@ -499,8 +506,11 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<(Vec<u8>, usize), R
         corrected[array_pos] = gf_add(corrected[array_pos], magnitudes[i]);
     }
 
-    // Verify syndromes are now zero
-    let check_syndromes = compute_syndromes(&corrected);
+    // Verify syndromes are now zero. T1.7 — leading bytes still
+    // zero post-correction (correction loop above rejects
+    // array_pos < padding), so same `[padding..]` slice optimization
+    // applies.
+    let check_syndromes = compute_syndromes(&corrected[padding..]);
     if !syndromes_are_zero(&check_syndromes) {
         return Err(RsDecodeError);
     }
@@ -649,11 +659,14 @@ pub fn rs_decode_with_parity(
     let mut full_block = vec![0u8; N_MAX];
     full_block[padding..].copy_from_slice(received);
 
-    // Compute syndromes with the given parity length
+    // Compute syndromes with the given parity length. T1.7 — skip
+    // leading-zero padding (see `rs_decode` for the math identity);
+    // saves padding × parity_len poly_eval iterations.
     let tab = gf_tables();
     let mut syndromes = vec![0u8; parity_len];
+    let non_zero = &full_block[padding..];
     for i in 0..parity_len {
-        syndromes[i] = poly_eval(&full_block, tab.exp[i]);
+        syndromes[i] = poly_eval(non_zero, tab.exp[i]);
     }
 
     if syndromes.iter().all(|&s| s == 0) {
@@ -679,10 +692,13 @@ pub fn rs_decode_with_parity(
         corrected[array_pos] = gf_add(corrected[array_pos], magnitudes[i]);
     }
 
-    // Verify syndromes are now zero
+    // Verify syndromes are now zero. T1.7 — same `[padding..]`
+    // optimization (corrected[..padding] is provably zero by the
+    // array_pos < padding rejection above).
     let mut check_ok = true;
+    let non_zero = &corrected[padding..];
     for i in 0..parity_len {
-        if poly_eval(&corrected, tab.exp[i]) != 0 {
+        if poly_eval(non_zero, tab.exp[i]) != 0 {
             check_ok = false;
             break;
         }

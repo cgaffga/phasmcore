@@ -1056,6 +1056,35 @@ fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
     Ok(())
 }
 
+/// T1.3 — verify the trailing CRC32 on a candidate decoded frame.
+/// `data` is the RS-decoded bytes; `total_len` is the expected total
+/// frame size (header + salt + nonce + ciphertext + 4-byte CRC).
+/// Returns true iff `crc32fast::hash(data[..total_len-4])` matches
+/// the u32 BE at `data[total_len-4..total_len]`.
+///
+/// Used as an O(~1µs) gate inside the RS-candidate brute-force loops
+/// (`try_rs_decode_frame_with_parity` + `try_rs_decode_compact_
+/// frame_with_parity`). Lets the loop keep iterating past a plausibility-
+/// pass-CRC-fail data_len candidate (which would otherwise cause the
+/// inner function to return a false-positive frame that the outer
+/// caller would just CRC-reject via `frame::parse_frame`, abandoning
+/// the entire (parity, r, delta) sweep). Mirrors the T1.2
+/// `peek_shadow_fdl` gate pattern.
+fn frame_crc_ok(data: &[u8], total_len: usize) -> bool {
+    if total_len < 4 || data.len() < total_len {
+        return false;
+    }
+    let payload = &data[..total_len - 4];
+    let stored_crc = u32::from_be_bytes([
+        data[total_len - 4],
+        data[total_len - 3],
+        data[total_len - 2],
+        data[total_len - 1],
+    ]);
+    let computed_crc = crc32fast::hash(payload);
+    stored_crc == computed_crc
+}
+
 /// Try to RS-decode a frame from extracted bytes using a specific parity length.
 ///
 /// Optimized sweep: after the first RS block decodes successfully, the
@@ -1101,6 +1130,12 @@ pub(super) fn try_rs_decode_frame_with_parity(
                 }
 
                 if total_frame_len == data_len {
+                    // T1.3 — CRC gate before returning. plausibility
+                    // passed but the random-bytes case can still slip
+                    // through; CRC pins it to the true encoder output.
+                    if !frame_crc_ok(&first_block_data, total_frame_len) {
+                        continue;
+                    }
                     let t_max = parity / 2;
                     let stats = ecc::RsDecodeStats {
                         total_errors: first_errors,
@@ -1112,6 +1147,9 @@ pub(super) fn try_rs_decode_frame_with_parity(
                 }
 
                 if total_frame_len < data_len {
+                    if !frame_crc_ok(&first_block_data, total_frame_len) {
+                        continue;
+                    }
                     let t_max = parity / 2;
                     let stats = ecc::RsDecodeStats {
                         total_errors: first_errors,
@@ -1128,6 +1166,9 @@ pub(super) fn try_rs_decode_frame_with_parity(
                         total_frame_len,
                         parity,
                     ) {
+                        if !frame_crc_ok(&decoded, total_frame_len) {
+                            continue;
+                        }
                         return Some((decoded, stats));
                     }
                     // Multi-block decode failed — first-block was a false
@@ -1182,6 +1223,10 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                 }
 
                 if total_frame_len == data_len {
+                    // T1.3 — CRC gate before returning.
+                    if !frame_crc_ok(&first_block_data, total_frame_len) {
+                        continue;
+                    }
                     let t_max = parity / 2;
                     let stats = ecc::RsDecodeStats {
                         total_errors: first_errors,
@@ -1193,6 +1238,9 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                 }
 
                 if total_frame_len < data_len {
+                    if !frame_crc_ok(&first_block_data, total_frame_len) {
+                        continue;
+                    }
                     let t_max = parity / 2;
                     let stats = ecc::RsDecodeStats {
                         total_errors: first_errors,
@@ -1209,6 +1257,9 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                         total_frame_len,
                         parity,
                     ) {
+                        if !frame_crc_ok(&decoded, total_frame_len) {
+                            continue;
+                        }
                         return Some((decoded, stats));
                     }
                     // Multi-block decode failed — first-block was a false
