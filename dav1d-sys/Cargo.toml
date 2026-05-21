@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2026, Christoph Gaffga
+
+[package]
+name = "core-dav1d-sys"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "FFI bindings for cgaffga/phasm-dav1d (phasm-stego fork of dav1d AV1 decoder)"
+publish = false
+links = "dav1d"
+
+[lib]
+# The -sys crate exposes only FFI types + extern "C" symbols.
+# Higher-level Rust API lives in phasm-core's av1 module (Phase B-D+).
+crate-type = ["rlib"]
+
+[dependencies]
+# Hand-written FFI bindings use core::ffi types exclusively — no
+# libc dependency needed. Mirrors core-openh264-sys.
+
+[build-dependencies]
+# Compiles the phasm_dav1d_stub.c C shim (Phase W2.2 fallback) and,
+# in Phase W2.3+, the phasm_dav1d_hooks.c shim that exposes the
+# phasm_on_decode_symbol callback to libdav1d.
+cc = "1"

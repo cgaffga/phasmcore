@@ -161,13 +161,35 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
             Complex32::new(c as f32, s as f32)
         }));
 
-        for start in (0..n).step_by(len) {
-            for k in 0..half {
-                let w = twiddles[k];
-                let u = data[start + k];
-                let v = data[start + k + half] * w;
-                data[start + k] = u + v;
-                data[start + k + half] = u - v;
+        // T2.3 — SIMD-accelerated butterfly chunks for half >= 4.
+        // butterfly_chunk_4 dispatches to NEON / SSE / WASM SIMD128 by
+        // arch (scalar fallback otherwise). All paths are bit-identical
+        // by construction (Path A: lane-pure IEEE 754, no FMA, no
+        // cross-lane reduction). For half < 4 (stages 1 and 2) the loop
+        // can't fill a 4-lane SIMD chunk; use the scalar fast path.
+        if half >= 4 {
+            for start in (0..n).step_by(len) {
+                let mut k = 0;
+                while k < half {
+                    super::fft2d_simd::butterfly_chunk_4(
+                        data,
+                        start,
+                        k,
+                        half,
+                        &twiddles[k..k + 4],
+                    );
+                    k += 4;
+                }
+            }
+        } else {
+            for start in (0..n).step_by(len) {
+                for k in 0..half {
+                    let w = twiddles[k];
+                    let u = data[start + k];
+                    let v = data[start + k + half] * w;
+                    data[start + k] = u + v;
+                    data[start + k + half] = u - v;
+                }
             }
         }
         len <<= 1;
@@ -240,31 +262,93 @@ pub fn fft2d(pixels: &[f64], width: usize, height: usize) -> Spectrum2D {
         None
     };
 
-    // FFT each row
-    for row in 0..height {
-        let start = row * width;
-        let row_data = &data[start..start + width];
+    // T2.2 — row FFTs are independent → par_chunks_mut over the
+    // row-major buffer. Each chunk is one row processed in place.
+    // Wire-format safe: rayon never changes the math; each row FFT
+    // produces deterministic output independent of execution order.
+    let process_row = |row_data: &mut [Complex32]| {
         let transformed = fft1d_f32_with_plan(row_data, -1.0, row_plan.as_ref());
-        data[start..start + width].copy_from_slice(&transformed);
+        row_data.copy_from_slice(&transformed);
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(width).for_each(process_row);
     }
+    #[cfg(not(feature = "parallel"))]
+    data.chunks_mut(width).for_each(process_row);
 
-    // P1a: FFT each column using gather-FFT-scatter with a single column buffer.
-    // No full transposed buffer needed.
-    let mut col_buf = vec![Complex32::new(0.0, 0.0); height];
-    for col in 0..width {
-        // Gather column
-        for r in 0..height {
-            col_buf[r] = data[r * width + col];
-        }
-        // FFT
-        let transformed = fft1d_f32_with_plan(&col_buf, -1.0, col_plan.as_ref());
-        // Scatter back
-        for r in 0..height {
-            data[r * width + col] = transformed[r];
-        }
-    }
+    // T2.2 — column FFTs are independent across columns (each col
+    // touches a disjoint set of indices). Parallelize via raw-pointer
+    // wrapper + per-thread col_buf scratch.
+    fft_columns_parallel(&mut data, width, height, col_plan.as_ref(), -1.0);
 
     Spectrum2D { data, width, height }
+}
+
+/// T2.2 — column gather/FFT/scatter parallelized across columns.
+///
+/// Each closure handles one column: gathers `height` strided
+/// `Complex32` values into a per-thread `col_buf`, runs the 1D FFT,
+/// scatters the result back. Different columns write to disjoint
+/// index sets (`col + r*width` for `r = 0..height`) so writes never
+/// alias across closures. Raw pointer is the only thing Rust's
+/// aliasing rules block; the SyncMutPtr wrapper makes it Send+Sync.
+fn fft_columns_parallel(
+    data: &mut [Complex32],
+    width: usize,
+    height: usize,
+    plan: Option<&BluesteinPlan>,
+    sign: f64,
+) {
+    // Cast the data pointer to usize so closure auto-trait inference
+    // doesn't propagate the raw pointer's `!Send + !Sync` through
+    // the closure's captures. We cast back inside the closure.
+    // Safety: each closure invocation indexes the pointer only at
+    // its own column's disjoint set (`col + r*width` for `r =
+    // 0..height`); different `col` values never overlap, so
+    // concurrent writes are race-free.
+    let data_addr = data.as_mut_ptr() as usize;
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        (0..width).into_par_iter().for_each_init(
+            || vec![Complex32::new(0.0, 0.0); height],
+            |col_buf, col| {
+                let dp = data_addr as *mut Complex32;
+                unsafe {
+                    for r in 0..height {
+                        col_buf[r] = *dp.add(r * width + col);
+                    }
+                }
+                let transformed = fft1d_f32_with_plan(col_buf, sign, plan);
+                unsafe {
+                    for r in 0..height {
+                        *dp.add(r * width + col) = transformed[r];
+                    }
+                }
+            },
+        );
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let dp = data_addr as *mut Complex32;
+        let mut col_buf = vec![Complex32::new(0.0, 0.0); height];
+        for col in 0..width {
+            unsafe {
+                for r in 0..height {
+                    col_buf[r] = *dp.add(r * width + col);
+                }
+            }
+            let transformed = fft1d_f32_with_plan(&col_buf, sign, plan);
+            unsafe {
+                for r in 0..height {
+                    *dp.add(r * width + col) = transformed[r];
+                }
+            }
+        }
+    }
 }
 
 /// 2D complex spectrum -> real-valued pixel array.
@@ -289,37 +373,65 @@ pub fn ifft2d(spectrum: &Spectrum2D) -> Vec<f64> {
         None
     };
 
-    // IFFT each row
-    for row in 0..height {
-        let start = row * width;
-        let row_data = &data[start..start + width];
+    // T2.2 — row IFFTs in parallel.
+    let process_row = |row_data: &mut [Complex32]| {
         let transformed = fft1d_f32_with_plan(row_data, 1.0, row_plan.as_ref());
-        data[start..start + width].copy_from_slice(&transformed);
+        row_data.copy_from_slice(&transformed);
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        data.par_chunks_mut(width).for_each(process_row);
     }
+    #[cfg(not(feature = "parallel"))]
+    data.chunks_mut(width).for_each(process_row);
 
-    // P1a: IFFT each column using gather-IFFT-scatter with a single column buffer.
-    let mut col_buf = vec![Complex32::new(0.0, 0.0); height];
-    for col in 0..width {
-        // Gather column
-        for r in 0..height {
-            col_buf[r] = data[r * width + col];
-        }
-        // IFFT
-        let transformed = fft1d_f32_with_plan(&col_buf, 1.0, col_plan.as_ref());
-        // Scatter back
-        for r in 0..height {
-            data[r * width + col] = transformed[r];
-        }
-    }
+    // T2.2 — column IFFTs in parallel via the same raw-pointer
+    // wrapper pattern as `fft2d`.
+    fft_columns_parallel(&mut data, width, height, col_plan.as_ref(), 1.0);
 
-    // Normalize and extract real parts
+    // Normalize and extract real parts. T2.2 — also parallelizable
+    // over the flat buffer; small change but visible on big images.
     let norm = 1.0 / (width * height) as f64;
-    let mut result = vec![0.0f64; width * height];
-    for i in 0..data.len() {
-        result[i] = data[i].re as f64 * norm;
-    }
+    #[cfg(feature = "parallel")]
+    let result: Vec<f64> = {
+        use rayon::prelude::*;
+        data.par_iter().map(|c| c.re as f64 * norm).collect()
+    };
+    #[cfg(not(feature = "parallel"))]
+    let result: Vec<f64> = data.iter().map(|c| c.re as f64 * norm).collect();
 
     result
+}
+
+/// Test/diagnostic helper — runs a deterministic 2D FFT and returns the
+/// raw little-endian byte serialization of the complex spectrum.
+///
+/// Inputs are produced by a fixed-seed LCG so every platform with a
+/// conforming IEEE 754 f32 implementation produces the SAME bytes. Used
+/// to empirically verify that scalar / NEON / SSE / WASM SIMD paths
+/// produce bit-identical FFT output (T2.3 Path A validation).
+///
+/// `size` must be small enough that the test runs quickly across all
+/// target archs (incl. WASM under Node). 256×256 takes <50 ms on
+/// modern hardware.
+#[doc(hidden)]
+pub fn fft2d_test_deterministic_bytes(size: usize) -> Vec<u8> {
+    let mut s: u32 = 0x12345678;
+    let mut pixels = Vec::with_capacity(size * size);
+    for _ in 0..size * size {
+        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+        // Map LCG output to f64 in roughly [-1, 1].
+        let v = ((s as i32) as f64) / (i32::MAX as f64);
+        pixels.push(v);
+    }
+    let spectrum = fft2d(&pixels, size, size);
+    let mut bytes = Vec::with_capacity(spectrum.data.len() * 8);
+    for c in &spectrum.data {
+        bytes.extend_from_slice(&c.re.to_le_bytes());
+        bytes.extend_from_slice(&c.im.to_le_bytes());
+    }
+    bytes
 }
 
 /// Compute magnitude of each spectrum element (returns f32).
@@ -328,6 +440,24 @@ pub fn magnitude_spectrum(spectrum: &Spectrum2D) -> Vec<f32> {
         // Use f64 det_hypot for precision, cast result to f32
         det_hypot(c.re as f64, c.im as f64) as f32
     }).collect()
+}
+
+/// T2.3 cross-platform empirical FFT-output byte equivalence.
+///
+/// Computes a SHA256 of the deterministic 256×256 FFT output bytes
+/// and asserts it matches a hardcoded value. The value was first
+/// produced on aarch64 NEON; the test is run again under x86_64 SSE
+/// (Rosetta) and WASM SIMD128 (Node/V8) to verify byte-identical
+/// FFT output across all SIMD paths.
+///
+/// Listed at module level (not in #[cfg(test)]) so it can be re-run
+/// from wasm-bridge in WASM and from native binaries under Rosetta.
+#[doc(hidden)]
+pub fn fft2d_test_hash_hex() -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = fft2d_test_deterministic_bytes(256);
+    let hash = Sha256::digest(&bytes);
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 #[cfg(test)]

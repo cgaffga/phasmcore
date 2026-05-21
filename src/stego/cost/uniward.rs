@@ -431,6 +431,15 @@ fn compute_three_subbands(
 /// Uses symmetric (mirror) boundary extension.
 /// Output has the same dimensions as input (undecimated).
 /// Accumulates in f64 for filter precision, stores result as f32.
+///
+/// T2.1a — loop-peeled into `[0, half)` left boundary, `[half, width-half)`
+/// interior (no mirror, contiguous load, branch-free → LLVM autovec
+/// emits f64x2/f64x4 SIMD), and `[width-half, width)` right boundary.
+/// T2.1b — outer loop parallelized over rows.
+///
+/// Determinism: f64 accumulator preserved, muladd order unchanged (per
+/// April 2026 SIMD audit — f32-throughout would change cost values by
+/// 1-2 ULP and risk flipping cost-pool boundaries across versions).
 fn filter_rows(
     pixels: &[f32],
     width: usize,
@@ -441,18 +450,83 @@ fn filter_rows(
     let half = (flen - 1) / 2; // = 7 for 16-tap filter (center at index 7)
     let mut output = vec![0.0f32; width * height];
 
-    for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0.0f64;
-            for k in 0..flen {
-                // Sample position with filter centered at x.
-                let sx = (x as isize) + (k as isize) - (half as isize);
-                let sx = mirror_index(sx, width);
-                sum += pixels[y * width + sx] as f64 * filter[k];
+    // Edge case: image narrower than filter — fall back to scalar with
+    // mirror everywhere.
+    if width < flen {
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0f64;
+                for k in 0..flen {
+                    let sx =
+                        mirror_index((x as isize) + (k as isize) - (half as isize), width);
+                    sum += pixels[y * width + sx] as f64 * filter[k];
+                }
+                output[y * width + x] = sum as f32;
             }
-            output[y * width + x] = sum as f32;
         }
+        return output;
     }
+
+    // Asymmetric filter (even flen=16, half=7): left extent = half=7,
+    // right extent = flen - half - 1 = 8. Interior x where the full
+    // window [x-half, x-half+flen) stays in [0, width):
+    // x ∈ [half, width - right_extent).
+    let right_extent = flen - half - 1;
+    let interior_end = width - right_extent;
+
+    // Per-row processing helper — same body for parallel + serial paths.
+    let process_row = |y: usize, row_out: &mut [f32]| {
+        let row_in = &pixels[y * width..(y + 1) * width];
+
+        // T2.1c Path A — boundary slabs gather 16 mirrored samples
+            // into a stack-local [f32; 16] and call the same pairwise-
+            // tree dot product as the interior. Byte-identical output
+            // regardless of which slab x lives in.
+            let mut samples = [0.0f32; 16];
+
+            // Left boundary [0..half): mirror needed.
+            for x in 0..half {
+                for k in 0..flen {
+                    let sx =
+                        mirror_index((x as isize) + (k as isize) - (half as isize), width);
+                    samples[k] = row_in[sx];
+                }
+                row_out[x] = super::uniward_simd::dot_product_16_taps(&samples, filter) as f32;
+            }
+
+            // Interior [half..interior_end): no mirror — contiguous
+            // 16-tap window, dispatched to NEON on aarch64 / scalar
+            // elsewhere via the same pinned-pairwise tree.
+            for x in half..interior_end {
+                let base = x - half;
+                row_out[x] = super::uniward_simd::dot_product_16_taps(
+                    &row_in[base..base + flen],
+                    filter,
+                ) as f32;
+            }
+
+        // Right boundary [interior_end..width): mirror needed.
+        for x in interior_end..width {
+            for k in 0..flen {
+                let sx =
+                    mirror_index((x as isize) + (k as isize) - (half as isize), width);
+                samples[k] = row_in[sx];
+            }
+            row_out[x] = super::uniward_simd::dot_product_16_taps(&samples, filter) as f32;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| process_row(y, row_out));
+
+    #[cfg(not(feature = "parallel"))]
+    output
+        .chunks_mut(width)
+        .enumerate()
+        .for_each(|(y, row_out)| process_row(y, row_out));
 
     output
 }
@@ -461,6 +535,18 @@ fn filter_rows(
 /// Uses symmetric (mirror) boundary extension.
 /// Output has the same dimensions as input (undecimated).
 /// Accumulates in f64 for filter precision, stores result as f32.
+///
+/// T2.1a — loop-peeled per-row (interior rows skip mirror) AND
+/// inner loops rewritten as k-outer / x-inner: for each input row k,
+/// stream contiguously across all x, accumulating into a per-row f64
+/// scratch. Cache-friendly (sequential reads, sequential writes) and
+/// autovec-friendly (the inner x loop is `scratch[x] += row[x] * c` —
+/// classic SAXPY shape LLVM emits SIMD for).
+/// T2.1b — outer over output rows is rayon-parallel.
+///
+/// Determinism: per-(x,y) the same 16 muladds happen in the same
+/// k=0..15 order; only the iteration order across (x,y) changed.
+/// Byte-identical output preserved.
 fn filter_cols(
     pixels: &[f32],
     width: usize,
@@ -471,16 +557,81 @@ fn filter_cols(
     let half = (flen - 1) / 2; // = 7
     let mut output = vec![0.0f32; width * height];
 
-    for y in 0..height {
-        for x in 0..width {
-            let mut sum = 0.0f64;
-            for k in 0..flen {
-                let sy = (y as isize) + (k as isize) - (half as isize);
-                let sy = mirror_index(sy, height);
-                sum += pixels[sy * width + x] as f64 * filter[k];
+    // Edge case: image shorter than filter — fall back to scalar.
+    if height < flen {
+        for y in 0..height {
+            for x in 0..width {
+                let mut sum = 0.0f64;
+                for k in 0..flen {
+                    let sy = mirror_index(
+                        (y as isize) + (k as isize) - (half as isize),
+                        height,
+                    );
+                    sum += pixels[sy * width + x] as f64 * filter[k];
+                }
+                output[y * width + x] = sum as f32;
             }
-            output[y * width + x] = sum as f32;
         }
+        return output;
+    }
+
+    // Asymmetric filter (even flen=16, half=7): interior y where full
+    // window stays in [0, height) is [half, height - right_extent).
+    let right_extent = flen - half - 1;
+
+    // Per-row processing helper — same body for parallel + serial paths.
+    let process_row = |scratch: &mut [f64], y: usize, row_out: &mut [f32]| {
+        // Reset scratch for this output row.
+        for s in scratch.iter_mut() {
+            *s = 0.0;
+        }
+
+        let is_interior = y >= half && y < height - right_extent;
+
+        if is_interior {
+            // No mirror: each of the 16 input rows is at y+k-half.
+            // Outer k, inner x — sequential reads + writes →
+            // T2.1c SIMD-accelerated SAXPY (NEON / AVX / WASM SIMD,
+            // scalar elsewhere). Byte-identical across all
+            // platforms by IEEE 754 + no-FMA + no-reduction-tree.
+            for k in 0..flen {
+                let sy = y + k - half;
+                let row_in = &pixels[sy * width..(sy + 1) * width];
+                super::uniward_simd::saxpy_inner(scratch, row_in, filter[k]);
+            }
+        } else {
+            // Boundary row: mirror index per k, but still k-outer.
+            for k in 0..flen {
+                let sy = mirror_index(
+                    (y as isize) + (k as isize) - (half as isize),
+                    height,
+                );
+                let row_in = &pixels[sy * width..(sy + 1) * width];
+                super::uniward_simd::saxpy_inner(scratch, row_in, filter[k]);
+            }
+        }
+
+        // Cast f64 scratch → f32 output. Sequential, autovec-friendly.
+        for x in 0..width {
+            row_out[x] = scratch[x] as f32;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    output
+        .par_chunks_mut(width)
+        .enumerate()
+        .for_each_init(
+            || vec![0.0f64; width], // per-thread scratch
+            |scratch, (y, row_out)| process_row(scratch.as_mut_slice(), y, row_out),
+        );
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut scratch = vec![0.0f64; width];
+        output.chunks_mut(width).enumerate().for_each(|(y, row_out)| {
+            process_row(scratch.as_mut_slice(), y, row_out);
+        });
     }
 
     output

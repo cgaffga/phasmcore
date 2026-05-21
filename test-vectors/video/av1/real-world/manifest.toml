@@ -1,0 +1,59 @@
+# AV1 Stego Corpus Manifest — v0.3 W4 Baseline
+#
+# Recorded baseline metrics for the fixtures driven by
+# `core/tests/av1_corpus_validation.rs`. Source files live under
+# `core/test-vectors/video/h264/real-world/source/` (shared with the
+# H.264 corpus — see that directory's README for provenance and the
+# regen scripts. Files are gitignored.)
+#
+# W5 (CI visual gate) consumes this manifest to assert per-fixture
+# regression bounds. W4 (this file) is the baseline snapshot from
+# the 2026-05-21 v0.3-AV1 architectural ship.
+
+schema_version = "0.3"
+recorded = "2026-05-21"
+phasm_rav1e_sha = "6254b700"
+phasm_dav1d_sha = "619908ef"
+notes = """
+v0.3 single-tile, single key frame, AC_COEFF_SIGN channel only.
+Uniform STC costs. J-UNIWARD + cascade-safety deferred to v0.5+.
+"""
+
+[[fixture]]
+name = "iphone_img4138"
+source = "IMG_4138.MOV"
+width = 256
+height = 144
+seek_s = 1.0
+quantizer = 30
+natural_bytes = 2285
+cover_bits_ac_sign = 2937
+cover_bits_total = 4380
+encode_ms_p50 = 41
+notes = "iPhone-shot footage. Natural sensor noise. Reference for real camera-grain content."
+
+[[fixture]]
+name = "carplane"
+source = "Artlist_CarPlane.mp4"
+width = 256
+height = 144
+seek_s = 2.0
+quantizer = 30
+natural_bytes = 2242
+cover_bits_ac_sign = 2947
+cover_bits_total = 4439
+encode_ms_p50 = 41
+notes = "Pro-camera Artlist footage. High motion, foliage + sky + vehicle texture mix."
+
+[[fixture]]
+name = "iphone5_1080p"
+source = "iphone5_1080p_30fps_h264_high.mov"
+width = 256
+height = 144
+seek_s = 1.0
+quantizer = 30
+natural_bytes = 4493
+cover_bits_ac_sign = 6491
+cover_bits_total = 9147
+encode_ms_p50 = 43
+notes = "Older iPhone 5 sensor. Different noise profile + ISP generation. ~2x more cover capacity than newer-iPhone / Artlist fixtures at the same dims, attributable to richer sensor-noise residuals."

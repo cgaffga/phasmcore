@@ -87,7 +87,7 @@ pub fn stdm_embed(coeffs: &mut [f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], bit: u8
     debug_assert!(bit <= 1);
 
     // Project onto spreading vector
-    let p: f64 = coeffs.iter().zip(v.iter()).map(|(&c, &vi)| c * vi).sum();
+    let p = super::embedding_simd::spread_dot_product(coeffs, v);
 
     // Dither-quantize to encode the bit
     let q = quantize_for_bit(p, delta, bit);
@@ -108,7 +108,7 @@ pub fn stdm_embed(coeffs: &mut [f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], bit: u8
 /// Returns the extracted bit (0 or 1).
 #[cfg(test)]
 pub fn stdm_extract(coeffs: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], delta: f64) -> u8 {
-    let p: f64 = coeffs.iter().zip(v.iter()).map(|(&c, &vi)| c * vi).sum();
+    let p = super::embedding_simd::spread_dot_product(coeffs, v);
 
     // Determine which quantizer lattice is closest
     let half_delta = delta / 2.0;
@@ -133,7 +133,7 @@ fn quantize_for_bit(p: f64, delta: f64, bit: u8) -> f64 {
 /// Positive LLR → bit 0 more likely, negative → bit 1 more likely.
 /// |LLR| magnitude indicates confidence.
 pub fn stdm_extract_soft(coeffs: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], delta: f64) -> f64 {
-    let p: f64 = coeffs.iter().zip(v.iter()).map(|(&c, &vi)| c * vi).sum();
+    let p = super::embedding_simd::spread_dot_product(coeffs, v);
 
     // Distance to nearest Q_0 lattice point
     let q0 = (p / delta).round() * delta;

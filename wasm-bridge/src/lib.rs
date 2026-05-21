@@ -789,3 +789,27 @@ pub fn optimize_pixels(
 
     Ok(optimize_cover(pixels, width, height, &config))
 }
+
+/// T2.4 — Cross-platform empirical STDM LLR byte-equivalence hook.
+///
+/// Returns the lowercase-hex SHA256 of 10,000 deterministic LCG-seeded
+/// `spread_dot_product` calls. Used to verify WASM SIMD128 produces
+/// bit-identical f64 dot products to the native NEON/SSE paths.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_spread_dot_hash() -> String {
+    phasm_core::stego::armor::embedding_simd::spread_dot_test_hash_hex()
+}
+
+/// T2.3 — Cross-platform empirical FFT byte-equivalence hook.
+///
+/// Returns the lowercase-hex SHA256 of the deterministic 256×256 FFT
+/// output. The expected value (recorded on aarch64 NEON) is checked
+/// from Node/V8 to verify WASM SIMD128 produces bit-identical FFT
+/// output to the native NEON path. Not part of the public API — only
+/// exists so the test harness can call into the WASM bundle.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_fft2d_hash() -> String {
+    phasm_core::stego::armor::fft2d::fft2d_test_hash_hex()
+}

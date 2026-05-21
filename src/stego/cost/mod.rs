@@ -17,6 +17,7 @@
 #[cfg(test)]
 pub mod uerd;
 pub mod uniward;
+mod uniward_simd;
 
 // HEVC-specific cost modules — archived behind `hevc-archive` feature.
 
