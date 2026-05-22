@@ -32,6 +32,8 @@ pub mod frame;
 pub mod marker;
 pub mod scan;
 pub mod pixels;
+pub mod pixels_aan;
+pub mod pixels_aan_simd;
 
 use dct::DctGrid;
 use error::{JpegError, Result};

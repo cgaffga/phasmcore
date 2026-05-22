@@ -3,7 +3,7 @@ members = ["cli"]
 
 [package]
 name = "phasm-core"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
@@ -49,6 +49,15 @@ h264-encoder = ["video", "parallel", "simd"]
 # accidentally bypassed.
 cabac-stego = ["h264-encoder"]
 wasm = ["js-sys", "wasm-bindgen"]
+# T3.1 — integer fixed-point 8×8 DCT/IDCT (LL&M, libjpeg-turbo
+# `jfdctint.c` / `jidctint.c` port) shipped 2026-05-21 with NEON
+# (aarch64) + AVX2 (x86_64) + WASM SIMD128 + scalar paths, all
+# bit-exact (cross-platform SHA256 `8affcdb9…` matches on every arch).
+# Phase F removed the `aan-dct` feature gate; the integer LL&M
+# kernels are now always built and the f64 reference paths in
+# `pixels.rs` are retained ONLY for the SI-UNIWARD and basis-function
+# carve-outs (continuous-precision requirements). See
+# `docs/design/image/t3.1-integer-aan.md`.
 
 [dependencies]
 aes-gcm-siv = "0.11"
@@ -68,6 +77,17 @@ zeroize = "1"
 memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+# Dev-only deps. Used by the M1 memory-audit harness
+# (core/tests/perf_memory_audit.rs) to synthesize JPEG fixtures at
+# arbitrary MP without bundling huge binary blobs in test-vectors/.
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# libc for peak-RSS query in the 60 MP memory regression test
+# (`tests/optimizer_memory_60mp.rs`). POSIX `getrusage` via libc is
+# the cleanest cross-Unix way; non-Unix targets fall through with
+# RSS=0 (the test still gates wall time on those).
+libc = "0.2"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

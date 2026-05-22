@@ -2,34 +2,43 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! SIMD-accelerated kernels for the Ghost cover optimizer (T2.11d/e/f).
+//! SIMD-accelerated kernels for the Ghost cover optimizer.
 //!
-//! Path A pattern: each SIMD lane computes ONE output pixel's
-//! reduction. Within each lane the f64 mul + add sequence matches
-//! the scalar code's order exactly, so the per-lane result is
-//! bit-identical to the corresponding scalar output. No FMA, no
-//! cross-lane reductions. The dispatcher picks the architecture's
-//! native f64x2 SIMD; the result is byte-identical across all paths,
-//! validated by the `optimizer_cross_platform` SHA256 test.
+//! ## Phase C2 contract (2026-05-22)
+//!
+//! Per-platform deterministic; cross-platform bit-exactness no longer
+//! required after #678 confirmed no code derives keys/salts from
+//! optimizer output bytes (wire-format cross-platform decode is
+//! independent). This unlocks:
+//!
+//! - **f32x4 lanes**: 2× the throughput of the previous f64x2 path.
+//! - **NEON FMA** (`vfmaq_f32`): essentially free on Apple Silicon;
+//!   `acc + a*b` in one rounding step. Each platform may round
+//!   differently; that's fine under the new contract.
+//! - **WASM native f32x4**: WASM SIMD128's f64x2 was synthetic /
+//!   slow; f32x4 is the native lane width and 2-3× faster.
 //!
 //! ## Pre-conditioning
 //!
-//! Both the Gaussian blur kernels here use pre-padded planar f64
-//! buffers (one per channel, length `w + 2*radius`, clamp-to-edge
-//! extension). This eliminates the per-iteration `saturating_sub +
-//! min` branch the scalar code used and lets the SIMD loop be a flat
-//! sequence of contiguous loads.
+//! The Gaussian blur kernels use pre-padded planar f32 buffers (one
+//! per channel, length `w + 2*radius`, clamp-to-edge extension).
+//! This eliminates the per-iteration `saturating_sub + min` branch
+//! the scalar code used and lets the SIMD loop be a flat sequence of
+//! contiguous loads.
 //!
-//! ## Per-arch status (2026-05-21)
+//! ## Per-arch status (2026-05-22)
 //!
-//! - aarch64 NEON: f64x2 (`vmulq_f64` / `vaddq_f64`) ✅ T2.11d
-//! - x86_64 SSE2 baseline: f64x2 (`_mm_mul_pd` / `_mm_add_pd`) ✅ T2.11d
-//! - WASM SIMD128: f64x2 (`f64x2_mul` / `f64x2_add`) ✅ T2.11d
-//! - Other archs: scalar fallback (bit-identical reference)
+//! - aarch64 NEON: f32x4 with FMA (`vfmaq_f32`)
+//! - x86_64 SSE2 baseline: f32x4 (`_mm_mul_ps` / `_mm_add_ps`). FMA3
+//!   intentionally skipped; gain is small (+5-10%) on a non-critical
+//!   dev/CLI path.
+//! - WASM SIMD128: f32x4 (`f32x4_mul` / `f32x4_add`). Relaxed-simd
+//!   FMA not yet stable enough to depend on.
+//! - Other archs: scalar fallback in f32.
 
 /// SIMD-aware Gaussian blur horizontal pass for a single row.
 ///
-/// `padded_row` must hold one channel's `w + 2*radius` f64 samples
+/// `padded_row` must hold one channel's `w + 2*radius` f32 samples
 /// in contiguous memory (clamp-to-edge extension already applied).
 /// `kernel` is the normalized 1D Gaussian kernel of length
 /// `kernel_size = 2*radius + 1`. Writes the blurred `w` output
@@ -40,8 +49,8 @@
 /// (RGB interleaved).
 #[inline]
 pub(super) fn blur_row_h(
-    padded_row: &[f64],
-    kernel: &[f64],
+    padded_row: &[f32],
+    kernel: &[f32],
     radius: usize,
     w: usize,
     dst: &mut [u8],
@@ -57,7 +66,7 @@ pub(super) fn blur_row_h(
         blur_row_h_neon(padded_row, kernel, radius, w, dst, dst_offset_bytes, dst_stride_bytes);
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     unsafe {
         blur_row_h_sse(padded_row, kernel, radius, w, dst, dst_offset_bytes, dst_stride_bytes);
     }
@@ -69,7 +78,7 @@ pub(super) fn blur_row_h(
 
     #[cfg(not(any(
         target_arch = "aarch64",
-        all(target_arch = "x86_64", target_feature = "sse4.1"),
+        all(target_arch = "x86_64", target_feature = "sse2"),
         all(target_arch = "wasm32", target_feature = "simd128"),
     )))]
     blur_row_h_scalar(padded_row, kernel, radius, w, dst, dst_offset_bytes, dst_stride_bytes);
@@ -77,8 +86,8 @@ pub(super) fn blur_row_h(
 
 #[inline]
 pub(super) fn blur_row_h_scalar(
-    padded_row: &[f64],
-    kernel: &[f64],
+    padded_row: &[f32],
+    kernel: &[f32],
     _radius: usize,
     w: usize,
     dst: &mut [u8],
@@ -87,7 +96,7 @@ pub(super) fn blur_row_h_scalar(
 ) {
     let kernel_size = kernel.len();
     for x in 0..w {
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for k in 0..kernel_size {
             acc += padded_row[x + k] * kernel[k];
         }
@@ -96,13 +105,13 @@ pub(super) fn blur_row_h_scalar(
     }
 }
 
-// ─── aarch64 NEON ───────────────────────────────────────────────
+// ─── aarch64 NEON f32x4 with FMA ────────────────────────────────
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn blur_row_h_neon(
-    padded_row: &[f64],
-    kernel: &[f64],
+    padded_row: &[f32],
+    kernel: &[f32],
     _radius: usize,
     w: usize,
     dst: &mut [u8],
@@ -114,31 +123,35 @@ unsafe fn blur_row_h_neon(
     let pr = padded_row.as_ptr();
 
     let mut x = 0;
-    // f64x2 lane-parallel: 2 output pixels per iteration. Per lane,
-    // the 7-tap acc is computed in the SAME f64 op sequence as the
-    // scalar code (no cross-lane reduction, no FMA).
-    while x + 2 <= w {
-        let mut acc = vdupq_n_f64(0.0);
+    // f32x4 lane-parallel: 4 output pixels per iteration with FMA.
+    // `vfmaq_f32(acc, a, b)` = acc + a*b in one rounded op. Cheaper
+    // than separate mul+add on aarch64 and produces (slightly)
+    // different rounding than the scalar path — fine under the
+    // C2 per-platform-deterministic contract.
+    while x + 4 <= w {
+        let mut acc = vdupq_n_f32(0.0);
         for k in 0..kernel_size {
-            let kv = vdupq_n_f64(kernel[k]); // broadcast scalar to both lanes
-            let inv = vld1q_f64(pr.add(x + k)); // [padded[x+k], padded[x+k+1]]
-            let prod = vmulq_f64(inv, kv);
-            acc = vaddq_f64(acc, prod);
+            let kv = vdupq_n_f32(kernel[k]);
+            let inv = vld1q_f32(pr.add(x + k));
+            acc = vfmaq_f32(acc, inv, kv);
         }
-        // Lane-wise: round + clamp + cast to u8.
-        let lane0 = vgetq_lane_f64::<0>(acc);
-        let lane1 = vgetq_lane_f64::<1>(acc);
-        dst[x * dst_stride_bytes + dst_offset_bytes] =
-            lane0.round().clamp(0.0, 255.0) as u8;
-        dst[(x + 1) * dst_stride_bytes + dst_offset_bytes] =
-            lane1.round().clamp(0.0, 255.0) as u8;
-        x += 2;
+        let l0 = vgetq_lane_f32::<0>(acc);
+        let l1 = vgetq_lane_f32::<1>(acc);
+        let l2 = vgetq_lane_f32::<2>(acc);
+        let l3 = vgetq_lane_f32::<3>(acc);
+        dst[x * dst_stride_bytes + dst_offset_bytes] = l0.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 1) * dst_stride_bytes + dst_offset_bytes] = l1.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 2) * dst_stride_bytes + dst_offset_bytes] = l2.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 3) * dst_stride_bytes + dst_offset_bytes] = l3.round().clamp(0.0, 255.0) as u8;
+        x += 4;
     }
-    // Scalar tail (at most 1 pixel).
+    // Scalar tail (at most 3 pixels). Uses FMA-equivalent
+    // `f32::mul_add` so the boundary pixels round the same way the
+    // SIMD lanes do.
     while x < w {
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for k in 0..kernel_size {
-            acc += padded_row[x + k] * kernel[k];
+            acc = padded_row[x + k].mul_add(kernel[k], acc);
         }
         dst[x * dst_stride_bytes + dst_offset_bytes] =
             acc.round().clamp(0.0, 255.0) as u8;
@@ -146,13 +159,13 @@ unsafe fn blur_row_h_neon(
     }
 }
 
-// ─── x86_64 SSE2 ────────────────────────────────────────────────
+// ─── x86_64 SSE2 f32x4 (no FMA3 per C2 scope) ───────────────────
 
-#[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
 #[target_feature(enable = "sse2")]
 unsafe fn blur_row_h_sse(
-    padded_row: &[f64],
-    kernel: &[f64],
+    padded_row: &[f32],
+    kernel: &[f32],
     _radius: usize,
     w: usize,
     dst: &mut [u8],
@@ -164,24 +177,24 @@ unsafe fn blur_row_h_sse(
     let pr = padded_row.as_ptr();
 
     let mut x = 0;
-    while x + 2 <= w {
-        let mut acc = _mm_setzero_pd();
+    while x + 4 <= w {
+        let mut acc = _mm_setzero_ps();
         for k in 0..kernel_size {
-            let kv = _mm_set1_pd(kernel[k]);
-            let inv = _mm_loadu_pd(pr.add(x + k));
-            let prod = _mm_mul_pd(inv, kv);
-            acc = _mm_add_pd(acc, prod);
+            let kv = _mm_set1_ps(kernel[k]);
+            let inv = _mm_loadu_ps(pr.add(x + k));
+            let prod = _mm_mul_ps(inv, kv);
+            acc = _mm_add_ps(acc, prod);
         }
-        let mut lanes = [0.0f64; 2];
-        _mm_storeu_pd(lanes.as_mut_ptr(), acc);
-        dst[x * dst_stride_bytes + dst_offset_bytes] =
-            lanes[0].round().clamp(0.0, 255.0) as u8;
-        dst[(x + 1) * dst_stride_bytes + dst_offset_bytes] =
-            lanes[1].round().clamp(0.0, 255.0) as u8;
-        x += 2;
+        let mut lanes = [0.0f32; 4];
+        _mm_storeu_ps(lanes.as_mut_ptr(), acc);
+        for i in 0..4 {
+            dst[(x + i) * dst_stride_bytes + dst_offset_bytes] =
+                lanes[i].round().clamp(0.0, 255.0) as u8;
+        }
+        x += 4;
     }
     while x < w {
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for k in 0..kernel_size {
             acc += padded_row[x + k] * kernel[k];
         }
@@ -191,13 +204,13 @@ unsafe fn blur_row_h_sse(
     }
 }
 
-// ─── WASM SIMD128 ───────────────────────────────────────────────
+// ─── WASM SIMD128 f32x4 (native, was synthetic f64x2 pre-C2) ────
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 unsafe fn blur_row_h_wasm(
-    padded_row: &[f64],
-    kernel: &[f64],
+    padded_row: &[f32],
+    kernel: &[f32],
     _radius: usize,
     w: usize,
     dst: &mut [u8],
@@ -209,24 +222,26 @@ unsafe fn blur_row_h_wasm(
     let pr = padded_row.as_ptr();
 
     let mut x = 0;
-    while x + 2 <= w {
-        let mut acc = f64x2_splat(0.0);
+    while x + 4 <= w {
+        let mut acc = f32x4_splat(0.0);
         for k in 0..kernel_size {
-            let kv = f64x2_splat(kernel[k]);
+            let kv = f32x4_splat(kernel[k]);
             let inv = v128_load(pr.add(x + k) as *const v128);
-            let prod = f64x2_mul(inv, kv);
-            acc = f64x2_add(acc, prod);
+            let prod = f32x4_mul(inv, kv);
+            acc = f32x4_add(acc, prod);
         }
-        let lane0 = f64x2_extract_lane::<0>(acc);
-        let lane1 = f64x2_extract_lane::<1>(acc);
-        dst[x * dst_stride_bytes + dst_offset_bytes] =
-            lane0.round().clamp(0.0, 255.0) as u8;
-        dst[(x + 1) * dst_stride_bytes + dst_offset_bytes] =
-            lane1.round().clamp(0.0, 255.0) as u8;
-        x += 2;
+        let l0 = f32x4_extract_lane::<0>(acc);
+        let l1 = f32x4_extract_lane::<1>(acc);
+        let l2 = f32x4_extract_lane::<2>(acc);
+        let l3 = f32x4_extract_lane::<3>(acc);
+        dst[x * dst_stride_bytes + dst_offset_bytes] = l0.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 1) * dst_stride_bytes + dst_offset_bytes] = l1.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 2) * dst_stride_bytes + dst_offset_bytes] = l2.round().clamp(0.0, 255.0) as u8;
+        dst[(x + 3) * dst_stride_bytes + dst_offset_bytes] = l3.round().clamp(0.0, 255.0) as u8;
+        x += 4;
     }
     while x < w {
-        let mut acc = 0.0f64;
+        let mut acc = 0.0f32;
         for k in 0..kernel_size {
             acc += padded_row[x + k] * kernel[k];
         }
@@ -383,10 +398,10 @@ mod tests {
         let mut s = seed;
         let mut next = || {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            ((s as i32) as f64) / (i32::MAX as f64)
+            ((s as i32) as f32) / (i32::MAX as f32)
         };
-        let padded: Vec<f64> = (0..w + 2 * radius).map(|_| next() * 255.0).collect();
-        let kernel: Vec<f64> = (0..kernel_size).map(|_| next().abs()).collect();
+        let padded: Vec<f32> = (0..w + 2 * radius).map(|_| next() * 255.0).collect();
+        let kernel: Vec<f32> = (0..kernel_size).map(|_| next().abs()).collect();
         let stride = 3;
 
         let mut dst_scalar = vec![0u8; w * stride];
@@ -395,13 +410,17 @@ mod tests {
         let mut dst_dispatch = vec![0u8; w * stride];
         blur_row_h(&padded, &kernel, radius, w, &mut dst_dispatch, 0, stride);
 
+        // C2 contract: per-platform deterministic, not bit-exact
+        // dispatch-vs-scalar (NEON FMA rounds differently than the
+        // separate mul+add the scalar path uses). Allow up to ±1 u8
+        // difference at any pixel — well under the optimizer's
+        // existing 1-2 ULP boundary tolerance.
         for x in 0..w {
-            assert_eq!(
-                dst_scalar[x * stride],
-                dst_dispatch[x * stride],
-                "seed={seed} w={w} x={x}: scalar={} dispatch={}",
-                dst_scalar[x * stride],
-                dst_dispatch[x * stride],
+            let a = dst_scalar[x * stride] as i32;
+            let b = dst_dispatch[x * stride] as i32;
+            assert!(
+                (a - b).abs() <= 1,
+                "seed={seed} w={w} x={x}: scalar={a} dispatch={b} (diff > 1)"
             );
         }
     }

@@ -64,6 +64,33 @@ pub struct DecodedCoverPosition {
     /// Channel tag set by the W3.D.3 site patches in `recon_tmpl.c`:
     /// `DAV1D_PHASM_TAG_OTHER` / `_AC_COEFF_SIGN` / `_GOLOMB_TAIL_LSB`.
     pub tag: u8,
+    /// Phase B.1.1.b: spatial metadata. Only meaningful when
+    /// `tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN`; otherwise zero-init.
+    /// Mirror of encoder-side `phasm_rav1e::AcSignMeta` — used by
+    /// J-UNIWARD cost compute to map decoded cover bit to a
+    /// (plane, pixel-coord, TX-shape, scan-pos) tuple.
+    pub meta: core_dav1d_sys::Dav1dPhasmAcSignMeta,
+}
+
+/// Visible-region YUV planes extracted from the last decoded picture.
+/// Phase B.1.4 — required by the AoSO self-steganalyzer adapter to
+/// compute J-UNIWARD cost on the STEGO reconstruction (decoder-side),
+/// not the encoder's `recording.reconstructed_planes`. For natural
+/// covers the two coincide; for stego streams they differ at flipped
+/// positions because the residual reconstruction inverts there.
+///
+/// Width/height are visible dimensions (after dav1d crop). Chroma
+/// dimensions reflect 4:2:0 subsampling (the only layout we ship in
+/// v0.3..v0.6 — `assert!(layout == 1)` at extraction time).
+#[derive(Debug, Clone, Default)]
+pub struct DecodedFramePlanes {
+    pub y: Vec<u8>,
+    pub cb: Vec<u8>,
+    pub cr: Vec<u8>,
+    pub luma_width: usize,
+    pub luma_height: usize,
+    pub chroma_width: usize,
+    pub chroma_height: usize,
 }
 
 /// All L(1) cover positions decoded from one AV1 stream. Output of
@@ -71,6 +98,11 @@ pub struct DecodedCoverPosition {
 #[derive(Debug, Clone, Default)]
 pub struct DecodedCoverPositions {
     all: Vec<DecodedCoverPosition>,
+    /// Phase B.1.4: optional visible-region YUV. Populated by
+    /// [`decode_with_recording_with_pixels`]; the legacy
+    /// `decode_with_recording` leaves this `None` so existing tests
+    /// don't pay the pixel-copy cost.
+    pub planes: Option<DecodedFramePlanes>,
 }
 
 impl DecodedCoverPositions {
@@ -99,11 +131,17 @@ impl DecodedCoverPositions {
 #[derive(Default)]
 struct RecorderState {
     bits: Vec<(u8, u8)>, // (decoded_value, tag)
+    /// Phase B.1.1.b: sticky meta state. meta_hook_cb writes here;
+    /// bit_hook_cb reads here and zips into the (bit, tag, meta)
+    /// tuple per emission. Mirrors encoder-side phasm_current_meta.
+    current_meta: core_dav1d_sys::Dav1dPhasmAcSignMeta,
+    /// Phase B.1.1.b: per-emission meta, parallel to `bits`.
+    metas: Vec<core_dav1d_sys::Dav1dPhasmAcSignMeta>,
 }
 
 /// FFI callback wired into `Dav1dSettings.phasm_hooks.bit_hook`.
 /// Cast cookie back to `&mut RecorderState`, push the
-/// `(decoded_value, tag)` tuple.
+/// `(decoded_value, tag, meta)` tuple.
 ///
 /// # Safety
 ///
@@ -119,6 +157,30 @@ unsafe extern "C" fn bit_hook_cb(
 ) {
     let state = unsafe { &mut *(cookie as *mut RecorderState) };
     state.bits.push((bit as u8, tag));
+    // Phase B.1.1.b: pull the current sticky meta into the parallel
+    // Vec. Set by `meta_hook_cb` at AC sign sites; stale for non-AC
+    // emissions (acceptable — phasm-core only reads meta for AC).
+    state.metas.push(state.current_meta);
+}
+
+/// Phase B.1.1.b: FFI callback wired into
+/// `Dav1dSettings.phasm_hooks.meta_hook`. Fires at each AC sign
+/// decode site BEFORE the bit_hook_cb so the meta is in place when
+/// the bit is captured.
+///
+/// # Safety
+///
+/// Same as `bit_hook_cb`. `meta` is a pointer into dav1d's stack
+/// frame for the current decode_coefs call; we copy it out before
+/// returning.
+unsafe extern "C" fn meta_hook_cb(
+    cookie: *mut core::ffi::c_void,
+    meta: *const core_dav1d_sys::Dav1dPhasmAcSignMeta,
+) {
+    let state = unsafe { &mut *(cookie as *mut RecorderState) };
+    if !meta.is_null() {
+        state.current_meta = unsafe { *meta };
+    }
 }
 
 /// Decode an AV1 byte stream and capture all 50/50 binary emissions
@@ -140,8 +202,90 @@ unsafe extern "C" fn bit_hook_cb(
 pub fn decode_with_recording(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
+    decode_with_recording_inner(av1_bytes, false)
+}
+
+/// Phase B.1.4 variant: same as [`decode_with_recording`] but also
+/// extracts the last decoded picture's visible-region YUV planes via
+/// the [`Dav1dPictureView`] layout mirror. The returned positions
+/// have `planes = Some(_)` populated.
+///
+/// Used by the W6/AoSO self-steganalyzer to compute J-UNIWARD costs
+/// over stego-side reconstructed pixels (NOT the encoder's pre-flip
+/// recording, which would yield identical costs to cover and erase
+/// any signal).
+pub fn decode_with_recording_with_pixels(
+    av1_bytes: &[u8],
+) -> Result<DecodedCoverPositions, Av1DecodeError> {
+    decode_with_recording_inner(av1_bytes, true)
+}
+
+/// Layout mirror of dav1d's `Dav1dPicture` prefix (through
+/// `Dav1dPictureParameters p`). C declaration in
+/// `vendor/phasm-dav1d/include/dav1d/picture.h`:
+///
+/// ```c
+/// typedef struct Dav1dPicture {
+///     Dav1dSequenceHeader *seq_hdr;
+///     Dav1dFrameHeader *frame_hdr;
+///     void *data[3];
+///     ptrdiff_t stride[2];
+///     Dav1dPictureParameters p;  // { int w, h, layout, bpc }
+///     ...
+/// } Dav1dPicture;
+/// ```
+///
+/// We only need fields up through `p.bpc` (72 bytes on 64-bit). The
+/// outer `Dav1dPicture` opaque blob in dav1d-sys is 1024 bytes; we
+/// `&*(pic as *const Dav1dPictureView)` to read the prefix.
+///
+/// Layout match is implicit (C-stable public header); a sentinel
+/// extraction test in the integration suite verifies the planes
+/// decode to the expected content for the v0.3 corpus.
+#[repr(C)]
+struct Dav1dPictureView {
+    _seq_hdr: *mut core::ffi::c_void,
+    _frame_hdr: *mut core::ffi::c_void,
+    data: [*mut core::ffi::c_void; 3],
+    stride: [isize; 2],
+    p_w: i32,
+    p_h: i32,
+    p_layout: i32, // Dav1dPixelLayout: 0=MONO 1=I420 2=I422 3=I444
+    _p_bpc: i32,
+}
+
+/// Copy the visible region of one plane (luma or chroma) out of a
+/// dav1d picture into a packed Rust Vec. dav1d's plane buffers
+/// include left/top stride padding for filter taps; the visible
+/// region starts at `data + 0` in dav1d's interface (the padding is
+/// to the LEFT of `data` per the public-header convention).
+///
+/// # Safety
+/// `data` must be a valid non-null pointer into a live Dav1dPicture's
+/// plane buffer, `stride >= width`, and `width × height` bytes must
+/// be readable starting at `(data + row × stride)` for row ∈ [0, h).
+unsafe fn copy_plane(
+    data: *const u8,
+    stride: isize,
+    width: usize,
+    height: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let row_start = unsafe { data.offset(row as isize * stride) };
+        let slice = unsafe { core::slice::from_raw_parts(row_start, width) };
+        out.extend_from_slice(slice);
+    }
+    out
+}
+
+fn decode_with_recording_inner(
+    av1_bytes: &[u8],
+    capture_pixels: bool,
+) -> Result<DecodedCoverPositions, Av1DecodeError> {
     let mut recorder = RecorderState::default();
     let eagain = dav1d_err_again();
+    let mut captured_planes: Option<DecodedFramePlanes> = None;
 
     // SAFETY: `decode_with_recording` is the sole owner of the FFI
     // resources allocated below — they're created and freed within
@@ -165,6 +309,7 @@ pub fn decode_with_recording(
                 as *mut core::ffi::c_void,
             bit_hook: Some(bit_hook_cb),
             tag_hook: None, // not used for v0.3 recording
+            meta_hook: Some(meta_hook_cb), // Phase B.1.1.b
         };
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
@@ -208,9 +353,49 @@ pub fn decode_with_recording(
             let mut pic = Dav1dPicture::default();
             let rc = dav1d_get_picture(ctx, &mut pic);
             if rc == 0 {
-                // Got a picture; release it (we don't read the
-                // pixels — just need dav1d's flow to fire the hooks
-                // during decode).
+                // Phase B.1.4: if pixel capture is requested, read
+                // the visible YUV via the Dav1dPictureView layout
+                // mirror BEFORE unref. We keep the LAST picture
+                // we see — v0.3 is single-frame so this is fine.
+                if capture_pixels {
+                    let view = &*(&pic as *const Dav1dPicture as *const Dav1dPictureView);
+                    assert_eq!(
+                        view.p_layout, 1,
+                        "Phase B.1.4 only handles 4:2:0 (Dav1dPixelLayout I420 == 1), got {}",
+                        view.p_layout
+                    );
+                    let luma_w = view.p_w as usize;
+                    let luma_h = view.p_h as usize;
+                    let chroma_w = (luma_w + 1) / 2;
+                    let chroma_h = (luma_h + 1) / 2;
+                    let y = copy_plane(
+                        view.data[0] as *const u8,
+                        view.stride[0],
+                        luma_w,
+                        luma_h,
+                    );
+                    let cb = copy_plane(
+                        view.data[1] as *const u8,
+                        view.stride[1],
+                        chroma_w,
+                        chroma_h,
+                    );
+                    let cr = copy_plane(
+                        view.data[2] as *const u8,
+                        view.stride[1],
+                        chroma_w,
+                        chroma_h,
+                    );
+                    captured_planes = Some(DecodedFramePlanes {
+                        y,
+                        cb,
+                        cr,
+                        luma_width: luma_w,
+                        luma_height: luma_h,
+                        chroma_width: chroma_w,
+                        chroma_height: chroma_h,
+                    });
+                }
                 dav1d_picture_unref(&mut pic);
                 // Try for more pictures + send if we still have data.
                 continue;
@@ -234,19 +419,28 @@ pub fn decode_with_recording(
         dav1d_close(&mut ctx);
     }
 
-    // Convert raw (value, tag) tuples into structured positions.
+    // Convert raw (value, tag, meta) tuples into structured positions.
+    // Phase B.1.1.b: bits + metas Vecs are pushed in lockstep by
+    // bit_hook_cb (meta is current sticky state at bit-capture time).
+    debug_assert_eq!(
+        recorder.bits.len(),
+        recorder.metas.len(),
+        "decoder bit/meta length mismatch"
+    );
     let positions = recorder
         .bits
         .into_iter()
+        .zip(recorder.metas.into_iter())
         .enumerate()
-        .map(|(i, (value, tag))| DecodedCoverPosition {
+        .map(|(i, ((value, tag), meta))| DecodedCoverPosition {
             cursor: i as u64,
             decoded_value: value,
             tag,
+            meta,
         })
         .collect();
 
-    Ok(DecodedCoverPositions { all: positions })
+    Ok(DecodedCoverPositions { all: positions, planes: captured_planes })
 }
 
 #[cfg(test)]

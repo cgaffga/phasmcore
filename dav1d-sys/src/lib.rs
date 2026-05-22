@@ -77,6 +77,37 @@ pub type Dav1dPhasmBitHook =
 pub type Dav1dPhasmTagHook =
     Option<unsafe extern "C" fn(cookie: *mut core::ffi::c_void, tag: u8)>;
 
+/// Phase B.1.1.b: per-AC-sign-emission spatial metadata. Field
+/// layout MUST match `Dav1dPhasmAcSignMeta` in
+/// `vendor/phasm-dav1d/include/dav1d/dav1d.h` and the encoder-side
+/// `AcSignMeta` in `vendor/phasm-rav1e/src/ec.rs`.
+///
+/// Pixel coords are PER-PLANE (already chroma-subsampled). Used by
+/// phasm-core's J-UNIWARD cost computation to map cover bits to
+/// reconstructed-pixel patches.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dav1dPhasmAcSignMeta {
+    pub plane: u8,
+    pub plane_px_x: u16,
+    pub plane_px_y: u16,
+    pub tx_width_log2: u8,
+    pub tx_height_log2: u8,
+    pub tx_type: u8,
+    pub scan_pos: u16,
+}
+
+/// Meta-change callback. Fires from `dav1d_msac_phasm_set_meta` at
+/// each AC sign decode site BEFORE the actual sign bit decode.
+/// Only fires when `tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN` is about
+/// to be set.
+pub type Dav1dPhasmMetaHook = Option<
+    unsafe extern "C" fn(
+        cookie: *mut core::ffi::c_void,
+        meta: *const Dav1dPhasmAcSignMeta,
+    ),
+>;
+
 /// Hook registration struct — embedded in `Dav1dSettings` (and copied
 /// down through `Dav1dContext` to each `MsacContext` per
 /// `dav1d-hook-sites.md` § 5).
@@ -90,6 +121,8 @@ pub struct Dav1dPhasmHooks {
     pub cookie: *mut core::ffi::c_void,
     pub bit_hook: Dav1dPhasmBitHook,
     pub tag_hook: Dav1dPhasmTagHook,
+    /// Phase B.1.1.b addition.
+    pub meta_hook: Dav1dPhasmMetaHook,
 }
 
 // ABI verification helpers exposed by the shim. Each returns the

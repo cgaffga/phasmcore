@@ -31,6 +31,11 @@ pub mod h264_ddca;
 #[cfg(feature = "video")]
 pub mod h264_mvd_cost;
 
+// AV1 cost module (Phase B.1.2). Gated on av1-encoder so it's
+// available whenever the encoder side is.
+#[cfg(feature = "av1-encoder")]
+pub mod av1_uniward;
+
 /// Cost assigned to coefficients that must never be modified (f32 version).
 /// Using infinity ensures the Viterbi STC never selects these positions for flipping.
 pub const WET_COST: f32 = f32::INFINITY;

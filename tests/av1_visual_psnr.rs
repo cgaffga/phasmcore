@@ -70,10 +70,12 @@ const FIXTURES: &[Fixture] = &[
         quantizer: 30,
     },
     Fixture {
+        // Source is 1080×1920 PORTRAIT — encode at portrait dims
+        // (v0.4 hygiene re-baseline).
         name: "carplane",
         source: "Artlist_CarPlane.mp4",
-        width: 256,
-        height: 144,
+        width: 144,
+        height: 256,
         seek_s: 2.0,
         quantizer: 30,
     },

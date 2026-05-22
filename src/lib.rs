@@ -47,6 +47,12 @@ pub use stego::EncodeQuality;
 pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION, ARMOR_TARGET_DIMENSION};
 pub use stego::{PayloadData, FileEntry, compressed_payload_size};
 pub use stego::progress;
+pub use stego::memory;
+pub use stego::{
+    get_memory_budget, predict_peak_memory, select_ghost_shadow_rung,
+    set_memory_budget, set_telemetry_hook,
+    GhostShadowRung, ModeId, TelemetryEvent, TelemetryHook,
+};
 pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
 
 // H.264 (production) re-exports.

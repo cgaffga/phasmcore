@@ -237,6 +237,11 @@ pub fn rs_encode_blocks(payload: &[u8]) -> Vec<u8> {
 
 /// Compute syndromes S_0 .. S_{2t-1} for a received block (FCR=0).
 /// poly_eval treats received as highest-degree-first: r(x) = received[0]*x^{n-1} + ...
+///
+/// **Legacy implementation** — kept for the T3.5 bit-exact gate
+/// (`syndromes_fast_matches_legacy`). Production callers use
+/// [`compute_syndromes_fast`] / [`compute_syndromes_fast_n`].
+#[allow(dead_code)]
 fn compute_syndromes(received: &[u8]) -> Vec<u8> {
     let tab = gf_tables();
     let two_t = PARITY_LEN;
@@ -245,6 +250,100 @@ fn compute_syndromes(received: &[u8]) -> Vec<u8> {
         syndromes[i] = poly_eval(received, tab.exp[i]); // S_i = r(α^i)
     }
     syndromes
+}
+
+/// T3.5 — per-α^i GF(2^8) multiplication lookup tables.
+///
+/// `mul_tables[i][x]` = `gf_mul(x, α^i)` for i ∈ 0..MAX_PARITY_TABLES,
+/// x ∈ 0..256. Used by `compute_syndromes_fast_n` to evaluate each
+/// syndrome's Horner step with a single byte-table lookup instead
+/// of the two-lookups + add + final-lookup `gf_mul` chain. Sized to
+/// cover every parity_len phasm uses:
+///   - Armor [`PARITY_TIERS`]:        max 240
+///   - Shadow `SHADOW_PARITY_TIERS`:  max 128
+///   - Ring `RING_RS_PARITY`:         192
+///
+/// Memory: 256 × 256 = 64 KB allocated once per process via
+/// `OnceLock`. Larger than L1 (32–48 KB on most targets) but the
+/// inner-loop access pattern is `parity_len` strided reads per outer
+/// byte — the hardware prefetcher tracks it well, and the working
+/// set for typical parity_len=64 is only ~16 KB.
+struct SyndromeMulTables {
+    tables: Vec<[u8; 256]>, // length = MAX_PARITY_TABLES
+}
+
+const MAX_PARITY_TABLES: usize = 256;
+
+fn syndrome_mul_tables() -> &'static SyndromeMulTables {
+    use std::sync::OnceLock;
+    static T: OnceLock<SyndromeMulTables> = OnceLock::new();
+    T.get_or_init(|| {
+        let tab = gf_tables();
+        let mut tables: Vec<[u8; 256]> = Vec::with_capacity(MAX_PARITY_TABLES);
+        for i in 0..MAX_PARITY_TABLES {
+            let alpha_i = tab.exp[i]; // α^i
+            let mut row = [0u8; 256];
+            // Build a multiplication table for `(x) → gf_mul(x, α^i)`.
+            // gf_mul handles the x==0 case with an explicit early-return;
+            // mirror that here by leaving row[0] = 0.
+            if alpha_i != 0 {
+                let log_alpha_i = tab.log[alpha_i as usize] as usize;
+                for x in 1u16..256 {
+                    let log_sum = tab.log[x as usize] as usize + log_alpha_i;
+                    row[x as usize] = tab.exp[log_sum];
+                }
+            }
+            tables.push(row);
+        }
+        SyndromeMulTables { tables }
+    })
+}
+
+/// T3.5 — restructured `compute_syndromes` that evaluates all
+/// `parity_len` syndromes in parallel by swapping the outer/inner
+/// loop order. Each inner iteration reads one entry from a
+/// precomputed `α^i`-multiplication table and XORs the data byte,
+/// collapsing the 4-op `gf_mul` chain to a 1-op lookup. Same total
+/// scalar ops but ~3× faster in practice due to the simpler
+/// instruction sequence + better L1 locality of the per-α^i tables.
+///
+/// Bit-exact with the legacy `compute_syndromes` (gated by
+/// `syndromes_fast_matches_legacy`) — same XOR/lookup arithmetic,
+/// just reordered.
+fn compute_syndromes_fast_n(received: &[u8], parity_len: usize) -> Vec<u8> {
+    debug_assert!(parity_len <= MAX_PARITY_TABLES);
+    let tabs = syndrome_mul_tables();
+    let mut result = vec![0u8; parity_len];
+    for &coeff in received {
+        for i in 0..parity_len {
+            result[i] = tabs.tables[i][result[i] as usize] ^ coeff;
+        }
+    }
+    result
+}
+
+/// Default-parity variant — same as `compute_syndromes` (PARITY_LEN
+/// syndromes) but via the fast path.
+#[allow(dead_code)]
+fn compute_syndromes_fast(received: &[u8]) -> Vec<u8> {
+    compute_syndromes_fast_n(received, PARITY_LEN)
+}
+
+/// Perf-bench helpers (T3.5). doc-hidden, pub so the
+/// `perf_t35_syndromes` integration test can compare paths.
+#[doc(hidden)]
+pub fn perf_legacy_compute_syndromes(received: &[u8], parity_len: usize) -> Vec<u8> {
+    let tab = gf_tables();
+    let mut syndromes = vec![0u8; parity_len];
+    for i in 0..parity_len {
+        syndromes[i] = poly_eval(received, tab.exp[i]);
+    }
+    syndromes
+}
+
+#[doc(hidden)]
+pub fn perf_fast_compute_syndromes(received: &[u8], parity_len: usize) -> Vec<u8> {
+    compute_syndromes_fast_n(received, parity_len)
 }
 
 fn syndromes_are_zero(syndromes: &[u8]) -> bool {
@@ -661,13 +760,11 @@ pub fn rs_decode_with_parity(
 
     // Compute syndromes with the given parity length. T1.7 — skip
     // leading-zero padding (see `rs_decode` for the math identity);
-    // saves padding × parity_len poly_eval iterations.
-    let tab = gf_tables();
-    let mut syndromes = vec![0u8; parity_len];
+    // saves padding × parity_len poly_eval iterations. T3.5 — fast
+    // path collapses the inner gf_mul chain to a single byte-table
+    // lookup via per-α^i precomputed multiplication tables.
     let non_zero = &full_block[padding..];
-    for i in 0..parity_len {
-        syndromes[i] = poly_eval(non_zero, tab.exp[i]);
-    }
+    let syndromes = compute_syndromes_fast_n(non_zero, parity_len);
 
     if syndromes.iter().all(|&s| s == 0) {
         return Ok((received[..data_len].to_vec(), 0));
@@ -694,16 +791,10 @@ pub fn rs_decode_with_parity(
 
     // Verify syndromes are now zero. T1.7 — same `[padding..]`
     // optimization (corrected[..padding] is provably zero by the
-    // array_pos < padding rejection above).
-    let mut check_ok = true;
+    // array_pos < padding rejection above). T3.5 — same fast path.
     let non_zero = &corrected[padding..];
-    for i in 0..parity_len {
-        if poly_eval(non_zero, tab.exp[i]) != 0 {
-            check_ok = false;
-            break;
-        }
-    }
-    if !check_ok {
+    let post_syndromes = compute_syndromes_fast_n(non_zero, parity_len);
+    if post_syndromes.iter().any(|&s| s != 0) {
         return Err(RsDecodeError);
     }
 
@@ -805,6 +896,39 @@ mod tests {
         for a in 0..=255u16 {
             assert_eq!(gf_mul(a as u8, 0), 0);
             assert_eq!(gf_mul(0, a as u8), 0);
+        }
+    }
+
+    /// T3.5 — the restructured compute_syndromes_fast must produce
+    /// IDENTICAL syndromes to the legacy `compute_syndromes` /
+    /// `poly_eval`-per-i path across a range of parity_len values
+    /// and varied received vectors. Same XOR/lookup arithmetic, just
+    /// reordered → output is byte-exact.
+    #[test]
+    fn syndromes_fast_matches_legacy() {
+        // Deterministic varied vectors (LCG fill, different lengths).
+        let mut state: u32 = 0xCAFE_F00D;
+        let mut step = || -> u8 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        };
+
+        for &n in &[64usize, 128, 200, 255] {
+            let mut received = vec![0u8; n];
+            for v in &mut received {
+                *v = step();
+            }
+            for &parity_len in &[4usize, 8, 16, 32, 64, 128] {
+                let tab = gf_tables();
+                let legacy: Vec<u8> = (0..parity_len)
+                    .map(|i| poly_eval(&received, tab.exp[i]))
+                    .collect();
+                let fast = compute_syndromes_fast_n(&received, parity_len);
+                assert_eq!(
+                    legacy, fast,
+                    "n={n} parity_len={parity_len}: legacy != fast"
+                );
+            }
         }
     }
 

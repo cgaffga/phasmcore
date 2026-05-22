@@ -13,6 +13,10 @@ use std::sync::OnceLock;
 
 use crate::codec::jpeg::JpegImage;
 
+// T3.1.F — bulk pixel-domain helpers (`jpeg_to_luma_f64` /
+// `luma_f64_to_jpeg`) call the integer LL&M kernels directly.
+use crate::codec::jpeg::pixels_aan::{aan_dct_block as dct_block_active, aan_idct_block as idct_block_active};
+
 /// Pre-computed 8×8 cosine table for IDCT/DCT.
 /// `COSINE[u][x] = cos((2*x + 1) * u * PI / 16)`
 static COSINE: OnceLock<[[f64; 8]; 8]> = OnceLock::new();
@@ -205,7 +209,7 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
         for bc in 0..bw {
             let block = grid.block(br, bc);
             let quantized: [i16; 64] = block.try_into().unwrap();
-            let block_pixels = idct_block(&quantized, &qt_values);
+            let block_pixels = idct_block_active(&quantized, &qt_values);
             for row in 0..8 {
                 for col in 0..8 {
                     let px = bc * 8 + col;
@@ -321,7 +325,7 @@ pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut J
                 block_pixels[row * 8 + col] = pixels[py * width + px];
             }
         }
-        let quantized = dct_block(&block_pixels, &qt_values);
+        let quantized = dct_block_active(&block_pixels, &qt_values);
         block_coeffs.copy_from_slice(&quantized);
     };
 

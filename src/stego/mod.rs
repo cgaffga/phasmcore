@@ -27,6 +27,7 @@ pub mod permute;
 pub mod payload;
 pub mod progress;
 pub mod shadow_layer;
+pub mod memory;
 
 // --- Steganographic algorithms ---
 pub mod cost;
@@ -38,6 +39,11 @@ pub mod video;
 pub use error::StegoError;
 pub use ghost::quality;
 pub use ghost::quality::EncodeQuality;
+pub use memory::{
+    get_memory_budget, predict_peak_memory, select_ghost_shadow_rung,
+    set_memory_budget, set_telemetry_hook,
+    GhostShadowRung, ModeId, TelemetryEvent, TelemetryHook,
+};
 pub use ghost::optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
 #[doc(hidden)]
 pub use ghost::optimizer::optimizer_test_hash_hex;
@@ -182,8 +188,18 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let img = JpegImage::from_bytes(stego_bytes)?;
     let mut saw_decryption_failed = false;
 
+    // M5: real Armor / Fortress stego never naturally arrives larger
+    // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for Armor's
+    // recompression-survival design). Skip both attempts when input is
+    // larger — saves a full FFT pass at decode (~30-60s + ~16 bytes/px
+    // working set at 60 MP).
+    let fi = img.frame_info();
+    let max_dim = fi.width.max(fi.height) as u32;
+    let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
+
     // Try Fortress (fast, runs first inside armor_decode in pre-T1.5 path).
-    if img.num_components() > 0
+    if try_armor
+        && img.num_components() > 0
         && let Ok(result) = fortress::fortress_decode(&img, passphrase)
     {
         return Ok(result);
@@ -192,13 +208,15 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     // Try Armor STDM + Phase 3 (Phase 3 still re-parses internally for
     // geometric recovery — that path resamples the image, so it can't
     // reuse the original parse).
-    match armor_decode_no_fortress(&img, stego_bytes, passphrase) {
-        Ok(result) => return Ok(result),
-        Err(StegoError::DecryptionFailed) => {
-            saw_decryption_failed = true;
-        }
-        Err(_) => {
-            // Not Armor — try Ghost.
+    if try_armor {
+        match armor_decode_no_fortress(&img, stego_bytes, passphrase) {
+            Ok(result) => return Ok(result),
+            Err(StegoError::DecryptionFailed) => {
+                saw_decryption_failed = true;
+            }
+            Err(_) => {
+                // Not Armor — try Ghost.
+            }
         }
     }
 
@@ -277,6 +295,15 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let img = JpegImage::from_bytes(stego_bytes)?;
 
+    // M5: real Armor / Fortress stego never naturally arrives larger
+    // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for
+    // Armor's recompression-survival design). Skip both attempts when
+    // input is larger — saves a full FFT pass at decode (~30-60s and
+    // ~16 bytes/px working set at 60 MP).
+    let fi = img.frame_info();
+    let max_dim = fi.width.max(fi.height) as u32;
+    let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
+
     // T1.8 — compute shared Y-channel UNIWARD positions ONCE before the
     // rayon::join and clone for shadow. Avoids the 2× concurrent
     // compute_positions_streaming runs in the previous parallel
@@ -300,14 +327,20 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let (fortress_result, (stdm_result, (ghost_result, shadow_result))) = rayon::join(
         || {
-            if img.num_components() > 0 {
+            if try_armor && img.num_components() > 0 {
                 fortress::fortress_decode(&img, passphrase)
             } else {
                 Err(StegoError::FrameCorrupted)
             }
         },
         || rayon::join(
-            || armor_decode_no_fortress(&img, stego_bytes, passphrase),
+            || {
+                if try_armor {
+                    armor_decode_no_fortress(&img, stego_bytes, passphrase)
+                } else {
+                    Err(StegoError::FrameCorrupted)
+                }
+            },
             || rayon::join(
                 || match shared_positions {
                     Some(p) => ghost::pipeline::ghost_decode_from_image_with_positions(&img, passphrase, p),

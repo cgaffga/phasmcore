@@ -279,7 +279,19 @@ fn run_corpus_roundtrip(spec: &Fixture, message: &[u8], passphrase: &str) -> Cor
 
 /// Fail with a clear message when `measured` is more than `pct_tol`%
 /// away from `baseline`. Includes the relative drift in the panic.
+///
+/// `baseline == 0` is treated as "re-baseline mode" — the assertion
+/// is skipped, the measured value is printed, and the test passes.
+/// Use this when changing fixture dims or quantizer, then update the
+/// `Fixture` struct's `baseline_*` fields with the printed values.
 fn assert_within_pct(fixture: &str, field: &str, measured: f64, baseline: f64, pct_tol: f64) {
+    if baseline == 0.0 {
+        eprintln!(
+            "[av1-corpus] {} {} = {:.0} (RE-BASELINE MODE — paste this into Fixture struct)",
+            fixture, field, measured
+        );
+        return;
+    }
     let drift_pct = ((measured - baseline) / baseline) * 100.0;
     if drift_pct.abs() > pct_tol {
         panic!(
@@ -313,16 +325,20 @@ fn corpus_av1_iphone_img4138() {
 /// distributions.
 #[test]
 fn corpus_av1_carplane() {
+    // Source is 1080×1920 PORTRAIT. Encoding at portrait dims
+    // (144×256 = exact 9:16 aspect, same pixel count as 256×144
+    // landscape) preserves source composition instead of squashing
+    // horizontally. v0.4 hygiene re-baseline (was 256×144 landscape).
     let spec = Fixture {
         name: "carplane",
         source: "Artlist_CarPlane.mp4",
-        width: 256,
-        height: 144,
+        width: 144,
+        height: 256,
         seek_s: 2.0,
         quantizer: 30,
-        baseline_natural_bytes: 12220,
-        baseline_cover_bits_ac_sign: 17880,
-        baseline_cover_bits_total: 24725,
+        baseline_natural_bytes: 13035,
+        baseline_cover_bits_ac_sign: 19300,
+        baseline_cover_bits_total: 26360,
     };
     run_corpus_roundtrip(&spec, b"hi from av1 stego (carplane)", "corpus-pass-2");
 }

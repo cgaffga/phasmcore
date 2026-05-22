@@ -34,6 +34,34 @@ use phasm_core::{
 
 const ALLOWED_HOSTS: &[&str] = &["phasm.app", "phasm.link", "localhost", "127.0.0.1"];
 
+/// Browser tab memory ceiling for the rung selector. 800 MB chosen as
+/// a compromise: Safari mobile gets the most aggressive degradation
+/// (~1.5 GB tab limit on iPhone with browser overhead); Chrome/Firefox
+/// desktop have more headroom but extreme-MP cases still benefit
+/// from the streaming ladder. See
+/// `docs/design/image/memory-budget-2026-05.md` § 8 Phase 3.
+const WASM_DEFAULT_MEMORY_BUDGET_BYTES: usize = 800 * 1024 * 1024;
+
+/// Initialization hook — wasm-bindgen invokes this automatically on
+/// module load. Sets the default 800 MB memory budget so the rung
+/// selector kicks in on big images without the JS caller having to
+/// remember.
+#[wasm_bindgen(start)]
+pub fn wasm_init() {
+    phasm_core::set_memory_budget(Some(WASM_DEFAULT_MEMORY_BUDGET_BYTES));
+}
+
+/// Override the default memory budget. Pass `0` to disable.
+///
+/// JS callers can use this when running on a host they know has
+/// different memory characteristics — but the default 800 MB is
+/// suitable for production browser tabs.
+#[wasm_bindgen]
+pub fn set_memory_budget(bytes: u64) {
+    let opt = if bytes == 0 { None } else { Some(bytes as usize) };
+    phasm_core::set_memory_budget(opt);
+}
+
 fn check_domain() -> Result<(), JsError> {
     let hostname = js_sys::eval("globalThis.location?.hostname || ''")
         .unwrap_or(JsValue::from_str(""))
@@ -812,4 +840,36 @@ pub fn __test_spread_dot_hash() -> String {
 #[doc(hidden)]
 pub fn __test_fft2d_hash() -> String {
     phasm_core::stego::armor::fft2d::fft2d_test_hash_hex()
+}
+
+/// T3.1.C.3 / E — Cross-platform empirical AAN DCT/IDCT byte-equivalence
+/// hook. Returns the lowercase-hex SHA256 of the deterministic 12-block
+/// LL&M DCT/IDCT output. Expected value (recorded on aarch64 NEON):
+/// `8affcdb98021d23b1c1ef536f782610f229fac187360f02722bb3470db8446d5`.
+/// Verifies WASM SIMD128 produces bit-identical output to NEON + AVX2 +
+/// scalar paths.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_aan_hash() -> String {
+    phasm_core::codec::jpeg::pixels_aan::aan_test_hash_hex()
+}
+
+/// T3.1.E debug — returns the SHA256 of the SCALAR-explicit path (bypassing
+/// SIMD dispatch). Used to confirm the SIMD path is being exercised (the
+/// returned hash should match the canonical aarch64 NEON pin
+/// `8affcdb9…`); if `__test_aan_hash` differs from this scalar value, the
+/// WASM SIMD kernel has diverged.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_aan_hash_scalar() -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = phasm_core::codec::jpeg::pixels_aan::aan_test_deterministic_bytes_scalar();
+    let mut h = Sha256::new();
+    h.update(&bytes);
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
 }

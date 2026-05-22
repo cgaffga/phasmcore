@@ -97,6 +97,28 @@ fn main() {
             // (W3.D shipped), license posture, sibling-fork links.
             // No source change.
             "8966e7226ed4380cb04e2b517db56d5c1d4e83d3",
+            // 2026-05-21: Phase B.1.1.b — Dav1dPhasmAcSignMeta +
+            // meta_hook + recon_tmpl.c capture sites. Decoder-side
+            // counterpart of phasm-rav1e d97cdd62 (encoder-side
+            // AcSignMeta capture). Cross-side strict parity test in
+            // av1_bit_meta_parity (phasm-core).
+            "54fda92adeb535634f15969bccb55c2de6a641c9",
+            // 2026-05-21: Phase B.2.2 — set meta before DC golomb
+            // tail tag (qmatrix + no-qmatrix paths). Closes stale-
+            // meta bug that would break joint Tier 1 cost compute
+            // once B.2.3 enrolls golomb tail in the STC.
+            "70800f10b246ed81411ce7fc9df1b9f6eef680e1",
+            // 2026-05-21: Phase B.2.3.proper — read_golomb_lsb_tagged
+            // helper + 4 call sites. Tags ONLY the literal LSB bit as
+            // GOLOMB_TAIL_LSB (leading zeros + non-LSB literals get
+            // OTHER), so the joint Tier 1 STC cover vector only
+            // contains bits safe to flip ±1.
+            "3fb3cc3c1677613b7303e2e1d0d68a5cdc948079",
+            // 2026-05-22: same Phase B.1.1.b + B.2.2 + B.2.3.proper
+            // content, rebased onto origin/phasm-stego's README commit
+            // (8966e722) prior to push. Identical hook surface;
+            // different SHA due to rebase.
+            "8a8db27fc33d648962bf65b3b1d4813d9a7c1d0e",
         ];
 
         // phasm-rav1e PINNED_SHAS (parallel pin list — documentation

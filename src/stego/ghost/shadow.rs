@@ -66,6 +66,7 @@ use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute::CoeffPos;
+use crate::stego::progress;
 use super::pipeline::{flat_get, flat_set};
 use crate::stego::shadow_layer::{
     build_shadow_frame, parse_shadow_frame, peek_shadow_fdl, SHADOW_FRAME_OVERHEAD_V1,
@@ -480,10 +481,38 @@ pub fn shadow_extract(
             }
         }
 
-        let result = combos.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
-            let lsbs = &fraction_lsbs[fi].1;
-            try_single_fdl(lsbs, fdl, parity_len, passphrase)
-        });
+        // T3 progress instrumentation — split the worst-case ~3000-
+        // 6000 combo brute-force into batches and emit one progress
+        // step per batch. Each batch still uses par_iter.find_map_first
+        // so first-hit short-circuit is preserved within a batch;
+        // between batches we check for cancellation and emit a
+        // visible progress tick. Eliminates the 1-3 s dark stretch
+        // that the user saw at the end of a wrong-pass smart_decode.
+        const SHADOW_BRUTE_BATCHES: usize = 32;
+        let total_combos = combos.len();
+        let batch_size = total_combos.div_ceil(SHADOW_BRUTE_BATCHES).max(1);
+        let mut emitted_steps: u32 = 0;
+        let mut result: Option<Result<PayloadData, StegoError>> = None;
+        for batch in combos.chunks(batch_size) {
+            progress::check_cancelled().ok();
+            let hit = batch.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
+                let lsbs = &fraction_lsbs[fi].1;
+                try_single_fdl(lsbs, fdl, parity_len, passphrase)
+            });
+            progress::advance();
+            emitted_steps += 1;
+            if hit.is_some() {
+                result = hit;
+                break;
+            }
+        }
+        // Drain any remaining steps if we short-circuited early so
+        // the bar reaches its budgeted ceiling (advance() is capped
+        // at total-1 anyway, but make the intent explicit).
+        while emitted_steps < SHADOW_BRUTE_BATCHES as u32 {
+            progress::advance();
+            emitted_steps += 1;
+        }
 
         match result {
             Some(ok_or_err) => ok_or_err,

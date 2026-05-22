@@ -1,5 +1,12 @@
 Last updated: 2026-05-21.
 
+(Updated for T3.1 — integer LL&M DCT/IDCT shipped 2026-05-21. New
+attributions appear under GROUP 8 at the bottom of this file:
+libjpeg-turbo SIMD ports (BSD-3-Clause + IJG clause-2) and
+`naoto256/jpeg-rusturbo` v0.3.0 NEON+AVX2 reference (MIT/Apache-2.0).
+These cover ported algorithmic content; the ports themselves are
+GPL-3.0-only under the phasm umbrella.)
+
 This file lists the licenses of third-party Rust crate dependencies of
 phasm-core (and its companion phasm-cli). The list reflects the
 transitive dependency tree built with the full feature set
@@ -206,3 +213,84 @@ just as they apply to the pure-Rust `h264-encoder` path.
 
 This patent-pool obligation is not a software license and is
 listed here for transparency only.
+
+===============================================================================
+GROUP 8 — T3.1 integer LL&M DCT/IDCT ports (BSD-3-Clause + IJG + MIT/Apache)
+
+phasm's `core/src/codec/jpeg/pixels_aan.rs` (scalar LL&M kernels) and
+`core/src/codec/jpeg/pixels_aan_simd.rs` (NEON + AVX2 + WASM SIMD128
+kernels) are derived from two upstream sources. Both are
+GPL-3.0-compatible and re-distributable under the phasm-core GPL-3
+umbrella.
+
+(a) libjpeg-turbo
+    https://github.com/libjpeg-turbo/libjpeg-turbo
+
+    The Loeffler-Ligtenberg-Moschytz integer "slow" DCT algorithm,
+    constants (12 FIX_* values at Q13 precision), and the algebraic
+    refactorings used by the NEON IDCT and the AVX2 DCT/IDCT kernels
+    are translated directly from these libjpeg-turbo upstream source
+    files:
+
+      simd/arm/jfdctint-neon.c       (BSD-3-Clause)
+      simd/arm/jidctint-neon.c       (zlib-style, see file header)
+      simd/x86_64/jfdctint-avx2.asm  (BSD-3-Clause)
+      simd/x86_64/jidctint-avx2.asm  (BSD-3-Clause)
+
+    libjpeg-turbo's overall distribution uses a triple license
+    (BSD-3-Clause + IJG + zlib, per file). The translated content
+    above is BSD-3-Clause (jfdctint-neon.c, both x86_64 .asm files)
+    and zlib-style (jidctint-neon.c — copyright Arm Limited / D. R.
+    Commander, identical conditions to BSD-3-Clause modulo wording).
+
+    IJG license clause 2 (acknowledgement) requires the following
+    notice on any product derived from this work:
+
+        "This software is based in part on the work of the Independent
+         JPEG Group."
+
+    See https://github.com/libjpeg-turbo/libjpeg-turbo/blob/main/LICENSE.md
+    for the full upstream license document.
+
+(b) naoto256/jpeg-rusturbo v0.3.0 (commit 2383e332)
+    https://github.com/naoto256/jpeg-rusturbo
+    License: MIT OR Apache-2.0
+
+    The phasm NEON fdct kernel (`fdct_kernel_neon`) was translated
+    from this crate's `src/arch/neon.rs::fdct_islow_inner`. The phasm
+    AVX2 fdct kernel (`fdct_kernel_avx2`) was translated from its
+    `src/arch/x86_64.rs::fdct_avx2`. Each port adapts the upstream
+    intrinsic structure to phasm style (snake_case names, our
+    descale macro, our wrapper API). jpeg-rusturbo itself
+    re-attributes libjpeg-turbo per its own NOTICE.md; the two
+    chains coincide for the SIMD content phasm ships.
+
+    The MIT license text (re-used here under MIT at our option per
+    "MIT OR Apache-2.0"):
+
+        Copyright (c) 2026 jpeg-rusturbo authors.
+
+        Permission is hereby granted, free of charge, to any person
+        obtaining a copy of this software and associated documentation
+        files (the "Software"), to deal in the Software without
+        restriction, including without limitation the rights to use,
+        copy, modify, merge, publish, distribute, sublicense, and/or
+        sell copies of the Software, and to permit persons to whom the
+        Software is furnished to do so, subject to the following
+        conditions:
+
+        The above copyright notice and this permission notice shall
+        be included in all copies or substantial portions of the
+        Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+        KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+        WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+        PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS
+        OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+        OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+        OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+        SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The BSD-3-Clause license text under "GROUP 5 / 6 / 7 shared block"
+above also applies to the libjpeg-turbo ported content.

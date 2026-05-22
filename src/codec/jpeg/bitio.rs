@@ -115,6 +115,23 @@ impl<'a> BitReader<'a> {
     }
 
     fn fill_byte(&mut self) -> Result<()> {
+        // #689 fix (2026-05-22): once a non-stuffing marker (EOI, RST,
+        // any non-FF/00 byte after FF) has been consumed, the rest of
+        // the scan stream is logically infinite 0xFF (1-bit) padding.
+        // libjpeg, libjpeg-turbo, mozjpeg all do this — it lets the
+        // Huffman decoder finish whatever code it was reading, and the
+        // outer MCU loop terminates naturally at the next iteration
+        // boundary. Previously this returned UnexpectedEof on the
+        // SECOND post-marker fill, which broke ~10% of phasm-encoded
+        // baseline JPEGs at the last MCU (when the byte-boundary
+        // padding bits happened to form the prefix of a long Huffman
+        // code).
+        if self.marker_found.is_some() {
+            self.buf = (self.buf << 8) | 0xFF;
+            self.bits_left += 8;
+            return Ok(());
+        }
+
         if self.pos >= self.data.len() {
             return Err(JpegError::UnexpectedEof);
         }
@@ -130,10 +147,11 @@ impl<'a> BitReader<'a> {
                 // Byte-stuffed 0xFF
                 self.pos += 1;
             } else {
-                // This is a marker — signal it
+                // This is a marker — signal it. Subsequent fill_byte
+                // calls return 0xFF padding (see top of function) so
+                // the decoder can finish its current Huffman code.
                 self.marker_found = Some(next);
                 self.pos += 1;
-                // Treat as zero-fill for remaining reads
                 self.buf = (self.buf << 8) | 0xFF;
                 self.bits_left += 8;
                 return Ok(());

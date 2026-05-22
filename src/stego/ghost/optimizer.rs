@@ -142,8 +142,11 @@ pub fn optimize_cover(
 /// Returns `(noise_factor, contrast_factor, sharpen_factor, dither_factor)`,
 /// each in [0.0, 1.0]. A factor of 0.0 means "skip this stage entirely"
 /// (image already has plenty of that characteristic). 1.0 means "apply fully".
+///
+/// M9.5.C1 (2026-05-22) — Takes `&[u8]` luma + `&[u16]` variance to
+/// match the type-narrowed buffers. Internal math stays f64.
 #[cfg(test)]
-fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, f64, f64, f64) {
+fn analyze_texture(luma: &[u8], variance: &[u16], w: usize, h: usize) -> (f64, f64, f64, f64) {
     let n = w * h;
     if n == 0 {
         return (1.0, 1.0, 1.0, 1.0);
@@ -153,7 +156,7 @@ fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, 
     //    Low variance (< 50) = smooth image, needs lots of noise → factor ~1.0
     //    Medium variance (50-300) = some texture → moderate noise
     //    High variance (> 600) = already noisy → skip noise
-    let mean_variance: f64 = variance.iter().sum::<f64>() / n as f64;
+    let mean_variance: f64 = variance.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
     let noise_factor = adaptive_scale(mean_variance, 50.0, 600.0);
 
     // 2. Contrast factor: based on proportion of pixels with low local contrast.
@@ -162,8 +165,8 @@ fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, 
     for y in 1..h {
         for x in 1..w {
             let idx = y * w + x;
-            let dy = (luma[idx] - luma[(y - 1) * w + x]).abs();
-            let dx = (luma[idx] - luma[y * w + (x - 1)]).abs();
+            let dy = (luma[idx] as f64 - luma[(y - 1) * w + x] as f64).abs();
+            let dx = (luma[idx] as f64 - luma[y * w + (x - 1) as usize] as f64).abs();
             let grad = dy + dx;
             if grad < 3.0 {
                 low_contrast_count += 1;
@@ -188,10 +191,12 @@ fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, 
     for y in 1..h.saturating_sub(1) {
         for x in 1..w.saturating_sub(1) {
             let idx = y * w + x;
-            let center = luma[idx];
+            let center = luma[idx] as f64;
             // 4-neighbor average
-            let avg = (luma[(y - 1) * w + x] + luma[(y + 1) * w + x]
-                + luma[y * w + (x - 1)] + luma[y * w + (x + 1)])
+            let avg = (luma[(y - 1) * w + x] as f64
+                + luma[(y + 1) * w + x] as f64
+                + luma[y * w + (x - 1)] as f64
+                + luma[y * w + (x + 1)] as f64)
                 / 4.0;
             hf_sum += (center - avg).abs();
             hf_count += 1;
@@ -213,14 +218,14 @@ fn analyze_texture(luma: &[f64], variance: &[f64], w: usize, h: usize) -> (f64, 
             let mut block_mean = 0.0f64;
             for dy in 0..4 {
                 for dx in 0..4 {
-                    block_mean += luma[(by * 4 + dy) * w + (bx * 4 + dx)];
+                    block_mean += luma[(by * 4 + dy) * w + (bx * 4 + dx)] as f64;
                 }
             }
             block_mean /= 16.0;
             let mut sad = 0.0f64;
             for dy in 0..4 {
                 for dx in 0..4 {
-                    sad += (luma[(by * 4 + dy) * w + (bx * 4 + dx)] - block_mean).abs();
+                    sad += (luma[(by * 4 + dy) * w + (bx * 4 + dx)] as f64 - block_mean).abs();
                 }
             }
             if sad < 15.0 {
@@ -286,332 +291,305 @@ fn gradient_energy(pixels: &[u8], w: usize, h: usize) -> f64 {
 // Ghost pipeline (4 stages, texture-adaptive)
 // ---------------------------------------------------------------------------
 
+// M9.5.B (2026-05-22) — Phase B strip refactor.
+//
+// The optimizer ran as a "stage-major" pipeline: Stage 1 over all
+// rows in parallel, Stage 2 over all rows in parallel, etc. Each
+// stage allocated full-image working buffers (variance 460 MB at 60
+// MP, stage1 clone 173 MB, blurred 173 MB, current_luma 460 MB) and
+// rayon workers shuffled between stages, blowing cache between every
+// transition.
+//
+// Phase B inverts the loop: each rayon worker takes a strip and runs
+// ALL 4 STAGES on it. Per-strip working set (~10-20 MB at 60 MP /
+// 64-row strips) fits L2/L3 and stays hot across all stages. The
+// 460 MB shared `variance` allocation disappears entirely — each
+// strip computes its own per-strip variance from its own per-strip
+// luma, and both get dropped at strip end.
+//
+// Strip overlap: 4 rows above/below the output range, clamped at
+// image boundary. Cascading kernel reach analysis:
+//   variance 5×5 → ±2 of input luma
+//   Stage 2 3×3  → ±1 of Stage 1 output → needs Stage 1 correct on ±1
+//   Stage 3 blur σ=1, radius=3 → ±3 of Stage 2 output → needs Stage
+//                                2 correct on ±3 → needs Stage 1
+//                                correct on ±4
+//   Stage 4: per 4×4 block, no inter-row read past block bounds
+//   Variance for output rows: needs luma on ±2 rows of OVERLAP
+//   Max needed overlap = max(2 luma, 4 stage cascade) = 4 rows.
+//
+// Output bytes match the pre-B byte-exact baseline:
+//   - Per-row ChaCha (A3): `set_word_pos(4 * abs_y * w)` keeps the
+//     same RNG stream byte the original serial pre-pass produced for
+//     that row's pixels.
+//   - Per-strip Stage 4 ChaCha (A4): `set_word_pos(h*w*4 + by*blocks_x*2)`
+//     matches the post-Stage-1 RNG position.
+//   - Variance computed per-strip differs from full-image only at
+//     the work-buffer edge rows (OVERLAP region), which we DON'T
+//     output. For output rows, per-strip variance == full-image
+//     variance (5×5 kernel within work buffer, OVERLAP=4 ≥ kernel
+//     radius 2).
+//
+// STRIP_HEIGHT must be 4-aligned because Stage 4 processes 4×4
+// blocks and we partition by block-rows.
+//
+// Tuning (2026-05-22): 256 rows bench-best on M-series 8-core. At
+// 64 rows the per-strip overhead (input copy + Vec allocation +
+// 12.5% overlap recompute over the 8-row OVERLAP/strip_h ratio)
+// dominated the cache locality win. At 256 the overlap ratio drops
+// to 3% and per-strip work amortises better. Working set per strip
+// at 60 MP / 9520 cols × 256 rows × ~7 bytes/pixel ≈ 17 MB — fits
+// L3 on Apple Silicon (24 MB per cluster).
+const STRIP_HEIGHT: usize = 256;
+const STRIP_OVERLAP: usize = 4;
+const SQRT_6: f64 = 2.449489742783178;
+
 fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -> Vec<u8> {
     let strength = config.strength as f64;
-    let mut rng = ChaCha20Rng::from_seed(config.seed);
+    let seed = config.seed;
 
-    // Compute per-pixel texture map: local variance drives ALL stages.
-    // Each pixel gets its own strength multiplier based on its neighborhood.
-    // Smooth areas (low variance) → full processing.
-    // Textured areas (high variance) → minimal/no processing.
-    let luma = extract_luma(pixels, w, h);
-    let variance = local_variance_5x5(&luma, w, h);
+    let blocks_x = w / 4;
+    let blocks_y = h / 4;
 
+    // Allocate the output buffer once and write strip outputs directly
+    // into disjoint `par_chunks_mut` slices — avoids a `collect()`
+    // intermediate that would hold every strip's output Vec
+    // simultaneously (~180 MB additional peak at 60 MP).
     let mut out = pixels.to_vec();
 
-    // Stage 1: Content-adaptive noise injection (per-pixel)
-    // Variance < 50: smooth region → σ up to 1.5 (needs texture)
-    // Variance 50–600: transitional → scaled σ
-    // Variance > 600: already textured → σ ≈ 0 (skip)
-    //
-    // T2.11c — split into two phases so the per-pixel application
-    // can run in parallel without breaking cross-platform RNG
-    // determinism:
-    //
-    //   (1) sequentially draw 2 ChaCha20 samples per pixel + compute
-    //       the Irwin-Hall(2) gauss value into a flat Vec<f64>. RNG
-    //       order is identical to the previous serial path on every
-    //       platform.
-    //
-    //   (2) parallel-apply: per-pixel branch on variance + scaled
-    //       sigma threshold, apply gauss × scaled_sigma to each RGB
-    //       channel. No RNG access in this phase; each output pixel
-    //       reads its own pre-generated gauss + writes its own row
-    //       of `out` (disjoint).
-    //
-    // Irwin-Hall(2) noise: u1+u2 has triangular distribution on
-    // [0, 2] with mean 1, variance 1/6. Center to mean 0 and scale
-    // by √6 so variance matches N(0,1).
-    //
-    // Replaces Box-Muller `(-2*ln(u1)).sqrt() * cos(2π·u2)` —
-    // f64::ln + f64::cos lower to non-deterministic libm / Math.*
-    // on WASM, breaking cross-platform reproducibility of the
-    // optimized cover. Triangular noise is a coarser Gaussian
-    // approximation but adequate for the small-amplitude texture
-    // injection done here. RNG consumption is unchanged (still 2
-    // uniform draws per pixel).
-    const SQRT_6: f64 = 2.449489742783178;
-    let gauss_table: Vec<f64> = (0..h * w)
-        .map(|_| {
-            let u1: f64 = rng.gen_range(0.0f64..1.0).max(1e-10);
-            let u2: f64 = rng.gen_range(0.0f64..1.0);
-            (u1 + u2 - 1.0) * SQRT_6
-        })
-        .collect();
+    // Per-strip closure: runs the full optimize pipeline on one
+    // strip's worth of rows, writing directly into `out_chunk` (the
+    // strip's slice of the shared output buffer).
+    let process_strip = |strip_idx: usize, out_chunk: &mut [u8]| {
+        let y_start = strip_idx * STRIP_HEIGHT;
+        let y_end = ((strip_idx + 1) * STRIP_HEIGHT).min(h);
+        let strip_h = y_end - y_start;
 
-    let stage1_row = |y: usize, row_out: &mut [u8]| {
-        for x in 0..w {
-            let var_val = variance[y * w + x];
-            let local_need = adaptive_scale(var_val, 50.0, 600.0);
-            // Skip pixels in areas that are already well-textured —
-            // even tiny modifications can hurt SI-UNIWARD rounding
-            // errors.
-            if local_need > 0.1 {
-                let sigma = 1.5 * local_need + 0.1;
-                let scaled_sigma = sigma * strength * local_need;
-                if scaled_sigma > 0.05 {
-                    let gauss = gauss_table[y * w + x];
-                    let noise = gauss * scaled_sigma;
-                    for c in 0..3 {
-                        let val = row_out[x * 3 + c] as f64 + noise;
-                        row_out[x * 3 + c] = val.round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-            }
-        }
-    };
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        out.par_chunks_mut(w * 3)
-            .enumerate()
-            .for_each(|(y, row)| stage1_row(y, row));
-    }
-    #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(w * 3)
-        .enumerate()
-        .for_each(|(y, row)| stage1_row(y, row));
+        let work_y_start = y_start.saturating_sub(STRIP_OVERLAP);
+        let work_y_end = (y_end + STRIP_OVERLAP).min(h);
+        let work_h = work_y_end - work_y_start;
 
-    // T2.11e — Stage 2 SIMD: pre-deinterleave + pad stage1 ONCE into
-    // 3 planar f64 buffers (clamp-to-edge by 1 cell). Then per-row
-    // rayon, per-pixel-pair lane-parallel f64x2 SIMD on the 3x3 sum.
-    // Path A: each lane is one pixel's 9-element sum done in the same
-    // f64 add order as the scalar code.
-    let stage1 = out.clone();
-    let stage1_planes = super::optimizer_simd::deinterleave_pad1_to_planar_f64(
-        &stage1, w, h,
-    );
-    let pw = w + 2;
-    let stage2_row = |y: usize, row_out: &mut [u8]| {
-        let mut x = 0;
-        // SIMD pair loop: process pixels (x, x+1) per iteration.
-        while x + 2 <= w {
-            // Per-lane gate computation (kept scalar — branches make
-            // SIMD-masking more code for no speedup on this path).
-            let need_x = adaptive_scale(variance[y * w + x], 80.0, 500.0);
-            let need_x1 = adaptive_scale(variance[y * w + x + 1], 80.0, 500.0);
-            let pass_x = need_x > 0.1;
-            let pass_x1 = need_x1 > 0.1;
-            if !pass_x && !pass_x1 {
-                x += 2;
-                continue;
-            }
-            let enhance_x = 0.15 * strength * need_x;
-            let enhance_x1 = 0.15 * strength * need_x1;
-            let pass_x = pass_x && enhance_x > 0.01;
-            let pass_x1 = pass_x1 && enhance_x1 > 0.01;
-            if !pass_x && !pass_x1 {
-                x += 2;
-                continue;
-            }
+        // Local-row offset of the OUTPUT range within the work buffer
+        // (== STRIP_OVERLAP for interior strips, 0 for strip 0).
+        let output_local_start = y_start - work_y_start;
 
-            for c in 0..3 {
-                let plane = &stage1_planes[c];
-                // SIMD sum: lane 0 = 3×3 around pixel x, lane 1 =
-                // around pixel x+1. Padded coords: (y, x) reads
-                // [y..y+3) × [x..x+3) in padded space (no border
-                // clamping needed inside the SIMD inner loop).
-                let (sum_x, sum_x1) =
-                    super::optimizer_simd::sum_3x3_pair(plane, pw, x, y);
-                let mean_x = sum_x / 9.0;
-                let mean_x1 = sum_x1 / 9.0;
+        // Copy input strip rows (with overlap) into the working buffer.
+        let mut work = pixels[work_y_start * w * 3..work_y_end * w * 3].to_vec();
 
-                // Original pixel value at padded (y+1, x+1) for
-                // pixel x, (y+1, x+2) for pixel x+1.
-                let pixel_x = plane[(y + 1) * pw + (x + 1)];
-                let pixel_x1 = plane[(y + 1) * pw + (x + 2)];
+        // Per-strip luma + variance. Computed from the working buffer
+        // luma; matches full-image variance for OUTPUT rows because
+        // STRIP_OVERLAP=4 ≥ variance 5×5 radius=2.
+        let work_variance = {
+            let work_luma = extract_luma(&work, w, work_h);
+            local_variance_5x5(&work_luma, w, work_h)
+        };
 
-                if pass_x {
-                    let deviation = pixel_x - mean_x;
-                    let enhanced = mean_x + deviation * (1.0 + enhance_x);
-                    row_out[x * 3 + c] = enhanced.round().clamp(0.0, 255.0) as u8;
-                }
-                if pass_x1 {
-                    let deviation = pixel_x1 - mean_x1;
-                    let enhanced = mean_x1 + deviation * (1.0 + enhance_x1);
-                    row_out[(x + 1) * 3 + c] =
-                        enhanced.round().clamp(0.0, 255.0) as u8;
-                }
-            }
-            x += 2;
-        }
-        // Tail scalar for odd-width images.
-        while x < w {
-            let var_val = variance[y * w + x];
-            let local_need = adaptive_scale(var_val, 80.0, 500.0);
-            if local_need > 0.1 {
-                let local_enhance = 0.15 * strength * local_need;
-                if local_enhance > 0.01 {
-                    for c in 0..3 {
-                        let (local_mean, pixel_val) =
-                            neighborhood_mean_3x3(&stage1, w, h, x, y, c);
-                        let deviation = pixel_val - local_mean;
-                        let enhanced =
-                            local_mean + deviation * (1.0 + local_enhance);
-                        row_out[x * 3 + c] =
-                            enhanced.round().clamp(0.0, 255.0) as u8;
-                    }
-                }
-            }
-            x += 1;
-        }
-    };
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        out.par_chunks_mut(w * 3)
-            .enumerate()
-            .for_each(|(y, row)| stage2_row(y, row));
-    }
-    #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(w * 3)
-        .enumerate()
-        .for_each(|(y, row)| stage2_row(y, row));
+        // === Stage 1: per-row noise injection ===
+        // Per-row RNG: `set_word_pos(4 * abs_y * w)` so byte order
+        // matches the pre-A3 serial pre-pass.
+        for local_y in 0..work_h {
+            let abs_y = work_y_start + local_y;
+            let mut row_rng = ChaCha20Rng::from_seed(seed);
+            row_rng.set_word_pos((4u128) * (abs_y as u128) * (w as u128));
 
-    // T2.11b — Stage 3: parallelize per-row. Reads from `stage2` +
-    // `blurred` + `variance`. Writes to `out` rows. Same disjoint-row
-    // pattern as Stage 2.
-    let stage2 = out.clone();
-    let blurred = gaussian_blur_separable(&stage2, w, h, 1.0);
-    let stage3_row = |y: usize, row_out: &mut [u8]| {
-        for x in 0..w {
-            let var_val = variance[y * w + x];
-            let local_need = adaptive_scale(var_val, 100.0, 400.0);
-            if local_need > 0.1 {
-                let local_sharpen = 0.12 * strength * local_need;
-                if local_sharpen > 0.01 {
-                    for c in 0..3 {
-                        let stage_i = (y * w + x) * 3 + c;
-                        let orig = stage2[stage_i] as f64;
-                        let blur = blurred[stage_i] as f64;
-                        let diff = orig - blur;
-                        // Threshold: only sharpen if difference > 3
-                        // (avoid amplifying noise).
-                        if diff.abs() > 3.0 {
-                            let sharpened = orig + local_sharpen * diff;
-                            row_out[x * 3 + c] =
-                                sharpened.round().clamp(0.0, 255.0) as u8;
+            let row_off = local_y * w * 3;
+            for x in 0..w {
+                // Always draw — matches pre-A3 unconditional pre-pass.
+                let u1: f64 = row_rng.gen_range(0.0f64..1.0).max(1e-10);
+                let u2: f64 = row_rng.gen_range(0.0f64..1.0);
+
+                let var_val = work_variance[local_y * w + x] as f64;
+                let local_need = adaptive_scale(var_val, 50.0, 600.0);
+                if local_need > 0.1 {
+                    let sigma = 1.5 * local_need + 0.1;
+                    let scaled_sigma = sigma * strength * local_need;
+                    if scaled_sigma > 0.05 {
+                        let gauss = (u1 + u2 - 1.0) * SQRT_6;
+                        let noise = gauss * scaled_sigma;
+                        for c in 0..3 {
+                            let idx = row_off + x * 3 + c;
+                            let val = work[idx] as f64 + noise;
+                            work[idx] = val.round().clamp(0.0, 255.0) as u8;
                         }
                     }
                 }
             }
         }
-    };
-    #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        out.par_chunks_mut(w * 3)
-            .enumerate()
-            .for_each(|(y, row)| stage3_row(y, row));
-    }
-    #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(w * 3)
-        .enumerate()
-        .for_each(|(y, row)| stage3_row(y, row));
 
-    // Stage 4: Smooth-region dithering (per 4×4 block, re-evaluated)
-    // Uses CURRENT luma (after stages 1-3) — blocks already textured by
-    // earlier stages won't get redundant dithering.
-    let bayer_4x4: [[f64; 4]; 4] = [
-        [0.0, 8.0, 2.0, 10.0],
-        [12.0, 4.0, 14.0, 6.0],
-        [3.0, 11.0, 1.0, 9.0],
-        [15.0, 7.0, 13.0, 5.0],
-    ];
-    let bayer_norm: [[f64; 4]; 4] = {
-        let mut b = [[0.0; 4]; 4];
-        for r in 0..4 {
-            for c in 0..4 {
-                b[r][c] = (bayer_4x4[r][c] / 15.0) * 2.0 - 1.0;
-            }
-        }
-        b
-    };
-
-    let current_luma = extract_luma(&out, w, h);
-    let blocks_x = w / 4;
-    let blocks_y = h / 4;
-
-    // T2.11b — Stage 4: pre-generate per-block RNG offsets sequentially
-    // (preserves cross-platform RNG order), then parallel-apply the
-    // dither in by-strips of 4 rows each. Different by-strips write
-    // disjoint pixel rows, so par_chunks_mut(w * 3 * 4) is race-free.
-    let block_offsets: Vec<f64> = (0..blocks_y * blocks_x)
-        .map(|_| rng.gen_range(0.0f64..1.0) * 2.0 - 1.0)
-        .collect();
-
-    let stage4_strip = |by: usize, strip: &mut [u8]| {
-        // par_chunks_mut may emit a trailing partial chunk if h isn't
-        // a multiple of 4 — the original loop iterated by in
-        // 0..blocks_y, so anything past that is a no-op.
-        if by >= blocks_y {
-            return;
-        }
-        for bx in 0..blocks_x {
-            let block_offset = block_offsets[by * blocks_x + bx];
-
-            let mut block_mean = 0.0f64;
-            let mut block_var_sum = 0.0f64;
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let px = bx * 4 + dx;
-                    let py = by * 4 + dy;
-                    if px < w && py < h {
-                        block_mean += current_luma[py * w + px];
-                        block_var_sum += variance[py * w + px];
+        // === Stage 2: 3×3 unsharp ===
+        // Needs pre-Stage-2 snapshot. Per-strip clone is ~2 MB at 60 MP
+        // (was a 173 MB full-image clone pre-Phase-B).
+        let work_stage1 = work.clone();
+        for local_y in 0..work_h {
+            let row_off = local_y * w * 3;
+            for x in 0..w {
+                let var_val = work_variance[local_y * w + x] as f64;
+                let local_need = adaptive_scale(var_val, 80.0, 500.0);
+                if local_need > 0.1 {
+                    let local_enhance = 0.15 * strength * local_need;
+                    if local_enhance > 0.01 {
+                        for c in 0..3 {
+                            // neighborhood_mean_3x3 clamps at work-buffer
+                            // edges; for OUTPUT rows with OVERLAP≥1 the
+                            // kernel stays inside the work buffer.
+                            let (local_mean, pixel_val) =
+                                neighborhood_mean_3x3(&work_stage1, w, work_h, x, local_y, c);
+                            let deviation = pixel_val - local_mean;
+                            let enhanced = local_mean + deviation * (1.0 + local_enhance);
+                            work[row_off + x * 3 + c] =
+                                enhanced.round().clamp(0.0, 255.0) as u8;
+                        }
                     }
                 }
             }
-            block_mean /= 16.0;
-            let block_var_avg = block_var_sum / 16.0;
-            let mut block_sad = 0.0f64;
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let px = bx * 4 + dx;
-                    let py = by * 4 + dy;
-                    if px < w && py < h {
-                        block_sad += (current_luma[py * w + px] - block_mean).abs();
-                    }
-                }
-            }
+        }
+        drop(work_stage1);
 
-            let block_need = adaptive_scale(block_var_avg, 50.0, 400.0);
-            let effective_dither = strength * block_need;
-
-            if block_sad < 15.0 && effective_dither > 0.01 {
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let px = bx * 4 + dx;
-                        let py = by * 4 + dy;
-                        if px < w && py < h {
-                            let dither = (bayer_norm[dy][dx] + block_offset * 0.3)
-                                * effective_dither;
-                            // strip is 4 rows of w*3 bytes; row dy
-                            // within strip is at offset dy * w * 3.
-                            let idx = dy * w * 3 + px * 3;
-                            for c in 0..3 {
-                                let val = strip[idx + c] as f64 + dither;
-                                strip[idx + c] =
-                                    val.round().clamp(0.0, 255.0) as u8;
+        // === Stage 3: blur + unsharp mask ===
+        let blurred = gaussian_blur_separable(&work, w, work_h, 1.0);
+        for local_y in 0..work_h {
+            let row_off = local_y * w * 3;
+            for x in 0..w {
+                let var_val = work_variance[local_y * w + x] as f64;
+                let local_need = adaptive_scale(var_val, 100.0, 400.0);
+                if local_need > 0.1 {
+                    let local_sharpen = 0.12 * strength * local_need;
+                    if local_sharpen > 0.01 {
+                        for c in 0..3 {
+                            let idx = row_off + x * 3 + c;
+                            let orig = work[idx] as f64;
+                            let blur = blurred[idx] as f64;
+                            let diff = orig - blur;
+                            if diff.abs() > 3.0 {
+                                let sharpened = orig + local_sharpen * diff;
+                                work[idx] = sharpened.round().clamp(0.0, 255.0) as u8;
                             }
                         }
                     }
                 }
             }
         }
+        drop(blurred);
+
+        // === Stage 4: per-block dither ===
+        // current_luma re-extracted from post-Stage-3 strip work buffer.
+        let work_current_luma = extract_luma(&work, w, work_h);
+
+        let bayer_4x4: [[f64; 4]; 4] = [
+            [0.0, 8.0, 2.0, 10.0],
+            [12.0, 4.0, 14.0, 6.0],
+            [3.0, 11.0, 1.0, 9.0],
+            [15.0, 7.0, 13.0, 5.0],
+        ];
+        let bayer_norm: [[f64; 4]; 4] = {
+            let mut b = [[0.0; 4]; 4];
+            for r in 0..4 {
+                for c in 0..4 {
+                    b[r][c] = (bayer_4x4[r][c] / 15.0) * 2.0 - 1.0;
+                }
+            }
+            b
+        };
+
+        // Block-row range within the strip's OUTPUT range. STRIP_HEIGHT
+        // is 4-aligned so y_start % 4 == 0. y_end might not be 4-aligned
+        // on the trailing strip (h not a multiple of 4); clamp to
+        // `blocks_y` to drop the partial bottom block, matching
+        // pre-Phase-B Stage 4 behavior.
+        let block_y_start = y_start / 4;
+        let block_y_end = (y_end / 4).min(blocks_y);
+
+        for by in block_y_start..block_y_end {
+            // Per-strip Stage 4 RNG (A4 byte order):
+            //   word_pos = h * w * 4 (post-Stage-1) + by * blocks_x * 2
+            let mut row_rng = ChaCha20Rng::from_seed(seed);
+            row_rng.set_word_pos(
+                (h as u128) * (w as u128) * 4u128
+                    + (by as u128) * (blocks_x as u128) * 2u128,
+            );
+
+            let block_local_y = by * 4 - work_y_start;
+
+            for bx in 0..blocks_x {
+                let block_offset = row_rng.gen_range(0.0f64..1.0) * 2.0 - 1.0;
+
+                let mut block_mean = 0.0f64;
+                let mut block_var_sum = 0.0f64;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let px = bx * 4 + dx;
+                        let py_local = block_local_y + dy;
+                        let py_abs = by * 4 + dy;
+                        if px < w && py_abs < h {
+                            block_mean += work_current_luma[py_local * w + px] as f64;
+                            block_var_sum += work_variance[py_local * w + px] as f64;
+                        }
+                    }
+                }
+                block_mean /= 16.0;
+                let block_var_avg = block_var_sum / 16.0;
+                let mut block_sad = 0.0f64;
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let px = bx * 4 + dx;
+                        let py_local = block_local_y + dy;
+                        let py_abs = by * 4 + dy;
+                        if px < w && py_abs < h {
+                            block_sad += (work_current_luma[py_local * w + px] as f64 - block_mean).abs();
+                        }
+                    }
+                }
+
+                let block_need = adaptive_scale(block_var_avg, 50.0, 400.0);
+                let effective_dither = strength * block_need;
+
+                if block_sad < 15.0 && effective_dither > 0.01 {
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let px = bx * 4 + dx;
+                            let py_local = block_local_y + dy;
+                            let py_abs = by * 4 + dy;
+                            if px < w && py_abs < h {
+                                let dither = (bayer_norm[dy][dx] + block_offset * 0.3)
+                                    * effective_dither;
+                                let idx = py_local * w * 3 + px * 3;
+                                for c in 0..3 {
+                                    let val = work[idx + c] as f64 + dither;
+                                    work[idx + c] = val.round().clamp(0.0, 255.0) as u8;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Write OUTPUT rows directly into the caller-provided
+        // `out_chunk` (skip overlap).
+        let out_start = output_local_start * w * 3;
+        let out_end = out_start + strip_h * w * 3;
+        out_chunk[..strip_h * w * 3].copy_from_slice(&work[out_start..out_end]);
     };
 
+    // Parallel over strips via `par_chunks_mut` on the shared output
+    // buffer. Each rayon worker holds one strip's working set (~10-20
+    // MB at 60 MP) which fits L2/L3 cache and stays hot across all 4
+    // stages — the cache-locality win this refactor is designed to
+    // deliver. Writing directly into the output buffer avoids a
+    // `collect()` intermediate that would peak at ~180 MB extra at
+    // 60 MP.
+    let strip_byte_size = STRIP_HEIGHT * w * 3;
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        out.par_chunks_mut(w * 3 * 4)
+        out.par_chunks_mut(strip_byte_size)
             .enumerate()
-            .for_each(|(by, strip)| stage4_strip(by, strip));
+            .for_each(|(strip_idx, out_chunk)| process_strip(strip_idx, out_chunk));
     }
     #[cfg(not(feature = "parallel"))]
-    out.chunks_mut(w * 3 * 4)
+    out.chunks_mut(strip_byte_size)
         .enumerate()
-        .for_each(|(by, strip)| stage4_strip(by, strip));
+        .for_each(|(strip_idx, out_chunk)| process_strip(strip_idx, out_chunk));
 
     out
 }
@@ -649,94 +627,77 @@ fn optimize_fortress(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig
 // ---------------------------------------------------------------------------
 
 /// Extract luma (Y) from RGB pixels. Y = 0.299R + 0.587G + 0.114B.
-fn extract_luma(pixels: &[u8], w: usize, h: usize) -> Vec<f64> {
-    let mut luma = vec![0.0f64; w * h];
+///
+/// M9.5.C1 (2026-05-22) — Returns `Vec<u8>` instead of `Vec<f64>`. Y
+/// values are in [0, 255] integer range anyway; the f64 storage was 8×
+/// memory for zero precision benefit downstream (variance integerizes
+/// luma in its inner loop; Stage 4 block stats accumulate in f32/f64
+/// on demand). Saves 60 MB at 60 MP full-image (or ~5 MB per strip
+/// post-Phase-B).
+fn extract_luma(pixels: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut luma = vec![0u8; w * h];
     for i in 0..w * h {
-        let r = pixels[i * 3] as f64;
-        let g = pixels[i * 3 + 1] as f64;
-        let b = pixels[i * 3 + 2] as f64;
-        luma[i] = 0.299 * r + 0.587 * g + 0.114 * b;
+        let r = pixels[i * 3] as f32;
+        let g = pixels[i * 3 + 1] as f32;
+        let b = pixels[i * 3 + 2] as f32;
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        luma[i] = y.round().clamp(0.0, 255.0) as u8;
     }
     luma
 }
 
 /// Compute local variance in a 5×5 neighborhood for each pixel.
-fn local_variance_5x5(luma: &[f64], w: usize, h: usize) -> Vec<f64> {
-    // T2.11a — integral-image (summed-area table) 5×5 variance.
-    //
-    // Replaces the previous O(N × 25) sliding-window implementation
-    // with O(N): one O(N) build pass for two SATs (sum + sum-of-
-    // squares over a clamped-edge-padded luma grid), then O(1) per-
-    // pixel variance via the 4-corner SAT difference.
-    //
-    // Boundary handling matches the previous code's clamp-to-edge
-    // semantics: the luma grid is virtually replicated by 2 cells on
-    // every side. The 5×5 window at any (y, x) reads the same 25
-    // values it did before — just summed in SAT order rather than
-    // window-direct order. f64 add isn't associative, so the
-    // resulting variance values shift by 1-2 ULP versus the
-    // sliding-window output. Downstream `adaptive_scale` smooths
-    // these out to ULP-level strength shifts that round to 0 in the
-    // final u8 cover bytes for ~all pixels (verified by the
-    // optimizer_cross_platform SHA256 test).
+///
+/// M9.5.A6 (2026-05-22) — Reverted T2.11a's SAT implementation.
+/// M9.5.C1 (2026-05-22) — Type narrowed to `&[u8]` luma in, `Vec<u16>`
+/// variance out. Sliding-window sum/sum_sq computed in u32 (max sum²
+/// ≈ 40.6M fits u26 < u32 max). Max possible variance for 8-bit luma
+/// in a 5×5 window is ~16,256 (8-bit Bernoulli, half-zero/half-255),
+/// fits u14 with headroom. Saves 460 MB → 120 MB full-image / ~5.5 MB
+/// → 1.3 MB per strip post-Phase-B.
+///
+/// Integer formula: `25 * sum_sq - sum²` is the numerator of
+/// `25² · variance`. Divide by 625 to recover variance. All inputs
+/// non-negative; numerator is exactly non-negative (Cauchy-Schwarz),
+/// so u32 arithmetic is safe and bit-exact across platforms.
+///
+/// Helper is called per-strip from `process_strip` inside
+/// `optimize_ghost`'s outer strip par_iter; kept serial here so
+/// inner par_chunks_mut doesn't oversubscribe the rayon pool.
+fn local_variance_5x5(luma: &[u8], w: usize, h: usize) -> Vec<u16> {
     if w == 0 || h == 0 {
         return Vec::new();
     }
 
-    const R: usize = 2; // 5×5 window → radius 2
-    let pw = w + 2 * R;
-    let ph = h + 2 * R;
+    let mut variance = vec![0u16; w * h];
 
-    // Padded luma: clamped-edge replicate by 2 cells on each side.
-    let mut padded = vec![0.0f64; pw * ph];
-    for py in 0..ph {
-        // Map padded row → original row via the same saturating_sub
-        // + min idiom the old sliding-window code used.
-        let sy = py.saturating_sub(R).min(h - 1);
-        for px in 0..pw {
-            let sx = px.saturating_sub(R).min(w - 1);
-            padded[py * pw + px] = luma[sy * w + sx];
-        }
-    }
-
-    // SATs: zero-row / zero-column at top/left so the 4-corner
-    // formula works uniformly. Dimensions: (pw+1) × (ph+1).
-    let sw = pw + 1;
-    let mut sat: Vec<f64> = vec![0.0; sw * (ph + 1)];
-    let mut sat_sq: Vec<f64> = vec![0.0; sw * (ph + 1)];
-
-    for py in 0..ph {
-        let mut row_sum = 0.0f64;
-        let mut row_sum_sq = 0.0f64;
-        let above_row_off = py * sw;
-        let curr_row_off = (py + 1) * sw;
-        for px in 0..pw {
-            let v = padded[py * pw + px];
-            row_sum += v;
-            row_sum_sq += v * v;
-            sat[curr_row_off + (px + 1)] = sat[above_row_off + (px + 1)] + row_sum;
-            sat_sq[curr_row_off + (px + 1)] = sat_sq[above_row_off + (px + 1)] + row_sum_sq;
-        }
-    }
-
-    // 4-corner SAT difference gives the inclusive sum over the 5×5
-    // window at padded coordinates [y..y+5) × [x..x+5).
-    // T2.11b — per-row parallelism. Each row writes a disjoint
-    // slice of `variance` and reads from the (immutable) SAT tables.
-    let count = 25.0f64;
-    let mut variance = vec![0.0f64; w * h];
-    let fill_row = |y: usize, row: &mut [f64]| {
-        let r2 = (y + 5) * sw;
-        let r1 = y * sw;
+    let fill_row = |y: usize, row: &mut [u16]| {
         for x in 0..w {
-            let c2 = x + 5;
-            let sum = sat[r2 + c2] - sat[r1 + c2] - sat[r2 + x] + sat[r1 + x];
-            let sum_sq =
-                sat_sq[r2 + c2] - sat_sq[r1 + c2] - sat_sq[r2 + x] + sat_sq[r1 + x];
-            let mean = sum / count;
-            row[x] = sum_sq / count - mean * mean;
+            let mut sum: u32 = 0;
+            let mut sum_sq: u32 = 0;
+            for dy in 0..5usize {
+                let py = (y + dy).saturating_sub(2).min(h - 1);
+                let row_off = py * w;
+                for dx in 0..5usize {
+                    let px = (x + dx).saturating_sub(2).min(w - 1);
+                    let v = luma[row_off + px] as u32;
+                    sum += v;
+                    sum_sq += v * v;
+                }
+            }
+            // Exact integer variance scaled by 25². See doc comment.
+            let numerator = 25 * sum_sq - sum * sum;
+            row[x] = (numerator / 625) as u16;
         }
     };
+
+    // M9.5.C2 (2026-05-22) — restored inner par_chunks_mut. Nested
+    // rayon here (called from `process_strip` inside the outer strip
+    // par_iter) is fine in production — the optimizer runs once per
+    // encode, no contention. The serial-within-strip version (Phase B
+    // initial commit) was 25-30% slower than pre-M9.5 on M-series
+    // 8-core; restoring inner parallelism closes that gap while
+    // keeping the strip refactor's memory savings.
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
@@ -771,44 +732,51 @@ fn neighborhood_mean_3x3(pixels: &[u8], w: usize, h: usize, x: usize, y: usize, 
 }
 
 /// Separable Gaussian blur with given sigma (truncated at 3σ kernel).
+///
+/// M9.5.C2 (2026-05-22) — Kernel + plane scratch narrowed to f32 so
+/// the SIMD blur dispatch (`optimizer_simd::blur_row_h`) uses native
+/// f32x4 lanes (NEON FMA on aarch64, native WASM SIMD128 f32x4,
+/// SSE2 f32x4 on x86) — 2× the lane count of the pre-C2 f64x2 path.
+/// `det_exp` is still used for the kernel builder so the kernel
+/// values themselves are deterministic across platforms; the f64
+/// intermediate is cast to f32 before normalisation.
 fn gaussian_blur_separable(pixels: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
     let radius = (sigma * 3.0).ceil() as usize;
     let kernel_size = radius * 2 + 1;
 
-    // Build 1D Gaussian kernel
-    let mut kernel = vec![0.0f64; kernel_size];
+    // Build 1D Gaussian kernel. The kernel is small (7 entries for
+    // sigma=1) and only built once per blur call; computing in f64
+    // (deterministic via det_exp) then casting to f32 for storage
+    // keeps the kernel-build precision while making the inner-loop
+    // arithmetic f32.
+    let mut kernel = vec![0.0f32; kernel_size];
     let mut sum = 0.0f64;
     for i in 0..kernel_size {
         let x = i as f64 - radius as f64;
-        // det_exp instead of f64::exp — f64::exp lowers to non-deterministic
-        // libm / Math.exp on WASM, breaking cross-platform bit-exactness of
-        // the optimized cover.
         let val = det_exp(-x * x / (2.0 * sigma * sigma));
-        kernel[i] = val;
+        kernel[i] = val as f32;
         sum += val;
     }
+    let inv_sum = 1.0 / sum as f32;
     for k in kernel.iter_mut() {
-        *k /= sum;
+        *k *= inv_sum;
     }
 
     let n = w * h * 3;
     let mut temp = vec![0u8; n];
     let mut result = vec![0u8; n];
 
-    // T2.11d — Horizontal pass: per-row de-interleave RGB into
-    // 3 padded planar f64 buffers (clamp-to-edge replicated), then
-    // run the SIMD-dispatched 1D blur on each channel plane. The
-    // pad eliminates the per-tap `saturating_sub + min` branch the
-    // scalar inner loop used to do.
+    // Horizontal pass: per-row de-interleave RGB into 3 padded planar
+    // f32 buffers (clamp-to-edge replicated), then run the SIMD-
+    // dispatched 1D blur on each channel plane. The pad eliminates
+    // the per-tap `saturating_sub + min` branch.
     let padded_w = w + 2 * radius;
-    let h_pass = |y: usize, plane_scratch: &mut [f64], row_out: &mut [u8]| {
-        // De-interleave + pad each channel into plane_scratch
-        // (laid out as 3 contiguous slabs of padded_w).
+    let h_pass = |y: usize, plane_scratch: &mut [f32], row_out: &mut [u8]| {
         for c in 0..3 {
             let slab = &mut plane_scratch[c * padded_w..(c + 1) * padded_w];
             for px in 0..padded_w {
                 let sx = px.saturating_sub(radius).min(w - 1);
-                slab[px] = pixels[(y * w + sx) * 3 + c] as f64;
+                slab[px] = pixels[(y * w + sx) * 3 + c] as f32;
             }
             super::optimizer_simd::blur_row_h(
                 slab, kernel.as_slice(), radius, w, row_out, c, 3,
@@ -816,79 +784,56 @@ fn gaussian_blur_separable(pixels: &[u8], w: usize, h: usize, sigma: f64) -> Vec
         }
     };
 
+    // M9.5.C2 (2026-05-22) — restored inner par_chunks_mut. See
+    // local_variance_5x5 comment above.
     let plane_scratch_size = 3 * padded_w;
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
         temp.par_chunks_mut(w * 3).enumerate().for_each_init(
-            || vec![0.0f64; plane_scratch_size],
+            || vec![0.0f32; plane_scratch_size],
             |scratch, (y, row)| h_pass(y, scratch, row),
         );
     }
     #[cfg(not(feature = "parallel"))]
     {
-        let mut scratch = vec![0.0f64; plane_scratch_size];
+        let mut scratch = vec![0.0f32; plane_scratch_size];
         temp.chunks_mut(w * 3)
             .enumerate()
             .for_each(|(y, row)| h_pass(y, &mut scratch, row));
     }
 
-    // T2.11d — Vertical pass: same idea but the padded planar
-    // buffers are columnar slices of `temp` per output row. We pad
-    // the kernel-size window of input rows (clamped) into a planar
-    // f64 buffer per channel, then run the SIMD 1D blur.
-    let v_pass = |y: usize, plane_scratch: &mut [f64], row_out: &mut [u8]| {
-        // For output row y we need rows y, y+1, ..., y + 2*radius
-        // from the padded V-axis (clamp-to-edge). The "padded row"
-        // for the SIMD blur is the LENGTH-w column we virtually
-        // construct — but for vertical conv, the SIMD shape is
-        // different: for each output pixel x, the conv reads
-        // `kernel_size` rows of input.
-        //
-        // Since the SIMD pattern in optimizer_simd expects a flat
-        // (padded_w) 1D buffer per channel laid out along the conv
-        // axis, the V pass would need to transpose. Instead we use
-        // a per-pixel layout: write `kernel_size` consecutive
-        // samples for each output column into the scratch in the
-        // shape (kernel_size, w_chunk), then process per-column.
-        //
-        // For simplicity + cache friendliness, V pass keeps the
-        // scalar autovec inner loop (already rayon-parallel per
-        // row from T2.11b). SIMD on the H pass + per-row planar
-        // de-interleave delivers the dominant gain; V pass tail
-        // optimization is deferred (the per-row reads in V pass
-        // are already strided-but-contiguous within a row, so
-        // LLVM autovec is friendlier than for H).
+    // Vertical pass: scalar in f32. Per-row reads of `temp` are
+    // strided (RGB-interleaved) which LLVM autovec handles. SIMD
+    // on the V axis would need column transposition; deferred.
+    let v_pass = |y: usize, _plane_scratch: &mut [f32], row_out: &mut [u8]| {
         for x in 0..w {
             for c in 0..3 {
-                let mut acc = 0.0f64;
+                let mut acc = 0.0f32;
                 for k in 0..kernel_size {
                     let sy = (y + k).saturating_sub(radius).min(h - 1);
-                    acc += temp[(sy * w + x) * 3 + c] as f64 * kernel[k];
+                    acc += temp[(sy * w + x) * 3 + c] as f32 * kernel[k];
                 }
                 row_out[x * 3 + c] = acc.round().clamp(0.0, 255.0) as u8;
             }
         }
-        // Touch scratch to silence unused-var; reserved for future
-        // V-pass SIMD.
-        let _ = plane_scratch;
     };
 
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
         result.par_chunks_mut(w * 3).enumerate().for_each_init(
-            || vec![0.0f64; plane_scratch_size],
+            || vec![0.0f32; plane_scratch_size],
             |scratch, (y, row)| v_pass(y, scratch, row),
         );
     }
     #[cfg(not(feature = "parallel"))]
     {
-        let mut scratch = vec![0.0f64; plane_scratch_size];
+        let mut v_scratch = vec![0.0f32; plane_scratch_size];
         result
             .chunks_mut(w * 3)
             .enumerate()
-            .for_each(|(y, row)| v_pass(y, &mut scratch, row));
+            .for_each(|(y, row)| v_pass(y, &mut v_scratch, row));
     }
 
     result

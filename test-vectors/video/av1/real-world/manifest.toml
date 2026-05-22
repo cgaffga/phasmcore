@@ -47,16 +47,15 @@ notes = "iPhone-shot footage. Natural sensor noise. Reference for real camera-gr
 [[fixture]]
 name = "carplane"
 source = "Artlist_CarPlane.mp4"
-width = 256
-height = 144
+width = 144
+height = 256
 seek_s = 2.0
 quantizer = 30
-natural_bytes = 12220
-cover_bits_ac_sign = 17880
-cover_bits_total = 24725
-encode_ms_p50 = 113
-y_psnr_db = 46.71
-notes = "Pro-camera Artlist footage. High motion, foliage + sky + vehicle texture mix. Source is 1080×1920 PORTRAIT (1:0.5625); scaling to 256×144 landscape introduces aspect distortion. v0.4 hygiene: re-baseline with aspect-preserving dims."
+natural_bytes = 13035
+cover_bits_ac_sign = 19300
+cover_bits_total = 26360
+encode_ms_p50 = 122
+notes = "Pro-camera Artlist footage. High motion, foliage + sky + vehicle texture mix. Source is 1080×1920 PORTRAIT (1:0.5625) — v0.4 re-baseline at 144×256 portrait preserves aspect. Same pixel count as the prior 256×144 landscape baseline (~36.9k Y pixels), but content is now un-distorted."
 
 [[fixture]]
 name = "iphone5_1080p"

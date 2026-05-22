@@ -20,6 +20,12 @@
 use crate::codec::jpeg::JpegImage;
 use crate::codec::jpeg::dct::DctGrid;
 use crate::codec::jpeg::pixels;
+// T3.1.F — armor's pre-clamp + QF-settle pixel-domain round-trips run
+// through the integer LL&M path (NEON / AVX2 / WASM SIMD / scalar,
+// all bit-exact). See `docs/design/image/t3.1-integer-aan.md`.
+use crate::codec::jpeg::pixels_aan::{
+    aan_dct_block as dct_block_active, aan_idct_block as idct_block_active,
+};
 use crate::stego::armor::ecc;
 use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract_soft};
 use crate::stego::armor::fft2d;
@@ -46,14 +52,48 @@ use crate::stego::quality::{self, EncodeQuality, ArmorMetrics};
 const HEADER_UNITS: usize = embedding::HEADER_UNITS; // 56
 const HEADER_COPIES: usize = embedding::HEADER_COPIES; // 7
 
+/// Number of sub-steps reported during the STDM embed loop. Subdividing
+/// the per-bit loop (~5000 iterations at 12 MP) eliminates a multi-
+/// hundred-ms "step jump" — the bar moves smoothly across the embed
+/// phase instead of sitting still then leaping forward.
+const STDM_EMBED_PROGRESS_STEPS: u32 = 5;
+
+/// Number of sub-steps reported during DFT template embed (luma→FFT,
+/// template+ring payload embed, IFFT→luma). The FFT alone is ~400 ms
+/// at 12 MP, so 3 sub-steps gives ~130 ms per step — comfortably
+/// under the 500 ms mobile-UX stall threshold.
+const DFT_TEMPLATE_PROGRESS_STEPS: u32 = 3;
+
 /// Total progress steps for Armor encode via STDM path.
-/// 1 (DFT template) + 1 (pre-clamp) + 1 (stability map) + 1 (RS+spreading)
-/// + 1 (STDM embed) + 1 (JPEG write) = 6.
-pub const ARMOR_ENCODE_STEPS: u32 = 6;
+///
+/// Post-T3 recalibration (was 6):
+/// - 3 (DFT template: luma+FFT, embed, IFFT+luma)
+/// - 1 (pre-clamp)
+/// - 1 (stability map)
+/// - 1 (RS+spreading)
+/// - STDM_EMBED_PROGRESS_STEPS (STDM embed loop, subdivided)
+/// - JPEG_WRITE_STEPS (JPEG entropy-coded scan write, subdivided)
+///
+/// Per-step wall-clock at 12 MP: ~30-150 ms. Smooth bar against
+/// wall-clock-100% target.
+pub const ARMOR_ENCODE_STEPS: u32 =
+    DFT_TEMPLATE_PROGRESS_STEPS
+    + 1
+    + 1
+    + 1
+    + STDM_EMBED_PROGRESS_STEPS
+    + crate::codec::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Total progress steps for Armor encode via Fortress path.
-/// 1 (pre-settle) + 1 (fortress encode) + 1 (JPEG write) = 3.
-const ARMOR_ENCODE_FORTRESS_STEPS: u32 = 3;
+///
+/// Post-T3 recalibration (was 3):
+/// - 3 (pre-settle per channel: Y, Cb, Cr — biggest wall-clock share)
+/// - 1 (BA-QIM fortress encode)
+/// - JPEG_WRITE_STEPS (JPEG write, subdivided)
+const ARMOR_ENCODE_FORTRESS_STEPS: u32 =
+    3
+    + 1
+    + crate::codec::jpeg::scan::JPEG_WRITE_STEPS;
 
 /// Encode a text message into a cover JPEG using Armor mode.
 ///
@@ -131,18 +171,22 @@ fn armor_encode_impl(
             // Switch to Fortress step count (shorter path).
             progress::set_total(ARMOR_ENCODE_FORTRESS_STEPS);
 
-            // Pre-settle Y channel to QF75 QT tables before Fortress embedding.
+            // Pre-settle Y/Cb/Cr to QF75 QT tables before Fortress embedding.
+            // Emits one progress step per channel (Y, Cb, Cr) — dominates
+            // Fortress wall-clock so subdividing it eliminates the worst
+            // pre-T3 stall.
             pre_settle_for_fortress(&mut img)?;
-            progress::advance(); // Step 1: pre-settle
 
             let fort_result = fortress::fortress_encode(&mut img, &fortress_frame, passphrase)?;
-            progress::advance(); // Step 2: fortress encode
+            progress::advance(); // Step 4: fortress BA-QIM encode
 
-            let stego_bytes = if let Ok(bytes) = img.to_bytes() { bytes } else {
+            // JPEG write: emits JPEG_WRITE_STEPS sub-steps via the
+            // scan-encode progress callback.
+            let progress_cb = || progress::advance();
+            let stego_bytes = if let Ok(bytes) = img.to_bytes_with_progress(Some(&progress_cb)) { bytes } else {
                 img.rebuild_huffman_tables();
-                img.to_bytes().map_err(StegoError::InvalidJpeg)?
+                img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
             };
-            progress::advance(); // Step 3: JPEG write
 
             // Fortress quality: use actual r and parity from encode, pre-settled to QF75.
             let fill_ratio = fortress_frame.len() as f64 / max_fort as f64;
@@ -167,12 +211,14 @@ fn armor_encode_impl(
     let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
 
     // Phase 3: Embed DFT template + ring payload BEFORE STDM.
+    // Emits DFT_TEMPLATE_PROGRESS_STEPS sub-steps internally (~130 ms
+    // each at 12 MP) — the FFT pair dominates Armor STDM encode
+    // wall-clock and was previously a single multi-hundred-ms stall.
     embed_dft_template(&mut img, passphrase, message)?;
-    progress::advance(); // Step 1: DFT template
 
     // Pre-clamp pass: IDCT -> clamp [0,255] -> DCT on all Y-channel blocks.
     pre_clamp_y_channel(&mut img)?;
-    progress::advance(); // Step 2: pre-clamp
+    progress::advance(); // pre-clamp done
 
     // 1. Compute stability map for Y channel (frequency-restricted).
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
@@ -180,7 +226,7 @@ fn armor_encode_impl(
         .quant_table(qt_id)
         .ok_or(StegoError::NoLuminanceChannel)?;
     let cost_map = compute_stability_map(img.dct_grid(0), qt);
-    progress::advance(); // Step 3: stability map
+    progress::advance(); // stability map done
 
     // 2. Derive structural key with Armor salt.
     let structural_key = crypto::derive_armor_structural_key(passphrase)?;
@@ -286,10 +332,20 @@ fn armor_encode_impl(
 
     // 9. Generate spreading vectors.
     let vectors = generate_spreading_vectors(&spread_seed, embed_count);
-    progress::advance(); // Step 4: RS encode + spreading vectors
+    progress::advance(); // RS encode + spreading vectors done
 
-    // 10. STDM embed each bit into coefficient groups.
+    // 10. STDM embed each bit into coefficient groups. T3 progress
+    // recalibration — emit STDM_EMBED_PROGRESS_STEPS sub-steps across
+    // the loop instead of a single end-of-loop step. At 12 MP the loop
+    // has ~5000 iterations × ~40 µs each = ~200 ms total; 5 sub-steps
+    // = ~40 ms per step (well under the 500 ms mobile stall target).
     let grid_mut = img.dct_grid_mut(0);
+    let mut next_step_threshold = if embed_count == 0 {
+        usize::MAX
+    } else {
+        embed_count / STDM_EMBED_PROGRESS_STEPS as usize
+    };
+    let mut steps_emitted: u32 = 0;
     for bit_idx in 0..embed_count {
         let group_start = bit_idx * SPREAD_LEN;
         let group = &positions[group_start..group_start + SPREAD_LEN];
@@ -306,17 +362,30 @@ fn armor_encode_impl(
             let new_val = coeffs[k].round() as i16;
             flat_set(grid_mut, pos.flat_idx as usize, new_val);
         }
+
+        if bit_idx + 1 >= next_step_threshold && steps_emitted < STDM_EMBED_PROGRESS_STEPS {
+            progress::advance();
+            steps_emitted += 1;
+            next_step_threshold =
+                ((steps_emitted + 1) as usize * embed_count) / STDM_EMBED_PROGRESS_STEPS as usize;
+        }
+    }
+    // Ensure we've emitted exactly STDM_EMBED_PROGRESS_STEPS sub-steps
+    // (covers the case where embed_count < STDM_EMBED_PROGRESS_STEPS).
+    while steps_emitted < STDM_EMBED_PROGRESS_STEPS {
+        progress::advance();
+        steps_emitted += 1;
     }
 
-    progress::advance(); // Step 5: STDM embed
-
-    // 11. Write modified JPEG.
-    let stego_bytes = if let Ok(bytes) = img.to_bytes() { bytes } else {
+    // 11. Write modified JPEG. T3 progress recalibration — uses the
+    // JPEG_WRITE_STEPS scan-encode callback to emit ~20 sub-steps
+    // across the entropy-coded scan write (~100-200 ms at 12 MP →
+    // ~5-10 ms per step).
+    let progress_cb = || progress::advance();
+    let stego_bytes = if let Ok(bytes) = img.to_bytes_with_progress(Some(&progress_cb)) { bytes } else {
         img.rebuild_huffman_tables();
-        img.to_bytes().map_err(StegoError::InvalidJpeg)?
+        img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)?
     };
-
-    progress::advance(); // Step 6: JPEG write
 
     // Compute quality score for STDM path.
     let fill_ratio = frame_bytes.len() as f64 / (payload_units / 8).max(1) as f64;
@@ -1041,11 +1110,11 @@ fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
 
     let process_block = |chunk: &mut [i16]| {
         let quantized: [i16; 64] = chunk.try_into().unwrap();
-        let mut px = pixels::idct_block(&quantized, &qt_values);
+        let mut px = idct_block_active(&quantized, &qt_values);
         for p in px.iter_mut() {
             *p = p.clamp(0.0, 255.0);
         }
-        let settled = pixels::dct_block(&px, &qt_values);
+        let settled = dct_block_active(&px, &qt_values);
         chunk.copy_from_slice(&settled);
     };
 
@@ -1407,6 +1476,7 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
     // P0: Drop luma_pixels after FFT — only needed to produce the spectrum.
     let mut spectrum = fft2d::fft2d(&luma_pixels, w, h);
     drop(luma_pixels);
+    progress::advance(); // DFT template sub-step 1: luma→FFT
 
     // Template peaks for geometry estimation
     let peaks = template::generate_template_peaks(passphrase, w, h)?;
@@ -1426,6 +1496,7 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
         let truncated = &message.as_bytes()[..truncated_len];
         dft_payload::embed_ring_payload(&mut spectrum, truncated, passphrase)?;
     }
+    progress::advance(); // DFT template sub-step 2: template + ring embed
 
     // P0: Drop spectrum after IFFT — only needed to produce the modified pixels.
     let modified = fft2d::ifft2d(&spectrum);
@@ -1433,6 +1504,7 @@ fn embed_dft_template(img: &mut JpegImage, passphrase: &str, message: &str) -> R
 
     pixels::luma_f64_to_jpeg(&modified, w, h, img)
         .ok_or(StegoError::NoLuminanceChannel)?;
+    progress::advance(); // DFT template sub-step 3: IFFT + luma→JPEG
     Ok(())
 }
 
@@ -1521,11 +1593,11 @@ fn pre_settle_for_fortress(img: &mut JpegImage) -> Result<(), StegoError> {
 
         let process_block = |chunk: &mut [i16]| {
             let quantized: [i16; 64] = chunk.try_into().unwrap();
-            let mut px = pixels::idct_block(&quantized, &old_qt);
+            let mut px = idct_block_active(&quantized, &old_qt);
             for p in px.iter_mut() {
                 *p = p.clamp(0.0, 255.0);
             }
-            let settled = pixels::dct_block(&px, &new_qt);
+            let settled = dct_block_active(&px, &new_qt);
             chunk.copy_from_slice(&settled);
         };
 
@@ -1535,6 +1607,12 @@ fn pre_settle_for_fortress(img: &mut JpegImage) -> Result<(), StegoError> {
         grid.coeffs_mut().chunks_mut(64).for_each(process_block);
 
         new_qts.push((qt_id, old_qt, new_qt));
+
+        // T3 progress recalibration — one step per channel. Pre-settle
+        // is the biggest Fortress wall-clock consumer (IDCT+DCT on every
+        // block × 3 channels); subdividing per-channel keeps the bar
+        // moving during the dominant phase.
+        progress::advance();
     }
 
     // Replace quantization tables (deduplicate by QT ID)
