@@ -93,6 +93,21 @@ int32_t phasm_encoder_encode_frame(
  * fork's InitDqLayers reads the current value. */
 void phasm_encoder_set_dual_recon_enabled(int32_t enabled);
 
+/* P3.3a (2026-05-25) — post-frame DPB correction for inter-frame
+ * cascade elimination. Returns a mutable pointer to pDecPic's Y plane
+ * and its stride so the Rust side can apply per-pixel IDCT deltas
+ * after each frame encode. Returns 0 on success, -1 if handle/encoder
+ * is null or no pDecPic is available.
+ *
+ * Safety: the returned pointer is valid until the next encode_frame
+ * call or encoder destruction. Caller must not hold it across those
+ * boundaries. Width × height pixels are addressable at
+ * y_ptr[row * *y_stride + col]. */
+int32_t phasm_encoder_get_dec_pic_y(
+    PhasmEncoderHandle* h,
+    uint8_t** y_ptr,
+    int32_t* y_stride);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

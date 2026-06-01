@@ -56,6 +56,42 @@ pub fn enumerate_coeff_sign_positions(
         .collect()
 }
 
+/// CASCADE.P1 — magnitudes in the same emit order as
+/// [`enumerate_coeff_sign_positions`]. Returned values are
+/// `|coeff|` clamped to `u16::MAX`. Used by the pure-Rust encoder's
+/// `PositionLoggerHook::on_residual_block` to populate
+/// `DomainBits::magnitudes` for the cost function.
+pub fn enumerate_coeff_sign_magnitudes(
+    scan_coeffs: &[i32],
+    start_idx: usize,
+    end_idx: usize,
+) -> Vec<u16> {
+    let mut sig: Vec<usize> = (start_idx..=end_idx)
+        .filter(|&i| scan_coeffs[i] != 0)
+        .collect();
+    sig.reverse();
+    sig.into_iter()
+        .map(|i| scan_coeffs[i].unsigned_abs().min(u16::MAX as u32) as u16)
+        .collect()
+}
+
+/// CASCADE.P1 — magnitudes for CoeffSuffixLsb positions, same emit
+/// order as [`enumerate_coeff_suffix_lsb_positions`]. Only
+/// coefficients with `|coeff| ≥ COEFF_SUFFIX_LSB_THRESHOLD` participate.
+pub fn enumerate_coeff_suffix_lsb_magnitudes(
+    scan_coeffs: &[i32],
+    start_idx: usize,
+    end_idx: usize,
+) -> Vec<u16> {
+    let mut sig: Vec<usize> = (start_idx..=end_idx)
+        .filter(|&i| scan_coeffs[i].unsigned_abs() >= COEFF_SUFFIX_LSB_THRESHOLD)
+        .collect();
+    sig.reverse();
+    sig.into_iter()
+        .map(|i| scan_coeffs[i].unsigned_abs().min(u16::MAX as u32) as u16)
+        .collect()
+}
+
 /// Apply [`BitInjector`] overrides for `CoeffSignBypass` to a
 /// residual block's `scan_coeffs` in place. For each significant
 /// coefficient (in reverse scan order, mirroring the decoder),
@@ -230,26 +266,45 @@ pub struct DomainCover {
 
 /// Cover bits + the positions that produced them, in emit order.
 /// Indices align: `bits[i]` is the cover bit at `positions[i]`.
+///
+/// CASCADE.P1 (2026-05-24) — `magnitudes[i]` carries the absolute
+/// value of the coefficient that emitted bit `i`, for CSB / CSL
+/// domains. MVD domains push `0` here because their per-position
+/// magnitude already lives in [`super::encoder_hook::MvdPositionMeta`].
+/// Used by `compute_content_costs_yuv` so the J-UNIWARD-style cost
+/// reflects the actual pixel delta a sign-flip introduces
+/// (`δ = 2·|coeff|·Q-step·IDCT_basis`).
 #[derive(Default, Debug, Clone)]
 pub struct DomainBits {
     pub bits: Vec<u8>,
     pub positions: Vec<PositionKey>,
+    pub magnitudes: Vec<u16>,
 }
 
 impl DomainBits {
     pub fn len(&self) -> usize {
         debug_assert_eq!(self.bits.len(), self.positions.len());
+        debug_assert_eq!(self.bits.len(), self.magnitudes.len());
         self.bits.len()
     }
     pub fn is_empty(&self) -> bool {
         self.bits.is_empty()
     }
     /// Append one (bit, position) pair to this domain's cover.
-    /// Used by Pass 1 scanners as they walk each block.
+    /// Used by Pass 1 scanners as they walk each block. Pushes
+    /// `magnitude = 0`; for CSB / CSL use
+    /// [`Self::push_with_magnitude`] instead.
     pub fn push(&mut self, bit: u8, pos: PositionKey) {
+        self.push_with_magnitude(bit, pos, 0);
+    }
+    /// CASCADE.P1 — same as `push` but records the coefficient
+    /// magnitude alongside. Only meaningful for CoeffSignBypass /
+    /// CoeffSuffixLsb positions; MVD callers stay on `push`.
+    pub fn push_with_magnitude(&mut self, bit: u8, pos: PositionKey, magnitude: u16) {
         debug_assert!(bit <= 1);
         self.bits.push(bit);
         self.positions.push(pos);
+        self.magnitudes.push(magnitude);
     }
     /// #516.1 perf — reserve capacity for at least `n` more entries.
     /// Used by the walker once SPS is parsed to pre-size both inner
@@ -261,12 +316,14 @@ impl DomainBits {
     pub fn reserve(&mut self, n: usize) {
         self.bits.reserve(n);
         self.positions.reserve(n);
+        self.magnitudes.reserve(n);
     }
     /// Concatenate another DomainBits at the tail (same domain).
     /// Used to fold per-block contributions into the per-GOP cover.
     pub fn extend(&mut self, other: DomainBits) {
         self.bits.extend(other.bits);
         self.positions.extend(other.positions);
+        self.magnitudes.extend(other.magnitudes);
     }
     /// Truncate to the given length (saved earlier via `len()`).
     /// Used by Phase 6F.2's MVD-rollback path: when the encoder
@@ -277,6 +334,7 @@ impl DomainBits {
     pub fn truncate(&mut self, new_len: usize) {
         self.bits.truncate(new_len);
         self.positions.truncate(new_len);
+        self.magnitudes.truncate(new_len);
     }
 }
 
@@ -531,7 +589,10 @@ pub fn record_residual_block_into_cover<F>(
                     frame_idx, mb_addr, EmbedDomain::CoeffSignBypass, sign_path,
                 );
                 let sign_bit: u8 = if v < 0 { 1 } else { 0 };
-                cover.coeff_sign_bypass.push(sign_bit, sign_key);
+                let abs_u16 = abs.min(u16::MAX as u32) as u16;
+                cover.coeff_sign_bypass.push_with_magnitude(
+                    sign_bit, sign_key, abs_u16,
+                );
 
                 if abs >= COEFF_SUFFIX_LSB_THRESHOLD {
                     let lsb_path = with_suffix_lsb_kind(
@@ -541,7 +602,9 @@ pub fn record_residual_block_into_cover<F>(
                         frame_idx, mb_addr, EmbedDomain::CoeffSuffixLsb, lsb_path,
                     );
                     let lsb_bit = suffix_lsb_bit_for_magnitude(abs);
-                    cover.coeff_suffix_lsb.push(lsb_bit, lsb_key);
+                    cover.coeff_suffix_lsb.push_with_magnitude(
+                        lsb_bit, lsb_key, abs_u16,
+                    );
                 }
                 m &= !(1u32 << msb);
             }
@@ -569,7 +632,10 @@ pub fn record_residual_block_into_cover<F>(
             frame_idx, mb_addr, EmbedDomain::CoeffSignBypass, sign_path,
         );
         let sign_bit: u8 = if v < 0 { 1 } else { 0 };
-        cover.coeff_sign_bypass.push(sign_bit, sign_key);
+        let abs_u16 = abs.min(u16::MAX as u32) as u16;
+        cover.coeff_sign_bypass.push_with_magnitude(
+            sign_bit, sign_key, abs_u16,
+        );
 
         // CoeffSuffixLsb: only |coeff| ≥ 16 contributes.
         if abs >= COEFF_SUFFIX_LSB_THRESHOLD {
@@ -580,7 +646,9 @@ pub fn record_residual_block_into_cover<F>(
                 frame_idx, mb_addr, EmbedDomain::CoeffSuffixLsb, lsb_path,
             );
             let lsb_bit = suffix_lsb_bit_for_magnitude(abs);
-            cover.coeff_suffix_lsb.push(lsb_bit, lsb_key);
+            cover.coeff_suffix_lsb.push_with_magnitude(
+                lsb_bit, lsb_key, abs_u16,
+            );
         }
     }
 }

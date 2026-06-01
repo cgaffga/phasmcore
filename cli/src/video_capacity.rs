@@ -46,9 +46,13 @@ pub struct VideoCapacityArgs {
 }
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
-    // Task #96 — CABAC v2 capacity branch.
+    // Default to CABAC v2 capacity (the production encoder path).
+    // The CAVLC legacy path below reports wildly incorrect numbers
+    // (392 KB vs ~8 KB actual) because it transcodes to Baseline
+    // CAVLC and counts CAVLC positions — completely wrong for the
+    // CABAC streaming-session encoder that video-encode uses.
     #[cfg(feature = "cabac-stego")]
-    if args.cabac_v2 {
+    {
         return run_cabac_v2(args);
     }
 
@@ -121,8 +125,6 @@ pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
 /// proportionally slower.
 #[cfg(feature = "cabac-stego")]
 fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
-    use phasm_core::h264_stego_capacity_4domain;
-
     transcode::ensure_ffmpeg_available()?;
     let probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
@@ -133,18 +135,41 @@ fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
     let _ = std::fs::remove_file(&yuv_path);
 
     let gop_size = args.gop_size.min(probe.n_frames).max(1);
-    let info = h264_stego_capacity_4domain(
-        &yuv, probe.width, probe.height, probe.n_frames, gop_size,
-    )
-    .map_err(CliError::from)?;
+    // #796 — use OH264-accurate capacity when the production OH264
+    // backend is built in; matches what `StreamingEncodeSession`
+    // actually accepts. Pure-Rust path over-reports by 5-32× on
+    // sparse content (mirrorless cameras, drone aerial).
+    #[cfg(feature = "openh264-backend")]
+    let info = {
+        use phasm_core::h264_stego_capacity_4domain_oh264;
+        use phasm_core::codec::h264::openh264_stego::EncodeOpts;
+        let opts = EncodeOpts { qp: 26, intra_period: gop_size as i32 };
+        h264_stego_capacity_4domain_oh264(
+            &yuv, probe.width, probe.height, probe.n_frames, opts,
+        )
+        .map_err(CliError::from)?
+    };
+    #[cfg(not(feature = "openh264-backend"))]
+    let info = {
+        use phasm_core::h264_stego_capacity_4domain;
+        h264_stego_capacity_4domain(
+            &yuv, probe.width, probe.height, probe.n_frames, gop_size,
+        )
+        .map_err(CliError::from)?
+    };
 
     if args.json {
         println!(
-            r#"{{"engine":"cabac-v2","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{}}}"#,
+            r#"{{"engine":"cabac-v2","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{},"per_tier_primary_max_message_bytes":[{},{},{},{},{}]}}"#,
             probe.width, probe.height, probe.n_frames, gop_size,
             info.cover_size_bits,
             info.primary_max_message_bytes,
             info.shadow_max_message_bytes,
+            info.per_tier_primary_max_message_bytes[0],
+            info.per_tier_primary_max_message_bytes[1],
+            info.per_tier_primary_max_message_bytes[2],
+            info.per_tier_primary_max_message_bytes[3],
+            info.per_tier_primary_max_message_bytes[4],
         );
     } else {
         println!("CABAC v2 capacity ({}x{}, {} frames, gop={}):",
@@ -152,6 +177,13 @@ fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
         println!("  cover bits (3 injectable domains): {}", info.cover_size_bits);
         println!("  primary max message bytes:         {}", info.primary_max_message_bytes);
         println!("  shadow max message bytes (n=1):    {}", info.shadow_max_message_bytes);
+        println!();
+        println!("  D'.2 per-tier primary capacity (cascade-safety quality):");
+        let tier_names = ["Max Capacity", "Balanced", "Quality", "High Quality", "Best Quality"];
+        for (tier, name) in tier_names.iter().enumerate() {
+            println!("    Tier {} ({:14}): {:>10} bytes",
+                tier, name, info.per_tier_primary_max_message_bytes[tier]);
+        }
     }
     Ok(())
 }

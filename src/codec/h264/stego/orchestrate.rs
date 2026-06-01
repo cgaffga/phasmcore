@@ -311,6 +311,100 @@ pub fn pass2_stc_plan_with_keys(
     pass2_stc_plan_internal(cover, messages, h, Some((keys, gop_idx)))
 }
 
+/// STEGO.A.2 — Scheme A combined-cover STC primary planner.
+///
+/// Replaces per-domain `stealth_weighted_allocation` +
+/// [`pass2_stc_plan_with_keys`]'s 4 independent STC calls with a
+/// single global STC over the 4-domain combined cover. The decoder
+/// side ([`super::decode_pixels`]'s Scheme A extract — landing in
+/// STEGO.A.4) mirrors with the same combine + single STC extract.
+///
+/// Why this is better than per-domain:
+/// - Joint optimization across all 4 domains: STC can trade flips
+///   between domains based on actual per-position cost. With
+///   content-adaptive costs from [`super::content_costs`], STC
+///   concentrates flips in high-detectability-headroom regions
+///   regardless of which domain they live in.
+/// - Single rate `w_global = n_total / m_total` removes the
+///   per-domain rate mismatches that Scheme B's hand-tuned
+///   stealth_weighted_allocation has to work around.
+///
+/// Inputs:
+/// - `cover` — Pass-1 cover with per-position costs in `cover.costs`
+///   already populated by [`super::content_costs::compute_content_costs_yuv`]
+///   (or `DomainCosts::default()` for the uniform-cost baseline).
+/// - `weights` — per-domain `CostWeights` multipliers applied during
+///   `combine_cover_4domain`. Acts as a final cross-domain calibration
+///   layer on top of the content-adaptive per-position costs.
+/// - `frame_bits` — full primary message bit vector (NOT pre-split).
+/// - `h` — STC constraint height (caller passes the same `h` as the
+///   decoder will use; v1.0 = 4).
+/// - `keys` — master keys; the combined STC seed is derived from the
+///   `CoeffSignBypass` per-GOP seed (canonical "primary" seed in
+///   Scheme A; encoder + decoder must agree on this choice).
+/// - `gop_idx` — GOP index for per-GOP seed selection.
+///
+/// Returns `None` when the cover is too small for the message (rate
+/// `w = n / m < 1`), or when `stc_embed` fails to find a syndrome.
+pub fn pass2_stc_plan_combined_with_keys(
+    cover: &GopCover,
+    weights: &super::cost_weights::CostWeights,
+    frame_bits: &[u8],
+    h: usize,
+    keys: &CabacStegoMasterKeys,
+    gop_idx: u32,
+) -> Option<DomainPlan> {
+    let (combined_cover, combined_costs, boundaries) =
+        super::cost_weights::combine_cover_4domain(&cover.cover, &cover.costs, weights);
+    let n_cover = combined_cover.len();
+    let m_total = frame_bits.len();
+
+    // Empty message: return an empty plan (caller can early-return).
+    if m_total == 0 {
+        let mut plan = DomainPlan::default();
+        plan.coeff_sign_bypass = cover.cover.coeff_sign_bypass.bits.clone();
+        plan.coeff_suffix_lsb = cover.cover.coeff_suffix_lsb.bits.clone();
+        plan.mvd_sign_bypass = cover.cover.mvd_sign_bypass.bits.clone();
+        plan.mvd_suffix_lsb = cover.cover.mvd_suffix_lsb.bits.clone();
+        return Some(plan);
+    }
+    if n_cover == 0 {
+        return None;
+    }
+    let w = n_cover / m_total;
+    if w == 0 {
+        return None;
+    }
+    let used_cover = m_total * w;
+
+    let hhat_seed = keys
+        .per_gop_seeds(EmbedDomain::CoeffSignBypass, gop_idx)
+        .hhat_seed;
+    let hhat = generate_hhat(h, w, &hhat_seed);
+
+    let plan = stc_embed(
+        &combined_cover[..used_cover],
+        &combined_costs[..used_cover],
+        frame_bits,
+        &hhat,
+        h,
+        w,
+    )?;
+
+    // Extend plan back to full combined length: positions past
+    // `used_cover` carry the original cover bits (STC didn't touch
+    // them, so neither does Pass 3).
+    let mut full_stego_bits = Vec::with_capacity(n_cover);
+    full_stego_bits.extend_from_slice(&plan.stego_bits);
+    full_stego_bits.extend_from_slice(&combined_cover[used_cover..]);
+    debug_assert_eq!(full_stego_bits.len(), n_cover);
+
+    let mut domain_plan = super::cost_weights::split_plan_4domain(&full_stego_bits, &boundaries);
+    domain_plan.total_modifications = plan.num_modifications;
+    domain_plan.total_cost = plan.total_cost;
+    Some(domain_plan)
+}
+
 fn pass2_stc_plan_internal(
     cover: &GopCover,
     messages: &DomainMessages,
@@ -1246,5 +1340,162 @@ mod tests {
             original_message,
             "STC decode must recover the embedded message",
         );
+    }
+
+    // ── STEGO.A.2 — Scheme A combined-STC primary planner tests ──
+
+    /// Build a synthetic GopCover with bits + positions across all 4
+    /// domains. Costs default to uniform 1.0 (or content-adaptive if
+    /// `populate_costs` is true — we use uniform here since the
+    /// content_costs module needs a real YUV).
+    fn synth_4domain_cover(
+        n_csb: usize, n_csl: usize, n_msb: usize, n_msl: usize,
+    ) -> GopCover {
+        use crate::codec::h264::stego::hook::{
+            PositionKey, SyntaxPath, BinKind, Axis as HookAxis,
+        };
+        use crate::codec::h264::stego::inject::{DomainBits, DomainCover};
+        let mut cover = DomainCover::default();
+        let mut seed: u32 = 0xDEADBEEF;
+        let mut next_bit = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 16) & 1) as u8
+        };
+        for i in 0..n_csb {
+            cover.coeff_sign_bypass.bits.push(next_bit());
+            cover.coeff_sign_bypass.positions.push(PositionKey::new(
+                0, (i / 16) as u32, EmbedDomain::CoeffSignBypass,
+                SyntaxPath::Luma4x4 {
+                    block_idx: (i % 16) as u8,
+                    coeff_idx: ((i % 15) + 1) as u8,
+                    kind: BinKind::Sign,
+                },
+            ));
+        }
+        for i in 0..n_csl {
+            cover.coeff_suffix_lsb.bits.push(next_bit());
+            cover.coeff_suffix_lsb.positions.push(PositionKey::new(
+                0, (i / 16) as u32, EmbedDomain::CoeffSuffixLsb,
+                SyntaxPath::Luma4x4 {
+                    block_idx: (i % 16) as u8,
+                    coeff_idx: ((i % 15) + 1) as u8,
+                    kind: BinKind::SuffixLsb,
+                },
+            ));
+        }
+        for i in 0..n_msb {
+            cover.mvd_sign_bypass.bits.push(next_bit());
+            cover.mvd_sign_bypass.positions.push(PositionKey::new(
+                0, (i / 4) as u32, EmbedDomain::MvdSignBypass,
+                SyntaxPath::Mvd {
+                    list: 0,
+                    partition: (i % 16) as u8,
+                    axis: HookAxis::X,
+                    kind: BinKind::Sign,
+                },
+            ));
+        }
+        for i in 0..n_msl {
+            cover.mvd_suffix_lsb.bits.push(next_bit());
+            cover.mvd_suffix_lsb.positions.push(PositionKey::new(
+                0, (i / 4) as u32, EmbedDomain::MvdSuffixLsb,
+                SyntaxPath::Mvd {
+                    list: 0,
+                    partition: (i % 16) as u8,
+                    axis: HookAxis::Y,
+                    kind: BinKind::SuffixLsb,
+                },
+            ));
+        }
+        let costs = DomainCosts {
+            coeff_sign_bypass: vec![1.0; n_csb],
+            coeff_suffix_lsb: vec![1.0; n_csl],
+            mvd_sign_bypass: vec![1.0; n_msb],
+            mvd_suffix_lsb: vec![1.0; n_msl],
+        };
+        GopCover { cover, costs }
+    }
+
+    /// Self-contained Scheme A round-trip at the planner level:
+    /// build cover → plan → reconstruct combined wire bits → STC
+    /// extract → recover frame_bits. Independent of any walker / real
+    /// encoder; validates that
+    /// `pass2_stc_plan_combined_with_keys` is a sound encoder for
+    /// the matching STEGO.A.4 decoder.
+    #[test]
+    fn scheme_a_combined_planner_roundtrip() {
+        use crate::codec::h264::stego::cost_weights::{
+            combine_cover_4domain, CostWeights,
+        };
+        use crate::stego::stc::extract::stc_extract;
+        let cover = synth_4domain_cover(80, 40, 30, 20);
+        let weights = CostWeights::default();
+        let keys = CabacStegoMasterKeys::derive("scheme-a-roundtrip-pass").unwrap();
+        let gop_idx = 0u32;
+        let h = 4;
+
+        // Pick m_total so w = n_total / m_total ≥ 4 (enough headroom
+        // for STC).
+        let n_total = 80 + 40 + 30 + 20;
+        let m_total = n_total / 5;
+        let frame_bits: Vec<u8> = (0..m_total).map(|i| (i % 2) as u8).collect();
+
+        let plan = pass2_stc_plan_combined_with_keys(
+            &cover, &weights, &frame_bits, h, &keys, gop_idx,
+        )
+        .expect("planner should succeed at w=5");
+
+        // Reconstruct the wire bits the decoder would walk: take the
+        // ORIGINAL combined cover, then overlay per-domain plan bits
+        // at their original positions (per-domain plan vectors have
+        // the SAME length as the cover's bits).
+        let mut wire = cover.cover.clone();
+        wire.coeff_sign_bypass.bits = plan.coeff_sign_bypass.clone();
+        wire.coeff_suffix_lsb.bits = plan.coeff_suffix_lsb.clone();
+        wire.mvd_sign_bypass.bits = plan.mvd_sign_bypass.clone();
+        wire.mvd_suffix_lsb.bits = plan.mvd_suffix_lsb.clone();
+
+        // Combine the wire bits + extract.
+        let dummy_costs = DomainCosts::default();
+        let (wire_combined, _, _) = combine_cover_4domain(&wire, &dummy_costs, &weights);
+        let w_rate = wire_combined.len() / m_total;
+        let hhat_seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, gop_idx).hhat_seed;
+        let hhat = generate_hhat(h, w_rate, &hhat_seed);
+        let used = m_total * w_rate;
+        let recovered = stc_extract(&wire_combined[..used], &hhat, w_rate);
+        assert_eq!(&recovered[..m_total], &frame_bits[..],
+            "Scheme A round-trip must recover the embedded message");
+    }
+
+    #[test]
+    fn scheme_a_combined_planner_empty_message() {
+        use crate::codec::h264::stego::cost_weights::CostWeights;
+        let cover = synth_4domain_cover(10, 10, 10, 10);
+        let weights = CostWeights::default();
+        let keys = CabacStegoMasterKeys::derive("empty").unwrap();
+        let plan = pass2_stc_plan_combined_with_keys(
+            &cover, &weights, &[], 4, &keys, 0,
+        ).expect("empty message should plan trivially");
+        // Empty-message plan: returns the original cover bits
+        // unchanged in all four domains (no STC modification).
+        assert_eq!(plan.coeff_sign_bypass, cover.cover.coeff_sign_bypass.bits);
+        assert_eq!(plan.coeff_suffix_lsb, cover.cover.coeff_suffix_lsb.bits);
+        assert_eq!(plan.mvd_sign_bypass, cover.cover.mvd_sign_bypass.bits);
+        assert_eq!(plan.mvd_suffix_lsb, cover.cover.mvd_suffix_lsb.bits);
+    }
+
+    #[test]
+    fn scheme_a_combined_planner_message_too_large_returns_none() {
+        use crate::codec::h264::stego::cost_weights::CostWeights;
+        // 8 cover bits across all 4 domains, 9-bit message → w = 0,
+        // unfeasible.
+        let cover = synth_4domain_cover(2, 2, 2, 2);
+        let weights = CostWeights::default();
+        let keys = CabacStegoMasterKeys::derive("too-large").unwrap();
+        let frame_bits = vec![1u8; 9];
+        let res = pass2_stc_plan_combined_with_keys(
+            &cover, &weights, &frame_bits, 4, &keys, 0,
+        );
+        assert!(res.is_none(), "expected planner failure on infeasible rate");
     }
 }

@@ -521,14 +521,20 @@ pub fn h264_ghost_decode(
     let (sps, pps, length_size) = extract_h264_params(&mp4_file)?;
 
     if pps.entropy_coding_mode_flag {
-        // Phase 6D.8 chunk 7 — cabac-stego cfg-gated route.
-        // Under the cabac-stego feature, CABAC inputs route through
-        // the new chunk-6G decoder (walk_nalus + STC reverse +
-        // frame unwrap). Without the feature, fall back to the
-        // legacy "not supported" error to keep CAVLC-only builds
-        // honest about scope.
+        // DECODE-FAST (2026-05-24) — try the modern StreamingDecodeSession
+        // first. It does per-GOP brute-force, which is ~order-of-magnitude
+        // cheaper than the legacy whole-video search in
+        // `decode_cabac_via_chunk_6g` on full-length 1080p clips. CLI's
+        // `decode_h264_cabac` already does this; mobile bridges (iOS +
+        // Android) reach this function via `h264_ghost_decode_path` and
+        // were stuck on the legacy path before this change.
         #[cfg(feature = "cabac-stego")]
         {
+            if let Some(payload) =
+                try_streaming_decode_mp4(&mp4_file, length_size, passphrase)
+            {
+                return Ok(payload);
+            }
             return decode_cabac_via_chunk_6g(&mp4_file, length_size, passphrase);
         }
         #[cfg(not(feature = "cabac-stego"))]
@@ -1095,6 +1101,85 @@ pub fn h264_ghost_capacity_max_path(path: &std::path::Path) -> Result<usize, Ste
 /// Decoupled from the legacy CAVLC pipeline: the cabac-stego
 /// route does not share scan/STC code with the bitstream-mod
 /// pipeline. Two different stego modes living side-by-side.
+/// DECODE-FAST (2026-05-24) — assemble an Annex-B bitstream from the
+/// already-demuxed MP4 (avcC SPS+PPS + per-sample length-prefixed NALs
+/// rewritten with `00 00 00 01` start codes) and try
+/// `StreamingDecodeSession`. Returns `Some(payload)` on a clean
+/// chunk_frame match, `None` if the file isn't streaming-session
+/// output (e.g. pre-streaming OH264 stego, or pure-Rust experimental
+/// path) so the caller can fall back to the legacy decoder.
+#[cfg(feature = "cabac-stego")]
+fn try_streaming_decode_mp4(
+    mp4_file: &mp4::Mp4File,
+    length_size: u8,
+    passphrase: &str,
+) -> Option<crate::stego::payload::PayloadData> {
+    use crate::codec::h264::streaming_session::StreamingDecodeSession;
+
+    let track_idx = mp4_file.video_track_idx?;
+    let track = &mp4_file.tracks[track_idx];
+    let avcc = track.avcc_data.as_ref()?;
+
+    // `split_annex_b_into_gops` looks for SPS boundaries to find each
+    // GOP. MP4 keeps SPS/PPS in avcC (not inline), so we prepend the
+    // SPS+PPS pair before every IDR slice (nal_type 5) we emit. That
+    // gives the streaming session the per-GOP slabs it expects.
+    let mut annex_b: Vec<u8> = Vec::new();
+    let start_code: [u8; 4] = [0, 0, 0, 1];
+    let push_params = |buf: &mut Vec<u8>| {
+        for sps_bytes in &avcc.sps_nalus {
+            if sps_bytes.is_empty() {
+                continue;
+            }
+            buf.extend_from_slice(&start_code);
+            buf.extend_from_slice(sps_bytes);
+        }
+        for pps_bytes in &avcc.pps_nalus {
+            if pps_bytes.is_empty() {
+                continue;
+            }
+            buf.extend_from_slice(&start_code);
+            buf.extend_from_slice(pps_bytes);
+        }
+    };
+    let ls = length_size as usize;
+    for sample in &track.samples {
+        let data = &sample.data;
+        let mut p = 0usize;
+        let mut sample_idr_emitted_params = false;
+        while p + ls <= data.len() {
+            let mut nal_len = 0usize;
+            for i in 0..ls {
+                nal_len = (nal_len << 8) | data[p + i] as usize;
+            }
+            p += ls;
+            if nal_len == 0 || p + nal_len > data.len() {
+                return None;
+            }
+            let nal_bytes = &data[p..p + nal_len];
+            let nal_type = nal_bytes.first().map(|b| b & 0x1F).unwrap_or(0);
+            if nal_type == 5 && !sample_idr_emitted_params {
+                push_params(&mut annex_b);
+                sample_idr_emitted_params = true;
+            }
+            annex_b.extend_from_slice(&start_code);
+            annex_b.extend_from_slice(nal_bytes);
+            p += nal_len;
+        }
+    }
+    if annex_b.is_empty() {
+        return None;
+    }
+
+    let mut session = StreamingDecodeSession::create(passphrase).ok()?;
+    session.push_annex_b(&annex_b).ok()?;
+    let result = session.finish().ok()?;
+    Some(crate::stego::payload::PayloadData {
+        text: result.text,
+        files: Vec::new(),
+    })
+}
+
 #[cfg(feature = "cabac-stego")]
 fn decode_cabac_via_chunk_6g(
     mp4_file: &mp4::Mp4File,

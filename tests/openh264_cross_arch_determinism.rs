@@ -122,16 +122,32 @@ fn cross_arch_determinism_record_hash() {
     // see workflow run id 25868497830. All three produced this
     // identical hash + 47118-byte stego.
     //
+    // **Re-pinned 2026-05-23** following V0.4.D fork patches:
+    //   1. constraint_set4/5 emit 0 instead of 1 (au_set.cpp:277-278);
+    //   2. pic_order_cnt_type emit 0 instead of 2 (au_set.cpp:503).
+    // Both patches close real-world cohort gaps surfaced by V0.4.C
+    // SPS audit. Stream gains 9 bytes (47119 → 47128) due to the
+    // per-slice pic_order_cnt_lsb field that POC type 0 mandates.
+    // Cross-arch matrix re-verification still pending (workflow is
+    // manual-only via workflow_dispatch); current pin captures the
+    // macOS arm64 result only.
+    //
+    // Prior pins (kept for audit trail):
+    //   - 2026-05-14 (pre-#691):   35fd85a47bab905d88c1fa96d8910e02d1248cbd17e9527809f5c4f9559c1f3e (47118 bytes, LEVEL_3_0 hardcoded)
+    //   - 2026-05-23 post-#691:    8ba4002b2ecec7662e1e1e04f24cb9720dafdb63354bc54099794220bd793ddf (47118 bytes, dynamic LEVEL_2_1, PRO_MAIN)
+    //   - 2026-05-23 post-V0.4.C:  c3a4d284e1b51741d0301ce469ffd9d0a886cae3885e1066c1f3049b555897b5 (47119 bytes, PRO_HIGH, set1=0)
+    //
     // If this assert ever fires:
     //   1. Print both hashes so the diff is captured in the log.
     //   2. Check whether the encoder source has intentionally
     //      changed (new OH264 fork SHA, new STC parameters, new
-    //      stego pipeline behaviour). If yes, re-record the hash.
+    //      stego pipeline behaviour, shim level/qp/refs/profile/POC
+    //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
     const PINNED_SHA256: &str =
-        "35fd85a47bab905d88c1fa96d8910e02d1248cbd17e9527809f5c4f9559c1f3e";
-    const PINNED_LEN: usize = 47118;
+        "1ff0a63fb6a5b90ae05992b2e67c52de7472c3840a42e4ce32f52ecc27ae35a1";
+    const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,
         "stego length {} on {os}-{arch} differs from pinned {}",

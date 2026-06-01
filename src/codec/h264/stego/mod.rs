@@ -15,10 +15,12 @@
 
 pub mod cascade_safety;
 pub mod chunk_frame;
+pub mod content_costs;
 pub mod cost_model;
 pub mod cost_weights;
 pub mod cover_replay;
 pub mod decode_pixels;
+pub mod dpb_correction;
 pub mod encode_pixels;
 pub mod encoder_hook;
 pub mod gop_pattern;
@@ -30,6 +32,7 @@ pub mod per_gop_plan;
 pub mod primary_rs;
 pub mod provisional_emit;
 pub mod shadow;
+pub mod tier_filter;
 pub mod validate;
 
 pub use cost_model::PositionCostCtx;
@@ -45,7 +48,8 @@ pub use hook::{
 pub use inject::{
     apply_coeff_sign_overrides, apply_coeff_suffix_lsb_overrides,
     apply_mvd_sign_overrides, apply_mvd_suffix_lsb_overrides,
-    enumerate_coeff_sign_positions, enumerate_coeff_suffix_lsb_positions,
+    enumerate_coeff_sign_magnitudes, enumerate_coeff_sign_positions,
+    enumerate_coeff_suffix_lsb_magnitudes, enumerate_coeff_suffix_lsb_positions,
     enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
     extract_coeff_sign_bits, extract_coeff_suffix_lsb_bits,
     extract_mvd_sign_bits, extract_mvd_suffix_lsb_bits,

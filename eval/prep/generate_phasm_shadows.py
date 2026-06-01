@@ -36,6 +36,8 @@ PRIMARY_PASS = "phasm-eval-primary-2026"
 SHADOW_PASSES = [
     "phasm-eval-shadow1-2026",
     "phasm-eval-shadow2-2026",
+    "phasm-eval-shadow3-2026",
+    "phasm-eval-shadow4-2026",
 ]
 MSG_BYTES = 64  # short text — matches Phasm spec "<1KB short messages"
 
@@ -115,7 +117,16 @@ def main() -> int:
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=0,
                    help="0 = all covers (smoke testing: --limit 5)")
+    p.add_argument("--n-list", type=str, default="1,2",
+                   help="Comma-separated list of shadow counts to generate "
+                        "(default: 1,2; for E8 set 3,4). Output dirs named "
+                        "n<N> e.g. n3, n4")
     args = p.parse_args()
+    n_list = [int(x.strip()) for x in args.n_list.split(",") if x.strip()]
+    if not n_list or any(n < 1 or n > len(SHADOW_PASSES) for n in n_list):
+        print(f"[gen] --n-list must contain ints in 1..{len(SHADOW_PASSES)}",
+              file=sys.stderr)
+        return 2
 
     phasm_bin = find_phasm_binary()
     if phasm_bin is None:
@@ -131,18 +142,18 @@ def main() -> int:
         return 1
     print(f"[gen] {len(covers)} covers, seed={args.seed}, workers={args.workers}")
 
-    out_n1 = args.out_dir / "n1"
-    out_n2 = args.out_dir / "n2"
-    out_n1.mkdir(parents=True, exist_ok=True)
-    out_n2.mkdir(parents=True, exist_ok=True)
+    out_dirs = {}
+    for n in n_list:
+        d = args.out_dir / f"n{n}"
+        d.mkdir(parents=True, exist_ok=True)
+        out_dirs[n] = d
 
     tasks: list[tuple[Path, Path, int, int, str]] = []
     for c in covers:
-        tasks.append((c, out_n1 / c.name, 1, args.seed, phasm_bin))
-        tasks.append((c, out_n2 / c.name, 2, args.seed, phasm_bin))
+        for n in n_list:
+            tasks.append((c, out_dirs[n] / c.name, n, args.seed, phasm_bin))
 
-    stats = {1: {"ok": 0, "skip": 0, "fail": 0},
-             2: {"ok": 0, "skip": 0, "fail": 0}}
+    stats = {n: {"ok": 0, "skip": 0, "fail": 0} for n in n_list}
 
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
         futures = [ex.submit(encode_one, t) for t in tasks]
@@ -156,11 +167,11 @@ def main() -> int:
             else:
                 stats[n]["ok"] += 1
 
-    for n in (1, 2):
+    for n in n_list:
         s = stats[n]
         print(f"[gen] n={n}: ok={s['ok']} skipped={s['skip']} failed={s['fail']}", flush=True)
 
-    fail_total = stats[1]["fail"] + stats[2]["fail"]
+    fail_total = sum(s["fail"] for s in stats.values())
     return 0 if fail_total == 0 else 1
 
 

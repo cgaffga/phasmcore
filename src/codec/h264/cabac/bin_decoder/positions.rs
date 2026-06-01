@@ -415,6 +415,21 @@ mod tests {
             logger_cover.cover.coeff_sign_bypass.bits,
             "coeff_sign_bypass bits must match"
         );
+        // CASCADE.P1.2/P1.3 — walker and encoder must agree on the
+        // coefficient magnitudes captured per position, byte-for-byte.
+        // Both paths read the same `scan_coeffs` array in the same
+        // reverse-scan-over-nonzero order, so this is equality by
+        // construction, but the assert pins it down so future changes
+        // can't drift one side without the other.
+        assert_eq!(
+            rec_cover.coeff_sign_bypass.magnitudes,
+            logger_cover.cover.coeff_sign_bypass.magnitudes,
+            "coeff_sign_bypass magnitudes must match (walker ↔ encoder)"
+        );
+        assert!(
+            rec_cover.coeff_sign_bypass.magnitudes.iter().all(|&m| m > 0),
+            "every CoeffSign magnitude must be positive (|coeff| ≥ 1)"
+        );
         assert_eq!(
             rec_cover.coeff_suffix_lsb.positions,
             logger_cover.cover.coeff_suffix_lsb.positions,
@@ -424,6 +439,11 @@ mod tests {
             rec_cover.coeff_suffix_lsb.bits,
             logger_cover.cover.coeff_suffix_lsb.bits,
             "coeff_suffix_lsb bits must match"
+        );
+        assert_eq!(
+            rec_cover.coeff_suffix_lsb.magnitudes,
+            logger_cover.cover.coeff_suffix_lsb.magnitudes,
+            "coeff_suffix_lsb magnitudes must match (walker ↔ encoder)"
         );
     }
 

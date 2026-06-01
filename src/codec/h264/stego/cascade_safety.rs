@@ -146,77 +146,132 @@ pub fn analyze_safe_mvd_subset(
         return safe;
     }
 
-    // Per-position cumulative-shift accumulator. `shift_bound[i]` is
-    // an UPPER BOUND on |m_meta[i]^post − m_meta[i]^pre|, given the
-    // safe selections we've made so far. Updated as we add positions
-    // to the safe set.
+    // Per-position cumulative-shift accumulator.
     let mut shift_bound: Vec<u32> = vec![0; n];
 
-    // Iterate in raster order. `meta` is already in this order
-    // (encoder pushes per-MVD as the encoder visits MBs in raster).
-    // Defensive: re-sort by (frame_idx, mb_addr, partition, axis)
-    // to handle any future change in capture order.
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&i| {
         (meta[i].frame_idx, meta[i].mb_addr, meta[i].partition, meta[i].axis)
     });
 
-    for &i in &order {
-        let p = &meta[i];
+    // STEGO.A.12.perf — O(n²) → O(n × k) optimization.
+    //
+    // The two inner loops (predicates a + b) only need to examine
+    // positions at MB-level NEIGHBOURS of P (mb_propagates is a
+    // 4-cell stencil: right/below/bottom-left/bottom-right). Index
+    // positions by (frame_idx, mb_addr) so each predicate is O(k)
+    // lookups into ≤ 4 neighbour MBs instead of O(n) scans over
+    // every position.
+    //
+    // At 1024×576 × 150f with 271k MVD positions, the baseline
+    // O(n²) took 62 seconds; this O(n × k) variant lands in
+    // sub-second territory.
+    use std::collections::HashMap;
+    let mut mb_index: HashMap<(u32, u32), Vec<usize>> =
+        HashMap::with_capacity(n / 8);
+    for (i, p) in meta.iter().enumerate() {
+        mb_index.entry((p.frame_idx, p.mb_addr)).or_default().push(i);
+    }
 
-        // Predicate (a): no previously-selected P' has its flip
-        // touching mv_grid cells that P's predictor reads. We
-        // overapproximate "P's predictor reads from MB X" by
-        // checking if P's MB has X as a propagation-source neighbour
-        // — equivalently, X propagates TO P's MB.
-        let p_mx = p.mb_addr % mb_w;
-        let p_my = p.mb_addr / mb_w;
-        let mut pred_a = true;
-        for &j in &order {
-            if j == i { break; }  // raster-order processing — only earlier positions checked
-            if !safe[j] { continue; }
-            let q = &meta[j];
-            // Same-frame restriction: cross-frame predictor reads
-            // are limited to reference frame DPB which doesn't carry
-            // current-frame MVDs. Different frames are independent.
-            if q.frame_idx != p.frame_idx { continue; }
-            let q_mx = q.mb_addr % mb_w;
-            let q_my = q.mb_addr / mb_w;
-            if mb_propagates(q_mx, q_my, p_mx, p_my) {
-                pred_a = false;
-                break;
+    // Rank lookup: order_rank[i] = position of i in `order`. Used
+    // for the "earlier in raster than P" check in predicate (a).
+    let mut order_rank: Vec<u32> = vec![0; n];
+    for (rank, &i) in order.iter().enumerate() {
+        order_rank[i] = rank as u32;
+    }
+
+    // Helper closures to enumerate the 4 propagation-source MBs (for
+    // predicate a) and 4 propagation-target MBs (for predicate b).
+    // Returns (mb_x, mb_y, mb_addr) for in-bounds MBs only.
+    let source_mbs = |p_mx: u32, p_my: u32| -> [Option<u32>; 4] {
+        // Sources read FROM these neighbours when computing P's
+        // predictor. Equivalently: these neighbours PROPAGATE TO P.
+        //   left: (p_mx-1, p_my)
+        //   above: (p_mx, p_my-1)
+        //   above-left D-fallback: (p_mx-1, p_my-1)
+        //   above-right: (p_mx+1, p_my-1)
+        let coords = [
+            (p_mx.checked_sub(1), Some(p_my)),
+            (Some(p_mx), p_my.checked_sub(1)),
+            (p_mx.checked_sub(1), p_my.checked_sub(1)),
+            (Some(p_mx + 1), p_my.checked_sub(1)),
+        ];
+        let mut out = [None; 4];
+        for (slot, (xo, yo)) in out.iter_mut().zip(coords.iter()) {
+            if let (Some(x), Some(y)) = (*xo, *yo) {
+                if x < mb_w && y < mb_h {
+                    *slot = Some(y * mb_w + x);
+                }
             }
         }
-        if !pred_a {
-            continue;
+        out
+    };
+    let target_mbs = |p_mx: u32, p_my: u32| -> [Option<u32>; 4] {
+        // P propagates TO these neighbours when they read predictors.
+        //   right: (p_mx+1, p_my)
+        //   below: (p_mx, p_my+1)
+        //   below-left: (p_mx-1, p_my+1)
+        //   below-right: (p_mx+1, p_my+1)
+        let coords = [
+            (Some(p_mx + 1), Some(p_my)),
+            (Some(p_mx), Some(p_my + 1)),
+            (p_mx.checked_sub(1), Some(p_my + 1)),
+            (Some(p_mx + 1), Some(p_my + 1)),
+        ];
+        let mut out = [None; 4];
+        for (slot, (xo, yo)) in out.iter_mut().zip(coords.iter()) {
+            if let (Some(x), Some(y)) = (*xo, *yo) {
+                if x < mb_w && y < mb_h {
+                    *slot = Some(y * mb_w + x);
+                }
+            }
         }
+        out
+    };
 
-        // Predicate (b): for every Q later in raster order that P
-        // would propagate to, the cumulative shift bound at Q
-        // (PLUS this new flip's contribution) is strictly less than
-        // |m_Q|. Tentatively propose adding P; check; commit only
-        // if all Qs survive.
+    for &i in &order {
+        let p = &meta[i];
+        let p_mx = p.mb_addr % mb_w;
+        let p_my = p.mb_addr / mb_w;
+        let i_rank = order_rank[i];
+
+        // Predicate (a): no EARLIER safe position at a propagation-
+        // source MB. Source MB = any MB that propagates TO P's MB,
+        // i.e. one of the 4 source neighbours.
+        let mut pred_a = true;
+        'a: for src_addr in source_mbs(p_mx, p_my).iter().flatten() {
+            if let Some(positions) = mb_index.get(&(p.frame_idx, *src_addr)) {
+                for &j in positions {
+                    if safe[j] && order_rank[j] < i_rank {
+                        pred_a = false;
+                        break 'a;
+                    }
+                }
+            }
+        }
+        if !pred_a { continue; }
+
+        // Predicate (b): for every Q at a propagation-TARGET MB of P,
+        // the cumulative shift bound + this flip's 2|m_P| must stay
+        // < |m_Q|. Target MBs are by construction strictly later than
+        // P's MB in raster scan, so we don't need to re-check raster
+        // ordering at the MB level.
         let two_m_p = 2u32.saturating_mul(p.magnitude);
         let mut pred_b = true;
         let mut tentative_updates: Vec<usize> = Vec::new();
 
-        for &j in &order {
-            if j == i { continue; }
-            let q = &meta[j];
-            if q.frame_idx != p.frame_idx { continue; }
-            let q_mx = q.mb_addr % mb_w;
-            let q_my = q.mb_addr / mb_w;
-            // Only Qs LATER in raster matter for downstream cascade.
-            if !mb_strictly_later(p_mx, p_my, q_mx, q_my) { continue; }
-            if !mb_propagates(p_mx, p_my, q_mx, q_my) { continue; }
-            // Cumulative shift at Q = existing bound + this flip's
-            // contribution. Must be strictly less than |m_Q|.
-            let new_bound = shift_bound[j].saturating_add(two_m_p);
-            if new_bound >= q.magnitude {
-                pred_b = false;
-                break;
+        'b: for tgt_addr in target_mbs(p_mx, p_my).iter().flatten() {
+            if let Some(positions) = mb_index.get(&(p.frame_idx, *tgt_addr)) {
+                for &j in positions {
+                    let q = &meta[j];
+                    let new_bound = shift_bound[j].saturating_add(two_m_p);
+                    if new_bound >= q.magnitude {
+                        pred_b = false;
+                        break 'b;
+                    }
+                    tentative_updates.push(j);
+                }
             }
-            tentative_updates.push(j);
         }
 
         if pred_b {

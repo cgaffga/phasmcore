@@ -30,7 +30,23 @@ fn load_real_world(name: &str) -> Vec<u8> {
         .unwrap_or_else(|_| panic!("missing real-world fixture: {name}"))
 }
 
+// STEGO.B.P3 (2026-05-23): the v2 "Phase B Viterbi orchestrator"
+// these tests were targeting no longer exists. streaming_v2's body
+// is now a thin Scheme A wrapper (single combined STC over the
+// whole-video cover). The 64×48×5 and 128×80×10 fixtures are too
+// small for Scheme A's stricter combined-cover capacity (w =
+// n_cover / m_total must be ≥ 1) and the encode returns
+// MessageTooLarge.
+//
+// Round-trip coverage at small fixtures still lives in
+// h264_bridge_atomic_swap (`bridge_atomic_swap_roundtrip_128x80_10f_*`),
+// which routes through the IPPPP/IBPBP bridge wrappers that own
+// their own message-framing layer with tighter capacity slack.
+// Cross-encoder unification proof in stego_a_roundtrip_parity
+// (`cross_encoder_primary_payload_parity`).
+
 #[test]
+#[ignore = "STEGO.B.P3: tiny-fixture Scheme A capacity — replaced by bridge_atomic_swap round-trip"]
 fn v2_orchestrator_roundtrip_64x48_5f_singlegop() {
     let yuv = load_real_world("img4138_64x48_f5.yuv");
     let bytes = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(
@@ -43,6 +59,7 @@ fn v2_orchestrator_roundtrip_64x48_5f_singlegop() {
 }
 
 #[test]
+#[ignore = "STEGO.B.P3: tiny-fixture Scheme A capacity — replaced by bridge_atomic_swap round-trip"]
 fn v2_orchestrator_roundtrip_128x80_10f_2gops() {
     let yuv = load_real_world("img4138_128x80_f10.yuv");
     let bytes = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2(

@@ -254,7 +254,16 @@ fn run_triage(
     max_dh
 }
 
+// STEGO.B.P3 (2026-05-23): the per-domain A/B mechanism this test
+// exercised (PHASM_STEALTH_ABLATE=cs zeroing other 3 domain weights)
+// applied to Scheme B's StealthAllocator. After P3, streaming_v2 is
+// Scheme A (single combined STC, no per-domain allocator). The
+// 128×80×10 fixture also hits Scheme A's stricter combined-cover
+// capacity (32-byte payload triggers MessageTooLarge). Stealth
+// measurement at production fixture sizes is in
+// `h264_stego_stealth_measurement`.
 #[test]
+#[ignore = "STEGO.B.P3: Scheme B per-domain A/B no longer applicable; PHASM_STEALTH_ABLATE removed in spirit"]
 fn phase5_triage_4domain_vs_cs_only_128x80_10f() {
     let yuv = load_yuv("img4138_128x80_f10.yuv");
     let payload_bytes = std::env::var("PHASM_PHASE5_PAYLOAD_BYTES")

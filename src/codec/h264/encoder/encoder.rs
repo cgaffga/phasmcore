@@ -2489,12 +2489,10 @@ impl Encoder {
         let slice_nal = wrap_rbsp_as_nal(&slice_rbsp, NalType::SLICE_IDR, 3);
         out.extend_from_slice(&ANNEX_B_START_CODE);
         out.extend_from_slice(&slice_nal);
-        // Snapshot the just-reconstructed frame into the DPB for use
-        // by the next P-frame.
+        // Fix A: self.recon is now post-flip (since Section 11 uses
+        // _post levels). DPB promotion from &self.recon is correct —
+        // next-frame ME sees what the decoder will reconstruct.
         self.dpb.promote(&self.recon, self.frame_num);
-        // §B-cascade-real Phase 1.1.B step 3: per-MB visual_recon
-        // writes (step 2) + parallel deblocking populate visual_recon
-        // throughout the frame. The step 1 frame-end mirror is gone.
         self.frame_num = (self.frame_num + 1) & 0xF;
         self.stego_frame_idx = self.stego_frame_idx.wrapping_add(1);
         self.gop_position = 1; // after the IDR, next frame is position 1
@@ -2544,6 +2542,7 @@ impl Encoder {
         let slice_nal = wrap_rbsp_as_nal(&slice_rbsp, NalType::SLICE_IDR, 3);
         out.extend_from_slice(&ANNEX_B_START_CODE);
         out.extend_from_slice(&slice_nal);
+        // Fix A: self.recon is post-flip; DPB promotion correct.
         self.dpb.promote(&self.recon, self.frame_num);
         self.frame_num = (self.frame_num + 1) & 0xF;
         self.gop_position = 1;
@@ -2629,6 +2628,7 @@ impl Encoder {
         // check. Without the grid, static-background B-MBs adjacent
         // to a moving subject pick up the subject's median MV and
         // produce visible "ghost" streaks.
+        // Fix A: self.recon is post-flip; DPB promotion correct.
         let motion_grid = self.mv_grid.to_colocated_grid();
         self.dpb.promote_with_motion(&self.recon, self.frame_num, motion_grid);
 
@@ -5200,54 +5200,27 @@ impl Encoder {
         nb.transform_size_8x8_flag = use_8x8;
         cabac.neighbors.commit(mb_x, nb);
 
-        // 11. Reconstruction.
+        // 11. Reconstruction — Fix A (Phase 3 closed-loop 2026-05-25).
+        //
+        // Both self.recon AND self.visual_recon are now built from the
+        // POST-FLIP coefficient arrays (_post). This makes the
+        // encoder's reconstruction match what the decoder will produce
+        // from the flipped wire bits. Next-MB intra-prediction and
+        // next-frame inter-prediction both read from self.recon →
+        // encoder and decoder agree on every predictor → cascade
+        // eliminated.
+        //
+        // Before Fix A, Section 11 used PRE-FLIP levels for self.recon
+        // (preserving the cover-capture invariant: Pass 1 and Pass 3
+        // saw identical neighbor-derived positions). Fix A breaks that
+        // invariant — Pass 3's reconstruction now diverges from Pass 1
+        // because the prediction reads post-flip data. This is
+        // acceptable because the STC plan was computed in Pass 2 on
+        // the Pass-1 cover; the actual bit writes in Pass 3 follow
+        // the plan regardless of what self.recon contains. The wire
+        // bits are correct; only the encoder's internal prediction
+        // shifts, which is exactly the desired behavior.
         let mut recon_luma = [[0u8; 16]; 16];
-        if use_8x8 {
-            // Dequant + inverse 8×8 for each of 4 8×8 blocks.
-            for blk in 0..4 {
-                let (bx_mb, by_mb) = I8X8_BLOCK_POS[blk];
-                let bx0 = (bx_mb * 8) as usize;
-                let by0 = (by_mb * 8) as usize;
-                let dq = dequant_8x8_block(&levels_8x8[blk], qp);
-                let inv = inverse_dct_8x8(&dq);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        let pixel_res = (inv[dy][dx] + 32) >> 6;
-                        let v = pred_y[by0 + dy][bx0 + dx] as i32 + pixel_res;
-                        recon_luma[by0 + dy][bx0 + dx] = v.clamp(0, 255) as u8;
-                    }
-                }
-            }
-        } else {
-            // Reuse the Phase 100-J cached 4×4 reconstructed residuals
-            // rather than re-running dequant+inverse here.
-            for k in 0..16 {
-                let (bx, by) = BLOCK_INDEX_TO_POS[k];
-                let sby = by as usize;
-                let sbx = bx as usize;
-                let sub_res = &luma_recon_residual_4x4[k];
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let v = pred_y[sby * 4 + dy][sbx * 4 + dx] as i32 + sub_res[dy][dx];
-                        recon_luma[sby * 4 + dy][sbx * 4 + dx] = v.clamp(0, 255) as u8;
-                    }
-                }
-            }
-        }
-        self.recon
-            .write_luma_mb(mb_x as u32, mb_y as u32, &recon_luma);
-        let recon_cb = self.reconstruct_chroma_mb(&pred_cb, &cb_ac, &cb_dc, qp_c);
-        self.recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &recon_cb);
-        let recon_cr = self.reconstruct_chroma_mb(&pred_cr, &cr_ac, &cr_dc, qp_c);
-        self.recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
-
-        // §B-cascade-real Phase 1.1.B step 2 — visual_recon path with
-        // POST-flip levels (sites 9-12 of 15: P-frame 8×8 + 4×4 luma +
-        // chroma DC + chroma AC). Re-run the same recon code with
-        // _post arrays.
-        let mut visual_recon_luma = [[0u8; 16]; 16];
         if use_8x8 {
             for blk in 0..4 {
                 let (bx_mb, by_mb) = I8X8_BLOCK_POS[blk];
@@ -5259,14 +5232,11 @@ impl Encoder {
                     for dx in 0..8 {
                         let pixel_res = (inv[dy][dx] + 32) >> 6;
                         let v = pred_y[by0 + dy][bx0 + dx] as i32 + pixel_res;
-                        visual_recon_luma[by0 + dy][bx0 + dx] =
-                            v.clamp(0, 255) as u8;
+                        recon_luma[by0 + dy][bx0 + dx] = v.clamp(0, 255) as u8;
                     }
                 }
             }
         } else {
-            // 4×4 path: dequant + inverse on _post levels (no cached
-            // residual exists for post-flip values; recompute here).
             use crate::codec::h264::transform::{dequant_4x4, inverse_4x4_integer};
             for k in 0..16 {
                 let (bx, by) = BLOCK_INDEX_TO_POS[k];
@@ -5278,22 +5248,28 @@ impl Encoder {
                     for dx in 0..4 {
                         let v = pred_y[sby * 4 + dy][sbx * 4 + dx] as i32
                             + res[dy][dx];
-                        visual_recon_luma[sby * 4 + dy][sbx * 4 + dx] =
+                        recon_luma[sby * 4 + dy][sbx * 4 + dx] =
                             v.clamp(0, 255) as u8;
                     }
                 }
             }
         }
+        self.recon
+            .write_luma_mb(mb_x as u32, mb_y as u32, &recon_luma);
         self.visual_recon
-            .write_luma_mb(mb_x as u32, mb_y as u32, &visual_recon_luma);
-        let visual_cb =
+            .write_luma_mb(mb_x as u32, mb_y as u32, &recon_luma);
+        let recon_cb =
             self.reconstruct_chroma_mb(&pred_cb, &cb_ac_post, &cb_dc_post, qp_c);
+        self.recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &recon_cb);
         self.visual_recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &visual_cb);
-        let visual_cr =
+            .write_chroma_block(mb_x as u32, mb_y as u32, 0, &recon_cb);
+        let recon_cr =
             self.reconstruct_chroma_mb(&pred_cr, &cr_ac_post, &cr_dc_post, qp_c);
+        self.recon
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
         self.visual_recon
-            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &visual_cr);
+            .write_chroma_block(mb_x as u32, mb_y as u32, 1, &recon_cr);
 
         // Phase 6F.2: inter MB committed; the MVDs logged earlier
         // by apply_mvd_hook_to_choice are now real bitstream

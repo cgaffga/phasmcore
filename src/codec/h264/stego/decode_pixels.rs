@@ -40,7 +40,7 @@ use crate::stego::payload::PayloadData;
 
 use crate::codec::h264::cabac::bin_decoder::{
     walk_annex_b_for_cover, walk_annex_b_for_cover_with_options,
-    walk_nalus_for_cover, WalkOptions,
+    walk_nalus_for_cover, walk_nalus_for_cover_with_options, WalkOptions,
 };
 use crate::codec::h264::NalUnit;
 
@@ -69,13 +69,35 @@ pub fn h264_stego_decode_yuv_string(
 /// (e.g., from MP4-demuxed length-prefixed NAL bytes plus the
 /// avcC SPS / PPS). Used by the chunk-7 cfg-gated branch in the
 /// legacy `h264_ghost_decode` MP4 path.
+///
+/// STEGO.A.11.fix — was calling Scheme B-only `decode_from_cover`,
+/// which missed shadow + Scheme A combined STC entirely (iOS users
+/// decoding STEGO.A-produced shadow stego saw multi-minute hangs
+/// finding nothing). Now routes through the same 3-tier
+/// `smart_decode_from_walked_cover` helper that
+/// `h264_stego_smart_decode_video` uses.
 pub fn h264_stego_decode_nalus_string(
     nalus: &[NalUnit],
     passphrase: &str,
 ) -> Result<String, StegoError> {
-    let walk = walk_nalus_for_cover(nalus)
-        .map_err(|e| StegoError::InvalidVideo(format!("walk nalus: {e}")))?;
-    decode_from_cover(walk.cover, passphrase)
+    h264_stego_decode_nalus_with_payload(nalus, passphrase).map(|p| p.text)
+}
+
+/// STEGO.A.11.fix — `_with_payload` variant of
+/// [`h264_stego_decode_nalus_string`]. Reuses the unified 3-tier
+/// cover-based decode (shadow → Scheme A combined → Scheme B fallback).
+pub fn h264_stego_decode_nalus_with_payload(
+    nalus: &[NalUnit],
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
+    let walk = walk_nalus_for_cover_with_options(
+        nalus,
+        WalkOptions { record_mvd: true, record_offsets: false },
+    )
+    .map_err(|e| StegoError::InvalidVideo(format!("walk nalus: {e}")))?;
+    smart_decode_from_walked_cover(
+        walk.cover, &walk.mvd_meta, walk.mb_w, walk.mb_h, passphrase,
+    )
 }
 
 /// Shared body: brute-force m_total over the recovered cover.
@@ -125,11 +147,15 @@ fn decode_from_cover(
     Err(StegoError::FrameCorrupted)
 }
 
-/// Phase 6D.8 §30D-C — 4-domain decode entry point. Pairs with
-/// `h264_stego_encode_yuv_string_4domain`. Walker opts into
-/// `record_mvd: true` so MVD positions+bits land in the cover;
-/// brute force m_total uses fill-MVD-first allocation matching
-/// the encoder's 3-pass orchestrator.
+/// Phase 6D.8 §30D-C — 4-domain decode entry point.
+///
+/// STEGO.B.P8 (2026-05-24) — migrated to route through the unified
+/// 2-tier `smart_decode_from_walked_cover` (shadow → Scheme A
+/// combined extract) now that the legacy bridge-shape encoder
+/// (`h264_stego_encode_yuv_string_4domain_multigop`) emits Scheme A.
+/// Same wire format as the production decode path; tests + the
+/// provisional_emit research module keep working against the same
+/// public API.
 pub fn h264_stego_decode_yuv_string_4domain(
     annex_b: &[u8],
     passphrase: &str,
@@ -137,246 +163,10 @@ pub fn h264_stego_decode_yuv_string_4domain(
     let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    decode_from_cover_4domain(walk.cover, passphrase)
-}
-
-/// §B-cascade-real Bug #1a fix decoder mirror (#235) — per-GOP STC extract.
-///
-/// Mirrors `h264_stego_encode_yuv_string_4domain_per_gop_v3`. Walks the
-/// stego stream per-GOP, extracts STC per-GOP per-domain with
-/// `gop_idx`-keyed seeds, concatenates per-GOP bits in canonical
-/// (MVD-sign | coeff-sign | coeff-suffix) per-GOP order matching
-/// encoder layout, then unpacks the framed payload.
-pub fn h264_stego_decode_yuv_string_4domain_per_gop_v3(
-    annex_b: &[u8],
-    passphrase: &str,
-) -> Result<String, StegoError> {
-    use crate::codec::h264::cabac::bin_decoder::{walk_annex_b_streaming, WalkAction};
-    use super::hook::GopCapacity;
-    use super::orchestrate::{stealth_weighted_allocation, StealthAllocator};
-
-    // Walk per-GOP, keep per-GOP DomainCover.
-    let mut per_gop_covers: Vec<DomainCover> = Vec::new();
-    let opts = WalkOptions { record_mvd: true, record_offsets: false };
-    walk_annex_b_streaming(annex_b, opts, |gop_ctx| {
-        per_gop_covers.push(gop_ctx.cover);
-        Ok(WalkAction::Continue)
-    })
-    .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    let num_gops = per_gop_covers.len();
-    if num_gops == 0 {
-        return Err(StegoError::InvalidVideo("no GOPs walked".into()));
-    }
-
-    // Per-GOP per-domain capacities (mirrors encoder's per_gop_counts).
-    let mut per_gop_counts: Vec<[usize; 4]> = Vec::with_capacity(num_gops);
-    for gc in &per_gop_covers {
-        per_gop_counts.push([
-            gc.coeff_sign_bypass.len(),
-            gc.coeff_suffix_lsb.len(),
-            gc.mvd_sign_bypass.len(),
-            gc.mvd_suffix_lsb.len(),
-        ]);
-    }
-    let mut totals = [0usize; 4];
-    for row in &per_gop_counts {
-        for d in 0..4 {
-            totals[d] += row[d];
-        }
-    }
-    let cap_for_alloc = GopCapacity {
-        coeff_sign_bypass: totals[0],
-        coeff_suffix_lsb: totals[1],
-        mvd_sign_bypass: totals[2],
-        mvd_suffix_lsb: 0,
-    };
-
-    let keys = CabacStegoMasterKeys::derive(passphrase)?;
-
-    let alloc_per_gop = |m_global: usize, dom: usize| -> Vec<usize> {
-        let mut out = vec![0usize; num_gops];
-        if m_global == 0 || totals[dom] == 0 {
-            return out;
-        }
-        let mut allocated = 0usize;
-        for g in 0..num_gops {
-            let m_g = (m_global as u64 * per_gop_counts[g][dom] as u64
-                / totals[dom] as u64) as usize;
-            out[g] = m_g;
-            allocated += m_g;
-        }
-        let mut rem = m_global - allocated;
-        for g in 0..num_gops {
-            if rem == 0 { break; }
-            if out[g] < per_gop_counts[g][dom] {
-                out[g] += 1;
-                rem -= 1;
-            }
-        }
-        out
-    };
-
-    let total_cover = totals.iter().sum::<usize>();
-    if total_cover == 0 {
-        return Err(StegoError::InvalidVideo("empty cover".into()));
-    }
-    let max_m = (frame::MAX_FRAME_BITS).min(total_cover);
-    let min_m = FRAME_OVERHEAD * 8;
-    let allocator = StealthAllocator::v1_default();
-
-    let mut m_total = min_m;
-    while m_total <= max_m {
-        if let Some(payload_data) = try_decode_at_per_gop(
-            &per_gop_covers, &per_gop_counts, &keys, &cap_for_alloc,
-            &allocator, &alloc_per_gop, m_total, passphrase,
-        ) {
-            return Ok(payload_data.text);
-        }
-        m_total += 8;
-    }
-    Err(StegoError::FrameCorrupted)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn try_decode_at_per_gop(
-    per_gop_covers: &[DomainCover],
-    _per_gop_counts: &[[usize; 4]],
-    keys: &CabacStegoMasterKeys,
-    cap_for_alloc: &super::hook::GopCapacity,
-    allocator: &super::orchestrate::StealthAllocator,
-    alloc_per_gop: &dyn Fn(usize, usize) -> Vec<usize>,
-    m_total: usize,
-    passphrase: &str,
-) -> Option<PayloadData> {
-    use super::hook::GopCapacity;
-    let (m_cs_swa, m_cl_swa, m_ms_swa, _) =
-        super::orchestrate::stealth_weighted_allocation(m_total, cap_for_alloc, allocator)?;
-    let m_mvd = m_ms_swa;
-    let m_residual = m_cs_swa + m_cl_swa;
-    if m_total != m_mvd + m_residual {
-        return None;
-    }
-
-    // Mirror encoder's split_message_per_domain on the same coeff-only
-    // capacity view to recover encoder's actual m_cs / m_cl. The
-    // weighted-allocation values use weighted ratios (cs=0.5, cl=0.8)
-    // while split_message_per_domain uses pure-capacity ratios — these
-    // diverge except in the trivial single-domain case. Encoder uses
-    // split-derived lengths (see `encode_pixels::...per_gop_v3`), so we
-    // must too.
-    let cap_mvd_only = GopCapacity {
-        coeff_sign_bypass: 0, coeff_suffix_lsb: 0,
-        mvd_sign_bypass: cap_for_alloc.mvd_sign_bypass, mvd_suffix_lsb: 0,
-    };
-    let cap_coeff_only = GopCapacity {
-        coeff_sign_bypass: cap_for_alloc.coeff_sign_bypass,
-        coeff_suffix_lsb: cap_for_alloc.coeff_suffix_lsb,
-        mvd_sign_bypass: 0, mvd_suffix_lsb: 0,
-    };
-    let stub_mvd = vec![0u8; m_mvd];
-    let split_a = super::orchestrate::split_message_per_domain(&stub_mvd, &cap_mvd_only)?;
-    let stub_residual = vec![0u8; m_residual];
-    let split_b = super::orchestrate::split_message_per_domain(&stub_residual, &cap_coeff_only)?;
-
-    let m_ms = split_a.mvd_sign_bypass.len();
-    let m_cs = split_b.coeff_sign_bypass.len();
-    let m_cl = split_b.coeff_suffix_lsb.len();
-
-    let m_cs_per_gop = alloc_per_gop(m_cs, 0);
-    let m_cl_per_gop = alloc_per_gop(m_cl, 1);
-    let m_ms_per_gop = alloc_per_gop(m_ms, 2);
-
-    // #529 — length-prefix early-reject. Message order across GOPs:
-    // all GOPs' mvd_sign concat, then all GOPs' coeff_sign concat,
-    // then all GOPs' coeff_suffix. Build the PrefixDomain list to
-    // match that exact emission order. Per-GOP seeds materialise
-    // lazily (only consumed if the helper actually walks that far).
-    let mvd_sign_seeds: Vec<_> = (0..per_gop_covers.len())
-        .map(|g| keys.per_gop_seeds(EmbedDomain::MvdSignBypass, g as u32).hhat_seed)
-        .collect();
-    let coeff_sign_seeds: Vec<_> = (0..per_gop_covers.len())
-        .map(|g| keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, g as u32).hhat_seed)
-        .collect();
-    let coeff_suffix_seeds: Vec<_> = (0..per_gop_covers.len())
-        .map(|g| keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, g as u32).hhat_seed)
-        .collect();
-    let mut prefix_domains: Vec<PrefixDomain<'_>> =
-        Vec::with_capacity(per_gop_covers.len() * 3);
-    for (g, cover) in per_gop_covers.iter().enumerate() {
-        prefix_domains.push(PrefixDomain {
-            cover_bits: &cover.mvd_sign_bypass.bits,
-            seed: &mvd_sign_seeds[g],
-            m_d: m_ms_per_gop[g],
-        });
-    }
-    for (g, cover) in per_gop_covers.iter().enumerate() {
-        prefix_domains.push(PrefixDomain {
-            cover_bits: &cover.coeff_sign_bypass.bits,
-            seed: &coeff_sign_seeds[g],
-            m_d: m_cs_per_gop[g],
-        });
-    }
-    for (g, cover) in per_gop_covers.iter().enumerate() {
-        prefix_domains.push(PrefixDomain {
-            cover_bits: &cover.coeff_suffix_lsb.bits,
-            seed: &coeff_suffix_seeds[g],
-            m_d: m_cl_per_gop[g],
-        });
-    }
-    if !m_total_passes_length_prefix(&prefix_domains, 4, m_total) {
-        return None;
-    }
-
-    // Per-GOP STC extract → concat per-domain bits across GOPs.
-    let mut all_mvd_sign = Vec::with_capacity(m_mvd);
-    let mut all_coeff_sign = Vec::with_capacity(m_cs);
-    let mut all_coeff_suffix = Vec::with_capacity(m_cl);
-
-    for (g, cover) in per_gop_covers.iter().enumerate() {
-        let m_cs_g = m_cs_per_gop[g];
-        let m_cl_g = m_cl_per_gop[g];
-        let m_ms_g = m_ms_per_gop[g];
-
-        if m_ms_g > 0 {
-            let seed = keys.per_gop_seeds(EmbedDomain::MvdSignBypass, g as u32).hhat_seed;
-            let bits = extract_one_domain(
-                &cover.mvd_sign_bypass.bits, m_ms_g, 4, &seed,
-            )?;
-            all_mvd_sign.extend_from_slice(&bits);
-        }
-        if m_cs_g > 0 {
-            let seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, g as u32).hhat_seed;
-            let bits = extract_one_domain(
-                &cover.coeff_sign_bypass.bits, m_cs_g, 4, &seed,
-            )?;
-            all_coeff_sign.extend_from_slice(&bits);
-        }
-        if m_cl_g > 0 {
-            let seed = keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, g as u32).hhat_seed;
-            let bits = extract_one_domain(
-                &cover.coeff_suffix_lsb.bits, m_cl_g, 4, &seed,
-            )?;
-            all_coeff_suffix.extend_from_slice(&bits);
-        }
-    }
-
-    if all_mvd_sign.len() + all_coeff_sign.len() + all_coeff_suffix.len() != m_total {
-        return None;
-    }
-
-    // Encoder layout: frame_bits = MVD bits || coeff bits.
-    // Within MVD: only mvd_sign (suffix forced 0).
-    // Within coeff: coeff_sign || coeff_suffix.
-    let mut all_bits = Vec::with_capacity(m_total);
-    all_bits.extend_from_slice(&all_mvd_sign);
-    all_bits.extend_from_slice(&all_coeff_sign);
-    all_bits.extend_from_slice(&all_coeff_suffix);
-    let frame_bytes = bits_to_bytes_msb_first(&all_bits);
-    let parsed = frame::parse_frame(&frame_bytes).ok()?;
-    let plaintext = crypto::decrypt(
-        &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
-    ).ok()?;
-    payload::decode_payload(&plaintext).ok()
+    smart_decode_from_walked_cover(
+        walk.cover, &walk.mvd_meta, walk.mb_w, walk.mb_h, passphrase,
+    )
+    .map(|p| p.text)
 }
 
 /// Phase 6E-C1b — decode a shadow message from the Annex-B byte
@@ -437,76 +227,140 @@ pub fn h264_stego_smart_decode_video_with_payload(
     let opts = WalkOptions { record_mvd: true, record_offsets: false };
     let walk = walk_annex_b_for_cover_with_options(annex_b, opts)
         .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
+    smart_decode_from_walked_cover(
+        walk.cover, &walk.mvd_meta, walk.mb_w, walk.mb_h, passphrase,
+    )
+}
 
-    // §6E-A5(d).6 — derive cascade-safe MvdSuffixLsb mask. Encoder
-    // ran the same analysis on its provisional walk → identical mask
-    // by §6F.2(j) construction.
+/// STEGO.A.11.fix — shared 3-tier cover-based decode used by BOTH
+/// the Annex-B entry ([`h264_stego_smart_decode_video_with_payload`])
+/// and the NALU-list entry
+/// ([`h264_stego_decode_nalus_string_with_payload`], used by the iOS
+/// CABAC path via `h264_pipeline::decode_cabac_via_chunk_6g`).
+///
+/// Pre-STEGO.A.11.fix, the NALU path called `decode_from_cover`
+/// (legacy Scheme B per-domain extract only). That missed shadow
+/// + Scheme A combined STC entirely, so iOS users decoding a
+/// STEGO.A-produced shadow stego MP4 saw their decode brute-force
+/// for minutes finding nothing. This helper fixes that — same 3-tier
+/// flow as smart_decode_video, callable from either entry point.
+pub(super) fn smart_decode_from_walked_cover(
+    cover: DomainCover,
+    mvd_meta: &[crate::codec::h264::stego::encoder_hook::MvdPositionMeta],
+    mb_w: u32,
+    mb_h: u32,
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
     let safe_msb = super::cascade_safety::analyze_safe_mvd_subset(
-        &walk.mvd_meta, walk.mb_w, walk.mb_h,
+        mvd_meta, mb_w, mb_h,
     );
     let safe_msl = super::cascade_safety::derive_msl_safe_from_msb(
-        &walk.cover.mvd_sign_bypass.positions,
+        &cover.mvd_sign_bypass.positions,
         &safe_msb,
-        &walk.cover.mvd_suffix_lsb.positions,
+        &cover.mvd_suffix_lsb.positions,
     );
+
     // Shadow attempt first — AES-GCM-SIV authentication ensures we
     // only return Ok if THIS passphrase matches a shadow layer.
     if let Ok(payload_data) = super::shadow::shadow_extract_all4_safe(
-        &walk.cover, passphrase, None, Some(&safe_msl),
+        &cover, passphrase, None, Some(&safe_msl),
     ) {
         return Ok(payload_data);
     }
 
-    // Primary fallback.
-    decode_from_cover_4domain_with_payload(walk.cover, passphrase)
+    // STEGO.A.4 — Scheme A combined STC extract. Decoder is UNCHANGED
+    // by the D' cascade-safety tier feature: encoder applies tier
+    // filter via ∞-cost in `content_costs` (steers STC away from
+    // filtered positions) — n_cover and the wire bitstream are
+    // unchanged. Same pattern as the existing `safe_msl` cascade-safety
+    // gate. Decoder walks → STC extract → AES decrypt, regardless of
+    // which tier the encoder used.
+    //
+    // (Earlier D'.4 design used physical position filtering + decoder
+    // brute-force; reverted in favor of ∞-cost which preserves wire
+    // structure and keeps decoder simple.)
+    decode_from_cover_4domain_combined_with_payload(cover, passphrase)
 }
 
-/// Shared body for 4-domain decode: brute-force m_total over the
-/// recovered cover, mirroring the encoder's fill-MVD-first split.
-fn decode_from_cover_4domain(
-    cover: DomainCover,
-    passphrase: &str,
-) -> Result<String, StegoError> {
-    decode_from_cover_4domain_with_payload(cover, passphrase).map(|p| p.text)
-}
-
-/// Task #97 — `_with_payload` variant returning the full
-/// PayloadData (text + attached files). Existing
-/// `decode_from_cover_4domain` is the text-only thin wrapper.
-fn decode_from_cover_4domain_with_payload(
+/// STEGO.A.4 — Scheme A combined STC extract for the primary
+/// (non-shadow) message. Mirrors the encoder side
+/// `pass2_stc_plan_combined_with_keys` + the existing
+/// `streaming_session::try_extract_chunk_from_gop` extract pattern,
+/// but operates on the WHOLE Annex-B's cover (not per-GOP) and
+/// recovers a phasm v1/v2 frame (not a chunk_frame).
+///
+/// Decoder doesn't use content-adaptive costs — STC's syndrome
+/// equation is cost-agnostic. We pass `DomainCosts::default()` so the
+/// combine ordering matches the encoder (CSB → CSL → MSB → MSL).
+fn decode_from_cover_4domain_combined_with_payload(
     cover: DomainCover,
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
-    let keys = CabacStegoMasterKeys::derive(passphrase)?;
-    let seeds = [
-        (EmbedDomain::CoeffSignBypass,
-         keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0).hhat_seed),
-        (EmbedDomain::CoeffSuffixLsb,
-         keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, 0).hhat_seed),
-        (EmbedDomain::MvdSignBypass,
-         keys.per_gop_seeds(EmbedDomain::MvdSignBypass, 0).hhat_seed),
-        (EmbedDomain::MvdSuffixLsb,
-         keys.per_gop_seeds(EmbedDomain::MvdSuffixLsb, 0).hhat_seed),
-    ];
+    use super::cost_weights::{combine_cover_4domain, CostWeights};
+    use super::orchestrate::DomainCosts;
 
-    const STC_H: usize = 4;
-    let total_n_bits = cover.coeff_sign_bypass.len()
-        + cover.coeff_suffix_lsb.len()
-        + cover.mvd_sign_bypass.len()
-        + cover.mvd_suffix_lsb.len();
-    if total_n_bits == 0 {
+    let keys = CabacStegoMasterKeys::derive(passphrase)?;
+    // Canonical "primary" seed in Scheme A — same choice the encoder
+    // (`pass2_stc_plan_combined_with_keys`) makes.
+    let hhat_seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0).hhat_seed;
+
+    let dummy_costs = DomainCosts::default();
+    let weights = CostWeights::default();
+    let (combined_cover, _, _) = combine_cover_4domain(&cover, &dummy_costs, &weights);
+    let n_cover = combined_cover.len();
+    if n_cover == 0 {
         return Err(StegoError::InvalidVideo("empty cover".into()));
     }
 
-    let max_m_total_bits = (frame::MAX_FRAME_BITS).min(total_n_bits);
+    const STC_H: usize = 4;
+    let max_m_total_bits = frame::MAX_FRAME_BITS.min(n_cover);
     let min_m_total_bits = FRAME_OVERHEAD * 8;
 
     let mut m_total = min_m_total_bits;
     while m_total <= max_m_total_bits {
-        if let Some(payload_data) = try_decode_at_4domain(
-            &cover, &seeds, STC_H, m_total, passphrase,
-        ) {
-            return Ok(payload_data);
+        let w = n_cover / m_total;
+        if w == 0 {
+            break;
+        }
+        let used = m_total * w;
+        let hhat = generate_hhat(STC_H, w, &hhat_seed);
+
+        // Length-prefix early-reject: extract first 16 syndrome bits
+        // (the v1 plaintext_len u16, or the v2 0x0000 sentinel).
+        // Implausible values reject immediately; cuts the extract loop
+        // from O(n_cover) to O(16w) per candidate.
+        let prefix_bits = stc_extract_prefix(&combined_cover[..used], &hhat, w, 16);
+        if prefix_bits.len() < 16 {
+            m_total += 8;
+            continue;
+        }
+        let prefix_bytes = bits_to_bytes_msb_first(&prefix_bits);
+        let prefix_u16 = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]);
+        // Accept if either:
+        //  - prefix_u16 is a plausible v1 plaintext_len
+        //    (1 ≤ len ≤ payload_capacity_for_m_total)
+        //  - prefix_u16 == 0 (v2 sentinel — full extract will check
+        //    the v2 length field)
+        let payload_capacity = (m_total / 8).saturating_sub(FRAME_OVERHEAD);
+        let accept_prefix = prefix_u16 == 0
+            || (prefix_u16 as usize >= 1 && prefix_u16 as usize <= payload_capacity);
+        if !accept_prefix {
+            m_total += 8;
+            continue;
+        }
+
+        // Full extract + parse + decrypt.
+        let extracted = stc_extract(&combined_cover[..used], &hhat, w);
+        let bits = &extracted[..m_total.min(extracted.len())];
+        let bytes = bits_to_bytes_msb_first(bits);
+        if let Ok(parsed) = frame::parse_frame(&bytes) {
+            if let Ok(plaintext) = crypto::decrypt(
+                &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
+            ) {
+                if let Ok(payload_data) = payload::decode_payload(&plaintext) {
+                    return Ok(payload_data);
+                }
+            }
         }
         m_total += 8;
     }
@@ -514,134 +368,6 @@ fn decode_from_cover_4domain_with_payload(
     Err(StegoError::FrameCorrupted)
 }
 
-/// Try one candidate m_total under the §6F.2(k).4 stealth-
-/// weighted cross-domain allocation. Both encoder and decoder
-/// run `stealth_weighted_allocation` against the SAME cover
-/// shape (cover_p1 ≡ walker_p3 — no cascade because MVD-sign
-/// override doesn't mutate slot.value), so the per-domain
-/// `m_d` split is identical on both sides by construction.
-fn try_decode_at_4domain(
-    cover: &DomainCover,
-    seeds: &[(EmbedDomain, [u8; 32]); 4],
-    h: usize,
-    m_total_bits: usize,
-    passphrase: &str,
-) -> Option<PayloadData> {
-    use super::hook::GopCapacity;
-
-    // Phase 6F.2(k).4 — mirror encoder's stealth-weighted
-    // allocation. mvd_suffix_lsb is forced to zero capacity
-    // (cascades through median predictor → can't be inline-mod),
-    // so the allocator gets exactly the same view as the
-    // encoder's cap_for_alloc.
-    let cap_for_alloc = GopCapacity {
-        coeff_sign_bypass: cover.coeff_sign_bypass.len(),
-        coeff_suffix_lsb: cover.coeff_suffix_lsb.len(),
-        mvd_sign_bypass: cover.mvd_sign_bypass.len(),
-        mvd_suffix_lsb: 0,
-    };
-    let allocator = super::orchestrate::StealthAllocator::v1_default();
-    let (m_cs, m_cl, m_ms, _m_ml) =
-        super::orchestrate::stealth_weighted_allocation(
-            m_total_bits, &cap_for_alloc, &allocator,
-        )?;
-    let m_mvd = m_ms; // mvd_sign only; mvd_suffix is forced 0
-    let m_residual = m_cs + m_cl;
-    debug_assert_eq!(m_total_bits, m_mvd + m_residual,
-        "decoder stealth-weighted alloc must conserve m_total");
-
-    // Stage A split (MVD-sign-only capacity; suffix disabled).
-    // Mirrors encoder's `cap_mvd_only`.
-    let cap_mvd = GopCapacity {
-        coeff_sign_bypass: 0,
-        coeff_suffix_lsb: 0,
-        mvd_sign_bypass: cover.mvd_sign_bypass.len(),
-        mvd_suffix_lsb: 0,
-    };
-    let stub_mvd = vec![0u8; m_mvd];
-    let split_a = split_message_per_domain(&stub_mvd, &cap_mvd)?;
-
-    // Stage B split (coeff-only capacity).
-    let cap_coeff = GopCapacity {
-        coeff_sign_bypass: cover.coeff_sign_bypass.len(),
-        coeff_suffix_lsb: cover.coeff_suffix_lsb.len(),
-        mvd_sign_bypass: 0,
-        mvd_suffix_lsb: 0,
-    };
-    let stub_residual = vec![0u8; m_residual];
-    let split_b = split_message_per_domain(&stub_residual, &cap_coeff)?;
-
-    // #529 — length-prefix early-reject. Message emission order
-    // (see concat below) is mvd_sign, mvd_suffix, coeff_sign,
-    // coeff_suffix; the plaintext_len header lives at the start of
-    // the first non-empty domain.
-    let prefix_domains = [
-        PrefixDomain {
-            cover_bits: &cover.mvd_sign_bypass.bits,
-            seed: &seeds[2].1,
-            m_d: split_a.mvd_sign_bypass.len(),
-        },
-        PrefixDomain {
-            cover_bits: &cover.mvd_suffix_lsb.bits,
-            seed: &seeds[3].1,
-            m_d: split_a.mvd_suffix_lsb.len(),
-        },
-        PrefixDomain {
-            cover_bits: &cover.coeff_sign_bypass.bits,
-            seed: &seeds[0].1,
-            m_d: split_b.coeff_sign_bypass.len(),
-        },
-        PrefixDomain {
-            cover_bits: &cover.coeff_suffix_lsb.bits,
-            seed: &seeds[1].1,
-            m_d: split_b.coeff_suffix_lsb.len(),
-        },
-    ];
-    if !m_total_passes_length_prefix(&prefix_domains, h, m_total_bits) {
-        return None;
-    }
-
-    // Per-domain STC extract.
-    let mvd_sign = extract_one_domain(
-        &cover.mvd_sign_bypass.bits,
-        split_a.mvd_sign_bypass.len(),
-        h, &seeds[2].1,
-    )?;
-    let mvd_suffix = extract_one_domain(
-        &cover.mvd_suffix_lsb.bits,
-        split_a.mvd_suffix_lsb.len(),
-        h, &seeds[3].1,
-    )?;
-    let coeff_sign = extract_one_domain(
-        &cover.coeff_sign_bypass.bits,
-        split_b.coeff_sign_bypass.len(),
-        h, &seeds[0].1,
-    )?;
-    let coeff_suffix = extract_one_domain(
-        &cover.coeff_suffix_lsb.bits,
-        split_b.coeff_suffix_lsb.len(),
-        h, &seeds[1].1,
-    )?;
-
-    // Concat in encoder MESSAGE order: MVD bits FIRST (encoder put
-    // them at message[..m_mvd]), then coeff bits.
-    let mut all_bits = Vec::with_capacity(m_total_bits);
-    all_bits.extend_from_slice(&mvd_sign);
-    all_bits.extend_from_slice(&mvd_suffix);
-    all_bits.extend_from_slice(&coeff_sign);
-    all_bits.extend_from_slice(&coeff_suffix);
-    if all_bits.len() != m_total_bits {
-        return None;
-    }
-
-    let frame_bytes = bits_to_bytes_msb_first(&all_bits);
-    let parsed = frame::parse_frame(&frame_bytes).ok()?;
-    let plaintext = crypto::decrypt(
-        &parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce,
-    ).ok()?;
-    let payload_data = payload::decode_payload(&plaintext).ok()?;
-    Some(payload_data)
-}
 
 /// Try one candidate `m_total` (total framed bit count). Returns
 /// `Some(plaintext)` on CRC + decrypt + payload-decode success;

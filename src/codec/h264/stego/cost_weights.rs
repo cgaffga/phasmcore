@@ -108,6 +108,63 @@ impl CostWeights {
             mvd_suffix: f32::INFINITY,
         }
     }
+
+    /// Bisect-only helper: CoeffSuffixLsb only.
+    pub fn debug_coeff_suffix_only() -> Self {
+        Self {
+            coeff_sign: f32::INFINITY,
+            coeff_suffix: 1.0,
+            mvd_sign: f32::INFINITY,
+            mvd_suffix: f32::INFINITY,
+        }
+    }
+
+    /// Bisect-only helper: MvdSuffixLsb only.
+    pub fn debug_mvd_suffix_only() -> Self {
+        Self {
+            coeff_sign: f32::INFINITY,
+            coeff_suffix: f32::INFINITY,
+            mvd_sign: f32::INFINITY,
+            mvd_suffix: 1.0,
+        }
+    }
+
+    /// Bisect-only helper: MVD pair only (MSB + MSL). Counterpart to
+    /// `conservative_cs_csl_only` — coeff domains WET-∞ excluded, both
+    /// MVD domains carry the message. Used in the IPPPP-cascade bisect
+    /// to attribute visible damage between coeff and MVD halves.
+    pub fn debug_mvd_pair_only() -> Self {
+        Self {
+            coeff_sign: f32::INFINITY,
+            coeff_suffix: f32::INFINITY,
+            mvd_sign: 1.0,
+            mvd_suffix: 3.0,
+        }
+    }
+
+    /// DOMAIN-BISECT (2026-05-24) — finite-bias variants for IPPPP
+    /// cascade attribution. All 4 domains stay STC-feasible (no INF
+    /// cost) but the named pair gets a 100× discount so STC concentrates
+    /// flips there. Used when WET-∞ isolation drops below per-GOP
+    /// chunk_frame overhead.
+    pub fn debug_bias_coeff_pair() -> Self {
+        Self { coeff_sign: 1.0, coeff_suffix: 3.0, mvd_sign: 1000.0, mvd_suffix: 1000.0 }
+    }
+    pub fn debug_bias_mvd_pair() -> Self {
+        Self { coeff_sign: 100.0, coeff_suffix: 300.0, mvd_sign: 1.0, mvd_suffix: 3.0 }
+    }
+    pub fn debug_bias_coeff_sign() -> Self {
+        Self { coeff_sign: 1.0, coeff_suffix: 100.0, mvd_sign: 1000.0, mvd_suffix: 1000.0 }
+    }
+    pub fn debug_bias_coeff_suffix() -> Self {
+        Self { coeff_sign: 100.0, coeff_suffix: 1.0, mvd_sign: 1000.0, mvd_suffix: 1000.0 }
+    }
+    pub fn debug_bias_mvd_sign() -> Self {
+        Self { coeff_sign: 1000.0, coeff_suffix: 1000.0, mvd_sign: 1.0, mvd_suffix: 100.0 }
+    }
+    pub fn debug_bias_mvd_suffix() -> Self {
+        Self { coeff_sign: 1000.0, coeff_suffix: 1000.0, mvd_sign: 100.0, mvd_suffix: 1.0 }
+    }
 }
 
 /// Per-domain length offsets within the concatenated combined cover.
@@ -279,7 +336,8 @@ mod tests {
                 )
             })
             .collect();
-        DomainBits { bits, positions }
+        let magnitudes = vec![0u16; bits.len()];
+        DomainBits { bits, positions, magnitudes }
     }
 
     /// CostWeights default values must match Phase 0.5 measurement

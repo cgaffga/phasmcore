@@ -237,7 +237,7 @@ pub fn ghost_encode_si_with_files_quality(
         pixel_height,
         img.dct_grid(0),
         &qt.values,
-    );
+    )?;
 
     // Pass pre-parsed image through to avoid re-parsing in ghost_encode_impl
     ghost_encode_impl(image_bytes, message, files, passphrase, Some(si), Some(img))
@@ -361,7 +361,7 @@ pub fn ghost_encode_si_with_shadows_quality(
         pixel_height,
         img.dct_grid(0),
         &qt.values,
-    );
+    )?;
 
     ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, Some(si), Some(img))
 }

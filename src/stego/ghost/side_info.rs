@@ -85,14 +85,21 @@ impl SideInfo {
         pixel_height: u32,
         cover_grid: &DctGrid,
         qt_values: &[u16; 64],
-    ) -> Self {
+    ) -> Result<Self, crate::StegoError> {
+        let w = pixel_width as usize;
+        let h = pixel_height as usize;
+        let expected_len = w.checked_mul(h).and_then(|n| n.checked_mul(3)).unwrap_or(0);
+        if w == 0 || h == 0 || raw_rgb.len() < expected_len {
+            return Err(crate::StegoError::ImageTooSmall);
+        }
+
         let bw = cover_grid.blocks_wide();
         let bh = cover_grid.blocks_tall();
         let total_coeffs = bw * bh * 64;
         let mut errors = vec![0i8; total_coeffs];
 
-        let luma_bw = (pixel_width as usize).div_ceil(8);
-        let luma_bh = (pixel_height as usize).div_ceil(8);
+        let luma_bw = w.div_ceil(8);
+        let luma_bh = h.div_ceil(8);
 
         // Process luma blocks in strips to limit transient memory.
         // Each strip holds at most STRIP_ROWS block-rows of luma data.
@@ -133,11 +140,11 @@ impl SideInfo {
             // luma_strip dropped here -- only one strip in memory at a time
         }
 
-        SideInfo {
+        Ok(SideInfo {
             rounding_errors: errors,
             blocks_wide: bw,
             blocks_tall: bh,
-        }
+        })
     }
 
     /// Get the rounding error at a flat index, decoded from i8 to f32.

@@ -171,7 +171,7 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
 }
 
 #[inline]
-fn symmetric_reflect(i: isize, len: isize) -> isize {
+pub(crate) fn symmetric_reflect(i: isize, len: isize) -> isize {
     if len <= 0 {
         return 0;
     }
@@ -195,7 +195,7 @@ fn symmetric_reflect(i: isize, len: isize) -> isize {
 /// The real pixel-domain delta for a coefficient flip is
 /// `Δ_coeff × scale(qp,u,v) / 64 × basis_unit[u][v]`. We fold the scale and
 /// `/64` in at cost time in [`compute_position_cost`].
-fn precompute_unit_basis() -> [[[[f64; 4]; 4]; 4]; 4] {
+pub(crate) fn precompute_unit_basis() -> [[[[f64; 4]; 4]; 4]; 4] {
     // For each (u, v), run the inverse transform on a matrix with a 1 at
     // (u, v) and zeros elsewhere, using exact integer arithmetic but keeping
     // the result as f64 (no rounding).
@@ -288,7 +288,7 @@ fn pixel_scale(qp: i32, u: usize, v: usize) -> f64 {
 /// `delta_magnitude` — absolute value of the coefficient change:
 ///    * T1 sign flip: 2 (coefficient goes +1 ↔ −1)
 ///    * LevelSuffixMag flip: 1 (LSB of magnitude toggles)
-fn compute_position_cost(
+pub(crate) fn compute_position_cost(
     unit_basis: &[[[[f64; 4]; 4]; 4]; 4],
     wavelets: &ThreeSubbands,
     img_w: usize,

@@ -45,7 +45,7 @@ use core_openh264_sys::{
     phasm_decoder_create, phasm_decoder_decode_frame, phasm_decoder_destroy,
     phasm_decoder_flush_frame, phasm_decoder_frames_remaining, phasm_decoder_initialize,
     phasm_decoder_initialize_with_options, phasm_encoder_create, phasm_encoder_destroy,
-    phasm_encoder_encode_frame, phasm_encoder_initialize,
+    phasm_encoder_encode_frame, phasm_encoder_get_dec_pic_y, phasm_encoder_initialize,
     phasm_encoder_set_dual_recon_enabled, phasm_encoder_uninitialize,
     PhasmDecoderHandle, PhasmEncoderHandle, PhasmStegoCallbacks, PhasmStegoMdCost, PhasmStegoPos,
     WelsRegisterPhasmStegoCallbacks, WelsStegoAbiVersion, WelsStegoSetFrameNum,
@@ -660,6 +660,27 @@ impl Encoder {
             return Err(EncoderError::EncodeFailed(rv));
         }
         Ok((FrameType::from_raw(rv), written as usize))
+    }
+
+    /// P3.3a — get a mutable slice over pDecPic's Y plane so the
+    /// Rust side can apply post-frame DPB correction deltas. Returns
+    /// `None` if no frame has been encoded yet.
+    pub(crate) fn raw_handle(&self) -> *mut PhasmEncoderHandle {
+        self.handle
+    }
+
+    pub fn get_dec_pic_y_mut(&self) -> Option<(&mut [u8], usize)> {
+        let mut y_ptr: *mut u8 = core::ptr::null_mut();
+        let mut y_stride: i32 = 0;
+        let rv = unsafe {
+            phasm_encoder_get_dec_pic_y(self.handle, &mut y_ptr, &mut y_stride)
+        };
+        if rv != 0 || y_ptr.is_null() || y_stride <= 0 {
+            return None;
+        }
+        let total = y_stride as usize * self.height as usize;
+        let slice = unsafe { core::slice::from_raw_parts_mut(y_ptr, total) };
+        Some((slice, y_stride as usize))
     }
 }
 

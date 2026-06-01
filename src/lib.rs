@@ -104,28 +104,31 @@ pub use codec::h264::encoder::baseline_transcode::{
 #[cfg(feature = "cabac-stego")]
 pub use codec::h264::stego::encode_pixels::{
     h264_stego_encode_i_frames_only, h264_stego_encode_i_then_p_frames,
-    h264_stego_encode_i_then_p_frames_4domain,
-    h264_stego_encode_i_then_p_frames_4domain_multigop,
     h264_stego_encode_yuv_string, h264_stego_encode_yuv_string_4domain,
     h264_stego_encode_yuv_string_4domain_multigop,
-    h264_stego_encode_yuv_string_4domain_multigop_streaming,
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2,
     h264_stego_encode_yuv_string_4domain_multigop_with_pattern,
-    h264_stego_encode_yuv_string_i_then_p,
     h264_stego_encode_yuv_string_with_n_shadows,
     h264_stego_encode_yuv_string_with_n_shadows_with_pattern,
     h264_stego_encode_yuv_string_with_shadow,
     h264_stego_encode_yuv_string_with_shadow_with_pattern,
     h264_stego_shadow_capacity, H264ShadowCapacityInfo,
     // Task #96 — combined primary + shadow capacity surface.
+    // #796 — OH264-accurate variant for the production streaming session.
     h264_stego_capacity_4domain, H264StegoCapacityInfo,
+    h264_stego_capacity_4domain_oh264,
+    h264_resolve_auto_tier_oh264,
     // Task #97 — file-attachment-aware encode entries.
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files,
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files,
+    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files_with_tier,
     h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files,
 };
 #[cfg(feature = "cabac-stego")]
 pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
+// D'.5 — Track 1 cascade-safety tier types for CLI / bridges.
+#[cfg(feature = "cabac-stego")]
+pub use codec::h264::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM as CASCADE_DEFAULT_HEADROOM};
 
 // Phase 6D.8 chunk 6G + §30D-C — decode entry points. Walks the
 // encoded Annex-B + passphrase → recovered UTF-8 string. The

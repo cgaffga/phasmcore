@@ -582,6 +582,7 @@ impl StegoMbHook for PositionLoggerHook {
         use super::cost_model::{coeff_sign_cost_vec, coeff_suffix_lsb_cost_vec, PositionCostCtx};
         use super::{
             enumerate_coeff_sign_positions, enumerate_coeff_suffix_lsb_positions,
+            enumerate_coeff_sign_magnitudes, enumerate_coeff_suffix_lsb_magnitudes,
             extract_coeff_sign_bits, extract_coeff_suffix_lsb_bits,
         };
         let ctx = PositionCostCtx::new(frame_idx, mb_addr);
@@ -592,9 +593,10 @@ impl StegoMbHook for PositionLoggerHook {
             |ci| path_kind.path(ci, BinKind::Sign),
         );
         let bits = extract_coeff_sign_bits(scan_coeffs, start_idx, end_idx);
+        let mags = enumerate_coeff_sign_magnitudes(scan_coeffs, start_idx, end_idx);
         let costs = coeff_sign_cost_vec(scan_coeffs, start_idx, end_idx, &ctx);
-        for ((p, b), c) in positions.iter().zip(bits.iter()).zip(costs.iter()) {
-            self.cover.cover.coeff_sign_bypass.push(*b, *p);
+        for (((p, b), c), m) in positions.iter().zip(bits.iter()).zip(costs.iter()).zip(mags.iter()) {
+            self.cover.cover.coeff_sign_bypass.push_with_magnitude(*b, *p, *m);
             self.cover.costs.coeff_sign_bypass.push(*c);
         }
 
@@ -604,9 +606,10 @@ impl StegoMbHook for PositionLoggerHook {
             |ci| path_kind.path(ci, BinKind::SuffixLsb),
         );
         let bits = extract_coeff_suffix_lsb_bits(scan_coeffs, start_idx, end_idx);
+        let mags = enumerate_coeff_suffix_lsb_magnitudes(scan_coeffs, start_idx, end_idx);
         let costs = coeff_suffix_lsb_cost_vec(scan_coeffs, start_idx, end_idx, &ctx);
-        for ((p, b), c) in positions.iter().zip(bits.iter()).zip(costs.iter()) {
-            self.cover.cover.coeff_suffix_lsb.push(*b, *p);
+        for (((p, b), c), m) in positions.iter().zip(bits.iter()).zip(costs.iter()).zip(mags.iter()) {
+            self.cover.cover.coeff_suffix_lsb.push_with_magnitude(*b, *p, *m);
             self.cover.costs.coeff_suffix_lsb.push(*c);
         }
     }

@@ -12,7 +12,7 @@ use phasm_core::{detect_video_codec, VideoCodec};
 #[cfg(not(feature = "cabac-stego"))]
 use phasm_core::h264_ghost_encode;
 #[cfg(feature = "cabac-stego")]
-use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files;
+use phasm_core::h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files_with_tier;
 #[cfg(feature = "cabac-stego")]
 use phasm_core::h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files;
 #[cfg(feature = "cabac-stego")]
@@ -56,6 +56,93 @@ impl Default for EncoderChoice {
         return EncoderChoice::OpenH264;
         #[cfg(not(feature = "openh264-backend"))]
         return EncoderChoice::RustH264;
+    }
+}
+
+/// D'.5 — CLI surface for the cascade-safety tier (Track 1).
+///
+/// Mirrors `phasm_core::CascadeTier` with kebab-case CLI names matching
+/// the mobile UI ladder. `auto` picks the highest tier whose capacity
+/// covers the message + headroom.
+#[cfg(feature = "cabac-stego")]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum CliCascadeTier {
+    /// Pick highest-quality tier that fits the message (default).
+    Auto,
+    /// Tier 0 — no filter, full capacity.
+    #[clap(name = "max-capacity")]
+    MaxCapacity,
+    /// Tier 1 — mild filter, +1-2 dB.
+    Balanced,
+    /// Tier 2 — moderate filter, +3-4 dB.
+    Quality,
+    /// Tier 3 — heavy filter, +5-7 dB.
+    #[clap(name = "high-quality")]
+    HighQuality,
+    /// Tier 4 — maximum filter, +8-12 dB. Best for small messages.
+    #[clap(name = "best-quality")]
+    BestQuality,
+}
+
+#[cfg(feature = "cabac-stego")]
+impl CliCascadeTier {
+    pub fn to_lib(self) -> phasm_core::CascadeTier {
+        match self {
+            CliCascadeTier::Auto => phasm_core::CascadeTier::Auto,
+            CliCascadeTier::MaxCapacity => phasm_core::CascadeTier::Tier0,
+            CliCascadeTier::Balanced => phasm_core::CascadeTier::Tier1,
+            CliCascadeTier::Quality => phasm_core::CascadeTier::Tier2,
+            CliCascadeTier::HighQuality => phasm_core::CascadeTier::Tier3,
+            CliCascadeTier::BestQuality => phasm_core::CascadeTier::Tier4,
+        }
+    }
+}
+
+/// D'.5 — print the user-facing cascade-tier line. Mirrors the mobile
+/// success-screen "Quality mode: X (auto)" UX. For explicit (non-Auto)
+/// selection, the suffix is omitted. The actual resolved tier under
+/// Auto isn't known until inside the encoder; this just announces the
+/// user's selection.
+#[cfg(feature = "cabac-stego")]
+fn report_cascade_tier(tier: phasm_core::CascadeTier, headroom: f32) {
+    use phasm_core::CascadeTier;
+    let name = tier.ui_name();
+    match tier {
+        CascadeTier::Auto => {
+            let pct = ((headroom - 1.0) * 100.0).round() as i32;
+            eprintln!("Cascade tier: Auto (headroom {pct}%) — encoder picks highest-quality fit");
+        }
+        _ => eprintln!("Cascade tier: {name}"),
+    }
+}
+
+/// #796 — resolve + report the Auto tier using the OH264 walker, so the
+/// CLI can show "Cascade tier: High Quality (auto)" before encoding.
+/// Falls back silently if the resolve probe fails (encode will then
+/// resolve internally with the same logic).
+#[cfg(feature = "openh264-backend")]
+fn report_resolved_auto_tier(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: usize,
+    gop_size: usize,
+    message_bytes: usize,
+    headroom: f32,
+) {
+    use phasm_core::{h264_resolve_auto_tier_oh264, CascadeTier};
+    use phasm_core::codec::h264::openh264_stego::EncodeOpts;
+    let opts = EncodeOpts { qp: 26, intra_period: gop_size as i32 };
+    // Framed message size ≈ message + ~64 (crypto envelope) + ~4 (chunk).
+    let estimated_framed_bytes = message_bytes.saturating_add(70);
+    match h264_resolve_auto_tier_oh264(
+        yuv, width, height, n_frames, opts, estimated_framed_bytes, headroom,
+    ) {
+        Ok(tier) if tier != CascadeTier::Auto => {
+            eprintln!("Cascade tier: {} (auto, payload {} B)",
+                tier.ui_name(), message_bytes);
+        }
+        _ => {}
     }
 }
 
@@ -182,6 +269,33 @@ pub struct VideoEncodeArgs {
     #[arg(long = "encoder", value_enum, default_value_t = EncoderChoice::default())]
     pub encoder: EncoderChoice,
 
+    /// D'.5 — cascade-safety tier (Track 1 tunable quality).
+    ///
+    /// Default `auto` picks the highest tier whose capacity covers
+    /// `msg_bytes × (1 + cascade_headroom)`. Higher tier = better
+    /// visual quality, lower capacity. See `phasm video-capacity` for
+    /// per-tier capacity. Currently only honored on `--encoder rust-h264`;
+    /// OH264 path integration is task #795.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "cascade-tier", value_enum, default_value_t = CliCascadeTier::Auto)]
+    pub cascade_tier: CliCascadeTier,
+
+    /// D'.5 — auto-tier headroom (fractional). Encoder picks highest
+    /// tier where `capacity ≥ msg_bytes × (1 + headroom)`. Default 0.2
+    /// (20%) covers AES envelope + STC w-slack + per-GOP variance.
+    /// Only honored when `--cascade-tier auto`.
+    #[cfg(feature = "cabac-stego")]
+    #[arg(long = "cascade-headroom", default_value_t = 0.2)]
+    pub cascade_headroom: f32,
+
+    /// VID-OPT (2026-05-24) — texture-adaptive cover optimizer toggle.
+    /// Wiring only in this commit: the flag is threaded to the encoder
+    /// dispatch site but the actual optimizer pass for video lands in
+    /// a follow-on. Mirrors the image-side `--optimize` flag in
+    /// `encode.rs` (line 81-83).
+    #[arg(long)]
+    pub optimize: bool,
+
     // Shadow attachments (attach2..attach9).
     #[cfg(feature = "cabac-stego")]
     #[arg(long, action = ArgAction::Append)] pub attach2: Vec<PathBuf>,
@@ -236,24 +350,28 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
     #[cfg(any(feature = "openh264-backend", feature = "cabac-stego"))]
     {
         let encoder = args.encoder;
+        let optimize = args.optimize;
         match encoder {
             #[cfg(feature = "openh264-backend")]
             EncoderChoice::OpenH264 => {
-                run_oh264_encode(&args.video, &message, &passphrase, &output_path)?;
+                run_oh264_encode(&args.video, &message, &passphrase, &output_path, optimize)?;
             }
             EncoderChoice::RustH264 => {
                 let primary_files = load_files(&args.attach)?;
                 let shadows = collect_shadows(&args)?;
                 let gop_override = args.gop_size;
+                let cascade_tier = args.cascade_tier.to_lib();
+                let cascade_headroom = 1.0 + args.cascade_headroom;
                 if shadows.is_empty() {
                     run_cabac_encode(
                         &args.video, &message, &primary_files, &passphrase,
-                        gop_override, args.mux_profile, &output_path,
+                        gop_override, args.mux_profile, &output_path, optimize,
+                        cascade_tier, cascade_headroom,
                     )?;
                 } else {
                     run_cabac_encode_with_shadows(
                         &args.video, &message, &primary_files, &passphrase,
-                        &shadows, gop_override, args.mux_profile, &output_path,
+                        &shadows, gop_override, args.mux_profile, &output_path, optimize,
                     )?;
                 }
             }
@@ -318,7 +436,15 @@ fn run_cabac_encode(
     gop_override: Option<usize>,
     mux_profile: transcode::MuxProfile,
     output: &PathBuf,
+    // VID-OPT (2026-05-24) — wiring only. The flag reaches this dispatch
+    // site but isn't yet plumbed into the Scheme A encoder API. Functional
+    // optimizer pass for video lands as a follow-on.
+    optimize: bool,
+    // D'.5 — Track 1 cascade-safety tier + auto-tier headroom.
+    cascade_tier: phasm_core::CascadeTier,
+    cascade_headroom: f32,
 ) -> Result<(), CliError> {
+    let _ = optimize; // TODO: thread to encoder when video optimizer ships
     transcode::ensure_ffmpeg_available()?;
     let probe = transcode::probe_video(input)?;
     eprintln!(
@@ -370,9 +496,25 @@ fn run_cabac_encode(
             }
         };
         eprintln!("Auto-selected GopPattern: {pattern:?}");
-        let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files(
+
+        // D'.5 — report cascade tier. For `Auto`, resolve here so the
+        // user sees what the encoder picked (matches mobile success-
+        // screen "Quality mode: High Quality (auto)" UX).
+        report_cascade_tier(cascade_tier, cascade_headroom);
+        #[cfg(feature = "openh264-backend")]
+        if matches!(cascade_tier, phasm_core::CascadeTier::Auto) {
+            report_resolved_auto_tier(
+                &yuv_bytes, probe.width, probe.height, probe.n_frames,
+                pattern.gop_size(),
+                message.len(),
+                cascade_headroom,
+            );
+        }
+
+        let annex_b = h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files_with_tier(
             &yuv_bytes, probe.width, probe.height, probe.n_frames, pattern,
             message, files, passphrase,
+            cascade_tier, cascade_headroom,
         )?;
         std::fs::write(&annex_b_temp, &annex_b)?;
         let audio_source = probe.has_audio.then_some(input.as_path());
@@ -411,7 +553,10 @@ fn run_cabac_encode_with_shadows(
     gop_override: Option<usize>,
     mux_profile: transcode::MuxProfile,
     output: &PathBuf,
+    // VID-OPT (2026-05-24) — wiring only; see sister run_cabac_encode.
+    optimize: bool,
 ) -> Result<(), CliError> {
+    let _ = optimize; // TODO: thread to encoder when video optimizer ships
     use phasm_core::stego::shadow_layer::ShadowLayer as VideoShadowLayer;
 
     transcode::ensure_ffmpeg_available()?;
@@ -523,7 +668,13 @@ fn run_oh264_encode(
     message: &str,
     passphrase: &str,
     output: &PathBuf,
+    // VID-OPT (2026-05-24) — wiring only. Reaches the dispatch site but
+    // not yet plumbed into EncodeSessionParams (the eventual home for
+    // the optimizer toggle). Functional optimizer pass for video lands
+    // as a follow-on.
+    optimize: bool,
 ) -> Result<(), CliError> {
+    let _ = optimize; // TODO: thread into EncodeSessionParams when video optimizer ships
     use phasm_core::{
         ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
         StreamingEncodeSession, YuvFrameRef,
@@ -564,7 +715,10 @@ fn run_oh264_encode(
 
         // Per-GOP STC isolation. Match mobile's DEFAULT_GOP=30 so
         // CLI- and mobile-encoded files have identical structure.
-        const QP: i32 = 26;
+        let qp: i32 = std::env::var("PHASM_DEBUG_QP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(26);
         const GOP_SIZE: u32 = 30;
 
         let params = EncodeSessionParams {
@@ -572,7 +726,7 @@ fn run_oh264_encode(
             height: probe.height,
             fps_num,
             fps_den,
-            qp: QP,
+            qp,
             gop_size: GOP_SIZE,
             total_frames_hint: probe.n_frames as u32,
             // Default BT.709 limited; CLI doesn't probe VUI from ffprobe
@@ -582,8 +736,17 @@ fn run_oh264_encode(
             engine: EncodeEngineChoice::Oh264,
             cost_weights: match std::env::var("PHASM_DEBUG_DOMAIN").as_deref() {
                 Ok("mvd_sign") => CostWeights::debug_mvd_sign_only(),
+                Ok("mvd_suffix") => CostWeights::debug_mvd_suffix_only(),
                 Ok("coeff_sign") => CostWeights::debug_coeff_sign_only(),
+                Ok("coeff_suffix") => CostWeights::debug_coeff_suffix_only(),
                 Ok("cs_csl") => CostWeights::conservative_cs_csl_only(),
+                Ok("mvd_pair") => CostWeights::debug_mvd_pair_only(),
+                Ok("bias_coeff") => CostWeights::debug_bias_coeff_pair(),
+                Ok("bias_mvd") => CostWeights::debug_bias_mvd_pair(),
+                Ok("bias_csb") => CostWeights::debug_bias_coeff_sign(),
+                Ok("bias_csl") => CostWeights::debug_bias_coeff_suffix(),
+                Ok("bias_msb") => CostWeights::debug_bias_mvd_sign(),
+                Ok("bias_msl") => CostWeights::debug_bias_mvd_suffix(),
                 _ => CostWeights::default(),
             },
                 progress_callback: None,
@@ -619,14 +782,22 @@ fn run_oh264_encode(
 
         std::fs::write(&annex_b_temp, &annex_b)?;
 
-        // Mux annex-B → MP4 via shared helper. Audio passthrough when
-        // the source has an audio track (§Stealth.L4.5 — parity with
-        // CABAC v2 path). v1.1 polish: route through
-        // `transcode::mux_annexb_to_mp4_with_profile` once the L4
-        // stealth profile is validated against OpenH264 output.
+        // Mux annex-B → MP4 via the in-tree HandBrake mux. The ffmpeg
+        // shell-out previously used here mis-synthesised PTS for raw
+        // H.264 input on streams with per-GOP POC reset — output had
+        // 60/1 r_frame_rate and ~1.7 s duration regardless of true
+        // length, breaking downstream tools (DECODE-FAST follow-up
+        // 2026-05-24). HandBrake-style mux supplies explicit PTS per
+        // frame from the encoder's known fps_num/fps_den, so the
+        // failure mode is bypassed entirely. Same path the CABAC v2
+        // CLI flow already uses.
         let audio_source = probe.has_audio.then_some(input.as_path());
-        transcode::mux_annexb_to_mp4(
-            &annex_b_temp, audio_source, &probe.frame_rate, output,
+        let pattern = phasm_core::GopPattern::Ipppp { gop: GOP_SIZE as usize };
+        let mux_profile = transcode::MuxProfile::HandbrakeX264;
+        let _dropped_audio = transcode::mux_annexb_to_mp4_with_profile(
+            &annex_b_temp, audio_source, &probe.frame_rate,
+            probe.width, probe.height, probe.n_frames, pattern,
+            mux_profile, output,
         )?;
         Ok(())
     })();

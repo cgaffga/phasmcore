@@ -795,6 +795,37 @@ unsafe extern "C" {
     /// only). Used by the Pass-1 cover probe path. Process-global —
     /// caller serializes encoder instances.
     pub fn phasm_encoder_set_dual_recon_enabled(enabled: i32);
+
+    /// D2.1 — per-row completion callback for windowed STC.
+    pub fn phasm_set_row_complete_callback(cb: Option<extern "C" fn(
+        frame_num: u32, row_y: u16,
+        bs_byte_pos: i32, bs_bits_left: i32,
+    )>);
+
+    /// P3.3b (2026-05-25) — post-quant coefficient capture callback.
+    pub fn phasm_set_post_quant_callback(cb: Option<extern "C" fn(
+        frame_num: u32, mb_x: u16, mb_y: u16,
+        coeffs: *const i16, coeff_count: i32,
+        cbp_luma: u8, cbp_chroma: u8, qp: i32,
+    )>);
+    /// P3.3b — replay mode: skip quantize, read from supplied buffer.
+    pub fn phasm_set_coeff_replay_mode(enabled: i32);
+    /// P3.3b — supply coefficient buffer for the next MB in replay mode.
+    pub fn phasm_set_replay_coeffs(coeffs: *const i16, count: i32);
+    /// P3.3b.4 — advance the replay pointer by `n` entries. Called
+    /// automatically by WelsEncInterY after each MB; exposed here so
+    /// Rust can also call it if needed (e.g. resetting between frames).
+    pub fn phasm_advance_replay_coeffs(n: i32);
+
+    /// P3.3a (2026-05-25) — get a mutable pointer to the OH264
+    /// encoder's current pDecPic Y plane. Returns 0 on success,
+    /// -1 if unavailable. The pointer is valid until the next
+    /// `phasm_encoder_encode_frame` or encoder destruction.
+    pub fn phasm_encoder_get_dec_pic_y(
+        h: *mut PhasmEncoderHandle,
+        y_ptr: *mut *mut u8,
+        y_stride: *mut i32,
+    ) -> i32;
 }
 
 // ---------------------------------------------------------------------

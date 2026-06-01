@@ -68,7 +68,6 @@
 //! already accumulates whole-stream cover transparently).
 
 use super::{DomainCover, EmbedDomain};
-#[cfg(test)]
 use super::PositionKey;
 use crate::stego::armor::ecc;
 use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
@@ -591,6 +590,85 @@ pub fn apply_shadow_to_plan_all4(
             EmbedDomain::MvdSignBypass => mvd_sign_bypass[slot.intra_index] = bit,
             EmbedDomain::MvdSuffixLsb => mvd_suffix_lsb[slot.intra_index] = bit,
         }
+    }
+}
+
+/// §6E-C2 polish — translate a [`ShadowState`]'s positions from
+/// `source_cover` indexing to `(mvd_target, coeff_target)` indexing
+/// via [`PositionKey`] lookup.
+///
+/// MVD-domain slots use `mvd_target.mvd_*.positions`; coeff-domain
+/// slots use `coeff_target.coeff_*.positions`. Slots whose
+/// `PositionKey` doesn't appear in the corresponding target are
+/// dropped (rare boundary drift case; cascade absorbs).
+///
+/// The returned state retains the same `parity_len` /
+/// `frame_data_len`. `n_total` is updated to reflect the dropped
+/// slots; `positions` and `bits` are aligned (slot[i] ↔ bits[i]).
+///
+/// For backends where the MVD cover and coeff cover come from the
+/// same walk (e.g. OH264 wire_only — encoder state stays clean so a
+/// single 4-domain cover serves both), pass the same `DomainCover`
+/// reference for both `mvd_target` and `coeff_target`.
+pub fn translate_shadow_state(
+    state: &ShadowState,
+    source_cover: &DomainCover,
+    mvd_target: &DomainCover,
+    coeff_target: &DomainCover,
+) -> ShadowState {
+    use std::collections::HashMap;
+    let build_map = |positions: &[PositionKey]| -> HashMap<PositionKey, usize> {
+        positions.iter().enumerate().map(|(i, &k)| (k, i)).collect()
+    };
+    let target_csb = build_map(&coeff_target.coeff_sign_bypass.positions);
+    let target_csl = build_map(&coeff_target.coeff_suffix_lsb.positions);
+    let target_msb = build_map(&mvd_target.mvd_sign_bypass.positions);
+    let target_msl = build_map(&mvd_target.mvd_suffix_lsb.positions);
+
+    let mut out_positions = Vec::with_capacity(state.positions.len());
+    let mut out_bits = Vec::with_capacity(state.bits.len());
+
+    for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
+        if i >= state.bits.len() {
+            break;
+        }
+        let pk_opt = match slot.domain {
+            EmbedDomain::CoeffSignBypass =>
+                source_cover.coeff_sign_bypass.positions.get(slot.intra_index),
+            EmbedDomain::CoeffSuffixLsb =>
+                source_cover.coeff_suffix_lsb.positions.get(slot.intra_index),
+            EmbedDomain::MvdSignBypass =>
+                source_cover.mvd_sign_bypass.positions.get(slot.intra_index),
+            EmbedDomain::MvdSuffixLsb =>
+                source_cover.mvd_suffix_lsb.positions.get(slot.intra_index),
+        };
+        let pk = match pk_opt {
+            Some(&k) => k,
+            None => continue,
+        };
+        let target_idx = match slot.domain {
+            EmbedDomain::CoeffSignBypass => target_csb.get(&pk).copied(),
+            EmbedDomain::CoeffSuffixLsb => target_csl.get(&pk).copied(),
+            EmbedDomain::MvdSignBypass => target_msb.get(&pk).copied(),
+            EmbedDomain::MvdSuffixLsb => target_msl.get(&pk).copied(),
+        };
+        if let Some(target_idx) = target_idx {
+            out_positions.push(ShadowSlot {
+                domain: slot.domain,
+                intra_index: target_idx,
+                priority: slot.priority,
+            });
+            out_bits.push(state.bits[i]);
+        }
+    }
+
+    let n_total = out_bits.len();
+    ShadowState {
+        positions: out_positions,
+        bits: out_bits,
+        n_total,
+        parity_len: state.parity_len,
+        frame_data_len: state.frame_data_len,
     }
 }
 

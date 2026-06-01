@@ -573,6 +573,31 @@ fn main() {
             // status + sibling AV1 fork pointers (phasm-rav1e +
             // phasm-dav1d). No source change.
             "41cd8251464183f3348ee5783be0bc0936a1e137",
+            // 2026-05-23: V0.4.D Layer 3 SPS stealth patches in
+            // au_set.cpp — constraint_set4/5 emit 0 (was 1) +
+            // pic_order_cnt_type emit 0 (was 2). Both close gaps
+            // surfaced by V0.4.C real-world cohort audit. Zero
+            // behavior change downstream (constraint flags are
+            // advisory; POC type 0 emit path was already wired).
+            "d6a4bdf87b835b668f9e6cb917de7af56fc27a6c",
+            // 2026-05-25: P3.3b — post-quant callback + replay mode +
+            // phasm_advance_replay_coeffs + pDecPic Y capture.
+            "9d18115df4e9d799dbe728280ba3f0ca0fcf70da",
+            // 2026-05-25: P3.3b.5 fix — replay pointer advance moved
+            // to per-MB loop in svc_encode_slice.cpp.
+            "d1127796886f99642b5b64674dac539f0c223093",
+            // P3.3b.6: skip replay for all-zero MB.
+            "38f52cdd41969556571a70cf0b21afd2314b19e7",
+            "5513605965e9d025c33a979c4ac9e034418da01f",
+            "8ee43d196d72d9149431b2be18f3130b8b782d5f",
+            // D2.1: per-row callback + PhasmRowCompleteCallback API.
+            "136e4778ba80d85f43ade747350474b04da77d94",
+            "4270988e401aba8a0b2f89e5c77848c93882b467",
+            // 2026-06-02: CASCADE.V2 A.1.10 — MvdSuffixLsb ctxIdxInc desync
+            // fix in WelsCabacMbMvd (store the overridden sMvd in the
+            // neighbour mvd-context cache). Closes the iphone7 stego
+            // "cascade ceiling" (decode failed above ~260 B/GOP).
+            "11dab21100bc1900278db1dc7cd4b2876e1f2021",
         ];
         let head_output = Command::new("git")
             .arg("-C")

@@ -98,8 +98,16 @@ fn h264_transcode_deterministic_hash_32x32x5() {
     // verification (x86_64 / linux-arm64 / WASM) happens in CI;
     // any divergence on a different arch indicates a real
     // determinism bug in encoder kernels.
+    //
+    // V0.4.A (2026-05-23) — pin re-recorded after intervening pure-Rust
+    // encoder changes (#549 partition_id fix, #540 wire_only port,
+    // #319/#324/#325 v1.6/v1.7 work, etc.). The V0.4.A.1 OH264 shim
+    // change is unrelated to this hash — `transcode_yuv_to_baseline_
+    // cavlc_h264` exercises the pure-Rust encoder, not OH264. The A.1
+    // change has since been reverted as a stealth-negative (see
+    // memory/h264_v04a_multi_ref_p_negative.md), but the hash stays.
     const EXPECTED_HASH: &str =
-        "a8740060dcaf3c05d03af3511a942e03941c783290de32647257461b623bccfc";
+        "3f78a8af7a0428752248d553770cf455401a7a4d9f2964ba5a4b1be532619b43";
     assert_eq!(hash, EXPECTED_HASH,
         "Phase E.2 cross-arch determinism: hash mismatch (output is {} bytes)",
         bytes.len());
@@ -117,8 +125,10 @@ fn h264_transcode_deterministic_hash_16x16x1() {
     eprintln!("CROSS-ARCH-DETERMINISM HASH (16x16x1): {hash}  ({} bytes)", bytes.len());
 
     // Re-pinned 2026-04-30 (same audit trail as the 32x32x5 test).
+    // V0.4.A (2026-05-23) — pin re-recorded after intervening pure-Rust
+    // encoder changes (unrelated to V0.4.A.1 OH264 shim, since reverted).
     const EXPECTED_HASH: &str =
-        "1bee4cc4132ef56984d636e78ee283c21b37484f80e2560d37ad40044aa45a06";
+        "a1fe3c65e8265d45a08011e045a46b8ac726d2450d7379f2c1cd22bf394b2d91";
     assert_eq!(hash, EXPECTED_HASH,
         "Phase E.2 cross-arch determinism: 16x16x1 hash mismatch");
 }
