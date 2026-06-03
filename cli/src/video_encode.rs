@@ -677,7 +677,7 @@ fn run_oh264_encode(
     let _ = optimize; // TODO: thread into EncodeSessionParams when video optimizer ships
     use phasm_core::{
         ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
-        StreamingEncodeSession, YuvFrameRef,
+        StreamingEncodeSession, StreamingProbeSession, YuvFrameRef,
     };
 
     transcode::ensure_ffmpeg_available()?;
@@ -751,13 +751,55 @@ fn run_oh264_encode(
             },
                 progress_callback: None,
         };
-        let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
-
         let frame_bytes = (probe.width as usize) * (probe.height as usize) * 3 / 2;
         let chroma_w = (probe.width as usize) / 2;
         let chroma_h = (probe.height as usize) / 2;
         let y_plane_size = (probe.width as usize) * (probe.height as usize);
         let chroma_plane_size = chroma_w * chroma_h;
+
+        // CAP2.2 §12 — proportional allocation (CLI two-pass). `yuv_bytes` holds
+        // the whole clip (re-readable), so run a capacity probe FIRST to learn
+        // each GOP's cap, then size each GOP's chunk PROPORTIONAL to its cap
+        // (uniform flip density — stealthier than the default online
+        // uniform-BYTES spread, which over-fills low-capacity GOPs into
+        // detectability hotspots). The per-GOP round-trip verify + shrink-carry
+        // inside the encode is the backstop, so an over-optimistic plan degrades
+        // to carry-forward (never data loss). This doubles encode wall-clock;
+        // the §13 easy-fit fast path (skip the probe for tiny payloads) is a
+        // perf follow-on.
+        // CAP2.3: concentrate+tail at the shared stealth-leaning default
+        // (0.5, provisional — #806 calibrates). Supersedes the 1.0
+        // pure-proportional spread, whose r_target was inert.
+        use phasm_core::codec::h264::stego::chunk_frame::CAP2_DEFAULT_R_TARGET;
+        let per_gop_caps: Vec<usize> = {
+            let mut probe_session = StreamingProbeSession::create(params.clone())?;
+            for frame_idx in 0..probe.n_frames {
+                let frame_off = frame_idx * frame_bytes;
+                let y_start = frame_off;
+                let y_end = y_start + y_plane_size;
+                let u_end = y_end + chroma_plane_size;
+                let v_end = u_end + chroma_plane_size;
+                probe_session.push_frame(YuvFrameRef {
+                    y: &yuv_bytes[y_start..y_end],
+                    y_stride: probe.width as usize,
+                    u: &yuv_bytes[y_end..u_end],
+                    u_stride: chroma_w,
+                    v: &yuv_bytes[u_end..v_end],
+                    v_stride: chroma_w,
+                })?;
+            }
+            let (_probe_result, caps) = probe_session.finish_with_per_gop()?;
+            caps
+        };
+
+        let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
+        if session.plan_proportional(&per_gop_caps, CAP2_DEFAULT_R_TARGET)? {
+            eprintln!(
+                "  concentrate+tail across {} GOPs (r_target={})",
+                per_gop_caps.len(),
+                CAP2_DEFAULT_R_TARGET
+            );
+        }
 
         let mut annex_b: Vec<u8> = Vec::with_capacity(yuv_bytes.len() / 8);
         for frame_idx in 0..probe.n_frames {

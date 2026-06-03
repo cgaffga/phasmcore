@@ -44,3 +44,13 @@ pub mod decoder;
 // public mirror) exposes only av1_stego_extract.
 #[cfg(any(feature = "av1-encoder", feature = "av1-backend"))]
 pub mod orchestrator;
+
+// B.1.5.2: cascade-safety v2 forward modeling kernels (deblock + CDEF
+// approximation). Consumed by the cost-compute path in B.1.5.5's
+// three-tier dispatch; for the ~10-15% of cover positions in the
+// ambiguous |coeff| middle band, the L2 cache here produces a
+// per-tuple post-cascade impulse pattern from L1's basis + frame-
+// level loop-filter state. See
+// `docs/design/video/av1/phase-b15-cascade-safety-v2.md` § 2.
+#[cfg(feature = "av1-encoder")]
+pub mod cascade_kernel;

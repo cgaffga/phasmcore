@@ -259,6 +259,7 @@ fn features_from_recording(
                 tx_height_log2: meta.tx_height_log2,
                 tx_type: meta.tx_type,
                 scan_pos: meta.scan_pos,
+                coeff_magnitude: meta.coeff_magnitude,
             });
         }
     }

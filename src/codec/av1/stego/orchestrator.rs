@@ -49,7 +49,7 @@ use phasm_rav1e::phasm_stego::{
 };
 #[cfg(feature = "av1-encoder")]
 use crate::stego::cost::av1_uniward::{
-    compute_av1_uniward_costs, Av1FramePosition, FramePlanes,
+    Av1FramePosition, FramePlanes,
 };
 
 #[cfg(feature = "av1-backend")]
@@ -214,10 +214,24 @@ pub fn av1_stego_embed(
             tx_height_log2: m.tx_height_log2,
             tx_type: m.tx_type,
             scan_pos: m.scan_pos,
+            // B.1.5.0.5: carry encoder-side coefficient magnitude
+            // through for cascade-safety v2's EE-D pre-filter +
+            // EE-C upper-bound + L3 cache key.
+            coeff_magnitude: m.coeff_magnitude,
         })
         .collect();
-    let costs =
-        compute_av1_uniward_costs(&frame_planes, &av1_positions, recording.frame_qindex);
+    // B.1.5.5: pass the frame-level loop-filter state captured by
+    // B.1.5.1's fork-patch through to cost compute. This activates
+    // the three-tier dispatch (EE-D |coeff|-based safe/reject bands +
+    // L3 forward model for the middle), replacing the v0.5 magnitude-
+    // proxy path that wasn't discriminating cascade-amplified
+    // positions.
+    let costs = crate::stego::cost::av1_uniward::compute_av1_uniward_costs_with_state(
+        &frame_planes,
+        &av1_positions,
+        recording.frame_qindex,
+        Some(recording.loop_filter_state),
+    );
     let embed_result = stc_embed(cover_used, &costs, &payload, &hhat_matrix, STC_H, w)
         .ok_or(Av1StegoError::StcInfeasible)?;
 

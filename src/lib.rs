@@ -118,11 +118,21 @@ pub use codec::h264::stego::encode_pixels::{
     h264_stego_capacity_4domain, H264StegoCapacityInfo,
     h264_stego_capacity_4domain_oh264,
     h264_resolve_auto_tier_oh264,
+    // CAP2.5 — single-sourced per-shadow capacity for the N-aware HUD bar.
+    h264_shadow_capacity_for_n,
     // Task #97 — file-attachment-aware encode entries.
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files,
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files,
     h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files_with_tier,
     h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files,
+};
+// CAP2 §17.1 — v3 tiered sampled capacity estimator (OH264). Fast + refining
+// HUD capacity (stratified GOP sample → Σ sample-mean + adaptive margin),
+// independent of clip length. Pool C feeds the closed-form shadow bar.
+#[cfg(feature = "openh264-backend")]
+pub use codec::h264::stego::capacity_estimator::{
+    oh264_capacity_estimate, oh264_capacity_estimate_yuv, oh264_capacity_quick,
+    CapacityEstimate, DEFAULT_MAX_SAMPLE_GOPS,
 };
 #[cfg(feature = "cabac-stego")]
 pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};

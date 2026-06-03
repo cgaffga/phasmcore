@@ -32,7 +32,8 @@ use super::progress::{
 // OH264 path imports — gated by the openh264-backend feature.
 #[cfg(feature = "openh264-backend")]
 use super::openh264_stego::{
-    bytes_to_bits_msb_first_pub, encode_yuv_with_pre_framed_bits_4domain_with_tier, EncodeOpts,
+    bytes_to_bits_msb_first_pub, encode_yuv_with_pre_framed_bits_4domain_with_tier,
+    oh264_plain_encode_gop, EncodeOpts,
 };
 #[cfg(feature = "openh264-backend")]
 use super::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM};
@@ -321,6 +322,21 @@ struct Oh264SessionState {
     /// [`StreamingEncodeSession::resolved_tier`] for the mobile
     /// success-screen badge.
     resolved_tier: Option<u8>,
+    /// CAP2.2 §12 — optional precise per-GOP byte-allocation plan (from
+    /// `allocate_chunks_proportional` run over a probe pass on re-readable
+    /// input — the CLI two-pass path). `Some(plan)` ⇒ `drain_one_gop` sizes
+    /// each GOP's chunk from the plan (carry-absorbing) instead of the online
+    /// uniform-spread; `None` (default, the push-once mobile path) ⇒
+    /// uniform-spread + carry. Either way each per-GOP embed is round-trip
+    /// verified + shrink-carried, so a plan never risks silent data loss.
+    gop_alloc_plan: Option<Vec<usize>>,
+    /// CAP2.3 §4 — count W of leading STEGO GOPs when a concentrate+tail plan
+    /// is installed (`gop_alloc_plan[W..]` are all 0 = the plain tail). `None`
+    /// when no plan / uniform-spread is active (then every GOP is a stego GOP).
+    /// Increment A keeps `total_chunks` (the wire value) = the GOP count and
+    /// emits empty-chunk tails; Increment B will use this as the wire
+    /// `total_chunks` (= W < n_gops) + emit a cheap plain tail.
+    stego_window: Option<u16>,
 }
 
 impl StreamingEncodeSession {
@@ -492,6 +508,121 @@ impl StreamingEncodeSession {
         }
     }
 
+    /// CAP2.2 §12 — the framed (encrypted + headered) message length in
+    /// bytes: the exact `Σ` that a [`set_gop_alloc_plan`](Self::set_gop_alloc_plan)
+    /// plan must equal, and the `message_len` the CLI two-pass orchestrator
+    /// feeds to
+    /// [`allocate_chunks_proportional`](super::stego::chunk_frame::allocate_chunks_proportional)
+    /// alongside the probe's per-GOP caps. `None` for non-OH264 backends.
+    #[cfg(feature = "openh264-backend")]
+    pub fn framed_message_len(&self) -> Option<usize> {
+        match &self.inner {
+            SessionImpl::Oh264(state) => Some(state.msg_frame.len()),
+            _ => None,
+        }
+    }
+
+    /// CAP2.2 §12 — install a precise per-GOP byte-allocation plan, overriding
+    /// the default online uniform-spread used by `drain_one_gop`. `plan[i]` is
+    /// GOP `i`'s target byte count; produce it with
+    /// [`allocate_chunks_proportional`](super::stego::chunk_frame::allocate_chunks_proportional)
+    /// over a probe pass (the CLI two-pass path). `drain_one_gop` still
+    /// round-trip-verifies + shrink-carries each GOP, so an over-optimistic
+    /// plan entry degrades to carry-forward, never silent data loss.
+    ///
+    /// Call after `create()` and before pushing frames. Only the OH264 backend
+    /// honours a plan; the push-once mobile path leaves it `None`.
+    ///
+    /// # Errors
+    /// * [`StegoError::InvalidVideo`] if `plan.len()` != the session's GOP
+    ///   count, `Σ plan` != [`framed_message_len`](Self::framed_message_len)
+    ///   (the plan must account for every framed byte exactly), or the backend
+    ///   isn't OH264.
+    #[cfg(feature = "openh264-backend")]
+    pub fn set_gop_alloc_plan(&mut self, plan: Vec<usize>) -> Result<(), StegoError> {
+        match &mut self.inner {
+            SessionImpl::Oh264(state) => {
+                if plan.len() != state.total_chunks as usize {
+                    return Err(StegoError::InvalidVideo(format!(
+                        "alloc plan length {} != GOP count {}",
+                        plan.len(),
+                        state.total_chunks
+                    )));
+                }
+                let sigma: usize = plan.iter().sum();
+                if sigma != state.msg_frame.len() {
+                    return Err(StegoError::InvalidVideo(format!(
+                        "alloc plan Σ {sigma} != framed message length {}",
+                        state.msg_frame.len()
+                    )));
+                }
+                state.gop_alloc_plan = Some(plan);
+                Ok(())
+            }
+            _ => Err(StegoError::InvalidVideo(
+                "set_gop_alloc_plan requires the OH264 backend".into(),
+            )),
+        }
+    }
+
+    /// CAP2.3 §4 — install a **concentrate+tail** allocation plan (name kept
+    /// `plan_proportional` for FFI stability; supersedes #804's uniform
+    /// proportional spread, whose `r_target` was inert). Fills each GOP
+    /// sequentially to `⌊r_target·cap⌋`, leaving a plain tail — so `r_target`
+    /// genuinely bounds per-GOP flip density (a lower value spreads the message
+    /// across more leading GOPs at lower density). Runs
+    /// `allocate_chunks_concentrate_tail` over the probe's per-GOP caps + this
+    /// session's framed length, installs the plan via
+    /// [`set_gop_alloc_plan`](Self::set_gop_alloc_plan), and records the stego
+    /// window `W` (Increment A keeps the wire `total_chunks` = GOP count via
+    /// empty-chunk tails; Increment B uses `W` as the wire total + a plain tail).
+    ///
+    /// `gop_caps` is the per-GOP tier-0 byte vector from
+    /// [`StreamingProbeSession::finish_with_per_gop`] (same content + GOP
+    /// shape). `r_target` is the rate ceiling: `CAP2_DEFAULT_R_TARGET` (0.5) is
+    /// the stealth-leaning default; `1.0` is greedy-concentrate (max per-GOP
+    /// rate). Calibration is #806.
+    ///
+    /// Returns `Ok(true)` if a plan was installed, `Ok(false)` if it falls back
+    /// to the default uniform-spread — when the message exceeds Σ caps (the
+    /// encode then surfaces `MessageTooLarge`), the backend isn't OH264, or
+    /// `gop_caps` doesn't match the session's GOP shape. Falling back is always
+    /// safe: uniform-spread + the per-GOP verify/carry never loses data.
+    #[cfg(feature = "openh264-backend")]
+    pub fn plan_proportional(
+        &mut self,
+        gop_caps: &[usize],
+        r_target: f64,
+    ) -> Result<bool, StegoError> {
+        let Some(framed) = self.framed_message_len() else {
+            return Ok(false); // not OH264 — nothing to plan
+        };
+        // CAP2.3 §4 — concentrate+tail: fill each GOP sequentially to
+        // ⌊r_target·cap⌋, leaving a plain tail. `window` = count of leading
+        // stego GOPs. This supersedes #804's uniform-proportional spread,
+        // whose r_target cancelled in the proportions and was inert; here
+        // r_target genuinely bounds per-GOP rate.
+        let Some((plan, window)) =
+            super::stego::chunk_frame::allocate_chunks_concentrate_tail(gop_caps, framed, r_target)
+        else {
+            return Ok(false); // message > Σ caps — leave uniform (→ MessageTooLarge)
+        };
+        // `set_gop_alloc_plan` re-validates len == GOP count and Σ == framed
+        // (both still hold: the plan spans every GOP, tail entries are 0). A
+        // probe/encode GOP-count disagreement degrades to uniform (safe).
+        if self.set_gop_alloc_plan(plan).is_err() {
+            return Ok(false);
+        }
+        // Record the stego window. Increment A: informational only — drain
+        // still emits empty-chunk tails with the wire `total_chunks` = GOP
+        // count, so today's decoder round-trips unchanged. Increment B will
+        // use this as the wire `total_chunks` (= W < n_gops) + a plain tail.
+        if let SessionImpl::Oh264(state) = &mut self.inner {
+            state.stego_window = Some(window as u16);
+        }
+        Ok(true)
+    }
+
     /// Finish the session. For OH264: drains the final partial GOP.
     /// For OH264Shadow: runs the n-shadow orchestrator on the
     /// buffered clip. For PureRust: runs the buffered v2 streaming
@@ -580,6 +711,8 @@ fn build_oh264_state(
         hhat_seed,
         frame_bytes_size,
         resolved_tier: None,
+        gop_alloc_plan: None,
+        stego_window: None,
     })
 }
 
@@ -882,6 +1015,59 @@ fn pure_rust_shadow_finish(
 }
 
 #[cfg(feature = "openh264-backend")]
+/// CAP2.2 §14 — embed one chunk into a single GOP, **round-trip-verified**.
+/// Tries `payload` (up to its full length); on encode-fail OR verify-fail
+/// (the J2 silent-loss zone — encodes but decodes wrong) it shrinks `want`
+/// ~12%/step and retries, verifying with the SAME extract the real decoder
+/// uses (`try_extract_chunk_from_gop`) on the GOP's self-contained slab. An
+/// empty chunk always round-trips, so the loop terminates. Returns the GOP
+/// Annex-B, the resolved cascade tier, and `consumed` ≤ `payload.len()`
+/// (the caller carries the rest forward). Correct-by-construction: never
+/// emits a chunk that decodes wrong.
+///
+/// Shared by the streaming encoder (`drain_one_gop`) and the round-trip-aware
+/// capacity estimator (#811), so both define "what fits" identically.
+#[cfg(feature = "openh264-backend")]
+pub(crate) fn embed_gop_roundtrip_safe(
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    frames_in_gop: u32,
+    opts: super::openh264_stego::EncodeOpts,
+    payload: &[u8],
+    chunk_idx: u16,
+    total_chunks: u16,
+    hhat_seed: &[u8; 32],
+    weights: &CostWeights,
+) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
+    let mut want = payload.len();
+    loop {
+        let chunk = &payload[..want];
+        let framed = build_chunk_frame(chunk_idx, total_chunks, chunk)?;
+        let frame_bits = bytes_to_bits_msb_first_pub(&framed);
+        match encode_yuv_with_pre_framed_bits_4domain_with_tier(
+            gop_yuv, width, height, frames_in_gop, opts, &frame_bits, hhat_seed, weights,
+            CascadeTier::Auto, DEFAULT_HEADROOM,
+        ) {
+            // Empty chunk round-trips trivially; non-empty must decode back to
+            // exactly the bytes embedded.
+            Ok((b, t))
+                if want == 0
+                    || try_extract_chunk_from_gop(&b, hhat_seed, chunk_idx, weights)
+                        .map_or(false, |c| c.payload.as_slice() == chunk) =>
+            {
+                break Ok((b, t, want));
+            }
+            Ok(_) | Err(StegoError::MessageTooLarge) => {
+                debug_assert!(want > 0, "empty chunk must always succeed");
+                want -= 1usize.max(want / 8); // ~12% step, reaches 0
+            }
+            Err(e) => break Err(e),
+        }
+    }
+}
+
+#[cfg(feature = "openh264-backend")]
 fn drain_one_gop(
     params: &EncodeSessionParams,
     state: &mut Oh264SessionState,
@@ -894,7 +1080,8 @@ fn drain_one_gop(
     // #474.2 — StcPlan fires BEFORE the C encoder call. The OH264
     // backend performs Pass-1 capture + STC compute + Pass-2 replay
     // inside a single call, so we synthesise one StcPlan event per GOP
-    // at the natural boundary.
+    // at the natural boundary. (Fired for plain tail GOPs too, so the
+    // progress smoothing sees a consistent StcPlan→Pass2Replay per GOP.)
     let total_gops = state.total_chunks as u32;
     emit_encode(
         params,
@@ -904,62 +1091,83 @@ fn drain_one_gop(
         },
     );
 
-    // CAP2.2 — dynamic per-GOP allocation (fast path: uniform-spread +
-    // carry-remainder), replacing the even-split pre-chunking. This GOP
-    // takes its uniform share of the remaining payload (everything left on
-    // the final GOP); once the payload is exhausted it carries an empty
-    // chunk. A GOP that cannot hold its share embeds an empty chunk and
-    // carries the bytes forward to later GOPs (absorbed by their headroom),
-    // so one weak GOP no longer caps the clip. Easy-fit payloads (a small
-    // message in a normal video) never hit the carry — the per-GOP share is
-    // a few bytes and trivially embeds. (Precise proportional allocation +
-    // the probe handshake for near-capacity payloads is the follow-on.)
-    let gops_remaining = (state.total_chunks - state.chunk_idx) as usize; // ≥ 1, incl. this GOP
-    let remaining = state.msg_frame.len() - state.cursor;
-    let want = if gops_remaining <= 1 {
-        remaining
-    } else {
-        remaining.div_ceil(gops_remaining)
-    };
-    let end = state.cursor + want; // want ≤ remaining by construction
-
+    // CAP2.3 §4 — the stego window W: GOPs [0, W) carry chunks; [W, n_gops)
+    // are a PLAIN tail (no stego). With no plan installed `stego_window` is
+    // None → W = n_gops, so every GOP is a stego GOP (no-plan / Increment-A
+    // behaviour unchanged).
+    let window = state.stego_window.unwrap_or(state.total_chunks);
     let opts = EncodeOpts {
         qp: params.qp,
         intra_period: params.gop_size as i32,
     };
-    // #798 — tier variant directly (Auto + default headroom) so we capture
-    // the resolved tier for the mobile success-screen badge.
-    let framed = build_chunk_frame(
-        state.chunk_idx, state.total_chunks, &state.msg_frame[state.cursor..end],
-    )?;
-    let frame_bits = bytes_to_bits_msb_first_pub(&framed);
-    let attempt = encode_yuv_with_pre_framed_bits_4domain_with_tier(
-        &state.gop_buffer, params.width, params.height, frames_in_gop, opts,
-        &frame_bits, &state.hhat_seed, &params.cost_weights,
-        CascadeTier::Auto, DEFAULT_HEADROOM,
-    );
-    let (bitstream, gop_tier, consumed) = match attempt {
-        Ok((b, t)) => (b, t, want),
-        Err(StegoError::MessageTooLarge) if want > 0 => {
-            // Weak GOP: embed an empty chunk here, carry the bytes forward.
-            let framed_empty =
-                build_chunk_frame(state.chunk_idx, state.total_chunks, &[])?;
-            let bits_empty = bytes_to_bits_msb_first_pub(&framed_empty);
-            let (b, t) = encode_yuv_with_pre_framed_bits_4domain_with_tier(
-                &state.gop_buffer, params.width, params.height, frames_in_gop, opts,
-                &bits_empty, &state.hhat_seed, &params.cost_weights,
-                CascadeTier::Auto, DEFAULT_HEADROOM,
-            )?;
-            (b, t, 0)
+
+    if state.chunk_idx < window {
+        // ── STEGO GOP ───────────────────────────────────────────────────
+        // This GOP takes its planned/uniform share of the remaining payload;
+        // a GOP that cannot hold its share embeds less and carries the rest
+        // forward (absorbed by later GOPs' headroom), so one weak GOP no
+        // longer caps the clip.
+        let gops_remaining = (window - state.chunk_idx) as usize; // ≥ 1, incl. this GOP
+        let remaining = state.msg_frame.len() - state.cursor;
+        let want = match &state.gop_alloc_plan {
+            // CAP2.2 §12 — precise plan (probe two-pass). This GOP's target is
+            // its cumulative planned bytes minus what's already consumed, so a
+            // shortfall carried from a shrunk earlier GOP rolls into this one.
+            Some(plan) => {
+                let planned_through_now: usize =
+                    plan.iter().take(state.chunk_idx as usize + 1).sum();
+                planned_through_now.saturating_sub(state.cursor).min(remaining)
+            }
+            // Fast path (§13): online uniform-spread + carry-remainder.
+            None => {
+                if gops_remaining <= 1 {
+                    remaining
+                } else {
+                    remaining.div_ceil(gops_remaining)
+                }
+            }
+        };
+
+        // CAP2.2 §14 — embed this GOP's share, ROUND-TRIP-VERIFIED with
+        // shrink-carry. CAP2.3: the wire `total_chunks` carried by every stego
+        // chunk is the WINDOW `window` (< n_gops when there is a plain tail),
+        // so the decoder learns W from GOP 0 and never walks the tail.
+        // `state.total_chunks` (the GOP count) is untouched — it remains the
+        // bookkeeping basis for the finish assertion. #798 — Auto tier captures
+        // the resolved tier for the mobile success badge.
+        let (bitstream, gop_tier, consumed) = embed_gop_roundtrip_safe(
+            &state.gop_buffer,
+            params.width,
+            params.height,
+            frames_in_gop,
+            opts,
+            &state.msg_frame[state.cursor..state.cursor + want],
+            state.chunk_idx,
+            window,
+            &state.hhat_seed,
+            &params.cost_weights,
+        )?;
+        state.cursor += consumed;
+        if state.resolved_tier.is_none() {
+            state.resolved_tier = Some(gop_tier.as_u8());
         }
-        Err(e) => return Err(e),
-    };
-    state.cursor += consumed;
-    // Stash the first GOP's resolved tier as representative of the encode.
-    if state.resolved_tier.is_none() {
-        state.resolved_tier = Some(gop_tier.as_u8());
+        out.extend_from_slice(&bitstream);
+    } else {
+        // ── PLAIN TAIL GOP (CAP2.3 §6) ──────────────────────────────────
+        // The message was fully embedded in GOPs [0, W); this GOP carries NO
+        // stego. A single clean `encode_once` (no Pass-1 walk / STC / content
+        // costs) — the perf win. The decoder's early-dropout never touches
+        // these slabs. The reset inside `oh264_plain_encode_gop` clears the
+        // fork state the preceding stego GOPs left (the #548 class).
+        let bitstream = oh264_plain_encode_gop(
+            &state.gop_buffer,
+            params.width,
+            params.height,
+            frames_in_gop,
+            opts,
+        )?;
+        out.extend_from_slice(&bitstream);
     }
-    out.extend_from_slice(&bitstream);
 
     state.chunk_idx += 1;
     state.frames_buffered = 0;
@@ -1235,9 +1443,15 @@ fn pack_frame_into_buffer(
 pub struct CapacityProbeResult {
     /// Total CoeffSign cover bits walked back from the baseline
     /// per-GOP encode. Sum across all GOPs. Kept for the #475 progress
-    /// callback + shadow-capacity formula; the PRIMARY capacity now uses
-    /// the per-tier STC-trial budget below (CAP2.1).
+    /// callback; the PRIMARY capacity now uses the per-tier STC-trial
+    /// budget below (CAP2.1).
     pub cover_bits: usize,
+    /// #809 — total injectable bits across the 3 shadow domains
+    /// (CoeffSign + CoeffSuffixLsb + MvdSign), summed across GOPs. The
+    /// shadow-capacity formula reads THIS (not `cover_bits`, which is
+    /// CoeffSign-only) so the streaming HUD matches the one-shot
+    /// `h264_stego_capacity_4domain_oh264` shadow number.
+    pub shadow_pool_bits: usize,
     /// Number of GOPs emitted (= number of chunk_frame headers in the
     /// real encode).
     pub n_gops: u32,
@@ -1245,8 +1459,18 @@ pub struct CapacityProbeResult {
     /// cascade tier (index 0..=4), from the accurate STC trial. The
     /// even-split encoder binds on the worst GOP, so per-tier message
     /// capacity = `n_gops × per_tier_min_payload[tier] − FRAME_OVERHEAD`.
-    /// `usize::MAX` entries mean "no GOP probed" (treated as 0).
+    /// `usize::MAX` entries mean "no GOP probed" (treated as 0). Kept for
+    /// reference (the worst-GOP cap); the message ceiling is now Σ (below).
     pub per_tier_min_payload: [usize; 5],
+    /// CAP2.2 §12 (#824) — SUM of per-GOP max-payload (bytes) across all GOPs,
+    /// per cascade tier (0..=4). The carry-based encoders (uniform-share + carry
+    /// AND proportional, #804) fill each GOP to its OWN cap, so the true message
+    /// ceiling is this Σ, not `n_gops × min`. `primary_max_message_bytes` reports
+    /// `per_tier_sum_payload[tier] − FRAME_OVERHEAD`. UPPER bound: the per-GOP
+    /// STC cap over-reports ~2% (J2 jitter), absorbed by the encoder's per-GOP
+    /// round-trip verify + shrink-carry (graceful `MessageTooLarge`, never data
+    /// loss) and the #807 upper-bound HUD framing.
+    pub per_tier_sum_payload: [usize; 5],
 }
 
 impl CapacityProbeResult {
@@ -1254,27 +1478,23 @@ impl CapacityProbeResult {
     /// combined, after envelope) that the streaming OH264 stego encode
     /// session can accept at this content + GOP shape.
     ///
-    /// CAP2.1 — accurate even-split budget. Each GOP carries an equal
-    /// chunk, so the binding limit is the worst GOP. Per-GOP payload is
-    /// already post-chunk-header (the STC trial frames the chunk), so we
-    /// subtract only the crypto-frame envelope:
-    /// `n_gops × per_tier_min_payload[0] − FRAME_OVERHEAD`. Saturates at 0.
-    /// (CAP2.2 spreading switches this aggregation to Σ per-GOP capacity.)
+    /// CAP2.2 §12 (#824) — Σ per-GOP capacity. The carry-based encoders
+    /// (uniform-share + carry AND proportional, #804) fill each GOP to its OWN
+    /// cap, so the ceiling is `Σ per_gop_cap`, not the even-split `n_gops × min`
+    /// (which under-reported on heterogeneous content). Per-GOP payload is
+    /// already post-chunk-header (the STC trial frames the chunk), so we subtract
+    /// only the one-time crypto-frame envelope: `per_tier_sum_payload[0] −
+    /// FRAME_OVERHEAD`. Saturates at 0. UPPER bound (per-GOP STC cap over-reports
+    /// ~2% J2; the encoder's verify + shrink-carry degrades gracefully to
+    /// `MessageTooLarge`, never data loss).
     pub fn primary_max_message_bytes(&self) -> usize {
         self.primary_max_message_bytes_at_tier(0)
     }
 
     /// Per-tier variant of [`Self::primary_max_message_bytes`] (tier 0..=4).
     pub fn primary_max_message_bytes_at_tier(&self, tier: usize) -> usize {
-        let min_payload = self
-            .per_tier_min_payload
-            .get(tier)
-            .copied()
-            .filter(|&p| p != usize::MAX)
-            .unwrap_or(0);
-        (self.n_gops as usize)
-            .saturating_mul(min_payload)
-            .saturating_sub(frame::FRAME_OVERHEAD)
+        let sum_payload = self.per_tier_sum_payload.get(tier).copied().unwrap_or(0);
+        sum_payload.saturating_sub(frame::FRAME_OVERHEAD)
     }
 
     /// Maximum per-shadow message bytes under `n_shadows` total
@@ -1286,21 +1506,14 @@ impl CapacityProbeResult {
     /// For `n_shadows == 1`, no inter-shadow collisions; capacity is
     /// the raw cover budget minus parity + per-shadow envelope.
     pub fn shadow_max_message_bytes(&self, n_shadows: u32) -> usize {
-        use crate::stego::shadow_layer::max_shadow_plaintext_bytes;
-        if n_shadows == 0 {
-            return 0;
-        }
-        let denom = (n_shadows.saturating_sub(1)).max(1) as usize;
-        let m_max_bits_sq = 1024usize
-            .saturating_mul(self.cover_bits)
-            / denom;
-        let m_max_bits = (m_max_bits_sq as f64).sqrt() as usize;
-        let m_max_bits = m_max_bits.min(self.cover_bits);
-        let m_max_bytes = m_max_bits / 8;
-        // 2026-05-21 — picks v1 or v2 frame overhead automatically
-        // (v2 gives 4 fewer bytes capacity but unlocks >64KB
-        // plaintext).
-        max_shadow_plaintext_bytes(m_max_bytes.saturating_sub(128))
+        // #809 — single source of truth for the collision-limited shadow
+        // formula, shared with the one-shot OH264 and pure-Rust paths. Uses
+        // the 3-domain injectable pool (`shadow_pool_bits`), NOT CoeffSign-only
+        // (`cover_bits`) — the streaming HUD now matches the one-shot number.
+        crate::codec::h264::stego::encode_pixels::shadow_max_message_bytes_from_cover_bits(
+            self.shadow_pool_bits,
+            n_shadows as usize,
+        )
     }
 }
 
@@ -1319,10 +1532,26 @@ pub struct StreamingProbeSession {
     params: EncodeSessionParams,
     inner: ProbeImpl,
     cover_bits: usize,
+    /// #809 — total injectable bits across the 3 shadow domains
+    /// (CoeffSign + CoeffSuffixLsb + MvdSign), accumulated per GOP. This
+    /// is the shadow-pool basis, distinct from `cover_bits` (CoeffSign-only,
+    /// kept for the #475 progress estimate). Unifies the streaming HUD's
+    /// shadow number with the one-shot `h264_stego_capacity_4domain_oh264`.
+    shadow_pool_bits: usize,
     n_gops: u32,
     /// CAP2.1 — running MIN per-GOP max-payload per cascade tier
     /// (`usize::MAX` = no GOP drained yet).
     per_tier_min_payload: [usize; 5],
+    /// CAP2.2 §12 — per-GOP tier-0 max-payload (bytes), pushed as each GOP
+    /// drains. Unlike `per_tier_min_payload` (the MIN, for the even-split
+    /// binding), this is the full per-GOP VECTOR `allocate_chunks_proportional`
+    /// needs to size a proportional plan. Surfaced via `finish_with_per_gop`
+    /// only — kept off the `Copy` `CapacityProbeResult`.
+    per_gop_tier0_payload: Vec<usize>,
+    /// CAP2.2 §12 (#824) — running SUM of per-GOP max-payload per tier (the true
+    /// carry/proportional message ceiling Σ, vs `per_tier_min` × n for the old
+    /// even-split). Feeds `CapacityProbeResult::primary_max_message_bytes`.
+    per_tier_sum_payload: [usize; 5],
     /// #475 — fires once per GOP completion so the caller can render
     /// a refining estimated-capacity in the HUD. `None` when no
     /// progressive estimate is wanted (e.g. CLI batch use).
@@ -1400,8 +1629,11 @@ impl StreamingProbeSession {
             params,
             inner,
             cover_bits: 0,
+            shadow_pool_bits: 0,
             n_gops: 0,
             per_tier_min_payload: [usize::MAX; 5],
+            per_gop_tier0_payload: Vec::new(),
+            per_tier_sum_payload: [0; 5],
             progress_callback: None,
         })
     }
@@ -1428,6 +1660,17 @@ impl StreamingProbeSession {
 
     /// Emit one progress event. Called from `push_frame`/`finish`
     /// after each GOP drain. No-op when no callback is installed.
+    ///
+    /// CAP2.5/#821 — the 3rd callback arg is the running ACCURATE primary
+    /// estimate in BYTES, NOT raw cover_bits. It extrapolates the running
+    /// min per-GOP STC budget (tier 0) across all GOPs:
+    /// `total_gops × per_tier_min[0] − FRAME_OVERHEAD`. Because the running
+    /// min only ever DROPS as leaner GOPs are sampled, this estimate
+    /// monotonically NARROWS DOWN toward the final `primary_max_message_bytes`
+    /// — replacing the old `cover_bits × 0.40` heuristic that over-reported
+    /// ~200× during the probe then snapped to the (correct, much smaller)
+    /// finish() value. Callers must use this value DIRECTLY (no ×0.40, no
+    /// re-extrapolation) and must NOT upward-ratchet it (it is meant to fall).
     fn emit_estimate(&self) {
         if let Some(cb) = self.progress_callback.as_ref() {
             // Total GOPs target = ceil(total_frames_hint / gop_size).
@@ -1438,7 +1681,17 @@ impl StreamingProbeSession {
             let total_gops = self.params.total_frames_hint
                 .div_ceil(self.params.gop_size)
                 .max(1);
-            cb(self.n_gops, total_gops, self.cover_bits);
+            // CAP2.2 §12 (#824) — extrapolate the running Σ per-GOP capacity to
+            // all GOPs: `(Σ_probed / gops_probed) × total_gops`. The carry/
+            // proportional encoders fill each GOP to its own cap, so the ceiling
+            // is Σ, not `n_gops × min`. At finish (all GOPs probed) this lands
+            // exactly on the final `primary_max_message_bytes`, so the live HUD
+            // refines toward — and converges on — the final number (no jump).
+            let sum0 = self.per_tier_sum_payload[0];
+            let probed = self.n_gops.max(1) as u128;
+            let est_total = (sum0 as u128).saturating_mul(total_gops as u128) / probed;
+            let est_bytes = (est_total as usize).saturating_sub(frame::FRAME_OVERHEAD);
+            cb(self.n_gops, total_gops, est_bytes);
         }
     }
 
@@ -1452,7 +1705,7 @@ impl StreamingProbeSession {
                 pack_frame_into_buffer(self.params.width, self.params.height, &frame, &mut state.gop_buffer)?;
                 state.frames_buffered += 1;
                 if state.frames_buffered == self.params.gop_size {
-                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.n_gops, &mut self.per_tier_min_payload)?;
+                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_tier_min_payload, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
                     self.emit_estimate();
                 }
                 Ok(())
@@ -1478,22 +1731,38 @@ impl StreamingProbeSession {
 
     /// Drain the final partial GOP (if any) and return the result.
     /// CONSUMES self — handle is invalid after this call.
-    pub fn finish(mut self) -> Result<CapacityProbeResult, StegoError> {
+    pub fn finish(self) -> Result<CapacityProbeResult, StegoError> {
+        self.finish_with_per_gop().map(|(result, _per_gop)| result)
+    }
+
+    /// CAP2.2 §12 — like [`finish`](Self::finish) but ALSO returns the per-GOP
+    /// tier-0 max-payload VECTOR (bytes), in GOP order (length == `n_gops`).
+    /// This is the basis the CLI two-pass orchestrator feeds to
+    /// [`allocate_chunks_proportional`](super::stego::chunk_frame::allocate_chunks_proportional)
+    /// via [`StreamingEncodeSession::plan_proportional`]. `CapacityProbeResult`
+    /// itself stays `Copy` and exposes only the per-GOP MIN.
+    pub fn finish_with_per_gop(
+        mut self,
+    ) -> Result<(CapacityProbeResult, Vec<usize>), StegoError> {
         match &mut self.inner {
             #[cfg(feature = "openh264-backend")]
             ProbeImpl::Oh264(state) => {
                 if state.frames_buffered > 0 {
-                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.n_gops, &mut self.per_tier_min_payload)?;
+                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_tier_min_payload, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
                     // Emit one final per-GOP event before returning so
                     // listeners that race a final-state read can see
                     // the full count rather than the second-last one.
                     self.emit_estimate();
                 }
-                Ok(CapacityProbeResult {
+                let result = CapacityProbeResult {
                     cover_bits: self.cover_bits,
+                    shadow_pool_bits: self.shadow_pool_bits,
                     n_gops: self.n_gops,
                     per_tier_min_payload: self.per_tier_min_payload,
-                })
+                    per_tier_sum_payload: self.per_tier_sum_payload,
+                };
+                let per_gop = std::mem::take(&mut self.per_gop_tier0_payload);
+                Ok((result, per_gop))
             }
             ProbeImpl::PureRust => Err(StegoError::InvalidVideo(
                 "capacity probe not implemented for pure-Rust engine".into(),
@@ -1511,8 +1780,11 @@ fn drain_one_gop_probe(
     params: &EncodeSessionParams,
     state: &mut Oh264ProbeState,
     cover_bits: &mut usize,
+    shadow_pool_bits: &mut usize,
     n_gops: &mut u32,
     per_tier_min: &mut [usize; 5],
+    per_gop_tier0: &mut Vec<usize>,
+    per_tier_sum: &mut [usize; 5],
 ) -> Result<(), StegoError> {
     let frames_in_gop = state.frames_buffered;
     if frames_in_gop == 0 {
@@ -1534,12 +1806,20 @@ fn drain_one_gop_probe(
         frames_in_gop,
         opts,
         &params.cost_weights,
+        // #809 — progress-probe path: tier 0 only (5× faster).
+        false,
     )?;
     *cover_bits = cover_bits.saturating_add(cap.coeff_sign_cover_bits);
+    *shadow_pool_bits = shadow_pool_bits.saturating_add(cap.injectable_cover_bits);
     *n_gops = n_gops.saturating_add(1);
     for t in 0..5 {
         per_tier_min[t] = per_tier_min[t].min(cap.per_tier_payload[t]);
+        // CAP2.2 §12 (#824) — Σ per tier = the true carry/proportional ceiling.
+        per_tier_sum[t] = per_tier_sum[t].saturating_add(cap.per_tier_payload[t]);
     }
+    // CAP2.2 §12 — record this GOP's tier-0 cap (bytes) for proportional
+    // allocation; GOP order matches the encode's chunk order.
+    per_gop_tier0.push(cap.per_tier_payload[0]);
     state.frames_buffered = 0;
     state.gop_buffer.clear();
     Ok(())
@@ -1660,54 +1940,59 @@ impl StreamingDecodeSession {
             .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
             .hhat_seed;
 
-        let mut collected: Vec<(u16, Vec<u8>)> = Vec::with_capacity(slabs.len());
-        let mut seen_total_chunks: Option<u16> = None;
-
-        let total_slabs = slabs.len() as u32;
-        for (gop_idx, slab) in slabs.iter().enumerate() {
-            let candidate = try_extract_chunk_from_gop(
-                slab, &hhat_seed, gop_idx as u16, &self.cost_weights,
-            )
-                .ok_or_else(|| {
-                    StegoError::InvalidVideo(format!(
-                        "decode session: no chunk_frame found in GOP {gop_idx}"
-                    ))
-                })?;
-            // Cross-GOP consistency: all chunks must agree on total_chunks.
-            match seen_total_chunks {
-                None => seen_total_chunks = Some(candidate.total_chunks),
-                Some(t) if t == candidate.total_chunks => {}
-                Some(t) => {
-                    return Err(StegoError::InvalidVideo(format!(
-                        "decode session: GOP {gop_idx} reports total_chunks={} but earlier GOPs reported {}",
-                        candidate.total_chunks, t,
-                    )));
-                }
-            }
-            collected.push((candidate.chunk_idx, candidate.payload));
-
-            // #474.2 — Walker progress event per slab. Streaming decode
-            // doesn't expose per-frame walker granularity (each slab is
-            // walked + STC-extracted as one unit), so we report at slab
-            // granularity. `total_frames` here means "total slabs" for
-            // the smoothing engine's fraction math — it doesn't care
-            // whether the unit is a frame or a GOP.
-            self.emit_progress(DecodePhase::Walker {
-                frame_idx: (gop_idx as u32) + 1,
-                total_frames: total_slabs,
-            });
-        }
-
-        let total_chunks = seen_total_chunks.expect("at least one GOP processed");
-        if (slabs.len() as u32) != total_chunks as u32 {
+        // CAP2.3 §6 — decoder early-dropout. GOP 0 is ALWAYS a stego GOP (the
+        // message occupies GOPs [0, W)); its chunk header carries the stego
+        // window W (= wire `total_chunks`). Learn W, collect exactly W chunks,
+        // and STOP — never walk the plain tail `slabs[W..]` (decode cost ∝ W,
+        // not n_gops). For old / no-plan / pure-Rust streams W == slabs.len()
+        // (all-stego), so this is a strict SUPERSET of the prior "walk every
+        // slab" loop → non-breaking for every existing producer.
+        let first = try_extract_chunk_from_gop(
+            &slabs[0], &hhat_seed, 0, &self.cost_weights,
+        )
+            .ok_or_else(|| {
+                StegoError::InvalidVideo(
+                    "decode session: no chunk_frame found in GOP 0".into(),
+                )
+            })?;
+        let window = first.total_chunks;
+        if window == 0 || window as usize > slabs.len() {
             return Err(StegoError::InvalidVideo(format!(
-                "decode session: extracted {} GOPs but chunk_frame header reports total_chunks={}",
+                "decode session: GOP 0 reports total_chunks={window} but only {} GOPs present",
                 slabs.len(),
-                total_chunks,
             )));
         }
 
-        let frame_bytes = assemble_chunks(collected, total_chunks).ok_or_else(|| {
+        let mut collected: Vec<(u16, Vec<u8>)> = Vec::with_capacity(window as usize);
+        collected.push((first.chunk_idx, first.payload));
+        // #474.2 — Walker progress is over the stego window W (the only GOPs we
+        // walk); the plain tail is skipped, so it isn't counted.
+        self.emit_progress(DecodePhase::Walker { frame_idx: 1, total_frames: window as u32 });
+
+        for chunk_idx in 1..window {
+            let slab = &slabs[chunk_idx as usize];
+            let candidate = try_extract_chunk_from_gop(
+                slab, &hhat_seed, chunk_idx, &self.cost_weights,
+            )
+                .ok_or_else(|| {
+                    StegoError::InvalidVideo(format!(
+                        "decode session: no chunk_frame found in stego GOP {chunk_idx} (window {window})"
+                    ))
+                })?;
+            if candidate.total_chunks != window {
+                return Err(StegoError::InvalidVideo(format!(
+                    "decode session: GOP {chunk_idx} reports total_chunks={} but GOP 0 reported {window}",
+                    candidate.total_chunks,
+                )));
+            }
+            collected.push((candidate.chunk_idx, candidate.payload));
+            self.emit_progress(DecodePhase::Walker {
+                frame_idx: chunk_idx as u32 + 1,
+                total_frames: window as u32,
+            });
+        }
+
+        let frame_bytes = assemble_chunks(collected, window).ok_or_else(|| {
             StegoError::InvalidVideo(
                 "decode session: chunk reassembly failed (missing/duplicate index)".into(),
             )
@@ -2248,6 +2533,299 @@ mod tests {
                 "round-trip text mismatch: got {:?}", result.text
             );
             assert_eq!(result.mode_id, 1);
+        }
+
+        #[test]
+        fn streaming_session_oh264_alloc_plan_roundtrip() {
+            // CAP2.2 §12 — a precise per-GOP allocation plan (the CLI
+            // two-pass path) must round-trip identically to the default
+            // uniform-spread. 3-GOP fixture; front-load the plan onto GOP 0
+            // (a shape uniform-spread would never choose) to exercise the
+            // `gop_alloc_plan` branch in `drain_one_gop`, with the round-trip
+            // verify + shrink-carry as the safety backstop.
+            let _g = SESSION_TEST_MUTEX.lock().unwrap();
+            const W: u32 = 320;
+            const H: u32 = 240;
+            const GOP: u32 = 2;
+            const N: u32 = 6; // 3 GOPs
+            const MSG: &str = "spread payload";
+            const PASS: &str = "pw";
+
+            let params = EncodeSessionParams {
+                width: W, height: H,
+                fps_num: 30, fps_den: 1,
+                qp: 26, gop_size: GOP, total_frames_hint: N,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::Oh264,
+                cost_weights: CostWeights::default(),
+                progress_callback: None,
+            };
+            let mut enc =
+                StreamingEncodeSession::create(params, MSG, PASS).expect("encode create");
+
+            // Build a valid 3-GOP plan summing to the framed length, front-
+            // loaded onto GOP 0 (uniform-spread would split ~evenly instead).
+            let framed = enc.framed_message_len().expect("oh264 framed len");
+            let g0 = framed / 2;
+            let g1 = (framed - g0) / 2;
+            let g2 = framed - g0 - g1;
+            assert_eq!(g0 + g1 + g2, framed);
+            enc.set_gop_alloc_plan(vec![g0, g1, g2]).expect("set plan");
+
+            let mut annex_b = Vec::new();
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                let frame = YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                };
+                enc.push_frame(frame, &mut annex_b).expect("push");
+            }
+            enc.finish(&mut annex_b).expect("finish encode");
+
+            let mut dec = StreamingDecodeSession::create(PASS).expect("decode create");
+            dec.push_annex_b(&annex_b).expect("push annex");
+            let result = dec.finish().expect("finish decode");
+            assert_eq!(
+                result.text, MSG,
+                "plan-allocated round-trip mismatch: got {:?}", result.text
+            );
+
+            // Plan validation rejects a wrong length or a wrong Σ.
+            let mut bad = StreamingEncodeSession::create(
+                EncodeSessionParams {
+                    width: W, height: H, fps_num: 30, fps_den: 1, qp: 26,
+                    gop_size: GOP, total_frames_hint: N,
+                    color: ColorParams::default(),
+                    engine: EncodeEngineChoice::Oh264,
+                    cost_weights: CostWeights::default(),
+                    progress_callback: None,
+                },
+                MSG, PASS,
+            ).expect("create bad");
+            assert!(bad.set_gop_alloc_plan(vec![framed, 0]).is_err(), "wrong length must reject");
+            assert!(bad.set_gop_alloc_plan(vec![1, 1, 1]).is_err(), "wrong Σ must reject");
+        }
+
+        #[test]
+        fn streaming_session_oh264_proportional_pipeline_roundtrip() {
+            // CAP2.2 §12 Increment 2 — the full CLI two-pass pipeline at the
+            // session level (no CLI/ffmpeg): probe the clip → per-GOP caps →
+            // plan_proportional → encode-with-plan → decode round-trips. Proves
+            // probe-vector + allocate + set_plan compose, and that proportional
+            // allocation never loses data (the verify/carry backstop holds).
+            let _g = SESSION_TEST_MUTEX.lock().unwrap();
+            const W: u32 = 320;
+            const H: u32 = 240;
+            const GOP: u32 = 2;
+            const N: u32 = 6; // 3 GOPs
+            const MSG: &str = "proportional";
+            const PASS: &str = "pw";
+
+            let params = EncodeSessionParams {
+                width: W, height: H,
+                fps_num: 30, fps_den: 1,
+                qp: 26, gop_size: GOP, total_frames_hint: N,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::Oh264,
+                cost_weights: CostWeights::default(),
+                progress_callback: None,
+            };
+
+            // Pass 1 — probe the clip for per-GOP caps.
+            let mut probe =
+                StreamingProbeSession::create(params.clone()).expect("probe create");
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                probe.push_frame(YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                }).expect("probe push");
+            }
+            let (probe_result, per_gop_caps) =
+                probe.finish_with_per_gop().expect("probe finish");
+            assert_eq!(
+                per_gop_caps.len(), probe_result.n_gops as usize,
+                "per-GOP vector length must equal n_gops"
+            );
+            assert_eq!(per_gop_caps.len(), 3, "expected 3 GOPs");
+
+            // Pass 2 — encode with a proportional plan from the probe caps.
+            let mut enc =
+                StreamingEncodeSession::create(params, MSG, PASS).expect("encode create");
+            let planned = enc.plan_proportional(&per_gop_caps, 1.0).expect("plan");
+            assert!(planned, "proportional plan should install for a fitting message");
+
+            let mut annex_b = Vec::new();
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                enc.push_frame(YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                }, &mut annex_b).expect("push");
+            }
+            enc.finish(&mut annex_b).expect("finish encode");
+
+            let mut dec = StreamingDecodeSession::create(PASS).expect("decode create");
+            dec.push_annex_b(&annex_b).expect("push annex");
+            let result = dec.finish().expect("finish decode");
+            assert_eq!(
+                result.text, MSG,
+                "proportional pipeline round-trip mismatch: got {:?}", result.text
+            );
+        }
+
+        #[test]
+        fn streaming_session_oh264_plain_tail_roundtrip() {
+            // CAP2.3 §6 (Increment B) — concentrate+tail with a genuine PLAIN
+            // tail. A tiny message over 4 GOPs concentrates into GOP 0 (W=1);
+            // GOPs 1-3 carry NO stego. Verifies what a round-trip ALONE cannot
+            // (the decoder SKIPS the tail, so tail corruption is invisible to it):
+            //   1. all 4 GOPs emit as separable H.264 (SPS-per-GOP holds for the
+            //      plain `encode_once` tail — else `split_annex_b_into_gops` would
+            //      merge them and desync the decoder's index↔GOP map),
+            //   2. GOP 0's wire `total_chunks` == W == 1 (< n_gops),
+            //   3. the tail GOPs carry NO chunk (genuinely plain, not the
+            //      Increment-A empty-chunk tail),
+            //   4. EVERY GOP — incl. the plain tail — walks cleanly (structurally
+            //      valid, not fork-state corrupted: the #548-class reset works),
+            //   5. the message round-trips via the decoder early-dropout.
+            let _g = SESSION_TEST_MUTEX.lock().unwrap();
+            const W: u32 = 320;
+            const H: u32 = 240;
+            const GOP: u32 = 2;
+            const N: u32 = 8; // 4 GOPs
+            const MSG: &str = "hi"; // tiny → W=1, plain tail GOPs 1-3
+            const PASS: &str = "pw";
+
+            let params = EncodeSessionParams {
+                width: W, height: H,
+                fps_num: 30, fps_den: 1,
+                qp: 26, gop_size: GOP, total_frames_hint: N,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::Oh264,
+                cost_weights: CostWeights::default(),
+                progress_callback: None,
+            };
+
+            let mut probe = StreamingProbeSession::create(params.clone()).expect("probe create");
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                probe.push_frame(YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                }).expect("probe push");
+            }
+            let (probe_result, per_gop_caps) = probe.finish_with_per_gop().expect("probe finish");
+            assert_eq!(probe_result.n_gops, 4, "expected 4 GOPs");
+
+            let mut enc = StreamingEncodeSession::create(params, MSG, PASS).expect("enc create");
+            // r=1.0 (greedy concentrate) guarantees W=1 for a tiny message.
+            assert!(
+                enc.plan_proportional(&per_gop_caps, 1.0).expect("plan"),
+                "concentrate+tail plan should install"
+            );
+
+            let mut annex_b = Vec::new();
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                enc.push_frame(YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                }, &mut annex_b).expect("push");
+            }
+            enc.finish(&mut annex_b).expect("finish encode");
+
+            // (1) all 4 GOPs emitted + SPS-separable (incl. the plain tail).
+            let slabs = split_annex_b_into_gops(&annex_b);
+            assert_eq!(slabs.len(), 4, "all 4 GOPs (incl. plain tail) must emit + be SPS-separable");
+
+            let keys = CabacStegoMasterKeys::derive(PASS).expect("keys");
+            let hhat_seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0).hhat_seed;
+            let weights = CostWeights::default();
+
+            // (2) GOP 0 carries the whole tiny message; its wire total_chunks = W = 1.
+            let g0 = try_extract_chunk_from_gop(slabs[0], &hhat_seed, 0, &weights)
+                .expect("GOP 0 must carry the stego chunk");
+            assert_eq!(g0.total_chunks, 1, "window W must be 1 for a tiny message");
+
+            // (3)+(4) tail GOPs are genuinely plain (no chunk) yet walk cleanly.
+            for i in 0..4usize {
+                walk_annex_b_for_cover_with_options(
+                    slabs[i], WalkOptions { record_mvd: true, ..Default::default() },
+                ).unwrap_or_else(|e| panic!("GOP {i} failed to walk (corrupt plain tail?): {e}"));
+            }
+            for i in 1..4u16 {
+                assert!(
+                    try_extract_chunk_from_gop(slabs[i as usize], &hhat_seed, i, &weights).is_none(),
+                    "plain tail GOP {i} must NOT carry a chunk"
+                );
+            }
+
+            // (5) round-trips via decoder early-dropout (collects W=1, skips tail).
+            let mut dec = StreamingDecodeSession::create(PASS).expect("dec create");
+            dec.push_annex_b(&annex_b).expect("push annex");
+            let result = dec.finish().expect("finish decode");
+            assert_eq!(result.text, MSG, "plain-tail round-trip mismatch: {:?}", result.text);
+        }
+
+        #[test]
+        fn streaming_session_oh264_capacity_is_sigma_not_evensplit() {
+            // CAP2.2 §12 (#824) — the reported capacity must be Σ per-GOP caps
+            // (what the carry/proportional encoders actually fill), i.e.
+            // `per_tier_sum_payload[0] − FRAME_OVERHEAD`, NOT the even-split
+            // `n_gops × min`. Σ ≥ n_gops × min always.
+            let _g = SESSION_TEST_MUTEX.lock().unwrap();
+            const W: u32 = 320;
+            const H: u32 = 240;
+            const GOP: u32 = 2;
+            const N: u32 = 6; // 3 GOPs
+
+            let params = EncodeSessionParams {
+                width: W, height: H, fps_num: 30, fps_den: 1, qp: 26,
+                gop_size: GOP, total_frames_hint: N,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::Oh264,
+                cost_weights: CostWeights::default(),
+                progress_callback: None,
+            };
+            let mut probe = StreamingProbeSession::create(params).expect("probe create");
+            for f in 0..N {
+                let (y, u, v) = synth_yuv_frame(W, H, f);
+                probe.push_frame(YuvFrameRef {
+                    y: &y, y_stride: W as usize,
+                    u: &u, u_stride: (W / 2) as usize,
+                    v: &v, v_stride: (W / 2) as usize,
+                }).expect("probe push");
+            }
+            let (result, per_gop_caps) = probe.finish_with_per_gop().expect("finish");
+            assert_eq!(per_gop_caps.len(), result.n_gops as usize);
+
+            let sigma: usize = per_gop_caps.iter().sum();
+            // The accumulated Σ equals the sum of the per-GOP vector.
+            assert_eq!(
+                result.per_tier_sum_payload[0], sigma,
+                "per_tier_sum[0] must == Σ per-GOP caps"
+            );
+            // Capacity is Σ − overhead (the new formula), not n_gops × min − overhead.
+            let overhead = crate::stego::frame::FRAME_OVERHEAD;
+            assert_eq!(
+                result.primary_max_message_bytes(),
+                sigma.saturating_sub(overhead),
+                "primary capacity must be Σ − FRAME_OVERHEAD"
+            );
+            // Σ is always ≥ the old even-split n_gops × min (the under-report it replaces).
+            let min_cap = *per_gop_caps.iter().min().unwrap();
+            assert!(
+                sigma >= (result.n_gops as usize) * min_cap,
+                "Σ ({}) must be ≥ even-split n×min ({} × {})",
+                sigma, result.n_gops, min_cap
+            );
         }
 
         #[test]

@@ -166,7 +166,7 @@ fn horse_flag_true_vs_reported_capacity() {
                 eprintln!("{:<13} {:>6} | SKIP", tag, n); continue;
             };
             let reported = h264_stego_capacity_4domain_oh264(&yuv, W, H, n as usize,
-                EncodeOpts { qp: 26, intra_period: GOP as i32 })
+                EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
                 .map(|i| i.per_tier_primary_max_message_bytes[0]).unwrap_or(0);
             let true_max = max_encodable(&yuv, W, H, n, GOP);
             let ratio = if true_max > 0 { reported as f64 / true_max as f64 } else { f64::NAN };
@@ -189,7 +189,7 @@ fn horse_flag_capacity_vs_frames() {
             eprintln!("{:>6} | SKIP (no fixture/ffmpeg)", n); continue;
         };
         let cap = h264_stego_capacity_4domain_oh264(&yuv, W, H, n as usize,
-            EncodeOpts { qp: 26, intra_period: GOP as i32 })
+            EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0] as i64)
             .unwrap_or(-1);
         let enc = encode(&yuv, W, H, n, GOP, msg, pass);
@@ -218,7 +218,7 @@ fn realistic_capacity_check() {
     const GOP: u32 = 30;
     let rep = |yuv: &[u8], n: u32| -> usize {
         h264_stego_capacity_4domain_oh264(yuv, W, H, n as usize,
-            EncodeOpts { qp: 26, intra_period: GOP as i32 })
+            EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0]).unwrap_or(0)
     };
 

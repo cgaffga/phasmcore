@@ -1454,6 +1454,57 @@ pub struct H264ShadowCapacityInfo {
     pub n_shadows: usize,
 }
 
+/// #809 — collision-limited shadow-capacity formula, shared by the
+/// pure-Rust path ([`h264_stego_shadow_capacity`]) and the OH264 path
+/// ([`h264_stego_capacity_4domain_oh264`]).
+///
+/// `cover_size_bits` = total injectable bits across the 3 shadow domains
+/// (CoeffSign + CoeffSuffixLsb + MvdSign). Multiple shadows write LSBs
+/// into one shared priority-ordered pool; the birthday-paradox collision
+/// rate over `N` messages bounds the per-message ceiling at
+/// √(1024·pool/(N−1)), capped by the raw pool. Worst-case RS parity
+/// (128 B) is then subtracted, and the v1/v2 frame envelope is applied
+/// by `max_shadow_plaintext_bytes`.
+pub(crate) fn shadow_max_message_bytes_from_cover_bits(
+    cover_size_bits: usize,
+    n_shadows: usize,
+) -> usize {
+    use crate::stego::shadow_layer::max_shadow_plaintext_bytes;
+    if n_shadows == 0 {
+        return 0;
+    }
+    let denom = n_shadows.saturating_sub(1).max(1);
+    let m_max_bits_squared = 1024usize.saturating_mul(cover_size_bits) / denom;
+    // f64::sqrt is a correctly-rounded IEEE-754 op (deterministic across
+    // platforms, unlike sin/cos) — and capacity is a display estimate, not
+    // a key-derived value, so cross-platform bit-identity isn't required.
+    let m_max_bits = (m_max_bits_squared as f64).sqrt() as usize;
+    let m_max_bits = m_max_bits.min(cover_size_bits);
+    let m_max_bytes = m_max_bits / 8;
+    max_shadow_plaintext_bytes(m_max_bytes.saturating_sub(128))
+}
+
+/// CAP2.5 — pure, stateless per-shadow capacity for the N-aware HUD bar.
+///
+/// Given a cover pool of `pool_bits` injectable bits (the 3-domain
+/// `shadow_pool_bits` reported by the capacity probe / one-shot
+/// capacity surface) and `n_shadows` total shadow messages sharing it,
+/// returns the maximum plaintext bytes available to EACH shadow. The
+/// per-shadow ceiling is symmetric (all N shadows share the same
+/// budget) and shrinks ~√N as messages are added, per the
+/// birthday-paradox collision bound in
+/// [`shadow_max_message_bytes_from_cover_bits`].
+///
+/// This is the single source of truth the mobile bridges call to size
+/// each segment of the N-aware shadow capacity bar without re-probing:
+/// the probe surfaces `shadow_pool_bits` once, then the UI calls this
+/// for the current N. Mirrors
+/// [`crate::codec::h264::streaming_session::CapacityProbeResult::shadow_max_message_bytes`]
+/// exactly, so the streaming HUD and the closed-form bar agree.
+pub fn h264_shadow_capacity_for_n(pool_bits: usize, n_shadows: usize) -> usize {
+    shadow_max_message_bytes_from_cover_bits(pool_bits, n_shadows)
+}
+
 /// §6E-C2 polish — predict the safe per-shadow message capacity
 /// for a given video + shadow count.
 ///
@@ -1477,11 +1528,6 @@ pub fn h264_stego_shadow_capacity(
     gop_size: usize,
     n_shadows: usize,
 ) -> Result<H264ShadowCapacityInfo, StegoError> {
-    // 2026-05-21 — Video shadow now uses the unified v1/v2 dispatch
-    // frame format. `max_shadow_plaintext_bytes` picks whichever
-    // format gives more capacity at the given buffer size.
-    use crate::stego::shadow_layer::max_shadow_plaintext_bytes;
-
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(StegoError::InvalidVideo(format!(
             "dimensions must be 16-aligned, got {width}x{height}"
@@ -1510,20 +1556,8 @@ pub fn h264_stego_shadow_capacity(
     let cover_size_bits =
         cap_p1.coeff_sign_bypass + cap_p1.coeff_suffix_lsb + cap_p1.mvd_sign_bypass;
 
-    let max_message_bytes = if n_shadows == 0 {
-        0
-    } else {
-        // Collision-limited per the formula in the doc above.
-        let denom = n_shadows.saturating_sub(1).max(1);
-        let m_max_bits_squared = 1024usize.saturating_mul(cover_size_bits) / denom;
-        let m_max_bits = (m_max_bits_squared as f64).sqrt() as usize;
-        // Also bound by raw cover capacity (single-shadow case dominates).
-        let m_max_bits = m_max_bits.min(cover_size_bits);
-        let m_max_bytes = m_max_bits / 8;
-        // Subtract worst-case parity (max tier), then map remaining
-        // pre-RS bytes to max user plaintext via v1/v2-aware helper.
-        max_shadow_plaintext_bytes(m_max_bytes.saturating_sub(128))
-    };
+    let max_message_bytes =
+        shadow_max_message_bytes_from_cover_bits(cover_size_bits, n_shadows);
 
     Ok(H264ShadowCapacityInfo {
         cover_size_bits,
@@ -1781,6 +1815,11 @@ pub fn h264_stego_capacity_4domain_oh264(
     height: u32,
     n_frames: usize,
     opts: super::super::openh264_stego::EncodeOpts,
+    // #809 — `false` (live mobile path) computes only tier 0 per GOP, 5×
+    // faster; `per_tier_primary_max_message_bytes[1..4]` are filled from
+    // tier 0 (capacity-neutral on real content, #814). `true` (CLI
+    // diagnostic / calibration) computes the true per-tier breakdown.
+    full_tiers: bool,
 ) -> Result<H264StegoCapacityInfo, StegoError> {
     use crate::stego::frame::FRAME_OVERHEAD;
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
@@ -1813,15 +1852,22 @@ pub fn h264_stego_capacity_4domain_oh264(
     let weights = super::cost_weights::CostWeights::default();
     let mut per_tier_min = [usize::MAX; 5];
     let mut cover_size_bits = 0usize;
+    // #809 — accumulate the 3-domain shadow pool straight off the OH264
+    // cover walk we're already doing per GOP, so the shadow number comes
+    // from the SAME encoder the shadow encode uses — no separate pure-Rust
+    // `pass1_count_4domain` whole-video pass (the ~45 s/clip bottleneck the
+    // probe profiling pinned).
+    let mut shadow_pool_bits = 0usize;
     for g in 0..n_gops {
         let f0 = g * gop_size;
         let f1 = ((g + 1) * gop_size).min(n_frames);
         let gop_n = (f1 - f0) as u32;
         let gop_yuv = &yuv[f0 * frame_size..f1 * frame_size];
         let cap = super::super::openh264_stego::oh264_gop_capacity_per_tier(
-            gop_yuv, width, height, gop_n, opts, &weights,
+            gop_yuv, width, height, gop_n, opts, &weights, full_tiers,
         )?;
         cover_size_bits += cap.coeff_sign_cover_bits;
+        shadow_pool_bits += cap.injectable_cover_bits;
         for t in 0..5 {
             per_tier_min[t] = per_tier_min[t].min(cap.per_tier_payload[t]);
         }
@@ -1842,19 +1888,18 @@ pub fn h264_stego_capacity_4domain_oh264(
     }
     let primary_max_message_bytes = per_tier_primary_max_message_bytes[0];
 
-    // Shadow capacity: keep the existing pure-Rust formula for now —
-    // shadow uses LSB writes + RS ECC at top-N priority positions, and
-    // its cap is collision-limited (RS parity tier) more than cover-
-    // size limited. Tracking per-encoder shadow capacity as a follow-on.
-    let gop_size_for_shadow = (opts.intra_period.max(1)) as usize;
-    let shadow_info = h264_stego_shadow_capacity(
-        yuv, width, height, n_frames, gop_size_for_shadow, /* n_shadows */ 1,
-    )?;
+    // #809 — shadow capacity from the OH264 pool we accumulated above
+    // (collision-limited √-formula), NOT a separate pure-Rust whole-video
+    // `pass1_count_4domain`. This is both faster (drops the dominant probe
+    // cost) and more correct: the number now reflects the OH264 encoder the
+    // shadow encode actually runs, instead of the divergent pure-Rust cover.
+    let shadow_max_message_bytes =
+        shadow_max_message_bytes_from_cover_bits(shadow_pool_bits, /* n_shadows */ 1);
 
     Ok(H264StegoCapacityInfo {
         cover_size_bits,
         primary_max_message_bytes,
-        shadow_max_message_bytes: shadow_info.max_message_bytes,
+        shadow_max_message_bytes,
         per_tier_primary_max_message_bytes,
     })
 }

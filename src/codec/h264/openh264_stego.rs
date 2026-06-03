@@ -1510,6 +1510,13 @@ const CAP2_SAFETY_DEN: usize = 6;
 pub(crate) struct GopCapacity {
     pub per_tier_payload: [usize; 5],
     pub coeff_sign_cover_bits: usize,
+    /// #809 — total injectable cover bits in the 3 shadow domains
+    /// (CoeffSign + CoeffSuffixLsb + MvdSign) for THIS GOP, read straight
+    /// off the OH264 cover walk. Lets `h264_stego_capacity_4domain_oh264`
+    /// compute the shadow capacity from the same encoder it will actually
+    /// use — instead of a separate pure-Rust whole-video `pass1_count_4domain`
+    /// (the ~45 s/clip bottleneck the #809 profiling pinned).
+    pub injectable_cover_bits: usize,
 }
 
 /// Deterministic ~incompressible payload bytes for an STC trial. The encoder
@@ -1613,8 +1620,24 @@ pub(crate) fn oh264_gop_capacity_per_tier(
     gop_n_frames: u32,
     opts: EncodeOpts,
     weights: &CostWeights,
+    // #809 — when false, compute ONLY tier 0 (the reported primary capacity)
+    // and fill tiers 1..4 from it. The tier filter is capacity-neutral on
+    // real content (#814 / D'.7), so this is exact for the live mobile path
+    // at 5× fewer STC Viterbis. `true` (CLI diagnostic / calibration tests)
+    // computes the true per-tier breakdown.
+    full_tiers: bool,
 ) -> Result<GopCapacity, StegoError> {
     validate_dims(gop_yuv, width, height, gop_n_frames)?;
+    let prof = std::env::var("PHASM_CAP_PROFILE").is_ok();
+    let mut t = std::time::Instant::now();
+    macro_rules! lap {
+        ($n:expr) => {
+            if prof {
+                eprintln!("  [cap-prof] {:<16} {:?}", $n, t.elapsed());
+                t = std::time::Instant::now();
+            }
+        };
+    }
     let mb_width = width / 16;
     let mb_per_frame = ((width / 16) * (height / 16)) as usize;
     let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1637,6 +1660,13 @@ pub(crate) fn oh264_gop_capacity_per_tier(
     .map_err(|e| StegoError::InvalidVideo(format!("cap2 walk: {e}")))?;
 
     let coeff_sign_cover_bits = baseline_walk.cover.coeff_sign_bypass.bits.len();
+    // #809 — 3 shadow-injectable domains, same definition the shadow formula
+    // uses (CS + CSL + MvdSign; MvdSuffixLsb is excluded — it's the safe-MSL
+    // gated domain, not part of the shadow LSB pool).
+    let injectable_cover_bits = baseline_walk.cover.coeff_sign_bypass.bits.len()
+        + baseline_walk.cover.coeff_suffix_lsb.bits.len()
+        + baseline_walk.cover.mvd_sign_bypass.bits.len();
+    lap!("encode+walk");
 
     // content costs + safe_msl gate — computed ONCE (tier-independent).
     let use_uniform = std::env::var("PHASM_DIAG_UNIFORM_COSTS")
@@ -1649,6 +1679,7 @@ pub(crate) fn oh264_gop_capacity_per_tier(
             gop_yuv, width, height, gop_n_frames, &baseline_walk.cover, opts.qp,
         )?
     };
+    lap!("content_costs");
     {
         let safe_msb = super::stego::cascade_safety::analyze_safe_mvd_subset(
             &baseline_walk.mvd_meta, baseline_walk.mb_w, baseline_walk.mb_h,
@@ -1669,12 +1700,14 @@ pub(crate) fn oh264_gop_capacity_per_tier(
             base_costs.mvd_suffix_lsb[i] = f32::INFINITY;
         }
     }
+    lap!("safe_msl");
 
     let csb_qp = vec![opts.qp; baseline_walk.cover.coeff_sign_bypass.len()];
     let csl_qp = vec![opts.qp; baseline_walk.cover.coeff_suffix_lsb.len()];
 
     let mut per_tier_payload = [0usize; 5];
-    for tier in 0u8..=4 {
+    let last_tier: u8 = if full_tiers { 4 } else { 0 };
+    for tier in 0u8..=last_tier {
         let mut costs = base_costs.clone();
         if tier > 0 {
             use super::stego::tier_filter::apply_tier_filter;
@@ -1697,10 +1730,20 @@ pub(crate) fn oh264_gop_capacity_per_tier(
             combine_cover_4domain(&baseline_walk.cover, &costs, weights);
         per_tier_payload[tier as usize] = cap2_stc_trial_max_payload(&cover, &costs_v);
     }
+    // #809 — tier filter is capacity-neutral on real content (#814); fill the
+    // un-probed tiers from tier 0 so callers see consistent values.
+    if !full_tiers {
+        let t0 = per_tier_payload[0];
+        for t in 1..5 {
+            per_tier_payload[t] = t0;
+        }
+    }
+    lap!("tier_loop");
 
     Ok(GopCapacity {
         per_tier_payload,
         coeff_sign_cover_bits,
+        injectable_cover_bits,
     })
 }
 
@@ -1721,6 +1764,45 @@ fn validate_dims(yuv: &[u8], width: u32, height: u32, n_frames: u32) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// CAP2.3 §6 — encode ONE plain (no-stego) GOP for the concentrate+tail plain
+/// tail. A single `encode_once` (no Pass-1 walk, no STC, no content-cost
+/// computation — the cheap path the capacity probe uses at
+/// `oh264_gop_capacity_per_tier`), so a small-payload clip's tail GOPs cost
+/// ~plain-encode speed instead of a full stego encode.
+///
+/// MANDATORY reset: the streaming stego GOPs that precede the tail leave the
+/// OH264 fork's per-session scratch state dirty (the stego path resets at its
+/// entry — openh264_stego.rs:509 — but `encode_once` does NOT self-reset the
+/// fork statics). Without this reset the first plain GOP would inherit the last
+/// stego GOP's fork state (#548 class: two sequential calls sharing fork state
+/// → spurious diffs). Reset here so every plain GOP encodes from a clean
+/// session, exactly like the stego path.
+#[cfg(feature = "openh264-backend")]
+pub(crate) fn oh264_plain_encode_gop(
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+) -> Result<Vec<u8>, StegoError> {
+    unsafe { core_openh264_sys::phasm_reset_encoder_session_state() };
+    let mb_width = width / 16;
+    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    encode_once(
+        gop_yuv, width, height, n_frames, opts,
+        empty_map, mb_type_table, applied,
+        mb_width, mb_per_frame,
+        /* dual_recon = */ false,
+        PassMode::Passthrough,
+        None,
+        None,
+        None,
+    )
 }
 
 fn encode_once(

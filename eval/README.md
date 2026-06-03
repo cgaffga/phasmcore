@@ -277,6 +277,26 @@ Aletheia ships only the **A** variant of SRNet S-UNIWARD (no B variant for the e
 
 The 3-path approach also kicks off a wider thread: empirically documenting whether real published steganalysis tools flag Phasm output. We log every detector we run against (CNN or feature-based, modern or legacy) into `runs/<datestamp>-<detector-slug>/RESULTS.md` so the table grows over time. Honest reporting both ways — what flagged us and what didn't.
 
+### JIN-pretrained EfficientNet — reviewer "why not JIN?" follow-up (2026-06-03)
+
+Patrick Bas's review asked why the complementary deep detector uses **vanilla ImageNet** pretraining rather than **JIN** (J-UNIWARD-ImageNet steganalysis pretraining; Butora, Yousfi & Fridrich, *"How to Pretrain for Steganalysis"*, IH&MMSec 2021) — the SOTA recipe, with the largest gains at the low payloads where Ghost operates. We built a JIN corpus (50k ImageNet → 256² grayscale QF75 covers + luminance J-UNIWARD @ U[0.4,0.6] bpnzAC stego), trained a JIN-pretrained EfficientNet-B0 at two scales, fine-tuned each on BOSSbase J-UNI@0.20 (40ep, matching the ImageNet-pretrained E15 baseline exactly — only the init differs), then re-ran the shadow-PE-vs-N curve.
+
+| stage | metric | Tier 1 tracer (20k/5ep) | **Tier 2 (50k/15ep)** |
+|---|---|---|---|
+| JIN backbone | test P_E on JIN task (detect J-UNI@[0.4,0.6] on ImageNet) | 0.34 | **0.32** ← stronger |
+| → fine-tune | test P_E on J-UNI@0.20 (BOSSbase, training dist.) | 0.38 | 0.38 |
+| → Phasm Ghost | **N=0 shadow-PE** | **0.500** | **0.487** |
+
+**Shadow-PE vs N** (P_E; 0.5 = chance; universal subset, n=40, SE ±0.056):
+
+| detector (40-ep fine-tune on J-UNI@0.20) | N=0 | N=1 | N=2 | N=3 | N=4 |
+|---|---|---|---|---|---|
+| **IN**-pretrained baseline (E15) | 0.488 | 0.500 | 0.475 | 0.475 | 0.488 |
+| **JIN** tracer (backbone 0.34) | 0.500 | 0.500 | 0.487 | 0.475 | 0.463 |
+| **JIN** Tier 2 (backbone 0.32) | 0.487 | 0.475 | 0.463 | 0.487 | 0.475 |
+
+**Headline: a properly-trained JIN-pretrained EfficientNet is still blind to Phasm Ghost.** The Tier 2 backbone is a competent J-UNIWARD detector (JIN-task P_E 0.32, learns J-UNI@0.20 on fine-tune) yet sits at chance on Phasm (N=0 P_E 0.487), flat across N — same as the ImageNet-pretrained EffNet baseline. Steganalysis-specific pretraining does **not** transfer EfficientNet to Phasm's ~0.19-bpnzAC regime *regardless of pretrain strength*; the blocker is EfficientNet's cross-stego transfer, not the pretrain recipe. This closes the "undercooked pretrain" objection. The from-scratch SRNet@0.20 (Phase 3 above) remains the only detector that sees Phasm + shows the shadow wash-out (Δ −0.119). **Net: the deniability claim does not depend on the EffNet's pretraining recipe — this strengthens §6.3/§7.** Full write-ups (reproduce commands + new code `prep/generate_jin_pretrain.py`, `detectors/train_efficientnet.py --init {imagenet,checkpoint}`) in `runs/2026-06-03-jin-shadow-pe-curve/RESULTS.md` (tracer) and `runs/2026-06-03-jin-T2-shadow-pe-curve/RESULTS.md` (Tier 2).
+
 ## Stack (decisions confirmed 2026-05-10)
 
 | Choice | Decision |

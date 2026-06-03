@@ -178,7 +178,7 @@ fn diag_run(n_frames: u32, gop: u32) {
         ).map(|i| i.primary_max_message_bytes).unwrap_or(0);
 
         let oh264 = h264_stego_capacity_4domain_oh264(
-            &yuv, W, H, n_frames as usize, opts,
+            &yuv, W, H, n_frames as usize, opts, false,
         ).map(|i| i.primary_max_message_bytes).unwrap_or(0);
 
         let measured = measured_max_msg(&yuv, W, H, n_frames, gop, pure_rust);

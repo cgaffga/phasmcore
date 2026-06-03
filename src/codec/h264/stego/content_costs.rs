@@ -63,7 +63,12 @@
 //! Per-frame wavelet decomposition is ~32 MB at 1080p. Module
 //! processes one frame at a time and drops the wavelet buffers before
 //! moving to the next, keeping peak memory at ~32 MB regardless of
-//! `n_frames`.
+//! `n_frames`. #809 parallelizes the wavelet *internally* (rows/cols in
+//! [`crate::stego::cost::h264_uniward::compute_three_subbands`]) rather
+//! than across frames, so this ~32 MB peak is preserved while still
+//! using all cores (the convolution's per-row parallelism saturates
+//! them on its own — frame-level concurrency would only add
+//! `cores × 32 MB` for no throughput gain).
 
 use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, PositionKey, SyntaxPath};

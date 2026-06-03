@@ -13,6 +13,7 @@
 //! for the architectural decisions A1–A7 and overall design,
 //! and `cabac-bypass-bin-stego.md` for the bin-by-bin invariant proofs.
 
+pub mod capacity_estimator;
 pub mod cascade_safety;
 pub mod chunk_frame;
 pub mod content_costs;

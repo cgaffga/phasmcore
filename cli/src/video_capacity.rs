@@ -146,6 +146,7 @@ fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
         let opts = EncodeOpts { qp: 26, intra_period: gop_size as i32 };
         h264_stego_capacity_4domain_oh264(
             &yuv, probe.width, probe.height, probe.n_frames, opts,
+            /* full_tiers — CLI shows the per-tier breakdown */ true,
         )
         .map_err(CliError::from)?
     };

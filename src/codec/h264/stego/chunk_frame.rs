@@ -38,12 +38,17 @@
 //!
 //! The `u16`→`u32` escape mirrors the outer frame's v1/v2 length idiom
 //! (`stego::frame`). The sentinel is **`0xFFFF`, not `0x0000`**: empty
-//! chunks (`payload_len = 0`) are routine — a long video produces more
-//! GOPs than a short message has bytes, padding the tail with empty
-//! chunks — so `0` must stay a valid inline value. `0xFFFF`
-//! unconditionally means "a u32 follows" (no peek-disambiguation); the
-//! only cost is that a chunk of *exactly* 65535 bytes uses the extended
-//! form.
+//! chunks (`payload_len = 0`) are routine — so `0` must stay a valid
+//! inline value. `0xFFFF` unconditionally means "a u32 follows" (no
+//! peek-disambiguation); the only cost is that a chunk of *exactly* 65535
+//! bytes uses the extended form.
+//!
+//! Tail handling: under the CAP2.3 concentrate+tail allocator the message
+//! occupies GOPs `[0, W)` and `total_chunks = W < n_gops`; the `[W, n_gops)`
+//! tail is emitted as PLAIN GOPs (no chunk at all) and the decoder stops at
+//! `W`. (The no-plan / pre-protocol path instead pads the tail with
+//! empty-payload chunks and `total_chunks = n_gops` — hence empty chunks
+//! staying routine.)
 //!
 //! ## Why chunks
 //!
@@ -86,6 +91,19 @@ pub const LEN_SENTINEL: u16 = 0xFFFF;
 /// 16-bit total. Practical limit for v1.0: a 2-hour 4K video at
 /// GOP=30 is ~7200 GOPs — well within u16.
 pub const MAX_CHUNKS: u16 = u16::MAX;
+
+/// CAP2.3 §7 — default per-GOP soft rate ceiling for the concentrate+tail
+/// allocator (`allocate_chunks_concentrate_tail`). **Provisional, NOT yet
+/// calibrated** — the real value is set in CAP2.4 (#806) by sweeping per-GOP
+/// embedding rate vs. an ML steganalysis detector and picking chance+margin.
+///
+/// 0.5 (vs the absolute-max 1.0) is the conservative interim: it fills each
+/// stego GOP to ~half its probed cap, which (a) leaves headroom so a verify
+/// shrink-carry stays inside the stego window instead of overflowing into the
+/// plain tail (→ graceful `MessageTooLarge` rather than a wider window), and
+/// (b) is stealth-leaning per the 2026-06-01 product decision. A future `fast`
+/// opt-in raises it (tighter window, more perf, higher rate).
+pub const CAP2_DEFAULT_R_TARGET: f64 = 0.5;
 
 /// Build the on-wire bytes for one chunk.
 ///
@@ -221,6 +239,174 @@ pub fn split_message_into_chunks(
     Ok(out)
 }
 
+/// CAP2.2 §4 — **rate-bounded proportional** chunk allocation (the carry-free
+/// successor to `split_message_into_chunks`' even-split).
+///
+/// Given each GOP's accurate byte capacity (`gop_caps`, from the §5 STC-trial /
+/// the v3 estimator) and the message length, return the per-GOP byte counts.
+/// Two properties the even-split lacks:
+///
+/// - **Achieves Σ, doesn't bind on `min`.** `alloc[i] = ⌊M·basis[i]/Σbasis⌋`;
+///   since the basis is per-GOP (capacity or rate-target), no GOP is asked to
+///   hold more than it can — a weak GOP simply takes less. The binding limit is
+///   `M ≤ Σ cap`, not `n_gops × min cap` (so `None` ⇔ genuinely over capacity).
+///   This is why proportional needs **no carry**: with `M ≤ Σcap`, `M/Σ ≤ 1`,
+///   so `alloc[i] ≤ cap[i]` automatically.
+/// - **Rate-bounded for stealth (`r_target`).** Each GOP is first capped at
+///   `⌊r_target·cap⌋` so a sub-capacity message spreads thin (low flip density).
+///   **Soft ceiling:** a message larger than `r_target·Σcap` falls back to the
+///   full-capacity basis — graceful stealth degradation exactly where stealth is
+///   already compromised (near the absolute max).
+///
+/// The leftover from integer rounding is distributed by the **largest-remainder
+/// method** (respecting each GOP's true cap), so `Σ alloc == message_len` exactly
+/// and the split is deterministic. Returns `None` iff `message_len > Σ cap`.
+///
+/// NOTE (§14 gate): this fills high-capacity GOPs nearer their STC budget than
+/// the even-split did. Wiring it into the encoder must be gated on a round-trip
+/// re-verification at these higher per-GOP fills (the cascade-decode ceiling,
+/// CASCADE.V2) — the allocator math here is encoder-independent and side-effect
+/// free.
+pub fn allocate_chunks_proportional(
+    gop_caps: &[usize],
+    message_len: usize,
+    r_target: f64,
+) -> Option<Vec<usize>> {
+    let n = gop_caps.len();
+    if n == 0 {
+        return (message_len == 0).then(Vec::new);
+    }
+    if message_len == 0 {
+        return Some(vec![0; n]);
+    }
+    let sigma_cap: usize = gop_caps.iter().sum();
+    if message_len > sigma_cap {
+        return None; // genuinely over the Σ ceiling
+    }
+
+    // Rate-bounded per-GOP targets (stealth). Soft ceiling: if the message
+    // doesn't fit under the rate target, widen the basis to full capacity.
+    let r = r_target.clamp(0.0, 1.0);
+    let targets: Vec<usize> = gop_caps.iter().map(|&c| (r * c as f64) as usize).collect();
+    let sigma_target: usize = targets.iter().sum();
+    let use_targets = sigma_target > 0 && message_len <= sigma_target;
+    let basis: &[usize] = if use_targets { &targets } else { gop_caps };
+    let sigma_basis: usize = basis.iter().sum();
+    if sigma_basis == 0 {
+        return None;
+    }
+
+    // Floor proportional + fractional remainders (u128 to avoid overflow on
+    // long clips).
+    let mut alloc = vec![0usize; n];
+    let mut frac = vec![0u128; n];
+    let mut assigned = 0usize;
+    for i in 0..n {
+        let num = (message_len as u128) * (basis[i] as u128);
+        alloc[i] = (num / sigma_basis as u128) as usize;
+        frac[i] = num % sigma_basis as u128;
+        assigned += alloc[i];
+    }
+
+    // Largest-remainder: hand the leftover bytes to the highest fractional
+    // remainders first, but never past a GOP's TRUE capacity.
+    let mut leftover = message_len - assigned;
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| frac[b].cmp(&frac[a]).then(a.cmp(&b)));
+    for &i in order.iter().cycle().take(n * 2) {
+        if leftover == 0 {
+            break;
+        }
+        if alloc[i] < gop_caps[i] {
+            alloc[i] += 1;
+            leftover -= 1;
+        }
+    }
+    // Final sweep in case the remainder basis was tight (targets near cap): fill
+    // any remaining bytes wherever capacity is left. Guaranteed to drain since
+    // message_len ≤ Σcap.
+    if leftover > 0 {
+        for i in 0..n {
+            while leftover > 0 && alloc[i] < gop_caps[i] {
+                alloc[i] += 1;
+                leftover -= 1;
+            }
+        }
+    }
+    debug_assert_eq!(leftover, 0, "leftover must drain when message_len ≤ Σcap");
+    Some(alloc)
+}
+
+/// CAP2.3 §4 — rate-bounded **concentrate + plain-tail** allocation. Unlike
+/// [`allocate_chunks_proportional`] (which spreads the message uniformly over
+/// *all* GOPs, so `r_target` cancels in the proportions and is inert), this
+/// fills GOPs **sequentially** to `min(remaining, ⌊r_target·cap⌋)` and stops
+/// once the message is exhausted — leaving a **plain tail** of zero-allocation
+/// GOPs. `r_target` is therefore *functional* here: it is the per-GOP rate
+/// ceiling, so a lower `r_target` forces the message across MORE leading GOPs
+/// at LOWER density (a wider stego window, a shorter plain tail).
+///
+/// Returns `(plan, window)` where `plan[i]` is GOP `i`'s byte count
+/// (`plan[window..]` are all 0) and `window = W` is the count of leading stego
+/// GOPs. `Σ plan == message_len` exactly.
+///
+/// **Soft ceiling:** if `message_len > Σ⌊r·cap⌋` (a large message near the
+/// absolute max), the per-GOP cap widens to the FULL `cap[i]` — graceful
+/// stealth degradation exactly where stealth is already compromised. Returns
+/// `None` iff `message_len > Σ cap` (genuinely over capacity).
+///
+/// Pure integer arithmetic except the per-element `(r·cap).floor()` cast (same
+/// deterministic pattern as `allocate_chunks_proportional`); cross-platform safe.
+pub fn allocate_chunks_concentrate_tail(
+    gop_caps: &[usize],
+    message_len: usize,
+    r_target: f64,
+) -> Option<(Vec<usize>, usize)> {
+    let n = gop_caps.len();
+    if n == 0 {
+        return (message_len == 0).then(|| (Vec::new(), 0));
+    }
+    if message_len == 0 {
+        return Some((vec![0; n], 0));
+    }
+    let sigma_cap: usize = gop_caps.iter().sum();
+    if message_len > sigma_cap {
+        return None; // genuinely over the Σ ceiling
+    }
+
+    // Per-GOP rate ceiling ⌊r·cap⌋. Soft ceiling: if the message doesn't fit
+    // under Σ⌊r·cap⌋, widen every GOP's cap to its FULL capacity.
+    let r = r_target.clamp(0.0, 1.0);
+    let ceiled: Vec<usize> = gop_caps
+        .iter()
+        .map(|&c| ((r * c as f64) as usize).min(c))
+        .collect();
+    let sigma_ceiled: usize = ceiled.iter().sum();
+    let use_full = message_len > sigma_ceiled;
+
+    // Sequential fill: each GOP takes up to its effective cap; the rest are
+    // plain. `window` is the index after the last GOP that took any bytes.
+    let mut plan = vec![0usize; n];
+    let mut remaining = message_len;
+    let mut window = 0usize;
+    for i in 0..n {
+        if remaining == 0 {
+            break;
+        }
+        let cap_i = if use_full { gop_caps[i] } else { ceiled[i] };
+        let take = remaining.min(cap_i);
+        plan[i] = take;
+        remaining -= take;
+        if take > 0 {
+            window = i + 1;
+        }
+    }
+    // Guaranteed to drain: under the rate branch Σ⌊r·cap⌋ ≥ message_len; under
+    // the soft-ceiling branch Σcap ≥ message_len.
+    debug_assert_eq!(remaining, 0, "concentrate fill must drain when message_len ≤ basis sum");
+    Some((plan, window))
+}
+
 /// Reassemble parsed chunks into the original message bytes.
 /// Input: vector of `(chunk_index, payload)` pairs collected from
 /// per-GOP decode passes. Caller has already validated that
@@ -254,6 +440,149 @@ pub fn assemble_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- CAP2.2 allocate_chunks_proportional ----
+
+    #[test]
+    fn alloc_sums_to_message_and_respects_caps() {
+        let caps = [100usize, 200, 50, 300, 10];
+        for &m in &[0usize, 1, 37, 200, 659, 660] {
+            let a = allocate_chunks_proportional(&caps, m, 1.0).expect("fits");
+            assert_eq!(a.iter().sum::<usize>(), m, "Σ alloc == message (m={m})");
+            for (i, (&got, &cap)) in a.iter().zip(caps.iter()).enumerate() {
+                assert!(got <= cap, "alloc[{i}]={got} > cap {cap} (m={m})");
+            }
+        }
+    }
+
+    #[test]
+    fn alloc_none_over_sigma_capacity() {
+        let caps = [100usize, 200, 50, 300, 10]; // Σ = 660
+        assert!(allocate_chunks_proportional(&caps, 661, 1.0).is_none());
+        assert!(allocate_chunks_proportional(&caps, 660, 1.0).is_some());
+    }
+
+    #[test]
+    fn alloc_does_not_bind_on_min_gop() {
+        // Even-split would bind on the weak GOP (10) → n×min = 5×10 = 50.
+        // Proportional achieves the full Σ = 660. A 600 B message must fit.
+        let caps = [100usize, 200, 50, 300, 10];
+        let a = allocate_chunks_proportional(&caps, 600, 1.0).expect("Σ fits");
+        assert_eq!(a.iter().sum::<usize>(), 600);
+        // The weak GOP takes proportionally less, not an equal 120.
+        assert!(a[4] <= caps[4], "weak GOP within its cap");
+        assert!(a[3] > a[4], "strong GOP carries more than the weak one");
+    }
+
+    #[test]
+    fn alloc_is_proportional_to_capacity() {
+        // Equal caps → ~equal split. 100 over 4×100 → 25 each.
+        let a = allocate_chunks_proportional(&[100, 100, 100, 100], 100, 1.0).unwrap();
+        assert_eq!(a, vec![25, 25, 25, 25]);
+        // 2:1 cap ratio → ~2:1 allocation.
+        let a = allocate_chunks_proportional(&[200, 100], 150, 1.0).unwrap();
+        assert_eq!(a.iter().sum::<usize>(), 150);
+        assert!(a[0] > a[1], "larger-cap GOP gets more ({a:?})");
+    }
+
+    #[test]
+    fn alloc_rate_target_spreads_thin_then_soft_ceiling() {
+        let caps = [1000usize; 4]; // Σcap = 4000, Σ(0.25·cap) = 1000
+        // Small message under the rate target: stays within ⌊0.25·cap⌋ = 250.
+        let a = allocate_chunks_proportional(&caps, 400, 0.25).unwrap();
+        assert_eq!(a.iter().sum::<usize>(), 400);
+        assert!(a.iter().all(|&x| x <= 250), "within rate target: {a:?}");
+        // Message above the rate target → soft-ceiling to full-cap basis.
+        let a = allocate_chunks_proportional(&caps, 2000, 0.25).unwrap();
+        assert_eq!(a.iter().sum::<usize>(), 2000);
+        assert!(a.iter().any(|&x| x > 250), "soft ceiling widened the basis: {a:?}");
+    }
+
+    #[test]
+    fn alloc_edge_cases() {
+        assert_eq!(allocate_chunks_proportional(&[], 0, 1.0), Some(vec![]));
+        assert_eq!(allocate_chunks_proportional(&[], 5, 1.0), None);
+        assert_eq!(allocate_chunks_proportional(&[100, 100], 0, 1.0), Some(vec![0, 0]));
+        // A zero-cap GOP never receives bytes.
+        let a = allocate_chunks_proportional(&[0, 100], 50, 1.0).unwrap();
+        assert_eq!(a, vec![0, 50]);
+    }
+
+    // ── CAP2.3 §4 concentrate+tail allocator ────────────────────────────
+
+    #[test]
+    fn concentrate_fills_then_tails() {
+        // r=1.0: fill each GOP to its full cap, sequentially, then plain tail.
+        let caps = [100usize, 200, 50, 300, 10];
+        let (plan, w) = allocate_chunks_concentrate_tail(&caps, 120, 1.0).unwrap();
+        assert_eq!(plan, vec![100, 20, 0, 0, 0]);
+        assert_eq!(w, 2);
+        assert_eq!(plan.iter().sum::<usize>(), 120);
+    }
+
+    #[test]
+    fn concentrate_window_is_count_of_stego_gops() {
+        let caps = [100usize, 200, 50, 300, 10];
+        for m in [1usize, 99, 100, 101, 300, 660] {
+            let (plan, w) = allocate_chunks_concentrate_tail(&caps, m, 1.0).unwrap();
+            // window == index after the last nonzero entry, and the tail is all 0.
+            let expected_w = plan.iter().rposition(|&x| x > 0).map_or(0, |p| p + 1);
+            assert_eq!(w, expected_w, "m={m} plan={plan:?}");
+            assert!(plan[w..].iter().all(|&x| x == 0), "tail not plain: {plan:?}");
+            assert_eq!(plan.iter().sum::<usize>(), m);
+        }
+    }
+
+    #[test]
+    fn concentrate_r_target_widens_window() {
+        // THE functional-r_target test: lower r ⇒ each GOP capped lower ⇒
+        // message spreads across MORE leading GOPs (wider window).
+        let caps = [1000usize; 4];
+        let (plan_hi, w_hi) = allocate_chunks_concentrate_tail(&caps, 400, 1.0).unwrap();
+        assert_eq!(plan_hi, vec![400, 0, 0, 0]);
+        assert_eq!(w_hi, 1);
+        let (plan_lo, w_lo) = allocate_chunks_concentrate_tail(&caps, 400, 0.25).unwrap();
+        // ⌊0.25·1000⌋ = 250 per GOP → 250 + 150.
+        assert_eq!(plan_lo, vec![250, 150, 0, 0]);
+        assert_eq!(w_lo, 2);
+        assert!(w_lo > w_hi, "lower r_target must widen the stego window");
+        assert!(plan_lo.iter().all(|&x| x <= 250), "rate-capped: {plan_lo:?}");
+    }
+
+    #[test]
+    fn concentrate_soft_ceiling() {
+        // Message above Σ⌊r·cap⌋ widens to full caps (graceful degradation).
+        let caps = [1000usize; 4]; // Σ⌊0.25·cap⌋ = 1000
+        let (plan, w) = allocate_chunks_concentrate_tail(&caps, 2000, 0.25).unwrap();
+        assert_eq!(plan, vec![1000, 1000, 0, 0]);
+        assert_eq!(w, 2);
+        assert_eq!(plan.iter().sum::<usize>(), 2000);
+    }
+
+    #[test]
+    fn concentrate_none_over_sigma() {
+        let caps = [100usize, 200, 50];
+        assert_eq!(allocate_chunks_concentrate_tail(&caps, 351, 1.0), None);
+        // exactly Σcap fits (fills everything, window == n).
+        let (plan, w) = allocate_chunks_concentrate_tail(&caps, 350, 1.0).unwrap();
+        assert_eq!(plan, vec![100, 200, 50]);
+        assert_eq!(w, 3);
+    }
+
+    #[test]
+    fn concentrate_edge_cases() {
+        assert_eq!(allocate_chunks_concentrate_tail(&[], 0, 1.0), Some((vec![], 0)));
+        assert_eq!(allocate_chunks_concentrate_tail(&[], 5, 1.0), None);
+        assert_eq!(
+            allocate_chunks_concentrate_tail(&[100, 100], 0, 1.0),
+            Some((vec![0, 0], 0))
+        );
+        // A leading zero-cap GOP is skipped; window starts at the first GOP
+        // that actually takes bytes.
+        let (plan, w) = allocate_chunks_concentrate_tail(&[0, 100], 50, 1.0).unwrap();
+        assert_eq!(plan, vec![0, 50]);
+        assert_eq!(w, 2);
+    }
 
     #[test]
     fn header_constants_match_wire_layout() {

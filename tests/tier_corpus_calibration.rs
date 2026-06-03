@@ -236,7 +236,7 @@ fn run_tier_sweep(w: u32, h: u32, n_frames: u32, gop: u32, msg: &str, pass: &str
         // is why the old table showed a 9247-byte cap next to an
         // encode-fail. qp/intra_period mirror the encode params below.
         let cap_opts = EncodeOpts { qp: 26, intra_period: GOP as i32 };
-        let capacities = match h264_stego_capacity_4domain_oh264(&yuv, W, H, N as usize, cap_opts) {
+        let capacities = match h264_stego_capacity_4domain_oh264(&yuv, W, H, N as usize, cap_opts, /* full_tiers */ true) {
             Ok(info) => info.per_tier_primary_max_message_bytes,
             Err(_) => [0; 5],
         };

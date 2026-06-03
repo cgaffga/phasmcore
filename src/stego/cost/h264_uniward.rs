@@ -115,23 +115,39 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
     let mut row_high = vec![0.0f32; padded_w * height];
     let lp = lpdf();
 
-    for y in 0..height {
+    // #809 — each output row is independent: disjoint write into
+    // row_low/row_high, and the inner k-sum stays serial. Parallelize over
+    // rows under `parallel`. Result is BIT-IDENTICAL to serial (no reduction
+    // is reordered) and adds NO allocation, so the module's documented
+    // ~32 MB-per-frame peak is preserved.
+    let fill_row = |y: usize, low_row: &mut [f32], high_row: &mut [f32]| {
         for out_x in 0..padded_w {
             let mut sum_low = 0.0f64;
             let mut sum_high = 0.0f64;
             for k in 0..FILT_LEN {
-                let _src_x = out_x as isize + k as isize - (2 * pad as isize) + pad as isize;
-                // src_x = out_x - pad + k  (simplified)
+                // src_x = out_x - pad + k
                 let src_x = out_x as isize - pad as isize + k as isize;
                 let clamped = symmetric_reflect(src_x, width as isize);
                 let v = y_plane[y * width + clamped as usize] as f64;
                 sum_low += lp[k] * v;
                 sum_high += HPDF[k] * v;
             }
-            row_low[y * padded_w + out_x] = sum_low as f32;
-            row_high[y * padded_w + out_x] = sum_high as f32;
+            low_row[out_x] = sum_low as f32;
+            high_row[out_x] = sum_high as f32;
         }
-    }
+    };
+    #[cfg(feature = "parallel")]
+    row_low
+        .par_chunks_mut(padded_w)
+        .zip(row_high.par_chunks_mut(padded_w))
+        .enumerate()
+        .for_each(|(y, (low_row, high_row))| fill_row(y, low_row, high_row));
+    #[cfg(not(feature = "parallel"))]
+    row_low
+        .chunks_mut(padded_w)
+        .zip(row_high.chunks_mut(padded_w))
+        .enumerate()
+        .for_each(|(y, (low_row, high_row))| fill_row(y, low_row, high_row));
 
     // Column-filter the row-filtered buffers to produce LH, HL, HH subbands.
     // Each subband is `padded_w × padded_h` with `pad` reflection on all four sides.
@@ -139,25 +155,45 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
     let mut hl = vec![0.0f32; padded_w * padded_h];
     let mut hh = vec![0.0f32; padded_w * padded_h];
 
-    for out_y in 0..padded_h {
-        for x in 0..padded_w {
-            let mut sum_lh = 0.0f64; // row_low  → high-pass col
-            let mut sum_hl = 0.0f64; // row_high → low-pass col
-            let mut sum_hh = 0.0f64; // row_high → high-pass col
-            for k in 0..FILT_LEN {
-                let src_y = out_y as isize - pad as isize + k as isize;
-                let clamped = symmetric_reflect(src_y, height as isize);
-                let low_val = row_low[clamped as usize * padded_w + x] as f64;
-                let high_val = row_high[clamped as usize * padded_w + x] as f64;
-                sum_lh += HPDF[k] * low_val;
-                sum_hl += lp[k] * high_val;
-                sum_hh += HPDF[k] * high_val;
+    // #809 — same structure: each output row is independent and reads the
+    // now read-only row_low/row_high. Parallelize over rows; bit-identical,
+    // no extra allocation.
+    let fill_col =
+        |out_y: usize, lh_row: &mut [f32], hl_row: &mut [f32], hh_row: &mut [f32]| {
+            for x in 0..padded_w {
+                let mut sum_lh = 0.0f64; // row_low  → high-pass col
+                let mut sum_hl = 0.0f64; // row_high → low-pass col
+                let mut sum_hh = 0.0f64; // row_high → high-pass col
+                for k in 0..FILT_LEN {
+                    let src_y = out_y as isize - pad as isize + k as isize;
+                    let clamped = symmetric_reflect(src_y, height as isize);
+                    let low_val = row_low[clamped as usize * padded_w + x] as f64;
+                    let high_val = row_high[clamped as usize * padded_w + x] as f64;
+                    sum_lh += HPDF[k] * low_val;
+                    sum_hl += lp[k] * high_val;
+                    sum_hh += HPDF[k] * high_val;
+                }
+                lh_row[x] = sum_lh as f32;
+                hl_row[x] = sum_hl as f32;
+                hh_row[x] = sum_hh as f32;
             }
-            lh[out_y * padded_w + x] = sum_lh as f32;
-            hl[out_y * padded_w + x] = sum_hl as f32;
-            hh[out_y * padded_w + x] = sum_hh as f32;
-        }
-    }
+        };
+    #[cfg(feature = "parallel")]
+    lh.par_chunks_mut(padded_w)
+        .zip(hl.par_chunks_mut(padded_w))
+        .zip(hh.par_chunks_mut(padded_w))
+        .enumerate()
+        .for_each(|(out_y, ((lh_row, hl_row), hh_row))| {
+            fill_col(out_y, lh_row, hl_row, hh_row)
+        });
+    #[cfg(not(feature = "parallel"))]
+    lh.chunks_mut(padded_w)
+        .zip(hl.chunks_mut(padded_w))
+        .zip(hh.chunks_mut(padded_w))
+        .enumerate()
+        .for_each(|(out_y, ((lh_row, hl_row), hh_row))| {
+            fill_col(out_y, lh_row, hl_row, hh_row)
+        });
 
     ThreeSubbands {
         lh,

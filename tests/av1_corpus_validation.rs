@@ -206,10 +206,22 @@ fn run_corpus_roundtrip(spec: &Fixture, message: &[u8], passphrase: &str) -> Cor
     let stego_packet = av1_stego_embed(natural_packet.clone(), recording, message, passphrase)
         .unwrap_or_else(|e| panic!("av1_stego_embed failed for {}: {:?}", spec.name, e));
     let embed_ms = t1.elapsed().as_millis();
-    assert_eq!(
+    // Orchestrator contract (commit c921f856): stego length == natural
+    // length on the fast path; ±1 byte on the rare range-coder
+    // trailing-carry case (handled via `rebuild_obu_with_stego_tile_
+    // group`). Both are valid stego packets that round-trip cleanly.
+    // Assert the tolerance, not exact equality, so changes to cost-
+    // function determinism (e.g., B.3.1 det_cos pivot) that nudge the
+    // STC plan into the rebuild path don't false-fire here.
+    let length_delta = (stego_packet.len() as i64 - natural_bytes as i64).abs();
+    assert!(
+        length_delta <= 1,
+        "{}: stego packet length must be natural ±1 byte (orchestrator contract per c921f856 \
+         TileGroupSize rebuild path); got stego {} vs natural {} (delta {})",
+        spec.name,
         stego_packet.len(),
         natural_bytes,
-        "stego packet length must equal natural packet length"
+        length_delta
     );
 
     let t2 = Instant::now();

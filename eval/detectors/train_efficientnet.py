@@ -103,12 +103,22 @@ def split_by_name_hash(names: list[str], n_train: int, n_val: int, n_test: int) 
 # ---------------------------------------------------------------------------
 # Model — torchvision EfficientNet-B0 with 2-class head
 # ---------------------------------------------------------------------------
-def build_model(device: torch.device) -> nn.Module:
-    weights = EfficientNet_B0_Weights.DEFAULT  # IMAGENET1K_V1
+def build_model(device: torch.device, init: str = "imagenet",
+                init_ckpt: Path | None = None) -> nn.Module:
+    # init="imagenet": torchvision IMAGENET1K_V1 classification weights — the
+    #   default every E15/E17 run used. init="checkpoint": start from a prior
+    #   steganalysis-trained backbone (e.g. the JIN-pretrained EffNet) — the
+    #   stronger-pretraining detector for the "why not JIN?" review point.
+    weights = EfficientNet_B0_Weights.DEFAULT if init == "imagenet" else None
     model = efficientnet_b0(weights=weights)
     # Replace 1000-class head with binary classifier.
     in_features = model.classifier[1].in_features
     model.classifier[1] = nn.Linear(in_features, 2)
+    if init == "checkpoint":
+        if init_ckpt is None:
+            raise ValueError("--init checkpoint requires --init-ckpt")
+        state = torch.load(init_ckpt, map_location="cpu", weights_only=True)
+        model.load_state_dict(state["model"])
     return model.to(device)
 
 
@@ -152,11 +162,16 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
 
 
 def train_one_seed(args, device: torch.device, run_dir: Path) -> dict:
-    cover_dir = ROOT / "data" / "bossbase" / f"jpeg_qf{args.quality}"
-    stego_dir = (
-        ROOT / "data" / "stego" / "juniward"
-        / f"qf{args.quality}" / f"payload_{int(round(args.payload * 100)):03d}"
-    )
+    if args.cover_dir and args.stego_dir:
+        # Explicit dirs (e.g. the JIN pretraining corpus data/jin/{covers,stego}/qf75).
+        cover_dir = Path(args.cover_dir)
+        stego_dir = Path(args.stego_dir)
+    else:
+        cover_dir = ROOT / "data" / "bossbase" / f"jpeg_qf{args.quality}"
+        stego_dir = (
+            ROOT / "data" / "stego" / "juniward"
+            / f"qf{args.quality}" / f"payload_{int(round(args.payload * 100)):03d}"
+        )
 
     if not cover_dir.exists():
         raise FileNotFoundError(f"covers not found: {cover_dir}")
@@ -186,7 +201,7 @@ def train_one_seed(args, device: torch.device, run_dir: Path) -> dict:
         batch_size=args.batch_size, shuffle=False, num_workers=0,
     )
 
-    model = build_model(device)
+    model = build_model(device, args.init, args.init_ckpt)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[train_effnet] EfficientNet-B0 (ImageNet pretrained) params: {n_params:,}")
 
@@ -254,7 +269,15 @@ def train_one_seed(args, device: torch.device, run_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--payload", type=float, required=True, help="bpnzAC payload rate")
+    p.add_argument("--payload", type=float, default=None,
+                   help="bpnzAC payload rate (BOSSbase path; omit when using --cover-dir/--stego-dir)")
+    p.add_argument("--cover-dir", type=str, default=None,
+                   help="override cover dir, e.g. JIN: data/jin/covers/qf75")
+    p.add_argument("--stego-dir", type=str, default=None,
+                   help="override stego dir, e.g. JIN: data/jin/stego/qf75")
+    p.add_argument("--init", choices=["imagenet", "checkpoint"], default="imagenet",
+                   help="backbone init: imagenet (default, all E15/E17 runs) or checkpoint (JIN backbone via --init-ckpt)")
+    p.add_argument("--init-ckpt", type=Path, default=None, help="checkpoint .pt for --init checkpoint")
     p.add_argument("--quality", type=int, default=75)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--epochs", type=int, default=40)
