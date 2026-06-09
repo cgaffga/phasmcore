@@ -213,102 +213,6 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     map
 }
 
-/// Compute J-UNIWARD costs with progress tracking.
-///
-/// Identical to [`compute_uniward`] but reports [`UNIWARD_PROGRESS_STEPS`]
-/// progress steps and checks for cancellation between phases. Used by
-/// the Ghost decode path; capacity uses the plain version; encode uses
-/// `compute_positions_streaming`.
-///
-/// Progress is distributed across phases proportional to wall-clock time:
-/// - Phase 1 (pixel decompress): ~10% of steps
-/// - Phase 2 (wavelet subbands): ~30% of steps
-/// - Phase 3 (per-block costs): ~60% of steps
-pub fn compute_uniward_with_progress(grid: &DctGrid, qt: &QuantTable) -> Result<CostMap, StegoError> {
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
-    let mut map = CostMap::new(bw, bt);
-
-    let img_w = bw * 8;
-    let img_h = bt * 8;
-
-    // Phase allocation: 10% + 30% + 60% of UNIWARD_PROGRESS_STEPS.
-    let phase1_steps = UNIWARD_PROGRESS_STEPS / 10;       // ~10 steps
-    let phase2_steps = (UNIWARD_PROGRESS_STEPS * 3) / 10; // ~30 steps
-    // phase3 gets the remainder
-
-    // Phase 1: Decompress to pixels.
-    let cover_pixels = decompress_to_pixels(grid, qt, bw, bt);
-    for _ in 0..phase1_steps {
-        progress::advance();
-    }
-    progress::check_cancelled()?;
-
-    // Phase 2: Wavelet subbands.
-    let lpdf = lpdf();
-    let cover_wavelets = compute_three_subbands(&cover_pixels, img_w, img_h, &lpdf);
-    drop(cover_pixels);
-    for _ in 0..phase2_steps {
-        progress::advance();
-    }
-    progress::check_cancelled()?;
-
-    // Phase 3: |delta| precompute table (T3.3.A) + per-block cost.
-    let abs_delta = AbsDeltaTable::precompute(qt);
-    let _ = &lpdf; // table absorbs the lpdf dependency; legacy var no longer used here
-    let pad = FILT_LEN - 1;
-    let n_blocks = bt * bw;
-
-    let total_len = n_blocks * 64;
-    let costs_ptr = CostMapPtr { ptr: map.costs_ptr(), total_len };
-
-    let compute_block = |bi: usize| {
-        let br = bi / bw;
-        let bc = bi % bw;
-        let blk = grid.block(br, bc);
-
-        for fi in 0..8 {
-            for fj in 0..8 {
-                if fi == 0 && fj == 0 {
-                    continue;
-                }
-
-                let coeff = blk[fi * 8 + fj];
-                if coeff == 0 {
-                    continue;
-                }
-
-                let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                let cost = compute_coefficient_cost_precomputed(
-                    abs_lh, abs_hl, abs_hh,
-                    &cover_wavelets,
-                    br, bc,
-                    img_w, img_h,
-                    pad,
-                );
-
-                if cost > 0.0 && cost.is_finite() {
-                    let idx = (br * bw + bc) * 64 + fi * 8 + fj;
-                    unsafe { costs_ptr.write(idx, cost as f32); }
-                }
-            }
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    (0..n_blocks).into_par_iter().for_each(compute_block);
-
-    #[cfg(not(feature = "parallel"))]
-    (0..n_blocks).for_each(compute_block);
-
-    let phase3_steps = UNIWARD_PROGRESS_STEPS - phase1_steps - phase2_steps;
-    for _ in 0..phase3_steps {
-        progress::advance();
-    }
-
-    Ok(map)
-}
-
 /// Decompress the entire DctGrid to pixel values (f32).
 fn decompress_to_pixels(grid: &DctGrid, qt: &QuantTable, bw: usize, bt: usize) -> Vec<f32> {
     let img_w = bw * 8;
@@ -1997,7 +1901,7 @@ pub fn compute_positions_with_dirty_recost(
 /// Reports [`UNIWARD_PROGRESS_STEPS`] progress steps and checks for cancellation.
 ///
 /// If `si` is `Some`, applies SI-UNIWARD cost modulation inline during position
-/// collection (no separate `modulate_costs_si` pass needed).
+/// collection (no separate cost-modulation pass needed).
 pub fn compute_positions_streaming(
     grid: &DctGrid,
     qt: &QuantTable,

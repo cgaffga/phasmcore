@@ -19,17 +19,13 @@ pub mod uerd;
 pub mod uniward;
 mod uniward_simd;
 
-// HEVC-specific cost modules — archived behind `hevc-archive` feature.
-
-// H.264 (production) cost modules.
-#[cfg(feature = "video")]
-pub mod h264_cost;
+// H.264 OH264 Tier-3 cost primitives (J-UNIWARD subband decomposition +
+// per-position cost, consumed by `codec::h264::stego::content_costs`). The
+// legacy CAVLC cost modules (`h264_cost`, `h264_ddca`, `h264_mvd_cost`) were
+// removed with the CAVLC stego subsystem — see
+// `docs/design/video/_RETIREMENT-PLAN.md` § "Phase 4".
 #[cfg(feature = "video")]
 pub mod h264_uniward;
-#[cfg(feature = "video")]
-pub mod h264_ddca;
-#[cfg(feature = "video")]
-pub mod h264_mvd_cost;
 
 // AV1 cost module (Phase B.1.2). Gated on av1-encoder so it's
 // available whenever the encoder side is.

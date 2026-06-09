@@ -18,9 +18,9 @@
 //
 // #[ignore] by default — needs ffmpeg + gitignored corpus fixtures.
 // Run: PHASM_TIER_OVERRIDE=0 cargo test --test mode_b_cascade_diag \
-//        --features openh264-backend,cabac-stego --release -- --ignored --nocapture
+//        --features h264-encoder,cabac-stego --release -- --ignored --nocapture
 
-#![cfg(all(feature = "openh264-backend", feature = "cabac-stego"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingDecodeSession,

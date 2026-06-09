@@ -56,7 +56,7 @@
 //! product. Symmetrized so AUC ∈ [0.5, 1.0] regardless of axis
 //! direction.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

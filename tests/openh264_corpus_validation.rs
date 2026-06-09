@@ -16,14 +16,14 @@
 // 640×368×8 frames. Production variants are `#[ignore]` (1080p × 30).
 //
 // Run:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //       --test openh264_corpus_validation -- --ignored --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_decode_yuv_string, openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -140,21 +140,17 @@ fn mux_to_desktop(stego_bytes: &[u8], name: &str) -> PathBuf {
 }
 
 fn run_roundtrip(spec: &Fixture, msg: &str, pass: &str, render_demo: bool) {
-    let _g = session_guard().lock().unwrap();
+    let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
     let (w, h) = probe_aligned_dims(spec);
     let yuv = ensure_yuv(spec, w, h);
-    let opts = EncodeOpts { qp: spec.qp, intra_period: 60 };
 
     let t_enc = std::time::Instant::now();
-    let stego = openh264_stego_encode_yuv_text(
-        &yuv, w, h, spec.n_frames, opts, msg, pass,
-    )
-    .expect("oh264 stego encode");
+    let stego = oh264_stream::encode(&yuv, w, h, spec.n_frames, spec.qp, msg, pass)
+        .expect("oh264 stego encode");
     let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
 
     let t_dec = std::time::Instant::now();
-    let recovered =
-        openh264_stego_decode_yuv_string(&stego, pass).expect("oh264 stego decode");
+    let recovered = oh264_stream::decode_text(&stego, pass).expect("oh264 stego decode");
     let dec_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(recovered, msg, "round-trip message mismatch for {}", spec.name);
 

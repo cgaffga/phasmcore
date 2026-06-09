@@ -23,9 +23,12 @@
 // IDRs) and asserts every PPS NAL and every slice header carries
 // pps_id=0.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{openh264_stego_encode_yuv_text, EncodeOpts};
+mod common;
+use common::oh264_stream;
+
+use phasm_core::codec::h264::stego::CostWeights;
 
 fn make_yuv(w: usize, h: usize, n: usize) -> Vec<u8> {
     let y = w * h;
@@ -129,12 +132,17 @@ fn pps_constant_id_across_multi_gop() {
         std::env::set_var("PHASM_DETERMINISTIC_SEED", "42");
     }
     let yuv = make_yuv(480, 272, 8);
-    let stego = openh264_stego_encode_yuv_text(
+    // intra_period=2 → 4 GOPs over 8 frames → 4 IDRs, exercising PPS
+    // rotation. Thread it into gop_size so the streaming session emits
+    // an IDR every 2 frames (the property under test).
+    let stego = oh264_stream::encode_with(
         &yuv,
         480,
         272,
         8,
-        EncodeOpts { qp: 26, intra_period: 2 },
+        26,
+        /*gop_size=*/ 2,
+        CostWeights::default(),
         "verify pps fix",
         "passphrase",
     )

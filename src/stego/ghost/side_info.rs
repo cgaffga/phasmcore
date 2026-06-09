@@ -62,6 +62,11 @@ fn decode_error(val: i8) -> f32 {
 /// When |rounding_error| ~ 0.5 ("1/2-coefficients"), the modulated cost
 /// approaches zero. Clamping to this floor prevents zero-cost embedding
 /// at quantization midpoints, which is a known detectable artifact.
+///
+/// Test-only since the production SI-cost floor is applied inline in
+/// `compute_positions_streaming` (the standalone `modulate_costs_si`
+/// pass was retired in #840); the tests below still pin the formula.
+#[cfg(test)]
 const MIN_SI_COST: f32 = 1e-6;
 
 impl SideInfo {
@@ -200,62 +205,6 @@ fn rgb_to_luma_blocks_strip(
     blocks
 }
 
-/// Modulate J-UNIWARD costs using SI rounding errors.
-///
-/// For each AC coefficient with finite cost:
-/// - `modulated_cost = rho * (1 - 2|e|)` where `e` is the rounding error
-/// - Larger |e| -> lower cost (closer to quantization boundary -> cheaper to flip)
-/// - |e| = 0 -> cost unchanged (exactly on the integer -> no benefit)
-/// - |e| = 0.5 -> cost clamped to `MIN_SI_COST` (avoid zero-cost artifact)
-///
-/// Special cases:
-/// - DC coefficients remain WET (infinite cost)
-/// - |coeff| = 1 positions: cost is NOT modulated (anti-shrinkage forces
-///   the direction, so the rounding error doesn't help choose direction)
-pub fn modulate_costs_si(
-    cost_map: &mut crate::stego::cost::CostMap,
-    side_info: &SideInfo,
-    cover_grid: &DctGrid,
-) {
-    let bw = cost_map.blocks_wide();
-    let bh = cost_map.blocks_tall();
-
-    for br in 0..bh {
-        for bc in 0..bw {
-            let block_idx = br * bw + bc;
-            for i in 0..8 {
-                for j in 0..8 {
-                    // Skip DC
-                    if i == 0 && j == 0 {
-                        continue;
-                    }
-
-                    let cost = cost_map.get(br, bc, i, j);
-                    if !cost.is_finite() {
-                        continue; // WET position -- leave as-is
-                    }
-
-                    // Skip |coeff| == 1: anti-shrinkage forces direction,
-                    // SI modulation doesn't help
-                    let coeff = cover_grid.get(br, bc, i, j);
-                    if coeff.abs() == 1 {
-                        continue;
-                    }
-
-                    let flat_idx = block_idx * 64 + i * 8 + j;
-                    let error = side_info.error_at(flat_idx);
-                    let abs_error = error.abs();
-
-                    // modulated = rho * (1 - 2|e|)
-                    // When |e| = 0.5: modulated = 0 -> clamp to MIN_SI_COST
-                    let factor = 1.0f32 - 2.0 * abs_error;
-                    let modulated = (cost * factor).max(MIN_SI_COST);
-                    cost_map.set(br, bc, i, j, modulated);
-                }
-            }
-        }
-    }
-}
 
 /// Determine the modification direction for a coefficient using SI rounding error.
 ///

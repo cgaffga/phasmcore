@@ -9,11 +9,9 @@ use crate::progress::spawn_progress_bar;
 use phasm_core::smart_decode;
 #[cfg(feature = "video")]
 use phasm_core::{detect_video_codec, is_mp4, DecodeQuality, VideoCodec};
-#[cfg(all(feature = "video", not(feature = "cabac-stego")))]
+#[cfg(all(feature = "video", not(feature = "h264-decoder")))]
 use phasm_core::h264_ghost_decode;
-#[cfg(feature = "cabac-stego")]
-use phasm_core::h264_stego_smart_decode_video_with_payload;
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "h264-decoder")]
 use crate::transcode;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -73,10 +71,10 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
 
     let start = Instant::now();
 
-    // Auto-detect format: H.264 MP4 vs JPEG image. HEVC is archived behind
-    // `hevc-archive`. Phase 4b note: we deliberately do NOT auto-transcode
+    // Auto-detect format: H.264 MP4 vs JPEG image. (HEVC stego unsupported —
+    // HEVC pipeline removed 2026-06-04.) Note: we do NOT auto-transcode
     // stego videos on decode — transcoding re-encodes pixels which destroys
-    // the embedded message. The stego must already be Baseline CAVLC
+    // the embedded message. The stego must already be CABAC High-profile
     // (which it would be, since it was produced by `phasm video-encode`).
     //
     // v0.2.9 — when this binary is built without `video`, video-stego
@@ -99,9 +97,9 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
             if is_mp4(&file_bytes) {
                 let payload = match detect_video_codec(&file_bytes) {
                     VideoCodec::H264 => {
-                        #[cfg(feature = "cabac-stego")]
+                        #[cfg(feature = "h264-decoder")]
                         { decode_h264_cabac(&args.image, &passphrase)? }
-                        #[cfg(not(feature = "cabac-stego"))]
+                        #[cfg(not(feature = "h264-decoder"))]
                         { h264_ghost_decode(&file_bytes, &passphrase)? }
                     }
                     VideoCodec::Hevc => {
@@ -163,19 +161,13 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Phase 6.5 + D.0.1 — H.264 decode dispatch. ffmpeg demuxes MP4 →
-/// Annex-B; tries OpenH264-backend decode first (production v1.0
-/// path), falls back to pure-Rust CABAC v2 decode (`open-h264` +
-/// `rust-h264` produced files are bitstream-distinct — different
-/// stego cover sets — so the right decoder must be selected per-file).
-///
-/// Auto-detection rationale: the user shouldn't have to remember
-/// which encoder produced a file. Try OH264 first (default encoder
-/// in v1.0), then CABAC v2 if that fails with a FrameCorrupted /
-/// invalid-stego error. The decoders fail fast on cross-encoder
-/// input — wrong-cover walks always trip CRC well before any
-/// expensive work.
-#[cfg(feature = "cabac-stego")]
+/// H.264 stego decode dispatch. ffmpeg demuxes MP4 → Annex-B, then the
+/// engine-agnostic `StreamingDecodeSession` (the pure-Rust walker — the
+/// sole production decoder) recovers the message. The streaming session
+/// owns the v1.0 chunk_frame wire format produced by `run_oh264_encode`
+/// and the mobile bridges. It fails fast on input it doesn't own
+/// (wrong-cover walks trip CRC well before any expensive work).
+#[cfg(feature = "h264-decoder")]
 fn decode_h264_cabac(
     input: &PathBuf,
     passphrase: &str,
@@ -186,46 +178,19 @@ fn decode_h264_cabac(
         transcode::extract_annexb_from_mp4(input, &annex_b_temp)?;
         let annex_b = std::fs::read(&annex_b_temp)?;
 
-        // D.0.7.13 — try the streaming decode session first. This
-        // handles the new chunk_frame wire format produced by
-        // `run_oh264_encode` (and by the mobile bridges). Falls
-        // through to the legacy OH264 + CABAC v2 decoders on
-        // failure, so files produced by older versions or by the
-        // experimental `--encoder rust-h264` path still decode.
-        {
-            use phasm_core::StreamingDecodeSession;
-            if let Ok(mut session) = StreamingDecodeSession::create(passphrase) {
-                if session.push_annex_b(&annex_b).is_ok() {
-                    if let Ok(res) = session.finish() {
-                        // Streaming decode currently returns text +
-                        // mode_id; surface as a PayloadData with no
-                        // attachments. Attached-file streaming-decode
-                        // recovery tracked as v1.1 polish.
-                        return Ok(phasm_core::PayloadData {
-                            text: res.text,
-                            files: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        // D.0.1 — fall back to the legacy OpenH264-backend decoder
-        // (handles older OH264-produced stego streams from before
-        // the streaming chunk_frame format landed).
-        #[cfg(feature = "openh264-backend")]
-        {
-            use phasm_core::codec::h264::openh264_stego::openh264_stego_decode_yuv;
-            match openh264_stego_decode_yuv(&annex_b, passphrase) {
-                Ok(payload) => return Ok(payload),
-                Err(_) => {
-                    // Not an OH264-produced stego stream — fall through
-                    // to CABAC v2 decode.
-                }
-            }
-        }
-
-        Ok(h264_stego_smart_decode_video_with_payload(&annex_b, passphrase)?)
+        // Streaming decode session: handles the chunk_frame wire format
+        // produced by `run_oh264_encode` and the mobile bridges.
+        use phasm_core::StreamingDecodeSession;
+        let mut session = StreamingDecodeSession::create(passphrase)?;
+        session.push_annex_b(&annex_b)?;
+        let res = session.finish()?;
+        // `DecodeSessionResult` also carries `res.files`, but this CLI path
+        // does not yet surface attached files — it returns a PayloadData
+        // with `text` only. Wiring `res.files` through is v1.1 polish.
+        Ok(phasm_core::PayloadData {
+            text: res.text,
+            files: Vec::new(),
+        })
     })();
     let _ = std::fs::remove_file(&annex_b_temp);
     result

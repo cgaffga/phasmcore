@@ -27,15 +27,15 @@
 // `#[ignore]`'d to keep the default suite fast.
 //
 // Run full corpus:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //     --test openh264_decode_perf -- --ignored --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
+
+mod common;
+use common::oh264_stream;
 
 use phasm_core::codec::h264::openh264::{extract_cover_bits_via_decoder, Decoder};
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -148,9 +148,8 @@ fn run_decode_bench(tag: &str, src: &str, w: u32, h: u32, n_frames: u32, qp: i32
     let _g = session_guard().lock().unwrap_or_else(|e| e.into_inner());
 
     let yuv = ensure_yuv(tag, src, w, h, n_frames);
-    let stego = openh264_stego_encode_yuv_text(
-        &yuv, w, h, n_frames,
-        EncodeOpts { qp, intra_period: 60 },
+    let stego = oh264_stream::encode(
+        &yuv, w, h, n_frames, qp,
         "decode perf bench",
         "perf-pass",
     ).expect("oh264 stego encode");

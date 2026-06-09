@@ -283,6 +283,13 @@ pub fn compute_av1_uniward_costs_with_state(
     #[cfg(feature = "av1-encoder")] loop_filter_state: Option<PhasmFrameLoopFilterState>,
     #[cfg(not(feature = "av1-encoder"))] _loop_filter_state: Option<()>,
 ) -> Vec<f32> {
+    // B.3.2.4 audit instrumentation: set PHASM_AV1_PROFILE=1 to dump
+    // per-phase timing to stderr. Profile facility kept as opt-in
+    // permanent so re-running the breakdown stays cheap after this
+    // audit closes.
+    let profile = phasm_av1_profile_enabled();
+    let t0 = std::time::Instant::now();
+
     // Wavelet decomposition of each plane (one-off per frame). This
     // is the expensive precompute step; per-position cost is then
     // ~O(tx_w * tx_h + impact_window²) which is cheap.
@@ -291,6 +298,7 @@ pub fn compute_av1_uniward_costs_with_state(
         compute_three_subbands(&planes.cb, planes.chroma_width, planes.chroma_height);
     let cr_wavelets =
         compute_three_subbands(&planes.cr, planes.chroma_width, planes.chroma_height);
+    let t_wavelets = t0.elapsed();
 
     let q_scale = qindex_to_step(qindex);
     let delta_magnitude = 2.0 * q_scale; // sign flip: ±1 × quant step
@@ -300,13 +308,16 @@ pub fn compute_av1_uniward_costs_with_state(
     // Rayon's `par_iter().collect()` preserves input order so the
     // returned `Vec<f32>` aligns position-for-position with `positions`
     // — same contract as the serial path.
+    let t1 = std::time::Instant::now();
     let mut basis_cache = FrameBasisCache::new(delta_magnitude);
     basis_cache.prefill(positions);
     let basis_cache = basis_cache; // freeze: subsequent reads are &-only
+    let t_basis_prefill = t1.elapsed();
 
     // B.1.5.5: prefill L3 cascade cache for middle-band positions
     // (the ~10-15% where |coeff| is ambiguous). Safe + reject bands
     // get O(1) closed-form cost; only middle needs forward modeling.
+    let t2 = std::time::Instant::now();
     #[cfg(feature = "av1-encoder")]
     let l3_cache = loop_filter_state.map(|state| {
         let mut l3 = L3CascadeCache::new(state);
@@ -315,6 +326,7 @@ pub fn compute_av1_uniward_costs_with_state(
     });
     #[cfg(not(feature = "av1-encoder"))]
     let l3_cache: Option<()> = None;
+    let t_l3_prefill = t2.elapsed();
 
     let compute_one = |p: &Av1FramePosition| {
         compute_position_cost(
@@ -331,19 +343,55 @@ pub fn compute_av1_uniward_costs_with_state(
         )
     };
 
+    let t3 = std::time::Instant::now();
     #[cfg(feature = "parallel")]
-    {
-        positions.par_iter().map(compute_one).collect()
-    }
+    let result: Vec<f32> = positions.par_iter().map(compute_one).collect();
     #[cfg(not(feature = "parallel"))]
-    {
-        positions.iter().map(compute_one).collect()
+    let result: Vec<f32> = positions.iter().map(compute_one).collect();
+    let t_par_iter = t3.elapsed();
+
+    if profile {
+        eprintln!(
+            "[av1-perf] frame n_positions={} | wavelets={}.{:03}ms | basis_prefill={}.{:03}ms | l3_prefill={}.{:03}ms | par_iter={}.{:03}ms | total={}.{:03}ms",
+            positions.len(),
+            t_wavelets.as_millis(), t_wavelets.subsec_micros() % 1000,
+            t_basis_prefill.as_millis(), t_basis_prefill.subsec_micros() % 1000,
+            t_l3_prefill.as_millis(), t_l3_prefill.subsec_micros() % 1000,
+            t_par_iter.as_millis(), t_par_iter.subsec_micros() % 1000,
+            t0.elapsed().as_millis(), t0.elapsed().subsec_micros() % 1000,
+        );
     }
+
+    result
+}
+
+/// B.3.2.4 — Opt-in stderr profile dump for `compute_av1_uniward_costs_with_state`.
+/// Set `PHASM_AV1_PROFILE=1` to enable. Cached via `OnceLock` so the
+/// env-var lookup runs once per process.
+fn phasm_av1_profile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("PHASM_AV1_PROFILE").is_ok())
 }
 
 /// B.1.5.5: prefill L3 entries for cover positions whose `|coeff|`
 /// upper bound falls in the middle band. Skips safe + reject band
 /// positions (they get O(1) closed-form cost via three-tier dispatch).
+///
+/// B.3.2.4 audit fix (2026-06-06): pre-B.3.2.4 this function
+/// allocated `vec![0.0; tx_w * tx_h]` AND ran `dct_ii_basis` (up to
+/// 1024 `det_cos` calls for 32×32 TX) for EVERY middle-band
+/// position, then passed to `get_or_compute` which discarded the
+/// basis on cache HIT. Empirical hit rate ~99% per phase-b31
+/// numbers → ~99% of the work was discarded. PHASM_AV1_PROFILE
+/// measurement (2026-06-06, iphone5_1080p): l3_prefill = 1067-1238
+/// ms / frame, ~82% of cost-compute total.
+///
+/// Fix: probe the cache via the read-only `L3CascadeCache::get`
+/// FIRST. On hit (~99% of calls): skip the allocation + dct_ii_basis
+/// entirely. On miss (~1%): compute as before. Expected ~99%
+/// reduction in l3_prefill time → ~40-43% wall-clock embed_ms
+/// reduction on the production path.
 #[cfg(feature = "av1-encoder")]
 fn prefill_l3_middle_band(l3: &mut L3CascadeCache, positions: &[Av1FramePosition]) {
     for pos in positions {
@@ -365,11 +413,19 @@ fn prefill_l3_middle_band(l3: &mut L3CascadeCache, positions: &[Av1FramePosition
         if freq_y >= tx_h {
             continue;
         }
-        // Compute unit-magnitude basis on demand for L3's
-        // normalized-energy storage.
+        let key = L2Key::new(tx_w, tx_h, freq_x, freq_y, pos.plane);
+
+        // B.3.2.4 cache-hit fast path: skip basis + dct_ii_basis when
+        // the key already exists. This is the load-bearing fix —
+        // ~99% of middle-band positions are duplicates of an earlier
+        // unique tuple.
+        if l3.get(&key).is_some() {
+            continue;
+        }
+
+        // Cold path: compute unit-magnitude basis + insert.
         let mut basis = vec![0.0f64; tx_w * tx_h];
         dct_ii_basis(tx_w, tx_h, freq_x, freq_y, &mut basis);
-        let key = L2Key::new(tx_w, tx_h, freq_x, freq_y, pos.plane);
         let _ = l3.get_or_compute(key, &basis);
     }
 }
@@ -415,11 +471,19 @@ fn compute_position_cost(
     // (in-module unit tests + paths without loop-filter state).
     #[cfg(feature = "av1-encoder")]
     if let Some(l3) = l3_cache {
-        let coeff_upper_bound = pos.coeff_magnitude as f64 * coeff_to_cascade_factor();
+        // B.3.2.2: three-tier dispatch hot path narrowed to f32 to
+        // match the cache-narrowed compute_position_cost_legacy path.
+        // Drops perverse `.abs() as f64` casts on already-f32 wavelets.
+        // OnceLock-cached env thresholds (coeff_to_cascade_factor,
+        // threshold_safe, threshold_reject, ee_e_smoothness_threshold,
+        // ee_e_smooth_penalty) still return f64; cast at read site to
+        // minimize blast radius.
+        let coeff_upper_bound = pos.coeff_magnitude as f32 * coeff_to_cascade_factor() as f32;
+        let thresh_reject = threshold_reject() as f32;
 
         // EE-D reject band: above threshold → STC will never pick.
         // Checked FIRST so smoothness lookup doesn't run for these.
-        if coeff_upper_bound > threshold_reject() {
+        if coeff_upper_bound > thresh_reject {
             return f32::INFINITY;
         }
 
@@ -432,8 +496,8 @@ fn compute_position_cost(
         // detectable bias on smooth content + frame-to-frame cliff
         // variance when one frame is smoother than another.
         // Active iff PHASM_AV1_EE_E_SMOOTHNESS > 0.
-        let smoothness_thresh = ee_e_smoothness_threshold();
-        let smoothness_mult = if smoothness_thresh > 0.0 {
+        let smoothness_thresh = ee_e_smoothness_threshold() as f32;
+        let smoothness_mult: f32 = if smoothness_thresh > 0.0 {
             let wavelets = match pos.plane {
                 0 => y_wavelets,
                 1 => cb_wavelets,
@@ -446,12 +510,12 @@ fn compute_position_cost(
             let wy = (abs_y - wavelets.y_offset) as usize;
             if wx < wavelets.width && wy * wavelets.width + wx < wavelets.lh.len() {
                 let idx = wy * wavelets.width + wx;
-                let w_lh = wavelets.lh[idx].abs() as f64;
-                let w_hl = wavelets.hl[idx].abs() as f64;
-                let w_hh = wavelets.hh[idx].abs() as f64;
+                let w_lh = wavelets.lh[idx].abs();
+                let w_hl = wavelets.hl[idx].abs();
+                let w_hh = wavelets.hh[idx].abs();
                 let local_hf = w_lh + w_hl + w_hh;
                 if local_hf < smoothness_thresh {
-                    ee_e_smooth_penalty()
+                    ee_e_smooth_penalty() as f32
                 } else {
                     1.0
                 }
@@ -465,8 +529,8 @@ fn compute_position_cost(
         // EE-D safe band: |coeff| × factor below threshold → low cost.
         // Gradient: |coeff|=1 → cost 6, |coeff|=2 → cost 12, modulated
         // by EE-E smoothness multiplier.
-        if coeff_upper_bound < threshold_safe() {
-            return (coeff_upper_bound * smoothness_mult) as f32;
+        if coeff_upper_bound < threshold_safe() as f32 {
+            return coeff_upper_bound * smoothness_mult;
         }
 
         // Middle band: look up the predicted post-cascade magnitude
@@ -490,9 +554,13 @@ fn compute_position_cost(
             freq_y_local,
             pos.plane,
         );
+        // B.3.2.2: L3 cache still stores normalized_energy as f64 +
+        // scale_l3_to_cascade returns f64 (cold-side bookkeeping in
+        // core/src/codec/av1/stego/cascade_kernel.rs). Narrow at use
+        // site to compose with f32 smoothness_mult.
         let normalized_energy = l3.get(&key).unwrap_or(0.0);
-        let cascade = scale_l3_to_cascade(normalized_energy, pos.coeff_magnitude);
-        return (cascade * smoothness_mult) as f32;
+        let cascade = scale_l3_to_cascade(normalized_energy, pos.coeff_magnitude) as f32;
+        return cascade * smoothness_mult;
     }
 
     // ---- Legacy J-UNIWARD path (B.1.3 magnitude proxy) follows ----
@@ -546,42 +614,190 @@ fn compute_position_cost(
     let impact_h = tuple.impact_h as usize;
     let pad = FILT_LEN - 1; // 15
 
-    // Per-position cost accumulation: walk the impact window, look up
-    // the cached delta values, accumulate cost against the cover
-    // wavelet magnitudes at the image-coordinate-mapped position.
-    let mut cost = 0.0f64;
+    // B.3.2.1 (2026-06-06): hot loop restructured for NEON SIMD.
+    //
+    // The pre-B.3.2.1 scalar loop did per-cell bounds checking (abs_x /
+    // abs_y vs img_w / img_h), which prevents auto-vectorization and
+    // mixes loads with branches. Restructured: hoist bounds to the row
+    // level, compute valid out_c subrange [c_lo, c_hi) once per row,
+    // run a contiguous SIMD loop over that subrange. The cell + idx
+    // arithmetic is sequential across out_c (delta arrays + wavelet
+    // arrays both stride by 1 along the column), so we can use
+    // vld1q_f32 to load 4 floats per instruction.
+    //
+    // Pre-B.3.2.2 path was end-to-end f32 (see commit 9b33c39c). This
+    // sub-task uses the f32 layout to pack 4 lanes on aarch64 NEON
+    // instead of the 2 lanes f64 would have given. Scalar path stays
+    // available via PHASM_AV1_DISABLE_SIMD env-gate for correctness
+    // byte-equivalence in CI.
+    let sigma_f32 = SIGMA as f32;
+    let mut cost = 0.0f32;
     for out_r in 0..impact_h {
-        for out_c in 0..impact_w {
-            // Map (out_r, out_c) back to image coordinates first so
-            // we can early-skip on bounds without touching the cache
-            // arrays (negligible — included for clarity).
-            let abs_x = block_px_x as isize + out_c as isize - pad as isize;
-            let abs_y = block_px_y as isize + out_r as isize - pad as isize;
-            if abs_x < 0 || abs_y < 0 || abs_x >= img_w as isize || abs_y >= img_h as isize {
-                continue;
-            }
-            let wx = (abs_x - wavelets.x_offset) as usize;
-            let wy = (abs_y - wavelets.y_offset) as usize;
-            let idx = wy * wavelets.width + wx;
-
-            let cell = out_r * impact_w + out_c;
-            let delta_lh = tuple.delta_lh[cell];
-            let delta_hl = tuple.delta_hl[cell];
-            let delta_hh = tuple.delta_hh[cell];
-
-            let w_lh = wavelets.lh[idx].abs() as f64;
-            let w_hl = wavelets.hl[idx].abs() as f64;
-            let w_hh = wavelets.hh[idx].abs() as f64;
-
-            cost += delta_lh.abs() / (w_lh + SIGMA);
-            cost += delta_hl.abs() / (w_hl + SIGMA);
-            cost += delta_hh.abs() / (w_hh + SIGMA);
+        let abs_y = block_px_y as isize + out_r as isize - pad as isize;
+        if abs_y < 0 || abs_y >= img_h as isize {
+            continue;
         }
+        let wy = (abs_y - wavelets.y_offset) as usize;
+        // Valid out_c range so abs_x = block_px_x + out_c - pad ∈ [0, img_w).
+        let c_lo_signed = (pad as isize) - block_px_x as isize;
+        let c_lo = c_lo_signed.max(0).min(impact_w as isize) as usize;
+        let c_hi_signed = (img_w as isize) + (pad as isize) - block_px_x as isize;
+        let c_hi = c_hi_signed.max(0).min(impact_w as isize) as usize;
+        if c_lo >= c_hi {
+            continue;
+        }
+        let n_cells = c_hi - c_lo;
+
+        // Cell base in delta arrays.
+        let cell_base = out_r * impact_w + c_lo;
+        // wx for the first cell in the SIMD-friendly subrange.
+        let wx_at_lo = (block_px_x as isize + c_lo as isize - pad as isize
+            - wavelets.x_offset) as usize;
+        let widx_base = wy * wavelets.width + wx_at_lo;
+        // Defensive bound vs wavelets.lh.len() — should always hold from
+        // c_lo/c_hi math but guards against out-of-frame meta.
+        let n_safe = n_cells
+            .min(wavelets.lh.len().saturating_sub(widx_base))
+            .min(tuple.delta_lh.len().saturating_sub(cell_base));
+        if n_safe == 0 {
+            continue;
+        }
+
+        cost += cost_accum_kernel(
+            &tuple.delta_lh[cell_base..cell_base + n_safe],
+            &tuple.delta_hl[cell_base..cell_base + n_safe],
+            &tuple.delta_hh[cell_base..cell_base + n_safe],
+            &wavelets.lh[widx_base..widx_base + n_safe],
+            &wavelets.hl[widx_base..widx_base + n_safe],
+            &wavelets.hh[widx_base..widx_base + n_safe],
+            sigma_f32,
+        );
     }
 
-    // Phase B.1.3: add the cascade-magnitude-proxy term.
-    let final_cost = cost + LAMBDA_CASCADE * cascade_magnitude_proxy;
-    final_cost as f32
+    // Phase B.1.3: add the cascade-magnitude-proxy term. f32 end-to-end.
+    cost + (LAMBDA_CASCADE as f32) * cascade_magnitude_proxy
+}
+
+/// B.3.2.1 — per-row cost-accum kernel. Dispatches to NEON on
+/// aarch64 (4-wide f32) when `PHASM_AV1_DISABLE_SIMD` is unset,
+/// else falls through to the scalar reference path (CI byte-
+/// equivalence gate per phase-b31-embed-perf.md § 3).
+///
+/// All six slices have the same length `n`. Caller-validated bounds.
+#[inline]
+fn cost_accum_kernel(
+    d_lh: &[f32],
+    d_hl: &[f32],
+    d_hh: &[f32],
+    w_lh: &[f32],
+    w_hl: &[f32],
+    w_hh: &[f32],
+    sigma: f32,
+) -> f32 {
+    debug_assert_eq!(d_lh.len(), d_hl.len());
+    debug_assert_eq!(d_lh.len(), d_hh.len());
+    debug_assert_eq!(d_lh.len(), w_lh.len());
+    debug_assert_eq!(d_lh.len(), w_hl.len());
+    debug_assert_eq!(d_lh.len(), w_hh.len());
+
+    #[cfg(target_arch = "aarch64")]
+    if phasm_av1_simd_enabled() {
+        // SAFETY: aarch64 baseline includes NEON per ARMv8 spec.
+        return unsafe {
+            cost_accum_kernel_neon(d_lh, d_hl, d_hh, w_lh, w_hl, w_hh, sigma)
+        };
+    }
+
+    cost_accum_kernel_scalar(d_lh, d_hl, d_hh, w_lh, w_hl, w_hh, sigma)
+}
+
+/// Scalar fallback / byte-equivalence reference.
+#[inline]
+fn cost_accum_kernel_scalar(
+    d_lh: &[f32],
+    d_hl: &[f32],
+    d_hh: &[f32],
+    w_lh: &[f32],
+    w_hl: &[f32],
+    w_hh: &[f32],
+    sigma: f32,
+) -> f32 {
+    let mut cost = 0.0f32;
+    for i in 0..d_lh.len() {
+        cost += d_lh[i].abs() / (w_lh[i].abs() + sigma);
+        cost += d_hl[i].abs() / (w_hl[i].abs() + sigma);
+        cost += d_hh[i].abs() / (w_hh[i].abs() + sigma);
+    }
+    cost
+}
+
+/// aarch64 NEON f32×4 kernel. Processes 4 cells per iteration; tail
+/// 0-3 cells scalar.
+///
+/// SIMD shape: per chunk, 6 loads + 6 absq + 3 add (denominators) +
+/// 3 div + 2 add (running accum). ~14 SIMD ops per 4 cells = 3.5
+/// ops/cell vs ~9 scalar ops/cell (3 abs + 3 add + 3 div) — ~2.5×
+/// instruction-count improvement plus latency-hiding via the divisions.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn cost_accum_kernel_neon(
+    d_lh: &[f32],
+    d_hl: &[f32],
+    d_hh: &[f32],
+    w_lh: &[f32],
+    w_hl: &[f32],
+    w_hh: &[f32],
+    sigma: f32,
+) -> f32 {
+    use core::arch::aarch64::*;
+
+    let n = d_lh.len();
+    let sigma_v = vdupq_n_f32(sigma);
+    let mut acc_v = vdupq_n_f32(0.0);
+
+    let dlh_ptr = d_lh.as_ptr();
+    let dhl_ptr = d_hl.as_ptr();
+    let dhh_ptr = d_hh.as_ptr();
+    let wlh_ptr = w_lh.as_ptr();
+    let whl_ptr = w_hl.as_ptr();
+    let whh_ptr = w_hh.as_ptr();
+
+    let mut i = 0;
+    while i + 4 <= n {
+        let dlh = vabsq_f32(vld1q_f32(dlh_ptr.add(i)));
+        let dhl = vabsq_f32(vld1q_f32(dhl_ptr.add(i)));
+        let dhh = vabsq_f32(vld1q_f32(dhh_ptr.add(i)));
+        let wlh = vabsq_f32(vld1q_f32(wlh_ptr.add(i)));
+        let whl = vabsq_f32(vld1q_f32(whl_ptr.add(i)));
+        let whh = vabsq_f32(vld1q_f32(whh_ptr.add(i)));
+
+        let denlh = vaddq_f32(wlh, sigma_v);
+        let denhl = vaddq_f32(whl, sigma_v);
+        let denhh = vaddq_f32(whh, sigma_v);
+
+        let qlh = vdivq_f32(dlh, denlh);
+        let qhl = vdivq_f32(dhl, denhl);
+        let qhh = vdivq_f32(dhh, denhh);
+
+        acc_v = vaddq_f32(acc_v, qlh);
+        acc_v = vaddq_f32(acc_v, qhl);
+        acc_v = vaddq_f32(acc_v, qhh);
+
+        i += 4;
+    }
+
+    // Horizontal sum of the 4-lane vector accumulator.
+    let mut cost = vaddvq_f32(acc_v);
+
+    // Tail 0-3 cells.
+    while i < n {
+        cost += d_lh[i].abs() / (w_lh[i].abs() + sigma);
+        cost += d_hl[i].abs() / (w_hl[i].abs() + sigma);
+        cost += d_hh[i].abs() / (w_hh[i].abs() + sigma);
+        i += 1;
+    }
+
+    cost
 }
 
 /// λ_cascade — multiplicative weight on the cascade-magnitude-proxy
@@ -641,10 +857,20 @@ fn dct_ii_basis(tx_w: usize, tx_h: usize, freq_x: usize, freq_y: usize, out: &mu
 /// `basis_max_abs` summary survives the cache build, since downstream
 /// cost compute only needs the three delta maps + the proxy.
 struct TupleEntry {
-    basis_max_abs: f64,
-    delta_lh: Vec<f64>,
-    delta_hl: Vec<f64>,
-    delta_hh: Vec<f64>,
+    // B.3.2.2 (2026-06-06): basis_max_abs + delta_* narrowed from f64
+    // to f32. Cold-path `compute_tuple_entry` still computes in f64
+    // (precision-critical basis + row-filter + column-filter math,
+    // called ~1024×/frame); narrowing happens at cache insertion.
+    // Cuts cache memory in half (~26 MB instead of ~53 MB worst case
+    // at 1080p) AND lets the hot per-position loop in
+    // `compute_position_cost` run end-to-end in f32 — drops the
+    // perverse `.abs() as f64` casts on already-f32 wavelet values
+    // and doubles NEON SIMD lane count (4× f32 vs 2× f64) for
+    // B.3.2.1.
+    basis_max_abs: f32,
+    delta_lh: Vec<f32>,
+    delta_hl: Vec<f32>,
+    delta_hh: Vec<f32>,
     impact_w: u16,
     impact_h: u16,
 }
@@ -822,11 +1048,13 @@ fn compute_tuple_entry(
         }
     }
 
+    // B.3.2.2: narrow at cache insertion. Cold path stays f64
+    // (above); hot path reads f32.
     TupleEntry {
-        basis_max_abs,
-        delta_lh,
-        delta_hl,
-        delta_hh,
+        basis_max_abs: basis_max_abs as f32,
+        delta_lh: delta_lh.into_iter().map(|x| x as f32).collect(),
+        delta_hl: delta_hl.into_iter().map(|x| x as f32).collect(),
+        delta_hh: delta_hh.into_iter().map(|x| x as f32).collect(),
         impact_w: impact_w as u16,
         impact_h: impact_h as u16,
     }

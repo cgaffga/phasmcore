@@ -8,7 +8,7 @@
 //! Not part of the regular test suite (#[ignore]'d). Run on demand:
 //!
 //! ```bash
-//! cargo test --features av1-encoder,av1-backend \
+//! cargo test --features av1-encoder,av1-decoder \
 //!     --test av1_desktop_render --release -- --ignored --nocapture
 //! ```
 //!
@@ -16,7 +16,7 @@
 //!   - phasm_av1_carplane_natural.mp4  (clean encode, no stego)
 //!   - phasm_av1_carplane_stego.mp4    (with hidden encrypted message)
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

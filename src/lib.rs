@@ -55,120 +55,65 @@ pub use stego::{
 };
 pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
 
-// H.264 (production) re-exports.
+// H.264 decode dispatch re-exports. (Production H.264 video encode is the
+// OpenH264 streaming session below; the legacy CAVLC encode/capacity pipeline
+// was retired — see `docs/design/video/_RETIREMENT-PLAN.md` § "Phase 4".)
 #[cfg(feature = "video")]
-pub use stego::video::{
-    h264_ghost_encode, h264_ghost_encode_inplace,
-    h264_ghost_decode, h264_ghost_capacity, h264_ghost_capacity_max,
-    h264_ghost_encode_path, h264_ghost_decode_path,
-    h264_ghost_capacity_path, h264_ghost_capacity_max_path,
-    is_mp4,
-};
+pub use stego::video::{h264_ghost_decode, h264_ghost_decode_path, is_mp4};
 
-// H.264 phase-6 encoder transcoder (#77) — replaces VideoToolbox /
-// MediaCodec on mobile for the input-video → Baseline-CAVLC step.
-// `StreamingEncoder` is the per-frame stateful API used by the mobile
-// bridges; `transcode_yuv_to_baseline_cavlc_h264` is the one-shot
-// convenience wrapper for tests / CLI / batch contexts.
-// D.0.7 — streaming H.264 stego session API (engine-agnostic).
-// Mobile bridges + CLI consume these directly; they own the per-GOP
-// state machine + chunk_frame wire format. Design memo:
-// `docs/design/video/h264/d07-streaming-sessions.md`.
+// Streaming H.264 stego session API (engine-agnostic). The encoder
+// transcoder (#77) replaces VideoToolbox / MediaCodec on mobile for the
+// input-video → H.264 step. Mobile bridges + CLI consume these directly;
+// they own the per-GOP state machine + chunk_frame wire format. Design
+// memo: `docs/design/video/h264/d07-streaming-sessions.md`.
+// Streaming DECODE session — available standalone (decode-only builds:
+// App Clip / decode WASM decode phasm H.264 stego without OpenH264).
+#[cfg(feature = "h264-decoder")]
+pub use codec::h264::streaming_session::{DecodeSessionResult, StreamingDecodeSession};
+// Streaming ENCODE session + capacity probe — OpenH264 encoder only.
 #[cfg(feature = "h264-encoder")]
 pub use codec::h264::streaming_session::{
-    CapacityProbeResult, ColorParams, DecodeSessionResult, EncodeEngineChoice,
-    EncodeSessionParams, StreamingDecodeSession, StreamingEncodeSession,
-    StreamingProbeSession, YuvFrameRef,
+    CapacityProbeResult, ColorParams, EncodeEngineChoice, EncodeSessionParams,
+    StreamingEncodeSession, StreamingProbeSession, YuvFrameRef,
 };
-#[cfg(feature = "h264-encoder")]
+#[cfg(feature = "h264-decoder")]
 pub use codec::h264::stego::CostWeights;
 
 // #474 — video stego progress event vocabulary. Mobile bridges re-export
 // these to wire C/JNI callbacks; see `docs/design/video/h264/progress-indicator.md`.
-#[cfg(feature = "h264-encoder")]
+#[cfg(feature = "h264-decoder")]
 pub use codec::h264::progress::{
     decode_phase_codes, encode_phase_codes, DecodePhase, DecodeProgressCallback, EncodePhase,
     EncodeProgressCallback, PROGRESS_MIN_INTERVAL, ProgressThrottle,
 };
 
+// OH264 video-stego capacity surface (relocated from the retired pure-Rust
+// `encode_pixels` in the video-retirement Phase 3). Production capacity API
+// consumed by the mobile bridges + CLI for the streaming session.
 #[cfg(feature = "h264-encoder")]
-pub use codec::h264::encoder::baseline_transcode::{
-    BaselineTranscodeConfig, StreamingEncoder, transcode_yuv_to_baseline_cavlc_h264,
+pub use codec::h264::stego::oh264_capacity::{
+    h264_resolve_auto_tier, h264_shadow_capacity_for_n,
+    h264_video_capacity, H264StegoCapacityInfo,
 };
-
-// Phase 6D.8 chunk 5 — encode-time CABAC stego public API. UTF-8
-// string message + passphrase + raw I420 YUV → Annex-B byte stream.
-// I-frame-only single-GOP scope until §30 MVD wiring lands.
-// Mobile bridges + CLI route through this once chunk 7 atomic-swaps
-// the legacy CAVLC pipeline gates.
-#[cfg(feature = "cabac-stego")]
-pub use codec::h264::stego::encode_pixels::{
-    h264_stego_encode_i_frames_only, h264_stego_encode_i_then_p_frames,
-    h264_stego_encode_yuv_string, h264_stego_encode_yuv_string_4domain,
-    h264_stego_encode_yuv_string_4domain_multigop,
-    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2,
-    h264_stego_encode_yuv_string_4domain_multigop_with_pattern,
-    h264_stego_encode_yuv_string_with_n_shadows,
-    h264_stego_encode_yuv_string_with_n_shadows_with_pattern,
-    h264_stego_encode_yuv_string_with_shadow,
-    h264_stego_encode_yuv_string_with_shadow_with_pattern,
-    h264_stego_shadow_capacity, H264ShadowCapacityInfo,
-    // Task #96 — combined primary + shadow capacity surface.
-    // #796 — OH264-accurate variant for the production streaming session.
-    h264_stego_capacity_4domain, H264StegoCapacityInfo,
-    h264_stego_capacity_4domain_oh264,
-    h264_resolve_auto_tier_oh264,
-    // CAP2.5 — single-sourced per-shadow capacity for the N-aware HUD bar.
-    h264_shadow_capacity_for_n,
-    // Task #97 — file-attachment-aware encode entries.
-    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_files,
-    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files,
-    h264_stego_encode_yuv_string_4domain_multigop_streaming_v2_with_pattern_and_files_with_tier,
-    h264_stego_encode_yuv_string_with_n_shadows_with_pattern_and_files,
-};
-// CAP2 §17.1 — v3 tiered sampled capacity estimator (OH264). Fast + refining
-// HUD capacity (stratified GOP sample → Σ sample-mean + adaptive margin),
-// independent of clip length. Pool C feeds the closed-form shadow bar.
-#[cfg(feature = "openh264-backend")]
-pub use codec::h264::stego::capacity_estimator::{
-    oh264_capacity_estimate, oh264_capacity_estimate_yuv, oh264_capacity_quick,
-    CapacityEstimate, DEFAULT_MAX_SAMPLE_GOPS,
-};
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "h264-decoder")]
 pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
-// D'.5 — Track 1 cascade-safety tier types for CLI / bridges.
-#[cfg(feature = "cabac-stego")]
+// Cascade-safety tier types for CLI / bridges.
+#[cfg(feature = "h264-decoder")]
 pub use codec::h264::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM as CASCADE_DEFAULT_HEADROOM};
-
-// Phase 6D.8 chunk 6G + §30D-C — decode entry points. Walks the
-// encoded Annex-B + passphrase → recovered UTF-8 string. The
-// `_4domain` variant pairs with §30D-C's 3-pass encoder + uses
-// fill-MVD-first allocation; the basic variant pairs with chunk
-// 5 / §30C residual-only encoders.
-#[cfg(feature = "cabac-stego")]
-pub use codec::h264::stego::decode_pixels::{
-    h264_stego_decode_yuv_string, h264_stego_decode_yuv_string_4domain,
-    h264_stego_shadow_decode, h264_stego_smart_decode_video,
-    // Task #97 — _with_payload variant returns PayloadData (text +
-    // attached files), not just text.
-    h264_stego_smart_decode_video_with_payload,
-};
-
-// HEVC (archived) re-exports — only available with the `hevc-archive` feature.
 
 /// Detected video codec inside an MP4 container.
 ///
-/// The `Hevc` variant is still reported even when the HEVC pipeline is
-/// archived — detection only needs MP4-level codec bytes, not the full
-/// HEVC parser. Callers should check for `VideoCodec::H264` as the only
+/// The `Hevc` variant is still reported even though the HEVC pipeline was
+/// removed — detection only needs MP4-level codec bytes, not a full HEVC
+/// parser. Callers should check for `VideoCodec::H264` as the only
 /// supported stego target.
 #[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
     /// H.264/AVC — uses CAVLC-based encoding (Baseline/Main CAVLC).
     H264,
-    /// HEVC/H.265. Detected but not supported for stego in current builds;
-    /// the pipeline is archived behind the `hevc-archive` feature flag.
+    /// HEVC/H.265. Detected but not supported for stego — the HEVC pipeline
+    /// was removed (see docs/design/video/_RETIREMENT-PLAN.md).
     Hevc,
     /// MP4 but no recognised H.264 or HEVC track.
     Unknown,

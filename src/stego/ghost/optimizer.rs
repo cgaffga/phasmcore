@@ -51,12 +51,12 @@ pub enum OptimizerMode {
     Fortress,
 }
 
-/// T2.11 — Cross-platform empirical optimizer-output byte equivalence.
+/// Cross-platform empirical optimizer-output byte equivalence.
 ///
 /// Returns the lowercase-hex SHA256 of `optimize_cover` output on a
 /// fixed deterministic input. Used to verify the optimizer produces
 /// bit-identical output across native / iOS / Android / WASM, and
-/// to catch any regression while shipping T2.11a/b/c.
+/// to catch any regression in the optimizer kernels.
 #[doc(hidden)]
 pub fn optimizer_test_hash_hex() -> String {
     use sha2::{Digest, Sha256};
@@ -291,18 +291,19 @@ fn gradient_energy(pixels: &[u8], w: usize, h: usize) -> f64 {
 // Ghost pipeline (4 stages, texture-adaptive)
 // ---------------------------------------------------------------------------
 
-// M9.5.B (2026-05-22) — Phase B strip refactor.
+// Per-strip pipeline (memory-bound refactor, see
+// docs/design/image/memory-budget-2026-05.md).
 //
-// The optimizer ran as a "stage-major" pipeline: Stage 1 over all
-// rows in parallel, Stage 2 over all rows in parallel, etc. Each
-// stage allocated full-image working buffers (variance 460 MB at 60
-// MP, stage1 clone 173 MB, blurred 173 MB, current_luma 460 MB) and
+// The optimizer previously ran as a "stage-major" pipeline: Stage 1
+// over all rows in parallel, Stage 2 over all rows in parallel, etc.
+// Each stage allocated full-image working buffers (variance 460 MB at
+// 60 MP, stage1 clone 173 MB, blurred 173 MB, current_luma 460 MB) and
 // rayon workers shuffled between stages, blowing cache between every
 // transition.
 //
-// Phase B inverts the loop: each rayon worker takes a strip and runs
-// ALL 4 STAGES on it. Per-strip working set (~10-20 MB at 60 MP /
-// 64-row strips) fits L2/L3 and stays hot across all stages. The
+// The strip refactor inverts the loop: each rayon worker takes a strip
+// and runs ALL 4 STAGES on it. Per-strip working set (~10-20 MB at 60
+// MP / 64-row strips) fits L2/L3 and stays hot across all stages. The
 // 460 MB shared `variance` allocation disappears entirely — each
 // strip computes its own per-strip variance from its own per-strip
 // luma, and both get dropped at strip end.
@@ -318,11 +319,11 @@ fn gradient_energy(pixels: &[u8], w: usize, h: usize) -> f64 {
 //   Variance for output rows: needs luma on ±2 rows of OVERLAP
 //   Max needed overlap = max(2 luma, 4 stage cascade) = 4 rows.
 //
-// Output bytes match the pre-B byte-exact baseline:
-//   - Per-row ChaCha (A3): `set_word_pos(4 * abs_y * w)` keeps the
+// Output bytes match the stage-major byte-exact baseline:
+//   - Per-row ChaCha: `set_word_pos(4 * abs_y * w)` keeps the
 //     same RNG stream byte the original serial pre-pass produced for
 //     that row's pixels.
-//   - Per-strip Stage 4 ChaCha (A4): `set_word_pos(h*w*4 + by*blocks_x*2)`
+//   - Per-strip Stage 4 ChaCha: `set_word_pos(h*w*4 + by*blocks_x*2)`
 //     matches the post-Stage-1 RNG position.
 //   - Variance computed per-strip differs from full-image only at
 //     the work-buffer edge rows (OVERLAP region), which we DON'T
@@ -386,7 +387,7 @@ fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -
 
         // === Stage 1: per-row noise injection ===
         // Per-row RNG: `set_word_pos(4 * abs_y * w)` so byte order
-        // matches the pre-A3 serial pre-pass.
+        // matches the original serial pre-pass.
         for local_y in 0..work_h {
             let abs_y = work_y_start + local_y;
             let mut row_rng = ChaCha20Rng::from_seed(seed);
@@ -394,7 +395,7 @@ fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -
 
             let row_off = local_y * w * 3;
             for x in 0..w {
-                // Always draw — matches pre-A3 unconditional pre-pass.
+                // Always draw — matches the original unconditional pre-pass.
                 let u1: f64 = row_rng.gen_range(0.0f64..1.0).max(1e-10);
                 let u2: f64 = row_rng.gen_range(0.0f64..1.0);
 
@@ -418,7 +419,7 @@ fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -
 
         // === Stage 2: 3×3 unsharp ===
         // Needs pre-Stage-2 snapshot. Per-strip clone is ~2 MB at 60 MP
-        // (was a 173 MB full-image clone pre-Phase-B).
+        // (was a 173 MB full-image clone under the stage-major pipeline).
         let work_stage1 = work.clone();
         for local_y in 0..work_h {
             let row_off = local_y * w * 3;
@@ -494,13 +495,13 @@ fn optimize_ghost(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig) -
         // Block-row range within the strip's OUTPUT range. STRIP_HEIGHT
         // is 4-aligned so y_start % 4 == 0. y_end might not be 4-aligned
         // on the trailing strip (h not a multiple of 4); clamp to
-        // `blocks_y` to drop the partial bottom block, matching
-        // pre-Phase-B Stage 4 behavior.
+        // `blocks_y` to drop the partial bottom block, matching the
+        // stage-major Stage 4 behavior.
         let block_y_start = y_start / 4;
         let block_y_end = (y_end / 4).min(blocks_y);
 
         for by in block_y_start..block_y_end {
-            // Per-strip Stage 4 RNG (A4 byte order):
+            // Per-strip Stage 4 RNG byte order:
             //   word_pos = h * w * 4 (post-Stage-1) + by * blocks_x * 2
             let mut row_rng = ChaCha20Rng::from_seed(seed);
             row_rng.set_word_pos(
@@ -628,12 +629,11 @@ fn optimize_fortress(pixels: &[u8], w: usize, h: usize, config: &OptimizerConfig
 
 /// Extract luma (Y) from RGB pixels. Y = 0.299R + 0.587G + 0.114B.
 ///
-/// M9.5.C1 (2026-05-22) — Returns `Vec<u8>` instead of `Vec<f64>`. Y
-/// values are in [0, 255] integer range anyway; the f64 storage was 8×
-/// memory for zero precision benefit downstream (variance integerizes
-/// luma in its inner loop; Stage 4 block stats accumulate in f32/f64
-/// on demand). Saves 60 MB at 60 MP full-image (or ~5 MB per strip
-/// post-Phase-B).
+/// Returns `Vec<u8>` (not `Vec<f64>`): Y values are in [0, 255] integer
+/// range anyway; the f64 storage was 8× memory for zero precision
+/// benefit downstream (variance integerizes luma in its inner loop;
+/// Stage 4 block stats accumulate in f32/f64 on demand). Saves 60 MB at
+/// 60 MP full-image (or ~5 MB per strip).
 fn extract_luma(pixels: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut luma = vec![0u8; w * h];
     for i in 0..w * h {
@@ -648,13 +648,13 @@ fn extract_luma(pixels: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// Compute local variance in a 5×5 neighborhood for each pixel.
 ///
-/// M9.5.A6 (2026-05-22) — Reverted T2.11a's SAT implementation.
-/// M9.5.C1 (2026-05-22) — Type narrowed to `&[u8]` luma in, `Vec<u16>`
-/// variance out. Sliding-window sum/sum_sq computed in u32 (max sum²
-/// ≈ 40.6M fits u26 < u32 max). Max possible variance for 8-bit luma
-/// in a 5×5 window is ~16,256 (8-bit Bernoulli, half-zero/half-255),
-/// fits u14 with headroom. Saves 460 MB → 120 MB full-image / ~5.5 MB
-/// → 1.3 MB per strip post-Phase-B.
+/// Direct sliding-window sum (a summed-area-table variant was tried and
+/// reverted). Type narrowed to `&[u8]` luma in, `Vec<u16>` variance out:
+/// sliding-window sum/sum_sq computed in u32 (max sum² ≈ 40.6M fits u26
+/// < u32 max). Max possible variance for 8-bit luma in a 5×5 window is
+/// ~16,256 (8-bit Bernoulli, half-zero/half-255), fits u14 with
+/// headroom. Saves 460 MB → 120 MB full-image / ~5.5 MB → 1.3 MB per
+/// strip.
 ///
 /// Integer formula: `25 * sum_sq - sum²` is the numerator of
 /// `25² · variance`. Divide by 625 to recover variance. All inputs
@@ -691,13 +691,12 @@ fn local_variance_5x5(luma: &[u8], w: usize, h: usize) -> Vec<u16> {
         }
     };
 
-    // M9.5.C2 (2026-05-22) — restored inner par_chunks_mut. Nested
-    // rayon here (called from `process_strip` inside the outer strip
-    // par_iter) is fine in production — the optimizer runs once per
-    // encode, no contention. The serial-within-strip version (Phase B
-    // initial commit) was 25-30% slower than pre-M9.5 on M-series
-    // 8-core; restoring inner parallelism closes that gap while
-    // keeping the strip refactor's memory savings.
+    // Inner par_chunks_mut. Nested rayon here (called from
+    // `process_strip` inside the outer strip par_iter) is fine in
+    // production — the optimizer runs once per encode, no contention.
+    // The serial-within-strip version was 25-30% slower on M-series
+    // 8-core; inner parallelism closes that gap while keeping the strip
+    // refactor's memory savings.
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
@@ -733,13 +732,13 @@ fn neighborhood_mean_3x3(pixels: &[u8], w: usize, h: usize, x: usize, y: usize, 
 
 /// Separable Gaussian blur with given sigma (truncated at 3σ kernel).
 ///
-/// M9.5.C2 (2026-05-22) — Kernel + plane scratch narrowed to f32 so
-/// the SIMD blur dispatch (`optimizer_simd::blur_row_h`) uses native
-/// f32x4 lanes (NEON FMA on aarch64, native WASM SIMD128 f32x4,
-/// SSE2 f32x4 on x86) — 2× the lane count of the pre-C2 f64x2 path.
-/// `det_exp` is still used for the kernel builder so the kernel
-/// values themselves are deterministic across platforms; the f64
-/// intermediate is cast to f32 before normalisation.
+/// Kernel + plane scratch narrowed to f32 so the SIMD blur dispatch
+/// (`optimizer_simd::blur_row_h`) uses native f32x4 lanes (NEON FMA on
+/// aarch64, native WASM SIMD128 f32x4, SSE2 f32x4 on x86) — 2× the lane
+/// count of the earlier f64x2 path. `det_exp` is still used for the
+/// kernel builder so the kernel values themselves are deterministic
+/// across platforms; the f64 intermediate is cast to f32 before
+/// normalisation.
 fn gaussian_blur_separable(pixels: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
     let radius = (sigma * 3.0).ceil() as usize;
     let kernel_size = radius * 2 + 1;
@@ -784,8 +783,7 @@ fn gaussian_blur_separable(pixels: &[u8], w: usize, h: usize, sigma: f64) -> Vec
         }
     };
 
-    // M9.5.C2 (2026-05-22) — restored inner par_chunks_mut. See
-    // local_variance_5x5 comment above.
+    // Inner par_chunks_mut. See local_variance_5x5 comment above.
     let plane_scratch_size = 3 * padded_w;
     #[cfg(feature = "parallel")]
     {

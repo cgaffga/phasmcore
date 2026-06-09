@@ -3,9 +3,8 @@
 // https://github.com/cgaffga/phasmcore
 
 use crate::error::CliError;
-use crate::output::{self, CliVideoCapacityInfo};
+#[cfg(feature = "h264-encoder")]
 use crate::transcode;
-use phasm_core::{detect_video_codec, h264_ghost_capacity, h264_ghost_capacity_max, VideoCodec};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -23,108 +22,53 @@ pub struct VideoCapacityArgs {
     /// of the conservative default (STC `w = 5`, default stealth).
     /// Useful for power users who want the absolute upper bound on
     /// what the encoder can fit. The default value is what the mobile
-    /// apps display. Ignored when `--cabac-v2` is set.
+    /// apps display.
     #[arg(long)]
     pub max: bool,
 
-    /// Task #96 — Use the CABAC v2 4-domain capacity formula instead
-    /// of the legacy CAVLC `h264_ghost_capacity` path. Requires the
-    /// `cabac-stego` build feature. Reports both primary and shadow
-    /// (single-shadow) capacities. Decodes the input to YUV first
-    /// via ffmpeg (slow on long clips) since the CABAC v2 pipeline
-    /// works on raw pixels not parsed Annex-B.
-    #[cfg(feature = "cabac-stego")]
-    #[arg(long)]
-    pub cabac_v2: bool,
-
-    /// Task #96 + #98 — GOP size used by the CABAC v2 capacity
+    /// GOP size used by the streaming-session capacity
     /// estimate. Defaults to 30 (matches mobile encoder default at
-    /// 30 fps = 1 IDR/sec). Only honored under `--cabac-v2`.
-    #[cfg(feature = "cabac-stego")]
+    /// 30 fps = 1 IDR/sec).
+    #[cfg(feature = "h264-encoder")]
     #[arg(long, default_value_t = 30)]
     pub gop_size: usize,
 }
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
-    // Default to CABAC v2 capacity (the production encoder path).
-    // The CAVLC legacy path below reports wildly incorrect numbers
-    // (392 KB vs ~8 KB actual) because it transcodes to Baseline
-    // CAVLC and counts CAVLC positions — completely wrong for the
-    // CABAC streaming-session encoder that video-encode uses.
-    #[cfg(feature = "cabac-stego")]
+    // H.264 video capacity is reported by the streaming-session 4-domain
+    // formula (the production OpenH264 encoder path). The legacy CAVLC
+    // capacity scan was retired with the CAVLC stego subsystem (it also
+    // reported wildly incorrect numbers — it counted Baseline-CAVLC
+    // positions, not what the OH264 streaming-session encoder accepts).
+    #[cfg(feature = "h264-encoder")]
     {
-        return run_cabac_v2(args);
+        return run_video_capacity(args);
     }
 
-    let mp4_bytes = std::fs::read(&args.video)?;
-
-    // Phase 4b: H.264 Baseline CAVLC only. Non-Baseline H.264 inputs
-    // (Main/High profile, CABAC) are auto-transcoded to Baseline via
-    // ffmpeg and the capacity is measured on the transcoded copy —
-    // because the capacity of the eventual stego file depends on what
-    // Baseline positions land after re-encoding.
-    let mut transcode_tempfile: Option<std::path::PathBuf> = None;
-    let cap_fn: fn(&[u8]) -> Result<usize, phasm_core::StegoError> = if args.max {
-        h264_ghost_capacity_max
-    } else {
-        h264_ghost_capacity
-    };
-    let info = match detect_video_codec(&mp4_bytes) {
-        VideoCodec::H264 => {
-            let cap = match cap_fn(&mp4_bytes) {
-                Ok(c) => c,
-                Err(e) if transcode::is_non_baseline_error(&e) => {
-                    transcode::ensure_ffmpeg_available()?;
-                    let temp = transcode::temp_transcode_path(&args.video);
-                    eprintln!(
-                        "Input is H.264 but not Baseline CAVLC — transcoding via ffmpeg..."
-                    );
-                    transcode::transcode_to_baseline(&args.video, &temp)?;
-                    transcode_tempfile = Some(temp.clone());
-                    let transcoded = std::fs::read(&temp)?;
-                    cap_fn(&transcoded)?
-                }
-                Err(e) => return Err(CliError::from(e)),
-            };
-            CliVideoCapacityInfo {
-                total_positions: 0,
-                num_i_frames: 0,
-                capacity_bytes: cap,
-                frame_positions: Vec::new(),
-            }
-        }
-        VideoCodec::Hevc => {
-            return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                format!(
-                    "HEVC/H.265 video stego is archived. Transcode first:\n  {}",
-                    transcode::TRANSCODE_SUGGESTION
-                ),
-            )));
-        }
-        VideoCodec::Unknown => {
-            return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                "unsupported or unrecognised video codec (expected H.264 Baseline CAVLC)".into(),
-            )));
-        }
-    };
-    if let Some(temp) = transcode_tempfile {
-        let _ = std::fs::remove_file(&temp);
+    // Without the OpenH264 backend there is no video-encode capacity to
+    // report — the only H.264 surface in a decode-only build is the
+    // walker. Tell the user to rebuild with the encoder feature.
+    #[cfg(not(feature = "h264-encoder"))]
+    {
+        let _ = args;
+        Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+            "H.264 video capacity requires the OpenH264 backend. \
+             Rebuild from source: \
+             `cargo install phasm-cli --features h264-encoder`."
+                .into(),
+        )))
     }
-
-    output::print_video_capacity(&info, args.json);
-
-    Ok(())
 }
 
-/// Task #96 — CABAC v2 capacity branch.
+/// Streaming-session capacity branch.
 ///
-/// Decodes the input MP4 to a temp YUV via ffmpeg (since CABAC v2's
-/// capacity API works on raw pixels), runs Pass-1 cover counting,
-/// and reports primary + shadow capacity. The decode + Pass 1
+/// Decodes the input MP4 to a temp YUV via ffmpeg (since the
+/// capacity API works on raw pixels), runs the OH264 walker cover
+/// count, and reports primary + shadow capacity. The decode + count
 /// together take O(seconds) on 1080p × 10 frames; long clips are
 /// proportionally slower.
-#[cfg(feature = "cabac-stego")]
-fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
+#[cfg(feature = "h264-encoder")]
+fn run_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
     let probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
@@ -135,33 +79,22 @@ fn run_cabac_v2(args: VideoCapacityArgs) -> Result<(), CliError> {
     let _ = std::fs::remove_file(&yuv_path);
 
     let gop_size = args.gop_size.min(probe.n_frames).max(1);
-    // #796 — use OH264-accurate capacity when the production OH264
-    // backend is built in; matches what `StreamingEncodeSession`
-    // actually accepts. Pure-Rust path over-reports by 5-32× on
-    // sparse content (mirrorless cameras, drone aerial).
-    #[cfg(feature = "openh264-backend")]
+    // OH264-accurate capacity, matching what
+    // `StreamingEncodeSession` actually accepts.
     let info = {
-        use phasm_core::h264_stego_capacity_4domain_oh264;
+        use phasm_core::h264_video_capacity;
         use phasm_core::codec::h264::openh264_stego::EncodeOpts;
         let opts = EncodeOpts { qp: 26, intra_period: gop_size as i32 };
-        h264_stego_capacity_4domain_oh264(
+        h264_video_capacity(
             &yuv, probe.width, probe.height, probe.n_frames, opts,
             /* full_tiers — CLI shows the per-tier breakdown */ true,
-        )
-        .map_err(CliError::from)?
-    };
-    #[cfg(not(feature = "openh264-backend"))]
-    let info = {
-        use phasm_core::h264_stego_capacity_4domain;
-        h264_stego_capacity_4domain(
-            &yuv, probe.width, probe.height, probe.n_frames, gop_size,
         )
         .map_err(CliError::from)?
     };
 
     if args.json {
         println!(
-            r#"{{"engine":"cabac-v2","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{},"per_tier_primary_max_message_bytes":[{},{},{},{},{}]}}"#,
+            r#"{{"engine":"video","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{},"per_tier_primary_max_message_bytes":[{},{},{},{},{}]}}"#,
             probe.width, probe.height, probe.n_frames, gop_size,
             info.cover_size_bits,
             info.primary_max_message_bytes,

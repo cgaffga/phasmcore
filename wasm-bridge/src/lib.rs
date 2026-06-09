@@ -818,7 +818,7 @@ pub fn optimize_pixels(
     Ok(optimize_cover(pixels, width, height, &config))
 }
 
-/// T2.4 — Cross-platform empirical STDM LLR byte-equivalence hook.
+/// Cross-platform empirical STDM LLR byte-equivalence hook.
 ///
 /// Returns the lowercase-hex SHA256 of 10,000 deterministic LCG-seeded
 /// `spread_dot_product` calls. Used to verify WASM SIMD128 produces
@@ -829,7 +829,7 @@ pub fn __test_spread_dot_hash() -> String {
     phasm_core::stego::armor::embedding_simd::spread_dot_test_hash_hex()
 }
 
-/// T2.3 — Cross-platform empirical FFT byte-equivalence hook.
+/// Cross-platform empirical FFT byte-equivalence hook.
 ///
 /// Returns the lowercase-hex SHA256 of the deterministic 256×256 FFT
 /// output. The expected value (recorded on aarch64 NEON) is checked
@@ -842,7 +842,7 @@ pub fn __test_fft2d_hash() -> String {
     phasm_core::stego::armor::fft2d::fft2d_test_hash_hex()
 }
 
-/// T3.1.C.3 / E — Cross-platform empirical AAN DCT/IDCT byte-equivalence
+/// Cross-platform empirical AAN DCT/IDCT byte-equivalence
 /// hook. Returns the lowercase-hex SHA256 of the deterministic 12-block
 /// LL&M DCT/IDCT output. Expected value (recorded on aarch64 NEON):
 /// `8affcdb98021d23b1c1ef536f782610f229fac187360f02722bb3470db8446d5`.
@@ -854,7 +854,7 @@ pub fn __test_aan_hash() -> String {
     phasm_core::codec::jpeg::pixels_aan::aan_test_hash_hex()
 }
 
-/// T3.1.E debug — returns the SHA256 of the SCALAR-explicit path (bypassing
+/// Returns the SHA256 of the SCALAR-explicit path (bypassing
 /// SIMD dispatch). Used to confirm the SIMD path is being exercised (the
 /// returned hash should match the canonical aarch64 NEON pin
 /// `8affcdb9…`); if `__test_aan_hash` differs from this scalar value, the

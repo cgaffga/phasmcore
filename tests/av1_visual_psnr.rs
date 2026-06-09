@@ -38,7 +38,7 @@
 //! Tighten to 30 dB once the bug is fixed (the post-fix baseline
 //! should easily exceed that).
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

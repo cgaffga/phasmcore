@@ -59,15 +59,15 @@ def fig_phase4_ceiling() -> None:
     """
     attacks = [
         # (label, class, AUC, half-CI or std, dataset)
-        ("4b multi-LR",      "ensemble",  0.481, 0.144, "BOSSbase n=160"),
-        ("4f white-box gray", "white-box", 0.517, 0.028, "BOSSbase n=79"),
-        ("4f white-box color","white-box", 0.551, 0.011, "ALASKA n=387"),
-        ("4c+4d CNN SRNet",  "cnn",       0.556, 0.003, "BOSSbase n=900×3"),
-        ("4a single feat.",   "single",    0.572, 0.000, "BOSSbase n=160"),
-        ("4e color XGB MIN", "stat-aware",0.685, 0.018, "ALASKA n=387"),
-        ("4e color XGB FULL","stat-aware",0.701, 0.022, "ALASKA n=387"),
-        ("4e gray XGBoost",  "stat-aware",0.803, 0.009, "BOSSbase n=1496"),
-        ("E4 MLP gray",      "stat-aware",0.870, 0.006, "BOSSbase n=1496"),
+        ("Multi-feature LR",     "ensemble",  0.481, 0.144, "BOSSbase n=160"),
+        ("White-box (gray)",     "white-box", 0.517, 0.028, "BOSSbase n=79"),
+        ("White-box (color)",    "white-box", 0.551, 0.011, "ALASKA n=387"),
+        ("CNN SRNet",            "cnn",       0.556, 0.003, "BOSSbase n=900×3"),
+        ("Single feature",       "single",    0.572, 0.000, "BOSSbase n=160"),
+        ("XGBoost (color, min)", "stat-aware",0.685, 0.018, "ALASKA n=387"),
+        ("XGBoost (color, full)","stat-aware",0.701, 0.022, "ALASKA n=387"),
+        ("XGBoost (gray)",       "stat-aware",0.803, 0.009, "BOSSbase n=1496"),
+        ("MLP (gray)",           "stat-aware",0.870, 0.006, "BOSSbase n=1496"),
     ]
     # Wong (Nature 2011) colorblind-safe palette. Avoids the red-green
     # confusion (deuteranopia / protanopia ~5-8% of males).
@@ -113,7 +113,7 @@ def fig_phase4_ceiling() -> None:
                label="trivial-detection threshold (AUC=0.85)")
     ax.set_ylabel("AUC (shadow-count discrimination)", fontsize=10)
     ax.set_ylim(0.4, 0.95)
-    ax.set_title("Phase 4 — Shadow-count deniability AUC ceiling, 9 measured attacks",
+    ax.set_title("Shadow-count deniability: AUC ceiling across nine attacks",
                  fontsize=10)
     # Class legend
     used = set(a[1] for a in attacks)
@@ -220,7 +220,7 @@ def fig_cost_pool_sensitivity() -> None:
     axes[1].set_title("(b) ALASKA-2 color (n=387, 4 seeds × 5 folds)", fontsize=10)
     axes[1].grid(axis="y", linestyle="--", alpha=0.3)
 
-    fig.suptitle("E5 — Cost-pool fraction sensitivity sweep",
+    fig.suptitle("Cost-pool fraction sensitivity sweep",
                  fontsize=11, y=1.02)
     fig.tight_layout()
     out = OUT / "fig_cost_pool_sensitivity.pdf"
@@ -256,7 +256,7 @@ def fig_capacity_sweep() -> None:
     # (Deep-Cover SI bytes are recorded but bpnzAC wasn't computed in the
     # 2026-05-12 sweep; see §6.5 prose for the ~43% boost number.)
     # Wong palette: blue for Ghost, vermilion for Shadow.
-    modes = [("ghost_bpnzAC", "Ghost (J-UNIWARD)", "#0072B2"),
+    modes = [("ghost_bpnzAC", "Primary (J-UNIWARD)", "#0072B2"),
              ("shadow_bpnzAC", "Shadow (cost-pool LSB)", "#D55E00")]
 
     x = np.arange(len(buckets))
@@ -297,8 +297,8 @@ def fig_capacity_sweep() -> None:
                     label="rule of thumb: 5×")
     axes[1].set_xticks(np.arange(len(buckets)))
     axes[1].set_xticklabels([bucket_labels[b] for b in buckets])
-    axes[1].set_ylabel("Shadow / Ghost capacity ratio")
-    axes[1].set_title("(b) Shadow capacity is ≈5× Ghost across buckets",
+    axes[1].set_ylabel("Shadow / primary capacity ratio")
+    axes[1].set_title("(b) Shadow capacity is ≈5× the primary across buckets",
                        fontsize=10)
     # Legend at lower-right (clear of the Real-world bucket's tall error
     # bar that reaches y≈7.5 in the upper-right area).
@@ -423,7 +423,7 @@ def fig_eval_singlemsg_pe() -> None:
             markersize=7, label="J-UNI native (SRNet trained on J-UNI@$p$)")
     ax.plot(payloads_phasm, [phasm_eval[p] for p in payloads_phasm],
             marker="^", linestyle="--", color="#D55E00", linewidth=1.6,
-            markersize=7, label="Phasm Ghost (same detector, cross-stego)")
+            markersize=7, label="Phasm (same detector, cross-stego)")
     ax.axhline(0.5, color="black", linestyle=":", linewidth=0.8,
                label="chance ($P_E = 0.5$)")
     ax.axhline(0.05, color="firebrick", linestyle="--", linewidth=0.6,
@@ -434,7 +434,7 @@ def fig_eval_singlemsg_pe() -> None:
     ax.set_ylim(0.0, 0.55)
     ax.set_xticks([0.05, 0.10, 0.20, 0.30, 0.40, 0.50])
     ax.grid(linestyle="--", alpha=0.3)
-    ax.set_title("Single-message security: Phasm Ghost vs J-UNIWARD reference (BOSSbase QF75)",
+    ax.set_title("Single-message security: Phasm vs J-UNIWARD reference (BOSSbase QF75)",
                  fontsize=9)
     ax.legend(fontsize=8, loc="upper right", framealpha=0.95)
     fig.tight_layout()
@@ -470,6 +470,15 @@ def fig_eval_shadowN_pe() -> None:
         eff_d = json.loads(e15_path.read_text())
         eff_pe_max = [eff_d["per_N"][str(n)]["per_n_max"]["PE"] for n in ns]
 
+    # JIN-pretrained EfficientNet (Tier 2) — answers the "why not JIN?" review
+    # point: a stronger, steganalysis-specific pretrain is still flat on Phasm.
+    jin_path = EVAL / "runs/2026-06-03-jin-T2-shadow-pe-curve/per_n_pe.json"
+    jin_pe_max = None
+    if jin_path.exists():
+        jin_d = json.loads(jin_path.read_text())
+        jin_pe_max = [(lambda v: v["PE"] if isinstance(v, dict) else v)(
+                       jin_d["per_N"][str(n)]["per_n_max"]) for n in ns]
+
     fig, ax = plt.subplots(figsize=(5.6, 3.6))
     # Wong blue (SRNet universal), vermilion (SRNet per-N max),
     # bluish-green (EffNet per-N max) — colorblind-safe palette.
@@ -483,7 +492,11 @@ def fig_eval_shadowN_pe() -> None:
     if eff_pe_max is not None:
         ax.plot(ns, eff_pe_max, marker="s", linestyle="-.",
                 color="#009E73", linewidth=1.6, markersize=7,
-                label=f"EffNet pretrained (per-$N$ max)")
+                label="EffNet ImageNet-pretrained (per-$N$ max)")
+    if jin_pe_max is not None:
+        ax.plot(ns, jin_pe_max, marker="D", linestyle=":",
+                color="#CC79A7", linewidth=1.6, markersize=6,
+                label="EffNet JIN-pretrained (per-$N$ max)")
     ax.axhline(0.5, color="black", linestyle=":", linewidth=0.8,
                label="chance ($P_E = 0.5$)")
     ax.set_xlabel(r"Shadow count $N$")
@@ -493,15 +506,16 @@ def fig_eval_shadowN_pe() -> None:
     # Expand y-range slightly to accommodate EffNet curve (may go below 0.45 if
     # pretrained detector sees through wash-out)
     y_lo, y_hi = 0.45, 0.60
-    if eff_pe_max is not None:
-        y_lo = min(y_lo, min(eff_pe_max) - 0.02)
-        y_hi = max(y_hi, max(eff_pe_max) + 0.02)
+    for _series in (eff_pe_max, jin_pe_max):
+        if _series is not None:
+            y_lo = min(y_lo, min(_series) - 0.02)
+            y_hi = max(y_hi, max(_series) + 0.02)
     ax.set_ylim(y_lo, y_hi)
     ax.set_xlim(-0.3, 4.3)
     ax.grid(linestyle="--", alpha=0.3)
     title = ("Shadow-message security: detection error vs shadow count\n"
-             "BOSSbase QF75; SRNet@p=0.20 detector"
-             + (" + EffNet pretrained" if eff_pe_max is not None else ""))
+             "BOSSbase QF75; from-scratch SRNet vs EffNet "
+             "(ImageNet & JIN pretrained)")
     ax.set_title(title, fontsize=9)
     ax.legend(fontsize=7, loc="upper left", framealpha=0.95)
     fig.tight_layout()

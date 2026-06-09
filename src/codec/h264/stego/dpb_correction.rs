@@ -2,7 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// P3.3a — post-frame DPB correction for inter-frame cascade elimination.
+// Post-frame DPB correction for inter-frame cascade elimination.
+//
+// STATUS: RETAINED BUT DISABLED in production (2026-05-27). Both
+// entry points (`compute_and_apply_deltas` and the per-row
+// `compute_and_apply_deltas_for_row`) only run when `encode_once` is
+// passed a `Some(dpb_cover)`, and the live 2-pass path passes `None`
+// on both passes (see openh264_stego.rs:363 / :641 and the disabled
+// per-row block at :1682). Correcting pDecPic between passes changes
+// the Pass-2 bitstream vs Pass 1, which diverges the cover positions
+// and invalidates the STC plan → roundtrip decode fails on real
+// content. Cascade elimination in the shipping path comes from the
+// wire_only clean-reconstruction approach (encoder reconstruction
+// stays clean by construction), NOT from this module. Kept for a
+// hypothetical future single-pass architecture. The description below
+// documents the mechanism this code implements when enabled.
+//
+// #837 (2026-06-08) re-confirmed KEEP after the dead-code sweep. This
+// module LOOKS dead (every `encode_once` call passes `dpb_cover: None`,
+// and `ROW_DPB_STATE` is never set), but deleting it means dropping the
+// `dpb_cover` parameter from `encode_once` across 12 call sites + the
+// dormant per-row callback machinery — a signature refactor in the core
+// encode path for provably-inert code. Deliberately retained instead;
+// `transform.rs` is its paired oracle. See
+// `docs/design/video/_RETIREMENT-PLAN.md` §8.
 //
 // After each frame's CABAC emit (Pass 2), the wire_only path has
 // already written the stego bits to the bitstream but the encoder's
@@ -18,11 +41,11 @@
 //
 // Scope: CSB (CoeffSignBypass) + CSL (CoeffSuffixLsb) luma 4×4
 // blocks only. MVD domains don't have a pixel-block
-// interpretation; chroma correction is a follow-on (P3.3c).
+// interpretation; chroma correction is a follow-on.
 
 use std::collections::HashMap;
 
-use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
+use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, SyntaxPath};
 use crate::codec::h264::stego::inject::DomainCover;
 use crate::codec::h264::tables::ZIGZAG_4X4;
@@ -405,7 +428,7 @@ fn apply_delta_to_plane(
     }
 }
 
-/// D2.2 — per-row variant: apply IDCT deltas only for MBs whose
+/// Per-row variant: apply IDCT deltas only for MBs whose
 /// `mb_addr / mb_width == mb_row`. Called from the row-complete
 /// callback so the NEXT row's vertical intra prediction reads
 /// post-flip pixels within the same frame.

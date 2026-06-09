@@ -5,7 +5,7 @@
 //! #493.4 Phase 3 — OH264 per-GOP 4-domain primitive integration test.
 //!
 //! Mirror of Phase 2's `h264_4domain_primitive_493_2.rs` for the OH264
-//! backend. Verifies the new `encode_yuv_with_pre_framed_bits_4domain`
+//! backend. Verifies the new `h264_encode_gop_framed_bits_auto`
 //! at the primitive level: encode → walk → combine_cover_4domain →
 //! stc_extract → compare to original frame bits.
 //!
@@ -14,13 +14,18 @@
 //! Phase 4 / #493.5 will swap the call site once the matching combined-
 //! cover decoder lands.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+// DISABLED — do not reactivate without the source fix. Exercises the known
+// 4-domain capacity gap (#493.4 / #505, deferred to retirement Phase 6). It
+// was previously dead-gated on the removed pure-Rust `h264-encoder` feature;
+// the openh264-backend→h264-encoder rename (Phase 5) would have silently
+// reactivated it, so it is now explicitly disabled via `cfg(any())`.
+#![cfg(any())]
 
 use phasm_core::codec::h264::cabac::bin_decoder::slice::{
     walk_annex_b_for_cover_with_options, WalkOptions,
 };
 use phasm_core::codec::h264::openh264_stego::{
-    encode_yuv_with_pre_framed_bits_4domain, EncodeOpts,
+    h264_encode_gop_framed_bits_auto, EncodeOpts,
 };
 use phasm_core::codec::h264::stego::{combine_cover_4domain, CostWeights};
 use phasm_core::codec::h264::stego::orchestrate::DomainCosts;
@@ -89,7 +94,7 @@ fn encode_and_extract(
         qp,
         intra_period: n_frames as i32,
     };
-    let annex_b = encode_yuv_with_pre_framed_bits_4domain(
+    let annex_b = h264_encode_gop_framed_bits_auto(
         &yuv, width, height, n_frames, opts, frame_bits, hhat_seed, weights,
     )
     .expect("OH264 4-domain encode");
@@ -247,7 +252,7 @@ fn oh264_4domain_primitive_diagnose_plan_vs_walker_pass2() {
     eprintln!("  plan: {} positions to flip", planned_flips.len());
 
     // ── Pass-2: stego encode via primitive ──
-    let stego_annex_b = encode_yuv_with_pre_framed_bits_4domain(
+    let stego_annex_b = h264_encode_gop_framed_bits_auto(
         &yuv, w_dim, h_dim, n_dim, opts, &frame_bits, &hhat_seed, &weights,
     ).expect("primitive encode");
     let stego_walked = walk_annex_b_for_cover_with_options(&stego_annex_b, full_walk_options())
@@ -352,7 +357,7 @@ fn oh264_4domain_primitive_diagnose_uniform_weights() {
     let hhat_seed = [0x77u8; 32];
     let m_total = frame_bits.len();
 
-    let annex_b = encode_yuv_with_pre_framed_bits_4domain(
+    let annex_b = h264_encode_gop_framed_bits_auto(
         &yuv, 320, 240, 2, opts, &frame_bits, &hhat_seed, &weights,
     ).expect("encode");
     let walked = walk_annex_b_for_cover_with_options(&annex_b, full_walk_options())
@@ -443,7 +448,7 @@ fn oh264_4domain_primitive_rejects_empty_frame_bits() {
     let yuv = build_yuv_clip(128, 80, 2);
     let opts = EncodeOpts { qp: 26, intra_period: 2 };
     let weights = CostWeights::default();
-    let err = encode_yuv_with_pre_framed_bits_4domain(
+    let err = h264_encode_gop_framed_bits_auto(
         &yuv, 128, 80, 2, opts, &[], &[0u8; 32], &weights,
     )
     .expect_err("empty frame_bits should error");

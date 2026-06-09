@@ -2,145 +2,41 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Decode-side position recorder for paired stego decode (Phase
-// 6D.8 chunk 6A).
+// Decode-side position recorder for paired stego decode.
 //
-// Symmetric to the encoder-side `PositionLoggerHook`: as the slice
-// walker (chunk 6B+) decodes each macroblock, it pipes the already-
-// decoded coefficients + MVD slots into this recorder, which
-// enumerates per-domain positions + bit values in the same order
-// the encoder emitted them. The accumulated `DomainCover` then
-// feeds STC extract (per-domain) → frame parse → decrypt → message
-// recovery.
+// Symmetric to the encode-side cover capture: as the slice walker
+// decodes each macroblock, it pipes the already-decoded
+// coefficients + MVD slots into this recorder, which enumerates
+// per-domain positions + bit values in the same order the OH264
+// encoder's wire_only emit produced them. The accumulated
+// `DomainCover` then feeds STC extract (per-domain) → frame parse →
+// decrypt → message recovery.
 //
 // Costs are intentionally NOT tracked here. Pass 2 (STC plan) ran at
 // encode time; the decoder only needs the cover bits + positions to
 // reverse the embed. Skipping cost vectors keeps the decoder light.
 //
-// **Parity with `PositionLoggerHook`**: by-construction. Both call
-// the same `enumerate_*_positions` + `extract_*_bits` primitives
-// from `crate::codec::h264::stego` on identical (scan_coeffs,
-// MvdSlot) inputs in identical (frame_idx, mb_addr, path_kind)
-// contexts. By the encode-time stego invariant (post-quantize hook
-// fires before entropy emit; decoder dequantize produces the same
-// scan_coeffs the encoder entropy-coded), inputs match.
+// **Parity with the encode-side cover capture**: by-construction.
+// Both sides call the same `enumerate_*_positions` + `extract_*_bits`
+// primitives from `crate::codec::h264::stego` (the shared
+// `stego::inject` helpers) on identical (scan_coeffs, MvdSlot) inputs
+// in identical (frame_idx, mb_addr, path_kind) contexts. By the
+// encode-time stego invariant (the OH264 wire_only override is keyed
+// off the post-quantize coefficients before entropy emit; decoder
+// dequantize produces the same scan_coeffs the encoder entropy-
+// coded), inputs match.
 
 use crate::codec::h264::stego::{
     record_residual_block_into_cover,
-    enumerate_coeff_sign_positions, enumerate_coeff_suffix_lsb_positions,
     enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
-    extract_coeff_sign_bits, extract_coeff_suffix_lsb_bits,
     extract_mvd_sign_bits, extract_mvd_suffix_lsb_bits,
     Axis, BinKind, DomainCover, MvdSlot, ResidualPathKind,
 };
-use crate::codec::h264::stego::encoder_hook::MvdPositionMeta;
-use crate::codec::h264::stego::hook::{
-    EmbedDomain, GopCapacity, PositionKey, PositionLogger,
-};
+use crate::codec::h264::stego::hook::MvdPositionMeta;
 
-/// Phase C.3.6.1 (task #428) — RBSP bit offset + NAL index of a
-/// single bypass-coded bin. Captured by the walker before the bin is
-/// read, so a downstream caller can re-locate the exact byte+bit in
-/// the original (post-emulation-prevention-strip) RBSP. The Option C
-/// bitstream-mod stego splicer uses this to flip selected cover bits
-/// directly in the encoded Annex-B stream without re-encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct PositionOffset {
-    /// RBSP bit position of the bypass-coded bin, measured from the
-    /// start of the NAL's RBSP (i.e. after the leading NAL header
-    /// byte is consumed and emulation-prevention triplets `0x000003`
-    /// have been stripped to `0x0000`).
-    pub rbsp_bit: u64,
-    /// Zero-based index into the input NALU sequence identifying
-    /// which slice NAL contains this bypass bin.
-    pub nal_idx: u32,
-}
-
-/// Phase C.3.6.1 — four parallel vectors of `PositionOffset`, one per
-/// stego domain, populated 1:1 with each domain's cover-bit vector in
-/// `DomainCover` when `WalkOptions::record_offsets` is set.
-///
-/// **Index alignment**: `offsets.coeff_sign_bypass[i]` is the byte+bit
-/// offset of `cover.coeff_sign_bypass.bits[i]`. The walker guarantees
-/// this by capturing offsets at the same syntax sites that the
-/// encoder's `PositionLoggerHook` + decoder's `enumerate_*_positions`
-/// derive cover bits from, in the same scan order.
-#[derive(Default, Debug, Clone)]
-pub struct DomainOffsets {
-    pub coeff_sign_bypass: Vec<PositionOffset>,
-    pub coeff_suffix_lsb: Vec<PositionOffset>,
-    pub mvd_sign_bypass: Vec<PositionOffset>,
-    pub mvd_suffix_lsb: Vec<PositionOffset>,
-}
-
-impl DomainOffsets {
-    pub fn total_len(&self) -> usize {
-        self.coeff_sign_bypass.len()
-            + self.coeff_suffix_lsb.len()
-            + self.mvd_sign_bypass.len()
-            + self.mvd_suffix_lsb.len()
-    }
-}
-
-/// Phase C.3.6.1 — `PositionLogger` impl that captures
-/// `(rbsp_bit_offset, nal_idx)` per domain into a `DomainOffsets`.
-/// Plugged into the 5 inner `PositionCtx` construction sites in the
-/// walker when `WalkOptions::record_offsets` is set; otherwise those
-/// sites use `NullLogger` and pay no per-bin cost.
-///
-/// Capacity tracking is not relevant here — the recorder's per-domain
-/// `cover` vectors already track length. `capacity()` returns the
-/// running per-domain offset count for diagnostic parity.
-#[derive(Default, Debug)]
-pub struct OffsetCapturingLogger {
-    pub offsets: DomainOffsets,
-}
-
-impl OffsetCapturingLogger {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl PositionLogger for OffsetCapturingLogger {
-    #[inline]
-    fn register(&mut self, _key: PositionKey) -> bool {
-        // The walker-side recorder derives positions from enumerate_*
-        // post-decode, so the trait's register() is a no-op here — the
-        // log of cover bits is on `PositionRecorder`, not on us.
-        true
-    }
-
-    #[inline]
-    fn capacity(&self) -> GopCapacity {
-        GopCapacity {
-            coeff_sign_bypass: self.offsets.coeff_sign_bypass.len(),
-            coeff_suffix_lsb: self.offsets.coeff_suffix_lsb.len(),
-            mvd_sign_bypass: self.offsets.mvd_sign_bypass.len(),
-            mvd_suffix_lsb: self.offsets.mvd_suffix_lsb.len(),
-        }
-    }
-
-    #[inline]
-    fn register_with_offset(
-        &mut self,
-        key: PositionKey,
-        rbsp_bit_offset: u64,
-        nal_idx: u32,
-    ) -> bool {
-        let off = PositionOffset { rbsp_bit: rbsp_bit_offset, nal_idx };
-        match key.domain() {
-            EmbedDomain::CoeffSignBypass => self.offsets.coeff_sign_bypass.push(off),
-            EmbedDomain::CoeffSuffixLsb => self.offsets.coeff_suffix_lsb.push(off),
-            EmbedDomain::MvdSignBypass => self.offsets.mvd_sign_bypass.push(off),
-            EmbedDomain::MvdSuffixLsb => self.offsets.mvd_suffix_lsb.push(off),
-        }
-        true
-    }
-}
-
-/// Decode-side recorder. Mirrors `stego::PositionLoggerHook`
-/// but takes immutable inputs (decoded coefficients aren't mutated)
+/// Decode-side recorder. Mirrors the encode-side cover capture
+/// (the shared `stego::inject` enumerate/extract primitives) but
+/// takes immutable inputs (decoded coefficients aren't mutated)
 /// and skips cost tracking (decoder doesn't replan).
 ///
 /// **Usage**: the slice walker calls `on_residual_block` after each
@@ -151,18 +47,12 @@ impl PositionLogger for OffsetCapturingLogger {
 #[derive(Debug, Default)]
 pub struct PositionRecorder {
     cover: DomainCover,
-    /// Phase 6F.2(j) — per-MVD-position metadata aligned by index
-    /// with `cover.mvd_sign_bypass.positions`. Mirrors the encoder's
-    /// `PositionLoggerHook::mvd_meta`. Drained via `take_mvd_meta()`
-    /// for the cascade-safety analysis at decode time.
+    /// Per-MVD-position metadata aligned by index with
+    /// `cover.mvd_sign_bypass.positions`. Mirrors the per-MVD
+    /// metadata the encode-side cover capture records. Drained via
+    /// `take_mvd_meta()` for the cascade-safety analysis at decode
+    /// time.
     mvd_meta: Vec<MvdPositionMeta>,
-    /// Phase C.3.6.1 (task #428) — opt-in capture of RBSP bit
-    /// offsets, one entry per cover bit per domain. `None` keeps the
-    /// walker on the zero-cost NullLogger fast path; `Some(_)`
-    /// activates per-bin offset push at the 5 inner production sites
-    /// in slice.rs. Toggled by `WalkOptions::record_offsets` in the
-    /// top-level walker entry points.
-    pub offset_logger: Option<OffsetCapturingLogger>,
 }
 
 impl PositionRecorder {
@@ -170,25 +60,7 @@ impl PositionRecorder {
         Self::default()
     }
 
-    /// Phase C.3.6.1 — construct a recorder that captures RBSP bit
-    /// offsets in addition to cover bits. Equivalent to
-    /// `let mut r = PositionRecorder::new(); r.enable_offset_capture();`.
-    pub fn with_offsets() -> Self {
-        Self {
-            offset_logger: Some(OffsetCapturingLogger::new()),
-            ..Self::default()
-        }
-    }
-
-    /// Phase C.3.6.1 — opt-in to offset capture mid-stream. Idempotent
-    /// when capture is already enabled.
-    pub fn enable_offset_capture(&mut self) {
-        if self.offset_logger.is_none() {
-            self.offset_logger = Some(OffsetCapturingLogger::new());
-        }
-    }
-
-    /// #516.1 perf — pre-size cover Vecs from MB count.
+    /// Pre-size cover Vecs from MB count to cut reallocations.
     ///
     /// Called by the walker after SPS parse, once `mb_count = mb_w *
     /// mb_h` is known for the slice. Per-domain heuristics based on
@@ -213,7 +85,7 @@ impl PositionRecorder {
     /// Total upfront cap at 1080p (241k MBs): ~482k + 121k + 60k + 30k
     /// = 693k entries × ~25 bytes avg = ~17 MB. At 60-frame GOP
     /// long-form (482k MBs): ~34 MB worst case. Stays well under the
-    /// per-GOP memory bound from `streaming-Viterbi` (#472).
+    /// per-GOP streaming memory bound.
     pub fn reserve_for_mb_count(&mut self, mb_count: usize) {
         self.cover.coeff_sign_bypass.reserve(mb_count * 2);
         self.cover.coeff_suffix_lsb.reserve(mb_count / 2);
@@ -234,18 +106,11 @@ impl PositionRecorder {
         std::mem::take(&mut self.cover)
     }
 
-    /// Phase 6F.2(j) — drain the per-MVD-position metadata captured
-    /// alongside the cover. Aligned by index with
+    /// Drain the per-MVD-position metadata captured alongside the
+    /// cover. Aligned by index with
     /// `take_cover().mvd_sign_bypass.positions`.
     pub fn take_mvd_meta(&mut self) -> Vec<MvdPositionMeta> {
         std::mem::take(&mut self.mvd_meta)
-    }
-
-    /// Phase C.3.6.1 — drain captured offsets. Returns `None` if
-    /// offset capture was never enabled on this recorder; returns
-    /// `Some(empty)` if enabled but no bypass bins were emitted.
-    pub fn take_offsets(&mut self) -> Option<DomainOffsets> {
-        self.offset_logger.as_mut().map(|ol| std::mem::take(&mut ol.offsets))
     }
 
     /// Record a residual block's bypass-bin positions + bits across
@@ -264,9 +129,9 @@ impl PositionRecorder {
         end_idx: usize,
         path_kind: ResidualPathKind,
     ) {
-        // #516.1.b perf — fused single-pass walker that pushes
-        // CoeffSign + CoeffSuffixLsb (bit, position) directly into
-        // the cover Vecs. The legacy implementation built 4
+        // Fused single-pass walker that pushes CoeffSign +
+        // CoeffSuffixLsb (bit, position) directly into the cover
+        // Vecs. The legacy implementation built 4
         // intermediate Vecs per call (sig indices, positions, sig
         // indices again, bits) — at ~16 residual blocks per MB ×
         // 241k MBs (1080p × 30f) = ~3.86M small alloc/free pairs
@@ -301,9 +166,10 @@ impl PositionRecorder {
         for (p, b) in positions.iter().zip(bits.iter()) {
             self.cover.mvd_sign_bypass.push(*b, *p);
         }
-        // Phase 6F.2(j) — capture per-position metadata aligned with
+        // Capture per-position metadata aligned with
         // mvd_sign_bypass. `enumerate_mvd_sign_positions` filters
-        // zero-valued slots, matching the encoder's PositionLoggerHook.
+        // zero-valued slots, matching the shared encode-side
+        // enumerate primitive.
         let pushed = self.cover.mvd_sign_bypass.len() - pre_sign_len;
         if pushed > 0 {
             self.mvd_meta.push(MvdPositionMeta {
@@ -328,7 +194,6 @@ impl PositionRecorder {
 mod tests {
     use super::*;
     use crate::codec::h264::stego::Axis;
-    use crate::codec::h264::stego::encoder_hook::{PositionLoggerHook, StegoMbHook};
 
     #[test]
     fn recorder_residual_block_collects_per_domain() {
@@ -374,105 +239,4 @@ mod tests {
         assert_eq!(cover.mvd_suffix_lsb.len(), 0);
     }
 
-    /// Parity gate vs `PositionLoggerHook` (encode side). Same
-    /// inputs ⇒ same per-domain positions + bits. This is the
-    /// load-bearing invariant for chunk 6: STC extract on the
-    /// decode-side cover must operate on cover bits identical to
-    /// what STC embed saw at encode time.
-    #[test]
-    fn recorder_matches_encoder_position_logger_hook() {
-        let mut scan: Vec<i32> = (0..16).map(|i| ((i * 13) as i32) - 50).collect();
-        let logger_scan_input = scan.clone();
-        let path = ResidualPathKind::Luma4x4 { block_idx: 3 };
-
-        // Encode-side: PositionLoggerHook reads (and does not
-        // mutate) scan_coeffs.
-        let mut logger = PositionLoggerHook::new();
-        logger.on_residual_block(
-            7, 42, &mut scan, 0, 15, path,
-        );
-        let logger_cover = logger.take_cover();
-
-        // PositionLoggerHook is non-mutating — confirm and use the
-        // pristine input for the recorder.
-        assert_eq!(scan, logger_scan_input,
-            "PositionLoggerHook must not mutate scan");
-
-        let mut rec = PositionRecorder::new();
-        rec.on_residual_block(
-            7, 42, &scan, 0, 15, path,
-        );
-        let rec_cover = rec.into_cover();
-
-        // Same positions, same bits in the same order.
-        assert_eq!(
-            rec_cover.coeff_sign_bypass.positions,
-            logger_cover.cover.coeff_sign_bypass.positions,
-            "coeff_sign_bypass positions must match"
-        );
-        assert_eq!(
-            rec_cover.coeff_sign_bypass.bits,
-            logger_cover.cover.coeff_sign_bypass.bits,
-            "coeff_sign_bypass bits must match"
-        );
-        // CASCADE.P1.2/P1.3 — walker and encoder must agree on the
-        // coefficient magnitudes captured per position, byte-for-byte.
-        // Both paths read the same `scan_coeffs` array in the same
-        // reverse-scan-over-nonzero order, so this is equality by
-        // construction, but the assert pins it down so future changes
-        // can't drift one side without the other.
-        assert_eq!(
-            rec_cover.coeff_sign_bypass.magnitudes,
-            logger_cover.cover.coeff_sign_bypass.magnitudes,
-            "coeff_sign_bypass magnitudes must match (walker ↔ encoder)"
-        );
-        assert!(
-            rec_cover.coeff_sign_bypass.magnitudes.iter().all(|&m| m > 0),
-            "every CoeffSign magnitude must be positive (|coeff| ≥ 1)"
-        );
-        assert_eq!(
-            rec_cover.coeff_suffix_lsb.positions,
-            logger_cover.cover.coeff_suffix_lsb.positions,
-            "coeff_suffix_lsb positions must match"
-        );
-        assert_eq!(
-            rec_cover.coeff_suffix_lsb.bits,
-            logger_cover.cover.coeff_suffix_lsb.bits,
-            "coeff_suffix_lsb bits must match"
-        );
-        assert_eq!(
-            rec_cover.coeff_suffix_lsb.magnitudes,
-            logger_cover.cover.coeff_suffix_lsb.magnitudes,
-            "coeff_suffix_lsb magnitudes must match (walker ↔ encoder)"
-        );
-    }
-
-    #[test]
-    fn recorder_mvd_matches_encoder_position_logger_hook() {
-        let mut slot = MvdSlot { list: 0, partition: 1, axis: Axis::Y, value: -23 };
-        let mut logger = PositionLoggerHook::new();
-        logger.on_mvd_slot(11, 99, &mut slot);
-        let logger_cover = logger.take_cover();
-
-        let mut rec = PositionRecorder::new();
-        rec.on_mvd_slot(11, 99, &slot);
-        let rec_cover = rec.into_cover();
-
-        assert_eq!(
-            rec_cover.mvd_sign_bypass.positions,
-            logger_cover.cover.mvd_sign_bypass.positions,
-        );
-        assert_eq!(
-            rec_cover.mvd_sign_bypass.bits,
-            logger_cover.cover.mvd_sign_bypass.bits,
-        );
-        assert_eq!(
-            rec_cover.mvd_suffix_lsb.positions,
-            logger_cover.cover.mvd_suffix_lsb.positions,
-        );
-        assert_eq!(
-            rec_cover.mvd_suffix_lsb.bits,
-            logger_cover.cover.mvd_suffix_lsb.bits,
-        );
-    }
 }

@@ -6,14 +6,13 @@
 //! libjpeg-turbo's `jfdctint.c` / `jidctint.c` "slow integer", ported
 //! to pure Rust).
 //!
-//! ## Status — Phase T3.1.A (2026-05-21)
+//! ## Status
 //!
-//! Scalar baseline, gated behind the `aan-dct` Cargo feature. **No call
-//! sites switched** — this module is pure additive code that lives
-//! alongside the existing f64 [`crate::codec::jpeg::pixels`] kernels.
-//! The switchover happens in Phase B sub-phases (B.1 armor, B.2 ghost
-//! UNIWARD cost, B.4 codec helpers). Phases C / D / E add NEON /
-//! AVX2 / WASM SIMD intrinsic paths underneath this same scalar
+//! This is the sole production DCT/IDCT path: it has fully replaced the
+//! older f64 [`crate::codec::jpeg::pixels`] kernels at every call site
+//! (armor, ghost UNIWARD cost, codec helpers). A scalar baseline sits
+//! behind the per-architecture NEON / AVX2 / WASM SIMD intrinsic paths
+//! (see [`crate::codec::jpeg::pixels_aan_simd`]), all sharing this same
 //! interface. See `docs/design/image/t3.1-integer-aan.md`.
 //!
 //! ## Algorithm choice
@@ -52,8 +51,8 @@
 //! input. Every pixel produced by [`aan_idct_block`] differs from
 //! [`crate::codec::jpeg::pixels::idct_block`] by ≤ 1 (in pixel-value
 //! units, i.e., ≤ 1 of 256 levels). This envelope IS the canonical
-//! spec — once Phase F flips the default, this module's output is the
-//! reference and the f64 path is retired.
+//! spec — this module's output is the reference; the f64 path is
+//! kept only as the parity oracle these envelopes are measured against.
 //!
 //! ## References
 //!
@@ -66,7 +65,7 @@
 //!   shared constant).
 //! - `naoto256/jpeg-rusturbo` v0.3.0 (2026-05-20, MIT/Apache-2.0) —
 //!   pure-Rust port of the same algorithm with NEON + AVX2 stable-Rust
-//!   intrinsic paths. Phase C/D ports mine from this crate.
+//!   intrinsic paths; the NEON / AVX2 kernels here are ported from it.
 
 /// Number of fractional bits in the trig constants.
 const CONST_BITS: u32 = 13;
@@ -101,11 +100,11 @@ const fn descale(x: i32, n: u32) -> i32 {
 //
 // `fdct_kernel` / `idct_kernel` are the bare LL&M math, with API shapes
 // that match libjpeg-turbo's SIMD convention (in-place i16 fdct;
-// dequant-included i16-in / i32-out idct). Phase C and Phase D plug a
-// per-architecture SIMD implementation underneath these signatures; the
-// public wrappers `aan_dct_block` / `aan_idct_block` are unchanged in
-// behavior. See `docs/design/image/t3.1-integer-aan.md` § 2.2 and
-// `memory/t3_1_jpeg_rusturbo_pin.md`.
+// dequant-included i16-in / i32-out idct). The per-architecture SIMD
+// implementations plug in underneath these signatures; the public
+// wrappers `aan_dct_block` / `aan_idct_block` are behavior-identical to
+// the scalar kernels. See `docs/design/image/t3.1-integer-aan.md` § 2.2
+// and `memory/t3_1_jpeg_rusturbo_pin.md`.
 
 /// Bare LL&M forward DCT, in-place. Input MUST be pre-level-shifted
 /// (caller subtracts 128 from sample values and clamps to i16). Output
@@ -513,14 +512,13 @@ pub fn aan_idct_block(quantized: &[i16; 64], qt: &[u16; 64]) -> [f64; 64] {
 }
 
 // ============================================================================
-// Cross-platform empirical equivalence — T3.1.C.3
+// Cross-platform empirical equivalence
 // ============================================================================
 //
 // Deterministic test fixture + SHA256 helpers. The test lives in
 // `core/tests/pixels_aan_cross_platform.rs` and asserts the same hash on
-// aarch64 NEON, x86_64 (scalar today, AVX2 in Phase D), and WASM
-// SIMD128 (Phase E). If any path's hash diverges → the integer LL&M
-// IS-determinism claim broke; Phase F gate fails.
+// aarch64 NEON, x86_64 AVX2, and WASM SIMD128. If any path's hash
+// diverges → the integer LL&M cross-platform-determinism claim broke.
 //
 // Listed at module level (not under #[cfg(test)]) so the test can be
 // re-run from wasm-bridge under V8/Node.

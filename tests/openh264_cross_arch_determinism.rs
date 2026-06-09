@@ -34,14 +34,14 @@
 //
 // Run locally:
 //   PHASM_DETERMINISTIC_SEED=42 cargo test --release \
-//     --features "h264-encoder openh264-backend" \
+//     --features "h264-encoder" \
 //     --test openh264_cross_arch_determinism -- --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use sha2::{Digest, Sha256};
 
 /// Self-contained YUV fixture. Synthetic content so the test runs in
@@ -99,9 +99,11 @@ fn cross_arch_determinism_record_hash() {
     }
 
     let yuv = synthetic_yuv();
-    let stego = openh264_stego_encode_yuv_text(
+    // Production 4-domain streaming session. N==4 with intra_period 4 is a
+    // single GOP, so `encode` (gop_size = n_frames) reproduces the geometry.
+    let stego = oh264_stream::encode(
         &yuv, W, H, N,
-        EncodeOpts { qp: 26, intra_period: 4 },
+        26,
         "phasm cross-arch determinism v1",
         "cross-arch-pass",
     ).expect("oh264 stego encode");
@@ -145,8 +147,15 @@ fn cross_arch_determinism_record_hash() {
     //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
+    // Re-baselined for the production 4-domain streaming path
+    // (video-retirement Phase 6). The retired single-domain one-shot
+    // produced the old hash (1ff0a63f…35a1); the streaming session writes
+    // a genuinely different — but same-length (47128 B) — 4-domain
+    // bitstream. Pinned here from macOS aarch64; CI MUST confirm the
+    // Linux x86_64 + aarch64 hashes match it (the cross-arch determinism
+    // claim) per the workflow_dispatch re-pin protocol documented above.
     const PINNED_SHA256: &str =
-        "1ff0a63fb6a5b90ae05992b2e67c52de7472c3840a42e4ce32f52ecc27ae35a1";
+        "597e1db6e403e98454a9218bae3c8dc4178581c0302677668cb1a94dd618236d";
     const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,

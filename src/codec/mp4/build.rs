@@ -53,7 +53,7 @@
 //!   (§Stealth.L3.1 follow-on / I_8x8 walker support).
 //! - Audio track passthrough — separate task.
 
-use super::{write_u32, write_u64, AvccData, Mp4Error};
+use super::{write_u32, write_u64, Av1cData, AvccData, Mp4Error};
 use crate::codec::h264::NalType;
 #[cfg(feature = "h264-encoder")]
 use crate::codec::h264::stego::gop_pattern::{iter_encode_order, FrameType, GopPattern};
@@ -760,7 +760,7 @@ fn build_video_trak_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
 /// the IDR from display output and producing a 1-frame
 /// presentation-time shift that read as ~5–10 dB Y-PSNR vs source.
 ///
-/// See `docs/design/video/h264/encoder-quality-perf-gap-2026-05-04.md`.
+/// See `docs/design/video/_archive/h264/encoder-quality-perf-gap-2026-05-04.md`.
 ///
 /// Kept around as `_unused` for diff readability — caller never invokes.
 #[allow(dead_code)]
@@ -971,6 +971,53 @@ fn build_avc1(width: u32, height: u32, avcc: &AvccData) -> Vec<u8> {
     wrap_box(b"avc1", &content)
 }
 
+/// VP.M.1 — stsd builder for AV1 video tracks. Mirror of
+/// [`build_stsd_avc1`] but emits an `av01` sample entry wrapping an
+/// `av1C` config box. Used by [`build_mp4_av1`] (VP.M.2+).
+#[allow(dead_code)] // Used by build_mp4_av1 once VP.M.2 lands.
+fn build_stsd_av01(width: u32, height: u32, av1c: &Av1cData) -> Vec<u8> {
+    let av01 = build_av01(width, height, av1c);
+    let mut content = Vec::new();
+    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+    content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+    content.extend_from_slice(&av01);
+    wrap_box(b"stsd", &content)
+}
+
+/// VP.M.1 — `av01` VisualSampleEntry builder. The ISO/IEC 14496-12
+/// VisualSampleEntry layout (§ 8.5.2) is codec-agnostic — same 78
+/// bytes as `avc1` — the only difference is the fourcc and the
+/// trailing codec-specific config box (`av1C` for AV1 vs `avcC` for
+/// H.264).
+///
+/// Per AV1-ISOBMFF § 2.2.1, the `av01` sample entry MAY also include
+/// optional `colr` / `pasp` boxes. VP.M.1 emits only `av1C` for the
+/// MVP; color VUI passthrough (VP.9) adds `colr` later.
+#[allow(dead_code)] // Used by build_mp4_av1 once VP.M.2 lands.
+fn build_av01(width: u32, height: u32, av1c: &Av1cData) -> Vec<u8> {
+    // VisualSampleEntry layout per ISO/IEC 14496-12 §8.5.2.
+    let mut content = Vec::new();
+    content.extend_from_slice(&[0; 6]); // reserved
+    content.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
+    content.extend_from_slice(&[0; 2]); // pre_defined
+    content.extend_from_slice(&[0; 2]); // reserved
+    content.extend_from_slice(&[0; 12]); // pre_defined[3]
+    content.extend_from_slice(&(width as u16).to_be_bytes());
+    content.extend_from_slice(&(height as u16).to_be_bytes());
+    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution = 72 dpi
+    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution = 72 dpi
+    content.extend_from_slice(&[0; 4]); // reserved
+    content.extend_from_slice(&1u16.to_be_bytes()); // frame_count
+    content.extend_from_slice(&[0; 32]); // compressorname (32-byte Pascal string, all zeros)
+    content.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
+    content.extend_from_slice(&[0xFF, 0xFF]); // pre_defined = -1
+
+    let av1c_box = wrap_box(b"av1C", &av1c.to_bytes());
+    content.extend_from_slice(&av1c_box);
+
+    wrap_box(b"av01", &content)
+}
+
 fn build_stts_uniform(sample_count: u32) -> Vec<u8> {
     // One run: sample_count samples each with delta = STTS_DELTA_PER_FRAME.
     let mut content = Vec::new();
@@ -1056,6 +1103,341 @@ fn build_udta_handbrake() -> Vec<u8> {
     too_content.extend_from_slice(s);
     let too_box = wrap_box(&[0xA9, b't', b'o', b'o'], &too_content);
     wrap_box(b"udta", &too_box)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//  VP.M.3 — AV1-in-MP4 orchestrator
+// ──────────────────────────────────────────────────────────────────────
+
+/// VP.M.3 — top-level entry point: encode an AV1 OBU byte stream
+/// into a valid AV1-in-MP4 (av01) file ready for distribution. Used
+/// by [`crate::codec::av1`] consumers to wrap rav1e output.
+///
+/// **Per VP decision D2 (locked 2026-06-06)**: single cross-platform
+/// Rust muxer. No platform-specific paths (no AVAssetWriter, no
+/// MediaMuxer).
+///
+/// **Scope**: video-only mux. Audio passthrough (when input video
+/// has audio tracks) is the iOS/Android app layer's responsibility
+/// (VP.3 / VP.6).
+///
+/// **Pipeline**:
+///
+/// 1. [`super::av1_obu_split::split_av1_into_samples`] partitions the
+///    OBU stream into a `sequence_header_obu` + per-frame samples +
+///    sync flags.
+/// 2. The SH OBU populates `av1C` via
+///    [`Av1cData::default_yuv420_8bit`] (assumes 4:2:0 8-bit BT.709 —
+///    VP.M's MVP; VP.8 will add proper SH parsing).
+/// 3. Sample byte sizes + offsets are computed assuming
+///    ftyp → mdat → moov layout (HandBrake convention).
+/// 4. The full mp4 byte stream is assembled and returned.
+///
+/// **Errors**: `InvalidBox` if dimensions are zero, frame rate is
+/// zero, OBU stream contains no sequence_header_obu, or OBU stream
+/// contains no frame samples.
+pub fn build_mp4_av1(
+    av1_obus: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+) -> Result<Vec<u8>, Mp4Error> {
+    build_mp4_av1_inner(av1_obus, width, height, timing, None)
+}
+
+/// VP.M.4 — same as [`build_mp4_av1`] but also passes through the
+/// first audio track from `source_mp4`. The source's audio `trak` box
+/// is copied verbatim modulo `track_id` (renumbered to 2) and
+/// `stco`/`co64` (rewritten to point at the audio sample positions in
+/// the new mdat). Codec-agnostic — AAC, Opus, anything the source
+/// carries works the same way because we never touch the audio
+/// codec-config record (`mp4a`/`esds`, `Opus`/`dops`, etc.).
+///
+/// When `source_mp4` has no audio track the result is identical to
+/// [`build_mp4_av1`].
+pub fn build_mp4_av1_with_audio(
+    av1_obus: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    source_mp4: &[u8],
+) -> Result<Vec<u8>, Mp4Error> {
+    let audio = AudioPassthrough::extract_first(source_mp4)?;
+    build_mp4_av1_inner(av1_obus, width, height, timing, audio.as_ref())
+}
+
+fn build_mp4_av1_inner(
+    av1_obus: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    audio: Option<&AudioPassthrough<'_>>,
+) -> Result<Vec<u8>, Mp4Error> {
+    use super::av1_obu_split::split_av1_into_samples;
+
+    if width == 0 || height == 0 {
+        return Err(Mp4Error::InvalidBox(format!(
+            "invalid dimensions {width}x{height}"
+        )));
+    }
+    if timing.fps_num == 0 || timing.fps_den == 0 {
+        return Err(Mp4Error::InvalidBox(format!(
+            "invalid frame rate {}/{}",
+            timing.fps_num, timing.fps_den
+        )));
+    }
+
+    // 1. Split + extract SH.
+    let split = split_av1_into_samples(av1_obus)?;
+    if split.sequence_header_obu.is_empty() {
+        return Err(Mp4Error::InvalidBox(
+            "no sequence_header_obu in stream".into(),
+        ));
+    }
+    if split.samples.is_empty() {
+        return Err(Mp4Error::InvalidBox(
+            "no frame samples in stream".into(),
+        ));
+    }
+    // VP.8: try the real parser first; fall back to default profile
+    // (4:2:0 8-bit BT.709, level 4.0) if the parser doesn't recognize
+    // the OBU syntax. Default is correct for phasm-rav1e's standard
+    // output; the parser improves accuracy for non-standard streams
+    // (different profile / bit depth / chroma config).
+    let av1c = Av1cData::from_sequence_header_obu(split.sequence_header_obu.clone())
+        .unwrap_or_else(|| Av1cData::default_yuv420_8bit(split.sequence_header_obu));
+
+    // 2. Sample layout — video first, then audio (when present).
+    let sample_sizes: Vec<u32> = split.samples.iter().map(|s| s.len() as u32).collect();
+    let video_payload: u64 = sample_sizes.iter().map(|&s| s as u64).sum();
+    let audio_payload: u64 = audio
+        .map(|a| a.samples.iter().map(|s| s.len() as u64).sum::<u64>())
+        .unwrap_or(0);
+    let total_mdat_payload: u64 = video_payload + audio_payload;
+
+    // 3. ftyp + mdat header sizing.
+    let ftyp = build_ftyp_av1();
+    let mdat_header_len: u64 = if total_mdat_payload + 8 > u32::MAX as u64 { 16 } else { 8 };
+    let first_sample_offset = ftyp.len() as u64 + mdat_header_len;
+
+    // 4. Per-video-sample absolute file offsets.
+    let mut sample_offsets: Vec<u64> = Vec::with_capacity(sample_sizes.len());
+    let mut cursor = first_sample_offset;
+    for &size in &sample_sizes {
+        sample_offsets.push(cursor);
+        cursor += size as u64;
+    }
+    // Per-audio-sample absolute offsets — sit right after the video.
+    let mut audio_sample_offsets: Vec<u64> = Vec::new();
+    if let Some(a) = audio {
+        for s in &a.samples {
+            audio_sample_offsets.push(cursor);
+            cursor += s.len() as u64;
+        }
+    }
+
+    // 5. Sync sample indices (1-based per ISO BMFF stss).
+    let sync_samples: Vec<u32> = split
+        .sync
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &s)| if s { Some(i as u32 + 1) } else { None })
+        .collect();
+
+    // 6. Patch the audio trak when present — rewrite stco/co64 + track_id.
+    // Same mechanism the §Stealth.L4.5 H.264 audio passthrough uses
+    // (see `build_handbrake_x264`).
+    let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
+        let mut trak = a.trak_raw.clone();
+        let chunk_offsets: Vec<u64> = a
+            .chunks
+            .iter()
+            .map(|&(first_idx, _spc)| {
+                audio_sample_offsets
+                    .get(first_idx)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .collect();
+        patch_trak_stco(&mut trak, &chunk_offsets)?;
+        patch_trak_track_id(&mut trak, 2)?;
+        Ok::<Vec<u8>, Mp4Error>(trak)
+    }).transpose()?;
+
+    // 7. moov.
+    let mdhd_timescale = handbrake::mdhd_timescale(timing.fps_num, timing.fps_den);
+    let frame_count = sample_sizes.len() as u32;
+    let track_duration_media: u64 =
+        (frame_count as u64) * (handbrake::STTS_DELTA_PER_FRAME as u64);
+    let movie_duration_ms_video: u64 =
+        (frame_count as u64) * 1000 * (timing.fps_den as u64) / (timing.fps_num as u64);
+    // mvhd.duration must cover the longest track. Convert the audio
+    // track's mdhd-timescale duration into movie-timescale (1000 ms/s)
+    // and take the max.
+    let movie_duration_ms = match audio {
+        Some(a) => {
+            let mdhd_ts = read_audio_mdhd_timescale(&a.trak_raw).unwrap_or(48000) as u64;
+            let audio_ms = a.duration_media * (handbrake::MVHD_TIMESCALE as u64) / mdhd_ts;
+            movie_duration_ms_video.max(audio_ms)
+        }
+        None => movie_duration_ms_video,
+    };
+
+    let moov = build_moov_av1(MoovParamsAv1 {
+        width,
+        height,
+        movie_duration_ms,
+        track_duration_media,
+        mdhd_timescale,
+        sample_sizes: &sample_sizes,
+        sample_offsets: &sample_offsets,
+        sync_samples: &sync_samples,
+        av1c: &av1c,
+        audio_trak: audio_trak_patched.as_deref(),
+    });
+
+    // 8. Assemble.
+    let total_size = ftyp.len() as u64
+        + mdat_header_len
+        + total_mdat_payload
+        + moov.len() as u64;
+    let mut out = Vec::with_capacity(total_size as usize);
+    out.extend_from_slice(&ftyp);
+
+    // mdat header — 8-byte for ≤ ~4 GiB payload, 16-byte extended for larger.
+    if mdat_header_len == 8 {
+        out.extend_from_slice(&((total_mdat_payload + 8) as u32).to_be_bytes());
+        out.extend_from_slice(b"mdat");
+    } else {
+        out.extend_from_slice(&1u32.to_be_bytes()); // size=1 signals extended u64 length
+        out.extend_from_slice(b"mdat");
+        out.extend_from_slice(&(total_mdat_payload + 16).to_be_bytes());
+    }
+
+    // Video samples, then audio samples.
+    for s in &split.samples {
+        out.extend_from_slice(s);
+    }
+    if let Some(a) = audio {
+        for s in &a.samples {
+            out.extend_from_slice(s);
+        }
+    }
+
+    // moov.
+    out.extend_from_slice(&moov);
+
+    Ok(out)
+}
+
+/// `ftyp` for AV1-in-MP4. Major brand = `isom`; compatible brands
+/// include `av01` to advertise AV1 capability per
+/// AV1-ISOBMFF § 2.1. Modern decoders use the major brand for
+/// container compatibility checks; av01 in compatible_brands
+/// signals "this file contains AV1 video".
+fn build_ftyp_av1() -> Vec<u8> {
+    let mut content = Vec::new();
+    content.extend_from_slice(b"isom"); // major_brand
+    content.extend_from_slice(&0x0000_0200u32.to_be_bytes()); // minor_version
+    for brand in &[b"isom", b"iso6", b"av01", b"mp41"] {
+        content.extend_from_slice(*brand);
+    }
+    wrap_box(b"ftyp", &content)
+}
+
+/// Parallel of [`MoovParams`] for AV1 — carries an `av1C` config
+/// instead of `avcC`, drops `composition_offsets` (AV1 stego is IPPPP
+/// always; no B-frames). VP.M.4: gained `audio_trak` for source-MP4
+/// audio passthrough.
+struct MoovParamsAv1<'a> {
+    width: u32,
+    height: u32,
+    movie_duration_ms: u64,
+    track_duration_media: u64,
+    mdhd_timescale: u32,
+    sample_sizes: &'a [u32],
+    sample_offsets: &'a [u64],
+    sync_samples: &'a [u32],
+    av1c: &'a Av1cData,
+    /// VP.M.4 — pre-patched audio `trak` box bytes (track_id=2 +
+    /// rewritten stco/co64 offsets). None → video-only mux.
+    audio_trak: Option<&'a [u8]>,
+}
+
+fn build_moov_av1(p: MoovParamsAv1<'_>) -> Vec<u8> {
+    // next_track_ID: 2 video-only; 3 with audio (track 1 = video,
+    // track 2 = audio, next allocates 3).
+    let next_track_id: u32 = if p.audio_trak.is_some() { 3 } else { 2 };
+    let mvhd = build_mvhd(p.movie_duration_ms, next_track_id);
+    let trak = build_video_trak_av1(&p);
+    let udta = build_udta_handbrake(); // Reuse — UDTA is codec-agnostic.
+
+    let mut moov = Vec::new();
+    moov.extend_from_slice(&mvhd);
+    moov.extend_from_slice(&trak);
+    if let Some(audio_trak) = p.audio_trak {
+        moov.extend_from_slice(audio_trak);
+    }
+    moov.extend_from_slice(&udta);
+    wrap_box(b"moov", &moov)
+}
+
+fn build_video_trak_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
+    let tkhd = build_tkhd_video(p.movie_duration_ms, p.width, p.height);
+    let mdia = build_mdia_video_av1(p);
+    let mut trak = Vec::new();
+    trak.extend_from_slice(&tkhd);
+    trak.extend_from_slice(&mdia);
+    wrap_box(b"trak", &trak)
+}
+
+fn build_mdia_video_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
+    let mdhd = build_mdhd(p.track_duration_media, p.mdhd_timescale);
+    let hdlr = build_hdlr_vide();
+    let minf = build_minf_video_av1(p);
+    let mut mdia = Vec::new();
+    mdia.extend_from_slice(&mdhd);
+    mdia.extend_from_slice(&hdlr);
+    mdia.extend_from_slice(&minf);
+    wrap_box(b"mdia", &mdia)
+}
+
+fn build_minf_video_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
+    let vmhd = build_vmhd();
+    let dinf = build_dinf();
+    let stbl = build_stbl_av01(p);
+    let mut minf = Vec::new();
+    minf.extend_from_slice(&vmhd);
+    minf.extend_from_slice(&dinf);
+    minf.extend_from_slice(&stbl);
+    wrap_box(b"minf", &minf)
+}
+
+/// AV1 stbl — same shape as [`build_stbl_video_handbrake`] but emits
+/// an `av01` sample entry, no `ctts` (AV1 stego is IPPPP / no
+/// B-frames), and uses [`chunk_layout_per_gop`] keyed off the AV1
+/// sync sample list.
+fn build_stbl_av01(p: &MoovParamsAv1<'_>) -> Vec<u8> {
+    let chunks = chunk_layout_per_gop(p.sample_sizes.len() as u32, p.sync_samples);
+    let chunk_offsets = chunk_offsets_for_layout(&chunks, p.sample_offsets);
+
+    let stsd = build_stsd_av01(p.width, p.height, p.av1c);
+    let stts = build_stts_uniform(p.sample_sizes.len() as u32);
+    let stsc = build_stsc(&chunks);
+    let stsz = build_stsz(p.sample_sizes);
+    let stco = build_stco(&chunk_offsets);
+    let stss = build_stss(p.sync_samples);
+
+    // stbl child order matches the H.264 path (HandBrake/libavformat
+    // convention): stsd → stts → stss → stsc → stsz → stco.
+    let mut stbl = Vec::new();
+    stbl.extend_from_slice(&stsd);
+    stbl.extend_from_slice(&stts);
+    stbl.extend_from_slice(&stss);
+    stbl.extend_from_slice(&stsc);
+    stbl.extend_from_slice(&stsz);
+    stbl.extend_from_slice(&stco);
+    wrap_box(b"stbl", &stbl)
 }
 
 // ─── SEI synthesis ────────────────────────────────────────────────────
@@ -1431,6 +1813,121 @@ mod tests {
     use super::*;
     use crate::codec::mp4::{is_mp4, parse_box_header};
 
+    // ──────────────────────────────────────────────────────────────
+    //  VP.M.1 — AV1 box builder unit tests
+    // ──────────────────────────────────────────────────────────────
+
+    /// Helper: synthesize a 16-byte fake `sequence_header_obu` for
+    /// av1C ConfigOBU tests. Not a valid AV1 SH, just placeholder bytes.
+    fn fake_sh_obu() -> Vec<u8> {
+        vec![0x0A, 0x0E, 0x00, 0x00, 0x00, 0x42, 0xAB, 0xBF, 0xC3, 0xFB, 0xB3, 0xFE, 0x40, 0x00, 0x00, 0x00]
+    }
+
+    #[test]
+    fn av1c_serialization_default_4_2_0_8bit() {
+        let sh = fake_sh_obu();
+        let av1c = Av1cData::default_yuv420_8bit(sh.clone());
+        let bytes = av1c.to_bytes();
+
+        // 4 header bytes + ConfigOBUs length.
+        assert_eq!(bytes.len(), 4 + sh.len());
+
+        // Byte 0: marker(1)=1, version(7)=1 → 0b1000_0001 = 0x81.
+        assert_eq!(bytes[0], 0x81);
+
+        // Byte 1: seq_profile(3)=0, seq_level_idx_0(5)=8 → 0b000_01000 = 0x08.
+        assert_eq!(bytes[1], 0x08);
+
+        // Byte 2: bits for 4:2:0 8-bit:
+        //   seq_tier_0=0, high_bitdepth=0, twelve_bit=0, monochrome=0,
+        //   chroma_subsampling_x=1, chroma_subsampling_y=1, chroma_sample_position=0
+        //   → 0b0000_1100 = 0x0C.
+        assert_eq!(bytes[2], 0x0C);
+
+        // Byte 3: reserved(3) | initial_presentation_delay_present(1)=0 | reserved(4) = 0.
+        assert_eq!(bytes[3], 0x00);
+
+        // Trailing ConfigOBUs.
+        assert_eq!(&bytes[4..], sh.as_slice());
+    }
+
+    #[test]
+    fn av1c_serialization_high_tier_10bit_4_2_2() {
+        // Non-default profile for coverage of all the bit-field branches.
+        let av1c = Av1cData {
+            configuration_version: 1,
+            seq_profile: 2,                 // 2 = Professional
+            seq_level_idx_0: 16,            // Level 6.0
+            seq_tier_0: 1,                  // High tier
+            high_bitdepth: true,
+            twelve_bit: false,              // → 10-bit
+            monochrome: false,
+            chroma_subsampling_x: true,
+            chroma_subsampling_y: false,    // 4:2:2
+            chroma_sample_position: 2,
+            config_obus: Vec::new(),
+        };
+        let bytes = av1c.to_bytes();
+        assert_eq!(bytes.len(), 4);
+        assert_eq!(bytes[0], 0x81);                                  // marker=1, version=1
+        assert_eq!(bytes[1], (2 << 5) | 16);                         // seq_profile=2, level=16
+        assert_eq!(bytes[2], 0x80 | 0x40 | 0x08 | 0x02);             // tier=1, hi_bd=1, ss_x=1, csp=2
+        assert_eq!(bytes[3], 0x00);
+    }
+
+    #[test]
+    fn build_av01_box_well_formed() {
+        let av1c = Av1cData::default_yuv420_8bit(fake_sh_obu());
+        let av01 = build_av01(1920, 1080, &av1c);
+
+        // First 4 bytes = box size (big-endian u32).
+        let box_size =
+            u32::from_be_bytes([av01[0], av01[1], av01[2], av01[3]]) as usize;
+        assert_eq!(box_size, av01.len(), "size field must match actual length");
+
+        // Next 4 bytes = "av01" fourcc.
+        assert_eq!(&av01[4..8], b"av01", "fourcc must be av01");
+
+        // VisualSampleEntry header is 78 bytes after fourcc (per § 8.5.2).
+        // At byte 8 we have: 6 reserved + 2 data_ref_idx + 2 pre_defined
+        // + 2 reserved + 12 pre_defined[3] = 24 codec-agnostic
+        // before width. Width is bytes 32-33 of the box. Big-endian u16.
+        let width =
+            u16::from_be_bytes([av01[32], av01[33]]) as u32;
+        let height =
+            u16::from_be_bytes([av01[34], av01[35]]) as u32;
+        assert_eq!(width, 1920, "width must be encoded at expected offset");
+        assert_eq!(height, 1080, "height must be encoded at expected offset");
+
+        // av1C box must appear after the 78-byte VisualSampleEntry
+        // header (which lives at bytes [8..86]).
+        assert_eq!(&av01[86 + 4..86 + 8], b"av1C", "av1C box must follow VisualSampleEntry header");
+    }
+
+    #[test]
+    fn build_stsd_av01_well_formed() {
+        let av1c = Av1cData::default_yuv420_8bit(fake_sh_obu());
+        let stsd = build_stsd_av01(1280, 720, &av1c);
+
+        // Box header: size + "stsd".
+        let box_size =
+            u32::from_be_bytes([stsd[0], stsd[1], stsd[2], stsd[3]]) as usize;
+        assert_eq!(box_size, stsd.len());
+        assert_eq!(&stsd[4..8], b"stsd", "fourcc must be stsd");
+
+        // Then version+flags (4 bytes of zero), then entry_count = 1.
+        assert_eq!(&stsd[8..12], &[0, 0, 0, 0], "version+flags");
+        assert_eq!(
+            u32::from_be_bytes([stsd[12], stsd[13], stsd[14], stsd[15]]),
+            1,
+            "entry_count must be 1"
+        );
+
+        // Then the av01 entry starts at byte 16.
+        assert_eq!(&stsd[16 + 4..16 + 8], b"av01", "av01 entry must follow stsd header");
+    }
+
+
     /// Build the minimum viable Annex-B stream: SPS + PPS + AUD + IDR.
     fn build_minimal_annexb() -> Vec<u8> {
         // SPS NAL (header 0x67 = nal_ref_idc=3, type=7), profile=High(100),
@@ -1560,6 +2057,7 @@ mod tests {
         );
     }
 
+        #[cfg(feature = "h264-encoder")]
         #[test]
     fn stbl_child_order_with_ctts_inserts_after_stts() {
         // With B-frames present, stbl order is
@@ -1609,6 +2107,7 @@ mod tests {
     /// list. Lock this in: scan the entire MP4 byte stream for the
     /// `elst` 4-CC and assert it never appears, even with B-frames in
     /// the GOP pattern.
+    #[cfg(feature = "h264-encoder")]
     #[test]
     fn ibpbp_mp4_does_not_emit_edts_elst() {
         use crate::codec::h264::stego::gop_pattern::GopPattern;
@@ -2017,6 +2516,7 @@ mod tests {
         assert_eq!(&ctts[36..40], &(-512i32).to_be_bytes());
     }
 
+        #[cfg(feature = "h264-encoder")]
         #[test]
     fn build_mp4_with_ipppp_pattern_emits_no_ctts_no_edts() {
         // IPPPP (no B-frames) → no ctts, no edts.
@@ -2036,6 +2536,7 @@ mod tests {
         assert!(!mp4.windows(4).any(|w| w == b"edts"), "no edts box");
     }
 
+        #[cfg(feature = "h264-encoder")]
         #[test]
     fn build_mp4_with_pattern_rejects_au_count_mismatch() {
         // Pattern asks for 5 frames but input has 1 → error.

@@ -6,9 +6,11 @@
 //! prevention byte handling with raw-position tracking.
 //!
 //! The key addition over the HEVC bitstream reader is [`EpByteMap`], which maps
-//! RBSP byte indices back to raw (pre-EP-removal) byte indices. This enables the
-//! CAVLC parser to record embeddable bit positions in the raw byte stream — the
-//! coordinate space where bit flips are applied.
+//! RBSP byte indices back to raw (pre-EP-removal) byte indices. This lets the
+//! CABAC bin-walker's bitstream-mod splicer (`cabac::bin_decoder::bitstream_mod`)
+//! map a captured bypass-bin position back to the raw byte stream — the
+//! coordinate space where bit flips are applied. (The CAVLC parser that
+//! originally used this map was removed in the 2026-06 video-retirement.)
 
 use super::{H264Error, NalType, NalUnit};
 
@@ -50,7 +52,7 @@ pub fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 /// Returns `(rbsp_data, EpByteMap)` where `EpByteMap.rbsp_to_raw[i]` maps
 /// RBSP byte `i` to its raw byte offset in `data`.
 ///
-/// This is critical for steganography: the CAVLC parser reads RBSP data,
+/// This is critical for steganography: the CABAC bin-walker reads RBSP data,
 /// but bit flips must be applied to the raw NAL bytes (with EP bytes present).
 pub fn remove_emulation_prevention_with_map(data: &[u8]) -> (Vec<u8>, EpByteMap) {
     let mut rbsp = Vec::with_capacity(data.len());
@@ -172,20 +174,6 @@ impl<'a> RbspReader<'a> {
         Ok((1u32 << leading_zeros) - 1 + suffix)
     }
 
-    /// Read a truncated Exp-Golomb coded value (te(v)).
-    ///
-    /// H.264 Section 9.1.2: if `max_value == 1`, te(v) is a single inverted bit
-    /// (0 maps to 1, 1 maps to 0). For max_value > 1, te(v) == ue(v).
-    pub fn read_te(&mut self, max_value: u32) -> Result<u32, H264Error> {
-        if max_value == 1 {
-            // 1-bit FLC, inverted: read 1 bit, return !bit
-            let bit = self.read_bit()?;
-            Ok(if bit { 0 } else { 1 })
-        } else {
-            self.read_ue()
-        }
-    }
-
     /// Read a signed Exp-Golomb coded value (se(v)).
     pub fn read_se(&mut self) -> Result<i32, H264Error> {
         let ue = self.read_ue()?;
@@ -209,14 +197,6 @@ impl<'a> RbspReader<'a> {
     /// True if the reader is at a byte boundary.
     pub fn byte_aligned(&self) -> bool {
         self.bit_pos == 0
-    }
-
-    /// Skip to the next byte boundary.
-    pub fn align_to_byte(&mut self) {
-        if self.bit_pos > 0 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-        }
     }
 
     /// Total bits consumed so far.
@@ -299,54 +279,6 @@ pub fn parse_nal_unit(data: &[u8]) -> Result<NalUnit, H264Error> {
         nal_ref_idc,
         rbsp,
     })
-}
-
-/// Parse a single H.264 NAL unit, returning both the NalUnit and an EP byte map
-/// for raw position tracking. The `raw_payload` is `&data[1..]` (after NAL header).
-pub fn parse_nal_unit_with_map(data: &[u8]) -> Result<(NalUnit, EpByteMap), H264Error> {
-    if data.is_empty() {
-        return Err(H264Error::InvalidNalHeader);
-    }
-    let forbidden_zero = (data[0] >> 7) & 1;
-    if forbidden_zero != 0 {
-        return Err(H264Error::InvalidNalHeader);
-    }
-    let nal_ref_idc = (data[0] >> 5) & 0x03;
-    let nal_type = NalType(data[0] & 0x1F);
-
-    let (rbsp, ep_map) = remove_emulation_prevention_with_map(&data[1..]);
-    Ok((
-        NalUnit {
-            nal_type,
-            nal_ref_idc,
-            rbsp,
-        },
-        ep_map,
-    ))
-}
-
-/// Parse NAL units from length-prefixed data (MP4/ISOBMFF format).
-///
-/// Each NAL unit is preceded by a `length_size`-byte big-endian length field.
-pub fn parse_nal_units_mp4(data: &[u8], length_size: u8) -> Result<Vec<NalUnit>, H264Error> {
-    let ls = length_size as usize;
-    let mut nalus = Vec::new();
-    let mut pos = 0;
-    while pos + ls <= data.len() {
-        let mut len = 0usize;
-        for i in 0..ls {
-            len = (len << 8) | data[pos + i] as usize;
-        }
-        pos += ls;
-        if pos + len > data.len() {
-            return Err(H264Error::UnexpectedEof);
-        }
-        if len > 0 {
-            nalus.push(parse_nal_unit(&data[pos..pos + len])?);
-        }
-        pos += len;
-    }
-    Ok(nalus)
 }
 
 /// Parse NAL units from Annex B format (start-code delimited).
@@ -577,35 +509,6 @@ mod tests {
     fn parse_forbidden_bit_set() {
         let data = [0x80 | 0x67]; // forbidden bit = 1
         assert!(parse_nal_unit(&data).is_err());
-    }
-
-    #[test]
-    fn parse_nal_with_map() {
-        let data = [0x65, 0x00, 0x00, 0x03, 0x01, 0xFF];
-        let (nalu, map) = parse_nal_unit_with_map(&data).unwrap();
-        assert_eq!(nalu.nal_type, NalType::SLICE_IDR);
-        // payload is data[1..] = [0x00, 0x00, 0x03, 0x01, 0xFF]
-        // rbsp after EP removal: [0x00, 0x00, 0x01, 0xFF]
-        assert_eq!(nalu.rbsp, [0x00, 0x00, 0x01, 0xFF]);
-        // map: rbsp[0]→raw[0], rbsp[1]→raw[1], rbsp[2]→raw[3], rbsp[3]→raw[4]
-        assert_eq!(map.rbsp_to_raw, [0, 1, 3, 4]);
-    }
-
-    #[test]
-    fn parse_nal_units_mp4_format() {
-        // Two NAL units with 4-byte length prefix
-        let mut data = Vec::new();
-        // NAL 1: SPS (3 bytes)
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x03]); // length=3
-        data.extend_from_slice(&[0x67, 0x42, 0x00]); // SPS NAL
-        // NAL 2: PPS (2 bytes)
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]); // length=2
-        data.extend_from_slice(&[0x68, 0xCE]); // PPS NAL
-
-        let nalus = parse_nal_units_mp4(&data, 4).unwrap();
-        assert_eq!(nalus.len(), 2);
-        assert_eq!(nalus[0].nal_type, NalType::SPS);
-        assert_eq!(nalus[1].nal_type, NalType::PPS);
     }
 
     #[test]

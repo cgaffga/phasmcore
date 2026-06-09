@@ -5,8 +5,9 @@
 //! H.264 Sequence Parameter Set (SPS) and Picture Parameter Set (PPS) parsing.
 //!
 //! Implements ITU-T H.264 sections 7.3.2.1 (SPS) and 7.3.2.2 (PPS).
-//! Targets Baseline profile but parses High profile fields to detect and
-//! reject unsupported configurations.
+//! Parses both Baseline and High profile fields. The production wire format
+//! is High-profile CABAC; truly unsupported configurations (FMO, sps_id > 31)
+//! are detected and rejected.
 
 use super::bitstream::RbspReader;
 use super::H264Error;
@@ -18,7 +19,9 @@ pub struct Sps {
     pub constraint_set_flags: u8,
     pub level_idc: u8,
     pub sps_id: u8,
-    // High profile extensions (parsed but not used in Phase 1a)
+    // High profile extensions (chroma_format_idc + separate_colour_plane_flag
+    // are consumed by the slice-header parser; the rest are parsed for
+    // bitstream conformance)
     pub chroma_format_idc: u8,
     pub separate_colour_plane_flag: bool,
     pub bit_depth_luma: u8,

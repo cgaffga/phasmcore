@@ -1156,9 +1156,9 @@ fn flush_access_unit(
 /// Performs minimal SPS parsing: skip profile/level info, read pic_width/pic_height.
 /// Returns (0, 0) if parsing fails rather than propagating the error.
 fn extract_dimensions_from_sps(sps_nal_data: &[u8]) -> Option<(u32, u32)> {
-    // Phase 4a: switched from HEVC bitstream to H.264 bitstream for the RBSP
-    // primitives (they're spec-identical). This lets MP4 dimension extraction
-    // keep working when the HEVC parser is archived behind `hevc-archive`.
+    // Use the H.264 bitstream RBSP primitives (spec-identical to HEVC's) for
+    // MP4 dimension extraction, so this works without an HEVC parser (the HEVC
+    // pipeline was removed 2026-06-04).
     use crate::codec::h264::bitstream::{remove_emulation_prevention, RbspReader};
 
     if sps_nal_data.len() < 4 {

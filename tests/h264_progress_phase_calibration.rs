@@ -15,7 +15,7 @@
 //! sudden completion).
 //!
 //! Run with:
-//!   cargo test -p phasm-core --features h264-encoder,openh264-backend \
+//!   cargo test -p phasm-core --features h264-encoder \
 //!     --test h264_progress_phase_calibration -- --ignored --nocapture
 //!
 //! `#[ignore]`d by default — encodes ~6-10 s of wall time. Synthetic
@@ -24,7 +24,7 @@
 //! get the order-of-magnitude right, not to fit a model). Revisit
 //! with on-device traces if the user reports new pacing issues.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::progress::{
     DecodePhase, DecodeProgressCallback, EncodePhase, EncodeProgressCallback,
@@ -149,9 +149,8 @@ fn calibrate_progress_phase_weights_oh264_1080p_30f() {
         let ms = dec_start.elapsed().as_secs_f64() * 1000.0;
         dec_log_cb.lock().unwrap().push((decode_bucket(&phase), ms));
     });
-    let mut dec = StreamingDecodeSession::create(PASS)
-        .expect("decode create")
-        .with_progress_callback(dec_cb);
+    let mut dec = StreamingDecodeSession::create(PASS).expect("decode create");
+    dec.set_progress_callback(Some(dec_cb));
     dec.push_annex_b(&annex_b).expect("push annex-b");
     let result = dec.finish().expect("finish decode");
     let dec_total_ms = dec_start.elapsed().as_secs_f64() * 1000.0;

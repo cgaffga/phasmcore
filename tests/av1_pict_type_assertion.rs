@@ -17,7 +17,7 @@
 //! pairing had been comparing source[k] against stego[k+1], not the
 //! encoder making poor mode decisions. The "encoder is broken"
 //! diagnosis ran for weeks before the container layer was suspected.
-//! See `docs/design/video/h264/encoder-quality-perf-gap-2026-05-04.md`
+//! See `docs/design/video/_archive/h264/encoder-quality-perf-gap-2026-05-04.md`
 //! lines 380-388 + `memory/h264_elst_bug_2026_05_05.md`.
 //!
 //! phasm-av1 today only emits keyframes (single-frame encode) and uses
@@ -29,7 +29,7 @@
 //! See [`phase-c-test-gates.md`](../../docs/design/video/av1/phase-c-test-gates.md)
 //! § 3 for the full design rationale.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -251,7 +251,7 @@ fn assert_clean_container(spec: &Fixture) {
         "[{}] decode-order frame 0 pict_type must be I (keyframe), got {:?}. \
          A non-I first frame means the container lists a non-keyframe in decode position 0 — \
          either the encoder produced a non-key first frame, or an edit list reorders decode. \
-         See `docs/design/video/h264/encoder-quality-perf-gap-2026-05-04.md` for the H.264 \
+         See `docs/design/video/_archive/h264/encoder-quality-perf-gap-2026-05-04.md` for the H.264 \
          lesson where a similar misordering looked like a 7.2 dB B-frame encoder cliff.",
         spec.name, pict_type
     );

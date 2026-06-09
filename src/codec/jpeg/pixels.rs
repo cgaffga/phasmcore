@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 
 use crate::codec::jpeg::JpegImage;
 
-// T3.1.F — bulk pixel-domain helpers (`jpeg_to_luma_f64` /
+// Bulk pixel-domain helpers (`jpeg_to_luma_f64` /
 // `luma_f64_to_jpeg`) call the integer LL&M kernels directly.
 use crate::codec::jpeg::pixels_aan::{aan_dct_block as dct_block_active, aan_idct_block as idct_block_active};
 
@@ -202,7 +202,7 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
 
     let qt_values = qt.values;
 
-    // T2.5 — each block-row writes a disjoint 8-row strip of `pixels`,
+    // Each block-row writes a disjoint 8-row strip of `pixels`,
     // and reads `grid.block(br, bc)` (immutable). Parallelize across br
     // via par_chunks_mut over the 8*width pixel strips.
     let process_strip = |br: usize, strip: &mut [f64]| {
@@ -256,7 +256,7 @@ pub fn rgb_to_luma_blocks(rgb: &[u8], width: u32, height: u32) -> Vec<[f64; 64]>
     let bw = w.div_ceil(8);
     let bh = h.div_ceil(8);
 
-    // T2.5 — pre-allocate then fill blocks in parallel. Each block is
+    // Pre-allocate then fill blocks in parallel. Each block is
     // an independent computation over disjoint output slots.
     let mut blocks = vec![[0.0f64; 64]; bw * bh];
 
@@ -309,7 +309,7 @@ pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut J
     assert_eq!(width, bw * 8);
     assert_eq!(height, bh * 8);
 
-    // T2.5 — coeffs is a flat Vec<i16> with stride 64 per block. Each
+    // coeffs is a flat Vec<i16> with stride 64 per block. Each
     // 64-element chunk corresponds to one (br, bc). par_chunks_mut(64)
     // lets each worker DCT+quantize one block independently.
     let coeffs = grid.coeffs_mut();

@@ -9,23 +9,22 @@
 // parallelism). Emits a single `RESULT ...` line on stderr.
 //
 // Driver: cap_realworld_810.sh. Run:
-//   cargo test --test cap_realworld_810 --features openh264-backend,cabac-stego \
+//   cargo test --test cap_realworld_810 --features h264-encoder,cabac-stego \
 //     --release --no-run     # build once
 //   ./cap_realworld_810.sh   # fan out
 //
 // Env: PHASM_CAP_SRC (filename), PHASM_CAP_TAG, PHASM_CAP_W, PHASM_CAP_H,
 //      PHASM_CAP_N, PHASM_CAP_GOP.
 
-#![cfg(all(feature = "openh264-backend", feature = "cabac-stego"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::{
     h264_shadow_capacity_for_n,
-    h264_stego_capacity_4domain_oh264,
-    oh264_capacity_estimate_yuv, oh264_capacity_quick, CapacityEstimate,
+    h264_video_capacity,
     ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
     StreamingDecodeSession, StreamingEncodeSession, YuvFrameRef,
 };
-use phasm_core::codec::h264::openh264_stego::{count_cover_4domain_oh264, EncodeOpts};
+use phasm_core::codec::h264::openh264_stego::{h264_walk_cover, EncodeOpts};
 use phasm_core::codec::h264::cabac::bin_decoder::{walk_annex_b_for_cover_with_options, WalkOptions};
 
 fn env_u32(k: &str) -> u32 {
@@ -208,7 +207,7 @@ fn lumix_safe_cap_probe() {
 /// (encode either fits-and-decodes, or gracefully MessageTooLarge — never
 /// silent loss). This is the whole point of `drain_one_gop`'s verify+carry.
 ///
-///     cargo test -p phasm-core --features openh264-backend,cabac-stego --release \
+///     cargo test -p phasm-core --features h264-encoder,cabac-stego --release \
 ///         --test cap_realworld_810 cap_no_silent_loss -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -253,7 +252,7 @@ fn cap_no_silent_loss() {
 /// (and rare re-encodes on failure). Measure the decode/encode ratio on a
 /// 1080p clip so we can size the verification overhead before building it.
 ///
-///     cargo test -p phasm-core --features openh264-backend,cabac-stego --release \
+///     cargo test -p phasm-core --features h264-encoder,cabac-stego --release \
 ///         --test cap_realworld_810 verification_cost_estimate -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -327,7 +326,7 @@ fn gallop_max(start: usize, fits: &dyn Fn(usize) -> bool) -> usize {
 /// chunk), which is representative: every GOP is IDR-led, the cascade is
 /// within-GOP, and per-GOP STC is independent.
 ///
-///     cargo test -p phasm-core --features openh264-backend,cabac-stego --release \
+///     cargo test -p phasm-core --features h264-encoder,cabac-stego --release \
 ///         --test cap_realworld_810 cap_proportional_roundtrip_gate -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -363,7 +362,7 @@ fn cap_proportional_roundtrip_gate() {
     for g in 0..n_gops {
         let gy = &yuv[g * GOP as usize * fs..((g + 1) * GOP as usize).min(N as usize) * fs];
         let gf = (gy.len() / fs) as u32;
-        let rep_cap = h264_stego_capacity_4domain_oh264(gy, W, H, gf as usize, opts, false)
+        let rep_cap = h264_video_capacity(gy, W, H, gf as usize, opts, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0])
             .unwrap_or(0);
         if rep_cap == 0 {
@@ -415,7 +414,7 @@ fn cap_proportional_roundtrip_gate() {
 /// is the safe derating (the cap on the §4 soft-ceiling fill rate, and the
 /// Σ-derate the v3 estimator reports).
 ///
-///     cargo test -p phasm-core --features openh264-backend,cabac-stego --release \
+///     cargo test -p phasm-core --features h264-encoder,cabac-stego --release \
 ///         --test cap_realworld_810 cap_proportional_margin_corpus -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -453,7 +452,7 @@ fn cap_proportional_margin_corpus() {
         for g in 0..n_gops {
             let gy = &yuv[g * GOP as usize * fs..((g + 1) * GOP as usize).min(N as usize) * fs];
             let gf = (gy.len() / fs) as u32;
-            let rep_cap = h264_stego_capacity_4domain_oh264(gy, W, H, gf as usize, opts, false)
+            let rep_cap = h264_video_capacity(gy, W, H, gf as usize, opts, false)
                 .map(|i| i.per_tier_primary_max_message_bytes[0])
                 .unwrap_or(0);
             if rep_cap < 64 {
@@ -560,7 +559,7 @@ fn cap_realworld_one() {
         eprintln!("RESULT {:<14} SKIP (no fixture/ffmpeg)", tag);
         return;
     };
-    let reported = h264_stego_capacity_4domain_oh264(
+    let reported = h264_video_capacity(
         &yuv, w, h, n as usize, EncodeOpts { qp: 26, intra_period: gop as i32 }, false,
     ).map(|i| i.per_tier_primary_max_message_bytes[0]).unwrap_or(0);
     let true_max = true_max_from(&yuv, w, h, n, gop, reported);
@@ -590,7 +589,7 @@ fn iphone7_roundtrip_threshold() {
         eprintln!("SKIP (no iphone7 fixture)");
         return;
     };
-    let reported = h264_stego_capacity_4domain_oh264(
+    let reported = h264_video_capacity(
         &yuv, W, H, N as usize, EncodeOpts { qp: 26, intra_period: GOP as i32 }, false,
     )
     .map(|i| i.per_tier_primary_max_message_bytes[0])
@@ -636,7 +635,7 @@ fn iphone7_roundtrip_threshold() {
 ///
 /// Run:
 ///   PHASM_PERF_TRACE=1 cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     iphone7_cascade_bisect -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -725,7 +724,7 @@ fn iphone7_cascade_bisect_multigop() {
 ///
 /// Run (NO PHASM_PERF_TRACE):
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     iphone7_encode_determinism -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -783,7 +782,7 @@ fn iphone7_encode_determinism() {
 /// PHASM_PERF_TRACE=1 to read [selfextract]/[symmetry]/[diff#] and bisect.
 ///
 /// Run: cargo test --test cap_realworld_810 \
-///   --features openh264-backend,cabac-stego --release \
+///   --features h264-encoder,cabac-stego --release \
 ///   iphone7_cascade_seed_sweep -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -834,7 +833,7 @@ fn iphone7_cascade_seed_sweep() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     asia_bottle_overreport_diag -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -848,7 +847,7 @@ fn asia_bottle_overreport_diag() {
         eprintln!("SKIP asia_bottle_overreport_diag (no fixture)");
         return;
     };
-    let info = h264_stego_capacity_4domain_oh264(
+    let info = h264_video_capacity(
         &yuv, W, H, N as usize, EncodeOpts { qp: 26, intra_period: GOP as i32 }, false,
     )
     .expect("capacity");
@@ -907,7 +906,7 @@ fn asia_bottle_overreport_diag() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     asia_bottle_fullclip_success_rate -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -921,7 +920,7 @@ fn asia_bottle_fullclip_success_rate() {
         eprintln!("SKIP asia_bottle_fullclip_success_rate (no fixture)");
         return;
     };
-    let reported = h264_stego_capacity_4domain_oh264(
+    let reported = h264_video_capacity(
         &yuv, W, H, N as usize, EncodeOpts { qp: 26, intra_period: GOP as i32 }, false,
     )
     .map(|i| i.per_tier_primary_max_message_bytes[0])
@@ -962,7 +961,7 @@ fn asia_bottle_fullclip_success_rate() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     asia_bottle_enc_dec_split -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -1027,7 +1026,7 @@ fn cap_enc_dec_split_one() {
         eprintln!("RESULT {tag:<14} SKIP (no fixture/ffmpeg)");
         return;
     };
-    let reported = h264_stego_capacity_4domain_oh264(
+    let reported = h264_video_capacity(
         &yuv, w, h, n as usize, EncodeOpts { qp: 26, intra_period: gop as i32 }, false,
     )
     .map(|i| i.per_tier_primary_max_message_bytes[0])
@@ -1076,7 +1075,7 @@ fn cap_enc_dec_split_one() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     per_domain_cascade_stress -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -1139,7 +1138,7 @@ fn per_domain_cascade_stress() {
 /// stealth metrics via the pure-Rust encoder, which is currently
 /// #802-blocked (`MessageTooLarge` on tiny covers). This re-baselines them
 /// on the OH264 streaming path that actually ships: per domain, the clean
-/// cover bits (`count_cover_4domain_oh264`) vs the walked stego bits —
+/// cover bits (`h264_walk_cover`) vs the walked stego bits —
 /// flip rate + Shannon entropy. The stego carrier (bypass bins) must stay
 /// ~uniform and look like the clean cover (ΔH≈0) so the modifications are
 /// statistically undetectable at the bin level. Confirms the context-only
@@ -1147,7 +1146,7 @@ fn per_domain_cascade_stress() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     oh264_bypass_entropy_rebaseline -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -1180,8 +1179,8 @@ fn oh264_bypass_entropy_rebaseline() {
         };
         ran_any = true;
         let opts = EncodeOpts { qp: 26, intra_period: GOP as i32 };
-        let clean = count_cover_4domain_oh264(&yuv, w, h, n, opts).expect("clean cover");
-        let reported = h264_stego_capacity_4domain_oh264(&yuv, w, h, n as usize, opts, false)
+        let clean = h264_walk_cover(&yuv, w, h, n, opts).expect("clean cover");
+        let reported = h264_video_capacity(&yuv, w, h, n as usize, opts, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0])
             .unwrap_or(0);
         let payload = (reported * 4 / 5).max(16); // 80% of reported → comfortably fits
@@ -1243,7 +1242,7 @@ fn oh264_bypass_entropy_rebaseline() {
 }
 
 /// #809 — profile the per-GOP capacity probe (the live mobile path). Times
-/// the full `h264_stego_capacity_4domain_oh264` vs `count_cover_4domain_oh264`
+/// the full `h264_video_capacity` vs `h264_walk_cover`
 /// (encode+walk only, no STC trials) on iphone7 at a few realistic lengths,
 /// so the STC-trial share (the part the K-message floor multiplies, and the
 /// 5-tier-redundancy / parallelism wins target) is visible. Grounds #809
@@ -1251,7 +1250,7 @@ fn oh264_bypass_entropy_rebaseline() {
 ///
 /// Run:
 ///   cargo test --test cap_realworld_810 \
-///     --features openh264-backend,cabac-stego --release \
+///     --features h264-encoder,cabac-stego --release \
 ///     probe_perf_profile -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -1268,10 +1267,10 @@ fn probe_perf_profile() {
         };
         let opts = EncodeOpts { qp: 26, intra_period: 30 };
         let t0 = Instant::now();
-        let _ = count_cover_4domain_oh264(&yuv, W, H, n, opts).expect("count_cover");
+        let _ = h264_walk_cover(&yuv, W, H, n, opts).expect("count_cover");
         let t_enc = t0.elapsed();
         let t1 = Instant::now();
-        let info = h264_stego_capacity_4domain_oh264(&yuv, W, H, n as usize, opts, false).expect("probe");
+        let info = h264_video_capacity(&yuv, W, H, n as usize, opts, false).expect("probe");
         let t_probe = t1.elapsed();
         let stc = t_probe.saturating_sub(t_enc);
         eprintln!(
@@ -1329,86 +1328,4 @@ fn iphone7_mvd_ctxidxinc_regression_gate() {
         );
     }
     unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED"); }
-}
-
-/// CAP2 §17.1 — v3 sampled estimator accuracy + speedup gate. Probes a real
-/// 10-GOP iphone7 clip three ways and checks the **sampled** estimate tracks
-/// the **full-scan** estimate within its own confidence margin, at a fraction
-/// of the cost.
-///
-///     cargo test -p phasm-core --features openh264-backend,cabac-stego --release \
-///         --test cap_realworld_810 cap_estimator_sampled_vs_full -- --ignored --nocapture
-#[test]
-#[ignore]
-fn cap_estimator_sampled_vs_full() {
-    const W: u32 = 1920;
-    const H: u32 = 1072;
-    const N: u32 = 300; // 10 GOPs of 30
-    const GOP: u32 = 30;
-    let Some(yuv) = crop_yuv("iphone7_1080p_30fps_h264_high.mov", W, H, N) else {
-        eprintln!("SKIP (no iphone7 fixture)");
-        return;
-    };
-    let opts = EncodeOpts { qp: 26, intra_period: GOP as i32 };
-    let frame_size = (W * H * 3 / 2) as usize;
-    let n_gops = (N / GOP) as usize;
-
-    // Full scan (all 10 GOPs) — the reference Σ sample-mean, margin 0.
-    let t = std::time::Instant::now();
-    let full = oh264_capacity_estimate_yuv(
-        &yuv, W, H, N as usize, opts, /* max_sample */ 100, |_| {}, || false,
-    ).expect("full estimate");
-    let t_full = t.elapsed();
-
-    // Sampled (4 of 10 GOPs) — must track `full` within its margin, faster.
-    let mut refines = 0usize;
-    let t = std::time::Instant::now();
-    let sampled = oh264_capacity_estimate_yuv(
-        &yuv, W, H, N as usize, opts, /* max_sample */ 4,
-        |_e: CapacityEstimate| refines += 1, || false,
-    ).expect("sampled estimate");
-    let t_sampled = t.elapsed();
-
-    // Quick (GOP 0 only) — instant rough number.
-    let quick = oh264_capacity_quick(&yuv[..GOP as usize * frame_size], W, H, opts, n_gops)
-        .expect("quick");
-
-    eprintln!("\n=== CAP2 §17.1 estimator — iphone7 {W}x{H} x{N}f ({n_gops} GOPs) ===");
-    eprintln!(
-        "{:<10} | {:>7} | {:>9} | {:>8} | {:>8} | {:>8}",
-        "tier", "gops", "bytes", "mean/GOP", "margin%", "wall",
-    );
-    for (name, e, wall) in [
-        ("quick", quick, std::time::Duration::ZERO),
-        ("sampled", sampled, t_sampled),
-        ("full", full, t_full),
-    ] {
-        eprintln!(
-            "{:<10} | {:>2}/{:<4} | {:>9} | {:>8} | {:>7.1}% | {:>8.2?}",
-            name, e.gops_scanned, e.gops_total, e.bytes_estimate,
-            e.gop_mean_payload, e.margin_frac * 100.0, wall,
-        );
-    }
-
-    // Structural invariants.
-    assert_eq!(full.gops_scanned, n_gops, "full scans all GOPs");
-    assert_eq!(full.margin_frac, 0.0, "full scan has no extrapolation margin");
-    assert!(full.is_final && sampled.is_final, "both terminal");
-    assert_eq!(sampled.gops_scanned, 4, "sampled scans the cap");
-    assert!(sampled.margin_frac > 0.0, "sampled has a confidence margin");
-    assert_eq!(refines, 4, "progress fires once per sampled GOP");
-    assert_eq!(quick.gops_scanned, 1, "quick = GOP 0 only");
-    assert!(full.bytes_estimate > 0 && sampled.bytes_estimate > 0, "non-zero capacity");
-    assert!(full.pool_c_bits > 0 && sampled.pool_c_bits > 0, "non-zero shadow pool");
-
-    // Accuracy: the sampled mean tracks the full mean. Real content varies, so
-    // allow a generous band — the point is the estimator isn't wildly off.
-    let rel = (sampled.gop_mean_payload as f64 - full.gop_mean_payload as f64).abs()
-        / (full.gop_mean_payload.max(1) as f64);
-    assert!(rel < 0.5, "sampled mean {} vs full {} (rel {:.2}) — too far",
-        sampled.gop_mean_payload, full.gop_mean_payload, rel);
-
-    // Speedup: 4 GOPs must be meaningfully faster than 10.
-    assert!(t_sampled < t_full, "sampled {t_sampled:.2?} should beat full {t_full:.2?}");
-    eprintln!("sampled {:.0}% of full wall-clock\n", 100.0 * t_sampled.as_secs_f64() / t_full.as_secs_f64().max(1e-9));
 }

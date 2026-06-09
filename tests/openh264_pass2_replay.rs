@@ -18,7 +18,7 @@
 // byte on a clean cover (no stego flips), it will match on a flipped
 // cover too because the decisions are forced, not re-derived.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::openh264::{
     abi_version, header_abi_version, set_frame_num, set_pass_mode, Encoder, FrameType, MbDecision,
@@ -2055,7 +2055,7 @@ fn pass1_capture_vs_pass2_replay_byte_identity_with_flips_1080p() {
 /// behavior.
 ///
 /// If this fails: bug is at the OH264 fork level for real motion.
-/// If this passes: bug is in `encode_yuv_with_pre_framed_bits_4domain`
+/// If this passes: bug is in `h264_encode_gop_framed_bits_auto`
 /// or the streaming session wrapper, NOT in the fork.
 #[test]
 fn pass1_capture_vs_pass2_replay_byte_identity_real_carplane() {

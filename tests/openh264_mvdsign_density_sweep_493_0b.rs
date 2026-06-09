@@ -33,10 +33,10 @@
 //! research, and 454 is the canonical implementation.
 //!
 //! Run with:
-//!   cargo test --release --features "h264-encoder openh264-backend" \
+//!   cargo test --release --features "h264-encoder" \
 //!     --test openh264_mvdsign_density_sweep_493_0b -- --ignored --nocapture
 
-#![cfg(feature = "openh264-backend")]
+#![cfg(feature = "h264-encoder")]
 
 use core_openh264_sys::PhasmStegoDomain;
 use phasm_core::codec::h264::cabac::bin_decoder::{

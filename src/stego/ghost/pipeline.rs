@@ -29,7 +29,7 @@ use crate::stego::quality::{self, EncodeQuality, GhostMetrics};
 use crate::stego::stc::{embed, extract, hhat};
 use crate::stego::memory::{self, GhostShadowRung, ModeId, TelemetryEvent};
 
-/// STC constraint length for Ghost Phase 1.
+/// STC constraint length (height of the parity-check submatrix).
 const STC_H: usize = 7;
 
 /// Maximum number of STC cover positions before OOM protection kicks in.
@@ -300,7 +300,7 @@ pub fn ghost_encode_with_shadows(
     shadows: &[ShadowLayer],
     si: Option<SideInfo>,
 ) -> Result<Vec<u8>, StegoError> {
-    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si, None)
+    shadows_encode(image_bytes, message, files, passphrase, shadows, si, None)
         .map(|(bytes, _)| bytes)
 }
 
@@ -313,7 +313,7 @@ pub fn ghost_encode_with_shadows_quality(
     shadows: &[ShadowLayer],
     si: Option<SideInfo>,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
-    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, si, None)
+    shadows_encode(image_bytes, message, files, passphrase, shadows, si, None)
 }
 
 /// Encode with Ghost SI-UNIWARD plus shadow messages.
@@ -363,10 +363,10 @@ pub fn ghost_encode_si_with_shadows_quality(
         &qt.values,
     )?;
 
-    ghost_encode_with_shadows_impl(image_bytes, message, files, passphrase, shadows, Some(si), Some(img))
+    shadows_encode(image_bytes, message, files, passphrase, shadows, Some(si), Some(img))
 }
 
-fn ghost_encode_with_shadows_impl(
+fn shadows_encode(
     image_bytes: &[u8],
     message: &str,
     files: &[FileEntry],
@@ -375,7 +375,7 @@ fn ghost_encode_with_shadows_impl(
     si: Option<SideInfo>,
     pre_parsed: Option<JpegImage>,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
-    // M4: parse the JPEG up front so the ladder selector knows
+    // Parse the JPEG up front so the ladder selector knows
     // dimensions BEFORE the dominant allocations
     // (cover_wavelets / positions / original_y) happen.
     let parsed_img = match pre_parsed {
@@ -411,7 +411,7 @@ fn ghost_encode_with_shadows_impl(
         ladder_rung: rung_to_u8(rung),
     });
     let encode_start = std::time::Instant::now();
-    let outcome = ghost_encode_with_shadows_impl_rung(
+    let outcome = shadows_encode_at_rung(
         image_bytes, message, files, passphrase, shadows, si, Some(parsed_img), rung,
     );
     let wall_ms = encode_start.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -480,7 +480,7 @@ fn stego_error_kind(e: &StegoError) -> &'static str {
     }
 }
 
-fn ghost_encode_with_shadows_impl_rung(
+fn shadows_encode_at_rung(
     image_bytes: &[u8],
     message: &str,
     files: &[FileEntry],
@@ -490,10 +490,11 @@ fn ghost_encode_with_shadows_impl_rung(
     pre_parsed: Option<JpegImage>,
     rung: GhostShadowRung,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
-    // M4a (rung 0/1): The cascade body uses par_iter, which routes through
-    // the current rayon thread context. For rung >= CappedParallel we run
-    // the entire body inside a single-thread pool so every par_iter
-    // automatically respects the cap. Rung 0 keeps the current global pool.
+    // The cascade body uses par_iter, which routes through the current
+    // rayon thread context. For rung >= CappedParallel we run the entire
+    // body inside a single-thread pool so every par_iter automatically
+    // respects the cap. Rung 0 (FullParallel) keeps the current global
+    // pool.
     #[cfg(feature = "parallel")]
     if matches!(rung,
         GhostShadowRung::CappedParallel
@@ -509,17 +510,17 @@ fn ghost_encode_with_shadows_impl_rung(
             .build()
             .map_err(|_| StegoError::MessageTooLarge)?;
         return pool.install(move || {
-            ghost_encode_with_shadows_impl_inner(
+            shadows_encode_body(
                 image_bytes, message, files, passphrase, shadows, si, pre_parsed, rung,
             )
         });
     }
-    ghost_encode_with_shadows_impl_inner(
+    shadows_encode_body(
         image_bytes, message, files, passphrase, shadows, si, pre_parsed, rung,
     )
 }
 
-fn ghost_encode_with_shadows_impl_inner(
+fn shadows_encode_body(
     image_bytes: &[u8],
     message: &str,
     files: &[FileEntry],
@@ -532,11 +533,12 @@ fn ghost_encode_with_shadows_impl_inner(
     // Initialize progress with worst-case cascade budget so the bar moves
     // smoothly without dynamic set_total() jumps.
     //
-    // T3 recalibration: cascade verify replaced the full UNIWARD
-    // recompute with the dirty re-cost path (T3.2). Per-cascade-iter
-    // wall-clock dropped ~17×, so the per-iter budget drops from
-    // UNIWARD_PROGRESS_STEPS=100 to DIRTY_RECOST_PROGRESS_STEPS=10
-    // to keep step granularity matched to actual work.
+    // Cascade verify uses the dirty re-cost path instead of a full
+    // UNIWARD recompute (see docs/design/image/t3.2-dirty-block-recost.md).
+    // Per-cascade-iter wall-clock is ~17× lower, so the per-iter budget
+    // drops from UNIWARD_PROGRESS_STEPS=100 to
+    // DIRTY_RECOST_PROGRESS_STEPS=10 to keep step granularity matched to
+    // actual work.
     //
     // Additional one-time upfront budget for the cascade-trigger
     // cover_wavelets + cover_verify_positions (the
@@ -639,9 +641,9 @@ fn ghost_encode_with_shadows_impl_inner(
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
     let si_ref = si.as_ref().map(|s| (s, img.dct_grid(0)));
-    // T3.2 — only the SHADOW-with-verify path benefits from caching
-    // cover wavelets + a separate no-SI position vec. When no shadows
-    // are requested (defensive: `ghost_encode_with_shadows_impl` is
+    // Only the SHADOW-with-verify path benefits from caching cover
+    // wavelets + a separate no-SI position vec. When no shadows are
+    // requested (defensive: `shadows_encode` is
     // sometimes called with an empty shadow list), there's no verify
     // step downstream, so we skip the ~32 MB extra positions clone and
     // the 72 MB cover_wavelets resident allocation.
@@ -650,10 +652,10 @@ fn ghost_encode_with_shadows_impl_inner(
     // depends on prepare_shadow's fraction choice, computed later);
     // for the rare all-fraction-1 case we waste the dual output but
     // not the wall-clock since the dual output is essentially free.
-    // M4b: at rung 2+ (StreamingNoCache / MinimalClones) skip the
+    // At rung 2+ (StreamingNoCache / MinimalClones) skip the
     // cover_wavelets + cover_verify_positions allocations
     // (~604 MB + ~157 MB at 60 MP). Verify and cascade then use the
-    // slower streaming recompute instead of T3.2's dirty re-cost.
+    // slower streaming recompute instead of the dirty re-cost.
     let skip_wavelet_cache = matches!(
         _rung,
         GhostShadowRung::StreamingNoCache | GhostShadowRung::MinimalClones,
@@ -692,7 +694,7 @@ fn ghost_encode_with_shadows_impl_inner(
 
     // Restore raster order (sort by flat_idx) for STC permutation.
     // The raster order matches compute_positions_streaming output.
-    // T1.9 — flat_idx is unique per position (grid coordinate), so
+    // flat_idx is unique per position (grid coordinate), so
     // sort_unstable_by_key produces bit-identical output to sort_by_key
     // (no ties to break stably). ~30% faster on multi-million-element
     // vectors.
@@ -778,9 +780,9 @@ fn ghost_encode_with_shadows_impl_inner(
     let mut stc_total_cost: f64;
     let mut stc_num_modifications: usize;
 
-    // Bin where Phase B+ will hold the most recent pass's modified
-    // flat positions (for dirty-block UNIWARD re-cost). Unused in
-    // Phase A.
+    // Holds the most recent STC pass's modified flat positions, fed to
+    // the dirty-block UNIWARD re-cost on the shadow-verify path. Stays
+    // empty on the no-shadow path (no verify recompute).
     let mut _stc_modified_positions: Vec<u32> = Vec::new();
 
     if shadow_states.is_empty() {
@@ -809,11 +811,11 @@ fn ghost_encode_with_shadows_impl_inner(
         // This catches cost-pool boundary disagreements between cover and stego.
         if !all_fraction_1 {
             let qt_verify = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-            // T3.2: cached cover_wavelets enable dirty re-cost — much
-            // faster than the streaming recompute. M4b rung 2+ skips
+            // Cached cover_wavelets enable dirty re-cost — much
+            // faster than the streaming recompute. Rung 2+ skips
             // the cache to save ~760 MB at 60 MP and falls back to the
             // streaming path. Both produce the SAME stego positions —
-            // dirty re-cost was a wall-clock optimization, not a
+            // dirty re-cost is a wall-clock optimization, not a
             // behavior change. Both the first verify AND every
             // cascade iteration below share the same gating.
             let cover_wavelets = cover_wavelets.as_ref();
@@ -837,7 +839,7 @@ fn ghost_encode_with_shadows_impl_inner(
             };
             stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-            if !verify_all_shadows_decoder_side(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
+            if !all_shadows_decode_ok(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
                 // Escalate: try progressively larger fractions (more positions,
                 // lower BER) and higher parities (more error correction).
                 // CASCADE is ordered: fraction=1 first (eliminates boundary
@@ -880,8 +882,8 @@ fn ghost_encode_with_shadows_impl_inner(
                             if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
 
                             // Rebuild shadows with this (fraction, parity).
-                            // M4.5 (#669): rebuild_shadow takes &[CoeffPos] — share
-                            // the outer cascade_positions by ref instead of per-worker
+                            // rebuild_shadow takes &[CoeffPos] — share the outer
+                            // cascade_positions by ref instead of per-worker
                             // cloning. Saves N_workers × cascade_positions (~50 MB at
                             // 60 MP × 8 workers = 400 MB peak during cascade).
                             let mut local_states = shadow_states.clone();
@@ -908,8 +910,8 @@ fn ghost_encode_with_shadows_impl_inner(
                                 Some(qt) => qt,
                                 None => return None,
                             };
-                            // T3.2.E dirty re-cost when the cache is
-                            // present (rung 0/1) — per-iter clone of
+                            // Dirty re-cost when the cache is present
+                            // (rung 0/1) — per-iter clone of
                             // cover_wavelets mutated by this iter's
                             // modifications. At rung 2+ we use the
                             // slower streaming recompute instead;
@@ -944,7 +946,7 @@ fn ghost_encode_with_shadows_impl_inner(
                             };
                             local_stego_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-                            if verify_all_shadows_decoder_side(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
+                            if all_shadows_decode_ok(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
                                 // Publish: this fraction verified successfully.
                                 best_fraction.fetch_max(fraction, Ordering::Relaxed);
                                 Some((fraction, local_img, local_states, local_r.total_cost, local_r.num_modifications))
@@ -974,13 +976,13 @@ fn ghost_encode_with_shadows_impl_inner(
 
                 #[cfg(not(feature = "parallel"))]
                 {
-                    // M6: serial cascade now mirrors the parallel
-                    // algorithm — "collect all successes per parity,
-                    // pick the LARGEST fraction". Was greedy
-                    // first-success in CASCADE order, producing
-                    // different stego bytes than parallel for the
-                    // same input. Now CLI (no parallel) and mobile
-                    // produce byte-identical output.
+                    // Serial cascade mirrors the parallel algorithm —
+                    // "collect all successes per parity, pick the
+                    // LARGEST fraction" — so CLI (no parallel) and
+                    // mobile produce byte-identical output. (A greedy
+                    // first-success-in-CASCADE-order variant produced
+                    // different stego bytes than the parallel path for
+                    // the same input.)
                     'parity_loop: for &parity in &[4usize, 8, 16, 32, 64, 128] {
                         let fractions_for_parity: Vec<usize> = CASCADE.iter()
                             .filter(|&&(_, p)| p == parity)
@@ -999,7 +1001,7 @@ fn ghost_encode_with_shadows_impl_inner(
                             // smaller ones can't beat it.
                             if best_fraction > fraction { continue; }
 
-                            // M4.5 (#669): share cascade_positions by ref; serial
+                            // Share cascade_positions by ref; the serial
                             // path needed only 1 clone but the alloc churn × per-
                             // iter is still avoidable.
                             let mut local_states = shadow_states.clone();
@@ -1058,7 +1060,7 @@ fn ghost_encode_with_shadows_impl_inner(
                             };
                             local_stego_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-                            if verify_all_shadows_decoder_side(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
+                            if all_shadows_decode_ok(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
                                 if fraction > best_fraction {
                                     best_fraction = fraction;
                                 }
@@ -1125,10 +1127,11 @@ fn ghost_encode_with_shadows_impl_inner(
 /// Returns `(total_cost, num_modifications)` from STC embedding.
 /// Result of a single STC embedding pass.
 ///
-/// `modified_positions` is T3.2.A plumbing — the flat permute indices
-/// of coefficients whose LSB the STC pass actually flipped. Forward
-/// callers ignore it; the cascade-verify recompute path (T3.2.D+) uses
-/// it to localize wavelet/cost re-computation to the dirty region.
+/// `modified_positions` carries the flat permute indices of
+/// coefficients whose LSB the STC pass actually flipped. Forward
+/// callers ignore it; the cascade-verify recompute path uses it to
+/// localize wavelet/cost re-computation to the dirty region
+/// (see docs/design/image/t3.2-dirty-block-recost.md).
 struct StcPassResult {
     total_cost: f64,
     num_modifications: usize,
@@ -1203,12 +1206,12 @@ fn apply_stc_changes(
     stego_bits: &[u8],
     si: &Option<SideInfo>,
 ) -> Vec<u32> {
-    // T3.2.A — emit the flat indices of actually-modified positions.
-    // The dirty-block UNIWARD re-cost (Phase B+) needs these to
-    // identify which coefficients fall inside the 23×23 wavelet
-    // impact region of a modification. For the no-modification
-    // happy path (e.g. all `cover_bits == stego_bits`), this Vec
-    // stays empty. See `docs/design/image/t3.2-dirty-block-recost.md`.
+    // Emit the flat indices of actually-modified positions. The
+    // dirty-block UNIWARD re-cost needs these to identify which
+    // coefficients fall inside the 23×23 wavelet impact region of a
+    // modification. For the no-modification happy path (e.g. all
+    // `cover_bits == stego_bits`), this Vec stays empty. See
+    // `docs/design/image/t3.2-dirty-block-recost.md`.
     let mut modified_positions = Vec::new();
     let grid_mut = img.dct_grid_mut(0);
     let n_modified = stego_bits.len();
@@ -1233,12 +1236,11 @@ fn apply_stc_changes(
 /// Uses stego-image UNIWARD costs to select positions (simulating what the
 /// decoder will do), then checks RS decode + AES-GCM decrypt.
 ///
-/// T1.11 — parallelized via `par_iter().all(...)` (short-circuits on first
-/// failure). Verifying N shadows used to be sequential; now N-way concurrent
-/// up to the first failure. Each verify call does RS decode + AES decrypt
-/// for one shadow, so N-shadow encodes get N× verify-phase speedup on the
-/// happy path.
-fn verify_all_shadows_decoder_side(
+/// Parallelized via `par_iter().all(...)` (short-circuits on first
+/// failure). N shadows verify N-way concurrent up to the first failure.
+/// Each verify call does RS decode + AES decrypt for one shadow, so
+/// N-shadow encodes get N× verify-phase speedup on the happy path.
+fn all_shadows_decode_ok(
     img: &JpegImage,
     shadow_states: &[shadow::ShadowState],
     shadows: &[&ShadowLayer],
@@ -1462,8 +1464,8 @@ pub fn ghost_decode(
 }
 
 /// Ghost decode against an already-parsed JPEG. Used by `smart_decode`'s
-/// shared-parse path (T1.5) to avoid re-parsing the same JPEG across
-/// the Ghost / Armor / Fortress / Shadow attempt sequence.
+/// shared-parse path to avoid re-parsing the same JPEG across the
+/// Ghost / Armor / Fortress / Shadow attempt sequence.
 pub fn ghost_decode_from_image(
     img: &JpegImage,
     passphrase: &str,
@@ -1474,8 +1476,9 @@ pub fn ghost_decode_from_image(
 
     // 1. Compute J-UNIWARD costs strip-by-strip and collect positions directly.
     // Overlap Argon2id structural key derivation (~200ms) with UNIWARD (1-10s).
-    // Argon2 result discarded — `_with_positions` re-derives with T1.1
-    // thread-local cache (worker stays warm across smart_decode calls).
+    // Argon2 result discarded — `_with_positions` re-derives from the
+    // structural-key thread-local cache (worker stays warm across
+    // smart_decode calls).
     #[cfg(feature = "parallel")]
     let key_thread = {
         let pass = passphrase.to_string();
@@ -1492,12 +1495,12 @@ pub fn ghost_decode_from_image(
     ghost_decode_from_image_with_positions(img, passphrase, positions)
 }
 
-/// Ghost decode given pre-computed positions (T1.8). Used by `smart_decode`
+/// Ghost decode given pre-computed positions. Used by `smart_decode`
 /// to share Y-channel UNIWARD positions between Ghost primary and Ghost
 /// shadow — both consumers take ownership of their own clone since both
 /// mutate (permute vs sort).
 ///
-/// The Argon2id structural-key derivation uses T1.1's thread-local cache;
+/// The Argon2id structural-key derivation uses the thread-local cache;
 /// the overlap-with-UNIWARD pattern in the public wrapper above is for
 /// the standalone-call path where the cache may be cold.
 pub fn ghost_decode_from_image_with_positions(
@@ -1507,7 +1510,7 @@ pub fn ghost_decode_from_image_with_positions(
 ) -> Result<PayloadData, StegoError> {
     progress::check_cancelled()?;
 
-    // Derive structural key (T1.1 cache).
+    // Derive structural key (uses the thread-local cache).
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
@@ -1565,7 +1568,7 @@ pub fn ghost_decode_from_image_with_positions(
             let stego_bits = &all_stego_bits[..n_used];
             let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
 
-            // T1.4 — length-prefix gate. Skip wrong-w candidates after
+            // Length-prefix gate. Skip wrong-w candidates after
             // ~16 syndrome XORs instead of the full m_max × w.
             if !w_length_prefix_consistent(stego_bits, &hhat_matrix, w, m_max) {
                 return None;
@@ -1604,7 +1607,7 @@ pub fn ghost_decode_from_image_with_positions(
             let stego_bits = &all_stego_bits[..n_used];
             let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
 
-            // T1.4 — length-prefix gate. Skip wrong-w candidates after
+            // Length-prefix gate. Skip wrong-w candidates after
             // ~16 syndrome XORs instead of the full m_max × w.
             if !w_length_prefix_consistent(stego_bits, &hhat_matrix, w, m_max) {
                 continue;
@@ -1640,7 +1643,7 @@ pub fn ghost_decode_from_image_with_positions(
     Err(StegoError::FrameCorrupted)
 }
 
-/// T1.4 — length-prefix early-reject for the brute-force `w` loop.
+/// Length-prefix early-reject for the brute-force `w` loop.
 ///
 /// Reads the first 16 (and if needed 48) STC syndrome bits via
 /// [`extract::stc_extract_prefix`] and checks the v1/v2 length-field
@@ -1752,7 +1755,7 @@ pub fn ghost_shadow_decode_from_image(
     ghost_shadow_decode_from_image_with_positions(img, passphrase, positions)
 }
 
-/// Decode a shadow message given pre-computed positions (T1.8). Used by
+/// Decode a shadow message given pre-computed positions. Used by
 /// `smart_decode` to share Y-channel UNIWARD positions with Ghost primary.
 /// Takes ownership of `positions` since the cost-sort mutates them in
 /// place.

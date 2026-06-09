@@ -14,7 +14,7 @@
 
 //! Per-architecture SIMD kernels for the LL&M integer DCT/IDCT.
 //!
-//! ## Phase T3.1.C (NEON) — current
+//! ## NEON (aarch64)
 //!
 //! Both forward and inverse DCT NEON kernels are wired in. The IDCT
 //! was written directly from libjpeg-turbo upstream
@@ -50,12 +50,12 @@
 //! `idct_neon_bitexact_vs_scalar` and `idct_parity_random_blocks` are
 //! deliberately scoped to this envelope.
 //!
-//! ## Determinism (Phase A spec, preserved)
+//! ## Determinism (binding spec)
 //!
 //! - Pure integer arithmetic. No f64. No FMA. No SIMD rounding-mode
 //!   dependence.
-//! - Bit-identical output across scalar / NEON / future AVX2 / WASM
-//!   SIMD paths, verified by `tests/pixels_aan_cross_platform.rs`.
+//! - Bit-identical output across scalar / NEON / AVX2 / WASM SIMD
+//!   paths, verified by `tests/pixels_aan_cross_platform.rs`.
 //! - Parity envelope vs the f64 reference: ≤ 1 LSB per coefficient on
 //!   forward, ≤ 1 pixel-unit per pixel on inverse.
 
@@ -703,15 +703,13 @@ pub(super) mod neon {
 
 #[cfg(target_arch = "x86_64")]
 pub(super) mod avx2 {
-    //! AVX2 LL&M DCT (x86_64).
+    //! AVX2 LL&M DCT/IDCT (x86_64).
     //!
-    //! ## Phase T3.1.D.1 — fdct ported, IDCT still scalar
-    //!
-    //! Direct port of `naoto256/jpeg-rusturbo` v0.3.0
+    //! The fdct is a direct port of `naoto256/jpeg-rusturbo` v0.3.0
     //! `src/arch/x86_64.rs::fdct_avx2` (MIT/Apache-2.0), itself a Rust
     //! translation of libjpeg-turbo `simd/x86_64/jfdctint-avx2.asm`
-    //! (BSD-3-Clause + IJG). Phase D.2 will add the AVX2 IDCT directly
-    //! from `simd/x86_64/jidctint-avx2.asm` (no Rust reference exists).
+    //! (BSD-3-Clause + IJG). The IDCT (below) was written directly from
+    //! `simd/x86_64/jidctint-avx2.asm` since no Rust reference exists.
     //!
     //! Algorithmic choices preserved from upstream:
     //!
@@ -965,7 +963,7 @@ pub(super) mod avx2 {
     }
 
     // ====================================================================
-    // IDCT — AVX2 inverse DCT (Phase D.2)
+    // IDCT — AVX2 inverse DCT
     // ====================================================================
     //
     // Direct port of libjpeg-turbo `simd/x86_64/jidctint-avx2.asm`
@@ -1205,9 +1203,7 @@ pub(super) mod avx2 {
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub(super) mod wasm {
-    //! WASM SIMD128 LL&M DCT (wasm32).
-    //!
-    //! ## Phase T3.1.E
+    //! WASM SIMD128 LL&M DCT/IDCT (wasm32).
     //!
     //! No Rust reference exists for LL&M in WASM SIMD128 (jpeg-rusturbo
     //! has no WASM target; image-rs/jpeg-decoder's WASM IDCT uses

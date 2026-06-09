@@ -116,16 +116,18 @@ pub fn temp_transcode_path(original: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("{stem}_phasm_baseline_{pid}_{ts}.mp4"))
 }
 
-// ─── Phase 6.5: CABAC-path helpers (cabac-stego feature) ─────────
+// ─── Streaming-session ffmpeg helpers (video feature) ────────────
 //
-// CLI's `video-encode` / `decode` subcommands route through the
-// CABAC v2 streaming orchestrator (matching the iOS + Android bridges)
-// when built with `--features cabac-stego`. The Rust core consumes
-// raw YUV in / Annex-B out; ffmpeg handles the MP4 demux + remux,
-// since phasm-core has no built-in H.264 → YUV decoder.
+// CLI's `video-encode` / `video-capacity` / `decode` subcommands route
+// through the OpenH264 streaming session (matching the iOS + Android
+// bridges). The Rust core consumes raw YUV in / Annex-B out; ffmpeg
+// handles the MP4 demux + remux, since phasm-core has no built-in
+// H.264 → YUV decoder. These helpers are shared by the OH264 encode
+// path (`h264-encoder`) and the decode path (`h264-decoder`), so
+// they are gated on the `video` umbrella that both imply.
 
 /// Probed video metadata from `ffprobe`.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub struct VideoProbe {
     pub width: u32,
@@ -145,7 +147,7 @@ pub struct VideoProbe {
 /// requires it and the v2 orchestrator rejects non-aligned inputs.
 /// Callers that need to handle non-aligned inputs should pre-crop
 /// via ffmpeg before this probe.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     use std::process::Command;
     let result = Command::new("ffprobe")
@@ -213,7 +215,7 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio })
 }
 
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 fn probe_n_frames_via_packet_count(input: &Path) -> Result<usize, CliError> {
     use std::process::Command;
     let result = Command::new("ffprobe")
@@ -238,7 +240,7 @@ fn probe_n_frames_via_packet_count(input: &Path) -> Result<usize, CliError> {
         )))
 }
 
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 fn probe_has_audio(input: &Path) -> bool {
     use std::process::Command;
     Command::new("ffprobe")
@@ -258,7 +260,7 @@ fn probe_has_audio(input: &Path) -> bool {
 
 /// Decode the input MP4 to raw YUV420p planar frames at `output`.
 /// Used to feed the v2 streaming orchestrator, which takes raw YUV.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
     use std::process::Command;
     let result = Command::new("ffmpeg")
@@ -289,7 +291,7 @@ pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
 /// strategy doc (`docs/design/video/h264/stealth-strategy.md`) names it as
 /// the v1.0 ship target — output lands inside the libx264 container
 /// metaclass instead of phasm's own (per Yang/EVA + Altinisik).
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum MuxProfile {
     /// HandBrake/x264-medium container shape (default). Video-only —
@@ -308,7 +310,7 @@ pub enum MuxProfile {
 /// Parse an `r_frame_rate` string ("30/1", "30000/1001") into
 /// `(num, den)`. Returns `(30, 1)` on any parse failure — the
 /// fallback fps phasm uses for the stealth-measurement fixtures.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 pub fn parse_frame_rate(s: &str) -> (u32, u32) {
     let mut parts = s.splitn(2, '/');
     let num = parts.next().and_then(|x| x.trim().parse().ok());
@@ -330,7 +332,7 @@ pub fn parse_frame_rate(s: &str) -> (u32, u32) {
 /// `bool` return for forward compatibility with future profiles
 /// that may yet drop audio (e.g. an Apple-rotation profile that
 /// replaces the audio track entirely).
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "h264-encoder")]
 #[allow(clippy::too_many_arguments)]
 pub fn mux_annexb_to_mp4_with_profile(
     annex_b_path: &Path,
@@ -387,7 +389,7 @@ pub fn mux_annexb_to_mp4_with_profile(
 /// Mux a raw H.264 Annex-B stream into MP4. If `audio_source` is
 /// `Some`, the audio track is copied from there (the original input
 /// file). The video track uses the supplied frame rate.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "h264-encoder")]
 pub fn mux_annexb_to_mp4(
     annex_b: &Path,
     audio_source: Option<&Path>,
@@ -424,7 +426,7 @@ pub fn mux_annexb_to_mp4(
 /// Extract the H.264 video track from an MP4 as raw Annex-B bytes
 /// (start-code-prefixed NAL stream, the format the CABAC decoder
 /// consumes). Uses ffmpeg's `h264_mp4toannexb` bitstream filter.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 pub fn extract_annexb_from_mp4(input: &Path, output: &Path) -> Result<(), CliError> {
     use std::process::Command;
     let result = Command::new("ffmpeg")
@@ -448,7 +450,7 @@ pub fn extract_annexb_from_mp4(input: &Path, output: &Path) -> Result<(), CliErr
 
 /// Produce a unique tempfile path with a custom extension. Caller is
 /// responsible for cleaning it up.
-#[cfg(feature = "cabac-stego")]
+#[cfg(feature = "video")]
 pub fn temp_path_with_ext(original: &Path, ext: &str) -> PathBuf {
     let stem = original
         .file_stem()

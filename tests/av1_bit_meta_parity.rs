@@ -29,7 +29,7 @@
 //! and prevents B.1.4 self-steganalyzer's AoSO adapter from running
 //! coherently.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::sync::Arc;
 

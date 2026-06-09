@@ -122,7 +122,7 @@ jobs:
         run: |
           ulimit -c 0
           cargo test --release \
-            --features "h264-encoder openh264-backend" \
+            --features "h264-encoder" \
             --test openh264_cross_arch_determinism \
             --no-fail-fast \
             -- --nocapture

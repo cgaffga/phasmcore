@@ -8,20 +8,14 @@
 //!
 //! See `docs/design/video/av1/streaming-session.md` § 3.2.
 //!
-//! Audit B-S4 finding (verified by Q11 spike at
-//! `research/16-spike-Q11-rav1e-api.md`): `WriterRecorder::replay`
-//! takes `&mut dyn StorageBackend`, not `&mut dyn Writer`. So the
-//! stego writer must impl BOTH traits — Writer for live encode
-//! interception at `bit()` (Tier 1 L(1) emission), StorageBackend
-//! for the replay sink role.
+//! `WriterRecorder::replay` takes `&mut dyn StorageBackend`, not
+//! `&mut dyn Writer`. So the stego writer must impl BOTH traits —
+//! Writer for live encode interception at `bit()` (Tier 1 L(1)
+//! emission), StorageBackend for the replay sink role.
 //!
-//! # W3.3 STATE (2026-05-21)
-//!
-//! Real Writer + StorageBackend impls landed; both forward to the
-//! inner `WriterBase<WriterEncoder>` via trait disambiguation.
-//! `bit()` has the override interception point with a placeholder
-//! `OverrideMap` Vec<(u64, u16)> mechanism. STC plan integration
-//! (real cost-weighted position selection) is W3.4+.
+//! Real Writer + StorageBackend impls forward to the inner
+//! `WriterBase<WriterEncoder>` via trait disambiguation. `bit()`
+//! has the override interception point.
 //!
 //! Test coverage includes:
 //! - skeleton constructs / defaults
@@ -39,17 +33,16 @@ use phasm_rav1e::ec::{
 
 /// Tier 1 override plan keyed by canonical cover position.
 ///
-/// v0.3-AV1 uses a sparse position → bit-value map. Real STC
-/// integration (cost-weighted position selection over the
-/// J-UNIWARD-derived cost vector per cost-model.md § 2) plugs into
-/// the [`OverrideMap::from_stc_plan`] constructor in a future commit
+/// Sparse position → bit-value map. Real STC integration
+/// (cost-weighted position selection over the J-UNIWARD-derived
+/// cost vector per cost-model.md § 2) plugs into the
+/// [`OverrideMap::from_stc_plan`] constructor in a future commit
 /// — for now this is a directly-populated mechanism for round-trip
 /// + override-correctness testing.
 ///
-/// W3.4: switched from `Vec<(u64, u16)>` to `HashMap<u64, u16>` for
-/// O(1) lookup at every `Writer::bit()` call (was O(N) in the Vec
-/// version, which becomes prohibitive for 1080p frames with ~200k
-/// candidate positions per cost-model.md § 3).
+/// Backed by `HashMap<u64, u16>` for O(1) lookup at every
+/// `Writer::bit()` call — necessary for 1080p frames with ~200k
+/// candidate positions per cost-model.md § 3.
 #[derive(Debug, Default, Clone)]
 pub struct OverrideMap {
     entries: HashMap<u64, u16>,
@@ -85,9 +78,8 @@ pub struct WriterStego {
     /// Empty by default → no overrides → bit() forwards unchanged.
     plan: OverrideMap,
     /// Monotonic counter incremented on every `bit()` call.
-    /// Position-keyed override lookup uses this. Real cover-position
-    /// canonical order (per streaming-session.md § 5) will replace
-    /// this with a more structured cursor in W3.4+.
+    /// Position-keyed override lookup uses this. Cover-position
+    /// canonical order is documented in streaming-session.md § 5.
     cursor: u64,
 }
 
@@ -115,7 +107,7 @@ impl WriterStego {
     /// Consume the writer, flush the inner range coder, and return
     /// the final encoded bytes.
     ///
-    /// W3.4: now invokes `WriterBase<WriterEncoder>::done()` (rav1e
+    /// Invokes `WriterBase<WriterEncoder>::done()` (rav1e
     /// `src/ec.rs::434`) which finalizes the range coder by emitting
     /// the minimum bits needed for unambiguous decode of all symbols
     /// written so far.
@@ -157,8 +149,8 @@ impl Writer for WriterStego {
     }
 
     fn bool(&mut self, val: bool, f: u16) {
-        // W3.6: 50/50 bool() calls are L(1) candidates equivalent to
-        // bit() (rav1e routes `bit(b)` through `bool(b==1, 16384)`).
+        // 50/50 bool() calls are L(1) candidates equivalent to bit()
+        // (rav1e routes `bit(b)` through `bool(b==1, 16384)`).
         // Non-bit() direct callers like `block_unit.rs:1770` delta_lf
         // sign + `ec.rs::667` write_subexp flag emit through bool()
         // directly. Mirror the fork's phasm_track_bit semantics here:
@@ -203,7 +195,7 @@ impl Writer for WriterStego {
     }
 
     fn write_golomb(&mut self, level: u32) {
-        // W3.4: re-implements rav1e's write_golomb (src/ec.rs::609)
+        // Re-implements rav1e's write_golomb (src/ec.rs::609)
         // routing every emitted bit through WriterStego::bit so the
         // cursor advances AND the Tier 1 override plan can intercept
         // golomb data bits (channel-design.md § 4.2 `GolombTailLsb`).
@@ -304,10 +296,10 @@ impl Writer for WriterStego {
 
 impl StorageBackend for WriterStego {
     fn store(&mut self, fl: u16, fh: u16, nms: u16) {
-        // TODO W3.4: store-level intercept site for cases where
-        // override is needed below the bit() layer. For Tier 1 L(1)
-        // overrides the bit() intercept already fired before this
-        // method is reached, so no extra work needed here for v0.3.
+        // TODO: store-level intercept site for cases where override
+        // is needed below the bit() layer. For Tier 1 L(1) overrides
+        // the bit() intercept already fired before this method is
+        // reached, so no extra work needed here.
         self.inner.store(fl, fh, nms);
     }
 
@@ -324,7 +316,7 @@ impl StorageBackend for WriterStego {
     }
 }
 
-// === Encoder-side cover positions (W3.10.1, collapsed-W3.9 helper) ===
+// === Encoder-side cover positions ===
 //
 // Typed view over `recorder.phasm_bit_positions()` + `phasm_bit_tags()`.
 // Pairs them with a monotonic cursor + the encoder-side tag, so STC
@@ -337,8 +329,7 @@ impl StorageBackend for WriterStego {
 //   encoder_positions[N].natural_value == decoder_positions[N].decoded_value
 //   encoder_positions[N].tag           == decoder_positions[N].tag
 //
-// for every N — verified by `w3d43_*` + W3.10.2 tests in
-// `decoder.rs::round_trip`.
+// for every N — verified by round-trip tests in `decoder.rs`.
 
 /// A single L(1) cover position from a recorded encoder pass. Cursor
 /// is the monotonic 50/50 emission index starting at 0; matches the
@@ -346,7 +337,7 @@ impl StorageBackend for WriterStego {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoverPosition {
     /// Monotonic L(1) emission count — matches the OverrideMap key
-    /// AND the decoder-side cursor (W3.10.2 parity invariant).
+    /// AND the decoder-side cursor (cursor-parity invariant).
     pub cursor: u64,
     /// Index into `recorder.phasm_storage()` where the matching
     /// `(fl, fh, nms)` tuple lives. Used by `replay_with_overrides`.
@@ -354,7 +345,7 @@ pub struct CoverPosition {
     /// The natural bit value at this position (0 or 1) — what the
     /// encoder would emit absent any stego override.
     pub natural_value: u16,
-    /// Channel identity per W3.9.0 tagging:
+    /// Channel identity:
     /// `phasm_rav1e::phasm_stego::PHASM_TAG_*` constants.
     pub tag: u8,
 }
@@ -425,7 +416,7 @@ impl CoverPositions {
 
 // === Hybrid Pass 2 replay-with-overrides ===
 //
-// Pairs phasm-rav1e's W3.6 fork patch with phasm-core's STC override
+// Pairs phasm-rav1e's fork patch with phasm-core's STC override
 // plan to apply Tier 1 L(1) overrides at REPLAY time (no full re-
 // encode required). Architecture per
 // `docs/design/video/av1/streaming-session.md` § 1.1 Option E.
@@ -445,8 +436,7 @@ impl CoverPositions {
 /// Compute the (fl, fh, nms) tuple that rav1e's `Writer::bool(val,
 /// 16384)` produces for the given binary value.
 ///
-/// Derived from rav1e `src/ec.rs::485-489` + `src/ec.rs::520-537`
-/// (W3.5 source-read):
+/// Derived from rav1e `src/ec.rs::485-489` + `src/ec.rs::520-537`:
 ///
 /// ```text
 /// bool(val, 16384) → symbol(val as u32, &[16384, 0])
@@ -591,17 +581,14 @@ mod tests {
 
     #[test]
     fn rav1e_ec_types_importable() {
-        // Verify the rav1e type imports still resolve (W3.2 carry-
-        // forward; ensures fork submodule + Cargo dep wiring stays
-        // healthy after the W3.3 expansion).
+        // Verify the rav1e type imports still resolve — ensures fork
+        // submodule + Cargo dep wiring stays healthy.
         fn _accept_writer<W: Writer>(_: &mut W) {}
         fn _accept_storage<S: StorageBackend>(_: &mut S) {}
         let mut stego = WriterStego::new();
         _accept_writer(&mut stego);
         _accept_storage(&mut stego);
     }
-
-    // === W3.4 additions ===
 
     #[test]
     fn finalize_returns_bytes() {
@@ -642,9 +629,8 @@ mod tests {
 
     #[test]
     fn override_map_hashmap_o1_lookup() {
-        // After W3.4's Vec → HashMap switch, lookup is O(1) instead
-        // of O(N). Sanity-check that get() still returns the right
-        // value when many entries are present.
+        // Lookup is O(1) via HashMap. Sanity-check that get() still
+        // returns the right value when many entries are present.
         let mut plan = OverrideMap::new();
         for i in 0..1000u64 {
             plan.set(i, (i & 1) as u16);
@@ -682,16 +668,16 @@ mod tests {
         stego.literal(8, 0b00000000);
         assert_eq!(stego.cursor(), 8, "literal(8) advances cursor by 8");
         // The override at position 3 substituted bit value 1 for the
-        // natural 0; round-trip verification deferred to W3.5+ when
-        // we have a decode-side walker.
+        // natural 0; bitstream-level round-trip verification covered
+        // by separate tests below.
     }
 
     #[test]
     fn override_applies_in_golomb_data_bits() {
-        // W3.4 key feature: write_golomb now routes through
-        // WriterStego::bit (not inner.write_golomb), so overrides at
-        // golomb data-bit positions take effect — closes the
-        // GolombTailLsb cursor-tracking gap noted in W3.3.
+        // write_golomb routes through WriterStego::bit (not
+        // inner.write_golomb), so overrides at golomb data-bit
+        // positions take effect — closes the GolombTailLsb
+        // cursor-tracking gap.
         let mut plan = OverrideMap::new();
         plan.set(2, 1); // override the 3rd bit emitted by golomb(1)
         let mut stego = WriterStego::new();
@@ -700,10 +686,10 @@ mod tests {
         assert_eq!(stego.cursor(), 3);
         // Position 2 (the 3rd bit = data '0') was planned to override
         // to '1'. Cursor-level verification only; bitstream-level
-        // verification covered by W3.5 tests below.
+        // verification covered by the tests below.
     }
 
-    // === W3.5: Pass 2 cached-replay round-trip tests ===
+    // === Pass 2 cached-replay round-trip tests ===
     //
     // These tests exercise the full WriterStego ↔ WriterBase<WriterEncoder>
     // ↔ WriterRecorder pipeline against the streaming-session.md § 1.1
@@ -723,16 +709,14 @@ mod tests {
     // through StorageBackend::store(), NOT through Writer::bit(). So
     // Tier 1 overrides at Writer::bit() level do NOT fire during
     // replay — they only fire during direct Writer-trait writes.
-    // That's the audit-confirmed semantics; W3.5+ Pass 2 architecture
+    // That's the audit-confirmed semantics; the Pass 2 architecture
     // therefore re-encodes (rather than replays) for cases where
-    // overrides need to apply. Verified by Q11 spike
-    // (research/16-spike-Q11-rav1e-api.md): rav1e is deterministic,
-    // so re-encoding the same input twice produces byte-identical
-    // output.
+    // overrides need to apply. rav1e is deterministic, so re-encoding
+    // the same input twice produces byte-identical output.
 
     use phasm_rav1e::ec::WriterRecorder as RavWriterRecorder;
 
-    /// W3.5 Test A — replay forwarding byte-identity.
+    /// Replay forwarding byte-identity.
     ///
     /// Replay the same WriterRecorder through:
     ///   sink_a = WriterBase<WriterEncoder> (rav1e native sink)
@@ -774,7 +758,7 @@ mod tests {
         );
     }
 
-    /// W3.5 Test B — direct writing byte-identity (no replay).
+    /// Direct writing byte-identity (no replay).
     ///
     /// Write identical inputs through WriterBase<WriterEncoder>
     /// directly and through WriterStego with empty plan; bytes must
@@ -804,7 +788,7 @@ mod tests {
         );
     }
 
-    /// W3.5 Test C — Tier 1 override changes bitstream bytes.
+    /// Tier 1 override changes bitstream bytes.
     ///
     /// Two WriterStego instances fed identical inputs, one with an
     /// active override plan: the bytes MUST differ — proves the
@@ -833,8 +817,8 @@ mod tests {
         );
     }
 
-    /// W3.5 Test D — override at a position equal to the natural bit
-    /// must NOT change output (no-op override).
+    /// Override at a position equal to the natural bit must NOT
+    /// change output (no-op override).
     #[test]
     fn override_matching_natural_value_is_noop() {
         // 0xab = 0b10101011. Bit at cursor=0 is the MSB = 1.
@@ -857,7 +841,7 @@ mod tests {
         );
     }
 
-    /// W3.5 Test E — multiple overrides accumulate (each takes effect).
+    /// Multiple overrides accumulate (each takes effect).
     #[test]
     fn multiple_overrides_accumulate() {
         // 0xab = 0b10101011 → natural bits MSB-first: 1,0,1,0,1,0,1,1.
@@ -884,9 +868,9 @@ mod tests {
         );
     }
 
-    /// W3.5 Test F — empty plan = byte-identical to direct WriterEncoder
-    /// across a longer sample (regression guard for any subtle Writer
-    /// trait method forwarding bug).
+    /// Empty plan = byte-identical to direct WriterEncoder across a
+    /// longer sample (regression guard for any subtle Writer trait
+    /// method forwarding bug).
     #[test]
     fn empty_plan_byte_identity_long_sample() {
         // Mix of bit / literal / golomb across many cursor positions.
@@ -918,14 +902,13 @@ mod tests {
         );
     }
 
-    // === W3.6: hybrid Pass 2 replay-with-overrides ===
+    // === Hybrid Pass 2 replay-with-overrides ===
     //
-    // These tests exercise the phasm-rav1e W3.6 fork patch + the
+    // These tests exercise the phasm-rav1e fork patch + the
     // phasm-core `replay_with_overrides` function. The patch makes
     // `WriterRecorder` track 50/50 L(1) emission positions
     // (`phasm_bit_positions`) parallel to its `storage` Vec, enabling
-    // bit-level override at replay time without the full re-encode
-    // Pass 2 cost that the W3.5 finding had implied.
+    // bit-level override at replay time without a full re-encode.
     //
     // Coverage:
     //  - empty plan → byte-identical to direct WriterEncoder
@@ -937,8 +920,8 @@ mod tests {
     //  - long varied sample byte-identity (regression guard)
     //  - rollback truncates phasm_bit_positions correctly
 
-    /// W3.6-A: hybrid replay with empty plan is byte-identical to a
-    /// direct `WriterBase<WriterEncoder>` encode of the same input.
+    /// Hybrid replay with empty plan is byte-identical to a direct
+    /// `WriterBase<WriterEncoder>` encode of the same input.
     #[test]
     fn hybrid_replay_empty_plan_byte_identity() {
         fn write_sample<W: Writer>(w: &mut W) {
@@ -963,8 +946,8 @@ mod tests {
         );
     }
 
-    /// W3.6-B: hybrid replay with override changes bytes (override
-    /// actually fires).
+    /// Hybrid replay with override changes bytes (override actually
+    /// fires).
     #[test]
     fn hybrid_replay_override_changes_bytes() {
         let mut recorder = WriterRecorder::new();
@@ -982,7 +965,7 @@ mod tests {
         );
     }
 
-    /// W3.6-C: hybrid replay byte-matches the encode-time
+    /// Hybrid replay byte-matches the encode-time
     /// `WriterStego::bit` override path. This is the load-bearing
     /// equivalence: it proves Pass 2 hybrid replay IS THE SAME as a
     /// Pass-2 full re-encode through WriterStego, so we can use the
@@ -1003,7 +986,7 @@ mod tests {
         plan.set(11, 1);
 
         // Encode-time path: WriterStego applies overrides during the
-        // initial encode (Path 1c re-encode equivalent).
+        // initial encode (re-encode equivalent).
         let mut stego = WriterStego::new();
         stego.set_plan(plan.clone());
         write_sample(&mut stego);
@@ -1021,8 +1004,8 @@ mod tests {
         );
     }
 
-    /// W3.6-D: hybrid replay override fires on `write_golomb` data
-    /// bits (the GolombTailLsb Tier 1 secondary channel per
+    /// Hybrid replay override fires on `write_golomb` data bits
+    /// (the GolombTailLsb Tier 1 secondary channel per
     /// channel-design.md § 4.2). Verified by override-vs-no-override
     /// byte difference AND by equivalence with the WriterStego
     /// encode-time path.
@@ -1058,8 +1041,8 @@ mod tests {
         );
     }
 
-    /// W3.6-E: hybrid replay catches direct `bool(_, 16384)` calls
-    /// (the rav1e pattern at `src/context/block_unit.rs:1770` for
+    /// Hybrid replay catches direct `bool(_, 16384)` calls (the
+    /// rav1e pattern at `src/context/block_unit.rs:1770` for
     /// delta_lf sign + `src/ec.rs::667` inside write_subexp). These
     /// emissions do NOT route through `bit()` but are still 50/50
     /// L(1) candidates; the fork patch's bool() hook catches them.
@@ -1095,9 +1078,9 @@ mod tests {
         );
     }
 
-    /// W3.6-F: verify the fork's `phasm_bit_positions` index sees
-    /// exactly the expected count of 50/50 emissions across mixed
-    /// Writer methods.
+    /// Verify the fork's `phasm_bit_positions` index sees exactly
+    /// the expected count of 50/50 emissions across mixed Writer
+    /// methods.
     #[test]
     fn fork_hook_counts_all_50_50_emissions() {
         let mut recorder = WriterRecorder::new();
@@ -1131,7 +1114,7 @@ mod tests {
         assert_eq!(positions[9].1, 1); // 0xab LSB
     }
 
-    /// W3.6-G: long varied sample byte-identity (regression guard).
+    /// Long varied sample byte-identity (regression guard).
     /// Mix of bit, literal, write_golomb, bool(_, 16384), and a
     /// non-50/50 bool(_, 8192) — all replayed must match a direct
     /// encode with the same input.
@@ -1167,7 +1150,7 @@ mod tests {
         );
     }
 
-    // === W3.10.1: CoverPositions wrapper tests ===
+    // === CoverPositions wrapper tests ===
 
     #[test]
     fn cover_positions_from_empty_recorder() {
@@ -1225,9 +1208,9 @@ mod tests {
         assert_eq!(ac_signs[1].cursor, 2);
     }
 
-    /// W3.6-H: rollback truncates `phasm_bit_positions` correctly.
-    /// Verify the fork's rollback hook keeps the index in sync with
-    /// the truncated storage (so subsequent replays don't reference
+    /// Rollback truncates `phasm_bit_positions` correctly. Verify
+    /// the fork's rollback hook keeps the index in sync with the
+    /// truncated storage (so subsequent replays don't reference
     /// dropped positions).
     #[test]
     fn fork_rollback_truncates_bit_positions() {
@@ -1250,12 +1233,12 @@ mod tests {
         );
     }
 
-    // === W3.8.6: end-to-end Pass 1 + Pass 2 round-trip via rav1e fork ===
+    // === End-to-end Pass 1 + Pass 2 round-trip via rav1e fork ===
     //
-    // Closes the W3.8 loop by combining the rav1e fork's Option 3
-    // surface (encode_tile::<WriterRecorder> + re-exported internal
-    // types per rav1e-hook-sites.md § 3.0) with phasm-core's
-    // hybrid-replay machinery (replay_with_overrides + WriterStego).
+    // Combines the rav1e fork's Option 3 surface
+    // (encode_tile::<WriterRecorder> + re-exported internal types
+    // per rav1e-hook-sites.md § 3.0) with phasm-core's hybrid-replay
+    // machinery (replay_with_overrides + WriterStego).
     //
     // Three assertions:
     //   1. Round-trip byte-identity: replay_with_overrides on the
@@ -1268,11 +1251,9 @@ mod tests {
     //      count regardless of value — load-bearing for the OBU-splice
     //      strategy in rav1e-hook-sites.md § 3.1).
     //
-    // This is the first test that drives Pass 1 through real rav1e
-    // encode logic (not synthetic WriterRecorder input). Validates
-    // the entire Option 3 architecture end-to-end before W3.9
-    // (cover-position walker) + W3.10 (orchestrator + STC plan)
-    // land on top of it.
+    // Drives Pass 1 through real rav1e encode logic (not synthetic
+    // WriterRecorder input), validating the Option 3 architecture
+    // end-to-end.
 
     use phasm_rav1e::phasm_stego::{
         encode_tile, make_frame, make_inter_config, FrameInvariants, FrameState,
@@ -1286,8 +1267,8 @@ mod tests {
     /// gradient-filled input. Mirrors `phasm-rav1e/src/encoder.rs`
     /// `phasm_smoke_tests::setup_frame_state()` but drives via the
     /// public `phasm_stego` re-export module so we exercise the
-    /// Option 3 API surface that phasm-core's W3.10 orchestrator
-    /// will eventually depend on.
+    /// Option 3 API surface that phasm-core's orchestrator depends
+    /// on.
     fn setup_rav1e_state() -> (
         FrameInvariants<u8>,
         FrameState<u8>,
@@ -1323,7 +1304,7 @@ mod tests {
     /// Deterministic gradient — required for the encoder to produce
     /// non-zero AC coefficients, which is what creates L(1) emission
     /// sites (per phasm-rav1e smoke-test learning, captured in
-    /// rav1e-hook-sites.md § 3.4 DEF-2).
+    /// rav1e-hook-sites.md § 3.4).
     fn fill_gradient<T: Pixel>(frame: &mut Frame<T>) {
         for (plane_idx, plane) in frame.planes.iter_mut().enumerate() {
             let stride = plane.cfg.stride;
@@ -1338,12 +1319,12 @@ mod tests {
         }
     }
 
-    /// W3.8.6 Test A — empty-plan hybrid replay is byte-identical to
-    /// a direct rav1e natural encode via encode_tile::<WriterEncoder>.
+    /// Empty-plan hybrid replay is byte-identical to a direct rav1e
+    /// natural encode via encode_tile::<WriterEncoder>.
     ///
     /// This is the load-bearing equivalence for the entire Option E
-    /// architecture: if it fails, the W3.6 fork hook is broken OR
-    /// rav1e's encoder isn't deterministic byte-by-byte across two
+    /// architecture: if it fails, the fork hook is broken OR rav1e's
+    /// encoder isn't deterministic byte-by-byte across two
     /// invocations.
     #[test]
     fn w386_round_trip_empty_plan_byte_identity() {
@@ -1390,9 +1371,9 @@ mod tests {
         );
     }
 
-    /// W3.8.6 Test B — override fires on the wire: non-empty plan
-    /// produces different bytes than natural, but with the SAME LENGTH.
-    /// Length invariance is load-bearing for the OBU-splice strategy
+    /// Override fires on the wire: non-empty plan produces different
+    /// bytes than natural, but with the SAME LENGTH. Length
+    /// invariance is load-bearing for the OBU-splice strategy
     /// (per rav1e-hook-sites.md § 3.1).
     #[test]
     fn w386_round_trip_override_changes_bytes_same_length() {
@@ -1440,10 +1421,9 @@ mod tests {
         );
     }
 
-    /// W3.8.6 Test C — multiple-override capacity. Flip every 3rd L(1)
-    /// emission; verify bytes differ AND length is preserved across
-    /// many override sites. Stress test for the length-invariance
-    /// claim.
+    /// Multiple-override capacity. Flip every 3rd L(1) emission;
+    /// verify bytes differ AND length is preserved across many
+    /// override sites. Stress test for the length-invariance claim.
     #[test]
     fn w386_round_trip_multiple_overrides_preserve_length() {
         use phasm_rav1e::context::CDFContext;

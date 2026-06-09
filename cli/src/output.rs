@@ -4,10 +4,9 @@
 
 use phasm_core::{DecodeQuality, EncodeQuality, PayloadData};
 
-/// Minimal CLI-side capacity report. Replaces the old
-/// `phasm_core::VideoCapacity` which was HEVC-specific and is now archived
-/// behind `hevc-archive`. Phase 4b will replace this with the H.264
-/// position-count report once the CLI is rewritten.
+/// Minimal CLI-side video capacity report (H.264 position counts). Replaces
+/// the old `phasm_core::VideoCapacity`, which was HEVC-specific and was
+/// removed with the HEVC pipeline (2026-06-04).
 #[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub struct CliVideoCapacityInfo {

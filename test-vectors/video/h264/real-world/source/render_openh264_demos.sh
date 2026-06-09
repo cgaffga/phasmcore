@@ -55,7 +55,7 @@ build_example() {
     (cd "$REPO_ROOT/core" && cargo build --release \
         --example openh264_clean_encode \
         --example openh264_visual_demo \
-        --features "openh264-backend video h264-encoder cabac-stego" >/dev/null 2>&1)
+        --features "h264-encoder video h264-encoder cabac-stego" >/dev/null 2>&1)
 }
 
 render_one() {

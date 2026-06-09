@@ -14,12 +14,12 @@
 //
 // Run (needs ffmpeg + gitignored corpus):
 //   PHASM_PERF_TRACE=1 cargo test --test horse_flag_capacity_797 \
-//     --features openh264-backend,cabac-stego --release -- --ignored --nocapture
+//     --features h264-encoder,cabac-stego --release -- --ignored --nocapture
 
-#![cfg(all(feature = "openh264-backend", feature = "cabac-stego"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::{
-    h264_stego_capacity_4domain_oh264,
+    h264_video_capacity,
     ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
     StreamingDecodeSession, StreamingEncodeSession, YuvFrameRef,
 };
@@ -90,7 +90,7 @@ fn decode(annex_b: &[u8], pass: &str) -> Result<String, String> {
 
 /// Binary-search the largest message that actually encodes (OK) for a
 /// fixture, to compare the TRUE encodable capacity against the reported
-/// `h264_stego_capacity_4domain_oh264` value. This is the real
+/// `h264_video_capacity` value. This is the real
 /// accuracy probe for #797.
 /// Deterministic ~incompressible printable-ASCII string (LCG-driven).
 /// Using "x".repeat(len) would measure Brotli compression, not capacity
@@ -165,7 +165,7 @@ fn horse_flag_true_vs_reported_capacity() {
             let Some(yuv) = try_scale_yuv(src, W, H, n) else {
                 eprintln!("{:<13} {:>6} | SKIP", tag, n); continue;
             };
-            let reported = h264_stego_capacity_4domain_oh264(&yuv, W, H, n as usize,
+            let reported = h264_video_capacity(&yuv, W, H, n as usize,
                 EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
                 .map(|i| i.per_tier_primary_max_message_bytes[0]).unwrap_or(0);
             let true_max = max_encodable(&yuv, W, H, n, GOP);
@@ -188,7 +188,7 @@ fn horse_flag_capacity_vs_frames() {
         let Some(yuv) = try_scale_yuv("Artlist_HorseFlag.mp4", W, H, n) else {
             eprintln!("{:>6} | SKIP (no fixture/ffmpeg)", n); continue;
         };
-        let cap = h264_stego_capacity_4domain_oh264(&yuv, W, H, n as usize,
+        let cap = h264_video_capacity(&yuv, W, H, n as usize,
             EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0] as i64)
             .unwrap_or(-1);
@@ -217,7 +217,7 @@ fn realistic_capacity_check() {
     const H: u32 = 720;
     const GOP: u32 = 30;
     let rep = |yuv: &[u8], n: u32| -> usize {
-        h264_stego_capacity_4domain_oh264(yuv, W, H, n as usize,
+        h264_video_capacity(yuv, W, H, n as usize,
             EncodeOpts { qp: 26, intra_period: GOP as i32 }, false)
             .map(|i| i.per_tier_primary_max_message_bytes[0]).unwrap_or(0)
     };

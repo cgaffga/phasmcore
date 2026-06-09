@@ -45,7 +45,7 @@
 //! See [`phase-c-test-gates.md`](../../docs/design/video/av1/phase-c-test-gates.md)
 //! § 2 for the full design rationale.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

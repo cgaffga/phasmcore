@@ -16,7 +16,7 @@
 //! is what guards against encoder/decoder spec drift on the meta
 //! contract (mirror of the W3.10.4-fix cursor parity test).
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::sync::Arc;
 

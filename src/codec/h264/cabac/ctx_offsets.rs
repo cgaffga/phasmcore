@@ -4,18 +4,15 @@
 
 //! H.264 CABAC ctxIdxOffset tables and per-block-cat offsets.
 //!
-//! Phase 6F.1 follow-on tidy (Task #50, deferred-item #35) — all
-//! direction-neutral spec data lives here, not in `cabac::encoder`.
-//! Both the encoder (`cabac::encoder`) and the bin-decoder
-//! (`cabac::bin_decoder::syntax`) use the same tables to compute
+//! All direction-neutral spec data lives here. (The forward CABAC
+//! encoder that previously shared these tables was removed in the
+//! video-retirement; the bin-decoder `cabac::bin_decoder::syntax` is
+//! now the sole consumer.) Used to compute
 //! `ctxIdx = ctxIdxOffset + ctxIdxBlockCatOffset + ctxIdxInc`.
 //!
 //! Tabular data is spec-defined (ITU-T H.264 03/2010 Tables 9-34,
 //! 9-40, 9-43); placement here is for code-organisation, not
 //! semantic.
-//!
-//! Re-exports under `cabac::encoder::*` are preserved for
-//! backwards-compat with existing callers.
 
 /// Per-element `ctxIdxOffset` values per spec Table 9-34.
 pub mod ctx_offset {

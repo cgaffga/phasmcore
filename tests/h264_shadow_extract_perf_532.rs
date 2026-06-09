@@ -23,10 +23,10 @@
 //!    cheaply, before AES).
 //!
 //! Run with: `cargo test --release -p phasm-core --features
-//! "video,h264-encoder,cabac-stego" --test
+//! "h264-decoder" --test
 //! h264_shadow_extract_perf_532 -- --nocapture`
 
-#![cfg(all(feature = "video", feature = "cabac-stego"))]
+#![cfg(feature = "h264-decoder")]
 
 use phasm_core::codec::h264::stego::shadow as shadow_h264;
 use phasm_core::codec::h264::stego::{DomainCover, DomainBits, EmbedDomain, PositionKey,
@@ -61,6 +61,10 @@ fn synth_cover(n_per_domain: usize) -> DomainCover {
             );
             bits.bits.push(bit);
             bits.positions.push(key);
+            // DomainBits invariant: one magnitude per bit (the magnitudes
+            // carrier was added by CASCADE.P1 #750 after this test went
+            // dormant; value is irrelevant to the shadow extract path).
+            bits.magnitudes.push(1 + ((raw >> 12) & 0x1F) as u16);
         }
     };
     push_bits(&mut cover.coeff_sign_bypass, EmbedDomain::CoeffSignBypass);
@@ -80,17 +84,19 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
         .map(|i| (b'a' + (i as u8 % 26)) as char)
         .collect();
 
-    let state = shadow_h264::prepare_shadow_all4(
+    let state = shadow_h264::prepare_shadow(
         &cover,
         "perf-test-pass",
         &msg,
         &[],
         4, // smallest parity tier — encoder's natural default
+        None,
+        None,
     )
-    .expect("prepare_shadow_all4");
+    .expect("prepare_shadow");
 
     // Inject into all 4 domain bit arrays.
-    shadow_h264::embed_shadow_lsb_all4(
+    shadow_h264::embed_shadow_lsb(
         &mut cover.coeff_sign_bypass.bits,
         &mut cover.coeff_suffix_lsb.bits,
         &mut cover.mvd_sign_bypass.bits,
@@ -100,7 +106,7 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
 
     // Extract — time only this.
     let t0 = Instant::now();
-    let recovered = shadow_h264::shadow_extract_all4(&cover, "perf-test-pass")
+    let recovered = shadow_h264::shadow_extract(&cover, "perf-test-pass", None, None)
         .expect("shadow_extract_all4 must succeed (#532 correctness)");
     let elapsed = t0.elapsed().as_nanos();
 
@@ -113,7 +119,7 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
 fn run_no_shadow(cover_positions_per_domain: usize) -> u128 {
     let cover = synth_cover(cover_positions_per_domain);
     let t0 = Instant::now();
-    let r = shadow_h264::shadow_extract_all4(&cover, "perf-test-pass");
+    let r = shadow_h264::shadow_extract(&cover, "perf-test-pass", None, None);
     let elapsed = t0.elapsed().as_nanos();
     assert!(r.is_err(), "no shadow → must fail to extract");
     elapsed
@@ -172,6 +178,11 @@ fn shadow_extract_perf_sweep() {
     println!("  v2 wire format with explicit tier hint — could cut it further).");
 
     // Sanity: extract must be well under 1 second on synthetic cover.
-    assert!(t12 < 1_000_000_000, "12B extract too slow: {} ns", t12);
-    assert!(t4096 < 5_000_000_000, "4KB extract too slow: {} ns", t4096);
+    // Perf thresholds are only meaningful in --release; debug is ~100×
+    // slower, so there we only exercise the round-trip (the #532
+    // correctness regression — large-fdl shadows must still decode).
+    if !cfg!(debug_assertions) {
+        assert!(t12 < 1_000_000_000, "12B extract too slow: {} ns", t12);
+        assert!(t4096 < 5_000_000_000, "4KB extract too slow: {} ns", t4096);
+    }
 }

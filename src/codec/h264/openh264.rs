@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_openh264_sys::{
     phasm_decoder_create, phasm_decoder_decode_frame, phasm_decoder_destroy,
-    phasm_decoder_flush_frame, phasm_decoder_frames_remaining, phasm_decoder_initialize,
+    phasm_decoder_flush_frame, phasm_decoder_initialize,
     phasm_decoder_initialize_with_options, phasm_encoder_create, phasm_encoder_destroy,
     phasm_encoder_encode_frame, phasm_encoder_get_dec_pic_y, phasm_encoder_initialize,
     phasm_encoder_set_dual_recon_enabled, phasm_encoder_uninitialize,
@@ -662,13 +662,11 @@ impl Encoder {
         Ok((FrameType::from_raw(rv), written as usize))
     }
 
-    /// P3.3a — get a mutable slice over pDecPic's Y plane so the
-    /// Rust side can apply post-frame DPB correction deltas. Returns
-    /// `None` if no frame has been encoded yet.
-    pub(crate) fn raw_handle(&self) -> *mut PhasmEncoderHandle {
-        self.handle
-    }
-
+    /// Get a mutable slice over pDecPic's Y plane. Returns `None` if no
+    /// frame has been encoded yet. Originally added for P3.3a post-frame
+    /// DPB correction (now disabled — cascade elimination comes from the
+    /// wire_only clean-reconstruction path); retained as a fork-recon
+    /// accessor.
     pub fn get_dec_pic_y_mut(&self) -> Option<(&mut [u8], usize)> {
         let mut y_ptr: *mut u8 = core::ptr::null_mut();
         let mut y_stride: i32 = 0;
@@ -746,13 +744,16 @@ pub struct DecodedFrame {
 /// shim. Single-threaded by virtue of `iMultipleThreadIdc` defaults;
 /// not `Sync`.
 ///
-/// # Phase B.9.1 scope
+/// # `dec_post_read` wiring
 /// This decoder parses fork-encoder output into Y/U/V planes. The
 /// `dec_post_read` callback in `StegoHandlers` is plumbed through to
-/// the global registration but **the decoder TU does not currently
-/// fire it** — that requires fork-side patches inside
-/// `parse_mb_syn_cabac.cpp` (B.9.2). Until then, registering a
-/// `dec_post_read` handler is a no-op from the decoder's perspective.
+/// the global registration; B.9.1 shipped the plumbing only (no
+/// decoder TU fired the hook yet). B.9.2.2–.5 then added the
+/// fork-side patches inside `parse_mb_syn_cabac.cpp`, so the decoder
+/// now fires `dec_post_read` once per parsed stego bypass bin across
+/// all 4 domains (CoeffSign, CoeffSuffixLsb, MvdSign, MvdSuffixLsb).
+/// Bit-for-bit parity with the phasm walker is gated by the
+/// `b9_2_*` / `b9_3_*` tests below.
 pub struct Decoder {
     handle: *mut PhasmDecoderHandle,
 }
@@ -898,18 +899,6 @@ impl Decoder {
         }))
     }
 
-    /// Number of frames currently buffered in the decoder's reorder
-    /// queue. Useful to know how many `flush_once` calls would drain
-    /// the buffer (or for diagnostic logging).
-    pub fn frames_remaining(&mut self) -> Result<i32, DecoderError> {
-        let mut n: i32 = 0;
-        let rv = unsafe { phasm_decoder_frames_remaining(self.handle, &mut n) };
-        if rv < 0 {
-            return Err(DecoderError::DecodeFailed(rv));
-        }
-        Ok(n)
-    }
-
     /// Single FFI call. Returns `Ok(None)` if the call succeeded but
     /// no frame was produced (caller decides whether to retry/flush);
     /// `Ok(Some(frame))` for a ready frame; `Err` on decoder error.
@@ -1042,11 +1031,11 @@ fn split_annex_b_per_frame(bytes: &[u8]) -> Vec<Vec<u8>> {
 /// walker is gated by `b9_3_full_roundtrip_via_decoder_hook` and
 /// `b11_extract_cover_bits_matches_walker`.
 ///
-/// `position_keys` is intentionally omitted. Production extract
-/// (`smart_decode`) is the immediate consumer and only needs the
-/// bit sequences for STC extract. Re-deriving `PositionKey`s from
-/// `PhasmStegoPos` is a heavier refactor — see Phase C for the
-/// production-swap plan.
+/// `position_keys` is intentionally omitted: this fork-decoder
+/// cover-extract path only yields the raw per-domain bit sequences,
+/// not `PositionKey`s. It is retained for tests/diagnostics — the
+/// production decoder is the pure-Rust CABAC bin-walker
+/// (`StreamingDecodeSession`), which emits `PositionKey`s directly.
 #[derive(Default, Debug, Clone)]
 pub struct OpenH264CoverBits {
     pub coeff_sign_bypass: Vec<u8>,
@@ -1097,12 +1086,13 @@ impl std::error::Error for CoverExtractError {}
 /// `dec_post_read` callbacks registered, and return the 4-domain
 /// stego cover bits in decoder fire (== H.264 spec scan) order.
 ///
-/// This is the production-ready primitive that replaces phasm's
-/// CABAC walker on the `openh264-backend` feature: any code path
-/// that today calls `walk_annex_b_for_cover(annex_b).cover.<domain>.bits`
-/// can switch to `extract_cover_bits_via_decoder(annex_b)?.<domain>`
-/// and get a bit-for-bit identical sequence (gated by
-/// `b9_3_full_roundtrip_via_decoder_hook`).
+/// This is a fork-decoder cover-extract path retained for
+/// tests/diagnostics on the `h264-encoder` feature, NOT a production
+/// decoder. The production decoder is the pure-Rust CABAC walker
+/// (`StreamingDecodeSession`); a planned walker→fork swap was not
+/// pursued. For any `annex_b`, this yields the same per-domain bit
+/// sequence as `walk_annex_b_for_cover(annex_b).cover.<domain>.bits`
+/// (parity gated by `b9_3_full_roundtrip_via_decoder_hook`).
 ///
 /// Decode errors from individual frames are tolerated (the call
 /// matches the b9_2_3 / b9_3 pattern of `let _ = dec.decode_frame(..)`)
@@ -2565,7 +2555,7 @@ mod tests {
         };
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .expect("walker");
         let walk_coeff = walker.cover.coeff_sign_bypass.positions.len() as u32;
@@ -2812,7 +2802,7 @@ mod tests {
     }
 
     /// Phase B.9.3 — full round-trip via decoder hook (walker retirement
-    /// gate on `openh264-backend`).
+    /// gate on `h264-encoder`).
     ///
     /// B.9.2.x proved that the fork decoder fires `dec_post_read` with
     /// the same fire COUNT as the walker for each of the 4 phasm stego
@@ -2821,7 +2811,7 @@ mod tests {
     /// `stc_extract` driven by the decoder-captured cover recovers the
     /// same message as one driven by the walker-captured cover.
     ///
-    /// With this property, production extract on the `openh264-backend`
+    /// With this property, production extract on the `h264-encoder`
     /// feature can replace the phasm CABAC walker with a fork-decoder
     /// callback loop: encode side stays the same (fork emit hooks +
     /// PositionKey translation from B.8), decode side becomes a fork
@@ -2947,7 +2937,7 @@ mod tests {
         // ---------- Walk the same bytes ----------
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .expect("walker");
 
@@ -3019,7 +3009,7 @@ mod tests {
         // The proof we need is: stc_extract is symmetric — passing
         // either the walker-cover or the decoder-cover through the
         // same `hhat` yields the bit-identical message. If yes, the
-        // openh264-backend production path can drop the walker on the
+        // h264-encoder production path can drop the walker on the
         // decode side.
         const STC_N: usize = 256;
         const STC_M: usize = 2;
@@ -3149,7 +3139,7 @@ mod tests {
         // ---------- Walker reference ----------
         let walker = walk_annex_b_for_cover_with_options(
             &stream_bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .expect("walker");
 

@@ -9,8 +9,20 @@
 //! Intra_16x16 DC block (Section 8.5.11) and the inverse 2×2 Hadamard used
 //! for chroma DC in 4:2:0 (Section 8.5.11.2).
 //!
-//! These are needed by Phase 1b (UNIWARD cost) to reconstruct I-frame pixels.
-//! P-frame reconstruction needs motion compensation and lives in Phase 7.
+//! Originally added for I-frame pixel reconstruction in the pure-Rust
+//! UNIWARD-cost / decode path. After the 2026-06 video-retirement (the
+//! pure-Rust H.264 encoder + CAVLC `reconstruct.rs` were deleted) these
+//! have no production consumer: UNIWARD cost (`stego/cost/h264_uniward.rs`)
+//! reimplements its own integer-transform basis inline, and the only
+//! in-tree caller is a `#[cfg(test)]` reference-check in the disabled
+//! `stego/dpb_correction.rs` — for which this module is the canonical
+//! oracle. Retained as a spec-correct inverse-transform reference.
+//!
+//! The dead-code sweep re-confirmed KEEP: this pairs with
+//! `dpb_correction.rs`, and deleting the pair is a 12-call-site
+//! `encode_once` signature change (dropping the always-`None` `dpb_cover`
+//! parameter) for provably-inert code — not worth the encoder churn. See
+//! `docs/design/video/_RETIREMENT-PLAN.md` §8.
 
 use super::tables::ZIGZAG_4X4;
 
@@ -295,7 +307,8 @@ pub fn inverse_chroma_dc_2x2_hadamard(c: &[[i32; 2]; 2], qp_c: i32) -> [[i32; 2]
 
 /// Combined dequant + inverse transform for an ordinary 4×4 residual block.
 ///
-/// `scan_coeffs` is the 16-entry zigzag-order coefficient array from CAVLC.
+/// `scan_coeffs` is a 16-entry zigzag-scan-order coefficient array (the
+/// format the retired CAVLC residual decode produced).
 /// Returns a 4×4 residual sample block.
 ///
 /// For Intra_16x16 AC blocks where the DC coefficient lives in a separate DC

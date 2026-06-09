@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! H.264 CABAC bin-level decoder for paired stego decode (Phase 6D.2).
+//! H.264 CABAC bin-level decoder for stego decode.
 //!
-//! Symmetric to [`super::encoder`] / [`super::CabacEncoder`] — same
-//! arithmetic engine, opposite direction. Decodes the same syntax
-//! elements that the encoder emits, in the same order, using the same
-//! context tables. By construction (paired implementation under our
-//! control) the decoder reads back exactly what the encoder wrote.
+//! Decode direction only — the spec § 9.3.3.2 arithmetic engine run
+//! backwards. It decodes the same syntax elements the bitstream
+//! carries, in the same order, using the same context tables. The
+//! forward CABAC encoder was removed in the video-retirement;
+//! production stego bytes are emitted by the OpenH264 fork, and the
+//! walker reads back the bins embedded at the bypass-bin emit site.
 //!
 //! ## Scope
 //!
@@ -21,14 +22,14 @@
 //!
 //! Total scope is ~3500 LOC vs ~12K for a full reference decoder.
 //!
-//! ## Module structure (mirrors `cabac/`):
+//! ## Module structure:
 //!   - [`engine`] — `CabacDecodeEngine`, the spec § 9.3.3.2 arithmetic decoder
-//!   - [`syntax`] — per-syntax-element decoders mirroring `cabac/encoder.rs`
+//!   - [`syntax`] — per-syntax-element decoders
 //!   - [`positions`] — position tracker that emits `PositionKey`s during parse
 //!   - [`slice`] — top-level slice walker
 //!
-//! See `docs/design/video/h264/encoder-algorithms/stego-encode-time-architecture.md`
-//! § A3 for scope rationale and § 12 ("6D.2 — slice boundary handling")
+//! See `docs/design/video/_archive/h264/encoder-algorithms/stego-encode-time-architecture.md`
+//! § A3 for scope rationale and § 12 ("slice boundary handling")
 //! for the single-slice constraint that this decoder honours.
 
 pub mod bitstream_mod;
@@ -40,9 +41,7 @@ pub mod syntax;
 
 pub use decoder::CabacDecoder;
 pub use engine::{CabacDecodeEngine, DecodeError};
-pub use positions::{
-    DomainOffsets, OffsetCapturingLogger, PositionOffset, PositionRecorder,
-};
+pub use positions::PositionRecorder;
 pub use bitstream_mod::{
     cabac_data_byte_offset, locate_nal_units_annexb, repack_emulation_prevention,
     strip_emulation_prevention, strip_emulation_prevention_with_map,
@@ -50,7 +49,7 @@ pub use bitstream_mod::{
 };
 pub use slice::{
     walk_annex_b_for_cover, walk_annex_b_for_cover_with_options,
-    walk_nalus_for_cover, walk_nalus_for_cover_with_options,
+    walk_nalus_for_cover_with_options,
     walk_annex_b_streaming, walk_nalus_streaming_with_options,
     CoverWalkOutput, GopContext, StreamingWalkOutput, WalkAction,
     WalkError, WalkOptions,

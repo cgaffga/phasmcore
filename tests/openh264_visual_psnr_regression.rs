@@ -26,7 +26,7 @@
 // 640×368 × 8 frames. Production variants are `#[ignore]` (1080p × 30).
 //
 // Run full corpus:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //     --test openh264_visual_psnr_regression -- --ignored --nocapture
 //
 // Why per-fixture #[test]: cargo's parallel runner spreads load, and
@@ -35,11 +35,11 @@
 // SessionGuard mutex serializes the actual OH264 calls; per-test
 // cargo overhead is negligible.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -236,11 +236,18 @@ fn ssim_y(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
 
 // ─────────────────────────── thresholds ───────────────────────────────
 
-/// Whole-frame Y-PSNR floor. OH264 stego at QP=26 on iPhone smoke
-/// fixture observed ~30 dB; production 1080p fixtures typically sit
-/// 28-35 dB. Floor set at 26 dB leaves ~4 dB headroom on smoke and
-/// ~2 dB on the toughest production content.
-const PSNR_FLOOR_DB: f64 = 26.0;
+/// Whole-frame Y-PSNR floor. Re-baselined for the production 4-domain
+/// streaming path (video-retirement Phase 6). The retired single-domain
+/// one-shot embedded in CoeffSign ONLY and measured ~30 dB on the smoke
+/// fixture; the production streaming session spreads flips across all 4
+/// stego domains (CS → CSL → MVDs → MVDsl, incl. higher-visual-cost MVD
+/// signs), so the same fixture now measures ~25.4 dB (min 25.36, SSIM
+/// 0.93, 0 concealment, worst-MB 17 dB). Whole-frame PSNR is only the
+/// coarse guard here — local visual correctness is enforced by the SSIM
+/// (≥0.90), worst-MB-PSNR (≥10 dB), bad-pixel-ceiling, and zero-
+/// concealment gates below, all of which still pass with margin. Floor
+/// at 24 dB leaves ~1.4 dB headroom on the smoke fixture.
+const PSNR_FLOOR_DB: f64 = 24.0;
 
 /// Worst-MB PSNR floor. The worst 16×16 MB in any frame is dominated
 /// by high-frequency content (motion blur, edge detail) at production
@@ -276,11 +283,10 @@ fn run_metrics(spec: &Fixture, msg: &str, pass: &str) {
     let _g = session_guard().lock().unwrap_or_else(|e| e.into_inner());
     let (w, h) = probe_aligned_dims(spec);
     let yuv = ensure_yuv(spec, w, h);
-    let opts = EncodeOpts { qp: spec.qp, intra_period: 60 };
 
     let t_enc = std::time::Instant::now();
-    let stego = openh264_stego_encode_yuv_text(
-        &yuv, w, h, spec.n_frames, opts, msg, pass,
+    let stego = oh264_stream::encode(
+        &yuv, w, h, spec.n_frames, spec.qp, msg, pass,
     )
     .expect("oh264 stego encode");
     let enc_ms = t_enc.elapsed().as_secs_f64() * 1000.0;

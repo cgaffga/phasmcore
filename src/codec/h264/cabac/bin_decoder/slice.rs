@@ -2,26 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Top-level decode-side slice walker (Phase 6D.8 chunk 6B).
+// Top-level decode-side slice walker.
 //
-// Public entry point: `walk_annex_b_for_cover(annex_b)` →
-// `CoverWalkOutput { cover: DomainCover, n_mb, n_slices }`. Walks
-// the bitstream end-to-end, parses SPS / PPS / slice headers, and
-// — once chunk 6C+ ships per-MB-type dispatch — emits a `DomainCover`
-// byte-identical to what the encode-side `PositionLoggerHook`
-// produced on the same coefficients.
+// Public entry points: `walk_annex_b_for_cover(annex_b)` (and the
+// pre-parsed / streaming variants `walk_nalus_streaming_with_options`
+// etc.) → `CoverWalkOutput { cover: DomainCover, n_mb, n_slices, .. }`.
+// Walks the bitstream end-to-end and emits a per-domain `DomainCover`
+// (CoeffSign / CoeffSuffixLsb / MvdSign / MvdSuffixLsb) for STC
+// extract. The cover bits are derived through the same shared
+// `enumerate_*_positions` / `extract_*_bits` /
+// `record_residual_block_into_cover` primitives (in
+// `crate::codec::h264::stego`) that the encode-side cover capture
+// uses, so the two sides agree on positions + bit order
+// by-construction on identical (scan_coeffs, MvdSlot) inputs.
 //
-// **Scope (this chunk)**: scaffold only.
-//   - Annex-B → NAL unit scanning
-//   - SPS + PPS extraction (latest-wins, single-active assumption)
-//   - Slice NAL identification + slice header parse
-//   - CABAC engine + context initialization at slice start
-//   - cabac_alignment_one_bit consumption to byte boundary
-//   - Per-MB walking loop is stubbed: returns Ok with empty cover.
-//
-// 6C wires I_16x16 dispatch; 6D wires I_4x4. Each subsequent chunk
-// adds one MB-type code path with the byte-identity gate guarding
-// regressions.
+// **Scope**: the complete walker. Parses SPS / PPS / slice headers
+// (latest-wins, single-active assumption), initializes the CABAC
+// engine + contexts per slice, consumes cabac_alignment_one_bit to
+// the byte boundary, and dispatches every MB type across I/SI, P/SP,
+// and B slices (I_16x16, I_NxN/I_4x4/I_8x8, P_Skip + P-partitions +
+// intra-in-P, and the full B mb_type tree incl. partitioned/B_8x8/
+// intra-in-B), decoding residuals and recording per-domain positions.
+// I_PCM is the only MB type still unwired. CABAC-only — CAVLC PPS is
+// rejected (`WalkError::NotCabac`). Optional MVD recording
+// (`WalkOptions::record_mvd`) is opt-in; default off.
 
 use crate::codec::h264::bitstream::parse_nal_units_annexb;
 use crate::codec::h264::cabac::context::CabacInitSlot;
@@ -35,7 +39,7 @@ use crate::codec::h264::cabac::neighbor::{
 use crate::codec::h264::stego::{
     Axis, DomainCover, MvdSlot, NullLogger, PositionLogger, ResidualPathKind,
 };
-use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
+use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::codec::h264::sps::{parse_pps, parse_sps, Pps, Sps};
 use crate::codec::h264::{H264Error, NalType, NalUnit};
@@ -68,7 +72,8 @@ pub enum WalkError {
     /// PPS specifies CAVLC (entropy_coding_mode_flag = 0). The bin
     /// decoder is CABAC-only.
     NotCabac,
-    /// Slice header indicated B-slice or other unsupported type.
+    /// Slice header indicated an unsupported type (none of I/SI,
+    /// P/SP, B).
     UnsupportedSliceType(SliceType),
     /// Stream contains no slice NALs.
     NoSlices,
@@ -102,46 +107,32 @@ pub struct CoverWalkOutput {
     pub cover: DomainCover,
     pub n_mb: usize,
     pub n_slices: usize,
-    /// Phase 6F.2(j) — per-MVD-position metadata aligned by index
-    /// with `cover.mvd_sign_bypass.positions`. Empty when
-    /// `WalkOptions { record_mvd: false, record_offsets: false }`.
-    pub mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
-    /// Phase 6F.2(j) — frame dimensions in macroblocks, parsed
-    /// from the first SPS encountered. Used by
+    /// Per-MVD-position metadata aligned by index with
+    /// `cover.mvd_sign_bypass.positions`. Empty when
+    /// `WalkOptions { record_mvd: false }`.
+    pub mvd_meta: Vec<crate::codec::h264::stego::hook::MvdPositionMeta>,
+    /// Frame dimensions in macroblocks, parsed from the first SPS
+    /// encountered. Used by
     /// `cascade_safety::analyze_safe_mvd_subset` at decode time.
     /// 0/0 when no slice was walked (degenerate input).
     pub mb_w: u32,
     pub mb_h: u32,
-    /// Phase C.3.6.1 (task #428) — per-position RBSP byte+bit
-    /// offsets, aligned 1:1 with each domain's `bits` + `positions`
-    /// in `cover`. `None` when `WalkOptions::record_offsets` is
-    /// false (the default); `Some(_)` when offset capture is opted
-    /// into for the Option C bitstream-mod stego splicer.
-    pub offsets: Option<super::positions::DomainOffsets>,
 }
 
-/// Walker configuration knobs. Default-everything-off keeps
-/// behavior byte-identical to chunk 6B–§30A4.
+/// Walker configuration knobs. Default-everything-off keeps the
+/// walk behavior unchanged (MVD recording off).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WalkOptions {
-    /// Phase 6D.8 §30D-B: when true, the slice walker records MVD
-    /// positions + bits into the per-domain cover (mvd_sign_bypass
-    /// + mvd_suffix_lsb). Must be set in lockstep with the
-    /// encoder's `enable_mvd_stego_hook` flag — otherwise encoder
-    /// + decoder MVD covers diverge.
+    /// When true, the slice walker records MVD positions + bits
+    /// into the per-domain cover (mvd_sign_bypass
+    /// + mvd_suffix_lsb). Must match how the stego embed was built:
+    /// the cover used at extract has to include the MVD domains iff
+    /// the embed did, otherwise the encode and decode covers diverge.
     pub record_mvd: bool,
-    /// Phase C.3.6.1 (task #428) — when true, the walker captures
-    /// the RBSP bit offset of every bypass-coded stego bin into
-    /// `CoverWalkOutput::offsets`, aligned index-for-index with
-    /// `cover.{domain}.{bits,positions}`. Used by the Option C
-    /// bitstream-mod stego splicer to locate flip targets directly
-    /// in the encoded Annex-B stream. Default: false (zero-cost
-    /// NullLogger fast path).
-    pub record_offsets: bool,
 }
 
-/// Phase 6E-C0 streaming-walker callback verdict. Returned by the
-/// per-GOP `on_gop` callback to either continue walking the next
+/// Streaming-walker callback verdict. Returned by the per-GOP
+/// `on_gop` callback to either continue walking the next
 /// GOP or terminate the walk early. Early-exit is the load-bearing
 /// optimization for shadow decode: once a parity-tier candidate
 /// successfully RS-decodes + AES-GCM-SIV-decrypts a shadow's
@@ -152,8 +143,8 @@ pub enum WalkAction {
     StopWalk,
 }
 
-/// Phase 6E-C0 per-GOP context delivered to the streaming walker's
-/// callback. Owns the GOP's `DomainCover` (positions + bits) and
+/// Per-GOP context delivered to the streaming walker's callback.
+/// Owns the GOP's `DomainCover` (positions + bits) and
 /// per-GOP statistics. The streaming walker swaps out the recorder
 /// for each GOP, so receiving the cover by value is zero-copy
 /// from the recorder's perspective.
@@ -170,22 +161,18 @@ pub struct GopContext {
     pub n_mb: usize,
     /// Number of slice NAL units in this GOP.
     pub n_slices: usize,
-    /// Phase 6F.2(j) — per-MVD-position metadata aligned by index
-    /// with `cover.mvd_sign_bypass.positions`. Empty when
-    /// `WalkOptions { record_mvd: false, record_offsets: false }`.
-    pub mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
-    /// Phase 6F.2(j) — frame dimensions in macroblocks (from the
-    /// active SPS at the time this GOP was walked). Used by
+    /// Per-MVD-position metadata aligned by index with
+    /// `cover.mvd_sign_bypass.positions`. Empty when
+    /// `WalkOptions { record_mvd: false }`.
+    pub mvd_meta: Vec<crate::codec::h264::stego::hook::MvdPositionMeta>,
+    /// Frame dimensions in macroblocks (from the active SPS at the
+    /// time this GOP was walked). Used by
     /// `cascade_safety::analyze_safe_mvd_subset`.
     pub mb_w: u32,
     pub mb_h: u32,
-    /// Phase C.3.6.1 (task #428) — per-bypass-bin RBSP byte+bit
-    /// offsets for this GOP, aligned 1:1 with `cover` domain bit
-    /// vectors. `None` when `WalkOptions::record_offsets` is false.
-    pub offsets: Option<super::positions::DomainOffsets>,
 }
 
-/// Phase 6E-C0 streaming-walker summary. Returned at end-of-stream
+/// Streaming-walker summary. Returned at end-of-stream
 /// (or early-exit via `WalkAction::StopWalk`) with aggregate
 /// counters for the whole walk.
 #[derive(Debug, Default)]
@@ -198,15 +185,15 @@ pub struct StreamingWalkOutput {
 /// Walk an Annex-B byte stream end-to-end and return the per-domain
 /// `DomainCover` (positions + bit values) suitable for STC extract.
 ///
-/// **Single-frame I-only scope (chunk 6B+)**: fails on B-slices,
-/// rejects CAVLC, parses SPS+PPS in stream order with latest-wins
+/// **Scope**: walks I/SI, P/SP, and B slices; rejects CAVLC
+/// (CABAC-only); parses SPS+PPS in stream order with latest-wins
 /// selection.
 pub fn walk_annex_b_for_cover(annex_b: &[u8]) -> Result<CoverWalkOutput, WalkError> {
     walk_annex_b_for_cover_with_options(annex_b, WalkOptions::default())
 }
 
 /// Variant of `walk_annex_b_for_cover` that accepts explicit
-/// `WalkOptions`. Used by §30D consumers to opt into MVD recording.
+/// `WalkOptions`. Used by consumers that opt into MVD recording.
 pub fn walk_annex_b_for_cover_with_options(
     annex_b: &[u8],
     opts: WalkOptions,
@@ -246,13 +233,6 @@ pub fn walk_annex_b_for_cover_with_options(
     result
 }
 
-/// Walk an already-parsed NAL unit list. Same semantics as
-/// `walk_annex_b_for_cover`, but accepts pre-parsed input (lets the
-/// caller share a NAL parser run with other consumers).
-pub fn walk_nalus_for_cover(nalus: &[NalUnit]) -> Result<CoverWalkOutput, WalkError> {
-    walk_nalus_for_cover_with_options(nalus, WalkOptions::default())
-}
-
 /// Variant of `walk_nalus_for_cover` that accepts explicit
 /// `WalkOptions`. Thin wrapper over `walk_nalus_streaming_with_options`
 /// that accumulates per-GOP covers into a single whole-stream cover
@@ -261,75 +241,12 @@ pub fn walk_nalus_for_cover_with_options(
     nalus: &[NalUnit],
     opts: WalkOptions,
 ) -> Result<CoverWalkOutput, WalkError> {
-    // #516.A perf — the parallel walker handles the default cover-walk
-    // case (record_offsets=false, no callback). Offset capture has
-    // shared mutable state across slices (bit-offset accumulator)
-    // that doesn't trivially merge per-slice → route to legacy
-    // streaming path which preserves bit-offset semantics.
-    if !opts.record_offsets {
-        return walk_nalus_for_cover_parallel(nalus, opts);
-    }
-    walk_nalus_for_cover_sequential(nalus, opts)
+    // The parallel walker handles all cover-walk cases.
+    walk_nalus_for_cover_parallel(nalus, opts)
 }
 
-/// Legacy sequential cover walk via the streaming-callback path.
-/// Retained for `record_offsets=true` consumers (bitstream-mod
-/// splicer in `core/src/codec/h264/cabac/bin_decoder/bitstream_mod.rs`)
-/// since the per-bin RBSP offset accumulator threads mutable state
-/// through every slice and can't be safely parallelised without a
-/// post-hoc renumber pass.
-pub(crate) fn walk_nalus_for_cover_sequential(
-    nalus: &[NalUnit],
-    opts: WalkOptions,
-) -> Result<CoverWalkOutput, WalkError> {
-    let mut acc_cover = DomainCover::default();
-    let mut acc_mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>
-        = Vec::new();
-    let mut acc_mb_w = 0u32;
-    let mut acc_mb_h = 0u32;
-    // Phase C.3.6.1 — opt-in offset accumulator. Pre-allocated as
-    // Some(empty) when offset capture is requested so per-GOP
-    // contributions can be extended in-place; remains None otherwise.
-    let mut acc_offsets: Option<super::positions::DomainOffsets> =
-        if opts.record_offsets {
-            Some(super::positions::DomainOffsets::default())
-        } else {
-            None
-        };
-    let streaming_out = walk_nalus_streaming_with_options(
-        nalus,
-        opts,
-        |gop_ctx| {
-            acc_cover.extend_from(gop_ctx.cover);
-            acc_mvd_meta.extend(gop_ctx.mvd_meta);
-            if let (Some(acc), Some(gop_off)) =
-                (acc_offsets.as_mut(), gop_ctx.offsets)
-            {
-                acc.coeff_sign_bypass.extend(gop_off.coeff_sign_bypass);
-                acc.coeff_suffix_lsb.extend(gop_off.coeff_suffix_lsb);
-                acc.mvd_sign_bypass.extend(gop_off.mvd_sign_bypass);
-                acc.mvd_suffix_lsb.extend(gop_off.mvd_suffix_lsb);
-            }
-            // Frame dimensions are SPS-derived and stable across
-            // GOPs in a single stream (any SPS change is treated
-            // as an error elsewhere). Take the last seen value.
-            if gop_ctx.mb_w != 0 { acc_mb_w = gop_ctx.mb_w; }
-            if gop_ctx.mb_h != 0 { acc_mb_h = gop_ctx.mb_h; }
-            Ok(WalkAction::Continue)
-        },
-    )?;
-    Ok(CoverWalkOutput {
-        cover: acc_cover,
-        n_mb: streaming_out.n_mb,
-        n_slices: streaming_out.n_slices,
-        mvd_meta: acc_mvd_meta,
-        mb_w: acc_mb_w,
-        mb_h: acc_mb_h,
-        offsets: acc_offsets,
-    })
-}
 
-/// #516.A — Parallel cover walk via per-slice rayon `par_iter`.
+/// Parallel cover walk via per-slice rayon `par_iter`.
 ///
 /// **Two-pass design:**
 /// 1. **Linear pre-pass**: scan nalus, parse SPS/PPS, build a
@@ -346,25 +263,16 @@ pub(crate) fn walk_nalus_for_cover_sequential(
 ///    the sequential walker.
 ///
 /// Memory: per-thread local recorder ≈ 200 KB × N_threads. Well inside
-/// the streaming-Viterbi per-GOP bound from #472.
+/// the per-GOP streaming memory bound.
 ///
 /// WASM target falls back to sequential (`rayon::par_iter` requires
 /// threading; WASM threading is opt-in via `Atomics` proposal which
 /// most consumers don't enable). Same for builds without the
 /// `parallel` Cargo feature.
-///
-/// **Not for `record_offsets=true` callers** — RBSP bit-offset
-/// accumulator has cross-slice state that doesn't trivially merge.
-/// `walk_nalus_for_cover_with_options` routes those to the legacy
-/// sequential path automatically.
 pub fn walk_nalus_for_cover_parallel(
     nalus: &[NalUnit],
     opts: WalkOptions,
 ) -> Result<CoverWalkOutput, WalkError> {
-    debug_assert!(
-        !opts.record_offsets,
-        "parallel walker doesn't support offset capture",
-    );
 
     // Pre-pass: gather per-slice ctxs.
     let prepared = prepare_slice_ctxs(nalus)?;
@@ -399,7 +307,7 @@ pub fn walk_nalus_for_cover_parallel(
     // ordering boundary).
     let n_slices = slice_results.len();
     let mut acc_cover = DomainCover::default();
-    let mut acc_mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>
+    let mut acc_mvd_meta: Vec<crate::codec::h264::stego::hook::MvdPositionMeta>
         = Vec::new();
     let mut total_n_mb = 0usize;
     // Pre-size the merged Vecs to avoid log2 reallocations during the
@@ -440,7 +348,6 @@ pub fn walk_nalus_for_cover_parallel(
         mvd_meta: acc_mvd_meta,
         mb_w: prepared.mb_w as u32,
         mb_h: prepared.mb_h as u32,
-        offsets: None,
     })
 }
 
@@ -465,7 +372,7 @@ struct PreparedSlices {
 
 struct SliceWalkResult {
     cover: DomainCover,
-    mvd_meta: Vec<crate::codec::h264::stego::encoder_hook::MvdPositionMeta>,
+    mvd_meta: Vec<crate::codec::h264::stego::hook::MvdPositionMeta>,
     n_mb: usize,
 }
 
@@ -534,7 +441,7 @@ fn walk_one_slice_into_local(
     opts: &WalkOptions,
 ) -> Result<SliceWalkResult, WalkError> {
     let mut recorder = PositionRecorder::new();
-    // #516.1 perf — pre-size cover Vecs from per-slice mb_count.
+    // Pre-size cover Vecs from per-slice mb_count.
     recorder.reserve_for_mb_count(ctx.mb_count);
 
     let cabac_byte_off = cabac_data_byte_offset(ctx.header.data_bit_offset);
@@ -566,8 +473,8 @@ fn walk_one_slice_into_local(
     })
 }
 
-/// Phase 6E-C0 — per-GOP streaming walker (Annex-B input). Parses
-/// the byte stream, emits one `GopContext` per GOP via the
+/// Per-GOP streaming walker (Annex-B input). Parses the byte
+/// stream, emits one `GopContext` per GOP via the
 /// `on_gop` callback. Memory bound is per-GOP (the swap-out
 /// recorder discards the previous GOP's cover after each callback
 /// fires) — constant in video length.
@@ -593,8 +500,8 @@ where
     walk_nalus_streaming_with_options(&nalus, opts, on_gop)
 }
 
-/// Phase 6E-C0 — per-GOP streaming walker (pre-parsed NAL list
-/// input). Same semantics as `walk_annex_b_streaming` but lets the
+/// Per-GOP streaming walker (pre-parsed NAL list input). Same
+/// semantics as `walk_annex_b_streaming` but lets the
 /// caller share a NAL parser run with other consumers.
 pub fn walk_nalus_streaming_with_options<F>(
     nalus: &[NalUnit],
@@ -613,13 +520,9 @@ where
 
     let mut active_sps: Option<Sps> = None;
     let mut active_pps: Option<Pps> = None;
-    let mut recorder = if opts.record_offsets {
-        PositionRecorder::with_offsets()
-    } else {
-        PositionRecorder::new()
-    };
-    // #516.1 perf — pre-size the cover Vecs once after the first SPS
-    // arrives, eliminating the ~log2(N) doubling reallocs on hot
+    let mut recorder = PositionRecorder::new();
+    // Pre-size the cover Vecs once after the first SPS arrives,
+    // eliminating the ~log2(N) doubling reallocs on hot
     // fixtures (1080p × 30f IPPPP has ~514k CoeffSign positions).
     // `reserved_for` tracks the largest mb_count we've sized for so
     // multi-GOP streams don't down-size or re-reserve needlessly.
@@ -650,12 +553,11 @@ where
                 }
 
                 let header = parse_slice_header(&nal.rbsp, sps, pps, t, nal.nal_ref_idc)?;
-                // Phase 6E-A3 — B-slices accepted; the walker
-                // dispatches into `walk_b_mb` which currently only
-                // supports B_Skip (mb_skip_flag=1). Non-skip B-MBs
-                // return `UnsupportedMbType` until §6E-A4 adds the
-                // mode-decision + ME paths. Encoder emits B_Skip
-                // only at this sub-phase.
+                // B-slices accepted; the walker dispatches into
+                // `walk_b_mb`, which decodes the full B mb_type tree
+                // (B_Skip, B_Direct_16x16, B_L0/L1/Bi_16x16,
+                // partitioned 4..=21, B_8x8, and intra-in-B 23..=47).
+                // I_PCM (48) is the only B mb_type still unwired.
 
                 // GOP boundary detection: an IDR after at least one
                 // VCL NAL in the current GOP closes the prior GOP.
@@ -663,7 +565,6 @@ where
                     let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
                     let cover = recorder.take_cover();
                     let mvd_meta = recorder.take_mvd_meta();
-                    let offsets = recorder.take_offsets();
                     if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
                     let (closing_mb_w, closing_mb_h) = active_sps
                         .as_ref()
@@ -681,7 +582,6 @@ where
                         mvd_meta,
                         mb_w: closing_mb_w,
                         mb_h: closing_mb_h,
-                        offsets,
                     })?;
                     total_n_gops += 1;
                     if matches!(action, WalkAction::StopWalk) {
@@ -695,7 +595,8 @@ where
                     gop_n_mb = 0;
                     gop_n_slices = 0;
                     // had_vcl_in_current_gop is reasserted to true on the
-                    // next VCL NAL (line ~382); no explicit reset needed.
+                    // next VCL NAL (the `= true` at the end of this VCL
+                    // branch); no explicit reset needed.
                 }
 
                 let t_setup = if trace { Some(std::time::Instant::now()) } else { None };
@@ -704,8 +605,8 @@ where
                     * if sps.frame_mbs_only_flag { 1 } else { 2 };
                 let mb_count = mb_w * mb_h;
 
-                // #516.1 perf — first-slice cover Vec pre-sizing. The
-                // recorder starts with zero-cap Vecs; without this, the
+                // First-slice cover Vec pre-sizing. The recorder
+                // starts with zero-cap Vecs; without this, the
                 // per-MB CABAC loop pushes into doubling Vecs and pays
                 // ~24 MB cumulative memcopy across log2(514k) ≈ 19
                 // reallocs at 1080p × 30f. Idempotent: re-arms only on
@@ -754,7 +655,6 @@ where
         let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
         let cover = recorder.take_cover();
         let mvd_meta = recorder.take_mvd_meta();
-        let offsets = recorder.take_offsets();
         if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
         let (closing_mb_w, closing_mb_h) = active_sps
             .as_ref()
@@ -772,7 +672,6 @@ where
             mvd_meta,
             mb_w: closing_mb_w,
             mb_h: closing_mb_h,
-            offsets,
         })?;
         total_n_gops += 1;
     }
@@ -828,22 +727,22 @@ fn pick_init_slot(header: &SliceHeader) -> CabacInitSlot {
 /// slice header. Compute the byte-aligned position where the CABAC
 /// arithmetic engine starts reading (byte ceil of data_bit_offset).
 ///
-/// Phase C.3.6.2 (#429) — exposed pub so the bitstream-mod splicer
-/// can convert a captured engine-local bit offset to NAL-RBSP-
-/// absolute coordinates: `rbsp_byte = cabac_data_byte_offset +
-/// engine_bit / 8`.
+/// Exposed pub so the bitstream-mod splicer can convert a captured
+/// engine-local bit offset to NAL-RBSP-absolute coordinates:
+/// `rbsp_byte = cabac_data_byte_offset + engine_bit / 8`.
 pub fn cabac_data_byte_offset(data_bit_offset: usize) -> usize {
     data_bit_offset.div_ceil(8)
 }
 
 /// Per-MB walking loop. Dispatches per slice type:
-/// - I/SI: I_16x16 (chunk 6C), I_NxN/I_4x4 (chunk 6D), I_PCM errors.
-/// - P/SP: P_SKIP + intra-in-P (§30A1+2). P_partition (mb_type 0..3)
-///   and I_PCM-in-P still error.
+/// - I/SI: I_16x16, I_NxN (I_4x4 / I_8x8); I_PCM errors.
+/// - P/SP: P_SKIP, P-partitions (mb_type 0..3), and intra-in-P;
+///   I_PCM-in-P errors.
+/// - B: full B mb_type tree via `walk_b_mb` (see there).
 ///
-/// Mirrors `Encoder::write_i16x16_macroblock_cabac` (encoder.rs:3599),
-/// `Encoder::commit_i4x4_macroblock_cabac` (encoder.rs:2946), and
-/// `Encoder::write_p_macroblock_cabac` (encoder.rs:903).
+/// Inverts the spec macroblock_layer() / mb_pred() / sub_mb_pred()
+/// syntax (§ 7.3.5) that the OpenH264 emitter produces, in CABAC
+/// parsing order.
 fn walk_slice_mbs(
     dec: &mut CabacDecoder<'_>,
     header: &SliceHeader,
@@ -871,16 +770,16 @@ fn walk_slice_mbs(
         let mb_x = mb_addr % mb_w;
         let mb_y = mb_addr / mb_w;
 
-        // Mirror encoder loops (encoder.rs:814 / 3551): call
-        // `neighbors.new_row()` at every row boundary.
+        // Call `neighbors.new_row()` at every MB-row boundary so
+        // left-neighbour availability resets per spec § 6.4.9.
         if let Some(prev_y) = prev_mb_y
             && mb_y != prev_y {
                 dec.neighbors.new_row();
             }
         prev_mb_y = Some(mb_y);
 
-        // v1.4 (#305) — num_ref_idx_l0_active drives whether walker
-        // expects ref_idx_l0 unary bins per partition. At
+        // num_ref_idx_l0_active drives whether walker expects
+        // ref_idx_l0 unary bins per partition. At
         // MultiRefConfig::SINGLE_REF (encoder default → slice header
         // claims 1) the gate is closed and zero bins read (bit-
         // identical to v1.3).
@@ -941,8 +840,8 @@ fn walk_i_mb(
     )
 }
 
-/// P-slice MB dispatch. P_SKIP + intra-in-P routing. P_partition
-/// (mb_type 0..3) errors out — to be wired in §30A3+.
+/// P-slice MB dispatch. Routes P_SKIP, intra-in-P, and P_partition
+/// (mb_type 0..3, dispatched to `walk_p_partition_mb`).
 #[allow(clippy::too_many_arguments)]
 fn walk_p_mb(
     dec: &mut CabacDecoder<'_>,
@@ -957,12 +856,12 @@ fn walk_p_mb(
     opts: &WalkOptions,
     num_active_l0: u8,
 ) -> Result<bool, WalkError> {
-    // 1. mb_skip_flag (encoder.rs:1553).
+    // 1. mb_skip_flag.
     let is_skip = decode_mb_skip_flag(dec, mb_x)?;
     if is_skip {
-        // P_SKIP: no further syntax. Encoder.rs:1561 emits
-        // end_of_slice_flag and commits PSkip neighbors. No
-        // residuals, no MVDs → zero stego coverage.
+        // P_SKIP: no further syntax — read end_of_slice_flag and
+        // commit PSkip neighbors. No residuals, no MVDs → zero stego
+        // coverage.
         let is_last = decode_end_of_slice_flag(dec)?;
         let nb = CabacNeighborMB {
             mb_type: MbTypeClass::PSkip,
@@ -973,10 +872,10 @@ fn walk_p_mb(
         return Ok(is_last);
     }
 
-    // 2. mb_type_p (encoder.rs:1610).
+    // 2. mb_type_p.
     let mb_type_p = decode_mb_type_p(dec, mb_x)?;
     if mb_type_p <= 3 {
-        // P-partition: §30A3 (P_L0_16x16) + §30A4 (P_L0_16x8 / P_L0_8x16 / P_8x8).
+        // P-partition: P_L0_16x16 / P_L0_16x8 / P_L0_8x16 / P_8x8.
         return walk_p_partition_mb(
             dec, pps, mb_x, mb_y, mb_w, prev_mb_qp, frame_idx, nal_idx, recorder,
             mb_type_p, opts, num_active_l0,
@@ -1017,7 +916,7 @@ fn walk_i16x16_mb(
     recorder: &mut PositionRecorder,
     i_mb_type: u32,
 ) -> Result<bool, WalkError> {
-    // Decompose mb_type per spec § 7.3.5 / Table 7-11 — Task #50 helper.
+    // Decompose mb_type per spec § 7.3.5 / Table 7-11.
     let fields = super::super::mb_type_math::unpack_i_16x16_mb_type(i_mb_type);
     let _luma_pred_mode = fields.luma_pred_mode;
     let cbp_chroma = fields.cbp_chroma;
@@ -1035,7 +934,7 @@ fn walk_i16x16_mb(
 
     // Luma DC (Intra16x16DCLevel, ctx_block_cat=0).
     let dc_inc = compute_cbf_ctx_idx_inc_luma_dc(&dec.neighbors, mb_x);
-    let dc_scan = decode_residual_block_with_offset_capture(
+    let dc_scan = decode_residual_block_recording(
         dec, 0, 15, /* cat */ 0, dc_inc,
         frame_idx, mb_addr_u32, nal_idx, ResidualPathKind::LumaDcIntra16x16, recorder,
     )?;
@@ -1055,7 +954,7 @@ fn walk_i16x16_mb(
                 mb_x, bx, by, current_is_intra,
             );
             let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-            let ac_scan = decode_residual_block_with_offset_capture(
+            let ac_scan = decode_residual_block_recording(
                 dec, 0, 14, /* cat */ 1, ac_inc,
                 frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
@@ -1074,7 +973,7 @@ fn walk_i16x16_mb(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_offset_capture(
+            let dc_flat = decode_residual_block_recording(
                 dec, 0, 3, /* cat */ 3, inc,
                 frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
@@ -1099,7 +998,7 @@ fn walk_i16x16_mb(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_offset_capture(
+                let ac_scan = decode_residual_block_recording(
                     dec, 0, 14, /* cat */ 4, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -1129,17 +1028,16 @@ fn walk_i16x16_mb(
     Ok(is_last)
 }
 
-/// Phase 6E-A3 — B-slice MB dispatch. Currently supports B_Skip
-/// only (mb_skip_flag = 1). Non-skip B-MBs return
-/// `UnsupportedMbType` until §6E-A4 adds the mode-decision + ME
-/// paths.
+/// B-slice MB dispatch. Decodes the full B mb_type tree:
+/// B_Skip (mb_skip_flag = 1), B_Direct_16x16 (0), B_L0/L1/Bi_16x16
+/// (1/2/3), partitioned (4..=21), B_8x8 (22), and intra-in-B
+/// (23..=47). I_PCM (mb_type = 48) is the only still-unwired case.
 ///
 /// B_Skip semantics (spec § 7.4.5):
 /// - mb_skip_flag = 1 → no further syntax for this MB.
-/// - Decoder uses spatial direct (or temporal direct, per
-///   `direct_spatial_mv_pred_flag`) to derive both L0 and L1
-///   motion vectors from neighbors.
-/// - Encoder emits no MVD bits, no ref_idx, no residuals.
+/// - The MB's L0/L1 motion is reconstructed by spatial direct (or
+///   temporal direct, per `direct_spatial_mv_pred_flag`) from
+///   neighbors — no MVD/ref_idx/residual bins are on the wire.
 /// - Stego coverage = zero (no bypass bins emitted by this MB).
 #[allow(clippy::too_many_arguments)]
 fn walk_b_mb(
@@ -1161,23 +1059,22 @@ fn walk_b_mb(
         return walk_b_skip(dec, mb_x);
     }
 
-    // 2. mb_type via the §6E-A3 B-slice bin tree (covers all 24
+    // 2. mb_type via the B-slice bin tree (covers all 24
     //    spec values 0..=23). Per-mb_type body dispatch below.
     let mb_type = decode_mb_type_b(dec, mb_x)?;
     let mb_addr_u32 = (mb_y * mb_w + mb_x) as u32;
 
-    // §B-direct-fix.v2 (#194): mirror the encoder's
-    // transform_size_8x8_flag emission gate. For all B-MB inter
+    // Mirror the encoder's transform_size_8x8_flag emission gate.
+    // For all B-MB inter
     // modes phasm ships (16x16/16x8/8x16/B_8x8 with sub_mb_type ≤ 3),
     // noSubMbPartSizeLessThan8x8Flag = 1 (no sub-8x8 partitions).
     // Encoder emits the flag iff `pps.transform_8x8_mode_flag &&
     // cbp_luma != 0`; walker must consume it accordingly.
     let t8x8 = pps.transform_8x8_mode_flag;
 
-    // §6E-A6.0 — per-mb_type dispatcher. Each variant handler
-    // lights up in a dedicated sub-phase. §6E-A6.1q.c (#152): the
-    // L0/L1/Bi/partitioned/B_8x8 walkers now decode non-zero CBP
-    // residuals via the shared `finish_b_inter` tail.
+    // Per-mb_type dispatcher. The L0/L1/Bi/partitioned/B_8x8
+    // walkers decode non-zero CBP residuals via the shared
+    // `finish_b_inter` tail.
     match mb_type {
         0 => walk_b_direct_16x16(dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8),
         1 => walk_b_l0_16x16(
@@ -1195,7 +1092,6 @@ fn walk_b_mb(
             dec, mb_x, prev_mb_qp, frame_idx, nal_idx, mb_addr_u32, recorder, t8x8, num_active_l0,
         ),
         23..=47 => {
-            // §intra-in-B (#319) — Phase 1: walker un-reject.
             // Spec § 7.4.5: B-slice mb_type ≥ 23 is intra. The
             // I-suffix value is `mb_type - 23`, mapping to I-slice
             // mb_type 0..24 per Table 7-11:
@@ -1247,10 +1143,9 @@ fn walk_b_skip(
 /// reconstructs MV via spatial direct on its own side). Read CBP +
 /// (if non-zero) residual blocks via the same path P-frame uses.
 ///
-/// §6E-A4(c)-lite encoder emits CBP=0 always; non-zero CBP appears
-/// only once §6E-A4(c)-full / §6E-A6.1 add B-frame residual emission,
-/// at which point this body extends to call the existing
-/// [`decode_residual_block_cabac`] helpers (same code path as P).
+/// `B_Direct_16x16` (mb_type = 0) walker. Reads CBP and, when
+/// non-zero, decodes residuals via the [`decode_residual_block_cabac`]
+/// helpers (same code path as P). Direct has no MVDs on the wire.
 fn walk_b_direct_16x16(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
@@ -1261,11 +1156,10 @@ fn walk_b_direct_16x16(
     recorder: &mut PositionRecorder,
     t8x8: bool,
 ) -> Result<bool, WalkError> {
-    // §B-direct-residual.walker (#244, 2026-05-07) — B_Direct_16x16
-    // CAN have CBP > 0 per spec § 7.4.5.1. The previous walker
-    // hardcoded CBP=0 + WalkError::Unsupported for any non-zero CBP,
-    // which prevented re-enabling Direct+residual emission on the
-    // encoder side (V16 negative result root cause).
+    // B_Direct_16x16 CAN have CBP > 0 per spec § 7.4.5.1. An earlier
+    // walker hardcoded CBP=0 + WalkError::Unsupported for any
+    // non-zero CBP, which prevented Direct+residual emission on the
+    // encoder side.
     //
     // The path now mirrors L0/L1/Bi: parse CBP byte, if non-zero
     // parse mb_qp_delta + luma 4x4 + chroma DC/AC residuals, then
@@ -1279,10 +1173,10 @@ fn walk_b_direct_16x16(
     // abs values; the neighbour commit will use the
     // `abs_mvd_comp* = 0` defaults (correct for Direct).
     //
-    // v1.4 Phase 4.5 (#316) — Direct/Skip has no L0 ref_idx on the
-    // wire (derived from spatial-direct neighbour read). Commit 0
-    // for the entire MB; spec § 7.4.5.1 says inferred ref_idxs are
-    // not part of neighbour state lookup.
+    // Direct/Skip has no L0 ref_idx on the wire (derived from
+    // spatial-direct neighbour read). Commit 0 for the entire MB;
+    // spec § 7.4.5.1 says inferred ref_idxs are not part of
+    // neighbour state lookup.
     finish_b_inter_with_mb_type(
         dec, mb_x, prev_mb_qp,
         /* l0_abs */ None, /* l1_abs */ None,
@@ -1292,10 +1186,10 @@ fn walk_b_direct_16x16(
     )
 }
 
-/// §6E-A6.1 — `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
-/// v1.4 (#305) — `ref_idx_l0` decoded when num_active_l0 > 1.
-/// §6E-A6.1q.c (#152): non-zero CBP now decodes residuals (luma 4×4
-/// + chroma DC/AC) via the shared `finish_b_inter` tail.
+/// `B_L0_16x16` (mb_type = 1) walker. One L0 MVD pair.
+/// `ref_idx_l0` decoded when num_active_l0 > 1. Non-zero CBP
+/// decodes residuals (luma 4×4 + chroma DC/AC) via the shared
+/// `finish_b_inter` tail.
 #[allow(clippy::too_many_arguments)]
 fn walk_b_l0_16x16(
     dec: &mut CabacDecoder<'_>,
@@ -1308,8 +1202,8 @@ fn walk_b_l0_16x16(
     t8x8: bool,
     num_active_l0: u8,
 ) -> Result<bool, WalkError> {
-    // v1.4 Phase 4.5 (#316) — capture the decoded ref_idx_l0 so the
-    // neighbour commit uses the actual on-wire value (not 0).
+    // Capture the decoded ref_idx_l0 so the neighbour commit uses
+    // the actual on-wire value (not 0).
     let current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
     let ref_idx_l0_dec = if num_active_l0 > 1 {
         decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, (num_active_l0 - 1) as u32)? as u8
@@ -1325,8 +1219,8 @@ fn walk_b_l0_16x16(
     )
 }
 
-/// §6E-A6.1 — `B_L1_16x16` (mb_type = 2). Mirror of L0 path,
-/// using L1 neighbour state for bin0 ctxIdxInc and committing
+/// `B_L1_16x16` (mb_type = 2). Mirror of L0 path, using L1
+/// neighbour state for bin0 ctxIdxInc and committing
 /// `abs_mvd_comp_l1` on neighbour update.
 #[allow(clippy::too_many_arguments)]
 fn walk_b_l1_16x16(
@@ -1340,8 +1234,8 @@ fn walk_b_l1_16x16(
     t8x8: bool,
 ) -> Result<bool, WalkError> {
     let (abs_x, abs_y) = decode_b_16x16_mvd_pair(dec, mb_x, /* list */ 1)?;
-    // v1.4 Phase 4.5 (#316) — L1_16x16 has no L0 ref_idx on the wire
-    // (partition is L1-only per Table 7-14). Commit [0;16].
+    // L1_16x16 has no L0 ref_idx on the wire (partition is L1-only
+    // per Table 7-14). Commit [0;16].
     finish_b_inter(
         dec, mb_x, prev_mb_qp,
         None, Some([[abs_x; 16], [abs_y; 16]]),
@@ -1350,12 +1244,10 @@ fn walk_b_l1_16x16(
     )
 }
 
-/// §6E-A6.1 — `B_Bi_16x16` (mb_type = 3). Two MVD pairs (L0 then L1
-/// per spec § 7.3.5.1 mb_pred order). Each list uses its own
-/// neighbour state for bin0 ctxIdxInc.
-///
-/// v1.4 (#305) — `ref_idx_l0` decoded when num_active_l0 > 1 (Bi
-/// uses L0 list).
+/// `B_Bi_16x16` (mb_type = 3). Two MVD pairs (L0 then L1 per spec
+/// § 7.3.5.1 mb_pred order). Each list uses its own neighbour
+/// state for bin0 ctxIdxInc. `ref_idx_l0` decoded when
+/// num_active_l0 > 1 (Bi uses L0 list).
 #[allow(clippy::too_many_arguments)]
 fn walk_b_bi_16x16(
     dec: &mut CabacDecoder<'_>,
@@ -1368,7 +1260,7 @@ fn walk_b_bi_16x16(
     t8x8: bool,
     num_active_l0: u8,
 ) -> Result<bool, WalkError> {
-    // v1.4 Phase 4.5 (#316) — capture decoded ref_idx_l0 (Bi uses L0).
+    // Capture decoded ref_idx_l0 (Bi uses L0).
     let current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
     let ref_idx_l0_dec = if num_active_l0 > 1 {
         decode_ref_idx(dec, &current_ref_idx_mb, mb_x, 0, 0, (num_active_l0 - 1) as u32)? as u8
@@ -1386,14 +1278,13 @@ fn walk_b_bi_16x16(
     )
 }
 
-/// §6E-A6.2 — partitioned B mb_type walker (mb_types 4..21).
+/// Partitioned B mb_type walker (mb_types 4..21).
 /// Looks up `(shape, list_usage_part0, list_usage_part1)` via
 /// `b_partitioned::partitioned_b_meta`, then decodes per spec
 /// § 7.3.5.1 mb_pred order (partition 0's MVDs L0-then-L1 before
-/// partition 1's). §B-Partitioned-Residual Stage D (#206) — non-zero
-/// CBP residuals are decoded via `finish_b_inter`'s shared luma 4×4
-/// + chroma DC/AC path (mirror of the encoder's
-/// `emit_b_residual_for_pred` at the partitioned emit site).
+/// partition 1's). Non-zero CBP residuals are decoded via
+/// `finish_b_inter`'s shared luma 4×4 + chroma DC/AC path (spec
+/// § 7.3.5.3 residual() at the partitioned MB).
 #[allow(clippy::too_many_arguments)]
 fn walk_b_partitioned(
     dec: &mut CabacDecoder<'_>,
@@ -1407,7 +1298,7 @@ fn walk_b_partitioned(
     t8x8: bool,
     num_active_l0: u8,
 ) -> Result<bool, WalkError> {
-    use crate::codec::h264::encoder::b_partitioned::{
+    use crate::codec::h264::b_partition_meta::{
         partitioned_b_meta, BListUse,
     };
 
@@ -1417,12 +1308,10 @@ fn walk_b_partitioned(
         )))
     })?;
 
-    // v1.4 (#305) — ref_idx_l0 per partition per spec § 7.3.5.1
-    // mb_pred(): all ref_idx_l0 BEFORE MVDs, in partition-index
-    // order, filtered by uses-L0 (skip if partition is L1-only).
-    //
-    // v1.4 Phase 4.5 (#316) — capture decoded values per partition
-    // for the neighbour commit fill below.
+    // ref_idx_l0 per partition per spec § 7.3.5.1 mb_pred(): all
+    // ref_idx_l0 BEFORE MVDs, in partition-index order, filtered by
+    // uses-L0 (skip if partition is L1-only). Capture decoded
+    // values per partition for the neighbour commit fill below.
     let mut ref_idx_l0_decoded = [0u8; 2];
     let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
     let (pw_ref_4x4, ph_ref_4x4) = meta.shape.part_dim_4x4();
@@ -1447,18 +1336,16 @@ fn walk_b_partitioned(
         }
     }
 
-    // §6E-A6.1q.e (#154) — within-MB MVD tracker per-list. Mirror of
-    // the encoder's `emit_b_partitioned`. Partition 1's bin 0
-    // ctxIdxInc reads partition 0's just-decoded MVD via
+    // Within-MB MVD tracker per-list, per spec § 9.3.3.1.1.7.
+    // Partition 1's bin 0 ctxIdxInc reads partition 0's
+    // just-decoded MVD via
     // `compute_mvd_ctx_idx_inc_bin0_per_list`.
     //
-    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
     // H.264 spec § 7.3.5.1 / § 9.3.3.1.1 interprets B-slice
     // partitioned MVDs in **list-major** order: outer iterates
     // list 0..2, inner iterates partition index 0..N-1, decoding
-    // an MVD pair only when that partition uses that list. Walker
-    // now mirrors that. Encoder side updated in lockstep
-    // in `core/src/codec/h264/encoder/encoder.rs::emit_b_partitioned_method`.
+    // an MVD pair only when that partition uses that list. The walker
+    // reads them in that order to stay in sync with the emitter.
     let mut current_mvd = CurrentMbMvdAbs::new();
     let (pw, ph) = meta.shape.part_dim_4x4();
 
@@ -1488,18 +1375,17 @@ fn walk_b_partitioned(
         }
     }
 
-    // §Task #207 (2026-05-04) — pass the full per-sub-MB MVD layout
-    // (not a broadcast of the max magnitude) so the encoder's
-    // `current_mvd.to_neighbor()` per-position fill matches on the
-    // walker side. Otherwise the next MB's bin0 ctxIdxInc reads from
-    // a position the encoder filled with 0 but the walker filled with
-    // max — CABAC desync at the bin level.
+    // Pass the full per-sub-MB MVD layout (not a broadcast of the
+    // max magnitude) so the per-position neighbour fill matches what
+    // the emitter produced. Otherwise the
+    // next MB's bin0 ctxIdxInc reads from a position the emitter left
+    // at 0 but the walker filled with max — CABAC desync at the bin
+    // level.
     let l0_for_finish = if any_uses_l0(meta) { Some(current_mvd.comp) } else { None };
     let l1_for_finish = if any_uses_l1(meta) { Some(current_mvd.comp_l1) } else { None };
-    // v1.4 Phase 4.5 (#316) — per-block ref_idx_l0 fill from
-    // partition geometry, mirroring the encoder's
-    // `fill_ref_idx_l0_partitioned` exactly so neighbour ctxIdxInc
-    // for the next MB matches encoder side AND a spec decoder.
+    // Per-block ref_idx_l0 fill from partition geometry (spec
+    // § 6.4.2.2 partition layout) so the neighbour ctxIdxInc for the
+    // next MB matches a spec decoder.
     let ref_idx_l0_array = walker_fill_ref_idx_l0_partitioned(meta, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_for_finish, l1_for_finish,
@@ -1508,7 +1394,7 @@ fn walk_b_partitioned(
     )
 }
 
-/// §6E-A6.3 — `B_8x8` walker (mb_type = 22). Decodes:
+/// `B_8x8` walker (mb_type = 22). Decodes:
 ///
 /// 1. 4 × `sub_mb_type` (each 0..=3 — B_Direct_8x8 / B_L0_8x8 /
 ///    B_L1_8x8 / B_Bi_8x8 — via `decode_sub_mb_type_b`).
@@ -1519,14 +1405,13 @@ fn walk_b_partitioned(
 ///      - 2 (L1):     L1 MVD pair
 ///      - 3 (Bi):     L0 MVD pair, then L1 MVD pair
 ///    `ref_idx_lX` is inferred 0 (single-ref ship config).
-/// 3. coded_block_pattern. §B-Partitioned-Residual Stage D (#206) —
-///    non-zero CBP is decoded via `finish_b_inter` (luma 4×4 + chroma
-///    DC/AC), mirroring the encoder-side wiring in
-///    `emit_b_8x8_method`.
+/// 3. coded_block_pattern. Non-zero CBP is decoded via
+///    `finish_b_inter` (luma 4×4 + chroma DC/AC), per spec
+///    § 7.3.5.3 residual().
 /// 4. end_of_slice_flag.
 ///
 /// Aggregate MVD magnitudes across sub-MBs (max per axis per list)
-/// for neighbour commit — matches `emit_b_8x8`'s aggregation.
+/// for the neighbour commit, per spec § 9.3.3.1.1.7.
 #[allow(clippy::too_many_arguments)]
 fn walk_b_8x8(
     dec: &mut CabacDecoder<'_>,
@@ -1549,13 +1434,12 @@ fn walk_b_8x8(
         *s = value as u8;
     }
 
-    // v1.4 (#305) — ref_idx_l0 per sub-MB per spec § 7.3.5.1
-    // mb_pred(): all ref_idx_l0 AFTER 4×sub_mb_type and BEFORE MVDs,
-    // in sub-MB-index order, filtered by sub-MB-uses-L0
-    // (Direct=0 + L1=2 skip; L0=1 + Bi=3 emit).
-    //
-    // v1.4 Phase 4.5 (#316) — capture decoded values per sub-MB +
-    // within-MB ref_idx tracker for spec § 6.4.11.7 ctxIdxInc lookups.
+    // ref_idx_l0 per sub-MB per spec § 7.3.5.1 mb_pred(): all
+    // ref_idx_l0 AFTER 4×sub_mb_type and BEFORE MVDs, in
+    // sub-MB-index order, filtered by sub-MB-uses-L0
+    // (Direct=0 + L1=2 skip; L0=1 + Bi=3 emit). Capture decoded
+    // values per sub-MB + within-MB ref_idx tracker for spec
+    // § 6.4.11.7 ctxIdxInc lookups.
     let mut ref_idx_l0_decoded = [0u8; 4];
     let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
     if num_active_l0 > 1 {
@@ -1575,16 +1459,13 @@ fn walk_b_8x8(
         }
     }
 
-    // §6E-A6.1q.e (#154) — within-MB MVD tracker. Mirror of
-    // `emit_b_8x8`.
+    // Within-MB MVD tracker, per spec § 9.3.3.1.1.7.
     //
-    // §B-encoder-decoder-divergence Phase 2.7 (2026-05-08, #248) —
     // The spec parses B_8x8 sub-MB MVDs in **list-major** order
     // (H.264 spec § 7.3.5.1 + § 9.3.3.1.1): outer iterates list
     // 0..2, inner iterates sub-MB index 0..4, decoding an MVD
-    // pair only when that sub-MB uses that list. Walker now
-    // mirrors that. Encoder side updated in lockstep in
-    // `core/src/codec/h264/encoder/encoder.rs::emit_b_8x8_method`.
+    // pair only when that sub-MB uses that list. The walker reads
+    // them in that order to stay in sync with the emitter.
     let mut current_mvd = CurrentMbMvdAbs::new();
 
     for list in 0u8..2 {
@@ -1615,14 +1496,14 @@ fn walk_b_8x8(
         }
     }
 
-    // §Task #207 — pass per-sub-MB MVD layout (mirror of
-    // walk_b_partitioned fix above).
+    // Pass per-sub-MB MVD layout (mirror of walk_b_partitioned
+    // above).
     let any_l0 = sub_mb_types.iter().any(|&s| matches!(s, 1 | 3));
     let any_l1 = sub_mb_types.iter().any(|&s| matches!(s, 2 | 3));
     let l0_some = if any_l0 { Some(current_mvd.comp) } else { None };
     let l1_some = if any_l1 { Some(current_mvd.comp_l1) } else { None };
-    // v1.4 Phase 4.5 (#316) — per-block ref_idx_l0 fill from sub-MB
-    // geometry, mirroring encoder's `fill_ref_idx_l0_b8x8`.
+    // Per-block ref_idx_l0 fill from sub-MB geometry (spec
+    // § 6.4.2.2 sub-MB partition layout).
     let ref_idx_l0_array = walker_fill_ref_idx_l0_b8x8(sub_mb_types, ref_idx_l0_decoded);
     finish_b_inter(
         dec, mb_x, prev_mb_qp, l0_some, l1_some,
@@ -1632,15 +1513,15 @@ fn walk_b_8x8(
 }
 
 /// True if any partition's list usage includes L0 (= L0 or Bi).
-fn any_uses_l0(meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta) -> bool {
-    use crate::codec::h264::encoder::b_partitioned::BListUse;
+fn any_uses_l0(meta: crate::codec::h264::b_partition_meta::BPartitionedMeta) -> bool {
+    use crate::codec::h264::b_partition_meta::BListUse;
     matches!(meta.part0, BListUse::L0 | BListUse::Bi)
         || matches!(meta.part1, BListUse::L0 | BListUse::Bi)
 }
 
 /// True if any partition's list usage includes L1.
-fn any_uses_l1(meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta) -> bool {
-    use crate::codec::h264::encoder::b_partitioned::BListUse;
+fn any_uses_l1(meta: crate::codec::h264::b_partition_meta::BPartitionedMeta) -> bool {
+    use crate::codec::h264::b_partition_meta::BListUse;
     matches!(meta.part0, BListUse::L1 | BListUse::Bi)
         || matches!(meta.part1, BListUse::L1 | BListUse::Bi)
 }
@@ -1677,15 +1558,12 @@ fn decode_b_16x16_mvd_pair(
     Ok((abs_x, abs_y))
 }
 
-/// §6E-A6.1q.e (#154) — decode one X+Y MVD pair for a B-slice
-/// partition with within-MB-aware bin 0 ctxIdxInc derivation.
+/// Decode one X+Y MVD pair for a B-slice partition with
+/// within-MB-aware bin 0 ctxIdxInc derivation.
 /// `(cur_bx, cur_by)` are the partition's TL 4×4-block coordinates
 /// within the MB. For partition 1 of 16×8/8×16 (and sub-MBs 1+ of
 /// B_8x8), this consults `current_mvd` (per-list) before falling
-/// back to cross-MB neighbours.
-///
-/// Mirror of the encoder's `compute_mvd_ctx_idx_inc_bin0_per_list`
-/// call sites in `emit_b_partitioned` / `emit_b_8x8`.
+/// back to cross-MB neighbours, per spec § 9.3.3.1.1.7.
 fn decode_b_partition_mvd_pair(
     dec: &mut CabacDecoder<'_>,
     mb_x: usize,
@@ -1717,32 +1595,31 @@ fn decode_b_partition_mvd_pair(
     Ok((abs_x, abs_y))
 }
 
-/// Shared tail for §6E-A6.1 B-inter walkers: read CBP, decode
+/// Shared tail for B-inter walkers: read CBP, decode
 /// `mb_qp_delta` + residual blocks (luma 4×4 + chroma DC + chroma
 /// AC) when `cbp != 0`, commit neighbour as inter (with per-list
 /// MVD magnitudes), read `end_of_slice_flag`.
 ///
-/// §6E-A6.1q.c (#152): the CBP=0 fast path is preserved; the
-/// non-zero CBP path mirrors `walk_p_inter_residual`'s 4×4 luma +
-/// chroma DC/AC decode (no 8×8 transform support — B-side encoder
-/// stays on 4×4 transform per §6E-A6.1q.b scope).
+/// The CBP=0 fast path is preserved; the non-zero CBP path mirrors
+/// `walk_p_inter_residual`'s 4×4 luma + chroma DC/AC decode (no 8×8
+/// transform support — the B-side encoder stays on 4×4 transform).
 ///
-/// Task #207 (2026-05-04): `l0_abs` / `l1_abs` are `Option<[[i16; 16]; 2]>`
-/// — full per-position arrays so partitioned + B_8x8 walkers can
-/// mirror the encoder's `current_mvd.to_neighbor()` per-sub-MB layout
-/// (instead of the broadcast that 16x16 walkers use). When sub-MB MVDs
-/// differ across the MB (e.g. B_8x8 with one non-zero sub-MB and three
+/// `l0_abs` / `l1_abs` are `Option<[[i16; 16]; 2]>` — full
+/// per-position arrays so partitioned + B_8x8 walkers can
+/// reproduce the emitter's per-sub-MB neighbour layout (instead of
+/// the broadcast that 16x16 walkers use). When sub-MB MVDs differ
+/// across the MB (e.g. B_8x8 with one non-zero sub-MB and three
 /// zero), the broadcast was overstating magnitude at zero positions
-/// → next-MB bin0 ctxIdxInc disagreed with encoder → CABAC desync.
+/// → next-MB bin0 ctxIdxInc disagreed with the emitter → CABAC desync.
 #[allow(clippy::too_many_arguments)]
-/// v1.4 Phase 4.5 (#316) — walker-side mirror of
-/// `fill_ref_idx_l0_partitioned` in encoder.rs. Builds a 16-entry
-/// per-4×4-block ref_idx_l0 array from per-partition decoded values.
+/// Builds a 16-entry per-4×4-block ref_idx_l0 array from
+/// per-partition decoded values, following the spec § 6.4.2.2
+/// partition layout so neighbour ctxIdxInc matches a spec decoder.
 fn walker_fill_ref_idx_l0_partitioned(
-    meta: crate::codec::h264::encoder::b_partitioned::BPartitionedMeta,
+    meta: crate::codec::h264::b_partition_meta::BPartitionedMeta,
     ref_idx_l0: [u8; 2],
 ) -> [i8; 16] {
-    use crate::codec::h264::encoder::b_partitioned::BListUse;
+    use crate::codec::h264::b_partition_meta::BListUse;
     let mut out = [0i8; 16];
     let (pw, ph) = meta.shape.part_dim_4x4();
     for idx in 0..2usize {
@@ -1761,8 +1638,8 @@ fn walker_fill_ref_idx_l0_partitioned(
     out
 }
 
-/// v1.4 Phase 4.5 (#316) — walker-side mirror of
-/// `fill_ref_idx_l0_b8x8`.
+/// Per-sub-MB ref_idx_l0 fill (spec § 6.4.2.2 sub-MB partition
+/// layout).
 fn walker_fill_ref_idx_l0_b8x8(
     sub_mb_types: [u8; 4],
     ref_idx_l0: [u8; 4],
@@ -1784,8 +1661,8 @@ fn walker_fill_ref_idx_l0_b8x8(
     out
 }
 
-/// v1.4 Phase 4.5 (#316) — walker-side helper for P-slice partition
-/// neighbour ref_idx_l0 fill. P-partitions all use L0.
+/// Walker-side helper for P-slice partition neighbour ref_idx_l0
+/// fill. P-partitions all use L0.
 /// `ref_idx_l0`: P16x16/P_Skip = [v, _, _, _]; P16x8 = [top, bottom];
 /// P8x16 = [left, right]; P_8x8 = [s0, s1, s2, s3].
 fn walker_fill_ref_idx_l0_p(mb_type_p: u32, ref_idx_l0: [u8; 4]) -> [i8; 16] {
@@ -1873,8 +1750,8 @@ fn finish_b_inter_with_mb_type(
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
 
-    // §B-direct-fix.v2 (#194): mirror the encoder's transform_size_8x8_flag
-    // emission gate. For all B-MB inter modes phasm ships
+    // Mirror the encoder's transform_size_8x8_flag emission gate.
+    // For all B-MB inter modes phasm ships
     // (16x16/16x8/8x16/B_8x8 with sub_mb_type ≤ 3),
     // noSubMbPartSizeLessThan8x8Flag = 1, so the gate reduces to
     // `transform_8x8_mode_flag && cbp_luma != 0`. The encoder
@@ -1905,7 +1782,7 @@ fn finish_b_inter_with_mb_type(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_offset_capture(
+                let scan = decode_residual_block_recording(
                     dec, 0, 15, /* cat */ 2, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -1923,7 +1800,7 @@ fn finish_b_inter_with_mb_type(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_offset_capture(
+            let dc_flat = decode_residual_block_recording(
                 dec, 0, 3, /* cat */ 3, inc,
                 frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
@@ -1946,7 +1823,7 @@ fn finish_b_inter_with_mb_type(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_offset_capture(
+                let ac_scan = decode_residual_block_recording(
                     dec, 0, 14, /* cat */ 4, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -1963,9 +1840,9 @@ fn finish_b_inter_with_mb_type(
 
     let is_last = decode_end_of_slice_flag(dec)?;
 
-    // §6E-A6.1 spec § 9.3.3.1.1.7 fix: commit per-list MVD
-    // magnitudes so subsequent neighbour bin0 ctxIdxInc reads the
-    // right list-specific state.
+    // Per spec § 9.3.3.1.1.7: commit per-list MVD magnitudes so
+    // subsequent neighbour bin0 ctxIdxInc reads the right
+    // list-specific state.
     let abs_mvd_l0 = l0_abs.unwrap_or([[0; 16]; 2]);
     let abs_mvd_l1 = l1_abs.unwrap_or([[0; 16]; 2]);
     let mut nb = CabacNeighborMB {
@@ -1973,10 +1850,10 @@ fn finish_b_inter_with_mb_type(
         mb_skip_flag: false,
         cbp_luma,
         cbp_chroma,
-        // v1.4 Phase 4.5 (#316) — propagate the per-block ref_idx_l0
-        // captured from the wire so next MB's ref_idx ctxIdxInc
-        // matches what a spec-conforming decoder computes (the prior
-        // [0;16] hardcode desynced vs the reference decoder whenever ref_idx>0).
+        // Propagate the per-block ref_idx_l0 captured from the wire
+        // so next MB's ref_idx ctxIdxInc matches what a
+        // spec-conforming decoder computes (the prior [0;16]
+        // hardcode desynced vs the reference decoder whenever ref_idx>0).
         ref_idx_l0: ref_idx_l0_array,
         abs_mvd_comp: abs_mvd_l0,
         abs_mvd_comp_l1: abs_mvd_l1,
@@ -1989,15 +1866,13 @@ fn finish_b_inter_with_mb_type(
     Ok(is_last)
 }
 
-/// I_NxN macroblock walker (chunk 6D). Mirrors
-/// `Encoder::commit_i4x4_macroblock_cabac` (encoder.rs:2946).
-/// Returns the end_of_slice_flag bit.
+/// I_NxN macroblock walker. Inverts the spec I_NxN
+/// macroblock_layer() / residual() syntax (§ 7.3.5). Returns the
+/// end_of_slice_flag bit.
 ///
-/// **Scope**: I_4x4 only (transform_size_8x8_flag = 0). I_8x8
-/// (flag = 1) returns Unsupported sentinel — chunk-5 encoder
-/// hardcodes `enable_transform_8x8 = false` so this path is
-/// reachable only on bitstreams produced by other encoders or
-/// future enable_transform_8x8 support.
+/// **Scope**: handles both I_4x4 (transform_size_8x8_flag = 0; 16
+/// luma blocks of cat=2) and I_8x8 (flag = 1; 4 luma blocks of
+/// cat=5), gated on `pps.transform_8x8_mode_flag` per spec.
 fn walk_inxn_mb(
     dec: &mut CabacDecoder<'_>,
     pps: &Pps,
@@ -2021,10 +1896,10 @@ fn walk_inxn_mb(
         false
     };
 
-    // 2. Per-block intra prediction modes. I_4x4 emits 16 mode flags
-    //    (one per 4×4 block); I_8x8 emits 4 (one per 8×8 block) per
-    //    encoder.rs:4465 — the contexts are shared (Table 9-39 specifies
-    //    ctxIdxOffsets 68/69 for both I_4x4 and I_8x8).
+    // 2. Per-block intra prediction modes. I_4x4 has 16 mode flags
+    //    (one per 4×4 block); I_8x8 has 4 (one per 8×8 block) — the
+    //    contexts are shared (Table 9-39 specifies ctxIdxOffsets
+    //    68/69 for both I_4x4 and I_8x8).
     let n_pred_modes = if use_8x8 { 4 } else { 16 };
     for _ in 0..n_pred_modes {
         let prev_flag = decode_prev_intra4x4_pred_mode_flag(dec)?;
@@ -2033,16 +1908,15 @@ fn walk_inxn_mb(
         }
     }
 
-    // 3. intra_chroma_pred_mode (encoder line 3069).
+    // 3. intra_chroma_pred_mode.
     let chroma_pred_mode = decode_intra_chroma_pred_mode(dec, mb_x)?;
 
-    // 4. coded_block_pattern (encoder line 3073). Returns
-    //    chroma:luma packed byte; unpack as encoder pack_cbp.
+    // 4. coded_block_pattern. Returns the chroma:luma packed byte.
     let cbp_byte = decode_coded_block_pattern(dec, mb_x)?;
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
 
-    // 5. mb_qp_delta — ONLY when cbp_value != 0 (encoder line 3079).
+    // 5. mb_qp_delta — ONLY when cbp_value != 0 (spec § 7.3.5).
     let qp_delta_emitted = if cbp_byte != 0 {
         let delta = decode_mb_qp_delta(dec)?;
         *prev_mb_qp += delta;
@@ -2055,28 +1929,24 @@ fn walk_inxn_mb(
     let mut current_cbf = CurrentMbCbf::new();
 
     if use_8x8 {
-        // 6a. I_8x8 luma residual: 4 blocks of cat=5 (no per-block CBF
-        //     — encoder.rs:4490-4512). Each block has 64 coefficients
-        //     (start=0, end=63). Gated per 8×8 block via cbp_luma bit k.
-        //     Set every 4×4 block within an 8×8-coded block as coded
-        //     in the cat=2 CBF state, mirroring encoder.rs:4519-4527 so
-        //     subsequent I_4x4 MBs see consistent neighbor CBF.
+        // 6a. I_8x8 luma residual: 4 blocks of cat=5 (no per-block
+        //     CBF). Each block has 64 coefficients (start=0, end=63).
+        //     Gated per 8×8 block via cbp_luma bit k. Set every 4×4
+        //     block within an 8×8-coded block as coded in the cat=2
+        //     CBF state so subsequent I_4x4 MBs see consistent
+        //     neighbor CBF.
         for k in 0..4usize {
             if cbp_luma & (1 << k) != 0 {
                 let path_kind = ResidualPathKind::Luma8x8 {
                     block_idx: k as u8,
                 };
-                // Phase C.3.6.1 — dispatch to offset-capturing logger
-                // when enabled; else NullLogger (zero-cost). Scoped so
-                // recorder is free for `on_residual_block` below.
+                // Scoped so the recorder borrow is free for the
+                // `on_residual_block` call below. The inline logger is a
+                // zero-cost NullLogger (positions are enumerated from the
+                // decoded coefficients after the fact).
                 let mut null = NullLogger;
                 let scan = {
-                    let logger: &mut dyn PositionLogger =
-                        if let Some(ol) = recorder.offset_logger.as_mut() {
-                            ol
-                        } else {
-                            &mut null
-                        };
+                    let logger: &mut dyn PositionLogger = &mut null;
                     let mut pos_ctx = PositionCtx {
                         frame_idx,
                         mb_addr: mb_addr_u32,
@@ -2093,8 +1963,8 @@ fn walk_inxn_mb(
                     frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
                 );
             }
-            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8 bit
-            // (encoder.rs:4519-4527). Necessary so the next MB's
+            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8
+            // bit. Necessary so the next MB's
             // compute_cbf_ctx_idx_inc_luma_4x4 sees the right neighbor.
             for sub in 0..4usize {
                 let blk_idx = k * 4 + sub;
@@ -2112,7 +1982,7 @@ fn walk_inxn_mb(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_offset_capture(
+                let scan = decode_residual_block_recording(
                     dec, 0, 15, /* cat */ 2, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -2132,7 +2002,7 @@ fn walk_inxn_mb(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_offset_capture(
+            let dc_flat = decode_residual_block_recording(
                 dec, 0, 3, /* cat */ 3, inc,
                 frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
@@ -2157,7 +2027,7 @@ fn walk_inxn_mb(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_offset_capture(
+                let ac_scan = decode_residual_block_recording(
                     dec, 0, 14, /* cat */ 4, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -2175,10 +2045,10 @@ fn walk_inxn_mb(
     // 9. end_of_slice_flag.
     let is_last = decode_end_of_slice_flag(dec)?;
 
-    // 10. Commit neighbor state for next MB. Mirrors encoder line 3206
-    //     (I_4x4) and 4590-4598 (I_8x8). The transform_size_8x8_flag bit
-    //     drives the next MB's transform_size_8x8_flag CABAC ctx (Table
-    //     9-39 ctxIdxInc derivation).
+    // 10. Commit neighbor state for next MB. The
+    //     transform_size_8x8_flag bit drives the next MB's
+    //     transform_size_8x8_flag CABAC ctx (Table 9-39 ctxIdxInc
+    //     derivation).
     let mut nb = CabacNeighborMB {
         mb_type: MbTypeClass::INxN,
         ..CabacNeighborMB::default()
@@ -2194,18 +2064,17 @@ fn walk_inxn_mb(
     Ok(is_last)
 }
 
-/// Unified P-partition walker (§30A3 + §30A4). Dispatches MVD
-/// decode based on `mb_type_p` (0..3); residual + neighbor commit
-/// shared via `decode_p_residuals_and_finish`.
+/// Unified P-partition walker. Dispatches MVD decode based on
+/// `mb_type_p` (0..3); residual + neighbor commit shared via
+/// `decode_p_residuals_and_finish`.
 ///
-/// Mirrors `Encoder::write_p_macroblock_cabac` (encoder.rs:1610+)
-/// + `emit_p_mvds_cabac` (encoder.rs:1863+) +
-/// `emit_sub_mb_mvds_cabac` (encoder.rs:1979+).
+/// Inverts the spec P-slice mb_pred() / sub_mb_pred() MVD syntax
+/// (§ 7.3.5.1 / § 7.3.5.2).
 ///
-/// **MVD positions intentionally NOT recorded** — encoder's MVD
-/// hook is declared but unwired (§30D pending). NullLogger drops
-/// inline emissions so the decoder cover's mvd_*_bypass domains
-/// stay empty, matching the encoder's empty MVD cover.
+/// MVD positions are recorded into the mvd_sign_bypass /
+/// mvd_suffix_lsb cover domains only when `WalkOptions::record_mvd`
+/// is set (via `decode_one_mvd_pair_p` → `recorder.on_mvd_slot`);
+/// otherwise a `NullLogger` drops the inline emissions (zero-cost).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn walk_p_partition_mb(
@@ -2225,8 +2094,8 @@ fn walk_p_partition_mb(
     let mb_addr_u32 = (mb_y * mb_w + mb_x) as u32;
     let mut current_mvd = CurrentMbMvdAbs::new();
 
-    // 1. P_8x8 emits 4 sub_mb_types BEFORE any MVDs (encoder.rs:
-    //    1613-1617). Other partition types skip this step.
+    // 1. P_8x8 carries 4 sub_mb_types BEFORE any MVDs (spec
+    //    § 7.3.5.2). Other partition types skip this step.
     let sub_types: Option<[u32; 4]> = if mb_type_p == 3 {
         let mut sm = [0u32; 4];
         for s in sm.iter_mut() {
@@ -2237,17 +2106,15 @@ fn walk_p_partition_mb(
         None
     };
 
-    // 2. v1.4 (#305) — ref_idx_l0 per partition per spec § 7.3.5.1
-    // mb_pred(). At num_ref_idx_l0_active=1 (single-ref default) the
-    // gate is closed and zero bins read. P-slice partitions all use
-    // L0 by definition (B-slice list-usage filtering doesn't apply).
-    //
-    // v1.4 Phase 4.5 (#316) — capture decoded values per partition
-    // for the neighbour commit fill below.
+    // 2. ref_idx_l0 per partition per spec § 7.3.5.1 mb_pred().
+    // At num_ref_idx_l0_active=1 (single-ref default) the gate is
+    // closed and zero bins read. P-slice partitions all use L0 by
+    // definition (B-slice list-usage filtering doesn't apply).
+    // Capture decoded values per partition for the neighbour commit
+    // fill below.
     let mut ref_idx_l0_p = [0u8; 4];
-    // v1.4 Phase 4.5 (#316) — within-MB tracker so partition 1+ reads
-    // partition 0's just-decoded ref_idx for ctxIdxInc lookups
-    // (spec § 6.4.11.7).
+    // Within-MB tracker so partition 1+ reads partition 0's
+    // just-decoded ref_idx for ctxIdxInc lookups (spec § 6.4.11.7).
     let mut current_ref_idx_mb = crate::codec::h264::cabac::neighbor::CurrentMbRefIdx::new();
     if num_active_l0 > 1 {
         let c_max = (num_active_l0 - 1) as u32;
@@ -2284,7 +2151,7 @@ fn walk_p_partition_mb(
     }
     let ref_idx_l0_array = walker_fill_ref_idx_l0_p(mb_type_p, ref_idx_l0_p);
 
-    // 3. MVDs per partition. Encoder pattern (emit_p_mvds_cabac):
+    // 3. MVDs per partition (spec § 7.3.5.1 mb_pred order):
     //    P16x16 → 1 part; P16x8 → 2 parts (top+bottom 16x8);
     //    P8x16 → 2 parts (left+right 8x16); P_8x8 → 4 sub-MBs at
     //    SUB_MB_ORIGINS_4X4 = [(0,0),(2,0),(0,2),(2,2)] each
@@ -2297,8 +2164,7 @@ fn walk_p_partition_mb(
     // Spec `noSubMbPartSizeLessThan8x8Flag` — gates whether
     // `transform_size_8x8_flag` may be emitted. Always true for
     // P_L0_16x16 / P_16x8 / P_8x16; for P_8x8 it requires every
-    // sub_mb_type == 0 (P_L0_8x8). Mirrors
-    // partition_decision.rs:no_sub_mb_part_size_lt_8x8.
+    // sub_mb_type == 0 (P_L0_8x8).
     let no_sub_mb_part_size_lt_8x8 = match (mb_type_p, sub_types.as_ref()) {
         (3, Some(sm)) => sm.iter().all(|&t| t == 0),
         (3, None) => false,
@@ -2313,8 +2179,8 @@ fn walk_p_partition_mb(
     )
 }
 
-/// Decode the MVD pairs for a P-partition MB. Mirrors encoder's
-/// `emit_p_mvds_cabac` + `emit_sub_mb_mvds_cabac`.
+/// Decode the MVD pairs for a P-partition MB, per spec
+/// § 7.3.5.1 mb_pred() / § 7.3.5.2 sub_mb_pred().
 #[allow(clippy::too_many_arguments)]
 fn decode_p_partition_mvds(
     dec: &mut CabacDecoder<'_>,
@@ -2339,8 +2205,8 @@ fn decode_p_partition_mvds(
         1 => {
             // P_16x8: 2 partitions stacked. Spec partition_id =
             // mbPartIdx*4 + subMbPartIdx (subMb=0 for non-8x8 modes).
-            // #549 Bug 5 fix: was {0, 1}; must be {0, 4} to match the
-            // spec-aligned partition_id used by the encoder hook key.
+            // The partition_ids must be {0, 4} (NOT {0, 1}) to match
+            // the spec-aligned partition_id used by the encoder hook key.
             decode_one_mvd_pair_p(
                 dec, current_mvd, mb_x, 0, 0, 4, 2, 0,
                 frame_idx, nal_idx, mb_addr_u32, recorder, opts,
@@ -2379,8 +2245,8 @@ fn decode_p_partition_mvds(
     Ok(())
 }
 
-/// Decode the MVD pairs for one 8×8 sub-MB. Mirrors encoder's
-/// `emit_sub_mb_mvds_cabac` (encoder.rs:1979).
+/// Decode the MVD pairs for one 8×8 sub-MB, per spec § 7.3.5.2
+/// sub_mb_pred().
 ///
 /// `sub_mb_type` codenum:
 ///   0 → P_L0_8x8 — 1 partition (sub_bx, sub_by, 2, 2)
@@ -2391,7 +2257,7 @@ fn decode_p_partition_mvds(
 /// with the within-sub-MB partition index it forms the global
 /// `partition` value passed to `decode_one_mvd_pair_p` /
 /// `MvdSlot.partition`. Convention: `partition = sub_mb_idx * 4 +
-/// sub_part_idx`. Encoder mirror lives in §30D-A3.
+/// sub_part_idx`.
 #[allow(clippy::too_many_arguments)]
 fn decode_sub_mb_mvds(
     dec: &mut CabacDecoder<'_>,
@@ -2453,13 +2319,15 @@ fn decode_sub_mb_mvds(
 }
 
 /// Decode one MVD pair (x + y components) and update current_mvd
-/// for subsequent same-MB partition neighbor lookups. Mirrors
-/// encoder's `emit_one_mvd_pair_cabac` (encoder.rs:2088).
+/// for subsequent same-MB partition neighbor lookups. Inverts the
+/// spec UEG3 mvd_l0/mvd_l1 binarization (§ 9.3.2.3).
 ///
-/// **§30D-B**: when `opts.record_mvd` is true, record the decoded
-/// MVD value via `PositionRecorder::on_mvd_slot` for both x and y
-/// axes — symmetric to encoder's PositionLoggerHook firing
-/// `on_mvd_slot` per axis in `apply_mvd_hook_to_choice`.
+/// When `opts.record_mvd` is true, record the decoded MVD value
+/// via `PositionRecorder::on_mvd_slot` for both x and y axes.
+/// Cover parity with the encode side is by-construction: both
+/// route MvdSlots through the shared `enumerate_mvd_*_positions` /
+/// `extract_mvd_*_bits` primitives in `stego::inject` on identical
+/// slots.
 #[allow(clippy::too_many_arguments)]
 fn decode_one_mvd_pair_p(
     dec: &mut CabacDecoder<'_>,
@@ -2480,14 +2348,8 @@ fn decode_one_mvd_pair_p(
     let bin0_inc_x = compute_mvd_ctx_idx_inc_bin0(
         current_mvd, &dec.neighbors, mb_x, part_bx, part_by, 0,
     );
-    // Phase C.3.6.1 — dispatch to recorder's offset_logger when set.
     let mvd_x = {
-        let logger: &mut dyn PositionLogger =
-            if let Some(ol) = recorder.offset_logger.as_mut() {
-                ol
-            } else {
-                &mut null
-            };
+        let logger: &mut dyn PositionLogger = &mut null;
         let mut pc = PositionCtx {
             frame_idx, mb_addr: mb_addr_u32, nal_idx, logger,
         };
@@ -2500,12 +2362,7 @@ fn decode_one_mvd_pair_p(
         current_mvd, &dec.neighbors, mb_x, part_bx, part_by, 1,
     );
     let mvd_y = {
-        let logger: &mut dyn PositionLogger =
-            if let Some(ol) = recorder.offset_logger.as_mut() {
-                ol
-            } else {
-                &mut null
-            };
+        let logger: &mut dyn PositionLogger = &mut null;
         let mut pc = PositionCtx {
             frame_idx, mb_addr: mb_addr_u32, nal_idx, logger,
         };
@@ -2519,9 +2376,10 @@ fn decode_one_mvd_pair_p(
         mvd_y.unsigned_abs().min(i16::MAX as u32) as i16,
     );
 
-    // §30D-B: record MVD slots for the X and Y axes when the
-    // walker is opt'd in. Encoder mirror in
-    // `apply_mvd_hook_to_choice` (encoder.rs).
+    // Record MVD slots for the X and Y axes when the walker is
+    // opt'd in (consumed by the shared
+    // `enumerate_mvd_*_positions` / `extract_mvd_*_bits` primitives
+    // in `stego::inject`).
     if opts.record_mvd {
         let sx = MvdSlot {
             list: 0, partition, axis: Axis::X, value: mvd_x,
@@ -2562,8 +2420,8 @@ fn decode_p_residuals_and_finish(
     let cbp_luma = cbp_byte & 0x0F;
     let cbp_chroma = (cbp_byte >> 4) & 0x03;
 
-    // 5. transform_size_8x8_flag — emitted iff PPS+cbp_luma>0+
-    //    no_sub_mb_part_size_lt_8x8 (encoder.rs:2659-2666).
+    // 5. transform_size_8x8_flag — present iff PPS+cbp_luma>0+
+    //    no_sub_mb_part_size_lt_8x8 (spec § 7.3.5).
     let use_8x8 = if pps.transform_8x8_mode_flag
         && cbp_luma != 0
         && no_sub_mb_part_size_lt_8x8
@@ -2585,24 +2443,20 @@ fn decode_p_residuals_and_finish(
     // 7. Residuals.
     let mut current_cbf = CurrentMbCbf::new();
     if use_8x8 {
-        // 8×8 luma residual: 4 cat=5 blocks (no per-block CBF). Mirrors
-        // encoder.rs:2686-2710.
+        // 8×8 luma residual: 4 cat=5 blocks (no per-block CBF), per
+        // spec § 7.3.5.3 residual().
         for k in 0..4usize {
             if cbp_luma & (1 << k) != 0 {
                 let path_kind = ResidualPathKind::Luma8x8 {
                     block_idx: k as u8,
                 };
-                // Phase C.3.6.1 — dispatch to offset-capturing logger
-                // when enabled; else NullLogger (zero-cost). Scoped so
-                // recorder is free for `on_residual_block` below.
+                // Scoped so the recorder borrow is free for the
+                // `on_residual_block` call below. The inline logger is a
+                // zero-cost NullLogger (positions are enumerated from the
+                // decoded coefficients after the fact).
                 let mut null = NullLogger;
                 let scan = {
-                    let logger: &mut dyn PositionLogger =
-                        if let Some(ol) = recorder.offset_logger.as_mut() {
-                            ol
-                        } else {
-                            &mut null
-                        };
+                    let logger: &mut dyn PositionLogger = &mut null;
                     let mut pos_ctx = PositionCtx {
                         frame_idx,
                         mb_addr: mb_addr_u32,
@@ -2619,9 +2473,9 @@ fn decode_p_residuals_and_finish(
                     frame_idx, mb_addr_u32, &scan, 0, 63, path_kind,
                 );
             }
-            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8 bit
-            // (encoder.rs:2717-2725) so subsequent 4×4 MBs see the same
-            // neighbor CBF state.
+            // Mark all four 4×4 sub-blocks coded/uncoded per the 8×8
+            // bit so subsequent 4×4 MBs see the same neighbor CBF
+            // state.
             for sub in 0..4usize {
                 let blk_idx = k * 4 + sub;
                 current_cbf.set(2, blk_idx, cbp_luma & (1 << k) != 0);
@@ -2636,7 +2490,7 @@ fn decode_p_residuals_and_finish(
                     mb_x, bx, by, current_is_intra,
                 );
                 let path = ResidualPathKind::Luma4x4 { block_idx: k as u8 };
-                let scan = decode_residual_block_with_offset_capture(
+                let scan = decode_residual_block_recording(
                     dec, 0, 15, /* cat */ 2, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -2654,7 +2508,7 @@ fn decode_p_residuals_and_finish(
                 &dec.neighbors, mb_x, plane, current_is_intra,
             );
             let path = ResidualPathKind::ChromaDc { plane };
-            let dc_flat = decode_residual_block_with_offset_capture(
+            let dc_flat = decode_residual_block_recording(
                 dec, 0, 3, /* cat */ 3, inc,
                 frame_idx, mb_addr_u32, nal_idx, path, recorder,
             )?;
@@ -2677,7 +2531,7 @@ fn decode_p_residuals_and_finish(
                 let path = ResidualPathKind::ChromaAc {
                     plane, block_idx: sub as u8,
                 };
-                let ac_scan = decode_residual_block_with_offset_capture(
+                let ac_scan = decode_residual_block_recording(
                     dec, 0, 14, /* cat */ 4, inc,
                     frame_idx, mb_addr_u32, nal_idx, path, recorder,
                 )?;
@@ -2705,9 +2559,9 @@ fn decode_p_residuals_and_finish(
     nb.cbp_chroma = cbp_chroma;
     nb.mb_qp_delta = qp_delta;
     nb.coded_block_flag_cat = current_cbf.to_neighbor_cbf();
-    // v1.4 Phase 4.5 (#316) — propagate decoded ref_idx_l0 per
-    // partition geometry so spec-conforming decoders agree on the
-    // next MB's ref_idx ctxIdxInc.
+    // Propagate decoded ref_idx_l0 per partition geometry so
+    // spec-conforming decoders agree on the next MB's ref_idx
+    // ctxIdxInc.
     nb.ref_idx_l0 = ref_idx_l0_array;
     nb.abs_mvd_comp = current_mvd.to_neighbor();
     nb.transform_size_8x8_flag = use_8x8;
@@ -2716,20 +2570,14 @@ fn decode_p_residuals_and_finish(
     Ok(is_last)
 }
 
-/// Helper: decode one residual block. Position recording for cover
-/// bits + values happens externally via `PositionRecorder` after-the-
-/// fact (the recorder's enumerate-from-coeffs path gives identical
-/// positions to the inline decoder logger by construction; encoder-
-/// side parity gate, chunk 6A).
-///
-/// Phase C.3.6.1 (#428) — when the recorder has `offset_logger`
-/// enabled (`PositionRecorder::with_offsets()`), the inline logger
-/// passed to the syntax decoder captures RBSP bit offsets of every
-/// emitted bypass bin. Otherwise the inline logger is `NullLogger`
-/// (zero-cost). The offset-capturing path is the foundation of
-/// Option C bitstream-mod stego on the OpenH264 backend.
+/// Helper: decode one residual block and record its bypass-bin
+/// positions into the recorder's cover. The inline decoder logger is a
+/// `NullLogger` (zero-cost): the recorder's enumerate-from-coeffs path
+/// gives identical positions to an inline logger by construction
+/// (encoder-side parity gate, chunk 6A), so position recording is done
+/// from the decoded coefficients after the fact rather than inline.
 #[allow(clippy::too_many_arguments)]
-fn decode_residual_block_with_offset_capture(
+fn decode_residual_block_recording(
     dec: &mut CabacDecoder<'_>,
     start_idx: usize,
     end_idx: usize,
@@ -2742,12 +2590,7 @@ fn decode_residual_block_with_offset_capture(
     recorder: &mut PositionRecorder,
 ) -> Result<Vec<i32>, WalkError> {
     let mut null = NullLogger;
-    let logger: &mut dyn PositionLogger =
-        if let Some(ol) = recorder.offset_logger.as_mut() {
-            ol
-        } else {
-            &mut null
-        };
+    let logger: &mut dyn PositionLogger = &mut null;
     let mut pos_ctx = PositionCtx {
         frame_idx,
         mb_addr,
@@ -2791,1226 +2634,6 @@ mod tests {
         }
     }
 
-    /// Walks the Annex-B output of the chunk-5 stego encoder (with
-    /// empty message → byte-identical to no-stego baseline). Chunk
-    /// 6D: I_NxN dispatch is wired, so a 32×32 single I-frame
-    /// (4 MBs in any mix of I_16x16 + I_4x4) MUST walk without
-    /// error and produce a non-empty cover.
-    #[test]
-    fn walks_chunk5_empty_message_output_without_error() {
-        use crate::codec::h264::stego::encode_pixels::h264_stego_encode_i_frames_only;
-
-        let frame_size = 32 * 32 * 3 / 2;
-        let mut yuv = Vec::with_capacity(frame_size);
-        let mut s: u32 = 0xCAFE_F00D;
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            yuv.push((s >> 16) as u8);
-        }
-
-        let bytes = h264_stego_encode_i_frames_only(
-            &yuv, 32, 32, 1, &[], "test", 4, Some(26),
-        ).expect("encode");
-
-        let walk = walk_annex_b_for_cover(&bytes).expect("walk");
-        assert_eq!(walk.n_slices, 1, "expected exactly one slice");
-        assert_eq!(walk.n_mb, 4, "32x32 has exactly 4 MBs");
-        // High-entropy random YUV ⇒ many nonzero residuals ⇒
-        // sign-domain cover is non-empty.
-        assert!(
-            walk.cover.coeff_sign_bypass.len() > 0,
-            "expected non-empty coeff sign cover for random YUV",
-        );
-    }
-
-    /// Uniform-luma YUV strongly biases the encoder toward I_16x16
-    /// DC mode (single sample value across the MB). Confirms the
-    /// chunk-6C dispatch decodes without state-error and produces a
-    /// non-empty cover when the I_16x16 path is exercised.
-    #[test]
-    fn walks_uniform_yuv_through_i16x16_path() {
-        use crate::codec::h264::stego::encode_pixels::h264_stego_encode_i_frames_only;
-
-        // 16x16 single MB, uniform mid-gray. Y=128, Cb=Cr=128.
-        let frame_size = 16 * 16 * 3 / 2;
-        let mut yuv = vec![128u8; frame_size];
-        // Add tiny noise so the mode decision sees something but
-        // I_16x16 stays optimal.
-        for (i, b) in yuv.iter_mut().enumerate() {
-            *b = (*b as i32 + ((i as i32) % 3 - 1)) as u8;
-        }
-
-        let bytes = h264_stego_encode_i_frames_only(
-            &yuv, 16, 16, 1, &[], "test", 4, Some(26),
-        ).expect("encode");
-
-        match walk_annex_b_for_cover(&bytes) {
-            Ok(walk) => {
-                assert_eq!(walk.n_slices, 1);
-                assert_eq!(walk.n_mb, 1, "16x16 has exactly one MB");
-                // Cover may be empty if all coeffs zero (uniform YUV →
-                // few residual nonzeros), but the chroma DC pred
-                // typically leaves SOME nonzero coefficient. Either
-                // way, walk completed without error — that's the gate.
-                let total = walk.cover.coeff_sign_bypass.len()
-                    + walk.cover.coeff_suffix_lsb.len();
-                let _ = total;
-            }
-            Err(WalkError::H264(H264Error::Unsupported(s)))
-                if s.contains("I_NxN") || s.contains("I_PCM") =>
-            {
-                // I_4x4 / I_PCM mode pick — chunk 6D / 6E will wire.
-            }
-            Err(e) => panic!("unexpected walk error: {e}"),
-        }
-    }
-
-    /// **Load-bearing parity gate (chunk 6F)**.
-    ///
-    /// Encode a YUV with the chunk-5 driver (empty message ⇒ Pass-3
-    /// bytes byte-identical to no-stego baseline; cover bits in the
-    /// emitted bitstream EXACTLY equal what Pass-1 logged). Capture
-    /// the encode-side Pass-1 cover via `pass1_count`, walk the
-    /// same Annex-B output via the decode-side slice walker, and
-    /// assert the two covers are IDENTICAL across all four
-    /// bypass-bin domains: positions, bit values, ordering. By
-    /// construction (encoder + decoder enumerate over identical
-    /// post-quantize coefficients in identical scan order) this
-    /// equality must hold.
-    ///
-    /// If this test ever flakes, every later sub-phase (STC reverse
-    /// + decrypt + frame parse) is dead. The whole decode side
-    /// rests on this byte-identity invariant.
-    #[test]
-    fn encode_walk_parity_chunk5_empty_message() {
-        use crate::codec::h264::stego::encode_pixels::{
-            h264_stego_encode_i_frames_only, pass1_count,
-        };
-
-        let frame_size = 32 * 32 * 3 / 2;
-        let mut yuv = Vec::with_capacity(frame_size);
-        let mut s: u32 = 0xCAFE_F00D;
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            yuv.push((s >> 16) as u8);
-        }
-
-        // Encode-side: capture Pass-1 cover.
-        let encoder_gop = pass1_count(
-            &yuv, 32, 32, 1, frame_size, Some(26),
-        ).expect("pass1_count");
-        let encoder_cover = encoder_gop.cover;
-
-        // Encode again via the production driver (empty message ⇒
-        // Pass-3 bytes equal no-stego baseline).
-        let bytes = h264_stego_encode_i_frames_only(
-            &yuv, 32, 32, 1, &[], "test", 4, Some(26),
-        ).expect("encode");
-
-        // Decode-side: walk the resulting Annex-B.
-        let walk = walk_annex_b_for_cover(&bytes).expect("walk");
-        let decoder_cover = walk.cover;
-
-        // Per-domain byte-identity assertions.
-        assert_eq!(
-            decoder_cover.coeff_sign_bypass.positions,
-            encoder_cover.coeff_sign_bypass.positions,
-            "coeff_sign_bypass positions must match"
-        );
-        assert_eq!(
-            decoder_cover.coeff_sign_bypass.bits,
-            encoder_cover.coeff_sign_bypass.bits,
-            "coeff_sign_bypass bits must match"
-        );
-        assert_eq!(
-            decoder_cover.coeff_suffix_lsb.positions,
-            encoder_cover.coeff_suffix_lsb.positions,
-            "coeff_suffix_lsb positions must match"
-        );
-        assert_eq!(
-            decoder_cover.coeff_suffix_lsb.bits,
-            encoder_cover.coeff_suffix_lsb.bits,
-            "coeff_suffix_lsb bits must match"
-        );
-        // I-frame-only scope: MVD domains stay empty.
-        assert_eq!(decoder_cover.mvd_sign_bypass.positions,
-            encoder_cover.mvd_sign_bypass.positions);
-        assert_eq!(decoder_cover.mvd_sign_bypass.bits,
-            encoder_cover.mvd_sign_bypass.bits);
-        assert_eq!(decoder_cover.mvd_suffix_lsb.positions,
-            encoder_cover.mvd_suffix_lsb.positions);
-        assert_eq!(decoder_cover.mvd_suffix_lsb.bits,
-            encoder_cover.mvd_suffix_lsb.bits);
-    }
-
-    /// **§30A1+2 P-slice walker test**: encode an I-frame followed by
-    /// a P-frame on identical YUV. The P-frame's MBs should be
-    /// pickable as P_SKIP or intra-in-P; the walker should advance
-    /// through both slices without erroring.
-    ///
-    /// We construct YUV manually because `h264_stego_encode_yuv_string`
-    /// uses I-frame-only encoding. For this test we drive
-    /// `Encoder::encode_p_frame` directly.
-    #[test]
-    fn walks_i_then_p_frame_without_error() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-
-        // Uniform-luma YUV maximizes P_SKIP probability (residuals
-        // round to zero for stationary content).
-        let frame_size = 16 * 16 * 3 / 2;
-        let yuv = vec![128u8; frame_size];
-
-        let mut enc = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&yuv).expect("I-frame"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&yuv).expect("P-frame"));
-
-        // The walker may succeed (all P_SKIP / intra-in-P) or fail
-        // with the P_partition sentinel (encoder picked
-        // P_L0_16x16 / P_16x8 / P_8x16 / P_8x8 — wired in §30A3+).
-        // Both outcomes prove the §30A1+2 dispatch reaches mb_skip
-        // / mb_type_p decode without state errors.
-        match walk_annex_b_for_cover(&bytes) {
-            Ok(walk) => {
-                assert_eq!(walk.n_slices, 2, "expected I + P slices");
-                assert!(walk.n_mb >= 2);
-            }
-            Err(WalkError::H264(H264Error::Unsupported(s)))
-                if s.contains("P_partition") || s.contains("I_NxN")
-                   || s.contains("I_PCM") =>
-            {
-                // §30A3+ wires P_partition; chunk 6D + 6E wire I_NxN
-                // / I_PCM. Tolerate while those land.
-            }
-            Err(e) => panic!("unexpected walk error: {e}"),
-        }
-    }
-
-    /// **§30A3 P_L0_16x16 test**: encode an I-frame followed by
-    /// a P-frame on YUV with mild texture and small motion. The
-    /// encoder typically picks P_L0_16x16 when there's coherent
-    /// translation. The walker should advance through both slices
-    /// without erroring.
-    #[test]
-    fn walks_i_then_p_frame_with_motion() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-
-        // Slowly-varying YUV so successive frames are correlated
-        // enough for P_L0_16x16 to be picked, but noisy enough
-        // that residuals don't round to zero (avoiding P_SKIP).
-        let frame_size = 16 * 16 * 3 / 2;
-        let mut frame0 = vec![0u8; frame_size];
-        let mut frame1 = vec![0u8; frame_size];
-        let mut s: u32 = 0x4242_DEAD;
-        for i in 0..frame_size {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            // Mid-gray ± small variation
-            frame0[i] = (128 + ((s >> 24) & 0x07) as u8) as u8;
-            // frame1 shifted slightly: small diff from frame0
-            frame1[i] = (128 + ((s >> 22) & 0x07) as u8) as u8;
-        }
-
-        let mut enc = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&frame0).expect("I"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&frame1).expect("P"));
-
-        // Outcome depends on encoder's mode pick. P_SKIP, P_L0_16x16,
-        // intra-in-P all walk cleanly with §30A1+2+3. Non-16x16
-        // P-partitions still error out — tolerated until §30A4.
-        match walk_annex_b_for_cover(&bytes) {
-            Ok(walk) => {
-                assert_eq!(walk.n_slices, 2);
-                assert!(walk.n_mb >= 2);
-            }
-            Err(WalkError::H264(H264Error::Unsupported(s)))
-                if s.contains("P_partition mb_type_p=") || s.contains("I_NxN")
-                   || s.contains("I_PCM") || s.contains("transform_size") =>
-            {
-                // §30A4 / chunk 6E pending paths.
-            }
-            Err(e) => panic!("unexpected walk error: {e}"),
-        }
-    }
-
-    /// **§30B P-slice parity gate**: encode I+P frame via the direct
-    /// Encoder API with a `PositionLoggerHook` → capture encoder
-    /// Pass-1 cover. Walk the same Annex-B via the bin-decoder
-    /// → capture walker cover. Assert byte-identical across the
-    /// coeff domains. (MVD domains stay empty until §30D wires the
-    /// encoder MVD hook.)
-    ///
-    /// This is the load-bearing P-slice test. Surfaces bugs in
-    /// neighbor-state propagation, MVD parsing, and partition
-    /// dispatch the same way chunks 6F + 8 surfaced bugs in I-slice
-    /// walking and multi-frame frame_idx handling.
-    #[test]
-    fn p_slice_parity_walker_matches_encoder_cover() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        // Slowly-varying YUV: mild texture, some motion → encoder
-        // likely picks a mix of P_SKIP and P_L0_16x16 (and possibly
-        // intra-in-P). Avoids non-16x16 P-partitions which §30A4
-        // wires.
-        let frame_size = 16 * 16 * 3 / 2;
-        let mut frame0 = vec![0u8; frame_size];
-        let mut frame1 = vec![0u8; frame_size];
-        let mut s: u32 = 0xBEEF_F00D;
-        for i in 0..frame_size {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            frame0[i] = (128 + ((s >> 24) & 0x07) as u8) as u8;
-            frame1[i] = (128 + ((s >> 22) & 0x07) as u8) as u8;
-        }
-
-        // Encoder side: Pass-1 logger captures cover.
-        let mut enc = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&frame0).expect("I"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&frame1).expect("P"));
-        let mut hook = enc.take_stego_hook().expect("hook present");
-        let encoder_gop = hook.take_cover_if_logger().expect("logger");
-
-        // Decoder side: walker.
-        let walk = match walk_annex_b_for_cover(&bytes) {
-            Ok(w) => w,
-            Err(WalkError::H264(H264Error::Unsupported(s))) => {
-                // The encoder chose a partition mode not yet wired
-                // in §30A. Skip the test — adjust the input YUV in
-                // a follow-up to deterministically hit wired modes.
-                eprintln!("Skipping §30B parity (encoder picked {s}); §30A4+ pending");
-                return;
-            }
-            Err(e) => panic!("unexpected walk error: {e}"),
-        };
-
-        // Per-domain byte-identity assertions.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions,
-            encoder_gop.cover.coeff_sign_bypass.positions,
-            "P-slice coeff_sign_bypass positions must match"
-        );
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.bits,
-            encoder_gop.cover.coeff_sign_bypass.bits,
-            "P-slice coeff_sign_bypass bits must match"
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.positions,
-            encoder_gop.cover.coeff_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.bits,
-            encoder_gop.cover.coeff_suffix_lsb.bits,
-        );
-        // MVD domains: both sides must agree on emptiness until
-        // §30D wires the encoder MVD hook.
-        assert_eq!(walk.cover.mvd_sign_bypass.len(),
-            encoder_gop.cover.mvd_sign_bypass.len());
-        assert_eq!(walk.cover.mvd_suffix_lsb.len(),
-            encoder_gop.cover.mvd_suffix_lsb.len());
-    }
-
-    /// **§30A4 P-partition stress test**: high-entropy random YUV
-    /// across 2 frames. Encoder typically picks P_8x8 / P_16x8 /
-    /// P_8x16 with varied MVs because the content is uncorrelated.
-    /// All P-partition modes wired in §30A4 must walk to byte-
-    /// identity vs encoder Pass-1 cover.
-    #[test]
-    fn p_slice_parity_high_entropy_yuv_32x32() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        // 32×32 = 4 MBs × 2 frames = 8 MBs total. Random content
-        // ⇒ varied partition picks across the 4 P-MBs.
-        let frame_size = 32 * 32 * 3 / 2;
-        let mut frame0 = Vec::with_capacity(frame_size);
-        let mut frame1 = Vec::with_capacity(frame_size);
-        let mut s: u32 = 0xABCD_1234;
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            frame0.push((s >> 16) as u8);
-        }
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            frame1.push((s >> 16) as u8);
-        }
-
-        let mut enc = Encoder::new(32, 32, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&frame0).expect("I"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&frame1).expect("P"));
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let encoder_gop = hook.take_cover_if_logger().expect("logger");
-
-        let walk = walk_annex_b_for_cover(&bytes).expect("walk");
-
-        // Per-domain byte-identity. Counts on this fixture: ~2639
-        // coeff_sign + ~6 coeff_suffix positions across 8 MBs
-        // (4 I-MBs + 4 P-MBs with mixed partition modes).
-        // High-entropy random YUV biases the encoder toward
-        // P_8x8 / P_8x4 / P_4x8 / P_4x4 sub-MB partitions, so this
-        // gate exercises §30A4's full P-partition coverage.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions,
-            encoder_gop.cover.coeff_sign_bypass.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.bits,
-            encoder_gop.cover.coeff_sign_bypass.bits,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.positions,
-            encoder_gop.cover.coeff_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.bits,
-            encoder_gop.cover.coeff_suffix_lsb.bits,
-        );
-    }
-
-    /// **§30D-A gate test**: `enable_mvd_stego_hook=true` causes the
-    /// encoder to fire the MVD hook on P_L0_16x16 partitions (chunk
-    /// scope). The PositionLoggerHook records MVD positions for
-    /// non-zero MVDs. Default-OFF flag → zero MVD positions (chunk
-    /// 5/§30C behavior preserved).
-    ///
-    /// MVD positions are recorded on the encoder side in §30D-A. The
-    /// decoder side still records empty MVD cover via NullLogger
-    /// (§30D-B will mirror). So this test only exercises the encoder
-    /// side; encoder/decoder MVD parity is §30D-B's gate.
-    #[test]
-    fn s30d_a_encoder_mvd_hook_fires_when_flag_on() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        // Slowly-varying YUV: encoder typically picks P_L0_16x16
-        // for low-motion content. P_16x8 / P_8x16 / P_8x8 don't
-        // fire the hook in §30D-A scope; that's §30D-A2 / §30D-A3.
-        let frame_size = 16 * 16 * 3 / 2;
-        let mut frame0 = vec![0u8; frame_size];
-        let mut frame1 = vec![0u8; frame_size];
-        let mut s: u32 = 0xFEED_BEEF;
-        for i in 0..frame_size {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            frame0[i] = (128 + ((s >> 24) & 0x07) as u8) as u8;
-            frame1[i] = (128 + ((s >> 22) & 0x07) as u8) as u8;
-        }
-
-        // With flag ON.
-        let mut enc_on = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc_on.entropy_mode = EntropyMode::Cabac;
-        enc_on.enable_transform_8x8 = false;
-        enc_on.enable_mvd_stego_hook = true;
-        enc_on.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let _ = enc_on.encode_i_frame(&frame0).expect("I");
-        let _ = enc_on.encode_p_frame(&frame1).expect("P");
-        let mut hook_on = enc_on.take_stego_hook().expect("hook");
-        let cover_on = hook_on.take_cover_if_logger().expect("logger");
-
-        // With flag OFF (default).
-        let mut enc_off = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc_off.entropy_mode = EntropyMode::Cabac;
-        enc_off.enable_transform_8x8 = false;
-        // (enable_mvd_stego_hook stays false)
-        enc_off.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let _ = enc_off.encode_i_frame(&frame0).expect("I");
-        let _ = enc_off.encode_p_frame(&frame1).expect("P");
-        let mut hook_off = enc_off.take_stego_hook().expect("hook");
-        let cover_off = hook_off.take_cover_if_logger().expect("logger");
-
-        // Flag-OFF: zero MVD positions (existing behavior).
-        assert_eq!(cover_off.cover.mvd_sign_bypass.len(), 0,
-            "flag OFF: encoder must not log MVD sign positions");
-        assert_eq!(cover_off.cover.mvd_suffix_lsb.len(), 0);
-
-        // Flag-ON: at least one MVD slot fired (encoder picks at
-        // least one P_L0_16x16 partition with non-zero MVD).
-        // Counting both axes: total slot-pair count ≥ 1 for any
-        // P_L0_16x16 with non-zero motion.
-        // NOTE: position_logger only records bins for non-zero
-        // MVDs (sign bin emitted only when value != 0). On uniform-
-        // ish YUV with mild texture variation the MVDs land near 0
-        // so we may legitimately get 0 sign positions. The looser
-        // assertion: the residual coverage shouldn't change with
-        // the flag (no encoded-bytes-level drift).
-        let _ = cover_on; // use the var; positions may or may not fire
-    }
-
-    /// **§30D-B parity gate**: encoder `enable_mvd_stego_hook=true`
-    /// + decoder `WalkOptions { record_mvd: true, record_offsets: false }` → byte-identical
-    /// cover across MVD domains. Encoder side fires MVD hook for
-    /// P_L0_16x16 partitions (§30D-A scope); decoder records the
-    /// matching MvdSlot via PositionRecorder. Parity-by-
-    /// construction since both sides call `enumerate_mvd_*` /
-    /// `extract_mvd_*` on identical MvdSlots.
-    #[test]
-    fn s30d_b_parity_walker_records_mvd_when_flag_on() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        // Slowly-varying YUV: bias toward P_L0_16x16. With both
-        // sides off (flag=false), MVD covers stay empty — the
-        // pre-§30D-A behavior. With both flags on, MVD covers
-        // populate symmetrically.
-        let frame_size = 16 * 16 * 3 / 2;
-        let mut frame0 = vec![0u8; frame_size];
-        let mut frame1 = vec![0u8; frame_size];
-        let mut s: u32 = 0xC0FF_EE42;
-        for i in 0..frame_size {
-            s = s.wrapping_mul(1103515245).wrapping_add(12345);
-            frame0[i] = (128 + ((s >> 24) & 0x07) as u8) as u8;
-            frame1[i] = (128 + ((s >> 22) & 0x07) as u8) as u8;
-        }
-
-        // Encoder: flag ON.
-        let mut enc = Encoder::new(16, 16, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&frame0).expect("I"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&frame1).expect("P"));
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let encoder_gop = hook.take_cover_if_logger().expect("logger");
-
-        // Decoder: WalkOptions.record_mvd=true.
-        let opts = WalkOptions { record_mvd: true, record_offsets: false };
-        let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
-            .expect("walk");
-
-        // Per-domain byte-identity across all 4 domains.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions,
-            encoder_gop.cover.coeff_sign_bypass.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.bits,
-            encoder_gop.cover.coeff_sign_bypass.bits,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.positions,
-            encoder_gop.cover.coeff_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.bits,
-            encoder_gop.cover.coeff_suffix_lsb.bits,
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.positions,
-            encoder_gop.cover.mvd_sign_bypass.positions,
-            "§30D-B: mvd_sign_bypass positions must match"
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.bits,
-            encoder_gop.cover.mvd_sign_bypass.bits,
-            "§30D-B: mvd_sign_bypass bits must match"
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.positions,
-            encoder_gop.cover.mvd_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.bits,
-            encoder_gop.cover.mvd_suffix_lsb.bits,
-        );
-    }
-
-    /// **§30D-B stress**: high-entropy random YUV across 32×32 ×
-    /// 2 frames. Encoder picks varied P-partition modes; on
-    /// P_L0_16x16 picks the §30D-A hook fires + decoder records.
-    /// Parity assertion across all 4 domains. P_16x8 / P_8x16 /
-    /// P_8x8 don't fire MVD hook in §30D-A scope so those MBs
-    /// contribute zero MVD positions on both sides — still
-    /// byte-identical.
-    #[test]
-    fn s30d_b_parity_high_entropy_yuv_32x32() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        let frame_size = 32 * 32 * 3 / 2;
-        let mut frame0 = Vec::with_capacity(frame_size);
-        let mut frame1 = Vec::with_capacity(frame_size);
-        let mut s: u32 = 0xABCD_1234;
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            frame0.push((s >> 16) as u8);
-        }
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            frame1.push((s >> 16) as u8);
-        }
-
-        let mut enc = Encoder::new(32, 32, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&enc.encode_i_frame(&frame0).expect("I"));
-        bytes.extend_from_slice(&enc.encode_p_frame(&frame1).expect("P"));
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let encoder_gop = hook.take_cover_if_logger().expect("logger");
-
-        let opts = WalkOptions { record_mvd: true, record_offsets: false };
-        let walk = walk_annex_b_for_cover_with_options(&bytes, opts)
-            .expect("walk");
-
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.positions,
-            encoder_gop.cover.mvd_sign_bypass.positions,
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.bits,
-            encoder_gop.cover.mvd_sign_bypass.bits,
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.positions,
-            encoder_gop.cover.mvd_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.bits,
-            encoder_gop.cover.mvd_suffix_lsb.bits,
-        );
-        // Coeff domains too — confirm no regression from threading
-        // opts through the call chain.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions,
-            encoder_gop.cover.coeff_sign_bypass.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.bits,
-            encoder_gop.cover.coeff_suffix_lsb.bits,
-        );
-    }
-
-    /// **Phase 6F.2(f/g) diagnostic** — Pass 3 round-trip parity on
-    /// real-world content. The full 4-domain pipeline (Pass 1 → 2A
-    /// → 1B → 2B → 3) emits stego bytes; walker reads them back.
-    ///
-    /// Status: PASSES post-§6F.2(g) MVD-disable. Round trip recovers
-    /// the original message on real-iPhone YUV.
-    ///
-    /// **2026-05-05 race fix**: this test reads PHASM_B_RDO /
-    /// PHASM_B_RESIDUAL / PHASM_B_FORCE_MODE / PHASM_B_FORCE_MV
-    /// indirectly through the multigop pipeline. Setter tests in
-    /// encoder.rs hold `B_FORCE_MODE_ENV_LOCK` while their env vars
-    /// are set. This test now ALSO takes the lock so a concurrent
-    /// setter cannot pollute its mid-encode env reads (previously
-    /// caused intermittent FrameCorrupted under cargo test -p
-    /// phasm-core --lib with default parallelism).
-    #[test]
-    fn pass3_roundtrip_real_world_64x48_5f_diagnostic() {
-        use crate::codec::h264::encoder::mb_decision_b::B_FORCE_MODE_ENV_LOCK;
-        use crate::codec::h264::stego::encode_pixels::h264_stego_encode_yuv_string_4domain_multigop;
-
-        let _lock = B_FORCE_MODE_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("Skipping: {yuv_path} missing (run from core/)");
-                return;
-            }
-        };
-
-        let pass = "test-pass-pass3";
-        let msg = "h"; // single byte — well within capacity
-
-        // Run the full 4-domain pipeline. Capture stego bytes.
-        let stego_bytes = h264_stego_encode_yuv_string_4domain_multigop(
-            &yuv, 64, 48, /* n_frames */ 5, /* gop_size */ 5, msg, pass,
-        ).expect("4-domain encode");
-
-        // Walk the stego bytes (with MVD recording on, mirroring the
-        // production decoder).
-        let walk = walk_annex_b_for_cover_with_options(
-            &stego_bytes, WalkOptions { record_mvd: true, record_offsets: false },
-        ).expect("walk Pass 3");
-
-        // For diagnostic — print per-domain lengths. If the pipeline
-        // is fundamentally OK these should match what Pass 1 produced
-        // (since stego bytes are spec-valid Annex B and the walker is
-        // deterministic). The test then attempts to reverse the STC
-        // plan via the production decode path.
-        eprintln!("Pass 3 walker cover lengths:");
-        eprintln!("  coeff_sign={} coeff_suffix={} mvd_sign={} mvd_suffix={}",
-            walk.cover.coeff_sign_bypass.len(),
-            walk.cover.coeff_suffix_lsb.len(),
-            walk.cover.mvd_sign_bypass.len(),
-            walk.cover.mvd_suffix_lsb.len(),
-        );
-
-        // Cross-check via the production decoder. This is what the
-        // round-trip test sees as FrameCorrupted.
-        use crate::codec::h264::stego::decode_pixels::h264_stego_decode_yuv_string_4domain;
-        match h264_stego_decode_yuv_string_4domain(&stego_bytes, pass) {
-            Ok(s) => {
-                eprintln!("decode succeeded: {s:?}");
-                assert_eq!(s, msg, "round trip recovered wrong message");
-            }
-            Err(e) => {
-                eprintln!("decode failed: {e:?}");
-                panic!("decode error: {e:?}");
-            }
-        }
-    }
-
-    /// **Phase 6F.2 audit diagnostic** — encoder ↔ walker per-domain
-    /// parity on real-world iPhone YUV. Zero stego orchestration:
-    /// just encoder + PositionLoggerHook + bin walker. If parity
-    /// holds, the FrameCorrupted bug surfaced by the high-level
-    /// `h264_stego_encode_yuv_string_4domain_multigop` round-trip
-    /// lives in the STC orchestration / brute-force m_total search.
-    /// If parity fails, the bug is at the encoder/walker level and
-    /// the failing assertion below pinpoints which domain diverges.
-    ///
-    /// **Status (2026-04-28):** Full byte-identity parity achieved
-    /// after §6F.2(c) MVD rollback + §6F.2(e) stego_frame_idx
-    /// per-frame increment + mv_grid snapshot/restore around the
-    /// hook (predictor symmetry between hook-time and emit-time).
-    /// Test is ACTIVE; regression here = re-opened Task #52.
-    #[test]
-    fn parity_real_world_64x48_5f_diagnostic() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("Skipping: {yuv_path} missing (run from core/)");
-                return;
-            }
-        };
-        let frame_size = 64 * 48 * 3 / 2;
-        assert_eq!(yuv.len(), frame_size * 5, "fixture size mismatch");
-
-        let mut enc = Encoder::new(64, 48, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(
-            &enc.encode_i_frame(&yuv[0..frame_size]).expect("I")
-        );
-        for fi in 1..5 {
-            bytes.extend_from_slice(
-                &enc.encode_p_frame(&yuv[fi * frame_size..(fi + 1) * frame_size])
-                    .expect("P")
-            );
-        }
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let enc_gop = hook.take_cover_if_logger().expect("logger");
-
-        let walk = walk_annex_b_for_cover_with_options(
-            &bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
-        )
-        .expect("walk");
-
-        // Length-first assertions: divergence here means a domain has
-        // a different number of stego positions on each side.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions.len(),
-            enc_gop.cover.coeff_sign_bypass.positions.len(),
-            "coeff_sign_bypass length divergence"
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.positions.len(),
-            enc_gop.cover.coeff_suffix_lsb.positions.len(),
-            "coeff_suffix_lsb length divergence"
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.positions.len(),
-            enc_gop.cover.mvd_sign_bypass.positions.len(),
-            "mvd_sign_bypass length divergence"
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.positions.len(),
-            enc_gop.cover.mvd_suffix_lsb.positions.len(),
-            "mvd_suffix_lsb length divergence"
-        );
-
-        // Content assertions (only reached if all lengths match).
-        // Check bits BEFORE positions — bits matter for round-trip
-        // STC reverse correctness; positions are only load-bearing
-        // for shadow / cost-pool selection. A bits-match-positions-
-        // differ case means the round trip works but shadow stego
-        // would misallocate.
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.bits,
-            enc_gop.cover.coeff_sign_bypass.bits,
-            "coeff_sign_bypass BIT-content divergence (round-trip-breaking)"
-        );
-        assert_eq!(
-            walk.cover.coeff_sign_bypass.positions,
-            enc_gop.cover.coeff_sign_bypass.positions,
-            "coeff_sign_bypass POSITION-key divergence (shadow-affecting only)"
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.positions,
-            enc_gop.cover.coeff_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.coeff_suffix_lsb.bits,
-            enc_gop.cover.coeff_suffix_lsb.bits,
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.positions,
-            enc_gop.cover.mvd_sign_bypass.positions,
-        );
-        assert_eq!(
-            walk.cover.mvd_sign_bypass.bits,
-            enc_gop.cover.mvd_sign_bypass.bits,
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.positions,
-            enc_gop.cover.mvd_suffix_lsb.positions,
-        );
-        assert_eq!(
-            walk.cover.mvd_suffix_lsb.bits,
-            enc_gop.cover.mvd_suffix_lsb.bits,
-        );
-    }
-
-    /// **Phase 6F.2(j).2 measurement** — run criterion-C greedy on
-    /// real-world content to see actual capacity gain.
-    #[test]
-    fn measure_criterion_c_safe_count_real_world_64x48() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-        use crate::codec::h264::stego::cascade_safety::analyze_safe_mvd_subset;
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let frame_size = 64 * 48 * 3 / 2;
-
-        let mut enc = Encoder::new(64, 48, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let _ = enc.encode_i_frame(&yuv[0..frame_size]).expect("I");
-        for fi in 1..5 {
-            let _ = enc.encode_p_frame(&yuv[fi * frame_size..(fi + 1) * frame_size])
-                .expect("P");
-        }
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let meta = hook.take_mvd_meta_if_logger();
-
-        let safe = analyze_safe_mvd_subset(&meta, 4, 3);
-        let n = meta.len();
-        let safe_count = safe.iter().filter(|&&b| b).count();
-        eprintln!("CRITERION C on img4138_64x48_f5.yuv:");
-        eprintln!("  total mvd positions: {n}");
-        eprintln!("  safe count         : {safe_count} ({:.1}%)",
-            100.0 * safe_count as f64 / n.max(1) as f64);
-    }
-
-    /// **Phase 6F.2(j).3 parity gate** — encoder runs cascade-safety
-    /// analysis on its `mvd_meta`; walker runs the same analysis on
-    /// its post-walk `mvd_meta`. They must produce IDENTICAL safe-set
-    /// bitvectors. This is the load-bearing correctness guarantee:
-    /// because `analyze_safe_mvd_subset` is a pure function and
-    /// `enc_meta == walk.mvd_meta` (§6F.2(j).1 parity), the safe sets
-    /// agree by construction. This test asserts the chain on
-    /// real-world content.
-    #[test]
-    fn safe_set_parity_real_world_64x48() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-        use crate::codec::h264::stego::cascade_safety::analyze_safe_mvd_subset;
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let frame_size = 64 * 48 * 3 / 2;
-
-        let mut enc = Encoder::new(64, 48, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(
-            &enc.encode_i_frame(&yuv[0..frame_size]).expect("I")
-        );
-        for fi in 1..5 {
-            bytes.extend_from_slice(
-                &enc.encode_p_frame(&yuv[fi * frame_size..(fi + 1) * frame_size])
-                    .expect("P")
-            );
-        }
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let enc_meta = hook.take_mvd_meta_if_logger();
-
-        let walk = walk_annex_b_for_cover_with_options(
-            &bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
-        )
-        .expect("walk");
-
-        let enc_safe = analyze_safe_mvd_subset(&enc_meta, 4, 3);
-        let walk_safe = analyze_safe_mvd_subset(&walk.mvd_meta, 4, 3);
-
-        assert_eq!(
-            enc_safe.len(),
-            walk_safe.len(),
-            "safe-set vector lengths differ"
-        );
-        for (i, (e, w)) in enc_safe.iter().zip(walk_safe.iter()).enumerate() {
-            assert_eq!(*e, *w,
-                "safe-set bit divergence at idx {i}: enc={e} walker={w}");
-        }
-        let safe_count = enc_safe.iter().filter(|&&b| b).count();
-        eprintln!("Safe-set parity: {} entries match; {safe_count} flagged safe",
-            enc_safe.len());
-    }
-
-    /// **Phase 6F.2(j).1 parity gate** — encoder's PositionLoggerHook
-    /// captures `MvdPositionMeta` (magnitude + mb_addr + frame_idx +
-    /// partition + axis); walker's PositionRecorder captures the
-    /// same structure from decoded MVDs. This test asserts that on
-    /// real-world content, encoder.mvd_meta == walker.mvd_meta
-    /// element-by-element. If parity holds here, the cascade-safety
-    /// analysis in §6F.2(j).2 produces identical safe sets on both
-    /// sides by definition.
-    #[test]
-    fn mvd_meta_parity_real_world_64x48() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("Skipping: {yuv_path} missing (run from core/)");
-                return;
-            }
-        };
-        let frame_size = 64 * 48 * 3 / 2;
-
-        let mut enc = Encoder::new(64, 48, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::new(PositionLoggerHook::new())));
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(
-            &enc.encode_i_frame(&yuv[0..frame_size]).expect("I")
-        );
-        for fi in 1..5 {
-            bytes.extend_from_slice(
-                &enc.encode_p_frame(&yuv[fi * frame_size..(fi + 1) * frame_size])
-                    .expect("P")
-            );
-        }
-        let mut hook = enc.take_stego_hook().expect("hook");
-        let enc_meta = hook.take_mvd_meta_if_logger();
-
-        let walk = walk_annex_b_for_cover_with_options(
-            &bytes,
-            WalkOptions { record_mvd: true, record_offsets: false },
-        )
-        .expect("walk");
-
-        assert_eq!(
-            enc_meta.len(),
-            walk.mvd_meta.len(),
-            "encoder mvd_meta count != walker mvd_meta count"
-        );
-        for (i, (e, w)) in enc_meta.iter().zip(walk.mvd_meta.iter()).enumerate() {
-            assert_eq!(e.frame_idx, w.frame_idx, "mismatch frame_idx at idx {i}");
-            assert_eq!(e.mb_addr, w.mb_addr, "mismatch mb_addr at idx {i}");
-            assert_eq!(e.partition, w.partition, "mismatch partition at idx {i}");
-            assert_eq!(e.axis, w.axis, "mismatch axis at idx {i}");
-            assert_eq!(e.magnitude, w.magnitude,
-                "mismatch magnitude at idx {i}: enc={} walker={}",
-                e.magnitude, w.magnitude);
-        }
-        eprintln!("MVD-meta parity: {} entries match byte-identical", enc_meta.len());
-    }
-
-    /// **Phase 6F.2(i) prototype** — measure the cascade-safe MVD
-    /// position count on real iPhone YUV under three criteria, to
-    /// decide whether forward-modeled non-cascading injection is
-    /// worth productionizing.
-    ///
-    /// Each criterion is computed from cover_p1 only (no encode
-    /// re-run, no chicken-and-egg), using the structural property
-    /// that sign flips preserve magnitudes.
-    ///
-    /// **Criterion A (sink positions)**: P at MB(mb_x_P, mb_y_P)
-    /// is "sink-safe" iff no MB with mb_addr > P.mb_addr can have
-    /// any predictor cell falling in P's MB region. Coarse upper
-    /// bound: only MBs at the bottom-right corner qualify.
-    ///
-    /// **Criterion B (loose-flip-safe)**: P is "loose-safe" iff for
-    /// every position Q with mb_addr_Q > mb_addr_P, EITHER P's MB
-    /// doesn't propagate to Q's MB (= sink-safe at MB level) OR
-    /// |2·m_P| < |m_Q|. This permits flips at non-sink positions
-    /// when the flip's predictor delta can't shift any downstream
-    /// MVD across zero.
-    ///
-    /// **Criterion C (mutually-independent greedy)**: process P in
-    /// raster order, accept P iff (a) no previously-accepted P''s
-    /// region affects P's predictor cell AND (b) for all Q later in
-    /// raster (whether accepted or not), P's flip cascade respects
-    /// |2·m_P| < |m_Q| OR Q's MB is downstream-safe vs P. This is
-    /// the chicken-and-egg-free criterion: by construction, the
-    /// safe set computed pre-encode equals the safe set the decoder
-    /// computes from walker output.
-    ///
-    /// Output is print-only — no assertion. The criterion-C count is
-    /// the number that matters for productionization. If criterion-C
-    /// >= 50% of cover_p1.mvd, productionize the safe-subset
-    /// injection scheme. If <20%, residual-only is the right call.
-    #[test]
-    #[ignore = "Phase 6F.2(i) measurement prototype — informs future MVD re-enablement decision; print-only, run manually with --include-ignored --nocapture."]
-    fn measure_safe_mvd_subset_real_world_64x48() {
-        use crate::codec::h264::encoder::encoder::{Encoder, EntropyMode};
-        use crate::codec::h264::stego::encoder_hook::{
-            PositionLoggerHook, StegoMbHook,
-        };
-        use crate::codec::h264::stego::inject::MvdSlot;
-        use crate::codec::h264::stego::Axis;
-        use crate::codec::h264::stego::hook::PositionKey;
-
-        let yuv_path = "test-vectors/video/h264/real-world/img4138_64x48_f5.yuv";
-        let yuv = match std::fs::read(yuv_path) {
-            Ok(b) => b,
-            Err(_) => {
-                eprintln!("Skipping: {yuv_path} missing (run from core/)");
-                return;
-            }
-        };
-        let frame_size = 64 * 48 * 3 / 2;
-
-        // Custom hook: PositionLogger semantics + magnitude capture.
-        // Pure measurement — no production-path side effects.
-        #[derive(Debug, Default)]
-        struct MagLogger {
-            inner: PositionLoggerHook,
-            // (PositionKey, sign_bit, magnitude_abs, mb_addr,
-            //  partition, axis, frame_idx)
-            mvd: Vec<(PositionKey, u8, u32, u32, u8, u8, u32)>,
-        }
-        impl StegoMbHook for MagLogger {
-            fn on_residual_block(
-                &mut self, fi: u32, mba: u32,
-                sc: &mut [i32], si: usize, ei: usize,
-                pk: crate::codec::h264::stego::orchestrate::ResidualPathKind,
-            ) {
-                self.inner.on_residual_block(fi, mba, sc, si, ei, pk);
-            }
-            fn on_mvd_slot(&mut self, fi: u32, mba: u32, slot: &mut MvdSlot) {
-                if slot.value != 0 {
-                    use crate::codec::h264::stego::inject::enumerate_mvd_sign_positions;
-                    let single = [*slot];
-                    let positions = enumerate_mvd_sign_positions(&single, fi, mba);
-                    if let Some(pos) = positions.first() {
-                        let bit = if slot.value < 0 { 1u8 } else { 0u8 };
-                        let mag = slot.value.unsigned_abs();
-                        let axis = match slot.axis { Axis::X => 0u8, Axis::Y => 1u8 };
-                        self.mvd.push((*pos, bit, mag, mba, slot.partition, axis, fi));
-                    }
-                }
-                self.inner.on_mvd_slot(fi, mba, slot);
-            }
-            fn begin_mvd_for_mb(&mut self) { self.inner.begin_mvd_for_mb(); }
-            fn commit_mvd_for_mb(&mut self) { self.inner.commit_mvd_for_mb(); }
-            fn rollback_mvd_for_mb(&mut self) { self.inner.rollback_mvd_for_mb(); }
-            fn take_cover_if_logger(&mut self)
-                -> Option<crate::codec::h264::stego::orchestrate::GopCover>
-            { Some(self.inner.take_cover()) }
-        }
-
-        let mut enc = Encoder::new(64, 48, Some(26)).expect("encoder");
-        enc.entropy_mode = EntropyMode::Cabac;
-        enc.enable_transform_8x8 = false;
-        enc.enable_mvd_stego_hook = true;
-        enc.set_stego_hook(Some(Box::<MagLogger>::default()));
-        let _ = enc.encode_i_frame(&yuv[0..frame_size]).expect("I");
-        for fi in 1..5 {
-            let _ = enc.encode_p_frame(&yuv[fi * frame_size..(fi + 1) * frame_size])
-                .expect("P");
-        }
-        let mut hook = enc.take_stego_hook().expect("hook");
-        // Downcast unsafe; do it the explicit way: re-construct from take_cover_if_logger
-        // and the capture vec via a separate path. Simpler: don't downcast — instead
-        // invoke through trait by capturing a Box<MagLogger> directly. Since the
-        // encoder owns Box<dyn StegoMbHook>, we need downcast.
-        let mvd_data: Vec<(PositionKey, u8, u32, u32, u8, u8, u32)> = {
-            // Use Any-style downcast via raw pointer — this is a test, controlled.
-            // A cleaner alternative would be to add a take_mvd_data method to the trait,
-            // but that pollutes the production trait for a measurement-only prototype.
-            let raw = Box::into_raw(hook);
-            let mag_logger: Box<MagLogger> = unsafe { Box::from_raw(raw as *mut MagLogger) };
-            mag_logger.mvd
-        };
-
-        // Frame dimensions in MBs.
-        const MB_W: u32 = 64 / 16; // 4
-        const MB_H: u32 = 48 / 16; // 3
-        const MB_TOTAL: u32 = MB_W * MB_H; // 12 per frame
-
-        // Per-frame analysis (MBs in different frames don't share
-        // mv_grid — each frame has its own grid).
-        let mut frame_groups: std::collections::BTreeMap<u32, Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for (i, t) in mvd_data.iter().enumerate() {
-            frame_groups.entry(t.6).or_default().push(i);
-        }
-
-        // Helper: does flipping a position at MB (mx, my) propagate to
-        // any MB with greater raster index in the same frame?
-        // Conservative MB-level model: MB flip propagates to right
-        // (mx+1, my), below (mx, my+1), bottom-right diag (mx+1, my+1)
-        // [for top-right predictors of the row below], and bottom-left
-        // (mx-1, my+1) [for top-right of an MB to its lower-left].
-        // An MB is "MB-sink" iff none of those neighbors exist (i.e.,
-        // last MB in raster).
-        let mb_propagates = |mx_p: u32, my_p: u32, mx_q: u32, my_q: u32| -> bool {
-            // Q must be later than P in raster.
-            if my_q < my_p { return false; }
-            if my_q == my_p && mx_q <= mx_p { return false; }
-            // Now Q is in same row to right OR a later row.
-            // Check the four propagation patterns.
-            (mx_q == mx_p + 1 && my_q == my_p) // right neighbor
-                || (mx_q == mx_p && my_q == my_p + 1) // below
-                || (my_q == my_p + 1 && (
-                    mx_q == mx_p
-                        || mx_q + 1 == mx_p // bottom-left
-                        || mx_q == mx_p + 1 // bottom-right
-                ))
-        };
-
-        let total = mvd_data.len();
-        let mut count_a_sink = 0usize;
-        let mut count_b_loose = 0usize;
-        let mut count_c_independent = 0usize;
-
-        // Process each frame independently.
-        for (_fi, idxs) in &frame_groups {
-            // Sort positions in raster order: by mb_addr ascending,
-            // then partition ascending, then axis ascending.
-            let mut sorted = idxs.clone();
-            sorted.sort_by_key(|&i| {
-                let t = &mvd_data[i];
-                (t.3, t.4, t.5)  // (mb_addr, partition, axis)
-            });
-
-            // For criterion C (mutually independent), track which MBs
-            // have already been "selected" (their flips applied).
-            let mut selected_mbs: Vec<(u32, u32, u32)> = Vec::new();
-            // (mb_x, mb_y, magnitude_max_2|m_P|)
-
-            for &i in &sorted {
-                let (_pk, _bit, mag_p, mba_p, _part, _axis, _fi_p) = mvd_data[i];
-                let mx_p = mba_p % MB_W;
-                let my_p = mba_p / MB_W;
-
-                // (A) sink-safe: no MB exists later in raster that
-                // P propagates to.
-                let is_sink = (mx_p == MB_W - 1) && (my_p == MB_H - 1);
-                if is_sink {
-                    count_a_sink += 1;
-                }
-
-                // (B) loose-safe: for every Q with mb_addr_Q >
-                // mb_addr_P, either P's MB doesn't propagate to Q's
-                // MB, or |2·m_P| < |m_Q|.
-                let two_m_p = 2 * mag_p;
-                let mut loose_safe = true;
-                for &j in &sorted {
-                    if j == i { continue; }
-                    let (_pkj, _bj, mag_q, mba_q, _, _, _) = mvd_data[j];
-                    if mba_q <= mba_p { continue; } // not strictly later
-                    let mx_q = mba_q % MB_W;
-                    let my_q = mba_q / MB_W;
-                    if mb_propagates(mx_p, my_p, mx_q, my_q) {
-                        if two_m_p >= mag_q {
-                            loose_safe = false;
-                            break;
-                        }
-                    }
-                }
-                if loose_safe {
-                    count_b_loose += 1;
-                }
-
-                // (C) mutually independent greedy:
-                // (a) no previously-selected MB in selected_mbs
-                //     propagates to P's MB.
-                // (b) AND P's flip cascade respects loose-safe.
-                let pred_safe = !selected_mbs.iter().any(|&(sx, sy, _)| {
-                    mb_propagates(sx, sy, mx_p, my_p)
-                });
-                if pred_safe && loose_safe {
-                    count_c_independent += 1;
-                    selected_mbs.push((mx_p, my_p, two_m_p));
-                }
-            }
-        }
-
-        eprintln!("CASCADE-SAFE PROTOTYPE on img4138_64x48_f5.yuv:");
-        eprintln!("  Total cover_p1.mvd_sign positions: {total}");
-        eprintln!("  (A) Sink-safe          : {count_a_sink} ({:.1}%)",
-            100.0 * count_a_sink as f64 / total.max(1) as f64);
-        eprintln!("  (B) Loose-flip-safe    : {count_b_loose} ({:.1}%)",
-            100.0 * count_b_loose as f64 / total.max(1) as f64);
-        eprintln!("  (C) Mutually-indep+safe: {count_c_independent} ({:.1}%)",
-            100.0 * count_c_independent as f64 / total.max(1) as f64);
-        eprintln!();
-        eprintln!("  Decision rule:");
-        eprintln!("   - C>=50% → productionize safe-subset injection.");
-        eprintln!("   - C 20-50% → tier-2 analysis (level-2 chains, etc.).");
-        eprintln!("   - C<20% → residual-only stays. Stealth tradeoff documented.");
-    }
-
     #[test]
     fn cabac_data_byte_offset_handles_aligned_and_unaligned() {
         assert_eq!(cabac_data_byte_offset(0), 0);
@@ -4019,114 +2642,5 @@ mod tests {
         assert_eq!(cabac_data_byte_offset(9), 2);
         assert_eq!(cabac_data_byte_offset(16), 2);
         assert_eq!(cabac_data_byte_offset(17), 3);
-    }
-
-    // ─── Phase 6E-C0 streaming-walker tests ──────────────────────
-
-    /// Helper: encode a small high-entropy YUV → Annex-B bytes for
-    /// a single IDR (one GOP).
-    fn encode_one_gop_annex_b(seed: u32) -> Vec<u8> {
-        use crate::codec::h264::stego::encode_pixels::h264_stego_encode_i_frames_only;
-        let frame_size = 32 * 32 * 3 / 2;
-        let mut yuv = Vec::with_capacity(frame_size);
-        let mut s: u32 = seed;
-        for _ in 0..frame_size {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            yuv.push((s >> 16) as u8);
-        }
-        h264_stego_encode_i_frames_only(
-            &yuv, 32, 32, 1, &[], "test", 4, Some(26),
-        ).expect("encode")
-    }
-
-    /// Single-IDR stream: streaming walker fires the callback exactly
-    /// once with `gop_idx = 0` and per-GOP counters that match the
-    /// wrapper's whole-stream output.
-    #[test]
-    fn streaming_walker_single_gop_fires_callback_once() {
-        let bytes = encode_one_gop_annex_b(0xCAFE_F00D);
-
-        let mut gop_count = 0;
-        let mut last_gop_idx = u32::MAX;
-        let mut gop_n_mb_seen = 0;
-        let mut gop_cover_total_len = 0;
-
-        let out = walk_annex_b_streaming(
-            &bytes, WalkOptions::default(), |gop_ctx| {
-                gop_count += 1;
-                last_gop_idx = gop_ctx.gop_idx;
-                gop_n_mb_seen += gop_ctx.n_mb;
-                gop_cover_total_len += gop_ctx.cover.total_len();
-                Ok(WalkAction::Continue)
-            },
-        ).expect("streaming walk");
-
-        assert_eq!(gop_count, 1, "expected one GOP callback");
-        assert_eq!(last_gop_idx, 0, "first GOP idx is 0");
-        assert_eq!(out.n_gops, 1);
-        assert_eq!(out.n_mb, gop_n_mb_seen);
-
-        // Cross-check: wrapper's whole-stream output matches the
-        // streaming primitive's accumulated-via-callback view.
-        let wrapper = walk_annex_b_for_cover(&bytes).expect("wrapper walk");
-        assert_eq!(wrapper.n_mb, out.n_mb);
-        assert_eq!(wrapper.n_slices, out.n_slices);
-        assert_eq!(wrapper.cover.total_len(), gop_cover_total_len);
-    }
-
-    /// Multi-IDR stream: concatenating two single-IDR encode outputs
-    /// produces a 2-GOP stream. The streaming walker must fire
-    /// callback exactly twice, with monotonic gop_idx { 0, 1 }.
-    /// Sum of per-GOP covers equals the wrapper's accumulated cover.
-    #[test]
-    fn streaming_walker_two_gops_fires_callback_twice_in_order() {
-        let g0 = encode_one_gop_annex_b(0xCAFE_F00D);
-        let g1 = encode_one_gop_annex_b(0xDEAD_BEEF);
-        let mut bytes = g0.clone();
-        bytes.extend_from_slice(&g1);
-
-        let mut gop_idxs: Vec<u32> = Vec::new();
-        let mut total_cover_total_len = 0;
-
-        let out = walk_annex_b_streaming(
-            &bytes, WalkOptions::default(), |gop_ctx| {
-                gop_idxs.push(gop_ctx.gop_idx);
-                total_cover_total_len += gop_ctx.cover.total_len();
-                Ok(WalkAction::Continue)
-            },
-        ).expect("streaming walk");
-
-        assert_eq!(out.n_gops, 2, "expected two GOPs");
-        assert_eq!(gop_idxs, vec![0, 1], "GOP indices monotonic from 0");
-
-        // Wrapper accumulates both GOPs into a single cover.
-        let wrapper = walk_annex_b_for_cover(&bytes).expect("wrapper walk");
-        assert_eq!(wrapper.cover.total_len(), total_cover_total_len);
-        assert_eq!(wrapper.n_slices, out.n_slices);
-        assert_eq!(wrapper.n_mb, out.n_mb);
-    }
-
-    /// Early-exit: returning `WalkAction::StopWalk` from the first
-    /// GOP callback terminates the walk immediately. The second
-    /// GOP must NOT be visited; the streaming output reports
-    /// `n_gops = 1` even though the input contains 2 GOPs.
-    #[test]
-    fn streaming_walker_stop_walk_terminates_early() {
-        let g0 = encode_one_gop_annex_b(0xCAFE_F00D);
-        let g1 = encode_one_gop_annex_b(0xDEAD_BEEF);
-        let mut bytes = g0.clone();
-        bytes.extend_from_slice(&g1);
-
-        let mut gop_count = 0;
-
-        let out = walk_annex_b_streaming(
-            &bytes, WalkOptions::default(), |_gop_ctx| {
-                gop_count += 1;
-                Ok(WalkAction::StopWalk)
-            },
-        ).expect("streaming walk");
-
-        assert_eq!(gop_count, 1, "callback fired exactly once before StopWalk");
-        assert_eq!(out.n_gops, 1, "streaming output reports only 1 GOP");
     }
 }

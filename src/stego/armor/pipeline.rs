@@ -20,7 +20,7 @@
 use crate::codec::jpeg::JpegImage;
 use crate::codec::jpeg::dct::DctGrid;
 use crate::codec::jpeg::pixels;
-// T3.1.F — armor's pre-clamp + QF-settle pixel-domain round-trips run
+// Armor's pre-clamp + QF-settle pixel-domain round-trips run
 // through the integer LL&M path (NEON / AVX2 / WASM SIMD / scalar,
 // all bit-exact). See `docs/design/image/t3.1-integer-aan.md`.
 use crate::codec::jpeg::pixels_aan::{
@@ -1125,7 +1125,7 @@ fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
     Ok(())
 }
 
-/// T1.3 — verify the trailing CRC32 on a candidate decoded frame.
+/// Verify the trailing CRC32 on a candidate decoded frame.
 /// `data` is the RS-decoded bytes; `total_len` is the expected total
 /// frame size (header + salt + nonce + ciphertext + 4-byte CRC).
 /// Returns true iff `crc32fast::hash(data[..total_len-4])` matches
@@ -1137,7 +1137,7 @@ fn pre_clamp_y_channel(img: &mut JpegImage) -> Result<(), StegoError> {
 /// pass-CRC-fail data_len candidate (which would otherwise cause the
 /// inner function to return a false-positive frame that the outer
 /// caller would just CRC-reject via `frame::parse_frame`, abandoning
-/// the entire (parity, r, delta) sweep). Mirrors the T1.2
+/// the entire (parity, r, delta) sweep). Mirrors the
 /// `peek_shadow_fdl` gate pattern.
 fn frame_crc_ok(data: &[u8], total_len: usize) -> bool {
     if total_len < 4 || data.len() < total_len {
@@ -1199,7 +1199,7 @@ pub(super) fn try_rs_decode_frame_with_parity(
                 }
 
                 if total_frame_len == data_len {
-                    // T1.3 — CRC gate before returning. plausibility
+                    // CRC gate before returning. plausibility
                     // passed but the random-bytes case can still slip
                     // through; CRC pins it to the true encoder output.
                     if !frame_crc_ok(&first_block_data, total_frame_len) {
@@ -1292,7 +1292,7 @@ pub(super) fn try_rs_decode_compact_frame_with_parity(
                 }
 
                 if total_frame_len == data_len {
-                    // T1.3 — CRC gate before returning.
+                    // CRC gate before returning.
                     if !frame_crc_ok(&first_block_data, total_frame_len) {
                         continue;
                     }

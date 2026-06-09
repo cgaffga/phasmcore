@@ -9,4 +9,5 @@
 #![allow(dead_code)] // not every test file uses every helper
 
 pub mod h264_oracle;
+pub mod oh264_stream;
 pub mod ship_gate;

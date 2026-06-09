@@ -13,7 +13,7 @@
 //!
 //! Usage:
 //!   cargo run --example openh264_clean_encode --release \
-//!       --features openh264-backend -- \
+//!       --features h264-encoder -- \
 //!       <input.yuv> <output.h264> <width> <height> <n_frames> <qp> <gop_size>
 //!
 //! Input: I420 YUV, plane-packed, no header. Plane sizes derived from
@@ -21,7 +21,7 @@
 //! one frame produces a single slice (matches Phase A.5 validation
 //! harness).
 
-#[cfg(feature = "openh264-backend")]
+#[cfg(feature = "h264-encoder")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use phasm_core::codec::h264::openh264::Encoder;
     use std::fs::File;
@@ -97,8 +97,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(feature = "openh264-backend"))]
+#[cfg(not(feature = "h264-encoder"))]
 fn main() {
-    eprintln!("openh264_clean_encode requires --features openh264-backend");
+    eprintln!("openh264_clean_encode requires --features h264-encoder");
     std::process::exit(1);
 }

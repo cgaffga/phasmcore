@@ -4,57 +4,33 @@
 
 //! H.264/AVC bitstream parsing.
 //!
-//! Parses NAL units, parameter sets (SPS/PPS), slice headers, and CAVLC-coded
-//! macroblock residual data. Designed for steganography: tracks exact bit
-//! positions of embeddable trailing-one sign bits in the raw byte stream.
+//! Parses NAL units, parameter sets (SPS/PPS), and slice headers. The CABAC
+//! bin-walker ([`cabac`]) handles High-profile residual + MV decode for stego.
+//! The legacy CAVLC parser cluster (`cavlc` / `macroblock` / `mv` /
+//! `reconstruct` / `intra_pred` / `intra_pred_8x8` / `fingerprint`) was removed
+//! with the CAVLC bitstream-mod stego subsystem — see
+//! `docs/design/video/_RETIREMENT-PLAN.md` § "Phase 4".
 
 pub mod bitstream;
 pub mod tables;
 pub mod sps;
 pub mod slice;
-pub mod cavlc;
-#[cfg(feature = "h264-encoder")]
-pub mod cavlc_writer;
-#[cfg(feature = "h264-encoder")]
-pub mod cavlc_size;
-pub mod macroblock;
 pub mod transform;
-pub mod intra_pred;
-pub mod intra_pred_8x8;
-pub mod reconstruct;
-pub mod mv;
-pub mod fingerprint;
+pub mod b_partition_meta;
 
-// Phase 6 — pure-Rust H.264 encoder + its dedicated CABAC entropy coder.
-// Gated behind the `h264-encoder` Cargo feature (OFF by default) so the
-// GitHub-release CLI binary never accidentally bundles an encoder
-// subject to Via LA AVC patent obligations. Mobile bridges enable the
-// feature explicitly. See
-// `docs/design/video/h264/video-steganography.md` § Phase 6.
-#[cfg(feature = "h264-encoder")]
+// H.264 CABAC entropy coder: the bin-walker (decode) + shared tables.
+#[cfg(feature = "h264-decoder")]
 pub mod cabac;
-#[cfg(feature = "h264-encoder")]
-pub mod encoder;
-// Phase 6F.1 — encode-time stego primitives previously lived under
-// `encoder/stego`. The decoder's bin walker also consumes them
-// (`crate::codec::h264::stego::hook::PositionKey` etc.), and the
-// encoder struct embeds an `Option<Box<dyn StegoMbHook>>` field
-// for hook plumbing — so this module must compile whenever the
-// `h264-encoder` feature is on. The PUBLIC stego API in `lib.rs`
-// stays gated by `cabac-stego` (consumer-facing intent unchanged).
-//
-// Phase 6F.4 (cross-platform smoke 2026-04-30) — gate widened from
-// `cabac-stego` to `h264-encoder` after iOS/Android bridges
-// (`features = ["parallel", "video", "h264-encoder"]`) failed to
-// compile post-6F.1 because the bin_decoder + encoder.rs reference
-// `stego::*` types unconditionally.
-#[cfg(feature = "h264-encoder")]
+// Encode-time stego primitives. The decoder's bin walker also consumes
+// the shared position/hook types (`stego::hook::PositionKey` etc.), so
+// this module compiles whenever the decode feature is on.
+#[cfg(feature = "h264-decoder")]
 pub mod stego;
 
 /// High-level Rust API for the cgaffga/phasm-openh264 fork's stego
-/// hooks. Gated by the `openh264-backend` Cargo feature (Phase B);
-/// pulls in `core-openh264-sys` for the raw FFI bindings.
-#[cfg(feature = "openh264-backend")]
+/// hooks. Gated by the `h264-encoder` Cargo feature; pulls in
+/// `core-openh264-sys` for the raw FFI bindings.
+#[cfg(feature = "h264-encoder")]
 pub mod openh264;
 
 /// Per-MB decision cache for the Pass-2 replay architecture (#533).
@@ -62,31 +38,33 @@ pub mod openh264;
 /// `capture_mb_decision` closure; Pass-2 fetches them via
 /// `replay_mb_decision`. Scope is per-GOP — caller drops the cache
 /// at GOP boundaries to keep memory bounded on long clips.
-#[cfg(feature = "openh264-backend")]
+#[cfg(feature = "h264-encoder")]
 pub mod pass2_cache;
 
-/// Phase C.8.13 — production stego orchestrator on top of the OpenH264
-/// backend. Single-domain (CoeffSign) STC encode + brute-force decode
-/// over walker-aligned cover, with passphrase-derived seeds. Relies on
-/// the C.8.3-11 dual-recon cascade-break to keep mode-decision stable
-/// across baseline ↔ stego encodes.
-#[cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+/// Production stego ENCODE orchestrator on top of the OpenH264 backend.
+/// The live primitive is the 2-pass `h264_encode_gop_framed_bits_auto
+/// [_with_tier]`: a single combined-cover STC over all four bypass-bin
+/// domains (CS → CSL → MVDs → MVDsl), with passphrase-derived seeds. OH264
+/// reaches the wire via `wire_only` scratch-table overrides at CABAC emit,
+/// so the encoder reconstruction stays clean by construction (this is what
+/// keeps mode-decision stable across baseline ↔ stego encodes). DECODE is
+/// not here — it lives in `streaming_session::StreamingDecodeSession`.
+#[cfg(feature = "h264-encoder")]
 pub mod openh264_stego;
 
-/// D.0.7 — streaming H.264 stego session API. Engine-agnostic surface
-/// that mobile bridges expose via FFI; internally dispatches to the
-/// OH264 backend or the pure-Rust encoder based on `EncodeEngineChoice`.
-/// Per-GOP STC, bounded memory, arbitrary clip length. Design memo
-/// at `docs/design/video/h264/d07-streaming-sessions.md`.
-#[cfg(feature = "h264-encoder")]
+/// Streaming H.264 stego session API: the OH264 encode session
+/// (mobile/CLI FFI) + the engine-agnostic streaming DECODE session.
+/// Per-GOP STC, bounded memory, arbitrary clip length. Design memo at
+/// `docs/design/video/h264/d07-streaming-sessions.md`.
+#[cfg(feature = "h264-decoder")]
 pub mod streaming_session;
 
-/// #474 — engine-agnostic encode + decode progress event vocabulary.
+/// Engine-agnostic encode + decode progress event vocabulary.
 /// Optional callback on the streaming session params; mobile bridges
 /// marshal events across FFI into per-platform smoothing engines that
 /// drive the HUD progress bar + ETA text. Design memo at
 /// `docs/design/video/h264/progress-indicator.md`.
-#[cfg(feature = "h264-encoder")]
+#[cfg(feature = "h264-decoder")]
 pub mod progress;
 
 use std::fmt;

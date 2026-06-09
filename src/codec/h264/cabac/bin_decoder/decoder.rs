@@ -4,10 +4,9 @@
 //
 // Top-level CABAC bin-level decoder: engine + contexts + neighbors.
 //
-// Mirrors `cabac::CabacEncoder` — same 1024-context table, same
-// neighbor row buffer, opposite arithmetic direction. The per-syntax
-// decoders in [`super::syntax`] operate on this struct, mirroring
-// `cabac::encoder` fn-for-fn.
+// Decode direction only: a full 1024-context table, a neighbor row
+// buffer, and the spec arithmetic decode engine. The per-syntax
+// decoders in [`super::syntax`] operate on this struct.
 
 use crate::codec::h264::cabac::context::{initialize_contexts, CabacContext, CabacInitSlot};
 use crate::codec::h264::cabac::neighbor::CabacNeighborContext;
@@ -20,7 +19,7 @@ use super::engine::{CabacDecodeEngine, DecodeError};
 ///
 /// Constructed at slice start with `new_slice`. Each per-syntax-element
 /// decoder in [`super::syntax`] takes a `&mut CabacDecoder` and
-/// returns the decoded value (mirror of encoder pattern).
+/// returns the decoded value.
 pub struct CabacDecoder<'a> {
     pub engine: CabacDecodeEngine<'a>,
     pub contexts: Box<[CabacContext; 1024]>,
@@ -44,8 +43,7 @@ impl<'a> CabacDecoder<'a> {
         Ok(Self { engine, contexts, neighbors })
     }
 
-    /// Decode one regular bin at the given `ctx_idx`. Mirrors the
-    /// encoder's `encode_dec`.
+    /// Decode one regular bin at the given `ctx_idx`.
     #[inline]
     pub(crate) fn decode_dec(&mut self, ctx_idx: u32) -> Result<u8, DecodeError> {
         let ctx = &mut self.contexts[ctx_idx as usize];
@@ -66,63 +64,18 @@ impl<'a> CabacDecoder<'a> {
         self.engine.decode_terminate()
     }
 
-    /// Bin count diagnostic (mirror of encoder's `bin_count`).
+    /// Bin count diagnostic.
     #[inline]
     pub fn bin_count(&self) -> u32 {
         self.engine.bin_count()
     }
 
     /// RBSP bit offset of the next raw bit. See
-    /// [`CabacDecodeEngine::next_rbsp_bit_offset`]. Phase C.3.6.1
-    /// (task #428) — used by Option C bitstream-mod stego to capture
-    /// the position of each bypass-coded stego bin.
+    /// [`CabacDecodeEngine::next_rbsp_bit_offset`]. Used by the
+    /// bitstream-mod stego path to capture the position of each
+    /// bypass-coded stego bin.
     #[inline]
     pub fn next_rbsp_bit_offset(&self) -> u64 {
         self.engine.next_rbsp_bit_offset()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codec::h264::cabac::CabacEncoder;
-
-    #[test]
-    fn new_slice_initializes_1024_contexts() {
-        // Encode a minimal slice (terminate-only) to get bytes.
-        let mut enc = CabacEncoder::new_slice(CabacInitSlot::ISI, 26, 4);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-
-        let dec = CabacDecoder::new_slice(&bytes, CabacInitSlot::ISI, 26, 4)
-            .expect("init");
-        assert_eq!(dec.contexts.len(), 1024);
-        // ctxIdx 276 is always non-adapting (pStateIdx=63, valMPS=0).
-        assert_eq!(dec.contexts[276].p_state_idx(), 63);
-        assert_eq!(dec.contexts[276].val_mps(), 0);
-    }
-
-    #[test]
-    fn p_slice_initializes_with_correct_slot() {
-        // Capture encoder context table before finish() consumes enc.
-        let mut enc = CabacEncoder::new_slice(CabacInitSlot::PIdc1, 30, 8);
-        let enc_ctx_snapshot: Vec<(u8, u8)> = enc
-            .contexts
-            .iter()
-            .map(|c| (c.p_state_idx(), c.val_mps()))
-            .collect();
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let dec = CabacDecoder::new_slice(&bytes, CabacInitSlot::PIdc1, 30, 8)
-            .expect("init");
-        // The encoder + decoder must have agreed on the initial
-        // context table because they used the same slot+QP.
-        for i in 0..1024 {
-            assert_eq!(
-                (dec.contexts[i].p_state_idx(), dec.contexts[i].val_mps()),
-                enc_ctx_snapshot[i],
-                "ctxIdx {i} initial state mismatch",
-            );
-        }
     }
 }

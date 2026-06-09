@@ -23,11 +23,11 @@
 // source is missing, but FAILs if any present fixture round-trips wrong.
 // At least one fixture must be present.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_decode_yuv_string, openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use std::sync::{Mutex, OnceLock};
 
 static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -102,7 +102,7 @@ fn v04b_oh264_corpus_roundtrip_480p() {
     const W: u32 = 480;
     const H: u32 = 272;
     const N: u32 = 8;
-    let opts = EncodeOpts { qp: 22, intra_period: 60 };
+    const QP: i32 = 22;
 
     let mut tested = 0usize;
     let mut skipped = Vec::new();
@@ -118,10 +118,10 @@ fn v04b_oh264_corpus_roundtrip_480p() {
         let msg = format!("v04b corpus round-trip — {}", fx.tag);
         let pass = "v04b-corpus-pass";
 
-        match openh264_stego_encode_yuv_text(&yuv, W, H, N, opts, &msg, pass) {
+        match oh264_stream::encode(&yuv, W, H, N, QP, &msg, pass) {
             Err(e) => failures.push((fx.tag.to_string(), format!("encode: {e}"))),
             Ok(stego) => {
-                match openh264_stego_decode_yuv_string(&stego, pass) {
+                match oh264_stream::decode_text(&stego, pass) {
                     Err(e) => {
                         failures.push((fx.tag.to_string(), format!("decode: {e}")))
                     }

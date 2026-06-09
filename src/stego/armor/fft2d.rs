@@ -9,13 +9,13 @@
 //! - Bluestein's chirp-z transform for arbitrary sizes
 //! All twiddle factors computed via `det_sincos()`.
 //!
-//! Memory optimizations (Phase 3):
-//! - P1a: Column FFTs use gather-FFT-scatter with a single column buffer
+//! Memory optimizations:
+//! - Column FFTs use gather-FFT-scatter with a single column buffer
 //!   instead of a full transposed copy (saves ~186 MB for 4032x3024).
-//! - P1b: All FFT data uses f32 (Complex32) — template detection only needs
+//! - All FFT data uses f32 (Complex32) — template detection only needs
 //!   coarse peak finding. Twiddle factors still computed in f64 via
 //!   `det_sincos()` then cast to f32.
-//! - P2a: BluesteinPlan precomputes chirp factors and FFT(b_hat) for reuse
+//! - BluesteinPlan precomputes chirp factors and FFT(b_hat) for reuse
 //!   across all rows/columns of the same length.
 
 use num_complex::Complex;
@@ -115,7 +115,7 @@ fn next_pow2(n: usize) -> usize {
     p
 }
 
-/// T2.14 — Process-wide cache of per-stage radix-2 twiddle tables,
+/// Process-wide cache of per-stage radix-2 twiddle tables,
 /// keyed by `(size, sign_is_negative)`. Twiddles depend only on
 /// (n, sign, stage), so the FIRST `fft_radix2_f32` call for any (n,
 /// sign) builds the full set of stage twiddles via `det_sincos` and
@@ -198,7 +198,7 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
         }
     }
 
-    // T2.14 — pull cached per-stage twiddle tables for (n, sign).
+    // Pull cached per-stage twiddle tables for (n, sign).
     // Built once per unique (n, sign) at first call; thousands of
     // subsequent calls during a 2D FFT pass share the same table via
     // an Arc reference (no det_sincos cost, no per-call allocation).
@@ -211,7 +211,7 @@ fn fft_radix2_f32(data: &mut [Complex32], sign: f64) {
         let half = len / 2;
         let twiddles: &[Complex32] = &stage_twiddles[stage_idx];
 
-        // T2.3 — SIMD-accelerated butterfly chunks for half >= 4.
+        // SIMD-accelerated butterfly chunks for half >= 4.
         // butterfly_chunk_4 dispatches to NEON / SSE / WASM SIMD128 by
         // arch (scalar fallback otherwise). All paths are bit-identical
         // by construction (Path A: lane-pure IEEE 754, no FMA, no
@@ -313,7 +313,7 @@ pub fn fft2d(pixels: &[f64], width: usize, height: usize) -> Spectrum2D {
         None
     };
 
-    // T2.2 — row FFTs are independent → par_chunks_mut over the
+    // Row FFTs are independent → par_chunks_mut over the
     // row-major buffer. Each chunk is one row processed in place.
     // Wire-format safe: rayon never changes the math; each row FFT
     // produces deterministic output independent of execution order.
@@ -329,7 +329,7 @@ pub fn fft2d(pixels: &[f64], width: usize, height: usize) -> Spectrum2D {
     #[cfg(not(feature = "parallel"))]
     data.chunks_mut(width).for_each(process_row);
 
-    // T2.2 — column FFTs are independent across columns (each col
+    // Column FFTs are independent across columns (each col
     // touches a disjoint set of indices). Parallelize via raw-pointer
     // wrapper + per-thread col_buf scratch.
     fft_columns_parallel(&mut data, width, height, col_plan.as_ref(), -1.0);
@@ -337,7 +337,7 @@ pub fn fft2d(pixels: &[f64], width: usize, height: usize) -> Spectrum2D {
     Spectrum2D { data, width, height }
 }
 
-/// T2.2 — column gather/FFT/scatter parallelized across columns.
+/// Column gather/FFT/scatter parallelized across columns.
 ///
 /// Each closure handles one column: gathers `height` strided
 /// `Complex32` values into a per-thread `col_buf`, runs the 1D FFT,
@@ -424,7 +424,7 @@ pub fn ifft2d(spectrum: &Spectrum2D) -> Vec<f64> {
         None
     };
 
-    // T2.2 — row IFFTs in parallel.
+    // Row IFFTs in parallel.
     let process_row = |row_data: &mut [Complex32]| {
         let transformed = fft1d_f32_with_plan(row_data, 1.0, row_plan.as_ref());
         row_data.copy_from_slice(&transformed);
@@ -437,11 +437,11 @@ pub fn ifft2d(spectrum: &Spectrum2D) -> Vec<f64> {
     #[cfg(not(feature = "parallel"))]
     data.chunks_mut(width).for_each(process_row);
 
-    // T2.2 — column IFFTs in parallel via the same raw-pointer
+    // Column IFFTs in parallel via the same raw-pointer
     // wrapper pattern as `fft2d`.
     fft_columns_parallel(&mut data, width, height, col_plan.as_ref(), 1.0);
 
-    // Normalize and extract real parts. T2.2 — also parallelizable
+    // Normalize and extract real parts. Also parallelizable
     // over the flat buffer; small change but visible on big images.
     let norm = 1.0 / (width * height) as f64;
     #[cfg(feature = "parallel")]
@@ -461,7 +461,7 @@ pub fn ifft2d(spectrum: &Spectrum2D) -> Vec<f64> {
 /// Inputs are produced by a fixed-seed LCG so every platform with a
 /// conforming IEEE 754 f32 implementation produces the SAME bytes. Used
 /// to empirically verify that scalar / NEON / SSE / WASM SIMD paths
-/// produce bit-identical FFT output (T2.3 Path A validation).
+/// produce bit-identical FFT output (Path A validation).
 ///
 /// `size` must be small enough that the test runs quickly across all
 /// target archs (incl. WASM under Node). 256×256 takes <50 ms on
@@ -493,7 +493,7 @@ pub fn magnitude_spectrum(spectrum: &Spectrum2D) -> Vec<f32> {
     }).collect()
 }
 
-/// T2.3 cross-platform empirical FFT-output byte equivalence.
+/// Cross-platform empirical FFT-output byte equivalence.
 ///
 /// Computes a SHA256 of the deterministic 256×256 FFT output bytes
 /// and asserts it matches a hardcoded value. The value was first

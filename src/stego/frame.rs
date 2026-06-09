@@ -281,7 +281,7 @@ pub fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
 
 /// Same as [`bits_to_bytes`] but writes into a caller-provided buffer
 /// (clears it first). Used by hot brute-force loops with thread-local
-/// scratch to avoid per-iteration Vec allocations (T1.10).
+/// scratch to avoid per-iteration Vec allocations.
 pub fn bits_to_bytes_into(bits: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(bits.len().div_ceil(8));

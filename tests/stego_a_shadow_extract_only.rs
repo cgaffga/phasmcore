@@ -1,17 +1,13 @@
-// Fast diagnostic: ONLY try shadow_extract_all4_safe on the user's stego
+// Fast diagnostic: ONLY try shadow_extract on the user's stego
 // video. Skips the slow Scheme A/B brute-force. If shadow IS embedded
 // for passphrase "s", this returns the message in <1s. If shadow is
 // NOT embedded, returns FrameCorrupted in <1s.
 
-#![cfg(all(
-    feature = "h264-encoder",
-    feature = "openh264-backend",
-    feature = "cabac-stego",
-))]
+#![cfg(feature = "h264-decoder")]
 
 use phasm_core::codec::h264::cabac::bin_decoder::{walk_annex_b_for_cover_with_options, WalkOptions};
 use phasm_core::codec::h264::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
-use phasm_core::codec::h264::stego::shadow::shadow_extract_all4_safe;
+use phasm_core::codec::h264::stego::shadow::shadow_extract;
 
 #[test]
 fn shadow_extract_only_on_user_video() {
@@ -24,7 +20,7 @@ fn shadow_extract_only_on_user_video() {
     let walk_start = std::time::Instant::now();
     let walk = walk_annex_b_for_cover_with_options(
         &annex_b,
-        WalkOptions { record_mvd: true, record_offsets: false },
+        WalkOptions { record_mvd: true },
     ).expect("walk");
     let dt_walk = walk_start.elapsed();
     eprintln!(
@@ -53,20 +49,20 @@ fn shadow_extract_only_on_user_video() {
 
     // Try shadow extract with "s"
     let s_start = std::time::Instant::now();
-    let result_s = shadow_extract_all4_safe(&walk.cover, "s", None, Some(&safe_msl));
+    let result_s = shadow_extract(&walk.cover, "s", None, Some(&safe_msl));
     let dt_s = s_start.elapsed();
     eprintln!("shadow_extract(\"s\"): {:?} ({:?})", result_s.as_ref().map(|p| &p.text), dt_s);
 
     // Try with empty pass too
     let e_start = std::time::Instant::now();
-    let result_empty = shadow_extract_all4_safe(&walk.cover, "", None, Some(&safe_msl));
+    let result_empty = shadow_extract(&walk.cover, "", None, Some(&safe_msl));
     let dt_empty = e_start.elapsed();
     eprintln!("shadow_extract(\"\"): {:?} ({:?})", result_empty.as_ref().map(|p| &p.text), dt_empty);
 
     // Try common variations in case the iOS UI added/stripped whitespace
     for variation in &["s ", " s", "S"] {
         let start = std::time::Instant::now();
-        let result = shadow_extract_all4_safe(&walk.cover, variation, None, Some(&safe_msl));
+        let result = shadow_extract(&walk.cover, variation, None, Some(&safe_msl));
         eprintln!("shadow_extract(\"{}\"): {:?} ({:?})", variation, result.as_ref().map(|p| &p.text), start.elapsed());
     }
 }

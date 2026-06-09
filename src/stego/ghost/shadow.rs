@@ -93,9 +93,9 @@ const COST_FRACTIONS: [usize; 5] = [20, 10, 5, 2, 1];
 /// Maximum RS-encoded frame bytes to prevent unreasonable allocations.
 const MAX_SHADOW_FRAME_BYTES: usize = 256 * 1024;
 
-// T1.10 — thread-local scratch buffer for the brute-force loop's
-// bits_to_bytes step. Phase 2b can call try_single_fdl ~6000× per
-// smart_decode no-match path; reusing a per-thread Vec eliminates
+// Thread-local scratch buffer for the brute-force loop's
+// bits_to_bytes step. The no-match path can call try_single_fdl
+// ~6000× per smart_decode; reusing a per-thread Vec eliminates
 // the per-iteration allocation churn. Each rayon worker gets its
 // own scratch via thread_local.
 thread_local! {
@@ -124,7 +124,7 @@ fn try_single_fdl(
     })
 }
 
-/// Inner body of [`try_single_fdl`] given pre-packed RS bytes (T1.10).
+/// Inner body of [`try_single_fdl`] given pre-packed RS bytes.
 fn try_single_fdl_with_rs_bytes(
     rs_bytes: &[u8],
     fdl: usize,
@@ -136,12 +136,12 @@ fn try_single_fdl_with_rs_bytes(
         Err(_) => return None,
     };
 
-    // O(1) format-aware consistency gate (port of the #532 video
-    // shadow fix to the image side). peek_shadow_fdl reads the
-    // first 2-6 bytes, dispatches v1 vs v2, returns the producer's
-    // total frame length. If that doesn't equal the brute-force fdl
-    // candidate, reject without parse + AES. Skips ~99% of bad
-    // candidates' Argon2 + AES-GCM-SIV work.
+    // O(1) format-aware consistency gate (mirrors the video shadow
+    // path). peek_shadow_fdl reads the first 2-6 bytes, dispatches
+    // v1 vs v2, returns the producer's total frame length. If that
+    // doesn't equal the brute-force fdl candidate, reject without
+    // parse + AES. Skips ~99% of bad candidates' Argon2 +
+    // AES-GCM-SIV work.
     let expected_total = peek_shadow_fdl(&decoded)?;
     if expected_total != fdl {
         return None;
@@ -168,9 +168,8 @@ fn try_single_fdl_with_rs_bytes(
 /// Returns the candidate fdl if the first block decodes and the resulting fdl
 /// is plausible (>= k, within pool capacity).
 ///
-/// 2026-05-21 unification — delegates v1/v2 dispatch to the shared
-/// [`peek_shadow_fdl`] helper in `shadow_layer`. Same dispatch logic
-/// for image + video shadow.
+/// Delegates v1/v2 dispatch to the shared [`peek_shadow_fdl`] helper
+/// in `shadow_layer`. Same dispatch logic for image + video shadow.
 fn peek_fdl_from_first_block(
     lsbs: &[u8],
     parity_len: usize,
@@ -442,8 +441,8 @@ pub fn shadow_extract(
         // Phase 2a: First-block peek — decode first RS block to read plaintext_len
         // and derive the exact fdl. Handles messages where fdl >= k (most cases).
         // This is O(30) RS block decodes — very fast.
-        // T1.11 — parallelized across (fraction, parity) combos with
-        // find_map_first short-circuit on first hit. Was sequential.
+        // Parallelized across (fraction, parity) combos with
+        // find_map_first short-circuit on first hit.
         let combos_2a: Vec<(usize, usize)> = (0..fraction_lsbs.len())
             .flat_map(|fi| SHADOW_PARITY_TIERS.iter().map(move |&p| (fi, p)))
             .collect();
@@ -481,7 +480,7 @@ pub fn shadow_extract(
             }
         }
 
-        // T3 progress instrumentation — split the worst-case ~3000-
+        // Progress instrumentation: split the worst-case ~3000-
         // 6000 combo brute-force into batches and emit one progress
         // step per batch. Each batch still uses par_iter.find_map_first
         // so first-hit short-circuit is preserved within a batch;
@@ -663,14 +662,14 @@ fn select_shadow_positions(
         let priority = rng.next_u64();
         (priority, p.clone())
     }).collect();
-    // T2.12 — LSD radix sort on the u64 priorities is ~2-3x faster
-    // than comparison sort for large pools (the 100% fraction on a
+    // LSD radix sort on the u64 priorities is ~2-3x faster than
+    // comparison sort for large pools (the 100% fraction on a
     // 12 MP photo sorts ~766 K elements; std sort_unstable_by_key
     // there runs ~80-100 ms, radsort runs ~30-40 ms). On unique
     // u64 keys (collision probability ~2^-26 at this scale) any
     // sort algorithm produces the same logical order, so the swap
-    // is byte-identical to the previous T1.9 unstable-sort output
-    // in practice. Path A wire-safe.
+    // is byte-identical to the previous unstable-sort output in
+    // practice (wire-safe — does not change embedded positions).
     radsort::sort_by_key(&mut candidates, |(priority, _)| *priority);
 
     candidates.into_iter().map(|(_, p)| p).take(n_total).collect()

@@ -23,6 +23,9 @@ pub mod error;
 pub mod stc;
 pub mod crypto;
 pub mod frame;
+pub mod chunk_frame;
+pub mod calibration;
+pub mod balanced_allocation;
 pub mod permute;
 pub mod payload;
 pub mod progress;
@@ -166,11 +169,11 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 /// Serial smart_decode implementation (default path and WASM).
 ///
 /// Tries Armor first (default mode, most common), then Ghost, then
-/// Ghost shadow. T1.5 (2026-05-21): parses the JPEG ONCE at the top
-/// and threads `&JpegImage` into all four mode attempts via the
-/// `_from_image` variants. Previously each mode re-parsed the same
-/// bytes — 2-3× wasted work on the failure path (Armor → Ghost →
-/// Ghost shadow), each parse 100s of ms on large iPhone JPEGs.
+/// Ghost shadow. Parses the JPEG ONCE at the top and threads
+/// `&JpegImage` into all four mode attempts via the `_from_image`
+/// variants. Otherwise each mode would re-parse the same bytes — 2-3×
+/// wasted work on the failure path (Armor → Ghost → Ghost shadow),
+/// each parse 100s of ms on large iPhone JPEGs.
 ///
 /// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) +
 ///   1 (phase3) + GHOST_DECODE_STEPS (102). Actual total set by
@@ -184,11 +187,11 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     progress::init(0); // reset; try_armor_decode sets real total
     progress::check_cancelled()?;
 
-    // T1.5 — parse JPEG once and share across all mode attempts.
+    // Parse JPEG once and share across all mode attempts.
     let img = JpegImage::from_bytes(stego_bytes)?;
     let mut saw_decryption_failed = false;
 
-    // M5: real Armor / Fortress stego never naturally arrives larger
+    // Real Armor / Fortress stego never naturally arrives larger
     // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for Armor's
     // recompression-survival design). Skip both attempts when input is
     // larger — saves a full FFT pass at decode (~30-60s + ~16 bytes/px
@@ -197,7 +200,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let max_dim = fi.width.max(fi.height) as u32;
     let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
 
-    // Try Fortress (fast, runs first inside armor_decode in pre-T1.5 path).
+    // Try Fortress (fast).
     if try_armor
         && img.num_components() > 0
         && let Ok(result) = fortress::fortress_decode(&img, passphrase)
@@ -205,9 +208,9 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         return Ok(result);
     }
 
-    // Try Armor STDM + Phase 3 (Phase 3 still re-parses internally for
-    // geometric recovery — that path resamples the image, so it can't
-    // reuse the original parse).
+    // Try Armor STDM + geometric recovery (the geometric-recovery stage
+    // still re-parses internally — that path resamples the image, so it
+    // can't reuse the original parse).
     if try_armor {
         match armor_decode_no_fortress(&img, stego_bytes, passphrase) {
             Ok(result) => return Ok(result),
@@ -226,7 +229,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let (armor_done, _) = progress::get();
     progress::set_total(armor_done + GHOST_DECODE_STEPS);
 
-    // T1.8 — compute Y-channel UNIWARD positions ONCE and share with
+    // Compute Y-channel UNIWARD positions ONCE and share with
     // both Ghost branches (each takes ownership of its own clone since
     // both mutate: permute vs sort). Saves one compute_positions
     // (~1-10s, ~170MB-1GB scratch) on the dominant
@@ -295,7 +298,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let img = JpegImage::from_bytes(stego_bytes)?;
 
-    // M5: real Armor / Fortress stego never naturally arrives larger
+    // Real Armor / Fortress stego never naturally arrives larger
     // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for
     // Armor's recompression-survival design). Skip both attempts when
     // input is larger — saves a full FFT pass at decode (~30-60s and
@@ -304,13 +307,13 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let max_dim = fi.width.max(fi.height) as u32;
     let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
 
-    // T1.8 — compute shared Y-channel UNIWARD positions ONCE before the
-    // rayon::join and clone for shadow. Avoids the 2× concurrent
-    // compute_positions_streaming runs in the previous parallel
-    // structure (each peaking at ~170MB-1GB scratch on big images).
-    // Net: 1 × compute scratch instead of 2 × concurrent (~1GB savings
-    // on 200MP), plus 50% CPU saved. Falls back to per-mode compute
-    // when shared compute fails (NoLuminanceChannel etc).
+    // Compute shared Y-channel UNIWARD positions ONCE before the
+    // rayon::join and clone for shadow. Avoids 2× concurrent
+    // compute_positions_streaming runs (each peaking at ~170MB-1GB
+    // scratch on big images). Net: 1 × compute scratch instead of 2 ×
+    // concurrent (~1GB savings on 200MP), plus 50% CPU saved. Falls
+    // back to per-mode compute when shared compute fails
+    // (NoLuminanceChannel etc).
     //
     // Trade-off: compute_positions now runs *before* rayon::join, so it
     // doesn't overlap with Fortress / Armor work. Same wall-clock
@@ -359,7 +362,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         return Ok((payload, quality));
     }
 
-    // Try Armor STDM + Phase 3.
+    // Try Armor STDM + geometric recovery.
     if let Ok((payload, quality)) = stdm_result {
         return Ok((payload, quality));
     }

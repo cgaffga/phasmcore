@@ -15,11 +15,11 @@
 //!
 //! Usage:
 //!   cargo run --example openh264_visual_demo --release \
-//!       --features openh264-backend -- \
+//!       --features h264-encoder -- \
 //!       <input.yuv> <out_clean.h264> <out_stego.h264> \
 //!       <width> <height> <n_frames> <qp> <gop_size> <payload_text>
 
-#[cfg(feature = "openh264-backend")]
+#[cfg(feature = "h264-encoder")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use phasm_core::codec::h264::openh264::{
         Encoder, PhasmStegoDomain, Position, StegoHandlers, StegoSession,
@@ -143,7 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "openh264-backend")]
+#[cfg(feature = "h264-encoder")]
 fn encode_to_file(
     input_path: &str,
     output_path: &str,
@@ -186,8 +186,8 @@ fn encode_to_file(
     Ok(())
 }
 
-#[cfg(not(feature = "openh264-backend"))]
+#[cfg(not(feature = "h264-encoder"))]
 fn main() {
-    eprintln!("openh264_visual_demo requires --features openh264-backend");
+    eprintln!("openh264_visual_demo requires --features h264-encoder");
     std::process::exit(1);
 }

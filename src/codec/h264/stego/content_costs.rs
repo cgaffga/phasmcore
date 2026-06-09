@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! STEGO.A.1 — Tier 3 content-adaptive cost computation for the
-//! unified video stego pipeline.
+//! Tier 3 content-adaptive cost computation for the unified video
+//! stego pipeline.
 //!
 //! Bridges CABAC walker output ([`DomainCover`] in
 //! [`crate::codec::h264::stego::inject`]) to the existing J-UNIWARD
 //! wavelet-based cost machinery in
 //! [`crate::stego::cost::h264_uniward`] (originally built for the
-//! CAVLC video pipeline; STEGO.A unifies its use across both encoder
-//! backends).
+//! now-retired CAVLC video pipeline; reused unchanged by the current
+//! OpenH264 stego path, which is unified onto this Scheme A cover).
 //!
 //! ## What this delivers
 //!
@@ -47,8 +47,8 @@
 //! - **MVD-domain wavelet cost**: MVD positions don't have a pixel-
 //!   block interpretation; instead we use the MB's aggregate Y-plane
 //!   wavelet response as the cost proxy (lower texture = higher cost).
-//!   This is a simpler heuristic than [`h264_mvd_cost`]'s
-//!   residual-energy-based formula, but adequate for first-cut.
+//!   This is a simpler heuristic than the retired CAVLC `h264_mvd_cost`
+//!   module's residual-energy-based formula, but adequate for first-cut.
 //!   Refinement deferred to v1.1+.
 //!
 //! ## Determinism
@@ -63,14 +63,14 @@
 //! Per-frame wavelet decomposition is ~32 MB at 1080p. Module
 //! processes one frame at a time and drops the wavelet buffers before
 //! moving to the next, keeping peak memory at ~32 MB regardless of
-//! `n_frames`. #809 parallelizes the wavelet *internally* (rows/cols in
+//! `n_frames`. The wavelet is parallelized *internally* (rows/cols in
 //! [`crate::stego::cost::h264_uniward::compute_three_subbands`]) rather
 //! than across frames, so this ~32 MB peak is preserved while still
 //! using all cores (the convolution's per-row parallelism saturates
 //! them on its own — frame-level concurrency would only add
 //! `cores × 32 MB` for no throughput gain).
 
-use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
+use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, PositionKey, SyntaxPath};
 use crate::codec::h264::stego::inject::DomainCover;
 use crate::codec::h264::stego::orchestrate::DomainCosts;
@@ -81,8 +81,7 @@ use crate::stego::error::StegoError;
 use std::collections::HashMap;
 
 /// Default `QP` value used when the caller doesn't pass one. Matches
-/// `EncodeOpts::default().qp` (=26) in the OH264 path and the typical
-/// pure-Rust encoder QP range.
+/// `EncodeOpts::default().qp` (=26) in the OH264 path.
 const DEFAULT_QP: i32 = 26;
 
 /// Stabilisation constant for the MVD-domain texture proxy. Avoids
@@ -184,9 +183,9 @@ pub fn compute_content_costs_yuv(
                 _ => continue,
             };
             let Some(&key) = positions.get(idx) else { continue };
-            // CASCADE.P1.4 — `δ = 2·|coeff|` for Sign and `δ = 1` for
-            // SuffixLsb (the LSB flip changes magnitude by ±1 by
-            // construction). Magnitudes can fall to 0 only for legacy
+            // `δ = 2·|coeff|` for Sign and `δ = 1` for SuffixLsb (the
+            // LSB flip changes magnitude by ±1 by construction).
+            // Magnitudes can fall to 0 only for legacy
             // call sites that use the back-compat `push(bit, pos)` path
             // (and for non-coeff positions that re-use this struct);
             // those see the legacy `δ = 2` fallback so cost-function
@@ -296,14 +295,14 @@ fn coeff_position_cost(
     let mb_x = (mb_addr as usize) % mb_width;
     let mb_y = (mb_addr as usize) / mb_width;
 
-    // CASCADE.P1.4 — pixel-delta scales with `|coeff|` for a sign
-    // flip (the coefficient swings from +M to −M, change = 2·M).
+    // Pixel-delta scales with `|coeff|` for a sign flip (the
+    // coefficient swings from +M to −M, change = 2·M).
     // Clamp to 32 so a single high-magnitude outlier can't dominate
     // the cost vector; at QP ≤ 32 with typical content, coefficients
     // above 32 are extremely rare and clamping has < 0.01% effect on
     // STC plan selection. Magnitude=0 (back-compat path that hasn't
     // been plumbed) falls through to the legacy δ=2/δ=1 constants —
-    // same numbers the cost fn used before P1.4.
+    // same numbers the cost fn used before magnitude was plumbed.
     let mag_clamped = (magnitude as f64).min(32.0).max(1.0);
     let sign_delta: f64 = if magnitude == 0 { 2.0 } else { 2.0 * mag_clamped };
     let suffix_lsb_delta: f64 = 1.0;

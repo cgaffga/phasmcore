@@ -2,36 +2,63 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Encode-time stego hook traits + bit-packed PositionKey (Phase 6D.1).
+//! Encode-time stego hook traits + bit-packed PositionKey.
 //!
-//! Two distinct trait contracts mirror the three-pass encoder model:
-//! - [`PositionLogger`] is invoked during Pass 1 (GOP search). The
-//!   encoder calls it for every bypass bin it would emit, in raster
-//!   order. The logger decides which positions enter the cover pool
-//!   and accumulates per-domain capacity counts.
-//! - [`BitInjector`] is invoked during Pass 3 (entropy with
-//!   injection). For each candidate position, the injector returns
-//!   `Some(bit)` to override the encoder's natural bypass-bin value
-//!   or `None` to leave it unchanged.
-//!
-//! The traits are intentionally distinct: a concrete hook
-//! implementation belongs to exactly one pass, and the encoder only
-//! invokes the contract that is meaningful for the pass it is in.
-//! See `docs/design/video/h264/encoder-algorithms/stego-encode-time-architecture.md`
+//! [`PositionLogger`] is invoked during Pass 1 (GOP search). The
+//! encoder calls it for every bypass bin it would emit, in raster
+//! order. The logger decides which positions enter the cover pool
+//! and accumulates per-domain capacity counts.
+//! See `docs/design/video/_archive/h264/encoder-algorithms/stego-encode-time-architecture.md`
 //! § 6 for rationale.
 //!
 //! [`PositionKey`] is a 64-bit packed integer so per-position
 //! `HashMap<PositionKey, u8>` lookups in Pass 3 (∼40M positions on a
 //! 1-min 1080p clip) hash via a single u64 ahash, no allocations.
 
-/// Stego target classes — the four bypass-bin domains (Phase 6D
-/// architecture decision A1, "bypass-bin-only injection").
+/// Per-MVD-position metadata captured alongside the cover. Aligned
+/// by INDEX with `cover.cover.mvd_sign_bypass`
+/// (one entry per logged sign position; empty when the MVD-sign
+/// position list is empty).
 ///
-/// Mapping to CAVLC pool (today's stego pipeline):
-/// `CoeffSignBypass` ← `T1Sign + LevelSuffixSign`,
-/// `CoeffSuffixLsb` ← `LevelSuffixMag`,
-/// `MvdSignBypass` + `MvdSuffixLsb` ← `MvdLsb` (split for cleaner
-/// per-domain cost modelling).
+/// Used by `cascade_safety::analyze_safe_mvd_subset` to build the
+/// dependency-graph + run criterion-C greedy. The walker side
+/// captures the same shape from `decode_mvd_with_bin0_inc` output
+/// so encoder + decoder run the safe-set computation on identical
+/// inputs. Relocated here from the (retired) pure-Rust `encoder_hook`
+/// in the video-retirement Phase 3 — it is decode-shared (the walker
+/// and `cascade_safety` both consume it).
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MvdPositionMeta {
+    /// Absolute MVD value at hook-fire time. Encoder side: pre-
+    /// or post-injection depending on hook order (PositionLogger
+    /// fires post-injection in InjectAndLogHook). Walker side:
+    /// the value decoded from the bitstream.
+    pub magnitude: u32,
+    /// Frame-relative MB address (mb_y * mb_w + mb_x).
+    pub mb_addr: u32,
+    /// Frame index in bitstream (encode/walk) order — the same
+    /// encode-order index the walker stamps into each emitted
+    /// `PositionKey.frame_idx`, so cover capture and override
+    /// lookup stay aligned.
+    pub frame_idx: u32,
+    /// Partition value packed into `MvdSlot::partition` (0 for
+    /// P_L0_16x16; for sub-MBs `sub_mb_idx * 4 + sub_part_idx`).
+    pub partition: u8,
+    /// 0 = X, 1 = Y. Matches the layout of `Axis`.
+    pub axis: u8,
+}
+
+/// Stego target classes — the four bypass-bin domains
+/// (bypass-bin-only injection).
+///
+/// CABAC bypass-bin mapping (the production CABAC-only pipeline):
+/// `CoeffSignBypass` ← coefficient-sign bypass bins;
+/// `CoeffSuffixLsb` ← the LSB of the Exp-Golomb suffix of
+/// `coeff_abs_level_minus1` (only `|coeff| ≥ 16` reaches the suffix
+/// path); `MvdSignBypass` ← MVD-sign bypass bins;
+/// `MvdSuffixLsb` ← the LSB of the MVD magnitude Exp-Golomb suffix
+/// (sign and suffix split into separate domains for cleaner per-
+/// domain cost modelling).
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 #[repr(u8)]
 pub enum EmbedDomain {
@@ -268,24 +295,6 @@ pub struct GopCapacity {
     pub mvd_suffix_lsb: usize,
 }
 
-impl GopCapacity {
-    #[inline]
-    pub fn total(&self) -> usize {
-        self.coeff_sign_bypass + self.coeff_suffix_lsb
-            + self.mvd_sign_bypass + self.mvd_suffix_lsb
-    }
-
-    #[inline]
-    pub fn add(&mut self, domain: EmbedDomain) {
-        match domain {
-            EmbedDomain::CoeffSignBypass => self.coeff_sign_bypass += 1,
-            EmbedDomain::CoeffSuffixLsb => self.coeff_suffix_lsb += 1,
-            EmbedDomain::MvdSignBypass => self.mvd_sign_bypass += 1,
-            EmbedDomain::MvdSuffixLsb => self.mvd_suffix_lsb += 1,
-        }
-    }
-}
-
 /// Pass 1 hook (GOP search). Encoder calls `register` for every
 /// candidate bypass bin it would emit. Hook decides whether the
 /// position joins the cover pool.
@@ -293,9 +302,8 @@ impl GopCapacity {
 /// **Concurrency**: invoked single-threaded per GOP, but instances
 /// move across rayon worker threads at GOP-parallel boundaries —
 /// hence the `Send` bound. Within a GOP the architecture
-/// guarantees no cross-thread access to a single instance (A7 of
-/// the architecture doc, the constraint that keeps Phase I.3 row-
-/// pipelining a viable post-6D.10 follow-up).
+/// guarantees no cross-thread access to a single instance, which is
+/// also what keeps row-level pipelining a viable future refinement.
 pub trait PositionLogger: Send {
     /// Returns `true` if the position is accepted into the cover pool
     /// (cost-model + per-position validity). Encoder uses the return
@@ -306,9 +314,9 @@ pub trait PositionLogger: Send {
     /// Drained at end of GOP for Pass 2 STC planning.
     fn capacity(&self) -> GopCapacity;
 
-    /// Phase C.3.6.1 (task #428) — register a position together with
-    /// the RBSP bit offset of the bypass-coded bin about to be
-    /// decoded, plus the NAL index containing that bin. Default impl
+    /// Register a position together with the RBSP bit offset of the
+    /// bypass-coded bin about to be decoded, plus the NAL index
+    /// containing that bin. Default impl
     /// forwards to `register`, ignoring the offset — preserves
     /// behavior for loggers that don't care (encoder side, trace
     /// recorders, capacity counters).
@@ -323,45 +331,6 @@ pub trait PositionLogger: Send {
         _nal_idx: u32,
     ) -> bool {
         self.register(key)
-    }
-}
-
-/// Pass 3 hook (entropy with injection). Encoder asks whether to
-/// override a bypass bin's natural value at this position.
-///
-/// **Concurrency**: same `Send` discipline as `PositionLogger`.
-pub trait BitInjector: Send {
-    /// `Some(bit)` overrides the encoder's natural bypass-bin value.
-    /// `None` leaves it unchanged. The override only takes effect at
-    /// positions the Pass 1 logger accepted into the cover pool.
-    fn override_bit(&mut self, key: PositionKey) -> Option<u8>;
-}
-
-/// Reference [`PositionLogger`] implementation that accepts every
-/// position and counts per domain. Used in Pass 1 to compute raw
-/// capacity; concrete cost-aware loggers in 6D.4 will reject some
-/// positions based on per-position cost.
-#[derive(Default, Debug)]
-pub struct PositionCounter {
-    capacity: GopCapacity,
-}
-
-impl PositionCounter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl PositionLogger for PositionCounter {
-    #[inline]
-    fn register(&mut self, key: PositionKey) -> bool {
-        self.capacity.add(key.domain());
-        true
-    }
-
-    #[inline]
-    fn capacity(&self) -> GopCapacity {
-        self.capacity
     }
 }
 
@@ -387,38 +356,6 @@ impl PositionLogger for NullLogger {
     #[inline]
     fn capacity(&self) -> GopCapacity {
         GopCapacity::default()
-    }
-}
-
-/// Reference [`PositionLogger`] implementation that records every
-/// position into a Vec, in order. Used by tests + the 6D.3 paired
-/// roundtrip validation gate to compare encoder + decoder
-/// position-key sequences.
-#[derive(Default, Debug)]
-pub struct PositionRecorder {
-    pub positions: Vec<PositionKey>,
-}
-
-impl PositionRecorder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl PositionLogger for PositionRecorder {
-    #[inline]
-    fn register(&mut self, key: PositionKey) -> bool {
-        self.positions.push(key);
-        true
-    }
-
-    #[inline]
-    fn capacity(&self) -> GopCapacity {
-        let mut cap = GopCapacity::default();
-        for key in &self.positions {
-            cap.add(key.domain());
-        }
-        cap
     }
 }
 
@@ -572,66 +509,6 @@ mod tests {
         ] {
             assert_eq!(EmbedDomain::from_bits(d as u8), d);
         }
-    }
-
-    #[test]
-    fn position_counter_tallies_per_domain() {
-        let mut counter = PositionCounter::new();
-        // 5 coefficient signs, 3 mvd signs, 2 coefficient suffix LSBs.
-        for i in 0..5 {
-            counter.register(PositionKey::new(
-                0, i, EmbedDomain::CoeffSignBypass,
-                SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 0, kind: BinKind::Sign },
-            ));
-        }
-        for i in 0..3 {
-            counter.register(PositionKey::new(
-                0, i, EmbedDomain::MvdSignBypass,
-                SyntaxPath::Mvd { list: 0, partition: 0, axis: Axis::X, kind: BinKind::Sign },
-            ));
-        }
-        for i in 0..2 {
-            counter.register(PositionKey::new(
-                0, i, EmbedDomain::CoeffSuffixLsb,
-                SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 0, kind: BinKind::SuffixLsb },
-            ));
-        }
-        let cap = counter.capacity();
-        assert_eq!(cap.coeff_sign_bypass, 5);
-        assert_eq!(cap.coeff_suffix_lsb, 2);
-        assert_eq!(cap.mvd_sign_bypass, 3);
-        assert_eq!(cap.mvd_suffix_lsb, 0);
-        assert_eq!(cap.total(), 10);
-    }
-
-    #[test]
-    fn position_counter_register_always_accepts() {
-        let mut counter = PositionCounter::new();
-        let key = PositionKey::new(
-            0, 0, EmbedDomain::CoeffSignBypass,
-            SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 0, kind: BinKind::Sign },
-        );
-        // Reference implementation accepts every position.
-        assert!(counter.register(key));
-    }
-
-    /// Demonstrates the trait shape — a no-op BitInjector is trivially
-    /// constructible. Concrete injection logic lands in 6D.3.
-    struct NoOpInjector;
-    impl BitInjector for NoOpInjector {
-        fn override_bit(&mut self, _: PositionKey) -> Option<u8> {
-            None
-        }
-    }
-
-    #[test]
-    fn bit_injector_default_is_passthrough() {
-        let mut inj = NoOpInjector;
-        let key = PositionKey::new(
-            0, 0, EmbedDomain::CoeffSignBypass,
-            SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 0, kind: BinKind::Sign },
-        );
-        assert!(inj.override_bit(key).is_none());
     }
 
     #[test]

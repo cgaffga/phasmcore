@@ -11,7 +11,7 @@
 //! `#[ignore]`d by default — encodes ~30+ frames of 1072×1920 YUV
 //! through the OH264 session (~3-5 s wall).
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingDecodeSession,
@@ -121,7 +121,7 @@ fn oh264_wire_only_two_sequential_calls_bisect() {
     // the bug is in the orchestrator/fork's persistent state across
     // sequential encode_yuv calls — NOT in the streaming session itself.
     use phasm_core::codec::h264::openh264_stego::{
-        encode_yuv_with_pre_framed_bits_4domain, EncodeOpts,
+        h264_encode_gop_framed_bits_auto, EncodeOpts,
     };
     use phasm_core::codec::h264::stego::CostWeights;
 
@@ -146,11 +146,11 @@ fn oh264_wire_only_two_sequential_calls_bisect() {
     }
 
     eprintln!("=== Call 1 ===");
-    let _b1 = encode_yuv_with_pre_framed_bits_4domain(
+    let _b1 = h264_encode_gop_framed_bits_auto(
         &yuv, w, h, n, opts, &frame_bits, &hhat_seed, &weights,
     ).expect("call 1");
     eprintln!("=== Call 2 ===");
-    let _b2 = encode_yuv_with_pre_framed_bits_4domain(
+    let _b2 = h264_encode_gop_framed_bits_auto(
         &yuv, w, h, n, opts, &frame_bits, &hhat_seed, &weights,
     ).expect("call 2");
 

@@ -26,28 +26,11 @@ simd = []
 # Pulls in memmap2 for the path-based streaming API used by the iOS +
 # Android bridges to avoid loading entire videos into heap.
 video = ["memmap2"]
-# `h264-encoder` enables the Phase 6 pure-Rust H.264 encoder (under
-# core/src/codec/h264/encoder/) plus its CABAC entropy-coder companion
-# (core/src/codec/h264/cabac/). OFF by default so the GitHub-release
-# CLI binary distribution NEVER bundles an H.264 encoder (Via LA AVC
-# patent-pool obligations — see docs/design/video/h264/video-steganography.md
-# §"Patent licensing — distribution plan"). Mobile bridges
-# (ios-bridge, android-bridge) enable this feature explicitly. CLI
-# users wanting video stego must build from source with
-# `cargo install phasm-cli --features h264-encoder`.
-h264-encoder = ["video", "parallel", "simd"]
-# `cabac-stego` enables the encode-time CABAC stego pipeline at
-# H.264 High Profile + CABAC (Phase 6D). Implies `h264-encoder`.
-# When OFF, the Rust core's video stego routes through the
-# transitional CAVLC bitstream-mod pipeline (today's #77 production
-# path). When ON, `h264_ghost_encode_pixels` becomes the production
-# encoder-level entry point (Phase 6D.8 atomic swap target).
-#
-# Mobile bridges + CLI both consume this once 6D.10 lands. For now
-# (6D.7-shipped + 6D.8-in-progress) this gates the cross-domain
-# orchestration framework so the legacy CAVLC pipeline is never
-# accidentally bypassed.
-cabac-stego = ["h264-encoder"]
+# `h264-decoder` — H.264 stego DECODE: the pure-Rust bin-walker + stego
+# extract, with NO C dependency. The standalone decode gate (App Clip /
+# decode-only WASM can decode phasm H.264 stego without linking OpenH264).
+# Implied by `h264-encoder`.
+h264-decoder = ["video"]
 wasm = ["js-sys", "wasm-bindgen"]
 # T3.1 — integer fixed-point 8×8 DCT/IDCT (LL&M, libjpeg-turbo
 # `jfdctint.c` / `jidctint.c` port) shipped 2026-05-21 with NEON
@@ -88,6 +71,45 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # RSS=0 (the test still gates wall time on those).
 libc = "0.2"
 
+# `h264_cabac_decoder` is a standalone spec-direct CABAC decoder
+# (debugging aid) that imports the H.264 walker/parser modules at
+# module scope, so it only builds when the decode feature is present.
+# Without this gate it fails `cargo test` / `cargo build` in the
+# default (no-video) configuration. The two `openh264_*` examples are
+# self-gated via `#[cfg]/#[cfg(not)]` mains and need no entry here.
+[[example]]
+name = "h264_cabac_decoder"
+required-features = ["h264-decoder"]
+
+# `av1_calibrate` is the G.2 Phase 2 calibration measurement binary.
+# Same gating idiom — the file is `#![cfg(all(feature = "av1-encoder",
+# feature = "av1-decoder"))]` at module scope and Cargo would otherwise
+# fail with `main not found` on default-feature builds.
+[[bin]]
+name = "av1_calibrate"
+required-features = ["av1-encoder", "av1-decoder"]
+
+# `av1_stealth_sweep` — G.2 Phase 2 Tier 2 AUC-vs-utilization measurement
+# binary. Parameterizes the W6 self-steganalyzer's measurement loop on
+# utilization rate. Same gating as av1_calibrate.
+[[bin]]
+name = "av1_stealth_sweep"
+required-features = ["av1-encoder", "av1-decoder"]
+
+# `h264_calibrate` — #844 codec-parity Tier 1 calibration binary for the
+# H.264 path. Runs `StreamingProbeSession` at the production GOP size and
+# emits per-GOP cap-byte stats as JSON. Same module-scope `#![cfg(all(...))]`
+# gating idiom as the AV1 binaries.
+[[bin]]
+name = "h264_calibrate"
+required-features = ["h264-encoder", "h264-decoder"]
+
+# `h264_stealth_sweep` — #844 Tier 2 W6 AUC-vs-utilization measurement on the
+# H.264 CoeffSign domain. Same gating idiom as h264_calibrate.
+[[bin]]
+name = "h264_stealth_sweep"
+required-features = ["h264-encoder", "h264-decoder"]
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
@@ -100,6 +122,16 @@ lto = "thin"
 # specs. Rewriting these to satisfy clippy would actively hurt
 # auditability. SIMD / MT work (Phase I.1, I.2) inherits zero warnings
 # from these decisions.
+[lints.rust]
+# Edition 2024 promotes `unsafe_op_in_unsafe_fn` (calling an unsafe
+# intrinsic in an `unsafe fn` body without an inner `unsafe {}` block).
+# The hand-written SIMD kernels (NEON / SSE / AVX / wasm-simd) trip this.
+# Pin to `warn` so a fresh build of the published decode-only mirror
+# compiles consistently with the monorepo (warn-by-default here) instead
+# of failing with E0133. Wrapping each intrinsic in an explicit unsafe
+# block is the proper follow-up cleanup; this keeps the warnings visible.
+unsafe_op_in_unsafe_fn = "warn"
+
 [lints.clippy]
 needless_range_loop = "allow"
 too_many_arguments = "allow"

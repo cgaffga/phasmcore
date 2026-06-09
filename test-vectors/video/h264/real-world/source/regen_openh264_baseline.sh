@@ -59,9 +59,9 @@ fixtures=(
 )
 
 build_example() {
-    echo "Building example openh264_clean_encode --features openh264-backend ..."
+    echo "Building example openh264_clean_encode --features h264-encoder ..."
     (cd "$REPO_ROOT/core" && cargo build --release --example openh264_clean_encode \
-        --features "openh264-backend video h264-encoder cabac-stego" >/dev/null 2>&1) \
+        --features "h264-encoder video h264-encoder cabac-stego" >/dev/null 2>&1) \
         || { echo "ERROR: cargo build failed"; exit 1; }
 }
 

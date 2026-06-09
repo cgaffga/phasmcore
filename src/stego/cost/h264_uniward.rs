@@ -18,8 +18,6 @@
 //! stay on the Phase 1a CSF cost because reconstructing P-frame pixels needs
 //! motion compensation (deferred to Phase 7).
 
-use crate::codec::h264::cavlc::{EmbedDomain, EmbeddablePosition};
-use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::tables::ZIGZAG_4X4;
 
 /// 2^(q_bits - 4) for q_bits ∈ [0, 8] (i.e. exponent ∈ [-4, 4]).
@@ -415,156 +413,15 @@ pub(crate) fn compute_position_cost(
     cost
 }
 
-/// Reconstructed I-frame planes fed into the UNIWARD cost. Produced by
-/// `codec::h264::reconstruct::reconstruct_i_frame_planes`. Cb/Cr use the
-/// 4:2:0 layout (W/2 × H/2).
-pub struct FramePlanes<'a> {
-    pub y: &'a [u8],
-    pub cb: &'a [u8],
-    pub cr: &'a [u8],
-    pub width: usize,
-    pub height: usize,
-}
-
-/// Compute J-UNIWARD costs for a slice of I-frame positions over all three
-/// planes (Y, Cb, Cr) at 4:2:0 subsampling.
-///
-/// Position routing via [`FramePosition::within_mb_block_idx`] (0..=25):
-/// * 0..=15 → luma wavelets, 4×4 block at `(mb_x*16 + bx*4, mb_y*16 + by*4)`
-///   using `qps[mb_idx]` and the `BLOCK_INDEX_TO_POS` ordering.
-/// * 16..=17 → chroma DC (Cb=16, Cr=17). Returns `f32::INFINITY` — the 2×2
-///   Hadamard DC has only three scan positions > 0 per block, not worth
-///   the code complexity and they cascade across all 4 AC blocks anyway.
-/// * 18..=21 → Cb wavelets, 4×4 block at `(mb_x*8 + bx*4, mb_y*8 + by*4)`
-///   where `(bx, by) = ((slot-18) % 2, (slot-18) / 2)`, using `qp_cb`.
-/// * 22..=25 → Cr wavelets, same shape with `qp_cr`.
-///
-/// DC positions (`scan_pos == 0`) in any plane are also returned as INF.
-pub fn compute_frame_uniward_costs(
-    planes: &FramePlanes,
-    frame_positions: &[FramePosition],
-    qps: &[i32],
-) -> Vec<f32> {
-    let width = planes.width;
-    let height = planes.height;
-    let chroma_w = width / 2;
-    let chroma_h = height / 2;
-
-    // Wavelet decomp of each plane (one-off per frame).
-    let y_wavelets = compute_three_subbands(planes.y, width, height);
-    let cb_wavelets = compute_three_subbands(planes.cb, chroma_w, chroma_h);
-    let cr_wavelets = compute_three_subbands(planes.cr, chroma_w, chroma_h);
-    let unit_basis = precompute_unit_basis();
-    let width_in_mbs = width / 16;
-
-    let compute_one = |fp: &FramePosition| -> f32 {
-        let pos = fp.pos;
-        // Phase 3a: MVD positions have no wavelet interpretation. Defensive
-        // guard — in practice the pipeline doesn't feed MVD positions here
-        // because UNIWARD runs I-slice only and MVDs are P-slice only.
-        if pos.domain == EmbedDomain::MvdLsb {
-            return f32::INFINITY;
-        }
-        if pos.scan_pos == 0 {
-            return f32::INFINITY;
-        }
-        let within_mb = fp.within_mb_block_idx;
-        let mb_x = fp.mb_idx % width_in_mbs;
-        let mb_y = fp.mb_idx / width_in_mbs;
-
-        // Pick plane, block-pixel offset, and QP based on the slot.
-        let (wavelets, img_w, img_h, block_px_x, block_px_y, qp) = if within_mb < 16 {
-            let (bx, by) = BLOCK_INDEX_TO_POS[within_mb];
-            (
-                &y_wavelets,
-                width,
-                height,
-                mb_x * 16 + bx as usize * 4,
-                mb_y * 16 + by as usize * 4,
-                qps.get(fp.mb_idx).copied().unwrap_or(26),
-            )
-        } else if within_mb <= 17 {
-            // Chroma DC — kept WET.
-            return f32::INFINITY;
-        } else if within_mb < 22 {
-            let slot = within_mb - 18;
-            let bx = slot % 2;
-            let by = slot / 2;
-            (
-                &cb_wavelets,
-                chroma_w,
-                chroma_h,
-                mb_x * 8 + bx * 4,
-                mb_y * 8 + by * 4,
-                fp.qp_cb,
-            )
-        } else if within_mb < 26 {
-            let slot = within_mb - 22;
-            let bx = slot % 2;
-            let by = slot / 2;
-            (
-                &cr_wavelets,
-                chroma_w,
-                chroma_h,
-                mb_x * 8 + bx * 4,
-                mb_y * 8 + by * 4,
-                fp.qp_cr,
-            )
-        } else {
-            return f32::INFINITY;
-        };
-
-        let delta = match pos.domain {
-            EmbedDomain::T1Sign => 2.0,
-            EmbedDomain::LevelSuffixMag => 1.0,
-            EmbedDomain::LevelSuffixSign => 2.0 * pos.coeff_value.unsigned_abs() as f64,
-            EmbedDomain::MvdLsb => unreachable!("MvdLsb handled above"),
-        };
-        let cost = compute_position_cost(
-            &unit_basis,
-            wavelets,
-            img_w,
-            img_h,
-            block_px_x,
-            block_px_y,
-            pos.scan_pos,
-            qp,
-            delta,
-        );
-        if cost.is_finite() && cost > 0.0 {
-            cost as f32
-        } else {
-            f32::INFINITY
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    {
-        frame_positions.par_iter().map(compute_one).collect()
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        frame_positions.iter().map(compute_one).collect()
-    }
-}
-
-/// Minimal description of a position needed to compute its UNIWARD cost in
-/// a reconstructed frame. Build this in the pipeline layer by translating
-/// the pipeline's global `block_idx` into a per-frame `mb_idx` +
-/// `within_mb_block_idx` pair.
-pub struct FramePosition<'a> {
-    pub pos: &'a EmbeddablePosition,
-    /// Macroblock index inside the frame (raster order, 0..width_in_mbs × height_in_mbs).
-    pub mb_idx: usize,
-    /// Block index inside the macroblock (see [`compute_frame_uniward_costs`]
-    /// for the slot layout; 0..=25 under the Phase 2 scheme).
-    pub within_mb_block_idx: usize,
-    /// Chroma QP for Cb (derived once at parse time from qp_y +
-    /// pps.chroma_qp_index_offset). Used when the slot routes to the Cb plane.
-    pub qp_cb: i32,
-    /// Chroma QP for Cr (derived from qp_y + pps.second_chroma_qp_index_offset).
-    pub qp_cr: i32,
-}
+// NOTE (Phase-4 CAVLC retirement): `compute_frame_uniward_costs` +
+// `FramePlanes` + `FramePosition` lived here to cost the legacy CAVLC
+// pipeline's per-position pool (they routed via `EmbeddablePosition` /
+// `EmbedDomain` from `codec::h264::cavlc` + `macroblock::BLOCK_INDEX_TO_POS`).
+// That CAVLC stego subsystem was retired; the surviving OH264 Tier-3 cost
+// path (`codec::h264::stego::content_costs`) builds its own per-position
+// routing and consumes only the primitives kept above
+// (`compute_three_subbands` / `precompute_unit_basis` / `compute_position_cost`
+// / `ThreeSubbands`). See `docs/design/video/_RETIREMENT-PLAN.md` § "Phase 4".
 
 #[cfg(test)]
 mod tests {

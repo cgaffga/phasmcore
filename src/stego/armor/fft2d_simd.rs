@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! SIMD-accelerated radix-2 FFT butterfly chunks (T2.3).
+//! SIMD-accelerated radix-2 FFT butterfly chunks.
 //!
 //! Path A pattern: each SIMD lane computes one butterfly's complex
 //! mul + add/sub. No reduction across lanes, no FMA — every operation

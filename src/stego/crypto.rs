@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use zeroize::Zeroizing;
 use crate::stego::error::StegoError;
 
-// ─── Argon2id structural-key cache (T1.1 from 2026-05 perf audit) ─────
+// ─── Argon2id structural-key cache ───────────────────────────────────
 //
 // Argon2id derivation is ~200 ms per call (OWASP minimum: t=2,
 // m=19 MiB, p=1). A smart_decode call runs Ghost / Ghost-shadow /
@@ -134,7 +134,7 @@ const STRUCTURAL_SALT: &[u8; 16] = b"phasm-ghost-v1\0\0";
 /// Different from Ghost so the same passphrase produces different permutations.
 const ARMOR_STRUCTURAL_SALT: &[u8; 16] = b"phasm-armor-v1\0\0";
 
-/// Fixed salt for DFT template key derivation (Phase 3 geometry resilience).
+/// Fixed salt for DFT template key derivation (Armor geometry resilience).
 /// Independent from structural/armor keys so the template peaks are uncorrelated.
 const TEMPLATE_SALT: &[u8; 16] = b"phasm-tmpl-v1\0\0\0";
 
@@ -151,7 +151,7 @@ pub const SALT_LEN: usize = 16;
 /// Independent from all other keys so shadow permutations are uncorrelated.
 const SHADOW_STRUCTURAL_SALT: &[u8; 16] = b"phasm-shdw-v1\0\0\0";
 
-/// Fixed salt for H.264 Phase 3c MVD-domain structural key. Independent from
+/// Fixed salt for the H.264 MVD-domain structural key. Independent from
 /// the Ghost structural salt so the MVD-domain permutation + STC matrix do
 /// not correlate with the coefficient-domain ones, keeping the two
 /// cross-domain flip sets statistically uncorrelated.
@@ -180,9 +180,9 @@ pub fn derive_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64]>, St
     Ok(output)
 }
 
-/// Derive the H.264 Phase 3c MVD-domain structural key.
+/// Derive the H.264 MVD-domain structural key.
 ///
-/// Independent from `derive_structural_key` so Phase 3c's two cross-domain
+/// Independent from `derive_structural_key` so the two cross-domain
 /// STC runs use uncorrelated permutations and HHat matrices. Same 64-byte
 /// layout as the main structural key: first 32 = perm_seed, last 32 =
 /// hhat_seed.
@@ -194,7 +194,7 @@ pub fn derive_h264_mvd_structural_key(
     Ok(output)
 }
 
-/// H.264 Phase I.0.5: derive a per-GOP seed by mixing a master 32-byte seed
+/// Derive a per-GOP H.264 seed by mixing a master 32-byte seed
 /// with `gop_idx` and a domain label using SHA-256.
 ///
 /// The master seed is already passphrase-derived via `derive_structural_key`
@@ -206,7 +206,7 @@ pub fn derive_h264_mvd_structural_key(
 /// `label` should be a short distinguishing tag (e.g. `b"coeff-perm"`,
 /// `b"coeff-hhat"`) so the four per-GOP seeds (perm + hhat × coeff + MVD)
 /// are mutually uncorrelated even when they share a master.
-pub fn derive_per_gop_seed_from_master(
+pub fn derive_per_gop_seed(
     master_seed: &[u8; 32],
     gop_idx: u32,
     label: &[u8],
@@ -284,8 +284,8 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONC
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
 
-    // §B-direct-fix diag — `PHASM_DETERMINISTIC_SEED=<u64>` env var
-    // overrides the OsRng salt+nonce with a ChaCha8-seeded RNG so
+    // Diagnostic override: `PHASM_DETERMINISTIC_SEED=<u64>` env var
+    // replaces the OsRng salt+nonce with a ChaCha8-seeded RNG so
     // consecutive encode runs produce byte-identical output (modulo
     // any other non-determinism in the encoder). Diagnostic-only:
     // production paths leave the env var unset, falling back to
@@ -346,6 +346,39 @@ pub fn decrypt(
     cipher
         .decrypt(nonce, ciphertext)
         .map_err(|_| StegoError::DecryptionFailed)
+}
+
+/// Test-only serialization for the process-global `PHASM_DETERMINISTIC_SEED`
+/// env var (read by [`encrypt`] to force a deterministic salt+nonce for
+/// repeatable encode runs). Env vars are process-wide, so a test that sets
+/// the seed must not run concurrently with one that needs the production
+/// (random) crypto path — e.g. `ciphertext_differs_per_encryption`. All
+/// seed-toggling tests in the lib test binary acquire this lock.
+#[cfg(test)]
+pub(crate) static SEED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: lock [`SEED_ENV_LOCK`] and set `PHASM_DETERMINISTIC_SEED`;
+/// clears the var (and releases the lock) on drop. Use in any lib test that
+/// needs a deterministic salt+nonce.
+#[cfg(test)]
+pub(crate) struct DeterministicSeedGuard(std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl DeterministicSeedGuard {
+    pub(crate) fn set(seed: &str) -> Self {
+        let g = SEED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: writes are serialized by SEED_ENV_LOCK; cleared on drop.
+        unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", seed) };
+        Self(g)
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeterministicSeedGuard {
+    fn drop(&mut self) {
+        // SAFETY: still holding SEED_ENV_LOCK while we clear the var.
+        unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED") };
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +505,12 @@ mod tests {
     fn ciphertext_differs_per_encryption() {
         // Even with the same plaintext and passphrase, each encryption
         // should produce different ciphertext (due to random salt + nonce).
+        // Serialize against deterministic-seed tests and force the random
+        // path: PHASM_DETERMINISTIC_SEED is process-global, so a parallel
+        // AV1 deterministic-seed test could otherwise pin encrypt()'s nonce.
+        let _seed_lock = super::SEED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: holding SEED_ENV_LOCK; restore the production (unset) path.
+        unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED") };
         let msg = b"same message";
         let (ct1, _, _) = encrypt(msg, "pass").unwrap();
         let (ct2, _, _) = encrypt(msg, "pass").unwrap();

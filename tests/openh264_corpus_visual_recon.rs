@@ -19,10 +19,10 @@
 //
 // Default smoke: iphone7_smoke (640x368 / 8 frames, intra_period=60)
 // runs unignored. Larger fixtures stay #[ignore] for local invocation:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //       --test openh264_corpus_visual_recon -- --ignored --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::cabac::bin_decoder::slice::walk_annex_b_for_cover;
 use phasm_core::codec::h264::openh264::{

@@ -28,11 +28,11 @@
 // fork's SPS/slice-header emission, these assertions will fail and force
 // re-reading the negative-result memory before shipping.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use phasm_core::codec::h264::bitstream::parse_nal_units_annexb;
 use phasm_core::codec::h264::slice::parse_slice_header;
 use phasm_core::codec::h264::sps::{parse_pps, parse_sps};
@@ -62,20 +62,17 @@ fn deterministic_yuv(w: u32, h: u32, n_frames: u32) -> Vec<u8> {
 
 #[test]
 fn v04a_sps_signals_single_ref_frame_matches_iphone7_cohort() {
-    let _g = session_guard().lock().unwrap();
+    let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
 
     // Smallest 16-aligned content-rich YUV with a P-frame: 64x48x3.
-    // Frames 0 = IDR, 1+ = P (intra_period=60 by default).
+    // Frames 0 = IDR, 1+ = P (single GOP, so all post-IDR frames are P).
     let w = 64u32;
     let h = 48u32;
     let n_frames = 3u32;
     let yuv = deterministic_yuv(w, h, n_frames);
-    let opts = EncodeOpts { qp: 26, intra_period: 60 };
 
-    let annex_b = openh264_stego_encode_yuv_text(
-        &yuv, w, h, n_frames, opts, "x", "p",
-    )
-    .expect("OH264 stego encode must succeed on tiny deterministic YUV");
+    let annex_b = oh264_stream::encode(&yuv, w, h, n_frames, 26, "x", "p")
+        .expect("OH264 stego encode must succeed on tiny deterministic YUV");
 
     let nals = parse_nal_units_annexb(&annex_b).expect("Annex-B parse");
     let sps_nal = nals
@@ -97,21 +94,18 @@ fn v04a_sps_signals_single_ref_frame_matches_iphone7_cohort() {
 
 #[test]
 fn v04a_slice_header_num_active_l0_observation() {
-    let _g = session_guard().lock().unwrap();
+    let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
 
     let w = 64u32;
     let h = 48u32;
     // 5 frames: IDR + 4 P. Gives the encoder several P-slices to
-    // potentially use the older reference. At intra_period=60 the
-    // last frame is still well within one GOP.
+    // potentially use the older reference. Single GOP, so all four
+    // post-IDR frames are P-slices.
     let n_frames = 5u32;
     let yuv = deterministic_yuv(w, h, n_frames);
-    let opts = EncodeOpts { qp: 26, intra_period: 60 };
 
-    let annex_b = openh264_stego_encode_yuv_text(
-        &yuv, w, h, n_frames, opts, "x", "p",
-    )
-    .expect("OH264 stego encode");
+    let annex_b = oh264_stream::encode(&yuv, w, h, n_frames, 26, "x", "p")
+        .expect("OH264 stego encode");
 
     let nals = parse_nal_units_annexb(&annex_b).expect("Annex-B parse");
     let sps_nal = nals

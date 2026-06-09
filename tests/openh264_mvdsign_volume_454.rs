@@ -52,10 +52,10 @@
 //!
 //! Marked `#[ignore]`: research measurement, not a CI ship-gate. Run
 //! manually:
-//!   cargo test --release --features "h264-encoder openh264-backend" \
+//!   cargo test --release --features "h264-encoder" \
 //!     --test openh264_mvdsign_volume_454 -- --ignored --nocapture
 
-#![cfg(feature = "openh264-backend")]
+#![cfg(feature = "h264-encoder")]
 
 use core_openh264_sys::PhasmStegoDomain;
 use phasm_core::codec::h264::cabac::bin_decoder::{
@@ -226,7 +226,7 @@ fn measure_cascade_leak(
     let baseline_h264 = encode_clean(yuv, width, height, n_frames);
     let baseline = walk_annex_b_for_cover_with_options(
         &baseline_h264,
-        WalkOptions { record_mvd: true, record_offsets: false },
+        WalkOptions { record_mvd: true },
     )
     .unwrap_or_else(|e| panic!("{label}: baseline walker: {e:?}"));
     let n_mvd = baseline.mvd_meta.len();
@@ -249,7 +249,7 @@ fn measure_cascade_leak(
     let flipped_h264 = encode_with_mvd_overrides(yuv, width, height, n_frames, &flip_mask);
     let flipped = walk_annex_b_for_cover_with_options(
         &flipped_h264,
-        WalkOptions { record_mvd: true, record_offsets: false },
+        WalkOptions { record_mvd: true },
     )
     .unwrap_or_else(|e| panic!("{label}: flipped walker: {e:?}"));
 

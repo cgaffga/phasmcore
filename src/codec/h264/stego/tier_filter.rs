@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Track 1 (D'.1) — Tunable cascade-safety tiers for H.264 video stego.
+// Tunable cascade-safety tiers for H.264 video stego.
 //
 // Discrete tier 0..4 controls a deterministic filter on cover positions.
 // The filter rejects positions whose estimated per-flip pixel impact
@@ -85,16 +85,6 @@ impl CascadeTier {
         }
     }
 
-    pub fn cli_alias(self) -> &'static str {
-        match self {
-            CascadeTier::Auto => "auto",
-            CascadeTier::Tier0 => "max-capacity",
-            CascadeTier::Tier1 => "balanced",
-            CascadeTier::Tier2 => "quality",
-            CascadeTier::Tier3 => "high-quality",
-            CascadeTier::Tier4 => "best-quality",
-        }
-    }
 }
 
 /// Default headroom for auto-tier selection: encoder needs
@@ -102,11 +92,6 @@ impl CascadeTier {
 /// AES envelope (~44 B), frame header (~10 B), STC w-slack (~20%), and
 /// per-GOP capacity variance (±10%).
 pub const DEFAULT_HEADROOM: f32 = 1.2;
-
-/// Decoder brute-force trial order. Auto-tier extremes (4 = small
-/// messages, 0 = large messages) cover ~80% of real encodes. Mid-tiers
-/// less common in practice.
-pub const DECODE_TIER_TRIAL_ORDER: [u8; 5] = [4, 0, 3, 1, 2];
 
 // ─── Pixel-delta primitives ──────────────────────────────────────
 
@@ -313,8 +298,8 @@ pub fn capacity_at_tier(cover: &DomainCover, csb_qp: &[i32], csl_qp: &[i32], tie
 /// Auto-select the highest tier whose capacity comfortably exceeds the
 /// message size by `headroom` factor.
 ///
-/// **D'.7 calibration (2026-05-28)** — empirical sweep over 13 real-world
-/// fixtures × 5 tiers shows the tier filter is **content-neutral** on
+/// Calibration (2026-05-28) — an empirical sweep over 13 real-world
+/// fixtures × 5 tiers showed the tier filter is **content-neutral** on
 /// real video: each fixture's roundtrip outcome is identical across all
 /// tiers. Aggressive count-based selection is safe on real content.
 ///
@@ -508,13 +493,4 @@ mod tests {
         assert_eq!(unique.len(), 5);
     }
 
-    #[test]
-    fn cli_aliases_lowercase() {
-        for t in [CascadeTier::Tier0, CascadeTier::Tier1, CascadeTier::Tier2,
-                  CascadeTier::Tier3, CascadeTier::Tier4]
-        {
-            let alias = t.cli_alias();
-            assert_eq!(alias, alias.to_lowercase());
-        }
-    }
 }

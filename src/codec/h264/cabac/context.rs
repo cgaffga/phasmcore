@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! H.264 CABAC context model. Phase 6C.1.
+//! H.264 CABAC context model.
 //!
 //! Per spec § 9.3.1 each context has two fields: `pStateIdx` (0..63,
 //! probability-state index) and `valMPS` (0..1, value of the Most
-//! Probable Symbol). Applied via `update_mps()` on MPS encode and
-//! `update_lps()` on LPS encode (which can flip `valMPS` at the
-//! saturated pStateIdx=0 state).
+//! Probable Symbol). Applied via `update_mps()` when the MPS is coded
+//! and `update_lps()` when the LPS is coded (which can flip `valMPS`
+//! at the saturated pStateIdx=0 state). The state transition is
+//! direction-neutral; here it runs on the decode path.
 //!
 //! Tables driving these updates live in [`super::tables`].
 
@@ -25,7 +26,7 @@ pub struct CabacContext {
 
 impl CabacContext {
     /// Create a context with explicit state. Used by
-    /// `InitializeContextVariables` (Phase 6C.2) or test setups.
+    /// `InitializeContextVariables` or test setups.
     pub fn new(p_state_idx: u8, val_mps: u8) -> Self {
         debug_assert!(p_state_idx <= 63);
         debug_assert!(val_mps <= 1);
@@ -37,7 +38,7 @@ impl CabacContext {
 
     /// Special non-adapting state for `ctxIdx = 276` (spec Table 9-11
     /// Note 2): `pStateIdx = 63, valMPS = 0`. Never updated because
-    /// the only access path is `encode_terminate` which doesn't
+    /// the only access path is `decode_terminate` which doesn't
     /// update context state.
     pub const fn non_adapting_276() -> Self {
         Self {
@@ -104,7 +105,7 @@ pub fn compute_initial_state(m: i32, n: i32, slice_qp_y: i32) -> CabacContext {
     }
 }
 
-/// Slot index into `CTX_INIT_MN[ctxIdx][slot]` (Phase 6C.2 table layout).
+/// Slot index into `CTX_INIT_MN[ctxIdx][slot]`.
 ///
 /// I / SI slices use slot 0 (single column, no `cabac_init_idc`).
 /// P / SP / B slices use slots 1, 2, or 3 per `cabac_init_idc`.

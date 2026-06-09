@@ -5,11 +5,13 @@
 //! Pack / unpack helpers for the I_16x16 mb_type encoding per spec
 //! § 7.3.5 + Table 7-11.
 //!
-//! Phase 6F.1 follow-on tidy (Task #50, deferred-item #36) — the
-//! forward and inverse formulas were duplicated across
-//! `cabac::encoder` (forward) and `cabac::bin_decoder::slice`
-//! (inverse). They now live here as a single paired pair so any
-//! future spec-table change touches one place.
+//! The forward and inverse I_16x16 mb_type formulas were originally
+//! duplicated across the (now-removed) pure-Rust CABAC encoder
+//! (forward) and `cabac::bin_decoder::slice` (inverse). They are
+//! unified here so any future spec-table change touches one place:
+//! the bin-decoder calls the inverse `unpack_i_16x16_mb_type`, and
+//! the forward `pack_i_16x16_mb_type` is retained for the round-trip
+//! test.
 //!
 //! The encoding packs three I_16x16 macroblock-type fields into one
 //! `mb_type` value in the range 1..=24:

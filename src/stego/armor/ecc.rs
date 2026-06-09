@@ -238,7 +238,7 @@ pub fn rs_encode_blocks(payload: &[u8]) -> Vec<u8> {
 /// Compute syndromes S_0 .. S_{2t-1} for a received block (FCR=0).
 /// poly_eval treats received as highest-degree-first: r(x) = received[0]*x^{n-1} + ...
 ///
-/// **Legacy implementation** — kept for the T3.5 bit-exact gate
+/// **Legacy implementation** — kept for the bit-exact gate
 /// (`syndromes_fast_matches_legacy`). Production callers use
 /// [`compute_syndromes_fast`] / [`compute_syndromes_fast_n`].
 #[allow(dead_code)]
@@ -252,7 +252,7 @@ fn compute_syndromes(received: &[u8]) -> Vec<u8> {
     syndromes
 }
 
-/// T3.5 — per-α^i GF(2^8) multiplication lookup tables.
+/// Per-α^i GF(2^8) multiplication lookup tables.
 ///
 /// `mul_tables[i][x]` = `gf_mul(x, α^i)` for i ∈ 0..MAX_PARITY_TABLES,
 /// x ∈ 0..256. Used by `compute_syndromes_fast_n` to evaluate each
@@ -299,7 +299,7 @@ fn syndrome_mul_tables() -> &'static SyndromeMulTables {
     })
 }
 
-/// T3.5 — restructured `compute_syndromes` that evaluates all
+/// Restructured `compute_syndromes` that evaluates all
 /// `parity_len` syndromes in parallel by swapping the outer/inner
 /// loop order. Each inner iteration reads one entry from a
 /// precomputed `α^i`-multiplication table and XORs the data byte,
@@ -329,7 +329,7 @@ fn compute_syndromes_fast(received: &[u8]) -> Vec<u8> {
     compute_syndromes_fast_n(received, PARITY_LEN)
 }
 
-/// Perf-bench helpers (T3.5). doc-hidden, pub so the
+/// Perf-bench helpers. doc-hidden, pub so the
 /// `perf_t35_syndromes` integration test can compare paths.
 #[doc(hidden)]
 pub fn perf_legacy_compute_syndromes(received: &[u8], parity_len: usize) -> Vec<u8> {
@@ -567,7 +567,7 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<(Vec<u8>, usize), R
     let mut full_block = vec![0u8; N_MAX];
     full_block[padding..].copy_from_slice(received);
 
-    // T1.7 — skip leading-zero padding in syndrome compute. Padding
+    // Skip leading-zero padding in syndrome compute. Padding
     // bytes contribute 0 to every term of poly_eval (Horner's rule:
     // `result = result * x + 0` is `result * x`, no information
     // added), so `&full_block[padding..]` is mathematically identical
@@ -605,7 +605,7 @@ pub fn rs_decode(received: &[u8], data_len: usize) -> Result<(Vec<u8>, usize), R
         corrected[array_pos] = gf_add(corrected[array_pos], magnitudes[i]);
     }
 
-    // Verify syndromes are now zero. T1.7 — leading bytes still
+    // Verify syndromes are now zero. Leading bytes still
     // zero post-correction (correction loop above rejects
     // array_pos < padding), so same `[padding..]` slice optimization
     // applies.
@@ -758,9 +758,9 @@ pub fn rs_decode_with_parity(
     let mut full_block = vec![0u8; N_MAX];
     full_block[padding..].copy_from_slice(received);
 
-    // Compute syndromes with the given parity length. T1.7 — skip
+    // Compute syndromes with the given parity length. Skip
     // leading-zero padding (see `rs_decode` for the math identity);
-    // saves padding × parity_len poly_eval iterations. T3.5 — fast
+    // saves padding × parity_len poly_eval iterations. The fast
     // path collapses the inner gf_mul chain to a single byte-table
     // lookup via per-α^i precomputed multiplication tables.
     let non_zero = &full_block[padding..];
@@ -789,9 +789,9 @@ pub fn rs_decode_with_parity(
         corrected[array_pos] = gf_add(corrected[array_pos], magnitudes[i]);
     }
 
-    // Verify syndromes are now zero. T1.7 — same `[padding..]`
+    // Verify syndromes are now zero. Same `[padding..]`
     // optimization (corrected[..padding] is provably zero by the
-    // array_pos < padding rejection above). T3.5 — same fast path.
+    // array_pos < padding rejection above), same fast path.
     let non_zero = &corrected[padding..];
     let post_syndromes = compute_syndromes_fast_n(non_zero, parity_len);
     if post_syndromes.iter().any(|&s| s != 0) {

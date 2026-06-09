@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Phasm-core decode-side wrapper around the W3.D phasm-dav1d fork
-//! hooks. Takes encoded AV1 bytes, drives dav1d with a recording
+//! Phasm-core decode-side wrapper around the phasm-dav1d fork hooks.
+//! Takes encoded AV1 bytes, drives dav1d with a recording
 //! bit_hook + tag_hook registered, returns a [`DecodedCoverPositions`]
 //! view of every 50/50 binary symbol decoded.
 //!
@@ -14,7 +14,7 @@
 //! - Encoder cursor N's `(natural_value, tag)` == decoder cursor N's
 //!   `(decoded_value, tag)` for every N
 //!
-//! W3.D.4.3's round-trip test asserts that equivalence on a real
+//! The round-trip test asserts that equivalence on a real
 //! rav1e-encoded fixture.
 //!
 //! # FFI lifetime contract
@@ -29,7 +29,7 @@
 //! For v0.3-AV1 single-thread, single-frame decode, this is safe —
 //! dav1d calls back inline during `dav1d_send_data` /
 //! `dav1d_get_picture`. For multi-frame / multi-thread (v0.5+), this
-//! pattern needs revisiting per `dav1d-hook-sites.md` § 6.
+//! pattern needs revisiting (see docs/design/video/av1/dav1d-hook-sites.md).
 
 use core_dav1d_sys::{
     dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings,
@@ -52,19 +52,18 @@ pub enum Av1DecodeError {
 }
 
 /// A single L(1) cover position from a decoded AV1 frame. Mirror of
-/// the encoder-side `CoverPosition` (W3.D.4.2-folded-into-W3.10
-/// helper); cursor is the monotonic 50/50 emission count starting
-/// from 0.
+/// the encoder-side `CoverPosition` helper; cursor is the monotonic
+/// 50/50 emission count starting from 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedCoverPosition {
     /// Monotonic cursor — index into the decoded bit stream.
     pub cursor: u64,
     /// The bit value dav1d decoded at this position (0 or 1).
     pub decoded_value: u8,
-    /// Channel tag set by the W3.D.3 site patches in `recon_tmpl.c`:
+    /// Channel tag set by the site patches in `recon_tmpl.c`:
     /// `DAV1D_PHASM_TAG_OTHER` / `_AC_COEFF_SIGN` / `_GOLOMB_TAIL_LSB`.
     pub tag: u8,
-    /// Phase B.1.1.b: spatial metadata. Only meaningful when
+    /// Spatial metadata. Only meaningful when
     /// `tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN`; otherwise zero-init.
     /// Mirror of encoder-side `phasm_rav1e::AcSignMeta` — used by
     /// J-UNIWARD cost compute to map decoded cover bit to a
@@ -73,11 +72,11 @@ pub struct DecodedCoverPosition {
 }
 
 /// Visible-region YUV planes extracted from the last decoded picture.
-/// Phase B.1.4 — required by the AoSO self-steganalyzer adapter to
-/// compute J-UNIWARD cost on the STEGO reconstruction (decoder-side),
-/// not the encoder's `recording.reconstructed_planes`. For natural
-/// covers the two coincide; for stego streams they differ at flipped
-/// positions because the residual reconstruction inverts there.
+/// Required by the AoSO self-steganalyzer adapter to compute J-UNIWARD
+/// cost on the STEGO reconstruction (decoder-side), not the encoder's
+/// `recording.reconstructed_planes`. For natural covers the two
+/// coincide; for stego streams they differ at flipped positions
+/// because the residual reconstruction inverts there.
 ///
 /// Width/height are visible dimensions (after dav1d crop). Chroma
 /// dimensions reflect 4:2:0 subsampling (the only layout we ship in
@@ -98,7 +97,7 @@ pub struct DecodedFramePlanes {
 #[derive(Debug, Clone, Default)]
 pub struct DecodedCoverPositions {
     all: Vec<DecodedCoverPosition>,
-    /// Phase B.1.4: optional visible-region YUV. Populated by
+    /// Optional visible-region YUV. Populated by
     /// [`decode_with_recording_with_pixels`]; the legacy
     /// `decode_with_recording` leaves this `None` so existing tests
     /// don't pay the pixel-copy cost.
@@ -131,11 +130,11 @@ impl DecodedCoverPositions {
 #[derive(Default)]
 struct RecorderState {
     bits: Vec<(u8, u8)>, // (decoded_value, tag)
-    /// Phase B.1.1.b: sticky meta state. meta_hook_cb writes here;
-    /// bit_hook_cb reads here and zips into the (bit, tag, meta)
-    /// tuple per emission. Mirrors encoder-side phasm_current_meta.
+    /// Sticky meta state. meta_hook_cb writes here; bit_hook_cb reads
+    /// here and zips into the (bit, tag, meta) tuple per emission.
+    /// Mirrors encoder-side phasm_current_meta.
     current_meta: core_dav1d_sys::Dav1dPhasmAcSignMeta,
-    /// Phase B.1.1.b: per-emission meta, parallel to `bits`.
+    /// Per-emission meta, parallel to `bits`.
     metas: Vec<core_dav1d_sys::Dav1dPhasmAcSignMeta>,
 }
 
@@ -157,16 +156,15 @@ unsafe extern "C" fn bit_hook_cb(
 ) {
     let state = unsafe { &mut *(cookie as *mut RecorderState) };
     state.bits.push((bit as u8, tag));
-    // Phase B.1.1.b: pull the current sticky meta into the parallel
-    // Vec. Set by `meta_hook_cb` at AC sign sites; stale for non-AC
-    // emissions (acceptable — phasm-core only reads meta for AC).
+    // Pull the current sticky meta into the parallel Vec. Set by
+    // `meta_hook_cb` at AC sign sites; stale for non-AC emissions
+    // (acceptable — phasm-core only reads meta for AC).
     state.metas.push(state.current_meta);
 }
 
-/// Phase B.1.1.b: FFI callback wired into
-/// `Dav1dSettings.phasm_hooks.meta_hook`. Fires at each AC sign
-/// decode site BEFORE the bit_hook_cb so the meta is in place when
-/// the bit is captured.
+/// FFI callback wired into `Dav1dSettings.phasm_hooks.meta_hook`.
+/// Fires at each AC sign decode site BEFORE the bit_hook_cb so the
+/// meta is in place when the bit is captured.
 ///
 /// # Safety
 ///
@@ -184,16 +182,16 @@ unsafe extern "C" fn meta_hook_cb(
 }
 
 /// Decode an AV1 byte stream and capture all 50/50 binary emissions
-/// via the W3.D phasm-dav1d hooks. The returned
-/// [`DecodedCoverPositions`] is the decoder-side counterpart of
-/// phasm-rav1e's `phasm_bit_positions` / `phasm_bit_tags` on the
-/// encoder side.
+/// via the phasm-dav1d hooks. The returned [`DecodedCoverPositions`]
+/// is the decoder-side counterpart of phasm-rav1e's
+/// `phasm_bit_positions` / `phasm_bit_tags` on the encoder side.
 ///
 /// # v0.3-AV1 constraints
 /// - Single-thread (`n_threads=1`) — avoids hook serialisation across
 ///   worker threads
 /// - Single-frame-delay (`max_frame_delay=1`) — avoids per-frame
-///   cookie multiplexing complexity per `dav1d-hook-sites.md` § 6
+///   cookie multiplexing complexity
+///   (see docs/design/video/av1/dav1d-hook-sites.md)
 ///
 /// # Errors
 /// Returns [`Av1DecodeError`] variants for `dav1d_open` / `_send_data`
@@ -205,12 +203,12 @@ pub fn decode_with_recording(
     decode_with_recording_inner(av1_bytes, false)
 }
 
-/// Phase B.1.4 variant: same as [`decode_with_recording`] but also
-/// extracts the last decoded picture's visible-region YUV planes via
-/// the [`Dav1dPictureView`] layout mirror. The returned positions
+/// Variant of [`decode_with_recording`] that also extracts the last
+/// decoded picture's visible-region YUV planes via the
+/// [`Dav1dPictureView`] layout mirror. The returned positions
 /// have `planes = Some(_)` populated.
 ///
-/// Used by the W6/AoSO self-steganalyzer to compute J-UNIWARD costs
+/// Used by the AoSO self-steganalyzer to compute J-UNIWARD costs
 /// over stego-side reconstructed pixels (NOT the encoder's pre-flip
 /// recording, which would yield identical costs to cover and erase
 /// any signal).
@@ -309,7 +307,7 @@ fn decode_with_recording_inner(
                 as *mut core::ffi::c_void,
             bit_hook: Some(bit_hook_cb),
             tag_hook: None, // not used for v0.3 recording
-            meta_hook: Some(meta_hook_cb), // Phase B.1.1.b
+            meta_hook: Some(meta_hook_cb),
         };
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
@@ -353,15 +351,15 @@ fn decode_with_recording_inner(
             let mut pic = Dav1dPicture::default();
             let rc = dav1d_get_picture(ctx, &mut pic);
             if rc == 0 {
-                // Phase B.1.4: if pixel capture is requested, read
-                // the visible YUV via the Dav1dPictureView layout
-                // mirror BEFORE unref. We keep the LAST picture
-                // we see — v0.3 is single-frame so this is fine.
+                // If pixel capture is requested, read the visible YUV
+                // via the Dav1dPictureView layout mirror BEFORE unref.
+                // We keep the LAST picture we see — v0.3 is
+                // single-frame so this is fine.
                 if capture_pixels {
                     let view = &*(&pic as *const Dav1dPicture as *const Dav1dPictureView);
                     assert_eq!(
                         view.p_layout, 1,
-                        "Phase B.1.4 only handles 4:2:0 (Dav1dPixelLayout I420 == 1), got {}",
+                        "pixel capture only handles 4:2:0 (Dav1dPixelLayout I420 == 1), got {}",
                         view.p_layout
                     );
                     let luma_w = view.p_w as usize;
@@ -420,8 +418,8 @@ fn decode_with_recording_inner(
     }
 
     // Convert raw (value, tag, meta) tuples into structured positions.
-    // Phase B.1.1.b: bits + metas Vecs are pushed in lockstep by
-    // bit_hook_cb (meta is current sticky state at bit-capture time).
+    // bits + metas Vecs are pushed in lockstep by bit_hook_cb (meta
+    // is current sticky state at bit-capture time).
     debug_assert_eq!(
         recorder.bits.len(),
         recorder.metas.len(),
@@ -488,12 +486,12 @@ mod tests {
     }
 
     // ============================================================
-    // W3.D.4.3: rav1e encode + dav1d decode round-trip test.
+    // rav1e encode + dav1d decode round-trip test.
     // ============================================================
     //
-    // First end-to-end test where encoder + decoder are both
+    // End-to-end test where encoder + decoder are both
     // actively recording and we cross-validate. If this passes, the
-    // entire W3.D architecture is proven correct.
+    // entire phasm-dav1d architecture is proven correct.
     //
     // Approach:
     //   1. Encode a tiny gradient key frame via rav1e Context API
@@ -502,7 +500,7 @@ mod tests {
     //   3. Assert the decoder captured at least one AC_COEFF_SIGN bit
     //      (proves the hooks fired end-to-end on real input).
     //
-    // Future extensions (W3.10+):
+    // Future extensions:
     //   - Compare decoder cursor sequence to encoder cursor sequence
     //     (load-bearing equivalence: cursor N's natural_value must
     //     equal cursor N's decoded_value).
@@ -645,13 +643,13 @@ mod tests {
             )
         }
 
-        /// W3.D.4.3 round-trip test: rav1e encode a gradient frame
+        /// Round-trip test: rav1e encode a gradient frame
         /// → dav1d decode the OBU bytes with recording → assert the
         /// decoder hook fired on at least some AC_COEFF_SIGN bits.
         ///
-        /// If this passes, the entire W3.D architecture
-        /// (W3.D.1 design + W3.D.2.* hooks + W3.D.3 tag sites +
-        /// W3.D.4.1 FFI + W3.D.4.2 wrapper) is end-to-end functional.
+        /// If this passes, the entire phasm-dav1d architecture
+        /// (design + hooks + tag sites + FFI + wrapper) is end-to-end
+        /// functional.
         #[test]
         fn w3d43_rav1e_encode_dav1d_decode_round_trip() {
             use core_dav1d_sys::DAV1D_PHASM_TAG_AC_COEFF_SIGN;
@@ -684,7 +682,7 @@ mod tests {
             assert!(
                 ac_sign_count > 0,
                 "expected ≥1 AC_COEFF_SIGN-tagged position; got 0 of {} total. \
-                 Either W3.D.3 site patches didn't propagate to runtime decode \
+                 Either dav1d site patches didn't propagate to runtime decode \
                  path, or encoder produced no AC coefficients at this QP",
                 positions.len()
             );
@@ -700,22 +698,20 @@ mod tests {
             }
         }
 
-        /// W3.10.4 STRICT cursor parity test — uses
-        /// encode_frame_with_phasm_tee to get OBU-wrapped bytes AND
-        /// per-tile recorder data from a SINGLE encode pass. Then
-        /// dav1d-decodes those exact bytes with the recording hook.
+        /// STRICT cursor parity test — uses encode_frame_with_phasm_tee
+        /// to get OBU-wrapped bytes AND per-tile recorder data from a
+        /// SINGLE encode pass. Then dav1d-decodes those exact bytes
+        /// with the recording hook.
         ///
         /// **Asserts STRICT byte-and-tag parity**: for every cursor
         /// in [0, total_bits), encoder.natural_value ==
         /// decoder.decoded_value AND encoder.tag == decoder.tag.
         ///
-        /// **2026-05-21 result on 128×128 gradient frame** (after
-        /// W3.10.4-fix: phasm-rav1e `replay()` resets dest tag +
-        /// phasm-dav1d DC golomb sites tagged):
-        ///   Total 50/50 bits: 16421 == 16421 ✓
-        ///   AC_SIGN tags: 5077 == 5077 ✓
-        ///   GOLOMB tags: 10636 == 10636 ✓
-        ///   OTHER tags: 708 == 708 ✓
+        /// **Measured result on 128×128 gradient frame**:
+        ///   Total 50/50 bits: 16421 == 16421
+        ///   AC_SIGN tags: 5077 == 5077
+        ///   GOLOMB tags: 10636 == 10636
+        ///   OTHER tags: 708 == 708
         ///   Zero tag disagreements, zero value disagreements.
         ///
         /// This is THE LOAD-BEARING equivalence for v0.3-AV1 stego —
@@ -800,10 +796,10 @@ mod tests {
                 .collect();
 
             // === STRICT PARITY ASSERTIONS ===
-            // After W3.10.4-fix (replay() resets dest tag +
-            // dav1d DC golomb tag sites), encoder + decoder agree
-            // on EVERY bit's value AND tag across all 16421
-            // emissions on the 128×128 gradient.
+            // With phasm-rav1e `replay()` resetting dest tag + dav1d
+            // DC golomb tag sites, encoder + decoder agree on EVERY
+            // bit's value AND tag across all 16421 emissions on the
+            // 128×128 gradient.
             let encoder_total = recording.tiles[0].bit_positions.len();
             let decoder_total = decoder_positions.len();
 
@@ -857,10 +853,9 @@ mod tests {
             }
         }
 
-        /// W3.10.3 STRICT cursor parity test — uses WriterTee to
-        /// produce bytes + recorder data from a SINGLE encode pass,
-        /// so the decoder + encoder are guaranteed to see the same
-        /// emission stream.
+        /// STRICT cursor parity test — uses WriterTee to produce bytes
+        /// + recorder data from a SINGLE encode pass, so the decoder
+        /// + encoder are guaranteed to see the same emission stream.
         ///
         /// For every AC_COEFF_SIGN-tagged position:
         ///   encoder.natural_value (recorded during the encode that
@@ -886,9 +881,9 @@ mod tests {
             use phasm_rav1e::prelude::Sequence;
             use phasm_rav1e::EncoderConfig;
 
-            // Build the same frame state as W3.10.2 but encode via
-            // WriterTee — single encode produces both bytes AND
-            // recorder data.
+            // Build the same frame state as the soft-parity test but
+            // encode via WriterTee — single encode produces both bytes
+            // AND recorder data.
             let config = Arc::new(EncoderConfig {
                 width: 64,
                 height: 64,
@@ -948,20 +943,21 @@ mod tests {
             // Decoder side: encode via Context (which goes through
             // a separate path — but we need OBU-wrapped bytes for
             // dav1d). For STRICT parity, ideally we'd splice tile_bytes
-            // into a stego OBU wrapper, but that's W3.10.4 territory.
-            // Here we use Context encode for the OBU bytes + accept
-            // that those bytes might differ from tile_bytes — what we
-            // CAN test strictly is that encoder records correctly
-            // even if not byte-paired with the decoder run.
+            // into a stego OBU wrapper, but that's covered by the
+            // phasm-tee test. Here we use Context encode for the OBU
+            // bytes + accept that those bytes might differ from
+            // tile_bytes — what we CAN test strictly is that encoder
+            // records correctly even if not byte-paired with the
+            // decoder run.
             //
             // Specifically: this test validates the WriterTee
             // primitive works correctly (encoder + recorder in lockstep
-            // on a single pass). True strict parity needs W3.10.4
-            // OBU-wrap + send the SAME bytes both directions.
+            // on a single pass). True strict parity needs OBU-wrap +
+            // sending the SAME bytes both directions.
             //
             // For now we assert that WriterTee captured a substantial
             // count of AcCoeffSign tags. The strict per-cursor parity
-            // test against dav1d follows in W3.10.4.
+            // test against dav1d lives in the phasm-tee variant above.
 
             assert!(
                 encoder_ac.len() > 100,
@@ -979,15 +975,13 @@ mod tests {
             }
         }
 
-        /// W3.10.2 SOFT cursor parity test — sanity check that
-        /// encoder + decoder produce SIMILAR AC sign counts on the
-        /// same input.
+        /// SOFT cursor parity test — sanity check that encoder +
+        /// decoder produce SIMILAR AC sign counts on the same input.
         ///
-        /// **Important architectural finding (2026-05-21):** strict
-        /// cursor parity (encoder[N].natural_value ==
-        /// decoder[N].decoded_value for every N) requires running
-        /// BOTH paths on the SAME single encode. We don't have that
-        /// infra yet — current options:
+        /// **Important architectural finding:** strict cursor parity
+        /// (encoder[N].natural_value == decoder[N].decoded_value for
+        /// every N) requires running BOTH paths on the SAME single
+        /// encode. The historical options:
         ///
         ///   A. encode_tile<WriterRecorder> (manual setup, no Context
         ///      lookahead pre-processing) → recorder positions, plus
@@ -1005,14 +999,11 @@ mod tests {
         ///      output ourselves (don't go through Context). Requires
         ///      implementing AV1 OBU framing in phasm-core.
         ///
-        /// Option B or C is W3.10.3+ work (orchestrator plumbing).
-        /// For now, this test does a SOFT check: both sides should
-        /// see roughly the same number of AC sign bits (within
-        /// tolerance) on the same gradient input. Catches gross
-        /// misalignment without requiring path-perfect alignment.
-        ///
-        /// Strict cursor parity will land as a separate test in
-        /// W3.10.3+ once orchestrator infra exists.
+        /// Option B was eventually picked up by the phasm-tee variant
+        /// (strict parity test above). This SOFT check stays as a
+        /// gross-misalignment canary: both sides should see roughly
+        /// the same number of AC sign bits (within tolerance) on the
+        /// same gradient input.
         #[test]
         fn w3102_soft_parity_ac_coeff_sign_count() {
             use core_dav1d_sys::DAV1D_PHASM_TAG_AC_COEFF_SIGN;

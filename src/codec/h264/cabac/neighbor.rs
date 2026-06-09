@@ -3,8 +3,9 @@
 // https://github.com/cgaffga/phasmcore
 
 #![allow(clippy::field_reassign_with_default)]
-// Same reasoning as in encoder.rs: step-by-step CabacNeighborMB
-// construction annotated per-field with spec references.
+// Step-by-step CabacNeighborMB construction (in this module and its
+// tests) is annotated per-field with spec references, so the
+// field-reassign-after-default pattern is intentional.
 
 //! CABAC neighbor context + `ctxIdxInc` derivation (spec § 9.3.3.1.1).
 //!
@@ -13,10 +14,11 @@
 //! ("A" = left, "B" = top). This module holds the per-MB state the
 //! derivation rules read and the rules themselves.
 //!
-//! Phase 6C.4 scope: all Baseline / Main (I + P) syntax elements with
-//! `ChromaArrayType = 1` (4:2:0) and progressive (non-MBAFF) coding.
-//! B-slice, MBAFF, and 4:4:4 rules are stubbed with
-//! `todo!()` guards — Phase 6C doesn't emit them.
+//! Scope: I / P / B syntax elements with `ChromaArrayType = 1`
+//! (4:2:0) and progressive (non-MBAFF) coding — the production
+//! High-profile path. B-slice rules (including the per-list L1 MVD
+//! derivation) are fully implemented. MBAFF and 4:4:4 rules are out
+//! of scope (the production path never emits them).
 
 use super::context::CabacInitSlot;
 
@@ -37,9 +39,9 @@ pub enum MbTypeClass {
     PInter,
     /// P_Skip (signaled via `mb_skip_flag = 1`).
     PSkip,
-    /// B-slice direct/skip — not used in Phase 6C.
+    /// B-slice direct or skip (B_Skip / B_Direct_16x16).
     BSkipOrDirect,
-    /// B-slice inter — not used in Phase 6C.
+    /// B-slice inter (any L0/L1/Bi or partitioned B macroblock).
     BInter,
 }
 
@@ -68,11 +70,10 @@ impl MbTypeClass {
 
 /// Per-MB state the CABAC context-derivation rules read.
 ///
-/// This is a superset of the data the encoder already tracks in
-/// `i4x4_mode_grid`, `total_coeff_grid`, `mv_grid`, and slice-level
-/// neighbor tables — but re-packaged per-MB to match how the
-/// spec's § 9.3.3.1.1 rules describe neighbors ("is mbAddrN
-/// available?", "is `mb_type[mbAddrN]` P_Skip?", etc.).
+/// Packaged per-MB to match how the spec's § 9.3.3.1.1 rules
+/// describe neighbors ("is mbAddrN available?", "is
+/// `mb_type[mbAddrN]` P_Skip?", etc.): the walker populates one of
+/// these per decoded MB and commits it to the row buffer.
 #[derive(Debug, Clone, Copy)]
 pub struct CabacNeighborMB {
     pub mb_type: MbTypeClass,
@@ -96,8 +97,8 @@ pub struct CabacNeighborMB {
     /// modes (mb_types 1..21) write this when the partition uses
     /// L0 (or Bi).
     pub abs_mvd_comp: [[i16; 16]; 2],
-    /// §6E-A6.1 — Absolute MVD values for **List 1** (B-slice
-    /// L1 / Bi partitions). Same layout as `abs_mvd_comp`. Spec
+    /// Absolute MVD values for **List 1** (B-slice L1 / Bi
+    /// partitions). Same layout as `abs_mvd_comp`. Spec
     /// § 9.3.3.1.1.7 reads this when computing bin0 ctxIdxInc for
     /// an `mvd_l1` component. P-frames + I-frames + B_Skip /
     /// B_Direct leave this at zero (no L1 MVD emitted at those
@@ -234,7 +235,7 @@ pub fn ctx_idx_inc_mb_type_bin0(
 ) -> u32 {
     // P/SP slice: Table 9-39 gives fixed ctxIdxInc=0 for binIdx=0;
     // no neighbor derivation. (Derived from conformance testing +
-    // spec Table 9-39 re-read — Task #21, 2026-04-23.)
+    // spec Table 9-39 re-read.)
     if ctx_idx_offset == 14 {
         return 0;
     }
@@ -274,11 +275,10 @@ pub fn ctx_idx_inc_prior_bin(ctx_idx_offset: u32, bin_idx: u32, prior_bins: &[u8
         (3, 4) => Some(if prior_bins[3] != 0 { 5 } else { 6 }),
         (3, 5) => Some(if prior_bins[3] != 0 { 6 } else { 7 }),
         (14, 2) => Some(if prior_bins[1] != 1 { 2 } else { 3 }),
-        // (17, 4) prior-bin rule verified by Phase D.0-B sweep
-        // (2026-04-23): the pair {2, 3} matches spec Table 9-41 for
-        // the offset=17 P-slice intra suffix bin 4 — inverting to
-        // {3, 2} regresses parity catastrophically (256/256 px
-        // diff). Keep as-is.
+        // (17, 4) prior-bin rule verified by a conformance sweep:
+        // the pair {2, 3} matches spec Table 9-41 for the offset=17
+        // P-slice intra suffix bin 4 — inverting to {3, 2} regresses
+        // parity catastrophically (256/256 px diff). Keep as-is.
         (17, 4) => Some(if prior_bins[3] != 0 { 2 } else { 3 }),
         (27, 2) => Some(if prior_bins[1] != 0 { 4 } else { 5 }),
         (32, 4) => Some(if prior_bins[3] != 0 { 2 } else { 3 }),
@@ -288,11 +288,12 @@ pub fn ctx_idx_inc_prior_bin(ctx_idx_offset: u32, bin_idx: u32, prior_bins: &[u8
 }
 
 /// Compute ctxIdxInc for `mvd_l0` bin 0 (spec § 9.3.3.1.1.7 eq 9-15).
-/// L0-list specialisation. Existing P-frame call sites use this;
-/// B-slice non-direct paths use [`ctx_idx_inc_mvd_bin0_per_list`].
+/// L0-list specialisation; B-slice non-direct paths use the per-list
+/// variant [`ctx_idx_inc_mvd_bin0_per_list`] directly.
 ///
-/// Kept as a thin wrapper over the per-list variant so all P-side
-/// call sites continue to compile unchanged.
+/// Thin L0 convenience wrapper over the per-list variant, for the
+/// walker's P-slice `mvd_l0` path and tests that only need the L0
+/// list.
 pub fn ctx_idx_inc_mvd_bin0(
     ctx: &CabacNeighborContext,
     mb_x: usize,
@@ -305,8 +306,8 @@ pub fn ctx_idx_inc_mvd_bin0(
     )
 }
 
-/// §6E-A6.1 — per-list bin0 ctxIdxInc for `mvd_lX`. Reads the
-/// SAME-LIST neighbour MVD magnitudes per spec § 9.3.3.1.1.7
+/// Per-list bin0 ctxIdxInc for `mvd_lX`. Reads the SAME-LIST
+/// neighbour MVD magnitudes per spec § 9.3.3.1.1.7
 /// (encoder uses L0 neighbour MVDs when emitting an L0 MVD bin0,
 /// L1 neighbour MVDs when emitting an L1 MVD bin0).
 ///
@@ -348,9 +349,10 @@ pub fn ctx_idx_inc_mvd_bin0_per_list(
 /// **DEPRECATED — buggy for partitioned MBs.** Always reads from cross-MB
 /// neighbours regardless of the partition's position within current MB,
 /// which spec § 6.4.11.7 says must use within-MB neighbours for any
-/// partition whose left/top edge is interior to the MB. Use
-/// [`compute_ref_idx_ctx_idx_inc_bin0`] instead for new code; this
-/// wrapper remains until all callers are migrated.
+/// partition whose left/top edge is interior to the MB. The walker
+/// uses [`compute_ref_idx_ctx_idx_inc_bin0`] instead; this
+/// cross-MB-only form is retained for the unit tests of the legacy
+/// derivation.
 pub fn ctx_idx_inc_ref_idx_bin0(
     ctx: &CabacNeighborContext,
     mb_x: usize,
@@ -369,8 +371,8 @@ pub fn ctx_idx_inc_ref_idx_bin0(
         + 2 * cond(ctx.neighbor_b(mb_x), block_idx_in_mb_b)
 }
 
-/// v1.4 Phase 4.5 (#316) — progressive ref_idx_l0 state for current MB,
-/// built up as partitions emit. Used by the spec-correct ref_idx bin 0
+/// Progressive ref_idx_l0 state for current MB, built up as
+/// partitions emit. Used by the spec-correct ref_idx bin 0
 /// ctxIdxInc derivation (`compute_ref_idx_ctx_idx_inc_bin0`) when the
 /// neighbouring partition falls INSIDE the current MB (partition 1 of
 /// P_16x8, right partition of P_8x16, interior sub-MBs of P_8x8).
@@ -394,7 +396,7 @@ impl CurrentMbRefIdx {
     /// Fill a rectangular 4×4-block region within the current MB with
     /// `ref_idx_l0`. The region is `(bx0..bx0+w) × (by0..by0+h)` in
     /// 4×4-block coords. Invoke right after the partition's
-    /// `encode_ref_idx` so subsequent partitions in the same MB can see
+    /// `decode_ref_idx` so subsequent partitions in the same MB can see
     /// it.
     pub fn fill_region(&mut self, bx0: u8, by0: u8, w: u8, h: u8, ref_idx: i8) {
         for dy in 0..h {
@@ -405,9 +407,9 @@ impl CurrentMbRefIdx {
     }
 }
 
-/// v1.4 Phase 4.5 (#316) — spec-correct bin 0 ctxIdxInc for `ref_idx_lX`
-/// (spec § 9.3.3.1.1.6 eq 9-14, with neighbouring partition derivation
-/// per spec § 6.4.11.7).
+/// Spec-correct bin 0 ctxIdxInc for `ref_idx_lX` (spec § 9.3.3.1.1.6
+/// eq 9-14, with neighbouring partition derivation per spec
+/// § 6.4.11.7).
 ///
 /// `cur_bx`, `cur_by`: current partition's top-left 4×4-block coordinates
 /// within the current MB (each 0..=3). For P/B 16×16 = (0,0). For P/B
@@ -494,24 +496,6 @@ pub fn ctx_idx_inc_intra_chroma_pred_mode_bin0(
         }
     };
     cond(ctx.neighbor_a(mb_x)) + cond(ctx.neighbor_b(mb_x))
-}
-
-/// Compute ctxIdxInc for `coded_block_pattern` luma bin (spec
-/// § 9.3.3.1.1.4, eq 9-10). `binIdx` refers to which 8x8 luma block's
-/// CBP bit we're emitting; the neighbor-condition terms look up the
-/// matching 8x8 block in each neighbor.
-pub fn ctx_idx_inc_cbp_luma(
-    ctx: &CabacNeighborContext,
-    mb_x: usize,
-    bin_idx: u32,
-) -> u32 {
-    // Legacy cross-MB-only form — kept for backwards compatibility with
-    // older callers. For I_4x4 / P / B encoding, use
-    // `compute_cbp_luma_ctx_idx_inc_bin` which correctly handles the
-    // same-MB 8×8 neighbors for binIdx 1..3.
-    let cross_neighbor_bit = bin_idx;
-    let cond = |n: Option<&CabacNeighborMB>| cbp_luma_cross_cond(n, cross_neighbor_bit);
-    cond(ctx.neighbor_a(mb_x)) + 2 * cond(ctx.neighbor_b(mb_x))
 }
 
 #[inline]
@@ -624,7 +608,7 @@ pub fn ctx_idx_inc_cbp_chroma(
 /// Compute ctxIdxInc for `coded_block_flag` (spec § 9.3.3.1.1.9,
 /// eq 9-19). `ctxIdxInc = condTermFlagA + 2·condTermFlagB`.
 ///
-/// `ctx_block_cat` is the block category (0..4 for 4:2:0 Phase 6C
+/// `ctx_block_cat` is the block category (0..4 for the 4:2:0
 /// scope). `block_idx_in_mb_{a,b}` are the per-category block
 /// indices in the respective neighbor.
 pub fn ctx_idx_inc_coded_block_flag(
@@ -748,7 +732,7 @@ pub fn ctx_idx_inc_transform_size_8x8_flag(
     a + b
 }
 
-// ─── Current-MB coded_block_flag tracking (Phase 6C.6d) ───────────
+// ─── Current-MB coded_block_flag tracking ─────────────────────────
 //
 // The `coded_block_flag` ctxIdxInc derivation (§ 9.3.3.1.1.9) pulls
 // `condTermFlagN` from the 4×4-block neighbor N. When N is in a
@@ -807,8 +791,8 @@ impl CurrentMbCbf {
 pub struct CurrentMbMvdAbs {
     /// L0 magnitudes (also used by P-slice paths — single list).
     pub comp: [[i16; 16]; 2],
-    /// §6E-A6.1q.e (#154) — L1 magnitudes for B-slice partitioned
-    /// MBs. P-slice paths leave these at 0 (no L1 partitions).
+    /// L1 magnitudes for B-slice partitioned MBs. P-slice paths
+    /// leave these at 0 (no L1 partitions).
     pub comp_l1: [[i16; 16]; 2],
 }
 
@@ -831,8 +815,8 @@ impl CurrentMbMvdAbs {
         }
     }
 
-    /// §6E-A6.1q.e (#154) — fill the L1-list region. Mirror of
-    /// `fill_region` but writes `comp_l1` for B-slice L1 partitions.
+    /// Fill the L1-list region. Mirror of `fill_region` but writes
+    /// `comp_l1` for B-slice L1 partitions.
     pub fn fill_region_l1(
         &mut self,
         bx0: u8,
@@ -856,7 +840,7 @@ impl CurrentMbMvdAbs {
         self.comp[component as usize][block_idx]
     }
 
-    /// §6E-A6.1q.e — read per-list within-MB magnitude.
+    /// Read per-list within-MB magnitude.
     #[inline]
     pub fn get_per_list(&self, component: u8, block_idx: usize, list: u8) -> i16 {
         match list {
@@ -870,7 +854,7 @@ impl CurrentMbMvdAbs {
         self.comp
     }
 
-    /// §6E-A6.1q.e — extract L1 magnitudes for the
+    /// Extract L1 magnitudes for the
     /// `CabacNeighborMB::abs_mvd_comp_l1` commit on B-slice
     /// partitioned MBs.
     #[inline]
@@ -925,9 +909,8 @@ pub fn compute_mvd_ctx_idx_inc_bin0(
     }
 }
 
-/// §6E-A6.1q.e (#154) — per-list bin 0 ctxIdxInc for `mvd_lX` with
-/// proper within-MB / cross-MB neighbour selection. Spec §
-/// 9.3.3.1.1.7 eq 9-15.
+/// Per-list bin 0 ctxIdxInc for `mvd_lX` with proper within-MB /
+/// cross-MB neighbour selection. Spec § 9.3.3.1.1.7 eq 9-15.
 ///
 /// `cur_bx`, `cur_by`: partition's top-left 4×4-block coordinates
 /// within the current MB (each 0..=3).
@@ -1385,7 +1368,7 @@ mod tests {
 
     #[test]
     fn block_pos_to_luma_idx_matches_block_index_to_pos() {
-        use crate::codec::h264::macroblock::BLOCK_INDEX_TO_POS;
+        use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
         for (expected_idx, &(bx, by)) in BLOCK_INDEX_TO_POS.iter().enumerate() {
             let idx = block_pos_to_luma_idx(bx, by);
             assert_eq!(

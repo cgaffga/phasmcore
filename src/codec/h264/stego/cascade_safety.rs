@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Phase 6F.2(j) — cascade-safe MVD subset analysis.
+//! Cascade-safe MVD subset analysis.
 //!
 //! Computes which MVD-sign positions in cover_p1 can be flipped
 //! by the STC plan WITHOUT shifting any downstream MVD across
@@ -50,9 +50,9 @@
 //! - `|m_P|` magnitudes — sign-flip invariant.
 //!
 //! Walker on Pass 3 bytes captures the same `(position, |m_P|)`
-//! tuples (the §6F.2(j).1 magnitude-capture parity gate
-//! confirms byte-identity on real-world content). Walker runs
-//! identical greedy → identical safe set. No iteration.
+//! tuples (a magnitude-capture parity gate confirms byte-identity
+//! on real-world content). Walker runs identical greedy → identical
+//! safe set. No iteration.
 //!
 //! ## MV-grid propagation pattern
 //!
@@ -77,52 +77,10 @@
 //! `Vec<bool>` aligned with `meta`. `true` at index i means
 //! `meta[i]` is safe to flip under the criterion above.
 
-use super::encoder_hook::MvdPositionMeta;
+use super::hook::MvdPositionMeta;
 use super::{Axis, PositionKey, SyntaxPath};
 
-/// §6E-A6.0 — hard cap on per-GOP MVD position count.
-///
-/// Sized for 1080p × 30-frame IBPBP under realistic motion: ~50k
-/// positions today (§6E-A4(c)-lite ships zero MVDs from B-frames),
-/// projected ~150-300k under §6E-A6.x partitioned-B with realistic
-/// content. The 200,000 cap leaves headroom while still catching
-/// pathological mode-decision configurations (e.g. all-MBs-emit-
-/// `B_Bi_4x4` would balloon to ~2.6M positions per frame and blow
-/// per-GOP working-set memory budget).
-///
-/// The cap is *advisory* in §6E-A4(c)-lite (today's shipping path
-/// produces well under 200k positions), but becomes a hard guard
-/// rail once §6E-A6.1+ widens the mode set. See
-/// `docs/design/video/h264/encoder-algorithms/6E-A6-bslice-partitions.md`
-/// open question § 5 (Streaming-Viterbi K window — RESOLVED) for
-/// the rationale.
-pub const MAX_MVD_POSITIONS_PER_GOP: usize = 200_000;
-
-/// §6E-A6.0 — guard rail check. Returns `Err` if `mvd_count` exceeds
-/// the per-GOP working-set budget. Callers (orchestrator, decoder)
-/// invoke this before allocating per-position metadata vectors so a
-/// pathological GOP fails cleanly with a documented error rather
-/// than silently OOM'ing on long-form mobile clips.
-///
-/// `gop_label` is included in the error string so multi-GOP
-/// orchestration can pinpoint the offending GOP.
-pub fn check_mvd_budget(
-    mvd_count: usize,
-    gop_label: &str,
-) -> Result<(), crate::stego::error::StegoError> {
-    if mvd_count > MAX_MVD_POSITIONS_PER_GOP {
-        return Err(crate::stego::error::StegoError::InvalidVideo(format!(
-            "MVD position count {mvd_count} exceeds per-GOP streaming \
-             budget {MAX_MVD_POSITIONS_PER_GOP} at {gop_label}: \
-             encoder mode-decision is producing pathologically fine \
-             partitioning (see §6E-A6.0 working-set guard rail)",
-        )));
-    }
-    Ok(())
-}
-
-/// Phase 6F.2(j) — analyze which MVD positions are cascade-safe
-/// to flip.
+/// Analyze which MVD positions are cascade-safe to flip.
 ///
 /// Inputs:
 /// - `meta`: per-MVD-position metadata, in cover-emission order
@@ -154,7 +112,7 @@ pub fn analyze_safe_mvd_subset(
         (meta[i].frame_idx, meta[i].mb_addr, meta[i].partition, meta[i].axis)
     });
 
-    // STEGO.A.12.perf — O(n²) → O(n × k) optimization.
+    // O(n²) → O(n × k) optimization.
     //
     // The two inner loops (predicates a + b) only need to examine
     // positions at MB-level NEIGHBOURS of P (mb_propagates is a
@@ -285,44 +243,7 @@ pub fn analyze_safe_mvd_subset(
     safe
 }
 
-/// Returns `true` iff a flip in MB (sx, sy) can affect any
-/// predictor read by an MB at (qx, qy). Per H.264 spec § 8.4.1.3,
-/// MB (qx, qy)'s partitions' predictors read from neighbours at
-/// positions (qx-1, qy), (qx, qy-1), (qx+1, qy-1), and via
-/// D-fallback (qx-1, qy-1). Equivalently:
-///
-/// - (sx, sy) propagates to (sx+1, sy)        — right neighbour
-/// - (sx, sy) propagates to (sx, sy+1)        — below
-/// - (sx, sy) propagates to (sx-1, sy+1)      — bottom-left (its
-///   top-right reads (sx, sy))
-/// - (sx, sy) propagates to (sx+1, sy+1)      — bottom-right (its
-///   top-left D-fallback reads (sx, sy))
-///
-/// Conservative: an MB-level affirmative may overcount within-MB
-/// granularity, but never under-counts (a true propagation at
-/// 4×4-cell granularity always implies MB-level propagation).
-#[inline]
-pub fn mb_propagates(sx: u32, sy: u32, qx: u32, qy: u32) -> bool {
-    // Right: (sx+1, sy)
-    if qx == sx.saturating_add(1) && qy == sy { return true; }
-    // Below: (sx, sy+1)
-    if qx == sx && qy == sy.saturating_add(1) { return true; }
-    // Bottom-left: (sx-1, sy+1) — only when sx > 0
-    if sx > 0 && qx == sx - 1 && qy == sy.saturating_add(1) { return true; }
-    // Bottom-right: (sx+1, sy+1)
-    if qx == sx.saturating_add(1) && qy == sy.saturating_add(1) { return true; }
-    false
-}
-
-/// Strict raster ordering: returns `true` iff (qx, qy) is later
-/// than (sx, sy) in MB raster scan order.
-#[inline]
-fn mb_strictly_later(sx: u32, sy: u32, qx: u32, qy: u32) -> bool {
-    qy > sy || (qy == sy && qx > sx)
-}
-
-/// §6E-A5(d).2 — map a sign-aligned safe mask to a suffix-aligned
-/// safe mask.
+/// Map a sign-aligned safe mask to a suffix-aligned safe mask.
 ///
 /// `msb_positions` is `cover.mvd_sign_bypass.positions` (one entry
 /// per logged MVD-sign bypass bin). `safe_msb` is the output of
@@ -380,37 +301,6 @@ mod tests {
 
     fn meta(frame_idx: u32, mb_addr: u32, partition: u8, axis: u8, magnitude: u32) -> MvdPositionMeta {
         MvdPositionMeta { frame_idx, mb_addr, partition, axis, magnitude }
-    }
-
-    // ─── §6E-A6.0 working-set budget guard ─────────────────────
-
-    #[test]
-    fn check_mvd_budget_passes_at_cap() {
-        // Exactly at the cap is OK — the cap is `> MAX`, not `>=`.
-        assert!(check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP, "test").is_ok());
-        assert!(check_mvd_budget(0, "test").is_ok());
-        assert!(check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP - 1, "test").is_ok());
-    }
-
-    #[test]
-    fn check_mvd_budget_rejects_above_cap() {
-        let r = check_mvd_budget(MAX_MVD_POSITIONS_PER_GOP + 1, "gop[5]");
-        assert!(r.is_err());
-        // Error message should include the count, the budget, and
-        // the gop_label so a multi-GOP orchestrator can localize.
-        let msg = format!("{:?}", r.unwrap_err());
-        assert!(msg.contains("gop[5]"), "missing gop label: {msg}");
-        assert!(msg.contains(&MAX_MVD_POSITIONS_PER_GOP.to_string()),
-            "missing cap value: {msg}");
-    }
-
-    #[test]
-    fn check_mvd_budget_const_is_nonzero_and_realistic() {
-        // Sanity: 200k positions × 44 bytes/MvdPositionMeta+plan
-        // = ~8.8 MB worst-case per GOP, well within the 250-400 MB
-        // total Phase 6 streaming budget across 2-3 GOPs in flight.
-        assert!(MAX_MVD_POSITIONS_PER_GOP >= 50_000);
-        assert!(MAX_MVD_POSITIONS_PER_GOP <= 1_000_000);
     }
 
     #[test]
@@ -503,21 +393,6 @@ mod tests {
         ];
         let r = analyze_safe_mvd_subset(&m, 4, 3);
         assert_eq!(r, vec![true, true]);
-    }
-
-    #[test]
-    fn mb_propagates_exhaustive_grid() {
-        // Spot-check the four propagation patterns.
-        assert!(mb_propagates(1, 1, 2, 1));  // right
-        assert!(mb_propagates(1, 1, 1, 2));  // below
-        assert!(mb_propagates(1, 1, 0, 2));  // bottom-left
-        assert!(mb_propagates(1, 1, 2, 2));  // bottom-right
-        // Non-propagation cases.
-        assert!(!mb_propagates(1, 1, 1, 1));  // self
-        assert!(!mb_propagates(1, 1, 0, 1));  // left (upstream, not down)
-        assert!(!mb_propagates(1, 1, 1, 0));  // above
-        assert!(!mb_propagates(1, 1, 3, 1));  // 2 right
-        assert!(!mb_propagates(1, 1, 0, 0));  // top-left (upstream)
     }
 
     use super::super::{BinKind, EmbedDomain};

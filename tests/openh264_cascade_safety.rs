@@ -27,7 +27,7 @@
 //! files in /tmp. Marked `#[ignore]` because of the runtime + tmp
 //! dependency.
 
-#![cfg(feature = "openh264-backend")]
+#![cfg(feature = "h264-encoder")]
 
 use core_openh264_sys::PhasmStegoDomain;
 use phasm_core::codec::h264::cabac::bin_decoder::{
@@ -183,7 +183,7 @@ fn c3_1_predict_safe_mvd_smoke_5_fixtures() {
 
         let walk = walk_annex_b_for_cover_with_options(
             &annex_b,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .unwrap_or_else(|e| {
             panic!(
@@ -369,7 +369,7 @@ fn c3_2_bulk_flip_empirical_fp_check() {
         let baseline_h264 = encode_clean(fix, &yuv);
         let baseline = walk_annex_b_for_cover_with_options(
             &baseline_h264,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .unwrap_or_else(|e| panic!("{}: baseline walker: {:?}", fix.tag, e));
 
@@ -392,7 +392,7 @@ fn c3_2_bulk_flip_empirical_fp_check() {
         let flipped_h264 = encode_with_mvd_sign_overrides(fix, &yuv, &safe_mask);
         let flipped = walk_annex_b_for_cover_with_options(
             &flipped_h264,
-            WalkOptions { record_mvd: true, record_offsets: false },
+            WalkOptions { record_mvd: true },
         )
         .unwrap_or_else(|e| panic!("{}: flipped walker: {:?}", fix.tag, e));
 
@@ -468,152 +468,6 @@ fn c3_2_bulk_flip_empirical_fp_check() {
         "no fixtures available — run \
          core/test-vectors/video/h264/real-world/source/regen_openh264_baseline.sh"
     );
-}
-
-/// Phase C.3.6.1 (task #428) — verify that `WalkOptions { record_offsets:
-/// true }` populates `CoverWalkOutput.offsets` with per-domain offset
-/// vectors aligned 1:1 with the cover-bit vectors. Sanity-checks:
-///
-///   1. `offsets.is_some()` when `record_offsets=true`.
-///   2. Per-domain offset count == per-domain cover-bit count.
-///   3. Offsets within each domain are strictly monotonically
-///      non-decreasing in `(nal_idx, rbsp_bit)` order — successive
-///      bypass bins always advance forward in the stream.
-///   4. Walking with `record_offsets=false` produces `offsets: None`
-///      (zero-cost fast path preserved).
-///
-/// Bit-level verification (read the byte at the captured offset,
-/// compare to the cover bit) requires absolute Annex-B coordinates
-/// which depends on per-slice `cabac_byte_off` + emulation-prevention
-/// re-insertion. The C.3.6.2 RBSP helpers expose those primitives; the
-/// downstream composition attempted in C.3.6.3 (raw-bit splicer)
-/// failed empirically (CABAC bypass coding is not 1-bit-per-bin —
-/// see `memory/openh264_c363_negative_bitstream_mod.md`). This test
-/// verifies the foundation only: offsets are populated and ordered.
-///
-/// Runs on the first available fixture (img4138 by convention).
-#[test]
-#[ignore]
-fn c3_6_1_offset_capture_aligned_with_cover_bits() {
-    let _g = OPENH264_TEST_MUTEX.lock().unwrap();
-
-    let fix = &FIXTURES[0];
-    let yuv = match read_yuv(&yuv_path(fix)) {
-        Some(y) => y,
-        None => {
-            eprintln!(
-                "SKIP: {} missing — run regen_openh264_baseline.sh",
-                yuv_path(fix).display()
-            );
-            return;
-        }
-    };
-
-    let annex_b = encode_clean(fix, &yuv);
-
-    // (1) record_offsets=false → offsets: None (default fast path).
-    let off_opts = WalkOptions { record_mvd: true, record_offsets: false };
-    let walk_off = walk_annex_b_for_cover_with_options(&annex_b, off_opts)
-        .expect("walk_off");
-    assert!(
-        walk_off.offsets.is_none(),
-        "record_offsets=false must leave offsets=None"
-    );
-
-    // (2)-(3) record_offsets=true → offsets populated, counts match.
-    let on_opts = WalkOptions { record_mvd: true, record_offsets: true };
-    let walk_on = walk_annex_b_for_cover_with_options(&annex_b, on_opts)
-        .expect("walk_on");
-    let offsets = walk_on.offsets.as_ref().expect("offsets must be Some");
-
-    let cover = &walk_on.cover;
-    assert_eq!(
-        offsets.coeff_sign_bypass.len(),
-        cover.coeff_sign_bypass.len(),
-        "CoeffSign offset count must match cover-bit count"
-    );
-    assert_eq!(
-        offsets.coeff_suffix_lsb.len(),
-        cover.coeff_suffix_lsb.len(),
-        "CoeffSuffixLsb offset count must match cover-bit count"
-    );
-    assert_eq!(
-        offsets.mvd_sign_bypass.len(),
-        cover.mvd_sign_bypass.len(),
-        "MvdSign offset count must match cover-bit count"
-    );
-    assert_eq!(
-        offsets.mvd_suffix_lsb.len(),
-        cover.mvd_suffix_lsb.len(),
-        "MvdSuffixLsb offset count must match cover-bit count"
-    );
-
-    // Monotonicity within a NAL (each slice resets the engine's
-    // byte_idx to 0). nal_idx groups by slice.
-    fn assert_monotone(
-        domain: &str,
-        offs: &[phasm_core::codec::h264::cabac::bin_decoder::PositionOffset],
-    ) {
-        use std::collections::HashMap;
-        let mut last_per_nal: HashMap<u32, u64> = HashMap::new();
-        for (i, o) in offs.iter().enumerate() {
-            if let Some(&prev) = last_per_nal.get(&o.nal_idx) {
-                assert!(
-                    o.rbsp_bit >= prev,
-                    "{} offsets non-monotone: i={} nal_idx={} rbsp_bit={} \
-                     but previous was {}",
-                    domain, i, o.nal_idx, o.rbsp_bit, prev
-                );
-            }
-            last_per_nal.insert(o.nal_idx, o.rbsp_bit);
-        }
-    }
-    assert_monotone("CoeffSign", &offsets.coeff_sign_bypass);
-    assert_monotone("CoeffSuffixLsb", &offsets.coeff_suffix_lsb);
-    assert_monotone("MvdSign", &offsets.mvd_sign_bypass);
-    assert_monotone("MvdSuffixLsb", &offsets.mvd_suffix_lsb);
-
-    eprintln!(
-        "\n=== Phase C.3.6.1 — offset capture (fixture: {}) ===",
-        fix.tag
-    );
-    eprintln!(
-        "  CoeffSign:       {} offsets / {} cover bits",
-        offsets.coeff_sign_bypass.len(),
-        cover.coeff_sign_bypass.len()
-    );
-    eprintln!(
-        "  CoeffSuffixLsb:  {} offsets / {} cover bits",
-        offsets.coeff_suffix_lsb.len(),
-        cover.coeff_suffix_lsb.len()
-    );
-    eprintln!(
-        "  MvdSign:         {} offsets / {} cover bits",
-        offsets.mvd_sign_bypass.len(),
-        cover.mvd_sign_bypass.len()
-    );
-    eprintln!(
-        "  MvdSuffixLsb:    {} offsets / {} cover bits",
-        offsets.mvd_suffix_lsb.len(),
-        cover.mvd_suffix_lsb.len()
-    );
-    eprintln!(
-        "  Total: {} offsets captured across {} NALs (n_mb={})",
-        offsets.total_len(),
-        walk_on.n_slices,
-        walk_on.n_mb
-    );
-
-    let total_cover = cover.coeff_sign_bypass.len()
-        + cover.coeff_suffix_lsb.len()
-        + cover.mvd_sign_bypass.len()
-        + cover.mvd_suffix_lsb.len();
-    if total_cover > 0 {
-        assert!(
-            offsets.total_len() > 0,
-            "non-empty cover must produce non-empty offsets"
-        );
-    }
 }
 
 /// Phase C.3.6.2 (task #429) — verify the bitstream_mod helpers on

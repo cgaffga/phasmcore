@@ -183,7 +183,7 @@ fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     #[cfg(not(feature = "parallel"))]
     let ac_energies: Vec<f64> = block_indices.iter().map(compute_energy).collect();
 
-    // T2.16 — `select_nth_unstable_by` is O(N) (Quickselect) vs
+    // `select_nth_unstable_by` is O(N) (Quickselect) vs
     // `sort_unstable_by`'s O(N log N). We only need the median value,
     // not a fully sorted array. The leading/trailing partition is
     // irrelevant; selecting the middle element gives the median in
@@ -212,7 +212,7 @@ fn watson_factors(ratios: &EnergyRatios, watson_lo: f64, watson_hi: f64) -> Vec<
         .collect()
 }
 
-/// T2.15 — Watson factors from pre-computed base factors + adaptive range.
+/// Watson factors from pre-computed base factors + adaptive range.
 ///
 /// `base_factors[i] = watson_base_factor(energy.ratios[i])` is image-
 /// dependent only — same for every candidate during a Fortress decode
@@ -537,7 +537,7 @@ pub fn fortress_decode(
 
     // Pre-compute energy ratios once for reuse across adaptive candidates.
     let energy = compute_energy_ratios(grid);
-    // T2.15 — Pre-compute Watson base factors once per image. These
+    // Pre-compute Watson base factors once per image. These
     // depend only on the energy ratios; only the (lo, hi) remap is
     // per-candidate. Eliminates ~30 redundant runs of the piecewise-
     // linear watson_base_factor across the candidate brute-force.
@@ -578,7 +578,7 @@ pub fn fortress_decode(
     // Try each candidate with per-r Watson factors (continuous adaptive).
     let try_candidate = |&(parity, r): &(usize, usize)| -> Option<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality)> {
         let params = adaptive_params(r);
-        // T2.15 — remap the pre-computed base factors per candidate.
+        // Remap the pre-computed base factors per candidate.
         let factors = watson_factors_from_base(&base_factors, params.watson_lo, params.watson_hi);
         let reference_llr = params.base_step / 2.0;
 

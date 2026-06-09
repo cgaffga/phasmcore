@@ -20,7 +20,7 @@
 //! culLevel proximity is a v0.6+ extension that needs a fork-side
 //! meta addition.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -25,7 +25,7 @@
 //! See [`phase-b15-cascade-safety-v2.md`](../../docs/design/video/av1/phase-b15-cascade-safety-v2.md)
 //! § 3 (sub-phase plan) and § 7 (threshold tuning approach).
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

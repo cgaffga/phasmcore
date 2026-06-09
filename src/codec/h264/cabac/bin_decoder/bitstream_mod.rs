@@ -2,17 +2,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Phase C.3.6.2 (task #429) — bitstream-mod stego: RBSP strip/repack
-//! helpers + NAL location indexing for the Option C bitstream-mod
-//! splicer.
+//! Bitstream-mod stego: RBSP strip/repack helpers + NAL location
+//! indexing for the (unshipped) bitstream-mod splicer.
 //!
-//! The Phase C OpenH264-backend pivot to **bitstream-mod stego**
-//! (Option F per `docs/design/video/h264/phase-c-ship-criteria.md`)
-//! flips bypass-coded CABAC bins **after** the encoder produces the
-//! Annex-B stream, rather than during encoding. This module provides
-//! the coordinate-mapping primitives needed to locate a captured
-//! bypass-bin offset (engine-local to the slice CABAC byte stream)
-//! within the original Annex-B bytes.
+//! **RETAINED BUT DORMANT.** Production stego does NOT flip bins
+//! post-encode: the OH264 path reaches the wire at the CABAC *emit*
+//! site via `wire_only` scratch-table overrides (encoder
+//! reconstruction stays clean by construction). These RBSP-offset
+//! mapping primitives are kept for the never-shipped **bitstream-mod
+//! stego** design (see
+//! `docs/design/video/h264/phase-c-ship-criteria.md`), which would
+//! instead flip bypass-coded CABAC bins **after** the encoder
+//! produces the Annex-B stream. That splicer would use the
+//! coordinate-mapping primitives here to locate a captured bypass-bin
+//! offset (engine-local to the slice CABAC byte stream) within the
+//! original Annex-B bytes. The walker-side offset capture that would
+//! drive it has since been retired, so the splicer path is
+//! unrealized; the coordinate-mapping primitives below remain as a
+//! reference.
 //!
 //! ## Coordinate spaces
 //!
@@ -30,14 +37,15 @@
 //!    Annex-B stream. Derived by adding `NalLocation.payload_start`
 //!    + 1 (NAL header byte).
 //!
-//! C.3.6.2 ships the indexing primitives (steps 1→4 lookup data).
-//! C.3.6.3 ships the composition + bit-flip splicer.
+//! This module ships the indexing primitives (steps 1→4 lookup
+//! data). The composition + bit-flip splicer was never built
+//! (production took the wire_only emit path instead).
 //!
 //! ## Round-trip property
 //!
 //! `insert_emulation_prevention(remove_emulation_prevention(data)) ==
 //! data` for any conformant H.264 NAL payload. Verified at module
-//! scope by `roundtrip_ep_strip_repack_on_openh264_output`.
+//! scope by `strip_repack_roundtrip_on_synthetic_ep_pattern`.
 
 use crate::codec::h264::bitstream::{
     insert_emulation_prevention, parse_nal_units_annexb,
@@ -67,8 +75,8 @@ pub use super::slice::cabac_data_byte_offset;
 ///      the Annex-B absolute byte position.
 ///   5. Flips bit `engine_bit % 8` (MSB-first) at that byte.
 ///
-/// Step 5 is the C.3.6.3 splicer's job; this struct surfaces the
-/// fields needed for steps 1–4.
+/// Step 5 is the splicer's job; this struct surfaces the fields
+/// needed for steps 1–4.
 #[derive(Clone, Debug)]
 pub struct NalLocation {
     /// NAL unit type (parsed from the NAL header byte).
@@ -148,7 +156,7 @@ impl From<H264Error> for LocateError {
 /// NAL per frame (~180,000 NALs) this is ~10 MB of metadata (each
 /// `NalLocation` carries `rbsp: Vec<u8>` which dominates). For very
 /// long-form streams the per-GOP streaming variant should be used —
-/// see `locate_nal_units_annexb_streaming` follow-on (C.3.6.4 scope).
+/// see the `locate_nal_units_annexb_streaming` follow-on.
 pub fn locate_nal_units_annexb(
     data: &[u8],
 ) -> Result<Vec<NalLocation>, LocateError> {
@@ -259,39 +267,6 @@ fn find_next_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
     None
 }
 
-/// Verify that `locate_nal_units_annexb` emits the same NAL list as
-/// `parse_nal_units_annexb` for parity with the walker (which uses
-/// the latter). Returns `(n_locations, n_walker_nalus)`. Used by the
-/// round-trip test + by the splicer's debug-assert path.
-pub fn assert_parity_with_walker_parse(
-    data: &[u8],
-) -> Result<(usize, usize), LocateError> {
-    let locs = locate_nal_units_annexb(data)?;
-    let nals = parse_nal_units_annexb(data)?;
-    assert_eq!(
-        locs.len(),
-        nals.len(),
-        "locate_nal_units_annexb / parse_nal_units_annexb NAL count mismatch"
-    );
-    for (i, (loc, nal)) in locs.iter().zip(nals.iter()).enumerate() {
-        assert_eq!(
-            loc.nal_type.0, nal.nal_type.0,
-            "NAL type mismatch at idx {i}"
-        );
-        assert_eq!(
-            loc.nal_ref_idc, nal.nal_ref_idc,
-            "nal_ref_idc mismatch at idx {i}"
-        );
-        assert_eq!(
-            loc.rbsp.as_slice(),
-            nal.rbsp.as_slice(),
-            "rbsp bytes mismatch at idx {i}"
-        );
-    }
-    Ok((locs.len(), nals.len()))
-}
-
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -376,18 +351,6 @@ mod tests {
         assert_eq!(locs[2].payload_start, 16);
         assert_eq!(locs[2].payload_end, 21);
         assert_eq!(locs[2].rbsp, vec![0xEE, 0xFF, 0x11, 0x22]);
-    }
-
-    #[test]
-    fn locate_parity_with_walker_parse_on_synthetic() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E]);
-        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x68, 0xCE, 0x32, 0xC8]);
-        data.extend_from_slice(&[0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00]);
-        let (n_locs, n_nals) =
-            assert_parity_with_walker_parse(&data).unwrap();
-        assert_eq!(n_locs, n_nals);
-        assert_eq!(n_locs, 3);
     }
 
     #[test]

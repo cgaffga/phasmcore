@@ -32,16 +32,16 @@
 // Full corpus variants (`stealth_oh264_*_1080p`) are `#[ignore]`'d.
 //
 // Run full corpus:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //     --test openh264_stealth_distribution_gate -- --ignored --nocapture
 //
 // Depends on: ffmpeg, ffprobe, python3, PyAV (for the histogram script).
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
+mod common;
+use common::oh264_stream;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -253,10 +253,9 @@ fn run_gate(spec: &Fixture, msg: &str, pass: &str) {
 
     let (w, h) = probe_baseline_dims(spec);
     let yuv = ensure_yuv(spec, w, h);
-    let opts = EncodeOpts { qp: spec.qp, intra_period: spec.intra_period };
 
-    let stego = openh264_stego_encode_yuv_text(
-        &yuv, w, h, spec.n_frames, opts, msg, pass,
+    let stego = oh264_stream::encode(
+        &yuv, w, h, spec.n_frames, spec.qp, msg, pass,
     ).expect("oh264 stego encode");
 
     // Write stego Annex-B + invoke histogram script.

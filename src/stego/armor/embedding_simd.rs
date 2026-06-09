@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! SIMD-accelerated SPREAD_LEN=8 dot product for STDM (T2.4).
+//! SIMD-accelerated SPREAD_LEN=8 dot product for STDM.
 //!
 //! `stdm_extract_soft` and `stdm_embed` previously computed the
 //! projection `p = sum(coeffs[i] * v[i] for i in 0..8)` via
 //! `iter().zip(...).map(|(c, vi)| c * vi).sum()` — left-to-right
 //! associative accumulation.
 //!
-//! T2.4 reorders this to a pinned 3-level pairwise tree so SIMD lanes
+//! This module reorders that to a pinned 3-level pairwise tree so SIMD lanes
 //! can be reduced via the architecture's natural horizontal-add
 //! intrinsic (`vpaddq_f64` / `_mm_hadd_pd`) while remaining
 //! bit-identical across all SIMD paths. Math equivalent of:
@@ -32,12 +32,12 @@
 //! decode (not stored in any stego). The decode soft-vote tolerates
 //! small magnitude perturbations as long as the LLR sign stays the
 //! same for each bit. Empirically verified on a 12-image Armor
-//! baseline corpus (pre-T2.4 stegos decoded byte-identical plaintext
-//! after T2.4).
+//! baseline corpus (stegos from the old left-to-right order decode
+//! byte-identical plaintext under the pairwise-tree order).
 //!
 //! `stdm_embed` also uses the same projection. Encoder output bytes
 //! depend on the projection's f64 value — so encode output WILL
-//! differ from the pre-T2.4 path in the last bits. Decode of NEW
+//! differ from the old left-to-right path in the last bits. Decode of NEW
 //! stego is internally consistent (same tree both sides). Decode of
 //! OLD stego succeeds because LLR signs match (ECC absorbs any
 //! magnitude perturbations).

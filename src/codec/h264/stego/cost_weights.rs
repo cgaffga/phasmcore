@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! #493.2 Phase 1 — 4-domain combined-cover helpers for streaming
-//! session 4-domain STC.
+//! 4-domain combined-cover helpers for streaming session 4-domain STC.
 //!
 //! Defines:
 //! - [`CostWeights`]: per-domain global multipliers exposed as session
-//!   config. Defaults locked by Phase 0.5 (#493.0b) — see
+//!   config. Default ratios were locked by a real-corpus MvdSign
+//!   density sweep — see
 //!   `docs/design/video/h264/d07-streaming-4domain.md`.
 //! - [`DomainBoundaries`]: per-domain length offsets within the
 //!   concatenated cover/cost vector. Lets [`split_plan_4domain`]
@@ -33,9 +33,8 @@ use super::orchestrate::{DomainCosts, DomainPlan};
 /// per-position distortion costs (from Pass 1) to drive allocation
 /// across all 4 domains in a single STC plan.
 ///
-/// Default values locked by Phase 0.5 (#493.0b) on real-corpus
-/// MvdSign density sweep. The ratios — not the absolute numbers —
-/// drive STC behaviour:
+/// Default values locked on a real-corpus MvdSign density sweep. The
+/// ratios — not the absolute numbers — drive STC behaviour:
 ///
 /// - CoeffSign : CoeffSuffix : MvdSign : MvdSuffix = 1 : 3 : 10 : 10
 ///
@@ -55,8 +54,8 @@ pub struct CostWeights {
 }
 
 impl Default for CostWeights {
-    /// v1.1 ship defaults — see Phase 0.5 measurement notes in
-    /// `memory/h264_mvdsign_density_sweep_493_0b.md`.
+    /// Ship defaults — ratios set by the MvdSign density sweep
+    /// documented in `docs/design/video/h264/d07-streaming-4domain.md`.
     fn default() -> Self {
         Self {
             coeff_sign: 1.0,
@@ -69,8 +68,8 @@ impl Default for CostWeights {
 
 impl CostWeights {
     /// Conservative variant — CS+CSL only, MvdSign/MvdSuffix
-    /// effectively excluded by WET-∞ weight. Useful as a Phase 5
-    /// escalation if 4-domain stealth degrades vs CS-only baseline:
+    /// effectively excluded by WET-∞ weight. Useful as an escalation
+    /// if 4-domain stealth degrades vs CS-only baseline:
     /// fall back to "3.5-domain" mode where MVD domains are in the
     /// cover (so a 4-domain-aware classifier sees natural MVD
     /// statistics) but never receive STC overrides.
@@ -83,8 +82,8 @@ impl CostWeights {
         }
     }
 
-    /// Bisect-only helper (#530 debugging): MvdSign domain receives
-    /// all STC overrides, every other domain is WET-∞ excluded.
+    /// Bisect-only helper: MvdSign domain receives all STC overrides,
+    /// every other domain is WET-∞ excluded.
     /// Used to isolate whether the OH264 fork's MV-cache mutation
     /// in `phasm_apply_mvd_hooks` is the primary Pass-1↔Pass-2 drift
     /// source. Not for production use.
@@ -97,8 +96,8 @@ impl CostWeights {
         }
     }
 
-    /// Bisect-only helper (#530 debugging): CoeffSign domain receives
-    /// all STC overrides, every other domain WET-∞. Counterpart to
+    /// Bisect-only helper: CoeffSign domain receives all STC
+    /// overrides, every other domain WET-∞. Counterpart to
     /// `debug_mvd_sign_only` for isolating the CS cascade class.
     pub fn debug_coeff_sign_only() -> Self {
         Self {
@@ -142,11 +141,10 @@ impl CostWeights {
         }
     }
 
-    /// DOMAIN-BISECT (2026-05-24) — finite-bias variants for IPPPP
-    /// cascade attribution. All 4 domains stay STC-feasible (no INF
-    /// cost) but the named pair gets a 100× discount so STC concentrates
-    /// flips there. Used when WET-∞ isolation drops below per-GOP
-    /// chunk_frame overhead.
+    /// Finite-bias variants for IPPPP cascade attribution. All 4
+    /// domains stay STC-feasible (no INF cost) but the named pair gets
+    /// a 100× discount so STC concentrates flips there. Used when WET-∞
+    /// isolation drops below per-GOP chunk_frame overhead.
     pub fn debug_bias_coeff_pair() -> Self {
         Self { coeff_sign: 1.0, coeff_suffix: 3.0, mvd_sign: 1000.0, mvd_suffix: 1000.0 }
     }
@@ -207,7 +205,8 @@ impl DomainBoundaries {
 /// single combined vectors for STC.
 ///
 /// Canonical order is fixed: CS → CSL → MVDs → MVDsl. The decoder's
-/// `combine_cover_for_extract_4domain` must use the same order to
+/// per-GOP extract (`try_extract_chunk_from_gop` in
+/// `streaming_session.rs`) calls this same `combine_cover_4domain` to
 /// reproduce the cover vector STC operated on.
 ///
 /// Returns `(combined_cover_bits, combined_costs, boundaries)`.
@@ -220,9 +219,8 @@ impl DomainBoundaries {
 /// **Cost-vector length invariant.** Each per-domain cost vector must
 /// match the bit vector length. If a Pass-1 cost vector is shorter
 /// than its bit vector (some `pass1` modes leave costs empty for
-/// fallback reasons), the missing entries are padded with `1.0` —
-/// matching `h264_stego_encode_one_gop_with_chunk_bits`'s existing
-/// fallback behaviour.
+/// fallback reasons), the missing entries are padded with `1.0`
+/// (see `push_domain` below).
 pub fn combine_cover_4domain(
     cover: &DomainCover,
     costs: &DomainCosts,

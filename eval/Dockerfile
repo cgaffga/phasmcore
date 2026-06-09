@@ -38,7 +38,7 @@
 # binary. ALL H.264 code paths — pure-Rust encoder, CABAC stego, the
 # Baseline CAVLC parser/walker, OpenH264 FFI — are gated behind opt-in
 # Cargo features (`video`, `h264-encoder`, `cabac-stego`,
-# `openh264-backend`) and are OFF in this image.
+# `h264-encoder`) and are OFF in this image.
 #
 # v0.2.9 (2026-05-19) tightened the posture: the `video` feature is
 # now opt-in at the CLI level. Default `cargo build -p phasm-cli`
@@ -49,7 +49,7 @@
 # (post-build) — phasm-core appears, openh264-sys does not.
 #
 # DO NOT add `--features video`, `--features h264-encoder`,
-# `--features cabac-stego`, or `--features openh264-backend` to the
+# `--features cabac-stego`, or `--features h264-encoder` to the
 # cargo build invocation below. If video stego repro is ever needed
 # in v2, build from the monorepo with explicit feature flags — not
 # from this image.
@@ -140,7 +140,7 @@ RUN cargo --version && rustc --version
 # `phasm --help`, no `core-openh264-sys` linkage.
 #
 # DO NOT add `--features video`, `--features h264-encoder`,
-# `--features cabac-stego`, or `--features openh264-backend` here — any
+# `--features cabac-stego`, or `--features h264-encoder` here — any
 # of those would re-introduce H.264 code and diverge from the public
 # cargo-dist GitHub-release binary.
 RUN cargo build --release -p phasm-cli && \

@@ -7,8 +7,8 @@
 use super::bitio::BitReader;
 use super::error::{JpegError, Result};
 
-/// T3.7 perf-bench reference — replicates the pre-T3.7 8-bit fast
-/// table + linear-scan slow path. Doc-hidden, kept around solely so
+/// Perf-bench reference — replicates the older 8-bit fast table +
+/// linear-scan slow path. Doc-hidden, kept around solely so
 /// `perf_t37_huffman` can compare wall-clock against the new path
 /// in the same binary.
 #[doc(hidden)]
@@ -89,11 +89,11 @@ pub fn perf_legacy_huffman_decode_n(
     Ok(checksum)
 }
 
-/// Perf-bench helpers (T3.7). doc-hidden, pub so `perf_t37_huffman`
+/// Perf-bench helper. doc-hidden, pub so `perf_t37_huffman`
 /// can decode a synthetic bitstream via the new path. The bench
-/// compares wall-clock against the pre-T3.7 8-bit-fast / linear-
+/// compares wall-clock against the older 8-bit-fast / linear-
 /// scan path captured by git history; this binary always runs the
-/// post-T3.7 fast path.
+/// new 10-bit fast path.
 #[doc(hidden)]
 pub fn perf_huffman_decode_n(
     table: &HuffmanDecodeTable,
@@ -108,7 +108,7 @@ pub fn perf_huffman_decode_n(
     Ok(checksum)
 }
 
-/// Width of the fast lookup table in bits (T3.7).
+/// Width of the fast lookup table in bits.
 ///
 /// Bumped from 8 → 10. For typical JPEG content, this drives the
 /// slow-path hit rate from ~10 % down to ~1 %. Memory: 1024 × 2 B =
@@ -123,15 +123,15 @@ const FAST_SIZE: usize = 1 << FAST_BITS;
 /// `(symbol, code_length)`. `code_length == 0` is the sentinel
 /// meaning "fall through to the slow path".
 ///
-/// **Level 2 (slow, T3.7 per-length canonical lookup)** — replaces
-/// the pre-T3.7 linear scan of `Vec<(code, length, symbol)>` with a
+/// **Level 2 (slow, per-length canonical lookup)** — replaces
+/// an earlier linear scan of `Vec<(code, length, symbol)>` with a
 /// per-length range check + array index, matching libjpeg's
 /// `dc/ac_derived_tbl` shape. For each length `L > FAST_BITS`, the
 /// canonical Huffman codes at that length live in `[code_min[L],
 /// code_max[L]]`; the symbol is `huffval[huffval_offset[L] + peek_L
 /// − code_min[L]]`. O(1) per length tried, ≤ 6 lengths to try, so
 /// O(1) total per slow-path symbol — vs O(slow.len()) (up to ~50
-/// in the pre-T3.7 code) for the linear scan.
+/// in the earlier code) for the linear scan.
 pub struct HuffmanDecodeTable {
     /// FAST_BITS-bit fast lookup, indexed by the top `FAST_BITS`
     /// bits of the bitstream. `length == 0` → use slow path.

@@ -1,11 +1,7 @@
 // Perf benchmark for analyze_safe_mvd_subset on user's real 1024×576
 // stego video. Pre-optimization baseline: 64s. Target: <1s.
 
-#![cfg(all(
-    feature = "h264-encoder",
-    feature = "openh264-backend",
-    feature = "cabac-stego",
-))]
+#![cfg(feature = "h264-decoder")]
 
 use phasm_core::codec::h264::cabac::bin_decoder::{walk_annex_b_for_cover_with_options, WalkOptions};
 use phasm_core::codec::h264::stego::cascade_safety::analyze_safe_mvd_subset;
@@ -18,7 +14,7 @@ fn cascade_safety_perf_user_video_1024x576() {
     };
     let walk = walk_annex_b_for_cover_with_options(
         &annex_b,
-        WalkOptions { record_mvd: true, record_offsets: false },
+        WalkOptions { record_mvd: true },
     ).expect("walk");
 
     eprintln!(

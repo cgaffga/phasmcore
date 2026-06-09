@@ -84,19 +84,16 @@ pub struct SliceHeader {
     /// Active number of L1 reference indices (B-slices only).
     pub num_ref_idx_l1_active: u8,
     /// Direct mode predictor selection for B-slices (spec § 7.4.3).
-    /// `true`  → spatial direct (mobile encoder default).
+    /// `true`  → spatial direct (the common mobile-encoder default).
     /// `false` → temporal direct.
-    /// Phase 6E-A locks `true`; the decoder needs the parsed value
-    /// for compliance with arbitrary B-slice streams. Always
-    /// `false` for non-B slices.
+    /// The walker parses and stores this value so it stays compliant
+    /// with arbitrary B-slice streams. Always `false` for non-B slices.
     pub direct_spatial_mv_pred_flag: bool,
     /// `cabac_init_idc` from the slice header (spec § 7.4.3) — selects
     /// which P/B context-init column to use (slot 1, 2, or 3 in the
     /// internal `CabacInitSlot::PIdc{0,1,2}` enum). 0 for I/SI slices.
-    /// Phase 6E-A captures this so B-slice CABAC contexts initialize
-    /// correctly; the encoder side already emits a fixed value (we
-    /// continue to use idc=0 by default for stealth-via-mimicry of
-    /// mobile encoder defaults).
+    /// The walker captures this so B-slice CABAC contexts initialize
+    /// with the column the stream actually selected.
     pub cabac_init_idc: u8,
     /// Slice QP delta (relative to PPS init_qp).
     pub slice_qp_delta: i32,
@@ -104,9 +101,11 @@ pub struct SliceHeader {
     pub disable_deblocking_filter_idc: u8,
     pub slice_alpha_c0_offset_div2: i32,
     pub slice_beta_offset_div2: i32,
-    /// Bit offset in the RBSP where macroblock data starts.
-    /// The CAVLC decoder reads from `rbsp[data_bit_offset / 8..]` at
-    /// bit position `data_bit_offset % 8`.
+    /// Bit offset in the RBSP right after the slice header (where
+    /// macroblock data begins). The CABAC bin-walker byte-aligns it up
+    /// via `cabac_data_byte_offset` (= `div_ceil(8)`, per § 7.3.4
+    /// cabac_alignment_one_bit) to find where the arithmetic engine
+    /// starts reading.
     pub data_bit_offset: usize,
     // Derived
     /// Slice QP = 26 + pic_init_qp_minus26 + slice_qp_delta.
@@ -283,11 +282,10 @@ pub fn parse_slice_header(
         }
     }
 
-    // data_bit_offset: where macroblock data begins
-    // For CAVLC, the slice data starts right after the header (byte-aligned
-    // only if entropy_coding_mode_flag is set, which it isn't for CAVLC).
-    // Actually, for CAVLC the data is NOT byte-aligned — it continues from
-    // the current bit position.
+    // data_bit_offset: the raw (un-aligned) bit position right after the
+    // slice header. We store it un-aligned; the CABAC bin-walker applies
+    // the § 7.3.4 cabac_alignment_one_bit byte-ceil itself via
+    // `cabac_data_byte_offset`.
     let data_bit_offset = r.bits_read();
 
     let slice_qp = 26 + pps.pic_init_qp_minus26 + slice_qp_delta;
@@ -315,8 +313,8 @@ pub fn parse_slice_header(
 }
 
 /// Skip ref_pic_list_modification syntax (H.264 Section 7.3.3.1).
-/// §Stealth.L4.6.4 — Skip the `pred_weight_table` block per spec §
-/// 7.3.3.2 without applying any weights (phasm uses unweighted MC).
+/// §Stealth.L4.6.4 — Walk past the `pred_weight_table` block per spec §
+/// 7.3.3.2, reading and discarding its syntax elements.
 ///
 /// Layout (4:2:0, ChromaArrayType=1):
 /// - `luma_log2_weight_denom`             : ue(v)
@@ -329,9 +327,10 @@ pub fn parse_slice_header(
 /// - For B-slices, repeat the loop for L1.
 ///
 /// For our 4:2:0 streams ChromaArrayType is always 1, so chroma fields
-/// are always present. The skipper does not apply any weights — phasm
-/// reconstruction uses the unweighted formula either way (the table is
-/// emitted purely as an L4 fingerprint match against the converter-pipeline centroid).
+/// are always present. The walker only needs to consume these bits to
+/// stay bit-aligned with the rest of the slice header; it reads and
+/// discards every weight/offset value (no pixel reconstruction happens
+/// in the walker).
 fn skip_pred_weight_table(
     r: &mut RbspReader<'_>,
     sps: &Sps,

@@ -2,26 +2,31 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Per-syntax-element CABAC decoders. Mirror of `cabac::encoder` fn-for-fn.
+// Per-syntax-element CABAC decoders. Each inverts the spec-defined
+// binarization (ITU-T H.264 § 9.3) that OpenH264's CABAC emitter
+// produces, reading the same bins in the same ctxIdx order. The
+// only forward binarizer still living in `cabac::binarization` is the
+// Table 9-36 I-slice `mb_type` bin table (`mb_type_i_bins`); the rest
+// are spec § 9.3.2 binarizations this module inverts inline.
 //
 // Each decode fn:
-//   1. Reads the same bins that the matching `encode_*` fn writes,
-//      using the same per-bin ctx_idx derivation and same neighbor
-//      state.
+//   1. Reads the bins for one syntax element, using the spec's
+//      per-bin ctx_idx derivation and the same neighbor state the
+//      emitter used.
 //   2. Inverts the binarization to reconstruct the original syntax
 //      value.
 //   3. Returns the decoded value (Result-wrapped for I/O errors).
 //
-// Phase 6D.2 chunk 2: simple syntax elements (no stego positions).
-// MVD + residual_block_cabac, which DO emit stego positions, land
-// in subsequent chunks alongside the position-tracker module.
+// The MVD + residual_block_cabac decoders additionally emit stego
+// positions (PositionKeys) for the bypass-bin cover domains; see the
+// position-tracker module.
 
-use crate::codec::h264::cabac::encoder::{
+use crate::codec::h264::cabac::ctx_offsets::{
     cat5_luma8x8, ctx_offset, CTX_BLOCK_CAT_OFFSET,
     LAST_COEFF_FLAG_OFFSET_8X8_FRAME, SIG_COEFF_FLAG_OFFSET_8X8_FRAME,
 };
 use crate::codec::h264::cabac::neighbor::{
-    ctx_idx_inc_cbp_chroma, ctx_idx_inc_coded_block_flag, ctx_idx_inc_coeff_abs_level,
+    ctx_idx_inc_cbp_chroma, ctx_idx_inc_coeff_abs_level,
     ctx_idx_inc_intra_chroma_pred_mode_bin0, ctx_idx_inc_mb_qp_delta_bin0,
     ctx_idx_inc_mb_skip_flag, ctx_idx_inc_mb_type_bin0, ctx_idx_inc_mvd_bin0,
     ctx_idx_inc_prior_bin, ctx_idx_inc_ref_idx_bin0, ctx_idx_inc_sig_4x4,
@@ -82,14 +87,13 @@ pub fn decode_tu(
 }
 
 /// Decode an FL value. Spec § 9.3.2.6 binIdx ordering: binIdx=0 is
-/// the **MSB** for general FL. The encoder's `binarize_fl` matches
-/// this: it shifts MSB-first.
+/// the **MSB** for general FL (spec § 9.3.2.6 emits MSB-first).
 ///
-/// HOWEVER, several call sites in `cabac::encoder` use a different
-/// ordering (LSB-first), described as "FL with binIdx=0 = LSB" in the
-/// comments at those sites. Those sites encode bits manually rather
-/// than calling `binarize_fl`. The decoder uses an `lsb_first` flag
-/// to switch between the two orderings.
+/// HOWEVER, a few syntax elements use the opposite (LSB-first) FL
+/// ordering — notably `rem_intra4x4_pred_mode` (spec § 9.3.2.4) and
+/// the `coded_block_pattern` luma prefix (spec § 9.3.2.6 / Table
+/// 9-39 FL nibble). The decoder uses an `lsb_first` flag to switch
+/// between the two orderings.
 pub fn decode_fl(
     dec: &mut CabacDecoder<'_>,
     n_bits: u32,
@@ -113,7 +117,7 @@ pub fn decode_fl(
     Ok(v)
 }
 
-/// Inverse of `mb_qp_delta_remap`: unsigned mapped value → signed.
+/// Inverse of the forward mb_qp_delta remap: unsigned mapped value → signed.
 #[inline]
 pub fn mb_qp_delta_unmap(mapped: u32) -> i32 {
     if mapped == 0 {
@@ -145,8 +149,8 @@ pub fn decode_mb_skip_flag(
     Ok(bin != 0)
 }
 
-/// Phase 6E-A3 — decode `mb_skip_flag` (B-slice). Same neighbor
-/// derivation rule as P (spec § 9.3.3.1.1.1; both P and B use
+/// Decode `mb_skip_flag` (B-slice). Same neighbor derivation rule
+/// as P (spec § 9.3.3.1.1.1; both P and B use
 /// `condTermFlagN = !is_skip(N)`), different ctxIdxOffset (24 for
 /// B vs 11 for P, spec Table 9-39).
 pub fn decode_mb_skip_flag_b(
@@ -219,8 +223,8 @@ pub fn decode_transform_size_8x8_flag(
 /// spec § 9.3.2.2 ref_idx binarization. `_c_max` retained on signature for caller
 /// uniformity but unused in body (no truncation).
 ///
-/// v1.4 Phase 4.5 (#316) — `current_mb` + `(cur_bx, cur_by)` replaces
-/// the prior `(block_idx_in_mb_a, block_idx_in_mb_b)` parameter pair.
+/// `current_mb` + `(cur_bx, cur_by)` replaces the prior
+/// `(block_idx_in_mb_a, block_idx_in_mb_b)` parameter pair.
 /// Caller fills `current_mb` AFTER this returns so subsequent partitions
 /// in the same MB read the just-decoded ref_idx for within-MB
 /// neighbour lookups (spec § 6.4.11.7).
@@ -277,14 +281,11 @@ pub fn decode_coded_block_pattern(
     Ok((chroma << 4) as u8 | (luma & 0x0F))
 }
 
-/// Decoder mirror of `cabac::encoder::ctx_idx_inc_mb_type_bin`. For
-/// bin 0 uses the neighbor derivation; for bin 1 the caller must
-/// route to `decode_terminate` (this fn is not consulted); for
-/// bins 2+ uses the prior-bin table or the spec Table 9-39 static
-/// fallback. **Production-default values only** — the dev-only
-/// `PHASM_IIP_CTX_*` env-var sweep knobs from the encoder are NOT
-/// honoured here. Production stego encode never sets those vars;
-/// sweep-encoded bitstreams are not decodable by this module.
+/// Derive ctxIdxInc for an `mb_type` bin per spec § 9.3.3.1 / Table
+/// 9-39. For bin 0 uses the neighbor derivation; for bin 1 the caller
+/// must route to `decode_terminate` (this fn is not consulted); for
+/// bins 2+ uses the prior-bin table or the Table 9-39 static
+/// fallback.
 fn ctx_idx_inc_mb_type_bin(
     neighbors: &CabacNeighborContext,
     mb_x: usize,
@@ -308,8 +309,8 @@ fn ctx_idx_inc_mb_type_bin(
         (17, 3) => 2,
         (17, 5) => 3,
         (17, 6) => 3,
-        // §6E-A6.1q.f — B-slice mb_type prefix bins per spec Table
-        // 9-41 / the reference decoder. Mirror of encoder.rs:178-203 fix.
+        // B-slice mb_type prefix bins per spec Table 9-41 / the
+        // reference decoder.
         (27, 1) => 3,
         (27, 3) => 5,
         (27, 4) => 5,
@@ -380,10 +381,9 @@ fn match_mb_type_i_bins(bins: &[u8]) -> u32 {
     0
 }
 
-/// Phase 6E-A4 — decode `mb_type` for a B-slice. Returns 0..=22
-/// for non-intra mb_types, or 23..=47 for intra-in-B. Spec Table
-/// 9-37 B rows; this decoder is the inverse of
-/// `encode_mb_type_b`.
+/// Decode `mb_type` for a B-slice. Returns 0..=22 for non-intra
+/// mb_types, or 23..=47 for intra-in-B. Inverts the spec Table
+/// 9-37 B-slice mb_type binarization.
 ///
 /// Tree structure:
 /// - bin0=0 → mb_type=0 (B_Direct_16x16).
@@ -601,14 +601,14 @@ pub fn decode_sub_mb_type_p(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeErr
     Ok(if bin2 == 1 { 2 } else { 3 })
 }
 
-/// §6E-A6.3 — decode `sub_mb_type` for a B-slice (uniform 8x8 family,
+/// Decode `sub_mb_type` for a B-slice (uniform 8x8 family,
 /// values 0..=3). Spec Table 9-38 B rows, ctxIdxOffset 36; ctxIdxInc
 /// from Table 9-39 with bin 2 path-dependent on bin 1.
 ///
-/// **Scope**: §6E-A6.3 ships sub_mb_types 0..=3 (`B_Direct_8x8`,
-/// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). The remaining 9 sub-sub-
-/// partition variants (4..=12, descoped per the the converter-pipeline centroid finding)
-/// return `DecodeError::Unsupported` until §6E-A6.4.
+/// **Scope**: ships sub_mb_types 0..=3 (`B_Direct_8x8`,
+/// `B_L0_8x8`, `B_L1_8x8`, `B_Bi_8x8`). The remaining 9
+/// sub-partition variants (4..=12) are out of scope and
+/// return `DecodeError::Unsupported`.
 pub fn decode_sub_mb_type_b(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeError> {
     let base = ctx_offset::SUB_MB_TYPE_B;
     // bin 0 (ctxIdxInc 0): 0 → B_Direct_8x8.
@@ -651,11 +651,11 @@ pub fn decode_sub_mb_type_b(dec: &mut CabacDecoder<'_>) -> Result<u32, DecodeErr
 /// positions. Carries the (frame, mb_addr) coordinate plus the
 /// PositionLogger to emit into.
 ///
-/// Phase C.3.6.1 (task #428) — `nal_idx` identifies which slice NAL
-/// in the Annex-B stream contains this MB's bins, plumbed into
+/// `nal_idx` identifies which slice NAL in the Annex-B stream
+/// contains this MB's bins, plumbed into
 /// `PositionLogger::register_with_offset` so the walker can capture
 /// per-position byte/bit offsets aligned to NAL boundaries (used by
-/// the Option C bitstream-mod splicer).
+/// the bitstream-mod splicer).
 pub struct PositionCtx<'a> {
     pub frame_idx: u32,
     pub mb_addr: u32,
@@ -663,38 +663,8 @@ pub struct PositionCtx<'a> {
     pub logger: &'a mut dyn PositionLogger,
 }
 
-/// Decode `mvd_lX[compIdx]` (UEG3, ctxIdxOffset 40 / 47). Mirror of
-/// `cabac::encoder::encode_mvd`. Returns the signed mvd value.
-///
-/// Emits stego positions:
-/// - `MvdSuffixLsb` at the final bin of the Exp-Golomb suffix
-///   (when |mvd| ≥ 9 and a suffix is present).
-/// - `MvdSignBypass` at the sign bypass bin (when mvd ≠ 0).
-///
-/// The two emitted [`SyntaxPath::Mvd`] keys are distinguished by
-/// [`BinKind`] (`Sign` vs `SuffixLsb`).
-pub fn decode_mvd(
-    dec: &mut CabacDecoder<'_>,
-    component: u8,
-    mb_x: usize,
-    block_idx_in_mb_a: usize,
-    block_idx_in_mb_b: usize,
-    list: u8,
-    partition: u8,
-    pos_ctx: &mut PositionCtx<'_>,
-) -> Result<i32, DecodeError> {
-    let bin0_inc = ctx_idx_inc_mvd_bin0(
-        &dec.neighbors,
-        mb_x,
-        block_idx_in_mb_a,
-        block_idx_in_mb_b,
-        component,
-    );
-    decode_mvd_with_bin0_inc(dec, component, list, partition, bin0_inc, pos_ctx)
-}
-
 /// Variant of [`decode_mvd`] that accepts a pre-computed bin-0
-/// ctxIdxInc. Mirror of `encode_mvd_with_bin0_inc`.
+/// ctxIdxInc.
 pub fn decode_mvd_with_bin0_inc(
     dec: &mut CabacDecoder<'_>,
     component: u8,
@@ -753,7 +723,7 @@ pub fn decode_mvd_with_bin0_inc(
                 kind: BinKind::Sign,
             },
         );
-        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        // Capture RBSP bit offset BEFORE the bypass read.
         let off = dec.next_rbsp_bit_offset();
         pos_ctx.logger.register_with_offset(key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
@@ -762,8 +732,8 @@ pub fn decode_mvd_with_bin0_inc(
     Ok(signed)
 }
 
-/// Decode an Exp-Golomb-k bypass suffix mirroring
-/// `binarize_egk_suffix`. Returns the suf_s value.
+/// Decode an Exp-Golomb-k bypass suffix (spec § 9.3.2.3 EGk).
+/// Returns the suf_s value.
 ///
 /// Emits a PositionKey with the caller-specified domain + SyntaxPath
 /// at the **final** suffix bin (the LSB of the suffix at the
@@ -797,7 +767,7 @@ fn decode_egk_suffix_emit_lsb(
                     lsb_domain,
                     path,
                 );
-                // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+                // Capture RBSP bit offset BEFORE the bypass read.
                 let off = dec.next_rbsp_bit_offset();
                 pos_ctx.logger.register_with_offset(key, off, pos_ctx.nal_idx);
             }
@@ -811,8 +781,8 @@ fn decode_egk_suffix_emit_lsb(
 // ─── Residual block decoder (with stego-position emission) ──────
 
 /// Decode a residual block at ctxBlockCat 0..=4 (4×4 luma residuals,
-/// chroma DC/AC, Intra_16x16 luma DC/AC). Mirror of
-/// `cabac::encoder::encode_residual_block_cabac_with_cbf_inc`.
+/// chroma DC/AC, Intra_16x16 luma DC/AC). Inverts the
+/// `residual_block_cabac` parse (spec § 9.3.3.1.3).
 ///
 /// Returns the decoded coefficient vector indexed by scan position
 /// (length = `end_idx + 1`). Positions before `start_idx` are zero.
@@ -937,7 +907,7 @@ pub fn decode_residual_block_cabac(
             EmbedDomain::CoeffSignBypass,
             sign_path,
         );
-        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        // Capture RBSP bit offset BEFORE the bypass read.
         let off = dec.next_rbsp_bit_offset();
         pos_ctx.logger.register_with_offset(sign_key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
@@ -955,8 +925,9 @@ pub fn decode_residual_block_cabac(
 
 /// Decode a cat=5 Luma 8×8 residual block (no per-block CBF — caller
 /// must decide whether this block is present via cbp_luma).
-/// Returns the 64-coefficient zigzag array. Mirror of
-/// `cabac::encoder::encode_residual_block_cabac_8x8`.
+/// Returns the 64-coefficient zigzag array. Inverts the
+/// `residual_block_cabac` parse for the 8×8 transform (spec
+/// § 9.3.3.1.3).
 ///
 /// Emits stego positions for each nonzero coefficient:
 /// - `CoeffSuffixLsb` at the LSB bin of any Exp-Golomb-0 suffix
@@ -1040,7 +1011,7 @@ pub fn decode_residual_block_cabac_8x8(
             EmbedDomain::CoeffSignBypass,
             sign_path,
         );
-        // Phase C.3.6.1 — capture RBSP bit offset BEFORE the bypass read.
+        // Capture RBSP bit offset BEFORE the bypass read.
         let off = dec.next_rbsp_bit_offset();
         pos_ctx.logger.register_with_offset(sign_key, off, pos_ctx.nal_idx);
         let sign_bin = dec.decode_bypass()?;
@@ -1053,1308 +1024,4 @@ pub fn decode_residual_block_cabac_8x8(
         }
     }
     Ok(coeffs)
-}
-
-/// Decode `coded_block_flag` for a residual block (spec
-/// § 9.3.3.1.1.9 + Table 9-39).
-pub fn decode_coded_block_flag(
-    dec: &mut CabacDecoder<'_>,
-    ctx_block_cat: u8,
-    mb_x: usize,
-    block_idx_in_mb_a: usize,
-    block_idx_in_mb_b: usize,
-    current_is_intra: bool,
-) -> Result<bool, DecodeError> {
-    let ctx_inc = ctx_idx_inc_coded_block_flag(
-        &dec.neighbors,
-        mb_x,
-        ctx_block_cat,
-        block_idx_in_mb_a,
-        block_idx_in_mb_b,
-        current_is_intra,
-    );
-    let ctx_idx = ctx_offset::CODED_BLOCK_FLAG_LOW
-        + CTX_BLOCK_CAT_OFFSET[0][ctx_block_cat as usize]
-        + ctx_inc;
-    let bin = dec.decode_dec(ctx_idx)?;
-    Ok(bin != 0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::codec::h264::cabac::context::CabacInitSlot;
-    use crate::codec::h264::cabac::encoder as cenc;
-    use crate::codec::h264::cabac::CabacEncoder;
-
-    fn fresh_enc() -> CabacEncoder {
-        CabacEncoder::new_slice(CabacInitSlot::ISI, 26, 4)
-    }
-
-    fn fresh_p_enc() -> CabacEncoder {
-        CabacEncoder::new_slice(CabacInitSlot::PIdc0, 26, 4)
-    }
-
-    fn finish_then_decode<'a>(
-        enc: CabacEncoder,
-        slot: CabacInitSlot,
-    ) -> Vec<u8> {
-        // Caller terminates and finishes the encoder; we just hand
-        // back the bytes. The decoder is constructed by the caller.
-        let _ = slot;
-        enc.finish()
-    }
-
-    fn decoder_from(bytes: &[u8], slot: CabacInitSlot) -> CabacDecoder<'_> {
-        CabacDecoder::new_slice(bytes, slot, 26, 4).expect("init")
-    }
-
-    #[test]
-    fn mb_skip_flag_zero_roundtrip() {
-        let mut enc = fresh_p_enc();
-        cenc::encode_mb_skip_flag(&mut enc, false, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_skip_flag(&mut dec, 0).unwrap();
-        assert!(!v);
-    }
-
-    #[test]
-    fn mb_skip_flag_one_roundtrip() {
-        let mut enc = fresh_p_enc();
-        cenc::encode_mb_skip_flag(&mut enc, true, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_skip_flag(&mut dec, 0).unwrap();
-        assert!(v);
-    }
-
-    #[test]
-    fn mb_qp_delta_zero_roundtrip() {
-        let mut enc = fresh_enc();
-        cenc::encode_mb_qp_delta(&mut enc, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_mb_qp_delta(&mut dec).unwrap();
-        assert_eq!(v, 0);
-    }
-
-    #[test]
-    fn mb_qp_delta_positive_roundtrip() {
-        for &dq in &[1, 3, 5, 10, 25] {
-            let mut enc = fresh_enc();
-            cenc::encode_mb_qp_delta(&mut enc, dq);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_mb_qp_delta(&mut dec).unwrap();
-            assert_eq!(v, dq, "dq={dq}");
-        }
-    }
-
-    #[test]
-    fn mb_qp_delta_negative_roundtrip() {
-        for &dq in &[-1, -3, -5, -10, -25] {
-            let mut enc = fresh_enc();
-            cenc::encode_mb_qp_delta(&mut enc, dq);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_mb_qp_delta(&mut dec).unwrap();
-            assert_eq!(v, dq, "dq={dq}");
-        }
-    }
-
-    #[test]
-    fn mb_qp_delta_remap_roundtrip() {
-        for dq in -26..=25i32 {
-            let mapped = crate::codec::h264::cabac::binarization::mb_qp_delta_remap(dq);
-            let unmapped = mb_qp_delta_unmap(mapped);
-            assert_eq!(unmapped, dq, "dq={dq} mapped={mapped}");
-        }
-    }
-
-    #[test]
-    fn intra_chroma_pred_mode_roundtrip() {
-        for mode in 0u8..=3 {
-            let mut enc = fresh_enc();
-            cenc::encode_intra_chroma_pred_mode(&mut enc, mode, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_intra_chroma_pred_mode(&mut dec, 0).unwrap();
-            assert_eq!(v, mode);
-        }
-    }
-
-    #[test]
-    fn prev_intra4x4_pred_mode_flag_roundtrip() {
-        for &flag in &[true, false] {
-            let mut enc = fresh_enc();
-            cenc::encode_prev_intra4x4_pred_mode_flag(&mut enc, flag);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_prev_intra4x4_pred_mode_flag(&mut dec).unwrap();
-            assert_eq!(v, flag);
-        }
-    }
-
-    #[test]
-    fn rem_intra4x4_pred_mode_roundtrip() {
-        for rem in 0u8..8 {
-            let mut enc = fresh_enc();
-            cenc::encode_rem_intra4x4_pred_mode(&mut enc, rem);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_rem_intra4x4_pred_mode(&mut dec).unwrap();
-            assert_eq!(v, rem, "rem={rem}");
-        }
-    }
-
-    #[test]
-    fn end_of_slice_flag_roundtrip() {
-        let mut enc = fresh_enc();
-        cenc::encode_end_of_slice_flag(&mut enc, true);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        assert!(decode_end_of_slice_flag(&mut dec).unwrap());
-    }
-
-    #[test]
-    fn ref_idx_zero_roundtrip() {
-        use crate::codec::h264::cabac::neighbor::CurrentMbRefIdx;
-        let mut enc = fresh_p_enc();
-        let cur = CurrentMbRefIdx::new();
-        cenc::encode_ref_idx(&mut enc, 0, &cur, 0, 0, 0, 31);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_ref_idx(&mut dec, &cur, 0, 0, 0, 31).unwrap();
-        assert_eq!(v, 0);
-    }
-
-    #[test]
-    fn ref_idx_nonzero_roundtrip() {
-        use crate::codec::h264::cabac::neighbor::CurrentMbRefIdx;
-        for &idx in &[1u32, 3, 7] {
-            let mut enc = fresh_p_enc();
-            let cur = CurrentMbRefIdx::new();
-            cenc::encode_ref_idx(&mut enc, idx, &cur, 0, 0, 0, 31);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::PIdc0);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_ref_idx(&mut dec, &cur, 0, 0, 0, 31).unwrap();
-            assert_eq!(v, idx);
-        }
-    }
-
-    #[test]
-    fn coded_block_pattern_zero_roundtrip() {
-        let mut enc = fresh_enc();
-        cenc::encode_coded_block_pattern(&mut enc, 0, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_coded_block_pattern(&mut dec, 0).unwrap();
-        assert_eq!(v, 0);
-    }
-
-    #[test]
-    fn coded_block_pattern_full_roundtrip() {
-        // CBP = 0x2F (luma=0xF, chroma=2 = "all coded").
-        let mut enc = fresh_enc();
-        cenc::encode_coded_block_pattern(&mut enc, 0x2F, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_coded_block_pattern(&mut dec, 0).unwrap();
-        assert_eq!(v, 0x2F);
-    }
-
-    #[test]
-    fn coded_block_pattern_mixed_roundtrip() {
-        for cbp in [0x05u8, 0x0A, 0x13, 0x1C, 0x27] {
-            let mut enc = fresh_enc();
-            cenc::encode_coded_block_pattern(&mut enc, cbp, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_coded_block_pattern(&mut dec, 0).unwrap();
-            assert_eq!(v, cbp, "cbp=0x{cbp:02x}");
-        }
-    }
-
-    #[test]
-    fn coded_block_flag_roundtrip() {
-        for &is_coded in &[false, true] {
-            let mut enc = fresh_enc();
-            cenc::encode_coded_block_flag(
-                &mut enc,
-                is_coded,
-                /* ctx_block_cat */ 1,
-                0, 0, 0,
-                /* current_is_intra */ true,
-            );
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_coded_block_flag(&mut dec, 1, 0, 0, 0, true).unwrap();
-            assert_eq!(v, is_coded);
-        }
-    }
-
-    #[test]
-    fn transform_size_8x8_flag_roundtrip() {
-        for &flag in &[false, true] {
-            let mut enc = fresh_enc();
-            cenc::encode_transform_size_8x8_flag(&mut enc, flag, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = finish_then_decode(enc, CabacInitSlot::ISI);
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_transform_size_8x8_flag(&mut dec, 0).unwrap();
-            assert_eq!(v, flag);
-        }
-    }
-
-    #[test]
-    fn unary_decode_terminates_at_zero() {
-        // Manually encode 5 ones + 0 = unary 5.
-        let mut enc = CabacEncoder::new_slice(CabacInitSlot::ISI, 26, 4);
-        let ctx_idx = ctx_offset::MB_QP_DELTA;
-        for _ in 0..5 {
-            enc.encode_dec(1, ctx_idx);
-        }
-        enc.encode_dec(0, ctx_idx);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_unary(&mut dec, 100, |_| ctx_idx).unwrap();
-        assert_eq!(v, 5);
-    }
-
-    #[test]
-    fn tu_decode_saturated() {
-        // TU cMax=3 saturated case: emit 3 ones (NO trailing zero) →
-        // TU value = c_max = 3.
-        let mut enc = CabacEncoder::new_slice(CabacInitSlot::ISI, 26, 4);
-        let ctx_idx = ctx_offset::INTRA_CHROMA_PRED_MODE;
-        for _ in 0..3 {
-            enc.encode_dec(1, ctx_idx);
-        }
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_tu(&mut dec, 3, |_| ctx_idx).unwrap();
-        assert_eq!(v, 3);
-    }
-
-    #[test]
-    fn mb_type_i_inxn_roundtrip() {
-        let mut enc = fresh_enc();
-        cenc::encode_mb_type_i(&mut enc, 0, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_mb_type_i(&mut dec, 0).unwrap();
-        assert_eq!(v, 0);
-    }
-
-    #[test]
-    fn mb_type_i_ipcm_roundtrip() {
-        let mut enc = fresh_enc();
-        cenc::encode_mb_type_i(&mut enc, 25, 0);
-        // I_PCM doesn't continue with end_of_slice; emit terminate(1)
-        // through the flush path manually since encode_mb_type_i for
-        // I_PCM already terminated bin 1.
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_mb_type_i(&mut dec, 0).unwrap();
-        assert_eq!(v, 25);
-    }
-
-    #[test]
-    fn mb_type_i_i16x16_roundtrip_all_values() {
-        for mb_type in 1u32..=24 {
-            let mut enc = fresh_enc();
-            cenc::encode_mb_type_i(&mut enc, mb_type, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-            let v = decode_mb_type_i(&mut dec, 0).unwrap();
-            assert_eq!(v, mb_type, "mb_type={mb_type}");
-        }
-    }
-
-    #[test]
-    fn mb_type_p_partition_roundtrip() {
-        // P-partition values 0, 1, 2, 3 (skipping 4 which is forbidden).
-        for mb_type in [0u32, 1, 2, 3] {
-            let mut enc = fresh_p_enc();
-            cenc::encode_mb_type_p(&mut enc, mb_type, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_mb_type_p(&mut dec, 0).unwrap();
-            assert_eq!(v, mb_type, "P-partition mb_type={mb_type}");
-        }
-    }
-
-    #[test]
-    fn mb_type_p_intra_in_p_inxn_roundtrip() {
-        // Intra-in-P with I_NxN suffix → mb_type = 5.
-        let mut enc = fresh_p_enc();
-        cenc::encode_mb_type_p(&mut enc, 5, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_type_p(&mut dec, 0).unwrap();
-        assert_eq!(v, 5);
-    }
-
-    #[test]
-    fn mb_type_p_intra_in_p_i16x16_roundtrip() {
-        // Sample of intra-in-P I_16x16 mb_type values.
-        for mb_type in [6u32, 10, 14, 18, 24, 29] {
-            let mut enc = fresh_p_enc();
-            cenc::encode_mb_type_p(&mut enc, mb_type, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_mb_type_p(&mut dec, 0).unwrap();
-            assert_eq!(v, mb_type, "intra-in-P mb_type={mb_type}");
-        }
-    }
-
-    #[test]
-    fn mb_type_p_intra_in_p_ipcm_roundtrip() {
-        // intra-in-P I_PCM is mb_type = 5 + 25 = 30.
-        let mut enc = fresh_p_enc();
-        cenc::encode_mb_type_p(&mut enc, 30, 0);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_type_p(&mut dec, 0).unwrap();
-        assert_eq!(v, 30);
-    }
-
-    // ─── §6E-A4 B-slice mb_type round-trip ──────────────────────
-
-    fn fresh_b_enc() -> CabacEncoder {
-        // B-slice uses the same PIdc{0,1,2} init slots as P/SP.
-        CabacEncoder::new_slice(CabacInitSlot::PIdc0, 26, 4)
-    }
-
-    /// §6E-A4 — B_Direct_16x16 round-trip (single-bin
-    /// short-circuit).
-    #[test]
-    fn mb_type_b_direct_roundtrip() {
-        let mut enc = fresh_b_enc();
-        cenc::encode_mb_type_b(&mut enc, 0, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_type_b(&mut dec, 0).unwrap();
-        assert_eq!(v, 0);
-    }
-
-    /// §6E-A4 — B_L0_16x16 / B_L1_16x16 round-trip (3-bin tree).
-    #[test]
-    fn mb_type_b_l0_l1_roundtrip() {
-        for mb_type in [1u32, 2] {
-            let mut enc = fresh_b_enc();
-            cenc::encode_mb_type_b(&mut enc, mb_type, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_mb_type_b(&mut dec, 0).unwrap();
-            assert_eq!(v, mb_type, "B-slice 16x16 mb_type={mb_type}");
-        }
-    }
-
-    /// §6E-A4 — B_Bi_16x16 round-trip (multi-partition v=0 path,
-    /// 6 bins).
-    #[test]
-    fn mb_type_b_bi_16x16_roundtrip() {
-        let mut enc = fresh_b_enc();
-        cenc::encode_mb_type_b(&mut enc, 3, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_type_b(&mut dec, 0).unwrap();
-        assert_eq!(v, 3);
-    }
-
-    /// §6E-A4 — B_8x8 round-trip (multi-partition v=15 short-circuit,
-    /// 6 bins).
-    #[test]
-    fn mb_type_b_8x8_roundtrip() {
-        let mut enc = fresh_b_enc();
-        cenc::encode_mb_type_b(&mut enc, 22, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let v = decode_mb_type_b(&mut dec, 0).unwrap();
-        assert_eq!(v, 22);
-    }
-
-    /// §6E-A4 — B-slice 16x8 / 8x16 partition family
-    /// (mb_types 4..=10) round-trip via the multi-partition v
-    /// ∈ [0, 7] path.
-    #[test]
-    fn mb_type_b_partition_4_to_10_roundtrip() {
-        for mb_type in 4u32..=10 {
-            let mut enc = fresh_b_enc();
-            cenc::encode_mb_type_b(&mut enc, mb_type, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_mb_type_b(&mut dec, 0).unwrap();
-            assert_eq!(v, mb_type, "B-slice partition mb_type={mb_type}");
-        }
-    }
-
-    #[test]
-    fn sub_mb_type_p_all_values() {
-        for sub in 0u32..=3 {
-            let mut enc = fresh_p_enc();
-            cenc::encode_sub_mb_type_p(&mut enc, sub);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let v = decode_sub_mb_type_p(&mut dec).unwrap();
-            assert_eq!(v, sub, "sub_mb_type={sub}");
-        }
-    }
-
-    #[test]
-    fn mvd_zero_no_sign_position() {
-        let mut enc = fresh_p_enc();
-        cenc::encode_mvd(&mut enc, 0, /* component */ 0, 0, 0, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let mut recorder = crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
-        assert_eq!(v, 0);
-        // mvd=0 → no sign bin emitted, no positions logged.
-        assert_eq!(recorder.positions.len(), 0);
-    }
-
-    #[test]
-    fn mvd_small_emits_only_sign_position() {
-        for &mvd in &[1i32, -1, 5, -5, 8, -8] {
-            let mut enc = fresh_p_enc();
-            cenc::encode_mvd(&mut enc, mvd, 0, 0, 0, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let mut recorder =
-                crate::codec::h264::stego::PositionRecorder::new();
-            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-            let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
-            assert_eq!(v, mvd, "mvd={mvd}");
-            // |mvd| < 9 → no suffix; only sign bypass emitted.
-            assert_eq!(recorder.positions.len(), 1, "mvd={mvd}");
-            assert_eq!(
-                recorder.positions[0].domain(),
-                EmbedDomain::MvdSignBypass,
-            );
-        }
-    }
-
-    #[test]
-    fn mvd_saturated_emits_suffix_and_sign_positions() {
-        // |mvd| >= 9 → both suffix LSB AND sign bins emitted.
-        for &mvd in &[9i32, -9, 17, -17, 100, -100] {
-            let mut enc = fresh_p_enc();
-            cenc::encode_mvd(&mut enc, mvd, 0, 0, 0, 0);
-            enc.engine.encode_terminate(1);
-            let bytes = enc.finish();
-            let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-            let mut recorder =
-                crate::codec::h264::stego::PositionRecorder::new();
-            let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-            let v = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
-            assert_eq!(v, mvd, "mvd={mvd}");
-            // 2 positions: SuffixLsb then SignBypass.
-            assert_eq!(recorder.positions.len(), 2, "mvd={mvd}");
-            assert_eq!(recorder.positions[0].domain(), EmbedDomain::MvdSuffixLsb);
-            assert_eq!(recorder.positions[1].domain(), EmbedDomain::MvdSignBypass);
-        }
-    }
-
-    #[test]
-    fn mvd_position_keys_have_correct_axis_and_kind() {
-        // Component 0 (X) and 1 (Y) must produce different SyntaxPath
-        // keys.
-        let mut enc = fresh_p_enc();
-        cenc::encode_mvd(&mut enc, 5, 0, 0, 0, 0);
-        cenc::encode_mvd(&mut enc, 5, 1, 0, 0, 0);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let _ = decode_mvd(&mut dec, 0, 0, 0, 0, 0, 0, &mut ctx).unwrap();
-        let _ = decode_mvd(&mut dec, 1, 0, 0, 0, 0, 0, &mut ctx).unwrap();
-        assert_eq!(recorder.positions.len(), 2);
-        // Two MvdSignBypass keys, but with different axes → distinct.
-        assert_ne!(recorder.positions[0], recorder.positions[1]);
-        // Both should be MvdSignBypass.
-        assert_eq!(recorder.positions[0].domain(), EmbedDomain::MvdSignBypass);
-        assert_eq!(recorder.positions[1].domain(), EmbedDomain::MvdSignBypass);
-        match recorder.positions[0].syntax_path() {
-            SyntaxPath::Mvd { axis: Axis::X, kind: BinKind::Sign, .. } => (),
-            other => panic!("expected MVD X+Sign, got {other:?}"),
-        }
-        match recorder.positions[1].syntax_path() {
-            SyntaxPath::Mvd { axis: Axis::Y, kind: BinKind::Sign, .. } => (),
-            other => panic!("expected MVD Y+Sign, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn residual_block_all_zero_emits_only_cbf() {
-        // Build a 16-coeff scan with all zeros. Encoder emits CBF=0
-        // and stops. Decoder reads CBF=0, returns zero vec, no stego
-        // positions emitted.
-        let mut enc = fresh_enc();
-        let scan = vec![0i32; 16];
-        let r = cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        assert!(!r, "encoder reports no nonzero");
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 0);
-    }
-
-    #[test]
-    fn residual_block_single_coeff_roundtrip() {
-        // Single nonzero at scan position 0, value 3.
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[0] = 3;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        // Single nonzero |level|=3 < 15 → no suffix LSB. Just one
-        // sign bypass position emitted.
-        assert_eq!(recorder.positions.len(), 1);
-        assert_eq!(recorder.positions[0].domain(), EmbedDomain::CoeffSignBypass);
-    }
-
-    #[test]
-    fn residual_block_negative_coeff_roundtrip() {
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[2] = -7;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 1);
-    }
-
-    #[test]
-    fn residual_block_multiple_coeffs_roundtrip() {
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[0] = 5;
-        scan[1] = -3;
-        scan[3] = 1;
-        scan[5] = -2;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        // 4 nonzeros, all |level| < 15 → 4 sign positions, 0 suffix.
-        assert_eq!(recorder.positions.len(), 4);
-        for key in &recorder.positions {
-            assert_eq!(key.domain(), EmbedDomain::CoeffSignBypass);
-        }
-    }
-
-    #[test]
-    fn residual_block_large_coeff_emits_suffix_lsb_position() {
-        // |level|=20 → abs_level_minus1=19 ≥ 14 → EG0 suffix path.
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[0] = 20;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        // Expect 1 suffix LSB + 1 sign = 2 positions.
-        assert_eq!(recorder.positions.len(), 2);
-        assert_eq!(recorder.positions[0].domain(), EmbedDomain::CoeffSuffixLsb);
-        assert_eq!(recorder.positions[1].domain(), EmbedDomain::CoeffSignBypass);
-    }
-
-    #[test]
-    fn residual_block_8x8_single_coeff_roundtrip() {
-        let mut enc = fresh_enc();
-        let mut scan = [0i32; 64];
-        scan[7] = 4;
-        cenc::encode_residual_block_cabac_8x8(&mut enc, &scan);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let coeffs = decode_residual_block_cabac_8x8(
-            &mut dec, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma8x8 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 1);
-        assert_eq!(recorder.positions[0].domain(), EmbedDomain::CoeffSignBypass);
-        match recorder.positions[0].syntax_path() {
-            SyntaxPath::Luma8x8 { block_idx: 0, coeff_idx: 7, kind: BinKind::Sign } => (),
-            other => panic!("wrong path {other:?}"),
-        }
-    }
-
-    #[test]
-    fn residual_block_chroma_dc_roundtrip() {
-        // ctxBlockCat=3 → uses ctx_idx_inc_sig_chroma_dc, different
-        // ctx_block_cat_offset entry. Chroma DC is a 2x2 Hadamard
-        // (start_idx=0, end_idx=3, 4 coefficients).
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 4];
-        scan[0] = 5;
-        scan[2] = -2;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 3, 3, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 3, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 3, 3, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::ChromaDc {
-                plane: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 2);
-    }
-
-    #[test]
-    fn residual_block_luma_dc_intra16_roundtrip() {
-        // ctxBlockCat=0 → LumaDcIntra16x16 (16-coeff Hadamard 4x4 of
-        // DC-of-each-4x4 in the macroblock).
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[0] = 100; // |level| > 14 → exercises the EG0 suffix path
-        scan[3] = -3;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 0, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 0, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 0, 15, 0, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::LumaDcIntra16x16 {
-                coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        // |level=100| > 14 → 1 SuffixLsb, plus 2 sign positions.
-        assert_eq!(recorder.positions.len(), 3);
-        let suffix_count = recorder
-            .positions
-            .iter()
-            .filter(|k| k.domain() == EmbedDomain::CoeffSuffixLsb)
-            .count();
-        let sign_count = recorder
-            .positions
-            .iter()
-            .filter(|k| k.domain() == EmbedDomain::CoeffSignBypass)
-            .count();
-        assert_eq!(suffix_count, 1);
-        assert_eq!(sign_count, 2);
-    }
-
-    #[test]
-    fn residual_block_luma_ac_intra16_cat2_roundtrip() {
-        // ctxBlockCat=2 → Intra16x16ACLevel. start_idx=1 (DC is
-        // separate at cat=0), end_idx=15 (15 AC coeffs). Production
-        // encoder emits cat=2 for I_16x16 MBs with non-zero AC.
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[1] = 6;
-        scan[3] = -2;
-        scan[8] = 1;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 1, 15, 2, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 2, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 1, 15, 2, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::LumaDcIntra16x16 {
-                coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 3);
-        for key in &recorder.positions {
-            assert_eq!(key.domain(), EmbedDomain::CoeffSignBypass);
-        }
-    }
-
-    #[test]
-    fn residual_block_chroma_ac_roundtrip() {
-        // ctxBlockCat=4 → ChromaAc (start_idx=1, end_idx=15, 15
-        // AC coefficients).
-        let mut enc = fresh_enc();
-        let mut scan = vec![0i32; 16];
-        scan[1] = 4;
-        scan[7] = -1;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 1, 15, 4, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 4, 0, 0, true,
-        );
-        let coeffs = decode_residual_block_cabac(
-            &mut dec, 1, 15, 4, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::ChromaAc {
-                plane: 1, block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        assert_eq!(recorder.positions.len(), 2);
-    }
-
-    #[test]
-    fn residual_block_8x8_multiple_coeffs_roundtrip() {
-        let mut enc = fresh_enc();
-        let mut scan = [0i32; 64];
-        scan[0] = 3;
-        scan[1] = -2;
-        scan[5] = 1;
-        scan[10] = -4;
-        cenc::encode_residual_block_cabac_8x8(&mut enc, &scan);
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let coeffs = decode_residual_block_cabac_8x8(
-            &mut dec, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma8x8 {
-                block_idx: 1, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(coeffs, scan);
-        // 4 nonzeros, all |level| < 15 → 4 sign positions, 0 suffix.
-        assert_eq!(recorder.positions.len(), 4);
-    }
-
-    /// Phase 6D.3 sign-off gate: a planned sign-bit pattern survives
-    /// the full round-trip through the encoder + decoder when
-    /// applied via [`apply_coeff_sign_overrides`], AND the position
-    /// keys the decoder logs match the keys
-    /// [`enumerate_coeff_sign_positions`] produces on the same input.
-    ///
-    /// Three properties verified:
-    ///   1. Coefficient magnitudes are byte-identical between cover
-    ///      and stego (bypass-bin invariant; Phase 6D.0
-    ///      cabac-bypass-bin-stego.md Theorem 1).
-    ///   2. Decoder-side `PositionRecorder` produces exactly the
-    ///      same `PositionKey` sequence (same keys, same order) as
-    ///      the encoder-side `enumerate_coeff_sign_positions`.
-    ///   3. The decoded coefficient signs match the injected plan.
-    #[test]
-    fn coeff_sign_bypass_full_roundtrip_with_position_parity() {
-        use crate::codec::h264::stego::{
-            apply_coeff_sign_overrides, enumerate_coeff_sign_positions,
-            BitInjector, PositionRecorder,
-        };
-
-        // Original cover: a residual block with 4 mixed-sign coeffs.
-        let cover = [5i32, -3, 0, 7, 0, 0, 0, -2, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut scan = cover.to_vec();
-
-        let path_for_coeff = |coeff_idx: u8| SyntaxPath::Luma4x4 {
-            block_idx: 0, coeff_idx, kind: BinKind::Sign,
-        };
-
-        // Encoder-side enumeration (what the stego planner sees).
-        let cover_positions = enumerate_coeff_sign_positions(
-            &scan, 0, 15, 0, 0, &path_for_coeff,
-        );
-        assert_eq!(cover_positions.len(), 4);
-
-        // Non-trivial injection plan: alternate the bit value across
-        // positions in emit order.
-        struct AlternateInjector { count: u32 }
-        impl BitInjector for AlternateInjector {
-            fn override_bit(&mut self, _key: PositionKey) -> Option<u8> {
-                let bit = (self.count & 1) as u8;
-                self.count += 1;
-                Some(bit)
-            }
-        }
-        let mut injector = AlternateInjector { count: 0 };
-        let _flips = apply_coeff_sign_overrides(
-            &mut scan, 0, 15, 0, 0, &path_for_coeff, &mut injector,
-        );
-
-        // Encode the modified scan.
-        let mut enc = fresh_enc();
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-
-        // Decode + record positions.
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let decoded = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-
-        // (1) Coefficient roundtrip: decoded == post-injection scan.
-        assert_eq!(decoded, scan, "decoded coeffs must match modified scan");
-
-        // (2) Position-key parity: encoder enumerate == decoder
-        //     emission (same keys, same order). 6D.3 sign-off gate.
-        assert_eq!(
-            recorder.positions, cover_positions,
-            "decoder position keys must match encoder enumeration",
-        );
-
-        // (3) Magnitude preservation: bypass-bin stego must NOT
-        //     change coefficient magnitudes (Theorem 1).
-        for i in 0..16 {
-            assert_eq!(
-                scan[i].unsigned_abs(),
-                cover[i].unsigned_abs(),
-                "scan[{i}] magnitude must be preserved",
-            );
-        }
-    }
-
-    /// Phase 6D.5 sign-off gate: `MvdSignBypass` end-to-end paired
-    /// roundtrip + position parity. Same shape as 6D.3 coeff gate.
-    #[test]
-    fn mvd_sign_bypass_full_roundtrip_with_position_parity() {
-        use crate::codec::h264::stego::{
-            apply_mvd_sign_overrides, enumerate_mvd_sign_positions,
-            BitInjector, MvdSlot, PositionRecorder,
-        };
-
-        // Three MVD slots (e.g. P_8x8 partitions): mixed signs.
-        let mut slots = vec![
-            MvdSlot { list: 0, partition: 0, axis: Axis::X, value: 5 },
-            MvdSlot { list: 0, partition: 1, axis: Axis::X, value: -3 },
-            MvdSlot { list: 0, partition: 2, axis: Axis::X, value: 7 },
-        ];
-
-        let cover_positions = enumerate_mvd_sign_positions(&slots, 0, 0);
-        assert_eq!(cover_positions.len(), 3);
-
-        // Plan: alternating override.
-        struct AlternateInjector { count: u32 }
-        impl BitInjector for AlternateInjector {
-            fn override_bit(&mut self, _key: PositionKey) -> Option<u8> {
-                let bit = (self.count & 1) as u8;
-                self.count += 1;
-                Some(bit)
-            }
-        }
-        let mut injector = AlternateInjector { count: 0 };
-        apply_mvd_sign_overrides(&mut slots, 0, 0, &mut injector);
-
-        // Encode each MVD as a stand-alone test (no full MB walker).
-        let mut enc = fresh_p_enc();
-        for s in &slots {
-            cenc::encode_mvd(&mut enc, s.value, /* component */ 0, 0, 0, 0);
-        }
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-
-        // Decode + record positions.
-        let mut dec = decoder_from(&bytes, CabacInitSlot::PIdc0);
-        let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        for s in &slots {
-            let v = decode_mvd(&mut dec, 0, 0, 0, 0, s.list, s.partition, &mut ctx).unwrap();
-            assert_eq!(v, s.value, "MVD roundtrip for slot {s:?}");
-        }
-
-        // Position parity: only sign bypass keys (all values < 9 so
-        // no suffix LSB). Encoder enumerate == decoder emission.
-        let recorded_signs: Vec<PositionKey> = recorder
-            .positions
-            .iter()
-            .filter(|k| k.domain() == EmbedDomain::MvdSignBypass)
-            .copied()
-            .collect();
-        assert_eq!(recorded_signs, cover_positions);
-    }
-
-    /// Phase 6D.6 sign-off gate: `CoeffSuffixLsb` end-to-end paired
-    /// roundtrip + position parity. Verifies magnitude changes by ±1
-    /// (NOT preserved, unlike sign-only domains), and that the
-    /// decoder reads back exactly the suffix LSB bits implied by
-    /// the modified magnitudes.
-    #[test]
-    fn coeff_suffix_lsb_full_roundtrip_with_position_parity() {
-        use crate::codec::h264::stego::{
-            apply_coeff_suffix_lsb_overrides, enumerate_coeff_suffix_lsb_positions,
-            extract_coeff_suffix_lsb_bits, BitInjector, PositionRecorder,
-        };
-
-        // Three large coefficients (|coeff| ≥ 16, eligibility threshold).
-        let mut scan = vec![0i32; 16];
-        scan[0] = 20;
-        scan[3] = -25;
-        scan[7] = 18;
-        // Plus a sub-threshold coeff (not eligible).
-        scan[10] = 5;
-
-        let path_for_coeff = |coeff_idx: u8| SyntaxPath::Luma4x4 {
-            block_idx: 0, coeff_idx, kind: BinKind::SuffixLsb,
-        };
-
-        let cover_positions = enumerate_coeff_suffix_lsb_positions(
-            &scan, 0, 15, 0, 0, &path_for_coeff,
-        );
-        // Three eligible (≥ 16); one sub-threshold.
-        assert_eq!(cover_positions.len(), 3);
-
-        // Plan: alternating override bits.
-        struct AltInjector { count: u32 }
-        impl BitInjector for AltInjector {
-            fn override_bit(&mut self, _key: PositionKey) -> Option<u8> {
-                let bit = (self.count & 1) as u8;
-                self.count += 1;
-                Some(bit)
-            }
-        }
-        let mut injector = AltInjector { count: 0 };
-        apply_coeff_suffix_lsb_overrides(
-            &mut scan, 0, 15, 0, 0, &path_for_coeff, &mut injector,
-        );
-
-        // Encode + decode.
-        let mut enc = fresh_enc();
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let decoded = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-
-        // Coefficient roundtrip.
-        assert_eq!(decoded, scan);
-
-        // Position-key parity for the SuffixLsb domain only.
-        let recorded_suffix: Vec<PositionKey> = recorder
-            .positions
-            .iter()
-            .filter(|k| k.domain() == EmbedDomain::CoeffSuffixLsb)
-            .copied()
-            .collect();
-        assert_eq!(recorded_suffix, cover_positions);
-
-        // Bits parity: extracted suffix LSB bits == decoder-side
-        // bits read from the modified scan.
-        let cover_bits = extract_coeff_suffix_lsb_bits(&scan, 0, 15);
-        // Extract decoder-side bits: walk recorded_suffix order +
-        // compute LSB(magnitude) of decoded coeffs.
-        for (idx, key) in recorded_suffix.iter().enumerate() {
-            let coeff_idx = match key.syntax_path() {
-                SyntaxPath::Luma4x4 { coeff_idx, .. } => coeff_idx,
-                _ => panic!("wrong path"),
-            };
-            let abs = decoded[coeff_idx as usize].unsigned_abs() as u32;
-            let decoder_bit = ((abs & 1) ^ 1) as u8;
-            assert_eq!(decoder_bit, cover_bits[idx],
-                "suffix LSB at coeff_idx={coeff_idx} mismatch");
-        }
-    }
-
-    /// Variant of the 6D.3 gate that exercises a custom plan
-    /// HashMap<PositionKey, u8> (mirrors the eventual STC bit-plan
-    /// lookup pattern). Verifies that the decoder reads back exactly
-    /// the bit pattern the injector planted.
-    #[test]
-    fn coeff_sign_bypass_decoded_bits_match_injected_plan() {
-        use crate::codec::h264::stego::{
-            apply_coeff_sign_overrides, enumerate_coeff_sign_positions,
-            extract_coeff_sign_bits, BitInjector, PositionRecorder,
-        };
-
-        let mut scan = vec![0i32; 16];
-        scan[1] = 4; scan[5] = -2; scan[9] = 1; scan[13] = -8;
-
-        let path_for_coeff = |coeff_idx: u8| SyntaxPath::Luma4x4 {
-            block_idx: 0, coeff_idx, kind: BinKind::Sign,
-        };
-
-        let cover_positions = enumerate_coeff_sign_positions(
-            &scan, 0, 15, 0, 0, &path_for_coeff,
-        );
-        // Choose a deterministic per-key bit value.
-        let plan: std::collections::HashMap<PositionKey, u8> = cover_positions
-            .iter()
-            .enumerate()
-            .map(|(idx, &k)| (k, ((idx * 3 + 1) & 1) as u8))
-            .collect();
-
-        struct PlanInjector(std::collections::HashMap<PositionKey, u8>);
-        impl BitInjector for PlanInjector {
-            fn override_bit(&mut self, key: PositionKey) -> Option<u8> {
-                self.0.get(&key).copied()
-            }
-        }
-        let mut injector = PlanInjector(plan.clone());
-
-        apply_coeff_sign_overrides(
-            &mut scan, 0, 15, 0, 0, &path_for_coeff, &mut injector,
-        );
-
-        // Encode + decode.
-        let mut enc = fresh_enc();
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder = PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 0, mb_addr: 0, nal_idx: 0, logger: &mut recorder };
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let decoded = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-
-        // Extract the sign bits the decoder would see, and confirm
-        // they match the injected plan exactly.
-        let decoded_bits = extract_coeff_sign_bits(&decoded, 0, 15);
-        let plan_bits: Vec<u8> = recorder.positions.iter()
-            .map(|k| plan[k])
-            .collect();
-        assert_eq!(decoded_bits, plan_bits);
-    }
-
-    #[test]
-    fn integration_multi_element_mb_roundtrip() {
-        // Encode a sequence of disparate elements that a real I-slice
-        // MB walker would emit, then decode them back in the same
-        // order. Verifies that:
-        //  - per-element decoders chain correctly without state drift,
-        //  - PositionRecorder captures the expected total set of
-        //    stego positions across multiple emitting decoders,
-        //  - the encoder's bin sequence matches the decoder's exactly.
-        let mut enc = fresh_enc();
-
-        // 1. mb_type_i = 1 (I_16x16 mode 0, cbp_chroma=0, cbp_luma=0)
-        cenc::encode_mb_type_i(&mut enc, 1, 0);
-        // 2. intra_chroma_pred_mode = 2
-        cenc::encode_intra_chroma_pred_mode(&mut enc, 2, 0);
-        // 3. mb_qp_delta = -2
-        cenc::encode_mb_qp_delta(&mut enc, -2);
-        // 4. coded_block_pattern = 0x07 (luma 0x7, chroma 0)
-        cenc::encode_coded_block_pattern(&mut enc, 0x07, 0);
-        // 5. residual block: 4x4 luma at scan[2] = -8 (level 8, sign bypass)
-        let mut scan = vec![0i32; 16];
-        scan[2] = -8;
-        cenc::encode_residual_block_cabac(
-            &mut enc, &scan, 0, 15, /*cat*/ 1, 0, 0, 0, true,
-        );
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let mut recorder =
-            crate::codec::h264::stego::PositionRecorder::new();
-        let mut ctx = PositionCtx { frame_idx: 5, mb_addr: 17, nal_idx: 0, logger: &mut recorder };
-
-        assert_eq!(decode_mb_type_i(&mut dec, 0).unwrap(), 1);
-        assert_eq!(decode_intra_chroma_pred_mode(&mut dec, 0).unwrap(), 2);
-        assert_eq!(decode_mb_qp_delta(&mut dec).unwrap(), -2);
-        assert_eq!(decode_coded_block_pattern(&mut dec, 0).unwrap(), 0x07);
-        let cbf_inc = ctx_idx_inc_coded_block_flag(
-            &dec.neighbors, 0, 1, 0, 0, true,
-        );
-        let out = decode_residual_block_cabac(
-            &mut dec, 0, 15, 1, cbf_inc, &mut ctx,
-            |coeff_idx, kind| SyntaxPath::Luma4x4 {
-                block_idx: 0, coeff_idx, kind,
-            },
-        ).unwrap();
-        assert_eq!(out, scan);
-
-        // Only the residual decoder emits stego positions in this
-        // sequence — it's the only call that received a logger.
-        // |level|=8 < 15 → no suffix; just one sign bypass.
-        assert_eq!(recorder.positions.len(), 1);
-        assert_eq!(recorder.positions[0].domain(), EmbedDomain::CoeffSignBypass);
-        assert_eq!(recorder.positions[0].frame_idx(), 5);
-        assert_eq!(recorder.positions[0].mb_addr(), 17);
-        match recorder.positions[0].syntax_path() {
-            SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 2, kind: BinKind::Sign } => (),
-            other => panic!("wrong path {other:?}"),
-        }
-
-        // Final terminate sees end_of_slice = true.
-        assert!(decode_end_of_slice_flag(&mut dec).unwrap());
-    }
-
-    #[test]
-    fn fl_lsb_first_decode() {
-        // 3-bit FL LSB-first encoding of 5 = 0b101 → emit bits LSB-first
-        // = 1, 0, 1.
-        let mut enc = CabacEncoder::new_slice(CabacInitSlot::ISI, 26, 4);
-        let ctx_idx = ctx_offset::REM_INTRA_PRED_MODE;
-        enc.encode_dec(1, ctx_idx); // bit 0 (LSB)
-        enc.encode_dec(0, ctx_idx); // bit 1
-        enc.encode_dec(1, ctx_idx); // bit 2 (MSB)
-        enc.engine.encode_terminate(1);
-        let bytes = enc.finish();
-        let mut dec = decoder_from(&bytes, CabacInitSlot::ISI);
-        let v = decode_fl(&mut dec, 3, true, |_| ctx_idx).unwrap();
-        assert_eq!(v, 5);
-    }
 }

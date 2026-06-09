@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Memory budget prediction + telemetry (M2).
+//! Memory budget prediction + telemetry.
 //!
-//! M1 shipped the calibration scaffold (`predict_peak_memory()` and the
-//! `ModeId` / `GhostShadowRung` enums). M2 adds the public API every
-//! bridge calls at startup:
+//! Provides peak-RSS prediction (`predict_peak_memory()`, the `ModeId` /
+//! `GhostShadowRung` enums) and the public API every bridge calls at
+//! startup:
 //!
 //! - `set_memory_budget(Some(bytes))` — bridge tells core the
 //!   per-process budget. iOS uses `os_proc_available_memory() / 2`;
@@ -16,11 +16,10 @@
 //!   Silent in release if unset. In debug builds, unset hook routes
 //!   through `eprintln!` so developers see the trace.
 //!
-//! M3 wires this into the bridges. M4-M5 use the budget to select a
-//! ladder rung in the encode paths.
+//! The encode paths use the budget to select a ladder rung.
 //!
-//! Coefficients here are STATIC for now — Phase 1's `perf_memory_audit`
-//! harness produces real RSS measurements that refine them. Treat the
+//! Coefficients here are STATIC — the `perf_memory_audit` harness
+//! produces real RSS measurements that refine them. Treat the
 //! bytes-per-pixel numbers as upper bounds; if actual RSS comes in
 //! higher, raise the safety factor before changing the per-component
 //! breakdown.
@@ -38,12 +37,12 @@ pub enum ModeId {
     Decode = 6,
 }
 
-/// Ladder rung selection for Ghost shadow encode. Rung 0 = current
+/// Ladder rung selection for Ghost shadow encode. Rung 0 = default
 /// behavior (fast, parallel); higher rungs trade wall-clock for peak
-/// memory. M4 wires the rung selection logic in `ghost_encode_with_shadows_impl`.
+/// memory. The rung selection logic lives in `shadows_encode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GhostShadowRung {
-    /// Rung 0: full parallel, T3.2 cover_wavelets cache on. Current default.
+    /// Rung 0: full parallel, cover_wavelets cache on. Default.
     FullParallel,
     /// Rung 1: cap rayon workers to 1, cover_wavelets cache on.
     CappedParallel,
@@ -55,7 +54,7 @@ pub enum GhostShadowRung {
 }
 
 /// Static safety multiplier applied on top of the per-component sum.
-/// ×1.5 chosen as starting point per M1 plan; Phase 1's harness
+/// ×1.5 chosen as a starting point; the `perf_memory_audit` harness
 /// validates against real RSS.
 pub(crate) const SAFETY_FACTOR_NUM: usize = 3;
 pub(crate) const SAFETY_FACTOR_DEN: usize = 2;
@@ -72,8 +71,8 @@ pub(crate) const FIXED_OVERHEAD_BYTES: usize = 4 * 1024 * 1024;
 /// Returns an upper bound suitable for comparing against `budget`.
 ///
 /// Coefficients trace to the cost table at
-/// `docs/design/image/memory-budget-2026-05.md` § 1. They are static
-/// for M1; M2 may refine after `perf_memory_audit` runs on cgPhone.
+/// `docs/design/image/memory-budget-2026-05.md` § 1. They are static;
+/// `perf_memory_audit` running on a real device may refine them.
 pub fn predict_peak_memory(
     mode: ModeId,
     width: u32,
@@ -129,7 +128,7 @@ fn bytes_per_pixel(mode: ModeId, rung: GhostShadowRung, n_workers: usize) -> usi
     }
 }
 
-// ===== Public memory-budget API (M2) =====
+// ===== Public memory-budget API =====
 
 /// Process-wide memory budget in bytes, or `None` for "no limit".
 ///
@@ -255,7 +254,7 @@ pub(crate) fn emit(event: TelemetryEvent) {
 /// `None` (no limit), else descends until predicted ≤ budget. Worst
 /// case (predicted > budget at every rung) returns `MinimalClones`.
 ///
-/// M4 calls this once per encode. Kept in this module so the
+/// Called once per encode. Kept in this module so the
 /// prediction coefficients and the selection logic live together.
 pub fn select_ghost_shadow_rung(
     mode: ModeId,

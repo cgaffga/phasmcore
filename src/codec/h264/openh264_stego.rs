@@ -2,44 +2,32 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Phase C.8.13 (#446) — production stego orchestrator on top of the
-// OpenH264 backend. Single-domain (CoeffSign) STC encode + brute-force
-// decode over walker-aligned cover, with passphrase-derived seeds.
+// Production stego ENCODE orchestrator on top of the OpenH264 fork —
+// the sole H.264 encoder (`h264-encoder` feature). The live primitive
+// is `h264_encode_gop_framed_bits`: a 2-pass
+// per-GOP, single combined-cover STC over all four bypass-bin domains
+// (CoeffSign, CoeffSuffixLsb, MvdSign, MvdSuffixLsb) in canonical
+// CS→CSL→MVDs→MVDsl order, driven by the streaming session
+// (`streaming_session.rs`). Passphrase-derived hhat seeds; per-position
+// Tier-3 content-adaptive J-UNIWARD costs; cascade-safety + Track-1
+// tier ∞-cost gates. There is NO decode entry in this file — decode is
+// the engine-agnostic walker (`StreamingDecodeSession`).
 //
-// **STATUS: v1.0 ALPHA** — API surface + capacity primitive + encode/decode
-// shape are shipped, but the round-trip is **not yet robust** against the
-// 0.003 % residual cascade-leak rate observed at higher flip counts
-// (~100 + flips). For small messages (≤ 10-20 flips, ~10 message bytes) the
-// round-trip is essentially deterministic; above that, occasional 1-2 bit
-// wire divergences from cascade leak break STC syndrome and fail decode.
-// C.8.13 ship gate is documented in
-// `docs/design/video/h264/phase-c8-visual-recon-plan.md` §C.8.13.
-//
-// Two follow-ons clear the alpha tag:
-//   * C.8.13(b) — cascade-break gap audit: localise which domain
-//     (CoeffSign / chroma DC/AC / deblock / …) leaks 2 / 76 384 wire
-//     bits on 124-flip plans and fix structurally.
-//   * C.8.13(c) — fallback: WET-INFINITY cost at empirically-detected
-//     unsafe positions per b10_cascade_safe_roundtrip pattern (slow but
-//     always correct), used as the ship-safe path until (b) lands.
-//
-// **Single-domain v1.0**: only CoeffSign positions carry the message.
-// CoeffSuffixLsb / MvdSign / MvdSuffixLsb are reserved for v1.1+ once
-// cascade-safety analysis (per-domain `cascade_safety.rs` equivalents)
-// is wired through the OpenH264 path.
-//
-// **Cascade-safety**: relies on the C.8.3-11 dual-recon (`pVisualRecPic`)
-// to keep mode-decision identical between baseline and stego encodes.
-// On the 4-fixture C.8.12 corpus this holds for the small flip set in
-// that test (≤ 3 flips); higher-flip-count plans intermittently observe
-// the residual leak described above.
+// **Cascade elimination**: Pass 2 re-encodes with the planned bits
+// applied via the OH264 fork's `wire_only` scratch-table overrides at
+// the CABAC bypass-bin emit site (default ON; `PHASM_USE_WIRE_ONLY=0`
+// opts into the legacy mutating + dual-recon path). In wire-only mode
+// the encoder's reconstruction (pDecPic) stays clean by construction —
+// no residual / MV mutation — so there is no inter-frame cascade. A
+// #533 Pass-1→Pass-2 mode-decision DecisionCache (Capture/Replay) keeps
+// the two passes byte-identical.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 // #549 Phase C diagnostic — thread-local pass index, set by
-// `encode_yuv_with_pre_framed_bits_4domain` before each `encode_once`
+// `h264_encode_gop_framed_bits_auto` before each `encode_once`
 // call. Read by the `md_cost` callback in encode_once when
 // `PHASM_549_MD_DUMP=1` is set, to tag dumped MB-decision records as
 // Pass 1 vs Pass 2 so a downstream diff can find the first divergent MB.
@@ -168,11 +156,9 @@ use super::openh264::{
 use super::pass2_cache::DecisionCache;
 use super::stego::hook::{BinKind, EmbedDomain, SyntaxPath};
 use super::stego::inject::DomainCover;
-use super::stego::keys::CabacStegoMasterKeys;
-use crate::stego::{crypto, frame, payload};
 use crate::stego::error::StegoError;
 use crate::stego::stc::embed::stc_embed;
-use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
+use crate::stego::stc::extract::stc_extract;
 use crate::stego::stc::hhat::generate_hhat;
 
 /// STC constraint length. Must match between encode and decode (decoder
@@ -211,248 +197,32 @@ impl Default for EncodeOpts {
     }
 }
 
-/// Encode `message` (plus optional `files`) into a stego H.264 Annex-B
-/// stream using the OpenH264 backend with C.8.3-11 visual_recon cascade
-/// safety.
-///
-/// The encode flow:
-/// 1. Encrypt the payload with the passphrase (AES-256-GCM-SIV +
-///    Argon2id key derive).
-/// 2. Wrap in the standard phasm v1/v2 frame format.
-/// 3. Baseline encode → walk → walker-aligned `PositionKey` cover.
-/// 4. STC plan over `cover[0..m_total * w]` with `w = n_cover / m_total`.
-/// 5. Re-encode with an `enc_pre_emit` hook that translates encoder hook
-///    fires to canonical `PositionKey` and applies the planned flips.
-///
-/// Returns the raw Annex-B bytes ready to mux into MP4 (or store raw).
-///
-/// # Arguments
-/// * `yuv` — raw YUV420p bytes, `width * height * 3 / 2 * n_frames` long.
-/// * `width`, `height` — 16-aligned encode dimensions.
-/// * `n_frames` — number of frames in `yuv`.
-/// * `opts` — encoder knobs (QP, intra_period).
-/// * `message` — UTF-8 text to embed (typically short; <1 KB).
-/// * `files` — file attachments embedded alongside the text.
-/// * `passphrase` — derives the AES key + STC hhat seed.
-///
-/// # Errors
-/// * `StegoError::InvalidVideo` — dims not 16-aligned, yuv length wrong.
-/// * `StegoError::MessageTooLarge` — cover capacity insufficient.
-/// * Encryption / encoding failures bubble up as their respective
-///   `StegoError` variants.
-pub fn openh264_stego_encode_yuv_string(
-    yuv: &[u8],
-    width: u32,
-    height: u32,
-    n_frames: u32,
-    opts: EncodeOpts,
-    message: &str,
-    files: &[payload::FileEntry],
-    passphrase: &str,
-) -> Result<Vec<u8>, StegoError> {
-    validate_dims(yuv, width, height, n_frames)?;
-
-    // 1. Build the encrypted, framed payload bits.
-    let payload_bytes = payload::encode_payload(message, files)?;
-    let (ct, nonce, salt) = crypto::encrypt(&payload_bytes, passphrase)?;
-    let frame_bytes = frame::build_frame(payload_bytes.len(), &salt, &nonce, &ct);
-    let frame_bits = bytes_to_bits_msb_first(&frame_bytes);
-
-    // 2. Derive the per-domain hhat seed from passphrase.
-    let keys = CabacStegoMasterKeys::derive(passphrase)?;
-    let hhat_seed = keys
-        .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
-        .hhat_seed;
-
-    // 3-6. Per-chunk 2-pass: baseline encode → walk → STC → stego encode.
-    encode_yuv_with_pre_framed_bits(yuv, width, height, n_frames, opts, &frame_bits, &hhat_seed)
-}
-
-/// D.0.7.2 — exposed core of the OH264 stego encode for the streaming
-/// session. Takes already-framed-and-encrypted payload bits + the
-/// passphrase-derived STC seed, runs the 2-pass (baseline encode →
-/// walker → STC plan → stego encode), returns the stego Annex-B.
-///
-/// The one-shot wrapper [`openh264_stego_encode_yuv_string`] computes
-/// `frame_bits` from a UTF-8 message + AES-256-GCM-SIV encryption +
-/// phasm v1 frame format. The streaming session (per-GOP) computes
-/// the same bits but with an additional `chunk_frame` header
-/// (`stego::chunk_frame`) wrapping the chunk-of-payload-bytes.
-///
-/// # Errors
-/// * [`StegoError::InvalidVideo`] — dims not 16-aligned, yuv length
-///   wrong, cover empty, or encoder failure.
-/// * [`StegoError::MessageTooLarge`] — `n_cover / m_total < 1`
-///   (chunk too big for this carrier).
-pub(crate) fn encode_yuv_with_pre_framed_bits(
-    yuv: &[u8],
-    width: u32,
-    height: u32,
-    n_frames: u32,
-    opts: EncodeOpts,
-    frame_bits: &[u8],
-    hhat_seed: &[u8; 32],
-) -> Result<Vec<u8>, StegoError> {
-    validate_dims(yuv, width, height, n_frames)?;
-    let m_total = frame_bits.len();
-
-    let trace = perf_trace();
-    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
-
-    // Baseline encode + walker for cover capture.
-    let mb_width = width / 16;
-    let mb_height = height / 16;
-    let mb_per_frame = (mb_width * mb_height) as usize;
-    let _ = mb_height; // dim sanity already done in validate_dims
-    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
-    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-
-    // Pass 1: cover probe. No overrides will fire, pVisualRecPic is not
-    // needed (bitstream is walked then discarded). C.9.0 (#482) disables
-    // the entire visual_recon mirror pool for this pass — ~30-50% encode
-    // wall-clock savings, byte-identical bitstream.
-    let t_pass1 = if trace { Some(std::time::Instant::now()) } else { None };
-    let baseline_bitstream = encode_once(
-        yuv, width, height, n_frames, opts,
-        override_map.clone(),
-        mb_type_table.clone(),
-        applied.clone(),
-        mb_width,
-        mb_per_frame,
-        /* dual_recon = */ false,
-        PassMode::Passthrough,
-        None,
-        None, // P3.3a: no DPB correction on Pass 1
-        None, // P3.3b.4: no coefficient replay on Pass 1
-    )?;
-    let dt_pass1 = t_pass1.map(|t| t.elapsed());
-    let pass1_bytes = baseline_bitstream.len();
-
-    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
-    let baseline_walk = walk_annex_b_for_cover(&baseline_bitstream)
-        .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
-    let dt_walk = t_walk.map(|t| t.elapsed());
-    let baseline_positions = baseline_walk.cover.coeff_sign_bypass.positions;
-    let baseline_bits = baseline_walk.cover.coeff_sign_bypass.bits;
-    let n_cover = baseline_bits.len();
-
-    if n_cover == 0 {
-        return Err(StegoError::InvalidVideo("openh264 cover empty".into()));
-    }
-    if m_total == 0 {
-        return Err(StegoError::InvalidVideo("empty frame bits".into()));
-    }
-
-    // Compute STC params: w = n_cover / m_total (must be >= 2 in practice
-    // for the h=4 Viterbi to find non-trivial plans). The cover slice
-    // used is m_total * w bits; remaining cover stays untouched.
-    let w = n_cover / m_total;
-    if w == 0 {
-        return Err(StegoError::MessageTooLarge);
-    }
-    let used_cover = m_total * w;
-    let cover_slice: Vec<u8> = baseline_bits[..used_cover].to_vec();
-
-    // STC plan.
-    let t_stc = if trace { Some(std::time::Instant::now()) } else { None };
-    let costs: Vec<f32> = vec![1.0; used_cover];
-    let hhat = generate_hhat(STC_H, w, hhat_seed);
-    let plan = stc_embed(&cover_slice, &costs, frame_bits, &hhat, STC_H, w)
-        .ok_or(StegoError::MessageTooLarge)?;
-    let dt_stc = t_stc.map(|t| t.elapsed());
-
-    // Build the override map keyed by canonical PositionKey::raw().
-    let t_overrides = if trace { Some(std::time::Instant::now()) } else { None };
-    let mut overrides_map: HashMap<u64, u8> = HashMap::new();
-    for i in 0..used_cover {
-        if plan.stego_bits[i] != cover_slice[i] {
-            overrides_map.insert(baseline_positions[i].raw(), plan.stego_bits[i]);
-        }
-    }
-    let n_flips = overrides_map.len();
-    {
-        let mut map = override_map.lock().expect("override map lock");
-        map.clear();
-        for (k, v) in overrides_map.iter() {
-            map.insert(*k, *v);
-        }
-    }
-    let dt_overrides = t_overrides.map(|t| t.elapsed());
-
-    // Pass 2: stego encode with overrides. C.8 cascade-break needs the
-    // visual_recon mirror so pDecPic stays clean for next-frame ME —
-    // dual_recon=true here.
-    let t_pass2 = if trace { Some(std::time::Instant::now()) } else { None };
-    let result = encode_once(
-        yuv, width, height, n_frames, opts,
-        override_map, mb_type_table, applied,
-        mb_width, mb_per_frame,
-        /* dual_recon = */ true,
-        PassMode::Passthrough,
-        None,
-        None, // P3.3a: legacy dual_recon path — DPB correction not applicable
-        None, // P3.3b.4: legacy 1-domain path — no coefficient replay
-    );
-    let dt_pass2 = t_pass2.map(|t| t.elapsed());
-
-    if trace {
-        let dt_total = t_start.unwrap().elapsed();
-        eprintln!(
-            "[PHASM_PERF_TRACE oh264_1domain] {w}x{h} f={f} n_cover={nc} m_total={mt} w={ww} flips={nf} pass1_bs={pb}",
-            w = width, h = height, f = n_frames,
-            nc = n_cover, mt = m_total, ww = w, nf = n_flips, pb = pass1_bytes,
-        );
-        let report = |label: &str, dt: Option<std::time::Duration>| {
-            if let Some(d) = dt {
-                let ms = d.as_secs_f64() * 1000.0;
-                let pct = ms / (dt_total.as_secs_f64() * 1000.0) * 100.0;
-                eprintln!("[PHASM_PERF_TRACE]   {label:<22} {ms:>9.1} ms  ({pct:>5.1}%)");
-            }
-        };
-        report("Pass 1 OH264 encode", dt_pass1);
-        report("walker (1-domain)", dt_walk);
-        report("STC plan", dt_stc);
-        report("override map build", dt_overrides);
-        report("Pass 2 OH264 stego", dt_pass2);
-        eprintln!(
-            "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)",
-            "TOTAL", dt_total.as_secs_f64() * 1000.0,
-        );
-    }
-
-    result
-}
-
 /// #493.4 Phase 3 — OH264 4-domain per-GOP encode primitive.
 ///
-/// Same shape as [`encode_yuv_with_pre_framed_bits`] but embeds
-/// `frame_bits` across all 4 stego domains (CoeffSign, CoeffSuffix,
-/// MvdSign, MvdSuffix) via a single combined-cover STC plan. The
-/// override map is keyed by canonical `PositionKey::raw()` across
-/// all 4 domains; the OH264 fork's per-domain emit hooks look up
-/// by the same key and apply the planned bit.
+/// Embeds `frame_bits` across all 4 stego domains (CoeffSign,
+/// CoeffSuffix, MvdSign, MvdSuffix) via a single combined-cover STC
+/// plan. The override map is keyed by canonical `PositionKey::raw()`
+/// across all 4 domains; the OH264 fork's per-domain emit hooks look
+/// up by the same key and apply the planned bit.
 ///
 /// Phase 0 walker-symmetry parity gates (#493.1) verified that the
 /// canonical keys match between OH264 fork emit + Rust walker for
 /// all 4 (engine, domain) pairs, so the override-map lookup works
 /// uniformly.
 ///
-/// Cost vector: OH264 has no Pass-1-side per-position content-adaptive
-/// cost (unlike pure-Rust which gets J-UNIWARD-style costs from
-/// `pass1_count_with_mode`). We use uniform 1.0 baseline distortion
-/// here; per-domain `CostWeights` × 1.0 = the domain weight, so STC's
-/// allocation is driven purely by domain weight (per Phase 0.5
-/// finding: cascade is binary, so domain weight is the right lever
-/// at this resolution). v1.2 research can layer in content-adaptive
-/// distortion costs if Phase 5 stealth gates require finer control.
+/// Cost vector (STEGO.A.3): per-position Tier-3 content-adaptive
+/// J-UNIWARD wavelet costs from `content_costs::compute_content_costs_yuv`
+/// feed the combined cover, multiplied by the per-domain `CostWeights`,
+/// so STC concentrates flips in textured / high-detectability-headroom
+/// regions. (`PHASM_DIAG_UNIFORM_COSTS=1` forces uniform 1.0 for the
+/// cascade-leak diagnostic.) Costs are transparent to the decoder —
+/// STC's syndrome equation depends only on which cover bits the encoder
+/// ultimately wrote.
 ///
-/// **WIRING STATUS (Phase 3 / 2026-05-16):** primitive is callable
-/// directly but NOT yet wired into the streaming session
-/// (`oh264_finish` still uses the CS-only `encode_yuv_with_pre_framed_bits`).
-/// Phase 4 / #493.5 swaps the call site once the matching combined-
-/// cover decoder lands.
-pub fn encode_yuv_with_pre_framed_bits_4domain(
+/// This 4-domain combined-cover STC primitive is the live production
+/// encode path: the streaming session drives it per GOP via
+/// [`h264_encode_gop_framed_bits`].
+pub fn h264_encode_gop_framed_bits_auto(
     yuv: &[u8],
     width: u32,
     height: u32,
@@ -462,7 +232,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
     hhat_seed: &[u8; 32],
     weights: &CostWeights,
 ) -> Result<Vec<u8>, StegoError> {
-    encode_yuv_with_pre_framed_bits_4domain_with_tier(
+    h264_encode_gop_framed_bits(
         yuv, width, height, n_frames, opts, frame_bits, hhat_seed, weights,
         super::stego::tier_filter::CascadeTier::Auto,
         super::stego::tier_filter::DEFAULT_HEADROOM,
@@ -471,14 +241,14 @@ pub fn encode_yuv_with_pre_framed_bits_4domain(
 }
 
 /// D'.3-OH264 (#795) — explicit cascade-tier variant of
-/// [`encode_yuv_with_pre_framed_bits_4domain`]. Mirrors the pure-Rust
+/// [`h264_encode_gop_framed_bits_auto`]. Mirrors the pure-Rust
 /// `h264_stego_encode_yuv_4domain_scheme_a_with_tier` (encode_pixels.rs).
 ///
 /// Tier filter sets ∞-cost on CSB/CSL positions whose estimated pixel
 /// impact exceeds the tier threshold. STC steers around them. Wire
 /// format is unchanged — decoder is tier-agnostic.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_yuv_with_pre_framed_bits_4domain_with_tier(
+pub fn h264_encode_gop_framed_bits(
     yuv: &[u8],
     width: u32,
     height: u32,
@@ -498,7 +268,7 @@ pub fn encode_yuv_with_pre_framed_bits_4domain_with_tier(
 
     // #548 v1.0 BLOCKER fix (2026-05-18) — Reset libencoder-side fork
     // statics before every encode session. Without this, two
-    // sequential `encode_yuv_with_pre_framed_bits_4domain` calls
+    // sequential `h264_encode_gop_framed_bits_auto` calls
     // share fork-side state across the encoder-instance teardown:
     // Call 2 produces 541 ChromaAc CS Sign diffs vs Call 1's 0
     // diffs on the same YUV. The bypass scratch + last-MB sentinels
@@ -816,20 +586,21 @@ pub fn encode_yuv_with_pre_framed_bits_4domain_with_tier(
     }
     let dt_overrides = t_overrides.map(|t| t.elapsed());
 
-    // Pass 2 — re-encode with overrides + C.8 dual_recon cascade-break.
+    // Pass 2 — re-encode with overrides. Default path is wire-only.
     //
-    // #538 Phase 4.6 EXPERIMENT: setting `PHASM_USE_WIRE_ONLY=1` flips
-    // the OH264 fork into wire-only override mode for Pass 2. In that
-    // mode `apply_coeff_hooks_to_level` + `phasm_apply_mvd_hooks`
-    // populate a per-MB scratch table instead of mutating *level / MV
-    // state. The CABAC emit reads the scratch at the bypass-bin site
-    // and writes the override bin directly to the wire. Encoder's
-    // pDecPic stays clean by construction — no C.8.x cascade-break
-    // needed for that mode, so `dual_recon` is also forced false.
+    // #538 Phase 4.6: with `wire_only` ON (the default — see the
+    // `let wire_only` block above) Pass 2 runs the OH264 fork in
+    // wire-only override mode. In that mode `apply_coeff_hooks_to_level`
+    // + `phasm_apply_mvd_hooks` populate a per-MB scratch table instead
+    // of mutating *level / MV state. The CABAC emit reads the scratch at
+    // the bypass-bin site and writes the override bin directly to the
+    // wire. Encoder's pDecPic stays clean by construction — no C.8.x
+    // cascade-break needed for that mode, so `dual_recon` is also forced
+    // false.
     //
-    // Default OFF: Pass 2 keeps the mutating + dual_recon path. This
-    // gate is the measurement step for #530 — once validated, the
-    // default flips and C.8.x machinery can be deleted (#539 Phase 5).
+    // Only `PHASM_USE_WIRE_ONLY=0` falls back to the legacy mutating +
+    // dual_recon path; that path + the C.8.x machinery are slated for
+    // deletion in #539 Phase 5.
     let t_pass2 = if trace { Some(std::time::Instant::now()) } else { None };
     // Keep an Arc clone of `applied` so the probe below can read the fired count.
     let applied_for_probe = applied.clone();
@@ -1196,230 +967,16 @@ pub fn encode_yuv_with_pre_framed_bits_4domain_with_tier(
 /// D.0.7.2 — expose the MSB-first byte→bit helper for the streaming
 /// session to convert its per-chunk `chunk_frame` + inner-stego-frame
 /// concatenation into bits before calling
-/// [`encode_yuv_with_pre_framed_bits`].
+/// [`h264_encode_gop_framed_bits`].
 pub(crate) fn bytes_to_bits_msb_first_pub(bytes: &[u8]) -> Vec<u8> {
     bytes_to_bits_msb_first(bytes)
 }
 
-/// Convenience entry: encode a text-only message (no file attachments).
-pub fn openh264_stego_encode_yuv_text(
-    yuv: &[u8],
-    width: u32,
-    height: u32,
-    n_frames: u32,
-    opts: EncodeOpts,
-    message: &str,
-    passphrase: &str,
-) -> Result<Vec<u8>, StegoError> {
-    openh264_stego_encode_yuv_string(yuv, width, height, n_frames, opts, message, &[], passphrase)
-}
-
-/// Decode a stego Annex-B stream produced by `openh264_stego_encode_yuv_string`.
-///
-/// Walks the bitstream with the phasm CABAC walker, brute-forces
-/// `m_total` over byte-aligned increments, and on each candidate runs
-/// STC extract → frame parse (CRC oracle) → decrypt → payload decode.
-///
-/// Returns the recovered `PayloadData` (text + file attachments).
-pub fn openh264_stego_decode_yuv(
-    annex_b: &[u8],
-    passphrase: &str,
-) -> Result<payload::PayloadData, StegoError> {
-    let trace = perf_trace();
-    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
-
-    let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
-    let walk = walk_annex_b_for_cover(annex_b)
-        .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    let dt_walk = t_walk.map(|t| t.elapsed());
-    let cover_bits = walk.cover.coeff_sign_bypass.bits;
-    let n_cover = cover_bits.len();
-    if n_cover == 0 {
-        return Err(StegoError::InvalidVideo("empty cover".into()));
-    }
-
-    let keys = CabacStegoMasterKeys::derive(passphrase)?;
-    let hhat_seed = keys
-        .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
-        .hhat_seed;
-
-    let min_m = frame::FRAME_OVERHEAD * 8;
-    let max_m = frame::MAX_FRAME_BITS.min(n_cover);
-
-    let t_search = if trace { Some(std::time::Instant::now()) } else { None };
-
-    // Brute-force m_total search. Sequential with early termination.
-    //
-    // #516.B NEGATIVE (3 strategies tried 2026-05-17):
-    //   1. naive par_iter().find_map_any: 49 → 56 ms (rayon default
-    //      chunks too large, cancellation lag)
-    //   2. par_chunks(8) + find_map_any: 49 → 51 ms (overhead at
-    //      8000+ chunks)
-    //   3. explicit outer-batched parallel: 49 → 51 ms (rayon batch
-    //      setup overhead)
-    //
-    // Root cause: after #516.2's length-prefix early-reject, wrong-
-    // try cost dropped to ~290 µs each, so parallel can shrink the
-    // 16 ms of wrong-try work to ~2 ms. But the WINNING try with
-    // full extract + Argon2id (key derive) + AES-GCM-SIV decrypt is
-    // ~5-8 ms by itself and runs single-threaded by security design
-    // (Argon2id is intentionally slow). Parallel wall is bounded
-    // below by the winning-try sequential cost.
-    //
-    // Parallel gains would only emerge for LONG messages (1000+
-    // tries) where wrong-try work dominates. Filed as deferred
-    // follow-on if message-length distribution shifts.
-    let mut m_total = min_m;
-    let mut tries = 0usize;
-    while m_total <= max_m {
-        tries += 1;
-        if let Some(plaintext) = try_decode_at(&cover_bits, &hhat_seed, m_total, passphrase) {
-            if trace {
-                let dt_search = t_search.unwrap().elapsed();
-                let dt_total = t_start.unwrap().elapsed();
-                eprintln!(
-                    "[PHASM_PERF_TRACE oh264_decode] annex_b={} bytes n_cover={} tries={} m_hit={}",
-                    annex_b.len(), n_cover, tries, m_total,
-                );
-                eprintln!(
-                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms",
-                    "walker", dt_walk.unwrap().as_secs_f64() * 1000.0,
-                );
-                eprintln!(
-                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  ({} tries)",
-                    "STC search + decrypt", dt_search.as_secs_f64() * 1000.0, tries,
-                );
-                eprintln!(
-                    "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)",
-                    "TOTAL", dt_total.as_secs_f64() * 1000.0,
-                );
-            }
-            return Ok(plaintext);
-        }
-        m_total += 8;
-    }
-    Err(StegoError::FrameCorrupted)
-}
-
-/// Text-only convenience wrapper around [`openh264_stego_decode_yuv`].
-pub fn openh264_stego_decode_yuv_string(
-    annex_b: &[u8],
-    passphrase: &str,
-) -> Result<String, StegoError> {
-    openh264_stego_decode_yuv(annex_b, passphrase).map(|p| p.text)
-}
-
-/// Capacity primitive (#424) — encode the YUV once into a baseline H.264
-/// stream, walk it, and report the maximum CoeffSign cover bits + the
-/// max embeddable message length (in bytes, after framing overhead).
-///
-/// The reported byte count is the *theoretical* max with `w = 1`; STC
-/// at `w = 1` is degenerate, so practical capacity is roughly half this.
-/// A caller building a UI capacity meter should display `max / 2` as
-/// the safe budget.
-#[derive(Debug, Clone, Copy)]
-pub struct OpenH264StegoCapacity {
-    /// Total CoeffSign cover bits the walker recovers from a baseline
-    /// encode of this YUV with these opts.
-    pub cover_bits: usize,
-    /// `(cover_bits / 8) - FRAME_OVERHEAD`. Upper bound on message
-    /// bytes; practical limit is roughly half (STC needs `w >= 2`).
-    pub max_message_bytes: usize,
-}
-
-/// Predict the cover capacity of a YUV stream by running one baseline
-/// encode + walker. No stego overrides applied.
-pub fn openh264_stego_capacity_yuv(
-    yuv: &[u8],
-    width: u32,
-    height: u32,
-    n_frames: u32,
-    opts: EncodeOpts,
-) -> Result<OpenH264StegoCapacity, StegoError> {
-    validate_dims(yuv, width, height, n_frames)?;
-
-    let mb_width = width / 16;
-    let mb_height = height / 16;
-    let mb_per_frame = (mb_width * mb_height) as usize;
-
-    let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
-    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-
-    // C.9.0 (#482): capacity probe is a pure cover-walk; bitstream
-    // discarded immediately. Disable dual_recon to skip visual_recon
-    // mirror work — byte-identical bitstream.
-    let bitstream = encode_once(
-        yuv, width, height, n_frames, opts,
-        empty_map, mb_type_table, applied,
-        mb_width, mb_per_frame,
-        /* dual_recon = */ false,
-        PassMode::Passthrough,
-        None,
-        None, // P3.3a: capacity probe — no DPB correction
-        None, // P3.3b.4: no coefficient replay
-    )?;
-    let walk = walk_annex_b_for_cover(&bitstream)
-        .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    let cover_bits = walk.cover.coeff_sign_bypass.bits.len();
-    let max_message_bytes = (cover_bits / 8).saturating_sub(frame::FRAME_OVERHEAD);
-    Ok(OpenH264StegoCapacity {
-        cover_bits,
-        max_message_bytes,
-    })
-}
-
-/// #424 D.0.6 — per-GOP cover-bits probe for the streaming capacity
-/// session. Encodes the given YUV chunk through the OH264 fork in
-/// baseline mode (no overrides applied) and walks the emitted Annex-B
-/// for CoeffSign cover positions. Returns the cover-bit count for the
-/// chunk.
-///
-/// Used by `StreamingProbeSession::push_frame` once per GOP. The
-/// emitted bitstream is discarded — only the position count matters.
-/// Cost is ~equal to the actual stego encode's first pass (the STC
-/// plan + override application is what makes the second pass slow,
-/// not the OH264 encode itself).
-// Retained for the CAP2.5 Phase-1 instant capacity estimate (cheap
-// CoeffSign-only walk, no STC trial); the accurate per-GOP probe now uses
-// `oh264_gop_capacity_per_tier` (CAP2.1), so this has no caller today.
-#[allow(dead_code)]
-pub(crate) fn count_cover_bits_for_gop(
-    gop_yuv: &[u8],
-    width: u32,
-    height: u32,
-    n_frames: u32,
-    opts: EncodeOpts,
-) -> Result<usize, StegoError> {
-    validate_dims(gop_yuv, width, height, n_frames)?;
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
-    let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
-    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    // C.9.0 (#482): per-GOP cover-bits probe — bitstream discarded after
-    // the walk. Disable dual_recon for the same reason as the capacity
-    // probe above.
-    let bitstream = encode_once(
-        gop_yuv, width, height, n_frames, opts,
-        empty_map, mb_type_table, applied,
-        mb_width, mb_per_frame,
-        /* dual_recon = */ false,
-        PassMode::Passthrough,
-        None,
-        None, // P3.3a: per-GOP cover probe — no DPB correction
-        None, // P3.3b.4: no coefficient replay
-    )?;
-    let walk = walk_annex_b_for_cover(&bitstream)
-        .map_err(|e| StegoError::InvalidVideo(format!("walk: {e}")))?;
-    Ok(walk.cover.coeff_sign_bypass.bits.len())
-}
-
 /// #796 Mode A — 4-domain OH264 baseline-walk capacity probe.
 ///
-/// Same as [`openh264_stego_capacity_yuv`] but returns per-domain
-/// counts so `h264_stego_capacity_4domain` can report numbers that
-/// match the OH264 streaming session's actual per-GOP STC budget.
+/// Runs one baseline OH264 encode + walker and returns per-domain
+/// cover counts so `h264_stego_capacity_4domain` can report numbers
+/// that match the OH264 streaming session's actual per-GOP STC budget.
 ///
 /// The pure-Rust `pass1_count_4domain` walker (used by the legacy
 /// capacity path) produces wildly different cover sizes on easy-to-
@@ -1430,7 +987,7 @@ pub(crate) fn count_cover_bits_for_gop(
 /// in all 4 domains) so the caller can re-run the tier filter,
 /// allocator, and any other cover-derived computation against the
 /// actual OH264 wire structure.
-pub fn count_cover_4domain_oh264(
+pub fn h264_walk_cover(
     yuv: &[u8],
     width: u32,
     height: u32,
@@ -1472,7 +1029,7 @@ pub fn count_cover_4domain_oh264(
 // calibration. Design: docs/design/video/h264/capacity-spreading-plan.md.
 //
 // NOTE (CAP2 follow-on): the cover construction below MIRRORS the encode
-// (`encode_yuv_with_pre_framed_bits_4domain_with_tier`: content_costs →
+// (`h264_encode_gop_framed_bits`: content_costs →
 // safe_msl → tier → combine). The reported-vs-real-encoder gate
 // (`core/tests/horse_flag_capacity_797.rs`) guards divergence. Extracting a
 // single shared helper that both encode + probe call is tracked for CAP2.2
@@ -1512,7 +1069,7 @@ pub(crate) struct GopCapacity {
     pub coeff_sign_cover_bits: usize,
     /// #809 — total injectable cover bits in the 3 shadow domains
     /// (CoeffSign + CoeffSuffixLsb + MvdSign) for THIS GOP, read straight
-    /// off the OH264 cover walk. Lets `h264_stego_capacity_4domain_oh264`
+    /// off the OH264 cover walk. Lets `h264_video_capacity`
     /// compute the shadow capacity from the same encoder it will actually
     /// use — instead of a separate pure-Rust whole-video `pass1_count_4domain`
     /// (the ~45 s/clip bottleneck the #809 profiling pinned).
@@ -1543,7 +1100,10 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
     let n_cover = combined_cover.len();
     let embeddable = |payload: usize| -> bool {
         let body = cap2_trial_payload(payload);
-        let framed = match super::stego::chunk_frame::build_chunk_frame(0, 1, &body) {
+        let framed = match super::stego::chunk_frame::build_first_chunk_frame(
+            body.len().max(1) as u32,
+            &body,
+        ) {
             Ok(f) => f,
             Err(_) => return false,
         };
@@ -1572,7 +1132,7 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
     if !embeddable(0) {
         return 0;
     }
-    let header = super::stego::chunk_frame::CHUNK_HEADER_LEN;
+    let header = super::stego::chunk_frame::CHUNK_FRAME_FIRST_HEADER_LEN;
     let hard_max = (n_cover / 8).saturating_sub(header);
     if hard_max == 0 {
         return 0;
@@ -1613,7 +1173,7 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
 /// `safe_msl` gate ONCE (tier-independent), then per tier apply the ∞-cost
 /// filter, combine, and STC-trial. `gop_yuv` must hold exactly
 /// `gop_n_frames` frames.
-pub(crate) fn oh264_gop_capacity_per_tier(
+pub(crate) fn h264_gop_capacity(
     gop_yuv: &[u8],
     width: u32,
     height: u32,
@@ -1769,17 +1329,17 @@ fn validate_dims(yuv: &[u8], width: u32, height: u32, n_frames: u32) -> Result<(
 /// CAP2.3 §6 — encode ONE plain (no-stego) GOP for the concentrate+tail plain
 /// tail. A single `encode_once` (no Pass-1 walk, no STC, no content-cost
 /// computation — the cheap path the capacity probe uses at
-/// `oh264_gop_capacity_per_tier`), so a small-payload clip's tail GOPs cost
+/// `h264_gop_capacity`), so a small-payload clip's tail GOPs cost
 /// ~plain-encode speed instead of a full stego encode.
 ///
 /// MANDATORY reset: the streaming stego GOPs that precede the tail leave the
 /// OH264 fork's per-session scratch state dirty (the stego path resets at its
-/// entry — openh264_stego.rs:509 — but `encode_once` does NOT self-reset the
+/// entry — openh264_stego.rs:291 — but `encode_once` does NOT self-reset the
 /// fork statics). Without this reset the first plain GOP would inherit the last
 /// stego GOP's fork state (#548 class: two sequential calls sharing fork state
 /// → spurious diffs). Reset here so every plain GOP encodes from a clean
 /// session, exactly like the stego path.
-#[cfg(feature = "openh264-backend")]
+#[cfg(feature = "h264-encoder")]
 pub(crate) fn oh264_plain_encode_gop(
     gop_yuv: &[u8],
     width: u32,
@@ -2193,100 +1753,12 @@ fn encoder_err_to_stego(e: EncoderError) -> StegoError {
     StegoError::InvalidVideo(format!("openh264 encoder: {e}"))
 }
 
-fn try_decode_at(
-    cover_bits: &[u8],
-    hhat_seed: &[u8; 32],
-    m_total: usize,
-    passphrase: &str,
-) -> Option<payload::PayloadData> {
-    if m_total == 0 {
-        return None;
-    }
-    let n_cover = cover_bits.len();
-    if m_total > n_cover {
-        return None;
-    }
-    let w = n_cover / m_total;
-    if w == 0 {
-        return None;
-    }
-    let used = m_total * w;
-    let hhat = generate_hhat(STC_H, w, hhat_seed);
-
-    // #516.2 perf — length-prefix early-reject.
-    //
-    // The phasm v1 frame's first 2 bytes are `plaintext_len: u16 BE`.
-    // For ANY candidate `m_total`, only ONE specific u16 makes the
-    // identity `(FRAME_OVERHEAD + plaintext_len) * 8 == m_total`
-    // hold. For wrong `m_total`, the partial syndrome is essentially
-    // random → prob(consistent) ≈ 1/65536. Almost every wrong
-    // candidate rejects after just 16 partial-extract message bits
-    // (= 16 * w syndrome XORs) instead of the full m_total * w.
-    //
-    // v2 sentinel (`first u16 == 0`, plaintext > 64 KB): extend
-    // partial extract to 48 bits and check u32 length identity
-    // `(FRAME_OVERHEAD_EXT + plaintext_len) * 8 == m_total`. Rare
-    // path; the 16-bit fast path covers all messages ≤ 65535 bytes.
-    let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 16);
-    if prefix_bits.len() < 16 {
-        return None;
-    }
-    let prefix_bytes = bits_to_bytes_msb_first(&prefix_bits);
-    let v1_len = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]) as usize;
-    let mut len_consistent =
-        (frame::FRAME_OVERHEAD + v1_len) * 8 == m_total;
-
-    if !len_consistent && v1_len == 0 {
-        // v2 sentinel — pull more bits for u32 length field
-        let ext = stc_extract_prefix(&cover_bits[..used], &hhat, w, 48);
-        if ext.len() >= 48 {
-            let ext_bytes = bits_to_bytes_msb_first(&ext);
-            let v2_len = u32::from_be_bytes([
-                ext_bytes[2], ext_bytes[3], ext_bytes[4], ext_bytes[5],
-            ]) as usize;
-            if v2_len > u16::MAX as usize
-                && (frame::FRAME_OVERHEAD_EXT + v2_len) * 8 == m_total
-            {
-                len_consistent = true;
-            }
-        }
-    }
-
-    if !len_consistent {
-        return None;
-    }
-
-    // Length-prefix consistent: do the full extract + CRC + decrypt
-    // path. CRC kills the rare 1/65536 false-positive that snuck
-    // past the length filter; AEAD then verifies key + integrity.
-    let extracted = stc_extract(&cover_bits[..used], &hhat, w);
-    let frame_bits = &extracted[..m_total.min(extracted.len())];
-    let frame_bytes = bits_to_bytes_msb_first(frame_bits);
-    let parsed = frame::parse_frame(&frame_bytes).ok()?;
-    let plaintext =
-        crypto::decrypt(&parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce).ok()?;
-    payload::decode_payload(&plaintext).ok()
-}
-
 fn bytes_to_bits_msb_first(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() * 8);
     for &b in bytes {
         for i in 0..8 {
             out.push((b >> (7 - i)) & 1);
         }
-    }
-    out
-}
-
-fn bits_to_bytes_msb_first(bits: &[u8]) -> Vec<u8> {
-    let n_bytes = bits.len() / 8;
-    let mut out = Vec::with_capacity(n_bytes);
-    for byte_idx in 0..n_bytes {
-        let mut byte = 0u8;
-        for i in 0..8 {
-            byte |= (bits[byte_idx * 8 + i] & 1) << (7 - i);
-        }
-        out.push(byte);
     }
     out
 }
@@ -2302,12 +1774,12 @@ fn bits_to_bytes_msb_first(bits: &[u8]) -> Vec<u8> {
 /// one of the [`SHADOW_PARITY_TIERS`] rungs, with positions chosen
 /// by passphrase-derived priority over the primary-emit cover.
 ///
-/// Round-trips through `h264_stego_smart_decode_video` (the unified
-/// Scheme A decoder from STEGO.A.4): shadow_extract_all4_safe runs
+/// Round-trips through `StreamingDecodeSession` (the unified
+/// Scheme A decoder from STEGO.A.4): shadow_extract runs
 /// first (cheap, AES-GCM-SIV auth-gated), Scheme A combined STC
 /// extract handles the primary.
 ///
-/// Wire format: identical to `encode_yuv_with_pre_framed_bits_4domain`
+/// Wire format: identical to `h264_encode_gop_framed_bits_auto`
 /// (Scheme A combined STC) plus shadow LSB injections at the cascade-
 /// safe shadow positions. No new wire-format flags.
 ///
@@ -2344,10 +1816,10 @@ fn bits_to_bytes_msb_first(bits: &[u8]) -> Vec<u8> {
 /// the residual cover the decoder will see.
 ///
 /// **Empty shadows shortcut**: when `shadows.is_empty()`, falls
-/// through to [`encode_yuv_with_pre_framed_bits_4domain`] — no
+/// through to [`h264_encode_gop_framed_bits_auto`] — no
 /// provisional pass, no cascade loop, single STC + emit.
 #[allow(clippy::too_many_arguments)]
-pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
+pub fn h264_encode_with_shadows<'a>(
     yuv: &[u8],
     width: u32,
     height: u32,
@@ -2360,9 +1832,9 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
     weights: &CostWeights,
 ) -> Result<Vec<u8>, StegoError> {
     use super::stego::shadow::{
-        apply_shadow_to_plan_all4, embed_shadow_lsb_all4,
-        overlay_infinity_costs_all4, prepare_shadow_over_emit_cover_safe,
-        shadow_extract_all4_safe, translate_shadow_state, ShadowState,
+        apply_shadow_to_plan, embed_shadow_lsb,
+        overlay_infinity_costs, prepare_shadow_over_emit_cover,
+        shadow_extract, translate_shadow_state, ShadowState,
     };
     use super::stego::cascade_safety::{
         analyze_safe_mvd_subset, derive_msl_safe_from_msb,
@@ -2379,11 +1851,11 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
         gop: opts.intra_period as usize,
         b_count: 1,
     };
-    let _setup = super::stego::encode_pixels::validate_n_shadow_inputs(
+    let _setup = super::stego::oh264_capacity::validate_n_shadow_inputs(
         yuv, width, height, n_frames as usize, pattern,
         primary_passphrase, shadows,
     )?;
-    let primary = super::stego::encode_pixels::prep_n_shadow_primary_payload(
+    let primary = super::stego::oh264_capacity::prep_n_shadow_primary_payload(
         primary_message, primary_files, primary_passphrase,
     )?;
 
@@ -2393,7 +1865,7 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
 
     // ── Empty-shadows shortcut: route to the primary-only orchestrator
     if shadows.is_empty() {
-        return encode_yuv_with_pre_framed_bits_4domain(
+        return h264_encode_gop_framed_bits_auto(
             yuv, width, height, n_frames, opts,
             &primary.frame_bits, &primary_hhat_seed, weights,
         );
@@ -2450,7 +1922,7 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
     )?;
     // STEGO.A.10 fix — apply cascade-safety MSL gate as ∞-cost in the
     // STC input (not as override-map filter). See the matching block
-    // in `encode_yuv_with_pre_framed_bits_4domain` for rationale.
+    // in `h264_encode_gop_framed_bits_auto` for rationale.
     let safe_msb_p1 = super::stego::cascade_safety::analyze_safe_mvd_subset(
         &baseline_walk.mvd_meta, baseline_walk.mb_w, baseline_walk.mb_h,
     );
@@ -2633,7 +2105,7 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
         // (a) Prepare shadow states over primary_emit_cover.
         let shadow_states_emit: Vec<ShadowState> = match shadows
             .iter()
-            .map(|s| prepare_shadow_over_emit_cover_safe(
+            .map(|s| prepare_shadow_over_emit_cover(
                 &walk_prov.cover, s.passphrase, s.message, s.files,
                 parity_len, None, Some(&safe_msl_prov),
             ))
@@ -2658,14 +2130,14 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
         let mut cover_for_stc = cover_p1.clone();
         let mut costs_for_stc = content_costs.clone();
         for state in &shadow_states_p1 {
-            embed_shadow_lsb_all4(
+            embed_shadow_lsb(
                 &mut cover_for_stc.coeff_sign_bypass.bits,
                 &mut cover_for_stc.coeff_suffix_lsb.bits,
                 &mut cover_for_stc.mvd_sign_bypass.bits,
                 &mut cover_for_stc.mvd_suffix_lsb.bits,
                 state,
             );
-            overlay_infinity_costs_all4(
+            overlay_infinity_costs(
                 &mut costs_for_stc.coeff_sign_bypass,
                 &mut costs_for_stc.coeff_suffix_lsb,
                 &mut costs_for_stc.mvd_sign_bypass,
@@ -2700,7 +2172,7 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
         // (g-h) Defensive shadow stamp — re-write shadow bits onto the
         // primary plan in case STC's allocation drifted them.
         for state in &shadow_states_p1 {
-            apply_shadow_to_plan_all4(
+            apply_shadow_to_plan(
                 &mut domain_plan.coeff_sign_bypass,
                 &mut domain_plan.coeff_suffix_lsb,
                 &mut domain_plan.mvd_sign_bypass,
@@ -2803,7 +2275,7 @@ pub fn encode_yuv_with_n_shadows_with_pattern_and_files<'a>(
 
         let mut all_ok = true;
         for s in shadows {
-            if shadow_extract_all4_safe(
+            if shadow_extract(
                 &walk_final.cover, s.passphrase, None, Some(&safe_msl_final),
             ).is_err() {
                 all_ok = false;
@@ -2859,14 +2331,4 @@ mod tests {
     // binary, producing 1-2 wire-flip cascade leaks. In an isolated
     // integration-test binary the state is pristine and the round-trip
     // is byte-exact (C.8.12 corpus suite is the structural proof).
-
-    #[test]
-    fn capacity_reports_positive_bits() {
-        let _g = SESSION_TEST_MUTEX.lock().unwrap();
-        let yuv = synth_yuv(320, 240, 2);
-        let opts = EncodeOpts { qp: 22, intra_period: 60 };
-        let cap = openh264_stego_capacity_yuv(&yuv, 320, 240, 2, opts).expect("capacity");
-        assert!(cap.cover_bits > 1000, "expect non-trivial cover, got {}", cap.cover_bits);
-        assert!(cap.max_message_bytes > 0);
-    }
 }

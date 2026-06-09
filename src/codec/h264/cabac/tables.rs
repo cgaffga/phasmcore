@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! H.264 CABAC engine-side tables. Phase 6C.1.
+//! H.264 CABAC engine-side tables.
 //!
 //! Three normative tables the arithmetic engine reads on every bin:
 //! `RANGE_TAB_LPS` (spec Table 9-44), `TRANS_IDX_LPS` (Table 9-45 LPS
-//! column), `TRANS_IDX_MPS` (Table 9-45 MPS column).
-//!
-//! Context-initialization tables (9-12 through 9-33) land in Phase 6C.2.
-//! See `docs/design/video/h264/encoder-algorithms/cabac-tables.md` for the
+//! column), `TRANS_IDX_MPS` (Table 9-45 MPS column). The
+//! context-initialization tables (9-12 through 9-33) follow in
+//! `CTX_INIT_MN`.
+//! See `docs/design/video/_archive/h264/encoder-algorithms/cabac-tables.md` for the
 //! full transcription reference.
 
 /// Spec Table 9-44, `rangeTabLPS[pStateIdx][qCodIRangeIdx]`.
 ///
 /// Indexed by `[pStateIdx][(codIRange >> 6) & 3]`. Used by
-/// `encode_decision` to compute `codIRangeLPS` (spec § 9.3.4.2 eq 9-25).
+/// `decode_decision` to compute `codIRangeLPS` (spec § 9.3.4.2 eq 9-25).
 pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240],
     [128, 167, 197, 227],
@@ -84,14 +84,14 @@ pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
 ];
 
 /// Spec Table 9-45 "State transition table", LPS column. 64 entries,
-/// indexed by `pStateIdx`. Applied after encoding an LPS.
+/// indexed by `pStateIdx`. Applied after an LPS bin.
 ///
 /// Values transcribed from ITU-T H.264 03/2010 Table 9-45 (page 276).
 /// Tabular data is spec-defined (non-copyrightable).
 ///
-/// Historical note (Task #115 bug 4): three prior entries ([57],
-/// [60], [62]) had off-by-one values from an incorrect initial
-/// transcription; the bug was masked because the matched pair with
+/// Historical note: three prior entries ([57], [60], [62]) had
+/// off-by-one values from an incorrect initial transcription; the
+/// bug was masked because the matched pair with
 /// `TRANS_IDX_MPS` still gave self-consistent encode/decode state
 /// evolution — but diverged from any other spec-conformant
 /// implementation after ~300 bins. Fixed against the spec and
@@ -104,7 +104,7 @@ pub const TRANS_IDX_LPS: [u8; 64] = [
 ];
 
 /// Spec Table 9-45, MPS column. 64 entries, indexed by `pStateIdx`.
-/// Applied after encoding an MPS. Saturates at 62 (NOT 63) at index 62.
+/// Applied after an MPS bin. Saturates at 62 (NOT 63) at index 62.
 pub const TRANS_IDX_MPS: [u8; 64] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,

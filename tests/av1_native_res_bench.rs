@@ -13,7 +13,7 @@
 //! 3 frames per fixture (smaller than B.3.0 because per-frame work
 //! at 1080p+ is 50-100× larger than at 256×144).
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -5,23 +5,19 @@
 //! Media format codecs — pure I/O parsers with no steganographic logic.
 //!
 //! - [`jpeg`] — JPEG coefficient codec (zero-dependency, byte-for-byte round-trip)
-//! - [`hevc`] — H.265/HEVC bitstream parser (NAL units, SPS, PPS, slices, CTUs)
-//! - [`cabac`] — Context-Adaptive Binary Arithmetic Coding engine
 //! - [`mp4`] — ISO BMFF / QuickTime MP4/MOV container demuxer and muxer
 
 pub mod jpeg;
 
-// Phase 4a: HEVC modules are archived. Gate behind `hevc-archive` (off by
-// default). The H.264 pipeline is the production path.
 #[cfg(feature = "video")]
 pub mod h264;
 #[cfg(feature = "video")]
 pub mod mp4;
 
 // AV1 stego: skeleton landed 2026-05-20 (W3.2). Now (W3.D.4.2) gated
-// on EITHER av1-encoder (rav1e) OR av1-backend (dav1d), since the
+// on EITHER av1-encoder (rav1e) OR av1-decoder (dav1d), since the
 // stego module contains both encode-side (writer.rs) and decode-side
 // (decoder.rs) pieces. Files within are individually cfg'd on the
 // specific feature they need.
-#[cfg(any(feature = "av1-encoder", feature = "av1-backend"))]
+#[cfg(any(feature = "av1-encoder", feature = "av1-decoder"))]
 pub mod av1;

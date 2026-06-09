@@ -30,7 +30,7 @@
 //! Each row is one (fixture, speed) combination with its measured
 //! metrics. Final summary computes per-speed averages.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

@@ -109,14 +109,14 @@ fn main() {
             // (1:1 with pRef[]) + pCtx->pVisualDecPic +
             // SDqLayer::pVisualRecPic plumbing. Buffer-infra only --
             // no dual-write hooks yet, encoder bit-identical (21/21
-            // openh264-backend lib tests including session_round_trip
+            // h264-encoder lib tests including session_round_trip
             // + b9_3_full_roundtrip + b10_cascade_safe_roundtrip).
             "eda532623010a93da7a340d4c25d9713840b8d98",
             // 2026-05-12: C.8.2 dual-recon hook ABI. Bumps
             // PHASM_STEGO_ABI_VERSION 1.1.0 -> 1.2.0 (additive). Adds
             // PhasmStegoDualReconFn + dual_recon_observe field +
             // internal phasm_dual_recon_writeback helper. ABI-only
-            // change; encoder bit-identical, 22/22 openh264-backend
+            // change; encoder bit-identical, 22/22 h264-encoder
             // lib tests + 4 new gtest cases for the writeback helper.
             "a70255e8ca91f0b39d4cb6933b53a0f38d897c04",
             // 2026-05-12: C.8.3 I_16x16 dual-recon. WelsEncRecI16x16Y
@@ -155,7 +155,7 @@ fn main() {
             // absorbed -- 6 sign-bit flips compress to the same CABAC
             // bytes in the 320x240 QP=18 fixture. b9_3 round-trip via
             // decoder hook continues to verify wire-level override
-            // propagation rigorously. 22/22 openh264-backend lib tests
+            // propagation rigorously. 22/22 h264-encoder lib tests
             // + 1365/1365 total lib tests pass.
             "f50fef5d52b85657bb80cf75631542794d25c91f",
             // 2026-05-13: C.8.6 P-frame luma dual-recon. Closes the
@@ -528,7 +528,7 @@ fn main() {
             // #548 2026-05-18 — fork-side per-session state reset.
             // Adds `phasm_reset_encoder_session_state()` entry point
             // called from the Rust orchestrator at the top of every
-            // `encode_yuv_with_pre_framed_bits_4domain` to clear the
+            // `h264_encode_gop_framed_bits_auto` to clear the
             // bypass scratch + last-MB sentinels + wire-only flag
             // between sequential calls. Closes the 541-diff
             // cross-call cascade observed in
@@ -1038,7 +1038,7 @@ fn ndk_host_tag() -> String {
 ///
 /// Phasmcore mirror consumers receive a `git archive`'d snapshot of
 /// `core/` that does NOT carry the submodule. Without this fallback,
-/// `cargo build --features openh264-backend` would panic in the
+/// `cargo build --features h264-encoder` would panic in the
 /// canonicalize() / meson.build check above. Instead, this function:
 ///
 /// 1. Emits a loud `cargo:warning=...` pointing at the README setup

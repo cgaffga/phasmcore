@@ -32,19 +32,19 @@
 // mode-decision level given the visual_recon invariant.
 //
 // Run smoke (default lane):
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //     --test openh264_spatial_mb_map_gate
 //
 // Run full corpus:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //     --test openh264_spatial_mb_map_gate -- --ignored --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
+
+mod common;
+use common::oh264_stream;
 
 use phasm_core::codec::h264::openh264::Encoder;
-use phasm_core::codec::h264::openh264_stego::{
-    openh264_stego_encode_yuv_text, EncodeOpts,
-};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -192,10 +192,12 @@ fn run_spatial_gate(spec: &Fixture) {
     let (w, h) = probe_baseline_dims(spec);
     let yuv = ensure_yuv(spec, w, h);
 
-    // Stego encode (regular pipeline).
-    let stego = openh264_stego_encode_yuv_text(
+    // Stego encode (production 4-domain streaming session). Single GOP:
+    // every fixture is 10 frames with intra_period 30, so the whole clip
+    // is one GOP — pass `n_frames` for gop_size.
+    let stego = oh264_stream::encode(
         &yuv, w, h, spec.n_frames,
-        EncodeOpts { qp: spec.qp, intra_period: spec.intra_period },
+        spec.qp,
         "C.4.3 spatial gate", "spatial-pass",
     ).expect("oh264 stego encode");
 

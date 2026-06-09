@@ -46,7 +46,7 @@
 //! miss. AUC ≈ 0.5 means our 4 cost features are too coarse and we
 //! need finer cost-deviation work in v0.6+.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -55,7 +55,7 @@ use std::sync::Arc;
 use phasm_core::codec::av1::stego::decoder::{
     decode_with_recording_with_pixels, DecodedFramePlanes,
 };
-use phasm_core::codec::av1::stego::orchestrator::av1_stego_embed;
+use phasm_core::codec::av1::stego::orchestrator::{av1_stego_embed, av1_stego_embed_with_shadows};
 use phasm_core::stego::cost::av1_uniward::{
     compute_av1_uniward_costs, Av1FramePosition, FramePlanes,
 };
@@ -600,6 +600,156 @@ fn b1_4_aoso_detector_with_cost_features() {
     assert!(
         worst_class_auc < 0.70,
         "Strongest-class AUC {:.4} exceeds v1.0 stealth gate (0.70)",
+        worst_class_auc
+    );
+}
+
+/// v0.7+ track 1 — same AoSO 12-feature measurement, but stego
+/// frames carry a SHADOW message alongside the primary. Validates
+/// that shadow-laden encodes still meet the v1.0 stealth gate
+/// (strongest-class AUC ≤ 0.70).
+///
+/// Shadows inject additional bit flips at ChaCha20-priority-sorted
+/// positions to carry a plausibly-deniable second message. Those
+/// extra flips perturb the cost histogram + DCTR residual on TOP of
+/// the primary's STC flips. If shadow injection roughly doubles
+/// per-frame stego mass on average, the measurement here might
+/// shift up vs the primary-only 0.6314 baseline.
+///
+/// Expected outcome: shadow flips happen at the SAME class of
+/// positions (top-priority by ChaCha20 over the same cover) as
+/// primary STC would naturally pick; their J-UNIWARD-cost
+/// distribution should not look statistically different from
+/// primary flips. So AUC drift should be modest (a few pp). If it's
+/// not, we have a structural stealth issue with the shadow
+/// protocol.
+#[test]
+fn shadows_active_aoso_detector_with_cost_features() {
+    eprintln!(
+        "[aoso-shadows] corpus: {} fixtures × {} seek points = {} pairs",
+        FIXTURES.len(),
+        SEEK_POINTS_PER_FIXTURE,
+        FIXTURES.len() * SEEK_POINTS_PER_FIXTURE
+    );
+
+    let mut cover_features: Vec<Features> = Vec::new();
+    let mut stego_features: Vec<Features> = Vec::new();
+    let mut skipped = 0u32;
+    let mut payload_seed: u64 = 0xC0FFEE_5_ADD_5_ADD_u64;
+
+    for fx in FIXTURES {
+        let usable_range = fx.duration_s - 1.0;
+        let step = usable_range / SEEK_POINTS_PER_FIXTURE as f32;
+        for i in 0..SEEK_POINTS_PER_FIXTURE {
+            let seek_s = 0.5 + step * i as f32;
+            let yuv = extract_yuv_frame(fx.source, seek_s);
+            let (natural, recording) = encode_natural(&yuv);
+
+            let tile = &recording.tiles[0];
+            let n_cover = tile
+                .bit_tags
+                .iter()
+                .filter(|&&t| t == PHASM_TAG_AC_COEFF_SIGN)
+                .count();
+            if n_cover < 256 {
+                skipped += 1;
+                continue;
+            }
+
+            // Primary payload: roughly half of cover capacity (matches
+            // the primary-only test). Shadow payload: small (~12 bytes
+            // plaintext + RS overhead, well below the cost-pool top-N
+            // shadow capacity) so we exercise the shadow code path
+            // without saturating cover.
+            let target_payload_bytes = (n_cover / 2 / 8).max(25);
+            let plaintext_len = (target_payload_bytes - 24).max(1).min(256);
+            payload_seed = payload_seed.wrapping_mul(0x9E3779B97F4A7C15);
+            let mut msg = vec![0u8; plaintext_len];
+            for (k, b) in msg.iter_mut().enumerate() {
+                let s = payload_seed
+                    .wrapping_add(k as u64)
+                    .wrapping_mul(0xCAFEBABE);
+                *b = (s >> 24) as u8;
+            }
+            let passphrase = format!("aoso-pass-{:x}", payload_seed);
+            let shadow_pass = format!("aoso-shadow-{:x}", payload_seed);
+            let mut shadow_msg = vec![0u8; 12];
+            for (k, b) in shadow_msg.iter_mut().enumerate() {
+                let s = payload_seed
+                    .wrapping_add(0xDEADBEEF + k as u64)
+                    .wrapping_mul(0x1337);
+                *b = (s >> 24) as u8;
+            }
+
+            let shadows: Vec<(&str, &[u8])> = vec![(shadow_pass.as_str(), &shadow_msg)];
+            match av1_stego_embed_with_shadows(
+                natural.clone(),
+                recording.clone(),
+                &msg,
+                &passphrase,
+                &shadows,
+            ) {
+                Ok(stego) => {
+                    cover_features.push(features_from_recording(&natural, &recording, false));
+                    stego_features.push(features_from_recording(&stego, &recording, true));
+                }
+                Err(e) => {
+                    skipped += 1;
+                    eprintln!(
+                        "[aoso-shadows]   skip {} @ {:.2}s: {:?}",
+                        fx.name, seek_s, e
+                    );
+                }
+            }
+        }
+    }
+
+    let n = cover_features.len();
+    eprintln!("[aoso-shadows] {} pairs usable ({} skipped)", n, skipped);
+    assert!(n >= 10, "too few usable pairs: {}", n);
+
+    let w6_features = [0, 1];
+    let juw_features = [2, 3, 4, 5];
+    let dctr_features = [6, 7, 8, 9, 10, 11];
+    let combined = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+
+    let auc_w6 = auc_along(&cover_features, &stego_features, &w6_features);
+    let auc_juw = auc_along(&cover_features, &stego_features, &juw_features);
+    let auc_dctr = auc_along(&cover_features, &stego_features, &dctr_features);
+    let auc_combined = auc_along(&cover_features, &stego_features, &combined);
+
+    let mean_c = mean_features(&cover_features);
+    let mean_s = mean_features(&stego_features);
+    eprintln!("[aoso-shadows] cover mean F = {:?}", mean_c);
+    eprintln!("[aoso-shadows] stego mean F = {:?}", mean_s);
+    eprintln!(
+        "[aoso-shadows] AUC W6-only       (F1+F2)        = {:.4}",
+        auc_w6
+    );
+    eprintln!(
+        "[aoso-shadows] AUC J-UNIWARD-AoSO (F3..F6)       = {:.4}",
+        auc_juw
+    );
+    eprintln!(
+        "[aoso-shadows] AUC DCTR-light    (F7..F12)      = {:.4}",
+        auc_dctr
+    );
+    eprintln!(
+        "[aoso-shadows] AUC combined-all  (F1..F12)      = {:.4}",
+        auc_combined
+    );
+
+    let worst_class_auc = auc_w6.max(auc_juw).max(auc_dctr);
+    eprintln!(
+        "[aoso-shadows] STRONGEST-CLASS AUC (vs 0.70 gate) = {:.4}",
+        worst_class_auc
+    );
+
+    assert!(
+        worst_class_auc < 0.70,
+        "Shadow-active strongest-class AUC {:.4} exceeds v1.0 stealth gate (0.70). \
+         Shadow protocol may be adding statistically distinguishable mass beyond \
+         primary STC flips — investigate shadow position selection + cost overlay.",
         worst_class_auc
     );
 }

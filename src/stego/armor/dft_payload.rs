@@ -110,7 +110,7 @@ fn generate_sector_assignment(passphrase: &str) -> Result<Vec<usize>, crate::ste
     Ok(assignment)
 }
 
-/// T3.4.A — Bin classification lookup table for DFT-ring sectors.
+/// Bin classification lookup table for DFT-ring sectors.
 ///
 /// For a fixed `(w, h)`, the mapping from `(dx, dy)` frequency offset
 /// to sector index is invariant across all 256 sectors, embed vs
@@ -148,7 +148,7 @@ impl SectorLut {
 
     /// Build the LUT for a spectrum of dimensions (w, h) using the
     /// standard ring radii. Scans every (dy, dx) ∈ [-r_max..r_max]²
-    /// once. T3.4.B — parallel by dy-row when the `parallel` feature
+    /// once. Parallel by dy-row when the `parallel` feature
     /// is enabled; sequential fallback otherwise. Bin order within
     /// each sector preserves dy-outer / dx-inner order so the f64
     /// sum in compute_sector_magnitude_lut is deterministic.
@@ -233,7 +233,7 @@ impl SectorLut {
     }
 }
 
-/// T3.4.D — deterministic byte stream for the SectorLut, used by
+/// Deterministic byte stream for the SectorLut, used by
 /// `lut_cross_platform_hash_hex` to pin the cross-platform hash.
 ///
 /// Layout: for each sector_idx (0..NUM_SECTORS), dump the sector's
@@ -285,7 +285,7 @@ pub fn lut_cross_platform_hash_hex() -> String {
 /// A sector covers an angular range and a radial range in the frequency domain.
 ///
 /// **Legacy implementation** — kept around as the reference for the
-/// T3.4.A bit-exact gate (`lut_matches_legacy_per_sector_magnitude`)
+/// bit-exact gate (`lut_matches_legacy_per_sector_magnitude`)
 /// AND for the `perf_t34_ring` perf bench. Production code uses
 /// `compute_sector_magnitude_lut`.
 #[doc(hidden)]
@@ -363,7 +363,7 @@ fn compute_sector_magnitude(
 /// Set the magnitude of all bins in a sector to a target value.
 ///
 /// **Legacy implementation** — kept around as the reference for the
-/// T3.4.A bit-exact gate. Production code uses
+/// bit-exact gate. Production code uses
 /// `set_sector_magnitude_lut`.
 #[allow(dead_code)]
 fn set_sector_magnitude(
@@ -435,7 +435,7 @@ fn set_sector_magnitude(
     }
 }
 
-/// T3.4.A — LUT-backed compute_sector_magnitude. Reads the bin set
+/// LUT-backed compute_sector_magnitude. Reads the bin set
 /// for `sector_idx` from `lut.sectors[sector_idx]`, sums their
 /// magnitudes, returns mean. Bit-identical to the legacy ring-scan
 /// path on the same fixture (same iteration order, same f64
@@ -464,7 +464,7 @@ fn compute_sector_magnitude_lut(spectrum: &Spectrum2D, sector_idx: usize, lut: &
     }
 }
 
-/// T3.4.A — LUT-backed set_sector_magnitude. Iterates the same bin
+/// LUT-backed set_sector_magnitude. Iterates the same bin
 /// set as `compute_sector_magnitude_lut`, rescales each bin to the
 /// target magnitude (preserving phase), and applies the Hermitian
 /// conjugate update using the pre-stored `conj_idx`.
@@ -502,7 +502,7 @@ fn set_sector_magnitude_lut(
     }
 }
 
-/// T3.4.C — combined compute-mean + qim-embed + scale-bins in a
+/// Combined compute-mean + qim-embed + scale-bins in a
 /// single pass over `lut.sectors[sector_idx]`. The legacy embed loop
 /// calls `compute_sector_magnitude_lut` (reads `det_hypot` per bin)
 /// then `set_sector_magnitude_lut` (reads `det_hypot` per bin AGAIN
@@ -603,7 +603,7 @@ pub fn embed_ring_payload(
 ) -> Result<(), crate::stego::error::StegoError> {
     let w = spectrum.width;
     let h = spectrum.height;
-    // T3.4.A — build the bin classification LUT once. Hoists ~750 M
+    // Build the bin classification LUT once. Hoists ~750 M
     // det_hypot/det_atan2 calls (at 4K) down to ~3 M during build,
     // then per-sector ops become O(bins_in_sector) memory reads.
     let lut = SectorLut::build(w, h);
@@ -630,7 +630,7 @@ pub fn embed_ring_payload(
             continue;
         }
 
-        // T3.4.C — combined compute + set in one pass. Halves the
+        // Combined compute + set in one pass. Halves the
         // per-bin `det_hypot` count (1 per bin instead of 2).
         embed_sector_bit_lut(spectrum, sector_idx, &lut, rs_bits[bit_idx]);
     }
@@ -646,7 +646,7 @@ pub fn extract_ring_payload(
 ) -> Option<Vec<u8>> {
     let w = spectrum.width;
     let h = spectrum.height;
-    // T3.4.A — same LUT-once optimization on the decode side.
+    // Same LUT-once optimization on the decode side.
     let lut = SectorLut::build(w, h);
 
     let assignment = generate_sector_assignment(passphrase).ok()?;

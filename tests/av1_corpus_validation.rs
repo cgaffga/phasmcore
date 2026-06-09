@@ -16,9 +16,9 @@
 //! v0.3-AV1 scope: single-tile, single key frame, AC_COEFF_SIGN only.
 //!
 //! Run:
-//!     cargo test --features av1-encoder,av1-backend --test av1_corpus_validation
+//!     cargo test --features av1-encoder,av1-decoder --test av1_corpus_validation
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::path::PathBuf;
 use std::process::Command;

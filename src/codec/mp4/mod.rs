@@ -18,6 +18,7 @@
 //! - Only handles single-fragment MP4 files (no fragmented MP4/fMP4)
 //! - Requires `mdat` box to be after `moov` for muxing (standard for camera output)
 
+pub mod av1_obu_split;
 pub mod build;
 pub mod demux;
 pub mod mux;
@@ -221,6 +222,158 @@ impl AvccData {
             out.push((pps.len() & 0xFF) as u8);
             out.extend_from_slice(pps);
         }
+        out
+    }
+}
+
+/// VP.M — AV1 Codec Configuration Record (`av1C` box payload).
+///
+/// Per AV1-ISOBMFF spec § 2.3.1. The decoder configuration contains a
+/// compact descriptor of the AV1 stream's basic properties (profile,
+/// level, bit depth, chroma subsampling) plus an optional
+/// `ConfigOBUs` byte string carrying the `sequence_header_obu`. Most
+/// decoders rely on the in-stream sequence header anyway, so we
+/// always ship it in `config_obus` for robustness.
+///
+/// Layout:
+/// ```text
+///   marker (1) | version (7)                      → 1 byte = 0x81 (marker=1, version=1)
+///   seq_profile (3) | seq_level_idx_0 (5)         → 1 byte
+///   seq_tier_0 (1) | high_bitdepth (1) | twelve_bit (1) | monochrome (1)
+///     | chroma_subsampling_x (1) | chroma_subsampling_y (1)
+///     | chroma_sample_position (2)                → 1 byte
+///   reserved (3) = 0 | initial_presentation_delay_present (1) = 0
+///     | reserved (4) = 0                          → 1 byte = 0
+///   config_obus (variable)                        → trailing
+/// ```
+///
+/// `seq_profile`, `seq_level_idx_0`, `seq_tier_0`, `high_bitdepth`,
+/// `twelve_bit`, `monochrome`, chroma subsampling, and
+/// `chroma_sample_position` should match what the AV1 encoder wrote
+/// into the `sequence_header_obu`. For phasm's rav1e fork with
+/// default 4:2:0 8-bit BT.709 the typical values are:
+///   seq_profile = 0, seq_level_idx_0 = 8 (level 4.0), seq_tier_0 = 0,
+///   high_bitdepth = 0, twelve_bit = 0, monochrome = 0,
+///   chroma_subsampling_x = 1, chroma_subsampling_y = 1,
+///   chroma_sample_position = 0 (CSP_UNKNOWN).
+#[derive(Debug, Clone)]
+pub struct Av1cData {
+    /// Configuration version. Always 1 per current spec.
+    pub configuration_version: u8,
+    /// AV1 sequence profile (0 = "Main").
+    pub seq_profile: u8,
+    /// AV1 sequence level index (0..=31). Level 4.0 = 8.
+    pub seq_level_idx_0: u8,
+    /// AV1 sequence tier (0 = "Main", 1 = "High").
+    pub seq_tier_0: u8,
+    /// True for 10/12-bit, false for 8-bit.
+    pub high_bitdepth: bool,
+    /// True for 12-bit (only when `high_bitdepth` is true).
+    pub twelve_bit: bool,
+    /// True for monochrome (no chroma planes).
+    pub monochrome: bool,
+    /// Chroma subsampling X (1 for 4:2:0 and 4:2:2; 0 for 4:4:4).
+    pub chroma_subsampling_x: bool,
+    /// Chroma subsampling Y (1 for 4:2:0; 0 for 4:2:2 and 4:4:4).
+    pub chroma_subsampling_y: bool,
+    /// Chroma sample position (0..=3 per AV1 spec).
+    pub chroma_sample_position: u8,
+    /// `sequence_header_obu` bytes (and optionally any
+    /// metadata_obu / temporal_delimiter_obu the encoder emits ahead
+    /// of the first frame). Decoders re-parse these. Phasm always
+    /// ships at least the first sequence_header_obu here.
+    pub config_obus: Vec<u8>,
+}
+
+impl Av1cData {
+    /// Construct an `Av1cData` from a phasm-rav1e-encoded AV1 OBU
+    /// byte stream by extracting the first `sequence_header_obu` and
+    /// reading the relevant fields. Returns `None` if no
+    /// sequence_header_obu is found in the first 4 KiB of the stream.
+    ///
+    /// **Note**: minimal-MVP implementation for VP.M.1 — relies on
+    /// the AV1 spec defaults (4:2:0 8-bit BT.709) rather than fully
+    /// re-parsing the sequence header. VP.M.2 / VP.8 will add the
+    /// proper parser via the new `phasm_av1_parse_sequence_header`
+    /// FFI helper; for now callers should use [`Av1cData::default_yuv420_8bit`]
+    /// or hand-set fields.
+    pub fn default_yuv420_8bit(sequence_header_obu: Vec<u8>) -> Self {
+        Self {
+            configuration_version: 1,
+            seq_profile: 0,
+            seq_level_idx_0: 8,
+            seq_tier_0: 0,
+            high_bitdepth: false,
+            twelve_bit: false,
+            monochrome: false,
+            chroma_subsampling_x: true,
+            chroma_subsampling_y: true,
+            chroma_sample_position: 0,
+            config_obus: sequence_header_obu,
+        }
+    }
+
+    /// VP.8 — construct an `Av1cData` by parsing the actual
+    /// `sequence_header_obu` to extract real field values (vs
+    /// [`Self::default_yuv420_8bit`] which hardcodes the rav1e
+    /// default profile). Returns `None` if the parser doesn't
+    /// recognize the OBU's syntax (e.g. multi-operating-point
+    /// streams — phasm-rav1e doesn't produce these but third-party
+    /// AV1 input streams might).
+    ///
+    /// Callers (typically `build_mp4_av1`) should fall back to
+    /// `default_yuv420_8bit` on `None`.
+    pub fn from_sequence_header_obu(sequence_header_obu: Vec<u8>) -> Option<Self> {
+        let info = av1_obu_split::parse_sequence_header_obu(&sequence_header_obu)?;
+        Some(Self {
+            configuration_version: 1,
+            seq_profile: info.seq_profile,
+            seq_level_idx_0: info.seq_level_idx_0,
+            seq_tier_0: info.seq_tier_0,
+            high_bitdepth: info.high_bitdepth,
+            twelve_bit: info.twelve_bit,
+            monochrome: info.monochrome,
+            chroma_subsampling_x: info.chroma_subsampling_x,
+            chroma_subsampling_y: info.chroma_subsampling_y,
+            chroma_sample_position: info.chroma_sample_position,
+            config_obus: sequence_header_obu,
+        })
+    }
+
+    /// Serialize this `Av1cData` into the raw bytes of an MP4 `av1C`
+    /// box payload (NOT including the outer 4-byte size + 4-byte
+    /// "av1C" fourcc header — caller wraps that).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.config_obus.len());
+
+        // Byte 0: marker(1) | version(7)
+        // marker = 1 (per spec), version = configuration_version
+        out.push(0x80 | (self.configuration_version & 0x7F));
+
+        // Byte 1: seq_profile(3) | seq_level_idx_0(5)
+        out.push(((self.seq_profile & 0x07) << 5) | (self.seq_level_idx_0 & 0x1F));
+
+        // Byte 2: seq_tier_0(1) | high_bitdepth(1) | twelve_bit(1) |
+        //         monochrome(1) | chroma_subsampling_x(1) |
+        //         chroma_subsampling_y(1) | chroma_sample_position(2)
+        let mut b2 = 0u8;
+        if self.seq_tier_0 != 0 { b2 |= 0x80; }
+        if self.high_bitdepth   { b2 |= 0x40; }
+        if self.twelve_bit      { b2 |= 0x20; }
+        if self.monochrome      { b2 |= 0x10; }
+        if self.chroma_subsampling_x { b2 |= 0x08; }
+        if self.chroma_subsampling_y { b2 |= 0x04; }
+        b2 |= self.chroma_sample_position & 0x03;
+        out.push(b2);
+
+        // Byte 3: reserved(3) = 0 | initial_presentation_delay_present(1) = 0
+        //         | reserved(4) = 0
+        // We don't use initial_presentation_delay; emit zero.
+        out.push(0);
+
+        // ConfigOBUs trailing bytes.
+        out.extend_from_slice(&self.config_obus);
+
         out
     }
 }

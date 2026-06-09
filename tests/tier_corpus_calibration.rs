@@ -11,7 +11,7 @@
 //
 // Uses the production OH264 path via `StreamingEncodeSession`. Tier
 // override is set via `PHASM_TIER_OVERRIDE` env var for each sweep cell
-// (the encoder code checks it inside `encode_yuv_with_pre_framed_bits_4domain`).
+// (the encoder code checks it inside `h264_encode_gop_framed_bits_auto`).
 //
 // Corpus = full `test-vectors/video/h264/real-world/source` set (iPhone,
 // Lumix, DJI drone, Artlist library — diverse content styles: static
@@ -20,10 +20,10 @@
 // Output: per-fixture × per-tier table on stderr. Tier 0 must roundtrip;
 // higher tiers may fail on some content (that's the calibration signal).
 
-#![cfg(all(feature = "openh264-backend", feature = "cabac-stego"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::{
-    h264_stego_capacity_4domain_oh264,
+    h264_video_capacity,
     ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
     StreamingDecodeSession, StreamingEncodeSession, YuvFrameRef,
 };
@@ -115,7 +115,7 @@ fn try_tier(
     tier_idx: u8,
 ) -> TierOutcome {
     // Tier override via env var — the OH264 path
-    // `encode_yuv_with_pre_framed_bits_4domain` checks PHASM_TIER_OVERRIDE
+    // `h264_encode_gop_framed_bits_auto` checks PHASM_TIER_OVERRIDE
     // and resolves it ahead of the Auto heuristic.
     // SAFETY: Rust 2024 edition flags env::set_var as unsafe due to
     // racey global state. Single-threaded test harness (SESSION_GUARD
@@ -236,7 +236,7 @@ fn run_tier_sweep(w: u32, h: u32, n_frames: u32, gop: u32, msg: &str, pass: &str
         // is why the old table showed a 9247-byte cap next to an
         // encode-fail. qp/intra_period mirror the encode params below.
         let cap_opts = EncodeOpts { qp: 26, intra_period: GOP as i32 };
-        let capacities = match h264_stego_capacity_4domain_oh264(&yuv, W, H, N as usize, cap_opts, /* full_tiers */ true) {
+        let capacities = match h264_video_capacity(&yuv, W, H, N as usize, cap_opts, /* full_tiers */ true) {
             Ok(info) => info.per_tier_primary_max_message_bytes,
             Err(_) => [0; 5],
         };

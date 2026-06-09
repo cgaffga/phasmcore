@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Phase B.1.5.2 — Cascade-safety v2 forward modeling kernels.
+//! Cascade-safety v2 forward modeling kernels.
 //!
 //! Given a per-tuple impulse pattern from
-//! [`crate::stego::cost::av1_uniward`]'s L1 basis cache (B.3.1.2),
+//! [`crate::stego::cost::av1_uniward`]'s L1 basis cache,
 //! predict the post-deblock pixel-domain perturbation that a single
 //! AC sign flip would produce. Used by the L3 cache to compute the
-//! cascade-magnitude scalar that drives B.1.5.5's three-tier
-//! dispatch.
+//! cascade-magnitude scalar that drives the three-tier dispatch.
 //!
 //! ## v0.5 approximation strategy
 //!
@@ -34,7 +33,7 @@
 //!   can store the *normalized* response and the L3 cache scales it
 //!   by `|coeff|` at lookup.
 //! * **Per-frame deterministic**: deblock levels are frame-level
-//!   constants captured by B.1.5.1's
+//!   constants captured by
 //!   [`PhasmFrameLoopFilterState`](phasm_rav1e::ec::PhasmFrameLoopFilterState).
 //!   No per-flip state.
 //!
@@ -43,18 +42,17 @@
 //! 1. **Per-edge boundary strength**: spec-correct deblock filter
 //!    size depends on coefficient magnitudes in adjacent blocks
 //!    (`get_dc_sign_ctx`-style context). Requires per-SB or per-
-//!    block state capture in phasm-rav1e (B.1.5.1 deferred this).
+//!    block state capture in phasm-rav1e.
 //! 2. **Spec-correct filter taps**: AV1 deblock has 4 distinct
 //!    filter-size variants with specific tap coefficients
 //!    (per `vendor/phasm-rav1e/src/deblock.rs::deblock_size{4,6,8,14}_inner`).
 //!    First cut uses a generic box filter for simplicity.
-//! 3. **CDEF prediction layer**: B.1.5.3 stacks CDEF on top of
-//!    deblock output. Adds a directional 8-tap secondary filter
-//!    per superblock.
+//! 3. **CDEF prediction layer**: stacks CDEF on top of deblock output.
+//!    Adds a directional 8-tap secondary filter per superblock.
 //!
-//! See [`phase-b15-cascade-safety-v2.md`](../../../../../docs/design/video/av1/phase-b15-cascade-safety-v2.md)
-//! § 2 (per-position forward modeling kernel) + § 6.5 (B.1.5.0
-//! spike findings + calibration data).
+//! See docs/design/video/av1/phase-b15-cascade-safety-v2.md
+//! for the per-position forward modeling kernel + spike findings +
+//! calibration data.
 
 use std::collections::HashMap;
 
@@ -149,7 +147,7 @@ fn box_smear_v(src: &[f64], w: usize, h: usize, r: usize) -> Vec<f64> {
 /// L2 cascade-context cache. Keyed by the L1 tuple `(tx_w, tx_h,
 /// freq_x, freq_y)` + plane. For each key, stores the *normalized*
 /// post-deblock impulse pattern — the L3 cache scales it by `|coeff|`
-/// at lookup time, and B.1.5.5's three-tier dispatch reads the
+/// at lookup time, and the three-tier dispatch reads the
 /// HPF-residual-energy summary scalar.
 ///
 /// **Single-frame invariant**: deblock levels are captured at frame
@@ -202,7 +200,7 @@ impl L2CascadeContext {
 }
 
 // ======================================================================
-//  B.1.5.3 — CDEF approximation layer + L3 cascade cache
+//  CDEF approximation layer + L3 cascade cache
 // ======================================================================
 
 /// Apply a separable box-filter approximation of AV1 CDEF on top of
@@ -227,9 +225,8 @@ impl L2CascadeContext {
 ///   uses it for the majority of SBs at typical QP.
 ///
 /// **Refinement to v0.6+**: per-SB CDEF index + spec-correct
-/// directional filter. Requires the deferred B.1.5.1 fork-patch
-/// surface (per-SB index Vec capture during `encode_tile_group_
-/// with_phasm_tee`).
+/// directional filter. Requires the deferred fork-patch surface
+/// (per-SB index Vec capture during `encode_tile_group_with_phasm_tee`).
 pub fn apply_cdef_box_smear(
     post_deblock: &[f64],
     tx_w: usize,
@@ -279,7 +276,7 @@ pub fn apply_cdef_box_smear(
 ///
 /// **Memory**: ≤ unique L2 tuples × 8 B. For 1080p typical: ~few KB.
 ///
-/// **Used by**: B.1.5.5's three-tier dispatch — for the ~10-15% of
+/// **Used by**: the three-tier dispatch — for the ~10-15% of
 /// positions in the `|coeff|` middle band, the L3 lookup gives the
 /// per-position cascade-magnitude scalar without running the full
 /// forward model on every cost query.
@@ -341,7 +338,7 @@ impl L3CascadeCache {
     /// Used by the parallel cost loop after `prefill` — `&self`
     /// makes the cache `Sync` and lets rayon workers share a single
     /// reference across threads (mirrors the [`FrameBasisCache::get`]
-    /// pattern from B.3.1.3).
+    /// pattern).
     pub fn get(&self, key: &L2Key) -> Option<f64> {
         self.inner.get(key).copied()
     }
@@ -481,7 +478,7 @@ mod tests {
     }
 
     // ======================================================================
-    //  B.1.5.3 — CDEF approximation + L3 cache tests
+    //  CDEF approximation + L3 cache tests
     // ======================================================================
 
     fn cdef_state(y_strength_packed: u8) -> PhasmFrameLoopFilterState {

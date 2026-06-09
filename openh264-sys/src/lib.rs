@@ -676,7 +676,7 @@ unsafe extern "C" {
     /// phasm statics at the start of a new encode session. Resets the
     /// bypass scratch table, the last-MB sentinels, and the
     /// wire-only flag. Call at the top of every
-    /// `encode_yuv_with_pre_framed_bits_4domain` invocation so two
+    /// `h264_encode_gop_framed_bits_auto` invocation so two
     /// consecutive calls don't share fork state.
     pub fn phasm_reset_encoder_session_state();
 

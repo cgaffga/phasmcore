@@ -32,7 +32,10 @@
 //!   * `_wire_only_off` — same content with PHASM_USE_WIRE_ONLY=0
 //!   * `_iphone7_30f` — second real-content fixture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
+
+mod common;
+use common::oh264_stream;
 
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingDecodeSession,
@@ -339,14 +342,10 @@ fn phase_c_walker_cs_parity_on_real_carplane() {
     use phasm_core::codec::h264::cabac::bin_decoder::{
         walk_annex_b_for_cover_with_options, WalkOptions,
     };
-    use phasm_core::codec::h264::openh264_stego::{
-        openh264_stego_encode_yuv_text, EncodeOpts,
-    };
     let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
     let yuv = ensure_real_yuv("Artlist_CarPlane.mp4", 1072, 1920, 12);
-    let opts = EncodeOpts { qp: 26, intra_period: 12 };
-    let bitstream = openh264_stego_encode_yuv_text(
-        &yuv, 1072, 1920, 12, opts, "walker parity probe", "pw",
+    let bitstream = oh264_stream::encode(
+        &yuv, 1072, 1920, 12, 26, "walker parity probe", "pw",
     ).expect("baseline encode");
 
     let walk_default = walk_annex_b_for_cover_with_options(
@@ -399,7 +398,7 @@ fn phase_c_walker_cs_parity_on_real_carplane() {
 #[ignore = "Phase C — Pass 1 byte-identity 1-domain vs 4-domain"]
 fn phase_c_pass1_bytewise_parity() {
     use phasm_core::codec::h264::openh264_stego::{
-        encode_yuv_with_pre_framed_bits_4domain, EncodeOpts,
+        h264_encode_gop_framed_bits_auto, EncodeOpts,
     };
     use phasm_core::codec::h264::stego::CostWeights;
     // Default wire_only=1 path — DecisionCache CAPTURE→REPLAY enabled.
@@ -413,12 +412,12 @@ fn phase_c_pass1_bytewise_parity() {
         let weights = CostWeights::default();
 
         // First call.
-        let result_a = encode_yuv_with_pre_framed_bits_4domain(
+        let result_a = h264_encode_gop_framed_bits_auto(
             &yuv, 1072, 1920, 12, opts, &frame_bits, &hhat_seed, &weights,
         ).expect("first 4-domain encode");
         // Second call — identical input. Bug repro #548 tests this on
         // synth YUV; here we use REAL content.
-        let result_b = encode_yuv_with_pre_framed_bits_4domain(
+        let result_b = h264_encode_gop_framed_bits_auto(
             &yuv, 1072, 1920, 12, opts, &frame_bits, &hhat_seed, &weights,
         ).expect("second 4-domain encode");
 
@@ -458,8 +457,8 @@ fn oh264_streaming_real_carplane_480p_12f() {
 // ─────────────── Phase B.4 — per-domain isolation ─────────────────────
 //
 // Hypothesis: the bug is exclusively in MVD overrides (MvdSign/MvdSuffix).
-// The legacy single-domain CS-only path (`openh264_stego_encode_yuv_text`)
-// works on real content; the 4-domain streaming session does not.
+// The legacy single-domain CS-only path (since retired) works on real
+// content; the 4-domain streaming session does not.
 // Difference: 4-domain adds CSL + MVDs + MVDsl overrides on top of CS.
 //
 // These tests use STREAMING SESSION + 4-domain cover layout but constrain
@@ -525,32 +524,26 @@ fn oh264_streaming_real_carplane_1080p_12f_mvd_sign_only() {
     });
 }
 
-/// Phase B.4 — sanity: legacy 1-domain `openh264_stego_encode_yuv_text`
-/// on the same 12f real carplane YUV. Goes through the OLD encode path
-/// (`encode_yuv_with_pre_framed_bits`, NOT the 4-domain function).
-/// If this PASSES while every 4-domain variant FAILS on the same YUV,
-/// it pinpoints the bug to `encode_yuv_with_pre_framed_bits_4domain`
-/// (or something it triggers in the fork that the 1-domain function
-/// doesn't).
+/// Phase B.4 — sanity: real-content round-trip on the same 12f carplane
+/// YUV via the production 4-domain streaming session. (Historically this
+/// exercised the now-retired single-domain CS-only one-shot path as a
+/// bisect control; that path is gone, so it now overlaps the other
+/// streaming-session variants and survives purely as an extra
+/// round-trip smoke test on real motion content.)
 #[test]
-#[ignore = "Phase B.4 — sanity: legacy 1-domain path on same real YUV"]
+#[ignore = "Phase B.4 — sanity: real-content round-trip on same real YUV"]
 fn oh264_legacy_1domain_real_carplane_1080p_12f() {
-    use phasm_core::codec::h264::openh264_stego::{
-        openh264_stego_decode_yuv_string, openh264_stego_encode_yuv_text,
-        EncodeOpts,
-    };
     let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
     let yuv = ensure_real_yuv("Artlist_CarPlane.mp4", 1072, 1920, 12);
     let msg = "1-domain sanity on real content";
     let pass = "pw";
-    let opts = EncodeOpts { qp: 26, intra_period: 12 };
-    let stego = openh264_stego_encode_yuv_text(&yuv, 1072, 1920, 12, opts, msg, pass)
-        .expect("1-domain legacy encode");
-    let recovered = openh264_stego_decode_yuv_string(&stego, pass)
-        .expect("1-domain legacy decode");
-    assert_eq!(recovered, msg, "legacy 1-domain failed on real content (would be new bug)");
+    let stego = oh264_stream::encode(&yuv, 1072, 1920, 12, 26, msg, pass)
+        .expect("streaming-session encode");
+    let recovered = oh264_stream::decode_text(&stego, pass)
+        .expect("streaming-session decode");
+    assert_eq!(recovered, msg, "streaming session failed on real content (would be new bug)");
     eprintln!(
-        "#549 legacy 1-domain GREEN on real-content carplane 1072×1920 × 12f ({} bytes)",
+        "#549 streaming-session GREEN on real-content carplane 1072×1920 × 12f ({} bytes)",
         stego.len(),
     );
 }

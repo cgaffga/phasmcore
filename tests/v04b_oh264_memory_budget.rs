@@ -23,7 +23,7 @@
 // catch order-of-magnitude regressions (the kind #472 surfaced), not
 // 10% drift.
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingEncodeSession, YuvFrameRef,

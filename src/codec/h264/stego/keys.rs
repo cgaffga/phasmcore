@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 //
-// Per-domain ChaCha20 seed derivation for encode-time CABAC stego
-// (Phase 6D.8 audit prerequisite §23).
+// Per-domain ChaCha20 seed derivation for encode-time CABAC stego.
 //
-// Architecture decision (cabac-bypass-bin-stego.md): the four
+// Architecture decision (see
+// docs/design/video/_archive/h264/encoder-algorithms/cabac-bypass-bin-stego.md):
+// the four
 // stego target domains (CoeffSignBypass, CoeffSuffixLsb,
 // MvdSignBypass, MvdSuffixLsb) MUST use uncorrelated per-domain
 // seeds for the STC permutation + H-hat matrices. Otherwise an
@@ -18,19 +19,18 @@
 //      `derive_h264_mvd_structural_key` for MVD domains) so the
 //      caller pays Argon2 once per encode/decode.
 //   2. Mixes the masters with a domain-specific label via the
-//      existing `derive_per_gop_seed_from_master` SHA-256 helper to
+//      existing `derive_per_gop_seed` SHA-256 helper to
 //      produce per-(domain, GOP) seeds — cheap, deterministic,
 //      cross-platform identical (same `det_math` discipline as the
 //      rest of the encoder).
 //
-// Same structure the legacy CAVLC pipeline uses
-// (`h264_pipeline.rs:247-253`); just extended to the four CABAC
-// domains.
+// Same structure the retired CAVLC pipeline used; just extended to
+// the four CABAC domains.
 
 use zeroize::Zeroizing;
 
 use crate::stego::crypto::{
-    derive_h264_mvd_structural_key, derive_per_gop_seed_from_master,
+    derive_h264_mvd_structural_key, derive_per_gop_seed,
     derive_structural_key,
 };
 use crate::stego::error::StegoError;
@@ -42,7 +42,7 @@ use super::EmbedDomain;
 /// domain seeds via cheap SHA-256 mixing.
 ///
 /// **Two distinct masters**, one for the coefficient domains and
-/// one for the MVD domains, mirroring the existing CAVLC pipeline's
+/// one for the MVD domains, mirroring the retired CAVLC pipeline's
 /// `coeff_master` + `mvd_master` split. This guarantees that the
 /// four per-domain seeds derived below are uncorrelated even at
 /// the same GOP index.
@@ -62,14 +62,6 @@ pub struct CabacStegoMasterKeys {
 pub struct DomainSeeds {
     pub perm_seed: [u8; 32],
     pub hhat_seed: [u8; 32],
-}
-
-impl DomainSeeds {
-    /// 32-byte H-hat seed in the format the existing
-    /// `crate::stego::stc::hhat::generate_hhat` expects.
-    pub fn hhat_seed_ref(&self) -> &[u8; 32] {
-        &self.hhat_seed
-    }
 }
 
 impl CabacStegoMasterKeys {
@@ -111,8 +103,8 @@ impl CabacStegoMasterKeys {
             ),
         };
         DomainSeeds {
-            perm_seed: derive_per_gop_seed_from_master(master_perm_src, gop_idx, perm_label),
-            hhat_seed: derive_per_gop_seed_from_master(master_hhat_src, gop_idx, hhat_label),
+            perm_seed: derive_per_gop_seed(master_perm_src, gop_idx, perm_label),
+            hhat_seed: derive_per_gop_seed(master_hhat_src, gop_idx, hhat_label),
         }
     }
 

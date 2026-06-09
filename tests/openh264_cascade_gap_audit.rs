@@ -4,18 +4,18 @@
 //
 // Phase C.8.13(b) (#455) — cascade-break gap audit.
 //
-// Reproduces the 2/76,384 wire-bit divergence observed in
-// `openh264_stego_encode_yuv_string` when STC plans have 100+ flips, and
-// reports per-diverging-position which `SyntaxPath` (Luma4x4 / Luma8x8 /
+// Reproduces the 2/76,384 wire-bit divergence observed in the
+// OpenH264 4-domain stego encode path when STC plans have 100+ flips,
+// and reports per-diverging-position which `SyntaxPath` (Luma4x4 / Luma8x8 /
 // ChromaAc / ChromaDc / LumaDcIntra16x16) the leaking position belongs
 // to. The SyntaxPath identifies the C.8.x dual-recon hook that should
 // have prevented the leak.
 //
 // Designed for ad-hoc invocation:
-//   cargo test --release --features "h264-encoder openh264-backend" \
+//   cargo test --release --features "h264-encoder" \
 //       --test openh264_cascade_gap_audit -- --ignored --nocapture
 
-#![cfg(all(feature = "h264-encoder", feature = "openh264-backend"))]
+#![cfg(feature = "h264-encoder")]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

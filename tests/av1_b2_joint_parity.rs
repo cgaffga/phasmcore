@@ -11,7 +11,7 @@
 //! is at the cursor-parity level (counts/order disagree between
 //! sides) or downstream.
 
-#![cfg(all(feature = "av1-encoder", feature = "av1-backend"))]
+#![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
 use std::sync::Arc;
 
