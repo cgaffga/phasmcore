@@ -125,11 +125,18 @@ lto = "thin"
 [lints.rust]
 # Edition 2024 promotes `unsafe_op_in_unsafe_fn` (calling an unsafe
 # intrinsic in an `unsafe fn` body without an inner `unsafe {}` block).
-# The hand-written SIMD kernels (NEON / SSE / AVX / wasm-simd) trip this.
-# Pin to `warn` so a fresh build of the published decode-only mirror
-# compiles consistently with the monorepo (warn-by-default here) instead
-# of failing with E0133. Wrapping each intrinsic in an explicit unsafe
-# block is the proper follow-up cleanup; this keeps the warnings visible.
+# The hand-written SIMD kernels (NEON / SSE / AVX / wasm-simd) trip it
+# ~121× across ~33 fns (uniward_simd, inject, embed, fft2d_simd,
+# embedding_simd, optimizer_simd, pixels_aan_simd, av1_uniward).
+#
+# DELIBERATE POSTURE (decided 2026-06-09, #846): keep at `warn` — the
+# `rust_2024_compatibility` migration default — rather than wrap every
+# intrinsic. The wrapping is purely syntactic (zero behavior change), and
+# these kernels are bit-exact cross-platform; churning 121 edits through
+# determinism-critical SIMD for a cosmetic lint isn't worth the risk.
+# `warn` keeps the migration visible AND lets a FRESH build of the
+# published decode-only mirror compile (without it the staged tree hits
+# E0133). If we ever wrap them, drop this line.
 unsafe_op_in_unsafe_fn = "warn"
 
 [lints.clippy]

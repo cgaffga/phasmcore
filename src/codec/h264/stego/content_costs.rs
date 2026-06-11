@@ -75,10 +75,14 @@ use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, PositionKey, SyntaxP
 use crate::codec::h264::stego::inject::DomainCover;
 use crate::codec::h264::stego::orchestrate::DomainCosts;
 use crate::stego::cost::h264_uniward::{
-    compute_position_cost, compute_three_subbands, precompute_unit_basis, ThreeSubbands,
+    accumulate_cost_from_field, compute_delta_field, compute_three_subbands,
+    precompute_unit_basis, DeltaField, ThreeSubbands,
 };
 use crate::stego::error::StegoError;
 use std::collections::HashMap;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 /// Default `QP` value used when the caller doesn't pass one. Matches
 /// `EncodeOpts::default().qp` (=26) in the OH264 path.
@@ -133,6 +137,15 @@ pub fn compute_content_costs_yuv(
     let chroma_plane_size = y_plane_size / 4;
 
     let unit_basis = precompute_unit_basis();
+    // Memoise the position-independent J-UNIWARD impact field. It depends only
+    // on (scan_pos, delta_class, qp); qp is constant for the whole call, so the
+    // ≤15×33 distinct fields are built ONCE here (~4 MB, sub-ms) and looked up
+    // per position instead of recomputing the 19×19 separable wavelet filter
+    // for every coefficient position (millions on a 1080p clip). Bit-identical
+    // to `compute_position_cost` — same arithmetic, just cached. See
+    // [`coeff_position_cost`]. The table is shared read-only across frames and
+    // the parallel position loop.
+    let field_table = build_field_table(&unit_basis, qp);
 
     // Group positions by frame_idx, recording (domain, slot_in_domain).
     // We compute wavelets once per frame; positions visiting the same
@@ -149,6 +162,12 @@ pub fn compute_content_costs_yuv(
         mvd_suffix_lsb: vec![f32::INFINITY; n_msl],
     };
 
+    // #847 wavelet-share probe: PHASM_PERF_TRACE accumulates the time spent in
+    // the (already row-parallel) 3-subband decomposition vs. the rest of
+    // content_costs, to confirm whether the wavelet is the dominant cost.
+    let trace_cc = std::env::var("PHASM_PERF_TRACE").as_deref() == Ok("1");
+    let mut t_wav = std::time::Duration::ZERO;
+
     let frame_buckets = group_positions_by_frame(cover);
     for (frame_idx, bucket) in &frame_buckets {
         if *frame_idx as usize >= n_frames as usize {
@@ -161,6 +180,7 @@ pub fn compute_content_costs_yuv(
         let cr_offset = cb_offset + chroma_plane_size;
         let cr_plane = &yuv[cr_offset .. cr_offset + chroma_plane_size];
 
+        let tw = trace_cc.then(std::time::Instant::now);
         let y_wavelets = compute_three_subbands(y_plane, width as usize, height as usize);
         let cb_wavelets = compute_three_subbands(
             cb_plane, (width / 2) as usize, (height / 2) as usize,
@@ -168,9 +188,24 @@ pub fn compute_content_costs_yuv(
         let cr_wavelets = compute_three_subbands(
             cr_plane, (width / 2) as usize, (height / 2) as usize,
         );
+        if let Some(t) = tw {
+            t_wav += t.elapsed();
+        }
 
         // Coefficient-domain positions: per-position wavelet cost.
-        for &CoverSlot { domain, idx } in &bucket.coeff_positions {
+        // #perf 2026-06: this per-position loop is the cover-scaling serial
+        // bottleneck (~82% of content_costs on high-texture footage). Each
+        // position reads the frame's SHARED, read-only wavelets and writes a
+        // DISJOINT cost index, so parallelising over positions is
+        // bit-identical to the serial loop (per-position-deterministic
+        // values; each index written exactly once) AND memory-neutral: the
+        // wavelets are shared by reference, not duplicated, preserving the
+        // module's one-frame-at-a-time ~32 MB peak. (Cross-frame concurrency
+        // was rejected — see the module ## Memory note — because the wavelet
+        // already parallelises internally; this parallelises the loop the
+        // wavelet doesn't.)
+        let cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
+            let CoverSlot { domain, idx } = *slot;
             let (positions, magnitudes) = match domain {
                 EmbedDomain::CoeffSignBypass => (
                     &cover.coeff_sign_bypass.positions,
@@ -180,58 +215,81 @@ pub fn compute_content_costs_yuv(
                     &cover.coeff_suffix_lsb.positions,
                     &cover.coeff_suffix_lsb.magnitudes,
                 ),
-                _ => continue,
+                _ => return None,
             };
-            let Some(&key) = positions.get(idx) else { continue };
-            // `δ = 2·|coeff|` for Sign and `δ = 1` for SuffixLsb (the
-            // LSB flip changes magnitude by ±1 by construction).
-            // Magnitudes can fall to 0 only for legacy
-            // call sites that use the back-compat `push(bit, pos)` path
-            // (and for non-coeff positions that re-use this struct);
-            // those see the legacy `δ = 2` fallback so cost-function
-            // behaviour stays unchanged when magnitude isn't plumbed.
+            let &key = positions.get(idx)?;
+            // `δ = 2·|coeff|` for Sign and `δ = 1` for SuffixLsb (the LSB
+            // flip changes magnitude by ±1). Magnitude 0 only for legacy
+            // `push(bit, pos)` call sites, which take the `δ = 2` fallback,
+            // so cost-function behaviour is unchanged.
             let magnitude = magnitudes.get(idx).copied().unwrap_or(0);
             let cost = coeff_position_cost(
-                key, magnitude, &unit_basis,
+                key, magnitude, &field_table,
                 &y_wavelets, &cb_wavelets, &cr_wavelets,
-                width as usize, height as usize, mb_width, qp,
+                width as usize, height as usize, mb_width,
             );
-            let bucket_costs = match domain {
-                EmbedDomain::CoeffSignBypass => &mut costs.coeff_sign_bypass,
-                EmbedDomain::CoeffSuffixLsb => &mut costs.coeff_suffix_lsb,
-                _ => continue,
-            };
-            bucket_costs[idx] = cost;
+            Some((domain, idx, cost))
+        };
+        #[cfg(feature = "parallel")]
+        let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
+            bucket.coeff_positions.par_iter().filter_map(&cost_of).collect();
+        #[cfg(not(feature = "parallel"))]
+        let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
+            bucket.coeff_positions.iter().filter_map(&cost_of).collect();
+        for &(domain, idx, cost) in &coeff_contribs {
+            match domain {
+                EmbedDomain::CoeffSignBypass => costs.coeff_sign_bypass[idx] = cost,
+                EmbedDomain::CoeffSuffixLsb => costs.coeff_suffix_lsb[idx] = cost,
+                _ => {}
+            }
         }
 
-        // MVD-domain positions: MB-aggregated wavelet cost.
-        // Cache MB-aggregate texture so each MB's wavelet response is
-        // summed only once across all positions in that MB.
-        let mut mb_texture_cache: HashMap<u32, f32> = HashMap::new();
-        for &CoverSlot { domain, idx } in &bucket.mvd_positions {
+        // MVD-domain positions: MB-aggregated wavelet cost. Parallelised
+        // over positions like the coeff loop above (#perf 2026-06): each
+        // position computes its MB texture directly from the frame's shared
+        // read-only wavelets and writes a DISJOINT index — bit-identical and
+        // memory-neutral. The previous per-MB texture cache is dropped:
+        // `mb_y_texture` is cheap, recomputing it for the few MVD positions
+        // that share an MB costs far less than the parallelism gain, and a
+        // shared cache would re-serialise the loop.
+        let mvd_cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
+            let CoverSlot { domain, idx } = *slot;
             let positions = match domain {
                 EmbedDomain::MvdSignBypass => &cover.mvd_sign_bypass.positions,
                 EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.positions,
-                _ => continue,
+                _ => return None,
             };
-            let Some(&key) = positions.get(idx) else { continue };
+            let &key = positions.get(idx)?;
             let mb_addr = key.mb_addr();
             let mb_x = (mb_addr as usize) % mb_width;
             let mb_y = (mb_addr as usize) / mb_width;
-            let texture = *mb_texture_cache.entry(mb_addr).or_insert_with(|| {
-                mb_y_texture(&y_wavelets, mb_x, mb_y, width as usize, height as usize)
-            });
+            let texture =
+                mb_y_texture(&y_wavelets, mb_x, mb_y, width as usize, height as usize);
             let cost = 1.0 / (texture + MVD_COST_SIGMA);
-            let bucket_costs = match domain {
-                EmbedDomain::MvdSignBypass => &mut costs.mvd_sign_bypass,
-                EmbedDomain::MvdSuffixLsb => &mut costs.mvd_suffix_lsb,
-                _ => continue,
-            };
-            bucket_costs[idx] = cost;
+            Some((domain, idx, cost))
+        };
+        #[cfg(feature = "parallel")]
+        let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
+            bucket.mvd_positions.par_iter().filter_map(&mvd_cost_of).collect();
+        #[cfg(not(feature = "parallel"))]
+        let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
+            bucket.mvd_positions.iter().filter_map(&mvd_cost_of).collect();
+        for &(domain, idx, cost) in &mvd_contribs {
+            match domain {
+                EmbedDomain::MvdSignBypass => costs.mvd_sign_bypass[idx] = cost,
+                EmbedDomain::MvdSuffixLsb => costs.mvd_suffix_lsb[idx] = cost,
+                _ => {}
+            }
         }
         // y/cb/cr wavelets drop here — next frame allocates fresh.
     }
 
+    if trace_cc {
+        eprintln!(
+            "[PHASM_PERF_TRACE]     ↳ of which wavelet (3-subband decomp) {:>8.1} ms",
+            t_wav.as_secs_f64() * 1000.0
+        );
+    }
     Ok(costs)
 }
 
@@ -282,32 +340,28 @@ fn group_positions_by_frame(cover: &DomainCover) -> HashMap<u32, FrameBucket> {
 fn coeff_position_cost(
     key: PositionKey,
     magnitude: u16,
-    unit_basis: &[[[[f64; 4]; 4]; 4]; 4],
+    field_table: &[DeltaField],
     y_wavelets: &ThreeSubbands,
     cb_wavelets: &ThreeSubbands,
     cr_wavelets: &ThreeSubbands,
     img_w: usize,
     img_h: usize,
     mb_width: usize,
-    qp: i32,
 ) -> f32 {
     let mb_addr = key.mb_addr();
     let mb_x = (mb_addr as usize) % mb_width;
     let mb_y = (mb_addr as usize) / mb_width;
 
-    // Pixel-delta scales with `|coeff|` for a sign flip (the
-    // coefficient swings from +M to −M, change = 2·M).
-    // Clamp to 32 so a single high-magnitude outlier can't dominate
-    // the cost vector; at QP ≤ 32 with typical content, coefficients
-    // above 32 are extremely rare and clamping has < 0.01% effect on
-    // STC plan selection. Magnitude=0 (back-compat path that hasn't
-    // been plumbed) falls through to the legacy δ=2/δ=1 constants —
-    // same numbers the cost fn used before magnitude was plumbed.
-    let mag_clamped = (magnitude as f64).min(32.0).max(1.0);
-    let sign_delta: f64 = if magnitude == 0 { 2.0 } else { 2.0 * mag_clamped };
-    let suffix_lsb_delta: f64 = 1.0;
+    // Magnitude class for the field-table lookup. A sign flip swings the
+    // coefficient +M↔−M (δ = 2·|coeff|); clamp |coeff| to 32 so a single
+    // high-magnitude outlier can't dominate the cost vector (at QP ≤ 32,
+    // coefficients above 32 are extremely rare; < 0.01% effect on STC plan
+    // selection). Magnitude 0 (back-compat `push(bit, pos)` call sites)
+    // clamps to 1 → δ=2, the legacy default. A SuffixLsb flip toggles the
+    // magnitude LSB (δ=1) → class 0.
+    let sign_class = (magnitude as usize).clamp(1, 32);
 
-    let (wavelets, plane_w, plane_h, block_px_x, block_px_y, scan_pos, delta) =
+    let (wavelets, plane_w, plane_h, block_px_x, block_px_y, scan_pos, class) =
         match key.syntax_path() {
             SyntaxPath::Luma4x4 { block_idx, coeff_idx, kind } => {
                 if coeff_idx == 0 {
@@ -317,11 +371,11 @@ fn coeff_position_cost(
                 let (bx, by) = BLOCK_INDEX_TO_POS[block_idx as usize];
                 let block_px_x = mb_x * 16 + bx as usize * 4;
                 let block_px_y = mb_y * 16 + by as usize * 4;
-                let delta = match kind {
-                    BinKind::Sign => sign_delta,
-                    BinKind::SuffixLsb => suffix_lsb_delta,
+                let class = match kind {
+                    BinKind::Sign => sign_class,
+                    BinKind::SuffixLsb => 0,
                 };
-                (y_wavelets, img_w, img_h, block_px_x, block_px_y, coeff_idx, delta)
+                (y_wavelets, img_w, img_h, block_px_x, block_px_y, coeff_idx, class)
             }
             SyntaxPath::Luma8x8 { .. } => {
                 // 8x8 transform — cost machinery currently targets 4x4
@@ -341,23 +395,50 @@ fn coeff_position_cost(
                 let chroma_h = img_h / 2;
                 let block_px_x = mb_x * 8 + bx * 4;
                 let block_px_y = mb_y * 8 + by * 4;
-                let delta = match kind {
-                    BinKind::Sign => sign_delta,
-                    BinKind::SuffixLsb => suffix_lsb_delta,
+                let class = match kind {
+                    BinKind::Sign => sign_class,
+                    BinKind::SuffixLsb => 0,
                 };
                 let wv = if plane == 0 { cb_wavelets } else { cr_wavelets };
-                (wv, chroma_w, chroma_h, block_px_x, block_px_y, coeff_idx, delta)
+                (wv, chroma_w, chroma_h, block_px_x, block_px_y, coeff_idx, class)
             }
             SyntaxPath::ChromaDc { .. } => return f32::INFINITY,
             SyntaxPath::LumaDcIntra16x16 { .. } => return f32::INFINITY,
             SyntaxPath::Mvd { .. } => return f32::INFINITY,
         };
 
-    let cost = compute_position_cost(
-        unit_basis, wavelets, plane_w, plane_h,
-        block_px_x, block_px_y, scan_pos, qp, delta,
-    );
+    // Look up the precomputed position-independent impact field for this
+    // (scan_pos, class) and accumulate it against the cover wavelets at this
+    // block — bit-identical to `compute_position_cost(unit_basis, …, δ)`.
+    let field = &field_table[(scan_pos as usize - 1) * N_DELTA_CLASS + class];
+    let cost =
+        accumulate_cost_from_field(field, wavelets, plane_w, plane_h, block_px_x, block_px_y);
     if cost.is_finite() && cost > 0.0 { cost as f32 } else { f32::INFINITY }
+}
+
+/// Magnitude classes in the field table: class 0 = SuffixLsb (δ=1), classes
+/// 1..=32 = Sign with clamped `|coeff|` (δ=2·class).
+const N_DELTA_CLASS: usize = 33;
+
+/// δ value for a field-table magnitude class. Mirrors `coeff_position_cost`'s
+/// δ: class 0 → SuffixLsb (1.0); class c≥1 → Sign with clamped `|coeff|`=c (2·c).
+#[inline]
+fn delta_for_class(class: usize) -> f64 {
+    if class == 0 { 1.0 } else { 2.0 * class as f64 }
+}
+
+/// Precompute every distinct [`DeltaField`] for the call: 15 AC scan positions
+/// (1..=15; DC is kept wet) × 33 magnitude classes. `qp` is constant for the
+/// call, so this is built once and shared read-only across all frames and the
+/// parallel position loop. Lookup index: `(scan_pos - 1) * N_DELTA_CLASS + class`.
+fn build_field_table(unit_basis: &[[[[f64; 4]; 4]; 4]; 4], qp: i32) -> Vec<DeltaField> {
+    let mut table = Vec::with_capacity(15 * N_DELTA_CLASS);
+    for scan_pos in 1u8..=15 {
+        for class in 0..N_DELTA_CLASS {
+            table.push(compute_delta_field(unit_basis, scan_pos, qp, delta_for_class(class)));
+        }
+    }
+    table
 }
 
 /// MB-level aggregate texture from the Y-plane wavelet subbands.

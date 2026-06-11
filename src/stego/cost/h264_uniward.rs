@@ -153,45 +153,59 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
     let mut hl = vec![0.0f32; padded_w * padded_h];
     let mut hh = vec![0.0f32; padded_w * padded_h];
 
-    // #809 — same structure: each output row is independent and reads the
-    // now read-only row_low/row_high. Parallelize over rows; bit-identical,
-    // no extra allocation.
-    let fill_col =
-        |out_y: usize, lh_row: &mut [f32], hl_row: &mut [f32], hh_row: &mut [f32]| {
-            for x in 0..padded_w {
-                let mut sum_lh = 0.0f64; // row_low  → high-pass col
-                let mut sum_hl = 0.0f64; // row_high → low-pass col
-                let mut sum_hh = 0.0f64; // row_high → high-pass col
-                for k in 0..FILT_LEN {
-                    let src_y = out_y as isize - pad as isize + k as isize;
-                    let clamped = symmetric_reflect(src_y, height as isize);
-                    let low_val = row_low[clamped as usize * padded_w + x] as f64;
-                    let high_val = row_high[clamped as usize * padded_w + x] as f64;
-                    sum_lh += HPDF[k] * low_val;
-                    sum_hl += lp[k] * high_val;
-                    sum_hh += HPDF[k] * high_val;
-                }
-                lh_row[x] = sum_lh as f32;
-                hl_row[x] = sum_hl as f32;
-                hh_row[x] = sum_hh as f32;
-            }
-        };
+    // #848 — k-outer / x-inner SAXPY over the shared `saxpy_inner` primitive
+    // (NEON / AVX / WASM-SIMD / scalar). The column reflection is on `out_y`
+    // only, so each tap reads one fully-contiguous source row and the whole
+    // x-range vectorises with no per-element border. Byte-identical to the
+    // prior scalar sum by construction: each x keeps its own f64 accumulator,
+    // summed in the SAME tap order (k=0..15), FMA-free (`a·b == b·a` in IEEE
+    // 754, so coef·val == val·coef). Each output row is independent → still
+    // row-parallel; the only added memory is a per-thread 3×padded_w f64
+    // scratch (~47 KB/thread), negligible against the lh/hl/hh outputs.
+    let fill_col_row = |scratch: &mut [f64], out_y: usize,
+                        lh_row: &mut [f32], hl_row: &mut [f32], hh_row: &mut [f32]| {
+        let (s_lh, rest) = scratch.split_at_mut(padded_w);
+        let (s_hl, s_hh) = rest.split_at_mut(padded_w);
+        s_lh.iter_mut().for_each(|v| *v = 0.0); // row_low  → high-pass col
+        s_hl.iter_mut().for_each(|v| *v = 0.0); // row_high → low-pass col
+        s_hh.iter_mut().for_each(|v| *v = 0.0); // row_high → high-pass col
+        for k in 0..FILT_LEN {
+            let src_y = out_y as isize - pad as isize + k as isize;
+            let clamped = symmetric_reflect(src_y, height as isize) as usize;
+            let rl = &row_low[clamped * padded_w..clamped * padded_w + padded_w];
+            let rh = &row_high[clamped * padded_w..clamped * padded_w + padded_w];
+            super::uniward_simd::saxpy_inner(s_lh, rl, HPDF[k]);
+            super::uniward_simd::saxpy_inner(s_hl, rh, lp[k]);
+            super::uniward_simd::saxpy_inner(s_hh, rh, HPDF[k]);
+        }
+        for x in 0..padded_w {
+            lh_row[x] = s_lh[x] as f32;
+            hl_row[x] = s_hl[x] as f32;
+            hh_row[x] = s_hh[x] as f32;
+        }
+    };
     #[cfg(feature = "parallel")]
     lh.par_chunks_mut(padded_w)
         .zip(hl.par_chunks_mut(padded_w))
         .zip(hh.par_chunks_mut(padded_w))
         .enumerate()
-        .for_each(|(out_y, ((lh_row, hl_row), hh_row))| {
-            fill_col(out_y, lh_row, hl_row, hh_row)
-        });
+        .for_each_init(
+            || vec![0.0f64; padded_w * 3],
+            |scratch, (out_y, ((lh_row, hl_row), hh_row))| {
+                fill_col_row(scratch.as_mut_slice(), out_y, lh_row, hl_row, hh_row)
+            },
+        );
     #[cfg(not(feature = "parallel"))]
-    lh.chunks_mut(padded_w)
-        .zip(hl.chunks_mut(padded_w))
-        .zip(hh.chunks_mut(padded_w))
-        .enumerate()
-        .for_each(|(out_y, ((lh_row, hl_row), hh_row))| {
-            fill_col(out_y, lh_row, hl_row, hh_row)
-        });
+    {
+        let mut scratch = vec![0.0f64; padded_w * 3];
+        lh.chunks_mut(padded_w)
+            .zip(hl.chunks_mut(padded_w))
+            .zip(hh.chunks_mut(padded_w))
+            .enumerate()
+            .for_each(|(out_y, ((lh_row, hl_row), hh_row))| {
+                fill_col_row(scratch.as_mut_slice(), out_y, lh_row, hl_row, hh_row)
+            });
+    }
 
     ThreeSubbands {
         lh,
@@ -314,25 +328,30 @@ fn pixel_scale(qp: i32, u: usize, v: usize) -> f64 {
     s * POW2_QBITS_MINUS_4[q_bits as usize]
 }
 
-/// Compute J-UNIWARD cost for a single candidate flip in an I-frame.
-///
-/// `block_px_x`, `block_px_y` — pixel coordinates of the top-left corner of
-/// the 4×4 block the flip lives in (block-aligned, within the Y plane).
-/// `scan_pos` — position within the 4×4 block in zigzag order (0..=15).
-/// `delta_magnitude` — absolute value of the coefficient change:
-///    * T1 sign flip: 2 (coefficient goes +1 ↔ −1)
-///    * LevelSuffixMag flip: 1 (LSB of magnitude toggles)
-pub(crate) fn compute_position_cost(
+/// Pixel-domain wavelet impact of a unit coefficient flip — the J-UNIWARD
+/// "embedding change" decomposed into the 3 directional sub-bands over the
+/// 19×19 window it touches. Depends ONLY on `(scan_pos, qp, delta_magnitude)`,
+/// NOT on the flip's position in the frame, so the same field serves every
+/// position that shares them — see the memoised field table in
+/// `content_costs`. 3 × 19 × 19 × f64 ≈ 8.5 KB.
+pub(crate) struct DeltaField {
+    lh: [[f64; IMPACT_SIZE]; IMPACT_SIZE],
+    hl: [[f64; IMPACT_SIZE]; IMPACT_SIZE],
+    hh: [[f64; IMPACT_SIZE]; IMPACT_SIZE],
+}
+
+/// Build the position-independent [`DeltaField`] for a unit flip at zigzag
+/// `scan_pos` (0..=15) under luma `qp`, scaled for `delta_magnitude`. This is
+/// the expensive half of the J-UNIWARD cost — the separable 19×19 row+column
+/// wavelet filter of the scaled 4×4 basis impulse — and is recomputed for
+/// every position by [`compute_position_cost`]; memoise it across positions
+/// that share `(scan_pos, qp, delta_magnitude)` to avoid that.
+pub(crate) fn compute_delta_field(
     unit_basis: &[[[[f64; 4]; 4]; 4]; 4],
-    wavelets: &ThreeSubbands,
-    img_w: usize,
-    img_h: usize,
-    block_px_x: usize,
-    block_px_y: usize,
     scan_pos: u8,
     qp: i32,
     delta_magnitude: f64,
-) -> f64 {
+) -> DeltaField {
     let raster = ZIGZAG_4X4[scan_pos as usize] as usize;
     let u = raster / 4;
     let v = raster % 4;
@@ -360,9 +379,9 @@ pub(crate) fn compute_position_cost(
                 // column src = out_c - (FILT_LEN - 1) + k = out_c - 15 + k.
                 let src = out_c as isize - (FILT_LEN - 1) as isize + k as isize;
                 if (0..4).contains(&src) {
-                    let v = basis[r][src as usize];
-                    sum_low += lp[k] * v;
-                    sum_high += HPDF[k] * v;
+                    let bv = basis[r][src as usize];
+                    sum_low += lp[k] * bv;
+                    sum_high += HPDF[k] * bv;
                 }
             }
             row_low[r][out_c] = sum_low;
@@ -370,10 +389,12 @@ pub(crate) fn compute_position_cost(
         }
     }
 
-    // Column-filter into 3 directional subbands and accumulate cost against
-    // the cover wavelets.
-    let pad = FILT_LEN - 1; // 15
-    let mut cost = 0.0f64;
+    // Column-filter into the 3 directional sub-bands.
+    let mut field = DeltaField {
+        lh: [[0.0; IMPACT_SIZE]; IMPACT_SIZE],
+        hl: [[0.0; IMPACT_SIZE]; IMPACT_SIZE],
+        hh: [[0.0; IMPACT_SIZE]; IMPACT_SIZE],
+    };
     for out_r in 0..IMPACT_SIZE {
         for out_c in 0..IMPACT_SIZE {
             let mut delta_lh = 0.0;
@@ -390,7 +411,30 @@ pub(crate) fn compute_position_cost(
                     delta_hh += HPDF[k] * high_val;
                 }
             }
+            field.lh[out_r][out_c] = delta_lh;
+            field.hl[out_r][out_c] = delta_hl;
+            field.hh[out_r][out_c] = delta_hh;
+        }
+    }
+    field
+}
 
+/// Accumulate the J-UNIWARD cost of a flip whose pixel-domain impact is
+/// `field`, for a 4×4 block at top-left pixel `(block_px_x, block_px_y)`,
+/// against the cover `wavelets`. The position-dependent half:
+/// `Σ |Δ_band| / (|cover_band| + σ)` over the in-bounds 19×19 window.
+pub(crate) fn accumulate_cost_from_field(
+    field: &DeltaField,
+    wavelets: &ThreeSubbands,
+    img_w: usize,
+    img_h: usize,
+    block_px_x: usize,
+    block_px_y: usize,
+) -> f64 {
+    let pad = FILT_LEN - 1; // 15
+    let mut cost = 0.0f64;
+    for out_r in 0..IMPACT_SIZE {
+        for out_c in 0..IMPACT_SIZE {
             let abs_x = block_px_x as isize + out_c as isize - pad as isize;
             let abs_y = block_px_y as isize + out_r as isize - pad as isize;
             if abs_x < 0 || abs_y < 0 || abs_x >= img_w as isize || abs_y >= img_h as isize {
@@ -405,12 +449,39 @@ pub(crate) fn compute_position_cost(
             let w_hl = wavelets.hl[idx].abs() as f64;
             let w_hh = wavelets.hh[idx].abs() as f64;
 
-            cost += delta_lh.abs() / (w_lh + SIGMA);
-            cost += delta_hl.abs() / (w_hl + SIGMA);
-            cost += delta_hh.abs() / (w_hh + SIGMA);
+            cost += field.lh[out_r][out_c].abs() / (w_lh + SIGMA);
+            cost += field.hl[out_r][out_c].abs() / (w_hl + SIGMA);
+            cost += field.hh[out_r][out_c].abs() / (w_hh + SIGMA);
         }
     }
     cost
+}
+
+/// Compute J-UNIWARD cost for a single candidate flip in an I-frame.
+///
+/// `block_px_x`, `block_px_y` — pixel coordinates of the top-left corner of
+/// the 4×4 block the flip lives in (block-aligned, within the Y plane).
+/// `scan_pos` — position within the 4×4 block in zigzag order (0..=15).
+/// `delta_magnitude` — absolute value of the coefficient change:
+///    * T1 sign flip: 2 (coefficient goes +1 ↔ −1)
+///    * LevelSuffixMag flip: 1 (LSB of magnitude toggles)
+///
+/// Equivalent to `compute_delta_field` then `accumulate_cost_from_field`;
+/// the hot path in `content_costs` memoises the former and calls the latter
+/// directly, so this reference form is kept for tests + one-shot callers.
+pub(crate) fn compute_position_cost(
+    unit_basis: &[[[[f64; 4]; 4]; 4]; 4],
+    wavelets: &ThreeSubbands,
+    img_w: usize,
+    img_h: usize,
+    block_px_x: usize,
+    block_px_y: usize,
+    scan_pos: u8,
+    qp: i32,
+    delta_magnitude: f64,
+) -> f64 {
+    let field = compute_delta_field(unit_basis, scan_pos, qp, delta_magnitude);
+    accumulate_cost_from_field(&field, wavelets, img_w, img_h, block_px_x, block_px_y)
 }
 
 // NOTE (Phase-4 CAVLC retirement): `compute_frame_uniward_costs` +

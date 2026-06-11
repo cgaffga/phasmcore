@@ -175,6 +175,28 @@ fn perf_trace() -> bool {
         .unwrap_or(false)
 }
 
+/// Phase-boundary current-RSS tap for the #847 memory audit. When
+/// `PHASM_MEM_TRACE=1`, prints the process resident set (MB) at a named
+/// point in the per-GOP encode so the ~0.7-1.1 GB peak can be localised to
+/// a specific phase (Pass1 / walk / costs / combine / STC / Pass2). Shells
+/// out to `ps -o rss=` — pure std, no FFI, ~8 calls/GOP so it doesn't
+/// perturb the footprint. Off by default (one `env::var` check).
+fn mem_trace(label: &str) {
+    if std::env::var("PHASM_MEM_TRACE").as_deref() != Ok("1") {
+        return;
+    }
+    let pid = std::process::id();
+    let rss_mb = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|kb| kb as f64 / 1024.0)
+        .unwrap_or(0.0);
+    eprintln!("[PHASM_MEM_TRACE] {label:<26} {rss_mb:>8.0} MB");
+}
+
 /// Encoder configuration knobs for the production stego path. The
 /// `qp` / `intra_period` defaults track the OpenH264 fork's recommended
 /// values for visual quality + reasonable IDR cadence.
@@ -280,6 +302,7 @@ pub fn h264_encode_gop_framed_bits(
 
     let trace = perf_trace();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+    mem_trace("00 enter");
 
     let mb_width = width / 16;
     let mb_height = height / 16;
@@ -354,6 +377,7 @@ pub fn h264_encode_gop_framed_bits(
     let captured_coeffs = take_coeff_capture();
     let dt_pass1 = t_pass1.map(|t| t.elapsed());
     let pass1_bytes = baseline_bitstream.len();
+    mem_trace("01 after Pass1+capture");
 
     let t_walk = if trace { Some(std::time::Instant::now()) } else { None };
     let baseline_walk = walk_annex_b_for_cover_with_options(
@@ -362,6 +386,7 @@ pub fn h264_encode_gop_framed_bits(
     )
     .map_err(|e| StegoError::InvalidVideo(format!("baseline walk: {e}")))?;
     let dt_walk = t_walk.map(|t| t.elapsed());
+    mem_trace("02 after walk (cover)");
 
     // STEGO.A.3 — Tier 3 content-adaptive costs. Computes per-position
     // J-UNIWARD wavelet costs (luma + chroma planes via
@@ -386,6 +411,14 @@ pub fn h264_encode_gop_framed_bits(
             yuv, width, height, n_frames, &baseline_walk.cover, opts.qp,
         )?
     };
+    if let Some(t) = t_stc {
+        eprintln!(
+            "[PHASM_PERF_TRACE]   ├─ content_costs(J-UNIWARD) {:>8.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let t_after_costs = if trace { Some(std::time::Instant::now()) } else { None };
+    mem_trace("03 after content_costs");
 
     // STEGO.A.10 fix — apply cascade-safety MSL gate as ∞-cost in
     // STC's input (not as override-map filter). Unsafe MvdSuffixLsb
@@ -480,6 +513,14 @@ pub fn h264_encode_gop_framed_bits(
 
     let (combined_cover, combined_costs, boundaries) =
         combine_cover_4domain(&baseline_walk.cover, &content_costs, weights);
+    if let Some(t) = t_after_costs {
+        eprintln!(
+            "[PHASM_PERF_TRACE]   ├─ safety+tier+combine     {:>8.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let t_before_stc = if trace { Some(std::time::Instant::now()) } else { None };
+    mem_trace("04 after combine");
     let n_cover = combined_cover.len();
     if n_cover == 0 {
         return Err(StegoError::InvalidVideo(
@@ -498,7 +539,14 @@ pub fn h264_encode_gop_framed_bits(
     let hhat = generate_hhat(STC_H, w, hhat_seed);
     let plan = stc_embed(&cover_slice, &cost_slice, frame_bits, &hhat, STC_H, w)
         .ok_or(StegoError::MessageTooLarge)?;
+    if let Some(t) = t_before_stc {
+        eprintln!(
+            "[PHASM_PERF_TRACE]   └─ stc_embed(Viterbi)      {:>8.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
     let dt_stc = t_stc.map(|t| t.elapsed());
+    mem_trace("05 after STC plan");
 
     // Extend STC result to full combined cover length (positions past
     // `used_cover` stay unchanged) so split_plan_4domain sees the
@@ -646,6 +694,7 @@ pub fn h264_encode_gop_framed_bits(
      * Pass-1-redo symmetry, closing the determinism gap. */
     set_549_pass_idx(0);
     let dt_pass2 = t_pass2.map(|t| t.elapsed());
+    mem_trace("06 after Pass2 (encode)");
 
     // #530 PROBE — verify encoder/walker symmetry on Pass-2 output.
     // For round-trip to work, walker on Pass-2 must recover

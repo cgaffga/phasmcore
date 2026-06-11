@@ -110,6 +110,36 @@ jobs:
           ls -d phasmcore/openh264-sys vendor/phasm-openh264/codec >/dev/null \
             && echo "layout: phasmcore/openh264-sys + vendor/phasm-openh264 ✓"
 
+      # The phasmcore mirror STRIPS `h264-encoder` + `core-openh264-sys` from
+      # Cargo.toml (crates.io / Via-LA AVC — the PUBLISHED crate ships NO H.264
+      # encoder). This determinism gate, however, must BUILD the encoder to
+      # hash its output. Re-add the encoder wiring to the CHECKED-OUT mirror
+      # ONLY — this clone is transient + never pushed back — so
+      # `--features h264-encoder` resolves against the openh264-sys subdir
+      # (present on the mirror) + the fork checked out as a sibling above.
+      # NO binary is shipped: the encoder is built transiently in the runner
+      # VM and erased by the post-run cleanup + the VM teardown. CI-only.
+      - name: Re-enable h264-encoder on the mirror checkout (CI-only, never pushed)
+        working-directory: phasmcore
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          if 'members = ["cli"]' in s:
+              s = s.replace('members = ["cli"]', 'members = ["cli", "openh264-sys"]', 1)
+          if "\nh264-encoder =" not in s:
+              s = s.replace('h264-decoder = ["video"]',
+                            'h264-decoder = ["video"]\nh264-encoder = ["h264-decoder", "parallel", "simd", "dep:core-openh264-sys"]', 1)
+          if "\ncore-openh264-sys =" not in s:
+              s = s.replace("[dependencies]\n",
+                            '[dependencies]\ncore-openh264-sys = { path = "openh264-sys", optional = true }\n', 1)
+          p.write_text(s)
+          PY
+          echo "--- re-enabled encoder wiring (CI-only) ---"
+          grep -nE 'members =|^h264-encoder =|^core-openh264-sys =' Cargo.toml
+
       # The actual test. cargo test --no-fail-fast keeps going if a
       # test fails (we want hashes from all matrix legs even if one
       # asserts). --nocapture prints the eprintln hash line into
