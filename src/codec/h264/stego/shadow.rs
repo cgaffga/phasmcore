@@ -71,7 +71,7 @@
 use super::{DomainCover, EmbedDomain};
 use super::PositionKey;
 use crate::stego::armor::ecc;
-use crate::stego::crypto::{self, NONCE_LEN, SALT_LEN};
+use crate::stego::crypto::{self};
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
@@ -90,6 +90,8 @@ use crate::stego::shadow_layer::{
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Locator for one shadow position inside a 4-domain `DomainCover`.
 /// Indexes the per-domain `bits[]` / `positions[]` / `costs[]`
@@ -195,6 +197,71 @@ fn peek_fdl_from_first_block(
     }
 }
 
+/// WV.6.g.5 — shared shadow-decode tail. Given the **priority-ordered** cover
+/// LSBs (one bit per `priority_slots` entry, in that ascending priority order)
+/// and the passphrase, bit-pack once and run the parity-tier × fdl
+/// peek/brute-force RS-decode search. Returns the recovered payload or
+/// [`StegoError::FrameCorrupted`].
+///
+/// This is the cover-shape-independent half of [`shadow_extract`]: the
+/// whole-clip extractor feeds it `bits[priority_slots(whole_cover)]`, and the
+/// WV.6.g.5 streaming verify feeds it the **emitted** clip's priority-ordered
+/// bits captured per-GOP (no whole-clip walk). Both must produce identical
+/// decode decisions — which holds because the decode depends only on the
+/// priority-ordered bit stream, not on how it was assembled.
+pub(crate) fn decode_shadow_from_priority_lsbs(
+    all_lsbs: &[u8],
+    passphrase: &str,
+) -> Result<PayloadData, StegoError> {
+    // Bit-pack the full LSB stream ONCE (not per parity tier nor per fdl
+    // candidate); try_single_fdl + peek slice into this buffer.
+    let max_rs_bytes = all_lsbs.len() / 8;
+    let all_rs_bytes = frame::bits_to_bytes(&all_lsbs[..max_rs_bytes * 8]);
+
+    for &parity_len in &SHADOW_PARITY_TIERS {
+        let k = 255usize.saturating_sub(parity_len);
+        // Need ≥4 bytes recovered from first RS block to read the
+        // u32 BE plaintext_len prefix. With k<4 the peek can't function;
+        // skip the tier (also unreachable for SHADOW_PARITY_TIERS — even
+        // parity=128 gives k=127).
+        if k < 4 {
+            continue;
+        }
+        let max_fdl = compute_max_shadow_fdl(max_rs_bytes, parity_len)
+            .min(MAX_SHADOW_FRAME_BYTES);
+        if SHADOW_FRAME_OVERHEAD > max_fdl {
+            continue;
+        }
+
+        // Peek path (works for fdl ≥ k, covers most real shadows
+        // including the >250-byte payloads that brute-force can't reach).
+        let peeked = peek_fdl_from_first_block(&all_rs_bytes, parity_len, max_fdl);
+        if let Some(fdl) = peeked
+            && let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase)
+        {
+            return result;
+        }
+
+        let small_max = (k - 1).min(max_fdl);
+        if SHADOW_FRAME_OVERHEAD > small_max {
+            continue;
+        }
+        for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
+            // Skip the peek-tried fdl in the brute-force fallback.
+            // If peek returned Some(fdl) and try_single_fdl rejected it,
+            // re-trying gains nothing.
+            if Some(fdl) == peeked {
+                continue;
+            }
+            if let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase) {
+                return result;
+            }
+        }
+    }
+
+    Err(StegoError::FrameCorrupted)
+}
+
 // ─── 4-domain helpers (cascade-equipped shadow) ──────────────────
 //
 // These are the production shadow path. They span all 4 bypass-bin
@@ -220,6 +287,51 @@ fn peek_fdl_from_first_block(
 /// (cover_p1 on encode, walker meta on decode), and the safe-set
 /// analysis is invariant under sign-flips and safe-set magnitude
 /// flips by construction.
+/// THE single source of truth for shadow-eligible cover positions + their
+/// iteration order. Invokes `f(domain, intra_index, key)` for every eligible
+/// position in the canonical domain order:
+///   CoeffSignBypass (all — sign-only, no cascade),
+///   CoeffSuffixLsb (cascade-aware `safe_csl` filter; `None` ⇒ all),
+///   MvdSignBypass (all — sign-only bitstream-mod override),
+///   MvdSuffixLsb (ONLY when `safe_msl` is `Some`, filtered by it).
+/// `intra_index` is the position's index within its domain's `positions[]`
+/// (the same `enumerate()` index everywhere). [`priority_slots`], the
+/// streaming verify (`streaming_shadow_verify`), and the streaming decoder
+/// (`StreamingDecodeSession::try_shadow_streaming`) all route through this so
+/// their priority order can NEVER diverge — a divergence would silently break
+/// shadow decode. (`sweep_b_emit`'s selection loop must mirror the same rule;
+/// it stays inline only because its iteration is interleaved with STC cost
+/// gating.)
+pub(crate) fn for_each_eligible_position(
+    cover: &DomainCover,
+    safe_csl: Option<&[bool]>,
+    safe_msl: Option<&[bool]>,
+    mut f: impl FnMut(EmbedDomain, usize, &PositionKey),
+) {
+    for (intra_index, key) in cover.coeff_sign_bypass.positions.iter().enumerate() {
+        f(EmbedDomain::CoeffSignBypass, intra_index, key);
+    }
+    for (intra_index, key) in cover.coeff_suffix_lsb.positions.iter().enumerate() {
+        if let Some(mask) = safe_csl
+            && (intra_index >= mask.len() || !mask[intra_index])
+        {
+            continue;
+        }
+        f(EmbedDomain::CoeffSuffixLsb, intra_index, key);
+    }
+    for (intra_index, key) in cover.mvd_sign_bypass.positions.iter().enumerate() {
+        f(EmbedDomain::MvdSignBypass, intra_index, key);
+    }
+    if let Some(mask) = safe_msl {
+        for (intra_index, key) in cover.mvd_suffix_lsb.positions.iter().enumerate() {
+            if intra_index >= mask.len() || !mask[intra_index] {
+                continue;
+            }
+            f(EmbedDomain::MvdSuffixLsb, intra_index, key);
+        }
+    }
+}
+
 pub(super) fn priority_slots(
     cover: &DomainCover,
     perm_seed: &[u8; 32],
@@ -227,72 +339,252 @@ pub(super) fn priority_slots(
     safe_msl: Option<&[bool]>,
 ) -> Vec<ShadowSlot> {
     let mut rng = ChaCha20Rng::from_seed(*perm_seed);
-    let msl_count = safe_msl
-        .map(|m| m.iter().filter(|&&b| b).count())
-        .unwrap_or(0);
-    let csl_count = match safe_csl {
-        Some(m) => m.iter().filter(|&&b| b).count(),
-        None => cover.coeff_suffix_lsb.len(),
-    };
-    let mut slots = Vec::with_capacity(
-        cover.coeff_sign_bypass.len() + csl_count + cover.mvd_sign_bypass.len() + msl_count,
-    );
-
-    // CoeffSignBypass — always injectable (sign-only, no cascade).
-    for (intra_index, key) in cover.coeff_sign_bypass.positions.iter().enumerate() {
+    let mut slots = Vec::new();
+    for_each_eligible_position(cover, safe_csl, safe_msl, |domain, intra_index, key| {
         rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-        slots.push(ShadowSlot {
-            domain: EmbedDomain::CoeffSignBypass,
-            intra_index,
-            priority: rng.next_u32(),
-        });
-    }
-
-    // CoeffSuffixLsb — optional |coeff|≥17 filter (cascade-aware
-    // when `safe_csl` supplied; otherwise include all).
-    for (intra_index, key) in cover.coeff_suffix_lsb.positions.iter().enumerate() {
-        if let Some(mask) = safe_csl
-            && (intra_index >= mask.len() || !mask[intra_index])
-        {
-            continue;
-        }
-        rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-        slots.push(ShadowSlot {
-            domain: EmbedDomain::CoeffSuffixLsb,
-            intra_index,
-            priority: rng.next_u32(),
-        });
-    }
-
-    // MvdSignBypass — always injectable (sign-only bitstream-mod
-    // override; doesn't mutate slot.value).
-    for (intra_index, key) in cover.mvd_sign_bypass.positions.iter().enumerate() {
-        rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-        slots.push(ShadowSlot {
-            domain: EmbedDomain::MvdSignBypass,
-            intra_index,
-            priority: rng.next_u32(),
-        });
-    }
-
-    // MvdSuffixLsb — ONLY when safe_msl supplied. Default-without-
-    // mask: skip the domain entirely.
-    if let Some(mask) = safe_msl {
-        for (intra_index, key) in cover.mvd_suffix_lsb.positions.iter().enumerate() {
-            if intra_index >= mask.len() || !mask[intra_index] {
-                continue;
-            }
-            rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-            slots.push(ShadowSlot {
-                domain: EmbedDomain::MvdSuffixLsb,
-                intra_index,
-                priority: rng.next_u32(),
-            });
-        }
-    }
-
+        slots.push(ShadowSlot { domain, intra_index, priority: rng.next_u32() });
+    });
     slots.sort_by_key(|s| s.priority);
     slots
+}
+
+/// One retained slot inside [`StreamingTopN`], ordered by the
+/// `priority_slots` total order: `(priority, domain as u8,
+/// intra_index)` ascending. `BinaryHeap` is a *max*-heap, so the
+/// natural `Ord` below makes it evict the largest tuple — retaining
+/// the smallest `capacity`, which is exactly the top-N
+/// `priority_slots` keeps after its ascending sort.
+///
+/// The full tuple is unique across all cover positions (`domain` +
+/// `intra_index` identify the position; only `priority` can collide),
+/// so the order is *strict* — there are no genuine ties to resolve,
+/// and the retained set is independent of push order.
+// `dead_code` until WV.6.g.4 wires the streaming cover into the
+// encode path; covered now by the equivalence tests below.
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TopNEntry {
+    priority: u32,
+    domain_rank: u8,
+    intra_index: usize,
+    domain: EmbedDomain,
+}
+
+impl Ord for TopNEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (self.priority, self.domain_rank, self.intra_index).cmp(&(
+            other.priority,
+            other.domain_rank,
+            other.intra_index,
+        ))
+    }
+}
+impl PartialOrd for TopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Streaming top-N shadow position selector — the O(N)-memory
+/// equivalent of `priority_slots(..)[..n]`, for the WV.6.g streaming
+/// shadow path (no whole-clip `Vec<ShadowSlot>` materialised).
+///
+/// `priority_slots` builds the *entire* slot vector (one entry per
+/// eligible cover position across all 4 domains), sorts it by
+/// `(priority, domain, intra_index)`, and the caller keeps the first
+/// `n`. At long-clip scale that vector is itself O(clip). This
+/// selector keeps only the `n` lowest-priority slots seen so far in a
+/// bounded max-heap: push every eligible `(domain, intra_index, key)`
+/// in any order; once the heap exceeds `n`, the current maximum is
+/// evicted. [`StreamingTopN::into_sorted`] then emits exactly the
+/// same `n` slots, in the same order, that `priority_slots(..)[..n]`
+/// would.
+///
+/// **Bit-identical to `priority_slots`** because the priority of a
+/// position is `ChaCha20(perm_seed).seek(key.raw()*2).next_u32()` —
+/// position-local and order-independent — and the total order's
+/// tie-break `(domain as u8, intra_index)` exactly reproduces
+/// `priority_slots`' stable-sort insertion order (CSB < CSL < MSB <
+/// MSL, intra ascending). The caller is responsible for offering the
+/// same eligible set: apply the `safe_csl` / `safe_msl` filters and
+/// the "MvdSuffixLsb only when masked" rule that `priority_slots`
+/// applies internally, and pass each position's `enumerate()` index
+/// within its domain as `intra_index`.
+// `dead_code` until WV.6.g.4 wires this into the streaming encode
+// path (g.2 ships the primitive + its equivalence gate first).
+#[allow(dead_code)]
+pub(crate) struct StreamingTopN {
+    rng: ChaCha20Rng,
+    capacity: usize,
+    heap: BinaryHeap<TopNEntry>,
+}
+
+#[allow(dead_code)] // see StreamingTopN: methods wired in WV.6.g.4
+impl StreamingTopN {
+    pub(crate) fn new(perm_seed: &[u8; 32], capacity: usize) -> Self {
+        Self {
+            rng: ChaCha20Rng::from_seed(*perm_seed),
+            capacity,
+            heap: BinaryHeap::with_capacity(capacity.saturating_add(1)),
+        }
+    }
+
+    /// Offer one eligible cover position. `intra_index` is the
+    /// position's index within its domain's `positions[]` vector (the
+    /// same `enumerate()` index `priority_slots` uses); `key` is its
+    /// [`PositionKey`]. Computes the position-local priority and
+    /// retains the entry iff it ranks within the current top-`capacity`.
+    pub(crate) fn push(&mut self, domain: EmbedDomain, intra_index: usize, key: PositionKey) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+        let entry = TopNEntry {
+            priority: self.rng.next_u32(),
+            domain_rank: domain as u8,
+            intra_index,
+            domain,
+        };
+        if self.heap.len() < self.capacity {
+            self.heap.push(entry);
+        } else if let Some(&max) = self.heap.peek() {
+            // Heap full: evict the current max iff this entry ranks
+            // strictly lower. The tuple is unique so `<` is a strict
+            // total order — no tie can flip the retained set.
+            if entry < max {
+                self.heap.pop();
+                self.heap.push(entry);
+            }
+        }
+    }
+
+    /// Drain into the final `Vec<ShadowSlot>`, ascending in the
+    /// `priority_slots` total order — bit-identical to
+    /// `priority_slots(..)[..min(capacity, eligible)]` over the same
+    /// eligible set.
+    pub(crate) fn into_sorted(self) -> Vec<ShadowSlot> {
+        self.heap
+            .into_sorted_vec() // ascending by `TopNEntry: Ord`
+            .into_iter()
+            .map(|e| ShadowSlot {
+                domain: e.domain,
+                intra_index: e.intra_index,
+                priority: e.priority,
+            })
+            .collect()
+    }
+}
+
+/// One retained slot inside [`ShadowBitTopN`] — same `(priority, domain_rank,
+/// intra_index)` total order as [`TopNEntry`], plus the cover **bit** at that
+/// position riding along as payload. Ord/Eq deliberately ignore `bit` (it is
+/// not part of the position identity), so the heap eviction keeps the same
+/// top-N positions [`StreamingTopN`] would.
+// `dead_code` until WV.6.g.5c wires the streaming verify; covered now by the
+// bit-equivalence gates below.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct BitTopNEntry {
+    priority: u32,
+    domain_rank: u8,
+    intra_index: usize,
+    bit: u8,
+}
+impl BitTopNEntry {
+    #[inline]
+    fn order_key(&self) -> (u32, u8, usize) {
+        (self.priority, self.domain_rank, self.intra_index)
+    }
+}
+impl PartialEq for BitTopNEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_key() == other.order_key()
+    }
+}
+impl Eq for BitTopNEntry {}
+impl Ord for BitTopNEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order_key().cmp(&other.order_key())
+    }
+}
+impl PartialOrd for BitTopNEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// WV.6.g.5 — bit-carrying twin of [`StreamingTopN`] for the streaming verify.
+///
+/// The per-tier verify must recover, from the **emitted** clip, the same
+/// priority-ordered LSB stream the whole-clip `shadow_extract` reads — without
+/// re-walking the whole clip. This selector is fed the emitted cover's eligible
+/// positions one GOP at a time (each with its emitted bit), keeps the top
+/// `capacity` by the identical `priority_slots` total order as `StreamingTopN`,
+/// and [`into_sorted_bits`](Self::into_sorted_bits) drains the retained **bits**
+/// in ascending priority order.
+///
+/// Result is bit-identical to `bits[priority_slots(emitted_cover, seed, None,
+/// safe_msl)[..min(capacity, eligible)]]` — i.e. exactly the prefix of
+/// `all_lsbs` that [`decode_shadow_from_priority_lsbs`] consumes. `capacity` is
+/// the shadow's `n_total` at the largest parity tier (≥ every cascade tier's
+/// frame length), so the retained bits cover the embedded frame at any tier.
+#[allow(dead_code)] // see BitTopNEntry: wired into the verify in WV.6.g.5c
+pub(crate) struct ShadowBitTopN {
+    rng: ChaCha20Rng,
+    capacity: usize,
+    heap: BinaryHeap<BitTopNEntry>,
+}
+
+#[allow(dead_code)] // see BitTopNEntry: wired into the verify in WV.6.g.5c
+impl ShadowBitTopN {
+    pub(crate) fn new(perm_seed: &[u8; 32], capacity: usize) -> Self {
+        Self {
+            rng: ChaCha20Rng::from_seed(*perm_seed),
+            capacity,
+            heap: BinaryHeap::with_capacity(capacity.saturating_add(1)),
+        }
+    }
+
+    /// Offer one eligible emitted position with its cover `bit`. Same
+    /// position-local priority + top-`capacity` retention as
+    /// [`StreamingTopN::push`]; the caller applies the identical per-domain
+    /// eligibility filters `priority_slots` applies internally.
+    pub(crate) fn push(
+        &mut self,
+        domain: EmbedDomain,
+        intra_index: usize,
+        key: PositionKey,
+        bit: u8,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+        let entry = BitTopNEntry {
+            priority: self.rng.next_u32(),
+            domain_rank: domain as u8,
+            intra_index,
+            bit,
+        };
+        if self.heap.len() < self.capacity {
+            self.heap.push(entry);
+        } else if let Some(&max) = self.heap.peek() {
+            if entry < max {
+                self.heap.pop();
+                self.heap.push(entry);
+            }
+        }
+    }
+
+    /// Drain the retained bits in ascending `priority_slots` order — the
+    /// `all_lsbs` prefix for [`decode_shadow_from_priority_lsbs`].
+    pub(crate) fn into_sorted_bits(self) -> Vec<u8> {
+        self.heap
+            .into_sorted_vec() // ascending by `BitTopNEntry: Ord`
+            .into_iter()
+            .map(|e| e.bit)
+            .collect()
+    }
 }
 
 /// 4-domain shadow preparation with optional per-domain
@@ -303,6 +595,31 @@ pub(super) fn priority_slots(
 /// The masks must be aligned with `cover.coeff_suffix_lsb.positions`
 /// and `cover.mvd_suffix_lsb.positions` respectively. Mask shorter
 /// than the position vector → trailing positions treated as unsafe.
+/// WV.6.g.4.2b — the cover-INDEPENDENT half of [`prepare_shadow`]: build the
+/// shadow's RS-encoded frame (the bits to embed) for a parity tier, decoupled
+/// from cover selection. Returns `(rs_bits, frame_data_len)`; `n_total =
+/// rs_bits.len()`. The streaming Sweep B pairs these bits with the
+/// `StreamingTopN` selection (the cover-side half) instead of re-running
+/// `priority_slots` — which needs the whole cover it no longer holds.
+///
+/// Length is deterministic (Brotli + AES-GCM-SIV add fixed-length overhead), so
+/// `n_total` is the same across runs; only the ciphertext bytes vary with the
+/// random salt+nonce (pinned under `PHASM_DETERMINISTIC_SEED`).
+pub fn build_shadow_rs_frame(
+    shadow_pass: &str,
+    message: &str,
+    files: &[FileEntry],
+    parity_len: usize,
+) -> Result<(Vec<u8>, usize), StegoError> {
+    let payload_bytes = payload::encode_payload(message, files)?;
+    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
+    let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
+    let frame_data_len = frame_bytes.len();
+    let rs_bytes = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity_len);
+    let rs_bits = frame::bytes_to_bits(&rs_bytes);
+    Ok((rs_bits, frame_data_len))
+}
+
 pub fn prepare_shadow(
     cover: &DomainCover,
     shadow_pass: &str,
@@ -312,13 +629,8 @@ pub fn prepare_shadow(
     safe_csl: Option<&[bool]>,
     safe_msl: Option<&[bool]>,
 ) -> Result<ShadowState, StegoError> {
-    let payload_bytes = payload::encode_payload(message, files)?;
-    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
-    let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
-    let frame_data_len = frame_bytes.len();
-
-    let rs_bytes = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity_len);
-    let rs_bits = frame::bytes_to_bits(&rs_bytes);
+    let (rs_bits, frame_data_len) =
+        build_shadow_rs_frame(shadow_pass, message, files, parity_len)?;
     let n_total = rs_bits.len();
 
     let perm_seed = crypto::derive_shadow_structural_key(shadow_pass)?;
@@ -573,58 +885,8 @@ pub fn shadow_extract(
         })
         .collect();
 
-    // Bit-pack the full LSB stream ONCE (not per parity tier
-    // nor per fdl candidate); try_single_fdl + peek slice into this buffer.
-    let max_rs_bytes = all_lsbs.len() / 8;
-    let all_rs_bytes = frame::bits_to_bytes(&all_lsbs[..max_rs_bytes * 8]);
-
-    for &parity_len in &SHADOW_PARITY_TIERS {
-        let k = 255usize.saturating_sub(parity_len);
-        // Need ≥4 bytes recovered from first RS block to read the
-        // u32 BE plaintext_len prefix. With k<4 the peek can't function;
-        // skip the tier (also unreachable for SHADOW_PARITY_TIERS — even
-        // parity=128 gives k=127).
-        if k < 4 {
-            continue;
-        }
-        let max_fdl = compute_max_shadow_fdl(max_rs_bytes, parity_len)
-            .min(MAX_SHADOW_FRAME_BYTES);
-        if SHADOW_FRAME_OVERHEAD > max_fdl {
-            continue;
-        }
-
-        // Peek path (works for fdl ≥ k, covers most real shadows
-        // including the >250-byte payloads that brute-force can't reach).
-        let peeked = peek_fdl_from_first_block(&all_rs_bytes, parity_len, max_fdl);
-        if let Some(fdl) = peeked
-            && let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase)
-        {
-            return result;
-        }
-
-        let small_max = (k - 1).min(max_fdl);
-        if SHADOW_FRAME_OVERHEAD > small_max {
-            continue;
-        }
-        for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
-            // Skip the peek-tried fdl in the brute-force fallback.
-            // If peek returned Some(fdl) and try_single_fdl rejected it,
-            // re-trying gains nothing.
-            if Some(fdl) == peeked {
-                continue;
-            }
-            if let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase) {
-                return result;
-            }
-        }
-    }
-
-    Err(StegoError::FrameCorrupted)
-}
-
-#[allow(dead_code)]
-fn _unused_imports_guard() -> usize {
-    NONCE_LEN + SALT_LEN
+    // WV.6.g.5 — the decode tail is shared with the streaming verify.
+    decode_shadow_from_priority_lsbs(&all_lsbs, passphrase)
 }
 
 #[cfg(test)]
@@ -633,4 +895,207 @@ mod tests {
     // wrapper tests were retired alongside the dead functions they
     // exercised. The live `_safe` / `_all4`-mutator shadow paths are
     // covered by integration tests in the H.264 stego test suite.
+
+    use super::*;
+    use crate::codec::h264::stego::hook::{BinKind, SyntaxPath};
+
+    // ─── WV.6.g.2 — StreamingTopN ≡ priority_slots(..)[..n] ───────
+    //
+    // The streaming shadow selector must pick BIT-IDENTICALLY to the
+    // whole-clip `priority_slots(..)[..n]` it replaces — otherwise the
+    // streaming path would place shadow bits at different cover
+    // positions and existing stego files would stop decoding. These
+    // tests prove the equivalence (and its push-order independence)
+    // over a synthetic 4-domain cover with distinct keys per position.
+
+    /// Distinct `PositionKey` per `(domain, i)` so every position gets
+    /// its own `raw()` (hence its own ChaCha20 priority draw).
+    fn pos_key(domain: EmbedDomain, i: usize) -> PositionKey {
+        PositionKey::new(
+            (i as u32) & 0xFFFF,
+            (i as u32).wrapping_mul(7).wrapping_add(1),
+            domain,
+            SyntaxPath::Luma4x4 {
+                block_idx: (i % 16) as u8,
+                coeff_idx: (i % 16) as u8,
+                kind: BinKind::Sign,
+            },
+        )
+    }
+
+    /// 4-domain cover with `k` positions in each domain.
+    fn build_cover(k: usize) -> DomainCover {
+        let mut c = DomainCover::default();
+        for i in 0..k {
+            c.coeff_sign_bypass.push(0, pos_key(EmbedDomain::CoeffSignBypass, i));
+            c.coeff_suffix_lsb.push(0, pos_key(EmbedDomain::CoeffSuffixLsb, i));
+            c.mvd_sign_bypass.push(0, pos_key(EmbedDomain::MvdSignBypass, i));
+            c.mvd_suffix_lsb.push(0, pos_key(EmbedDomain::MvdSuffixLsb, i));
+        }
+        c
+    }
+
+    fn assert_slots_eq(got: &[ShadowSlot], want: &[ShadowSlot]) {
+        assert_eq!(got.len(), want.len(), "slot count mismatch");
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.domain, w.domain, "domain mismatch at rank {i}");
+            assert_eq!(g.intra_index, w.intra_index, "intra_index mismatch at rank {i}");
+            assert_eq!(g.priority, w.priority, "priority mismatch at rank {i}");
+        }
+    }
+
+    #[test]
+    fn streaming_topn_matches_priority_slots_no_mask() {
+        let cover = build_cover(64);
+        let seed = [0x5Au8; 32];
+        // No masks ⇒ CSB + CSL(all) + MSB, MvdSuffixLsb EXCLUDED.
+        let full = priority_slots(&cover, &seed, None, None);
+        let n = 40usize;
+        let want = &full[..n];
+
+        let mut sel = StreamingTopN::new(&seed, n);
+        // Offer the SAME eligible set in an order UNRELATED to
+        // priority_slots' insertion order (intra descending,
+        // domains interleaved) to prove order-independence. No MSL.
+        for i in (0..64).rev() {
+            sel.push(EmbedDomain::MvdSignBypass, i, cover.mvd_sign_bypass.positions[i]);
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i]);
+            sel.push(EmbedDomain::CoeffSuffixLsb, i, cover.coeff_suffix_lsb.positions[i]);
+        }
+        assert_slots_eq(&sel.into_sorted(), want);
+    }
+
+    #[test]
+    fn streaming_topn_matches_priority_slots_with_masks() {
+        // The d.6 cascade-safe path: CSL filtered by |coeff|≥17 and
+        // MvdSuffixLsb included only where derive_msl_safe says so.
+        let cover = build_cover(50);
+        let seed = [0xC3u8; 32];
+        let safe_csl: Vec<bool> = (0..50).map(|i| i % 3 != 0).collect();
+        let safe_msl: Vec<bool> = (0..50).map(|i| i % 2 == 1).collect();
+        let full = priority_slots(&cover, &seed, Some(&safe_csl), Some(&safe_msl));
+        let n = full.len() / 2;
+        let want = &full[..n];
+
+        let mut sel = StreamingTopN::new(&seed, n);
+        // Caller applies the same per-domain filters priority_slots
+        // applies internally, and offers each position's enumerate()
+        // index as intra_index.
+        for i in 0..50 {
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i]);
+            if safe_csl[i] {
+                sel.push(EmbedDomain::CoeffSuffixLsb, i, cover.coeff_suffix_lsb.positions[i]);
+            }
+            sel.push(EmbedDomain::MvdSignBypass, i, cover.mvd_sign_bypass.positions[i]);
+            if safe_msl[i] {
+                sel.push(EmbedDomain::MvdSuffixLsb, i, cover.mvd_suffix_lsb.positions[i]);
+            }
+        }
+        assert_slots_eq(&sel.into_sorted(), want);
+    }
+
+    #[test]
+    fn streaming_topn_capacity_exceeds_eligible_returns_all_sorted() {
+        let cover = build_cover(8);
+        let seed = [0x11u8; 32];
+        let full = priority_slots(&cover, &seed, None, None); // 24 slots
+        let n = 1000usize; // >> eligible
+        let want = &full[..full.len().min(n)];
+
+        let mut sel = StreamingTopN::new(&seed, n);
+        for i in 0..8 {
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i]);
+            sel.push(EmbedDomain::CoeffSuffixLsb, i, cover.coeff_suffix_lsb.positions[i]);
+            sel.push(EmbedDomain::MvdSignBypass, i, cover.mvd_sign_bypass.positions[i]);
+        }
+        assert_slots_eq(&sel.into_sorted(), want);
+    }
+
+    #[test]
+    fn streaming_topn_zero_capacity_is_empty() {
+        let cover = build_cover(4);
+        let seed = [0u8; 32];
+        let mut sel = StreamingTopN::new(&seed, 0);
+        for i in 0..4 {
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i]);
+        }
+        assert!(sel.into_sorted().is_empty());
+    }
+
+    // ─── WV.6.g.5b — ShadowBitTopN bits ≡ priority_slots(..)[..n] bits ──
+    //
+    // The streaming verify reads the EMITTED clip's priority-ordered LSBs via
+    // ShadowBitTopN (per-GOP, bounded) instead of walking the whole clip. These
+    // prove the retained BITS equal what `shadow_extract` would read off
+    // `priority_slots(cover, seed, None, safe_msl)[..n]` — the `all_lsbs` prefix
+    // fed to `decode_shadow_from_priority_lsbs`.
+
+    /// 4-domain cover with a distinct per-(domain,i) bit pattern, so a
+    /// mis-selected position reads a different bit and the test fails.
+    fn build_cover_with_bits(k: usize) -> DomainCover {
+        let mut c = DomainCover::default();
+        for i in 0..k {
+            c.coeff_sign_bypass.push((i & 1) as u8, pos_key(EmbedDomain::CoeffSignBypass, i));
+            c.coeff_suffix_lsb.push(((i ^ 7) & 1) as u8, pos_key(EmbedDomain::CoeffSuffixLsb, i));
+            c.mvd_sign_bypass.push(((i ^ 13) & 1) as u8, pos_key(EmbedDomain::MvdSignBypass, i));
+            c.mvd_suffix_lsb.push(((i ^ 21) & 1) as u8, pos_key(EmbedDomain::MvdSuffixLsb, i));
+        }
+        c
+    }
+
+    /// The reference `all_lsbs` prefix: bits at `priority_slots(cover, seed,
+    /// None, safe_msl)[..n]` (safe_csl=None, matching the verify path).
+    fn ref_bits(cover: &DomainCover, seed: &[u8; 32], safe_msl: Option<&[bool]>, n: usize) -> Vec<u8> {
+        priority_slots(cover, seed, None, safe_msl)
+            .iter()
+            .take(n)
+            .map(|s| match s.domain {
+                EmbedDomain::CoeffSignBypass => cover.coeff_sign_bypass.bits[s.intra_index],
+                EmbedDomain::CoeffSuffixLsb => cover.coeff_suffix_lsb.bits[s.intra_index],
+                EmbedDomain::MvdSignBypass => cover.mvd_sign_bypass.bits[s.intra_index],
+                EmbedDomain::MvdSuffixLsb => cover.mvd_suffix_lsb.bits[s.intra_index],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shadow_bit_topn_matches_priority_slots_bits_no_mask() {
+        let cover = build_cover_with_bits(64);
+        let seed = [0x5Au8; 32];
+        let n = 40usize;
+        let want = ref_bits(&cover, &seed, None, n);
+
+        let mut sel = ShadowBitTopN::new(&seed, n);
+        // Push order UNRELATED to priority order (intra descending) to prove
+        // order-independence; MvdSuffixLsb excluded (no mask), matching ref.
+        for i in (0..64).rev() {
+            sel.push(EmbedDomain::MvdSignBypass, i, cover.mvd_sign_bypass.positions[i], cover.mvd_sign_bypass.bits[i]);
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i], cover.coeff_sign_bypass.bits[i]);
+            sel.push(EmbedDomain::CoeffSuffixLsb, i, cover.coeff_suffix_lsb.positions[i], cover.coeff_suffix_lsb.bits[i]);
+        }
+        assert_eq!(sel.into_sorted_bits(), want);
+    }
+
+    #[test]
+    fn shadow_bit_topn_matches_priority_slots_bits_with_msl_mask() {
+        // The d.6 cascade-safe path: MvdSuffixLsb included only where the mask
+        // says safe; safe_csl=None (CSL all-eligible), as the verify calls it.
+        let cover = build_cover_with_bits(50);
+        let seed = [0xC3u8; 32];
+        let safe_msl: Vec<bool> = (0..50).map(|i| i % 2 == 1).collect();
+        let full = priority_slots(&cover, &seed, None, Some(&safe_msl));
+        let n = full.len() / 2;
+        let want = ref_bits(&cover, &seed, Some(&safe_msl), n);
+
+        let mut sel = ShadowBitTopN::new(&seed, n);
+        for i in 0..50 {
+            sel.push(EmbedDomain::CoeffSignBypass, i, cover.coeff_sign_bypass.positions[i], cover.coeff_sign_bypass.bits[i]);
+            sel.push(EmbedDomain::CoeffSuffixLsb, i, cover.coeff_suffix_lsb.positions[i], cover.coeff_suffix_lsb.bits[i]);
+            sel.push(EmbedDomain::MvdSignBypass, i, cover.mvd_sign_bypass.positions[i], cover.mvd_sign_bypass.bits[i]);
+            if safe_msl[i] {
+                sel.push(EmbedDomain::MvdSuffixLsb, i, cover.mvd_suffix_lsb.positions[i], cover.mvd_suffix_lsb.bits[i]);
+            }
+        }
+        assert_eq!(sel.into_sorted_bits(), want);
+    }
 }

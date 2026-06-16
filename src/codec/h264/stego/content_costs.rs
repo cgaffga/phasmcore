@@ -180,108 +180,15 @@ pub fn compute_content_costs_yuv(
         let cr_offset = cb_offset + chroma_plane_size;
         let cr_plane = &yuv[cr_offset .. cr_offset + chroma_plane_size];
 
-        let tw = trace_cc.then(std::time::Instant::now);
-        let y_wavelets = compute_three_subbands(y_plane, width as usize, height as usize);
-        let cb_wavelets = compute_three_subbands(
-            cb_plane, (width / 2) as usize, (height / 2) as usize,
+        // WV.6.b.3: the per-frame wavelet + cost work is shared with the spill
+        // variant via `fill_frame_costs` (bit-identical — same arithmetic).
+        let dt = fill_frame_costs(
+            y_plane, cb_plane, cr_plane, bucket, cover, &field_table,
+            width as usize, height as usize, mb_width, &mut costs,
         );
-        let cr_wavelets = compute_three_subbands(
-            cr_plane, (width / 2) as usize, (height / 2) as usize,
-        );
-        if let Some(t) = tw {
-            t_wav += t.elapsed();
+        if trace_cc {
+            t_wav += dt;
         }
-
-        // Coefficient-domain positions: per-position wavelet cost.
-        // #perf 2026-06: this per-position loop is the cover-scaling serial
-        // bottleneck (~82% of content_costs on high-texture footage). Each
-        // position reads the frame's SHARED, read-only wavelets and writes a
-        // DISJOINT cost index, so parallelising over positions is
-        // bit-identical to the serial loop (per-position-deterministic
-        // values; each index written exactly once) AND memory-neutral: the
-        // wavelets are shared by reference, not duplicated, preserving the
-        // module's one-frame-at-a-time ~32 MB peak. (Cross-frame concurrency
-        // was rejected — see the module ## Memory note — because the wavelet
-        // already parallelises internally; this parallelises the loop the
-        // wavelet doesn't.)
-        let cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
-            let CoverSlot { domain, idx } = *slot;
-            let (positions, magnitudes) = match domain {
-                EmbedDomain::CoeffSignBypass => (
-                    &cover.coeff_sign_bypass.positions,
-                    &cover.coeff_sign_bypass.magnitudes,
-                ),
-                EmbedDomain::CoeffSuffixLsb => (
-                    &cover.coeff_suffix_lsb.positions,
-                    &cover.coeff_suffix_lsb.magnitudes,
-                ),
-                _ => return None,
-            };
-            let &key = positions.get(idx)?;
-            // `δ = 2·|coeff|` for Sign and `δ = 1` for SuffixLsb (the LSB
-            // flip changes magnitude by ±1). Magnitude 0 only for legacy
-            // `push(bit, pos)` call sites, which take the `δ = 2` fallback,
-            // so cost-function behaviour is unchanged.
-            let magnitude = magnitudes.get(idx).copied().unwrap_or(0);
-            let cost = coeff_position_cost(
-                key, magnitude, &field_table,
-                &y_wavelets, &cb_wavelets, &cr_wavelets,
-                width as usize, height as usize, mb_width,
-            );
-            Some((domain, idx, cost))
-        };
-        #[cfg(feature = "parallel")]
-        let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
-            bucket.coeff_positions.par_iter().filter_map(&cost_of).collect();
-        #[cfg(not(feature = "parallel"))]
-        let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
-            bucket.coeff_positions.iter().filter_map(&cost_of).collect();
-        for &(domain, idx, cost) in &coeff_contribs {
-            match domain {
-                EmbedDomain::CoeffSignBypass => costs.coeff_sign_bypass[idx] = cost,
-                EmbedDomain::CoeffSuffixLsb => costs.coeff_suffix_lsb[idx] = cost,
-                _ => {}
-            }
-        }
-
-        // MVD-domain positions: MB-aggregated wavelet cost. Parallelised
-        // over positions like the coeff loop above (#perf 2026-06): each
-        // position computes its MB texture directly from the frame's shared
-        // read-only wavelets and writes a DISJOINT index — bit-identical and
-        // memory-neutral. The previous per-MB texture cache is dropped:
-        // `mb_y_texture` is cheap, recomputing it for the few MVD positions
-        // that share an MB costs far less than the parallelism gain, and a
-        // shared cache would re-serialise the loop.
-        let mvd_cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
-            let CoverSlot { domain, idx } = *slot;
-            let positions = match domain {
-                EmbedDomain::MvdSignBypass => &cover.mvd_sign_bypass.positions,
-                EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.positions,
-                _ => return None,
-            };
-            let &key = positions.get(idx)?;
-            let mb_addr = key.mb_addr();
-            let mb_x = (mb_addr as usize) % mb_width;
-            let mb_y = (mb_addr as usize) / mb_width;
-            let texture =
-                mb_y_texture(&y_wavelets, mb_x, mb_y, width as usize, height as usize);
-            let cost = 1.0 / (texture + MVD_COST_SIGMA);
-            Some((domain, idx, cost))
-        };
-        #[cfg(feature = "parallel")]
-        let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
-            bucket.mvd_positions.par_iter().filter_map(&mvd_cost_of).collect();
-        #[cfg(not(feature = "parallel"))]
-        let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
-            bucket.mvd_positions.iter().filter_map(&mvd_cost_of).collect();
-        for &(domain, idx, cost) in &mvd_contribs {
-            match domain {
-                EmbedDomain::MvdSignBypass => costs.mvd_sign_bypass[idx] = cost,
-                EmbedDomain::MvdSuffixLsb => costs.mvd_suffix_lsb[idx] = cost,
-                _ => {}
-            }
-        }
-        // y/cb/cr wavelets drop here — next frame allocates fresh.
     }
 
     if trace_cc {
@@ -291,6 +198,122 @@ pub fn compute_content_costs_yuv(
         );
     }
     Ok(costs)
+}
+
+/// Per-frame wavelet decomposition + per-position cost evaluation for
+/// [`compute_content_costs_yuv`] (one frame's planes in, this frame's positions
+/// written into `costs` at their disjoint domain indices). Returns the time
+/// spent in the 3-subband decomposition (for PHASM_PERF_TRACE). Factored out so
+/// the WV.6.g per-GOP re-decode path can reuse the exact per-frame arithmetic.
+#[allow(clippy::too_many_arguments)]
+fn fill_frame_costs(
+    y_plane: &[u8],
+    cb_plane: &[u8],
+    cr_plane: &[u8],
+    bucket: &FrameBucket,
+    cover: &DomainCover,
+    field_table: &[DeltaField],
+    width: usize,
+    height: usize,
+    mb_width: usize,
+    costs: &mut DomainCosts,
+) -> std::time::Duration {
+    let tw = std::time::Instant::now();
+    let y_wavelets = compute_three_subbands(y_plane, width, height);
+    let cb_wavelets = compute_three_subbands(cb_plane, width / 2, height / 2);
+    let cr_wavelets = compute_three_subbands(cr_plane, width / 2, height / 2);
+    let wav_elapsed = tw.elapsed();
+
+    // Coefficient-domain positions: per-position wavelet cost.
+    // #perf 2026-06: this per-position loop is the cover-scaling serial
+    // bottleneck (~82% of content_costs on high-texture footage). Each
+    // position reads the frame's SHARED, read-only wavelets and writes a
+    // DISJOINT cost index, so parallelising over positions is
+    // bit-identical to the serial loop (per-position-deterministic
+    // values; each index written exactly once) AND memory-neutral: the
+    // wavelets are shared by reference, not duplicated, preserving the
+    // module's one-frame-at-a-time ~32 MB peak. (Cross-frame concurrency
+    // was rejected — see the module ## Memory note — because the wavelet
+    // already parallelises internally; this parallelises the loop the
+    // wavelet doesn't.)
+    let cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
+        let CoverSlot { domain, idx } = *slot;
+        let (positions, magnitudes) = match domain {
+            EmbedDomain::CoeffSignBypass => (
+                &cover.coeff_sign_bypass.positions,
+                &cover.coeff_sign_bypass.magnitudes,
+            ),
+            EmbedDomain::CoeffSuffixLsb => (
+                &cover.coeff_suffix_lsb.positions,
+                &cover.coeff_suffix_lsb.magnitudes,
+            ),
+            _ => return None,
+        };
+        let &key = positions.get(idx)?;
+        // `δ = 2·|coeff|` for Sign and `δ = 1` for SuffixLsb (the LSB
+        // flip changes magnitude by ±1). Magnitude 0 only for legacy
+        // `push(bit, pos)` call sites, which take the `δ = 2` fallback,
+        // so cost-function behaviour is unchanged.
+        let magnitude = magnitudes.get(idx).copied().unwrap_or(0);
+        let cost = coeff_position_cost(
+            key, magnitude, field_table,
+            &y_wavelets, &cb_wavelets, &cr_wavelets,
+            width, height, mb_width,
+        );
+        Some((domain, idx, cost))
+    };
+    #[cfg(feature = "parallel")]
+    let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
+        bucket.coeff_positions.par_iter().filter_map(&cost_of).collect();
+    #[cfg(not(feature = "parallel"))]
+    let coeff_contribs: Vec<(EmbedDomain, usize, f32)> =
+        bucket.coeff_positions.iter().filter_map(&cost_of).collect();
+    for &(domain, idx, cost) in &coeff_contribs {
+        match domain {
+            EmbedDomain::CoeffSignBypass => costs.coeff_sign_bypass[idx] = cost,
+            EmbedDomain::CoeffSuffixLsb => costs.coeff_suffix_lsb[idx] = cost,
+            _ => {}
+        }
+    }
+
+    // MVD-domain positions: MB-aggregated wavelet cost. Parallelised
+    // over positions like the coeff loop above (#perf 2026-06): each
+    // position computes its MB texture directly from the frame's shared
+    // read-only wavelets and writes a DISJOINT index — bit-identical and
+    // memory-neutral. The previous per-MB texture cache is dropped:
+    // `mb_y_texture` is cheap, recomputing it for the few MVD positions
+    // that share an MB costs far less than the parallelism gain, and a
+    // shared cache would re-serialise the loop.
+    let mvd_cost_of = |slot: &CoverSlot| -> Option<(EmbedDomain, usize, f32)> {
+        let CoverSlot { domain, idx } = *slot;
+        let positions = match domain {
+            EmbedDomain::MvdSignBypass => &cover.mvd_sign_bypass.positions,
+            EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.positions,
+            _ => return None,
+        };
+        let &key = positions.get(idx)?;
+        let mb_addr = key.mb_addr();
+        let mb_x = (mb_addr as usize) % mb_width;
+        let mb_y = (mb_addr as usize) / mb_width;
+        let texture = mb_y_texture(&y_wavelets, mb_x, mb_y, width, height);
+        let cost = 1.0 / (texture + MVD_COST_SIGMA);
+        Some((domain, idx, cost))
+    };
+    #[cfg(feature = "parallel")]
+    let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
+        bucket.mvd_positions.par_iter().filter_map(&mvd_cost_of).collect();
+    #[cfg(not(feature = "parallel"))]
+    let mvd_contribs: Vec<(EmbedDomain, usize, f32)> =
+        bucket.mvd_positions.iter().filter_map(&mvd_cost_of).collect();
+    for &(domain, idx, cost) in &mvd_contribs {
+        match domain {
+            EmbedDomain::MvdSignBypass => costs.mvd_sign_bypass[idx] = cost,
+            EmbedDomain::MvdSuffixLsb => costs.mvd_suffix_lsb[idx] = cost,
+            _ => {}
+        }
+    }
+
+    wav_elapsed
 }
 
 /// Per-frame work bucket: indices into the original `DomainCover` for

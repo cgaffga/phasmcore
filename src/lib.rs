@@ -101,21 +101,51 @@ pub use codec::h264::stego::gop_pattern::{FrameType, GopPattern};
 #[cfg(feature = "h264-decoder")]
 pub use codec::h264::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM as CASCADE_DEFAULT_HEADROOM};
 
+// AV1 streaming sessions + capacity. Mirror of the H.264 streaming
+// surface above.
+//
+// Re-exports require `av1-encoder` (which also implies `av1-decoder` at
+// the CLI / bridge feature layer). The `av1-decoder`-only configuration
+// would naturally re-export the decode session alone, but
+// `codec::av1::stego::session` currently has unconditional
+// `phasm_rav1e::*` use statements at module top — so the av1-decoder-only
+// build is broken upstream regardless of these re-exports. Tracked as
+// follow-on; in practice CLI builds always pair encoder + decoder, like
+// the H.264 surface above.
+#[cfg(feature = "av1-encoder")]
+pub use codec::av1::stego::session::{
+    Av1ShadowSpec, Av1StreamingDecodeSession, Av1StreamingEncodeParams,
+    Av1StreamingEncodeSession,
+};
+#[cfg(feature = "av1-encoder")]
+pub use codec::av1::stego::capacity::{
+    av1_capacity, av1_shadow_capacity, Av1CapacityInfo, Av1PerDomainBits,
+    Av1ShadowCapacityInfo, Av1StreamingProbeSession,
+};
+#[cfg(feature = "av1-encoder")]
+pub use codec::av1::stego::orchestrator::Av1StegoError;
+
 /// Detected video codec inside an MP4 container.
 ///
-/// The `Hevc` variant is still reported even though the HEVC pipeline was
-/// removed — detection only needs MP4-level codec bytes, not a full HEVC
-/// parser. Callers should check for `VideoCodec::H264` as the only
-/// supported stego target.
+/// `Hevc` is still reported even though the HEVC pipeline was removed —
+/// detection only needs MP4-level codec bytes, not a full parser. Callers
+/// dispatch on `H264` (OpenH264 streaming session) or `Av1`
+/// (Av1StreamingDecodeSession); `Hevc` / `Unknown` should be surfaced as
+/// "not a phasm stego" to the user.
 #[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoCodec {
-    /// H.264/AVC — uses CAVLC-based encoding (Baseline/Main CAVLC).
+    /// H.264/AVC — `avc1` / `avc3` sample entry.
     H264,
-    /// HEVC/H.265. Detected but not supported for stego — the HEVC pipeline
-    /// was removed (see docs/design/video/_RETIREMENT-PLAN.md).
+    /// HEVC/H.265 — `hev1` / `hvc1` sample entry. Detected but not
+    /// supported for stego (HEVC pipeline removed, see
+    /// docs/design/video/_RETIREMENT-PLAN.md).
     Hevc,
-    /// MP4 but no recognised H.264 or HEVC track.
+    /// AV1 — `av01` sample entry. Stego-supported via the
+    /// `Av1StreamingEncodeSession` / `Av1StreamingDecodeSession`
+    /// pipeline (phasm-rav1e encode + phasm-dav1d decode).
+    Av1,
+    /// MP4 but no recognised H.264 / HEVC / AV1 track.
     Unknown,
 }
 
@@ -137,6 +167,8 @@ pub fn detect_video_codec(mp4_bytes: &[u8]) -> VideoCodec {
         VideoCodec::H264
     } else if track.is_hevc() {
         VideoCodec::Hevc
+    } else if track.is_av1() {
+        VideoCodec::Av1
     } else {
         VideoCodec::Unknown
     }

@@ -12,8 +12,8 @@
 //! - Sample data from mdat
 
 use super::{
-    fourcc, iterate_boxes, parse_box_header, read_u16, read_u32, read_u64, AvccData, HvccData,
-    Mp4Error, Mp4File, Sample, Track,
+    fourcc, iterate_boxes, parse_box_header, read_u16, read_u32, read_u64, Av1cData, AvccData,
+    HvccData, Mp4Error, Mp4File, Sample, Track,
 };
 
 /// Parse an entire MP4 file into an [`Mp4File`] structure.
@@ -84,9 +84,12 @@ pub fn demux(data: &[u8]) -> Result<Mp4File, Mp4Error> {
     let moov_content_start = moov_start + moov_header.header_len as usize;
     let tracks = parse_moov(data, moov_content_start, moov_end)?;
 
-    // Find HEVC or H.264 video track
+    // Find the first recognised video track (H.264 / HEVC / AV1). AV1
+    // joined the dispatch when AV1.CLI0 added Track::is_av1 + Av1
+    // dispatch through detect_video_codec; the predicate was H.264 / HEVC
+    // before that.
     let video_track_idx = tracks.iter().position(|t| {
-        t.handler_type == *b"vide" && (t.is_hevc() || t.is_h264())
+        t.handler_type == *b"vide" && (t.is_hevc() || t.is_h264() || t.is_av1())
     });
 
     Ok(Mp4File {
@@ -130,7 +133,8 @@ fn parse_trak(
         duration: 0,
         samples: Vec::new(),
         hvcc_data: None,
-            avcc_data: None,
+        avcc_data: None,
+        av1c_data: None,
         stsd_raw: Vec::new(),
         trak_raw: trak_raw_data.to_vec(),
     };
@@ -313,11 +317,12 @@ fn parse_stsd(data: &[u8], start: usize, track: &mut Track) -> Result<(), Mp4Err
     // pre_defined(12) + width(2) + height(2) + horizresolution(4) +
     // vertresolution(4) + reserved(4) + frame_count(2) + compressorname(32) +
     // depth(2) + pre_defined(2) = 78 bytes after the box header.
-    // Children (hvcC/avcC, etc.) follow the fixed part.
+    // Children (hvcC/avcC/av1C, etc.) follow the fixed part.
     let is_video = track.codec == *b"hev1"
         || track.codec == *b"hvc1"
         || track.codec == *b"avc1"
-        || track.codec == *b"avc3";
+        || track.codec == *b"avc3"
+        || track.codec == *b"av01";
 
     if is_video {
         let children_start = entry_start + entry_header.header_len as usize + 78;
@@ -336,6 +341,9 @@ fn parse_stsd(data: &[u8], start: usize, track: &mut Track) -> Result<(), Mp4Err
                     track.hvcc_data = Some(parse_hvcc(data, cs)?);
                 } else if h.box_type == *b"avcC" {
                     track.avcc_data = Some(parse_avcc(data, cs)?);
+                } else if h.box_type == *b"av1C" {
+                    let payload_end = cs + h.size as usize - h.header_len as usize;
+                    track.av1c_data = parse_av1c(data, cs, payload_end);
                 }
                 Ok(())
             })?;
@@ -343,6 +351,47 @@ fn parse_stsd(data: &[u8], start: usize, track: &mut Track) -> Result<(), Mp4Err
     }
 
     Ok(())
+}
+
+/// Parse AV1CodecConfigurationRecord (`av1C` box payload).
+///
+/// Mirror of [`super::Av1cData::to_bytes`] serialization. Returns
+/// `None` on a payload too short to hold the 4-byte fixed header — the
+/// caller treats that as "no av1c on this track" rather than a hard
+/// error, matching the v1.0 stego CLI's best-effort posture.
+fn parse_av1c(data: &[u8], start: usize, end: usize) -> Option<Av1cData> {
+    if start + 4 > data.len() || start + 4 > end {
+        return None;
+    }
+    let b0 = data[start];
+    let b1 = data[start + 1];
+    let b2 = data[start + 2];
+    // b3 is reserved + initial_presentation_delay — not used here.
+    let configuration_version = b0 & 0x7F;
+    let seq_profile = (b1 >> 5) & 0x07;
+    let seq_level_idx_0 = b1 & 0x1F;
+    let seq_tier_0 = if (b2 & 0x80) != 0 { 1 } else { 0 };
+    let high_bitdepth = (b2 & 0x40) != 0;
+    let twelve_bit = (b2 & 0x20) != 0;
+    let monochrome = (b2 & 0x10) != 0;
+    let chroma_subsampling_x = (b2 & 0x08) != 0;
+    let chroma_subsampling_y = (b2 & 0x04) != 0;
+    let chroma_sample_position = b2 & 0x03;
+    let config_obus_end = end.min(data.len());
+    let config_obus = data[start + 4..config_obus_end].to_vec();
+    Some(Av1cData {
+        configuration_version,
+        seq_profile,
+        seq_level_idx_0,
+        seq_tier_0,
+        high_bitdepth,
+        twelve_bit,
+        monochrome,
+        chroma_subsampling_x,
+        chroma_subsampling_y,
+        chroma_sample_position,
+        config_obus,
+    })
 }
 
 /// Parse HEVCDecoderConfigurationRecord (hvcC box content).
@@ -1025,7 +1074,8 @@ fn build_recovered_mp4(
         duration: (samples.len() as u64) * 1000,
         samples,
         hvcc_data: Some(hvcc),
-            avcc_data: None,
+        avcc_data: None,
+        av1c_data: None,
         stsd_raw: Vec::new(),
         trak_raw: Vec::new(),
     };
@@ -1373,7 +1423,8 @@ fn parse_trak_metadata(
         duration: 0,
         samples: Vec::new(),
         hvcc_data: None,
-            avcc_data: None,
+        avcc_data: None,
+        av1c_data: None,
         stsd_raw: Vec::new(),
         trak_raw: trak_raw_data.to_vec(),
     };
@@ -1645,6 +1696,7 @@ mod tests {
             samples: Vec::new(),
             hvcc_data: None,
             avcc_data: None,
+            av1c_data: None,
             stsd_raw: Vec::new(),
             trak_raw: Vec::new(),
         };
@@ -1684,6 +1736,7 @@ mod tests {
             samples: Vec::new(),
             hvcc_data: None,
             avcc_data: None,
+            av1c_data: None,
             stsd_raw: Vec::new(),
             trak_raw: Vec::new(),
         };

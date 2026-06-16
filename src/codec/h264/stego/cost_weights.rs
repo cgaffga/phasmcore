@@ -226,10 +226,38 @@ pub fn combine_cover_4domain(
     costs: &DomainCosts,
     weights: &CostWeights,
 ) -> (Vec<u8>, Vec<f32>, DomainBoundaries) {
-    let n_cs = cover.coeff_sign_bypass.bits.len();
-    let n_csl = cover.coeff_suffix_lsb.bits.len();
-    let n_mvds = cover.mvd_sign_bypass.bits.len();
-    let n_mvdsl = cover.mvd_suffix_lsb.bits.len();
+    // Only the per-domain `bits` are combined (positions/magnitudes are never
+    // read here) — delegate to the bits-only core so the shadow cascade can
+    // combine over shadow-modified bits WITHOUT cloning the whole 11-byte/
+    // position `DomainCover` (§6.cover memory reduction).
+    combine_bits_4domain(
+        &cover.coeff_sign_bypass.bits,
+        &cover.coeff_suffix_lsb.bits,
+        &cover.mvd_sign_bypass.bits,
+        &cover.mvd_suffix_lsb.bits,
+        costs,
+        weights,
+    )
+}
+
+/// Bits-only core of [`combine_cover_4domain`]: pack the 4 domains'
+/// (already-extracted) cover bits into the canonical CS → CSL → MVDs → MVDsl
+/// order with per-domain cost weighting. Lets the shadow cascade build the
+/// combined STC input over shadow-embedded bits (cloned cheaply, 1 byte/pos)
+/// while sharing `cover_p1`'s positions/magnitudes (10 bytes/pos) by reference.
+/// Bit-identical to the `&DomainCover` path — same `push_domain`, same order.
+pub fn combine_bits_4domain(
+    coeff_sign_bits: &[u8],
+    coeff_suffix_bits: &[u8],
+    mvd_sign_bits: &[u8],
+    mvd_suffix_bits: &[u8],
+    costs: &DomainCosts,
+    weights: &CostWeights,
+) -> (Vec<u8>, Vec<f32>, DomainBoundaries) {
+    let n_cs = coeff_sign_bits.len();
+    let n_csl = coeff_suffix_bits.len();
+    let n_mvds = mvd_sign_bits.len();
+    let n_mvdsl = mvd_suffix_bits.len();
     let total = n_cs + n_csl + n_mvds + n_mvdsl;
 
     let mut bits = Vec::with_capacity(total);
@@ -237,27 +265,19 @@ pub fn combine_cover_4domain(
 
     push_domain(
         &mut bits, &mut weighted_costs,
-        &cover.coeff_sign_bypass.bits,
-        &costs.coeff_sign_bypass,
-        weights.coeff_sign,
+        coeff_sign_bits, &costs.coeff_sign_bypass, weights.coeff_sign,
     );
     push_domain(
         &mut bits, &mut weighted_costs,
-        &cover.coeff_suffix_lsb.bits,
-        &costs.coeff_suffix_lsb,
-        weights.coeff_suffix,
+        coeff_suffix_bits, &costs.coeff_suffix_lsb, weights.coeff_suffix,
     );
     push_domain(
         &mut bits, &mut weighted_costs,
-        &cover.mvd_sign_bypass.bits,
-        &costs.mvd_sign_bypass,
-        weights.mvd_sign,
+        mvd_sign_bits, &costs.mvd_sign_bypass, weights.mvd_sign,
     );
     push_domain(
         &mut bits, &mut weighted_costs,
-        &cover.mvd_suffix_lsb.bits,
-        &costs.mvd_suffix_lsb,
-        weights.mvd_suffix,
+        mvd_suffix_bits, &costs.mvd_suffix_lsb, weights.mvd_suffix,
     );
 
     debug_assert_eq!(bits.len(), total);

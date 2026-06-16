@@ -233,7 +233,10 @@ pub(crate) struct NShadowSetup {
 /// the retired pure-Rust `pass1_count_4domain`; it was dropped with the
 /// pure-Rust encoder.)
 pub(crate) fn validate_n_shadow_inputs<'a>(
-    yuv: &[u8],
+    // WV.6.b.3: the YUV is no longer materialised whole (it lives in a
+    // `YuvSpill`), so this takes the byte length instead of the buffer — the
+    // only thing it ever read from `yuv` was `yuv.len()` for the size check.
+    yuv_len: usize,
     width: u32,
     height: u32,
     n_frames: usize,
@@ -250,9 +253,9 @@ pub(crate) fn validate_n_shadow_inputs<'a>(
         )));
     }
     let frame_size = (width * height * 3 / 2) as usize;
-    if yuv.len() != frame_size * n_frames {
+    if yuv_len != frame_size * n_frames {
         return Err(StegoError::InvalidVideo(format!(
-            "yuv len {} != expected {}", yuv.len(), frame_size * n_frames
+            "yuv len {} != expected {}", yuv_len, frame_size * n_frames
         )));
     }
     if gop_size == 0 || gop_size > n_frames {
@@ -283,6 +286,10 @@ pub(crate) fn validate_n_shadow_inputs<'a>(
 /// master keys.
 pub(crate) struct NShadowPrimary {
     pub(crate) frame_bits: Vec<u8>,
+    /// The `build_frame` output bytes (`frame_bits` is just this expanded
+    /// MSB-first). WV.6.a chunks THESE into per-GOP `chunk_frame` v3
+    /// payloads; `total_bytes == frame_bytes.len()`.
+    pub(crate) frame_bytes: Vec<u8>,
     pub(crate) keys: CabacStegoMasterKeys,
     pub(crate) m_total: usize,
 }
@@ -304,5 +311,5 @@ pub(crate) fn prep_n_shadow_primary_payload(
         .collect();
     let keys = CabacStegoMasterKeys::derive(primary_passphrase)?;
     let m_total = frame_bits.len();
-    Ok(NShadowPrimary { frame_bits, keys, m_total })
+    Ok(NShadowPrimary { frame_bits, frame_bytes, keys, m_total })
 }

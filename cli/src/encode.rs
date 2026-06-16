@@ -32,39 +32,39 @@ pub struct EncodeArgs {
     #[arg(short = 'p')]
     pub passphrase: Option<String>,
 
-    // Shadow messages (m2..m9)
-    #[arg(long)] pub m2: Option<String>,
-    #[arg(long)] pub m3: Option<String>,
-    #[arg(long)] pub m4: Option<String>,
-    #[arg(long)] pub m5: Option<String>,
-    #[arg(long)] pub m6: Option<String>,
-    #[arg(long)] pub m7: Option<String>,
-    #[arg(long)] pub m8: Option<String>,
-    #[arg(long)] pub m9: Option<String>,
+    // Shadow messages (slots 2..9; primary message is `-m` above)
+    #[arg(long)] pub shadow_message_2: Option<String>,
+    #[arg(long)] pub shadow_message_3: Option<String>,
+    #[arg(long)] pub shadow_message_4: Option<String>,
+    #[arg(long)] pub shadow_message_5: Option<String>,
+    #[arg(long)] pub shadow_message_6: Option<String>,
+    #[arg(long)] pub shadow_message_7: Option<String>,
+    #[arg(long)] pub shadow_message_8: Option<String>,
+    #[arg(long)] pub shadow_message_9: Option<String>,
 
-    // Shadow passphrases (p2..p9)
-    #[arg(long)] pub p2: Option<String>,
-    #[arg(long)] pub p3: Option<String>,
-    #[arg(long)] pub p4: Option<String>,
-    #[arg(long)] pub p5: Option<String>,
-    #[arg(long)] pub p6: Option<String>,
-    #[arg(long)] pub p7: Option<String>,
-    #[arg(long)] pub p8: Option<String>,
-    #[arg(long)] pub p9: Option<String>,
+    // Shadow passphrases (slots 2..9; primary passphrase is `-p` above)
+    #[arg(long)] pub shadow_passphrase_2: Option<String>,
+    #[arg(long)] pub shadow_passphrase_3: Option<String>,
+    #[arg(long)] pub shadow_passphrase_4: Option<String>,
+    #[arg(long)] pub shadow_passphrase_5: Option<String>,
+    #[arg(long)] pub shadow_passphrase_6: Option<String>,
+    #[arg(long)] pub shadow_passphrase_7: Option<String>,
+    #[arg(long)] pub shadow_passphrase_8: Option<String>,
+    #[arg(long)] pub shadow_passphrase_9: Option<String>,
 
     /// File attachment for primary message (repeatable)
     #[arg(long, action = ArgAction::Append)]
     pub attach: Vec<PathBuf>,
 
-    // Shadow attachments (attach2..attach9)
-    #[arg(long, action = ArgAction::Append)] pub attach2: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach3: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach4: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach5: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach6: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach7: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach8: Vec<PathBuf>,
-    #[arg(long, action = ArgAction::Append)] pub attach9: Vec<PathBuf>,
+    // Shadow attachments (slots 2..9; repeatable per slot)
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_2: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_3: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_4: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_5: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_6: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_7: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_8: Vec<PathBuf>,
+    #[arg(long, action = ArgAction::Append)] pub shadow_attach_9: Vec<PathBuf>,
 
     /// Stego mode: ghost or armor
     #[arg(long, default_value = "armor")]
@@ -184,16 +184,22 @@ fn get_message(flag: &Option<String>) -> Result<String, CliError> {
 
 fn collect_shadows(args: &EncodeArgs) -> Result<Vec<ShadowLayer>, CliError> {
     let shadow_msgs: Vec<Option<&String>> = vec![
-        args.m2.as_ref(), args.m3.as_ref(), args.m4.as_ref(), args.m5.as_ref(),
-        args.m6.as_ref(), args.m7.as_ref(), args.m8.as_ref(), args.m9.as_ref(),
+        args.shadow_message_2.as_ref(), args.shadow_message_3.as_ref(),
+        args.shadow_message_4.as_ref(), args.shadow_message_5.as_ref(),
+        args.shadow_message_6.as_ref(), args.shadow_message_7.as_ref(),
+        args.shadow_message_8.as_ref(), args.shadow_message_9.as_ref(),
     ];
     let shadow_passes: Vec<Option<&String>> = vec![
-        args.p2.as_ref(), args.p3.as_ref(), args.p4.as_ref(), args.p5.as_ref(),
-        args.p6.as_ref(), args.p7.as_ref(), args.p8.as_ref(), args.p9.as_ref(),
+        args.shadow_passphrase_2.as_ref(), args.shadow_passphrase_3.as_ref(),
+        args.shadow_passphrase_4.as_ref(), args.shadow_passphrase_5.as_ref(),
+        args.shadow_passphrase_6.as_ref(), args.shadow_passphrase_7.as_ref(),
+        args.shadow_passphrase_8.as_ref(), args.shadow_passphrase_9.as_ref(),
     ];
     let shadow_attaches: Vec<&Vec<PathBuf>> = vec![
-        &args.attach2, &args.attach3, &args.attach4, &args.attach5,
-        &args.attach6, &args.attach7, &args.attach8, &args.attach9,
+        &args.shadow_attach_2, &args.shadow_attach_3,
+        &args.shadow_attach_4, &args.shadow_attach_5,
+        &args.shadow_attach_6, &args.shadow_attach_7,
+        &args.shadow_attach_8, &args.shadow_attach_9,
     ];
 
     let mut shadows = Vec::new();
@@ -216,7 +222,7 @@ fn collect_shadows(args: &EncodeArgs) -> Result<Vec<ShadowLayer>, CliError> {
     Ok(shadows)
 }
 
-fn load_files(paths: &[PathBuf]) -> Result<Vec<FileEntry>, CliError> {
+pub(crate) fn load_files(paths: &[PathBuf]) -> Result<Vec<FileEntry>, CliError> {
     let mut entries = Vec::new();
     for path in paths {
         let content = std::fs::read(path)?;

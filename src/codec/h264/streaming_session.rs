@@ -58,6 +58,10 @@ use super::stego::chunk_frame::{
 };
 use super::stego::hook::EmbedDomain;
 use super::stego::keys::CabacStegoMasterKeys;
+// #852 — whole-video SHADOW decode fallback. Decode-side / shared (not
+// behind `h264-encoder`), so the App Clip + decode-only WASM get it too.
+use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
+use super::stego::shadow::{decode_shadow_from_priority_lsbs, for_each_eligible_position};
 use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
 use crate::stego::stc::hhat::generate_hhat;
 use crate::stego::{crypto, frame, payload};
@@ -239,42 +243,10 @@ enum SessionImpl {
     /// per-GOP chunk schedule + STC seed.
     #[cfg(feature = "h264-encoder")]
     Oh264(Oh264SessionState),
-    /// STEGO.A.7 — OH264 shadow session. Buffer-on-finish mode:
-    /// accumulates all frames into a clip buffer, runs the n-shadow
-    /// orchestrator (Scheme A combined STC + Tier 3 + cascade) at
-    /// `finish()`. Memory cost is O(total_frames × frame_size); same
-    /// trade-off the non-streaming `phasm_h264_stego_encode_yuv_with_shadows`
-    /// API already pays. Used only when `shadows.len() > 0`.
-    #[cfg(feature = "h264-encoder")]
-    Oh264Shadow(Oh264ShadowSessionState),
     /// Requested engine isn't compiled in. push_frame / finish will
     /// error explicitly. Used when caller asks for OH264 but the
     /// crate was built without `h264-encoder`.
     EngineDisabled(EncodeEngineChoice),
-}
-
-/// STEGO.A.7 — owned shadow layer (storable in session state across
-/// push_frame calls; the borrow-based [`ShadowLayer`] is API-level
-/// only). Used by the Oh264Shadow path.
-struct OwnedShadowLayer {
-    message: String,
-    passphrase: String,
-    files: Vec<crate::stego::payload::FileEntry>,
-}
-
-/// STEGO.A.7 — buffer-on-finish OH264 shadow session state.
-#[cfg(feature = "h264-encoder")]
-struct Oh264ShadowSessionState {
-    /// Primary message + passphrase (owned for cross-call lifetime).
-    primary_message: String,
-    primary_files: Vec<crate::stego::payload::FileEntry>,
-    primary_passphrase: String,
-    /// Shadow layers (owned).
-    shadows: Vec<OwnedShadowLayer>,
-    /// Accumulated YUV bytes across all pushed frames (tight I420).
-    yuv_buffer: Vec<u8>,
-    /// Total frames pushed so far.
-    frames_pushed: u32,
 }
 
 #[cfg(feature = "h264-encoder")]
@@ -393,80 +365,6 @@ impl StreamingEncodeSession {
         Ok(Self { params, inner })
     }
 
-    /// STEGO.A.7 — create a streaming session with N shadow messages.
-    ///
-    /// When `shadows.is_empty()`, behaves identically to [`Self::create`]
-    /// (per-GOP streaming drain). When `shadows.len() > 0`, switches to
-    /// buffer-on-finish mode: `push_frame` accumulates the YUV into an
-    /// internal clip buffer (no per-GOP encode), `finish()` runs the
-    /// n-shadow orchestrator on the buffered clip via
-    /// `h264_encode_with_shadows`. The trade-
-    /// off is O(total_frames × frame_size) memory — same as the
-    /// non-streaming whole-clip shadow API.
-    ///
-    /// Decoder side (`StreamingDecodeSession` / `h264_ghost_decode`)
-    /// requires no changes: same wire format, same Scheme A combined
-    /// STC extract, shadows fall out of `shadow_extract`.
-    pub fn create_with_shadows(
-        params: EncodeSessionParams,
-        primary_message: &str,
-        primary_files: &[crate::stego::payload::FileEntry],
-        primary_passphrase: &str,
-        shadows: &[crate::stego::shadow_layer::ShadowLayer<'_>],
-    ) -> Result<Self, StegoError> {
-        // No shadow layers? Route to the per-GOP streaming path. File
-        // attachments are just payload bytes (`create_with_files` frames
-        // text-only and text+files identically), so only N-shadow layers
-        // need the whole-clip buffer mode below — this keeps non-shadow
-        // video file-attachment encode at O(GOP) memory instead of
-        // O(whole clip), matching text-only video encode.
-        if shadows.is_empty() {
-            return Self::create_with_files(
-                params,
-                primary_message,
-                primary_files,
-                primary_passphrase,
-            );
-        }
-
-        // Same validation as create().
-        if params.width == 0 || params.height == 0 {
-            return Err(StegoError::InvalidVideo(format!(
-                "dimensions must be > 0, got {}x{}", params.width, params.height,
-            )));
-        }
-        if params.width % 16 != 0 || params.height % 16 != 0 {
-            return Err(StegoError::InvalidVideo(format!(
-                "dimensions must be 16-aligned, got {}x{}", params.width, params.height,
-            )));
-        }
-        if params.fps_den == 0 || params.fps_num == 0 {
-            return Err(StegoError::InvalidVideo("fps_num and fps_den must be > 0".into()));
-        }
-        if params.gop_size == 0 {
-            return Err(StegoError::InvalidVideo("gop_size must be > 0".into()));
-        }
-        if params.total_frames_hint == 0 {
-            return Err(StegoError::InvalidVideo(
-                "total_frames_hint must be > 0".into(),
-            ));
-        }
-
-        let inner = match params.engine {
-            #[cfg(feature = "h264-encoder")]
-            EncodeEngineChoice::Oh264 => {
-                SessionImpl::Oh264Shadow(build_oh264_shadow_state(
-                    &params, primary_message, primary_files,
-                    primary_passphrase, shadows,
-                )?)
-            }
-            #[cfg(not(feature = "h264-encoder"))]
-            EncodeEngineChoice::Oh264 => SessionImpl::EngineDisabled(EncodeEngineChoice::Oh264),
-        };
-        emit_encode(&params, EncodePhase::Setup);
-        Ok(Self { params, inner })
-    }
-
     /// Push one YUV frame. Emits Annex-B bytes for a closing GOP into
     /// `out` (appended) when the frame completes a GOP. The OH264 path
     /// drains per-GOP; finish() handles the tail.
@@ -478,8 +376,6 @@ impl StreamingEncodeSession {
         match &mut self.inner {
             #[cfg(feature = "h264-encoder")]
             SessionImpl::Oh264(state) => oh264_push_frame(&self.params, state, frame, out),
-            #[cfg(feature = "h264-encoder")]
-            SessionImpl::Oh264Shadow(state) => oh264_shadow_push_frame(&self.params, state, frame),
             SessionImpl::EngineDisabled(engine) => Err(StegoError::InvalidVideo(format!(
                 "streaming encode engine {engine:?} not compiled in (rebuild with feature)"
             ))),
@@ -693,8 +589,6 @@ impl StreamingEncodeSession {
         match self.inner {
             #[cfg(feature = "h264-encoder")]
             SessionImpl::Oh264(mut state) => oh264_finish(&self.params, &mut state, out),
-            #[cfg(feature = "h264-encoder")]
-            SessionImpl::Oh264Shadow(state) => oh264_shadow_finish(&self.params, state, out),
             SessionImpl::EngineDisabled(engine) => Err(StegoError::InvalidVideo(format!(
                 "streaming encode engine {engine:?} not compiled in (rebuild with feature)"
             ))),
@@ -783,11 +677,22 @@ fn oh264_push_frame(
     frame: YuvFrameRef<'_>,
     out: &mut Vec<u8>,
 ) -> Result<(), StegoError> {
-    if state.chunk_idx >= state.total_chunks {
-        return Err(StegoError::InvalidVideo(format!(
-            "pushed more frames than total_frames_hint expected ({} GOPs already emitted)",
-            state.total_chunks
-        )));
+    // `total_frames_hint` (→ `total_chunks` GOPs) is an ESTIMATE. The mobile
+    // bridges derive it from duration×fps and stream frames one at a time
+    // (AVFoundation / MediaCodec), so the true decoded count is only known
+    // once the stream ends — and it routinely differs by a frame or two
+    // (e.g. an Artlist clip with a leading empty edit, #799). When MORE
+    // frames arrive than the hint predicted, the surplus GOPs fall OUTSIDE
+    // the stego window (`stego_window` ≤ `total_chunks` ≤ `chunk_idx` here),
+    // so `drain_one_gop` encodes them as a PLAIN TAIL: the message is already
+    // fully embedded in the leading window, and the decoder's
+    // read-until-`total_bytes` loop ignores the extra slabs. So we no longer
+    // hard-fail on overflow — we only guard the u16 GOP counter from wrapping
+    // (a pathological multi-million-frame clip).
+    if state.chunk_idx == u16::MAX {
+        return Err(StegoError::InvalidVideo(
+            "frame count exceeds the u16 GOP-index range".into(),
+        ));
     }
 
     // Pack the frame into the tight-pitch GOP buffer. Strides may
@@ -803,7 +708,10 @@ fn oh264_push_frame(
     // phase. `frame_idx` is the cumulative count (chunks finalised so
     // far × gop_size + current buffer count); `total_frames` is the
     // session-level hint.
-    let cumulative = state.chunk_idx as u32 * params.gop_size + state.frames_buffered;
+    // Clamp to the hint so a frame-count overshoot (actual > estimate) can't
+    // drive the progress bar past 100% — same guard the Pass2Replay emit uses.
+    let cumulative =
+        (state.chunk_idx as u32 * params.gop_size + state.frames_buffered).min(params.total_frames_hint);
     emit_encode(
         params,
         EncodePhase::Pass1Capture {
@@ -827,15 +735,21 @@ fn oh264_finish(
     if state.frames_buffered > 0 {
         drain_one_gop(params, state, out)?;
     }
-    if state.chunk_idx != state.total_chunks {
-        return Err(StegoError::InvalidVideo(format!(
-            "session finished with {}/{} chunks emitted — total_frames_hint was too high",
-            state.chunk_idx, state.total_chunks,
-        )));
-    }
-    // CAP2.2 — the whole payload must have been allocated across the GOPs.
-    // With the uniform-spread + carry allocator this only trips when the
-    // message genuinely exceeds the clip's total capacity (Σ per-GOP).
+    // `total_chunks` (the hint's GOP count) is NOT a finish gate. The hint is
+    // an estimate (see `oh264_push_frame`); the decoder reconstructs the
+    // message from GOP 0's declared `total_bytes` over however many GOPs the
+    // real stream contains, so the only ship invariant is payload
+    // completeness. When the decoder yields FEWER GOPs than predicted, the
+    // encode still succeeds as long as the (front-loaded) stego window fit
+    // inside the GOPs that materialised — the unrealised GOPs were a plain
+    // tail anyway. When it yields more, the surplus encoded plain. Either way
+    // the test below is the real gate.
+    //
+    // CAP2.2 — the whole payload must have been embedded. With a concentrate
+    // plan (the mobile path) this holds whenever the stego window fit; with
+    // the bare uniform-spread fallback it can trip if the real GOP count fell
+    // short of the hint — a clean, fail-closed MessageTooLarge (never silent
+    // corruption), and the user can retry.
     if state.cursor != state.msg_frame.len() {
         return Err(StegoError::MessageTooLarge);
     }
@@ -844,108 +758,6 @@ fn oh264_finish(
     // but we still emit Mux for parity with the design doc so the
     // mobile-side smoothing engine sees a Mux→Done transition even
     // when the underlying mux is a no-op at this layer.
-    emit_encode(params, EncodePhase::Mux);
-    emit_encode(params, EncodePhase::Done);
-    Ok(())
-}
-
-#[cfg(feature = "h264-encoder")]
-fn build_oh264_shadow_state(
-    params: &EncodeSessionParams,
-    primary_message: &str,
-    primary_files: &[crate::stego::payload::FileEntry],
-    primary_passphrase: &str,
-    shadows: &[crate::stego::shadow_layer::ShadowLayer<'_>],
-) -> Result<Oh264ShadowSessionState, StegoError> {
-    let frame_bytes_size = (params.width as usize) * (params.height as usize) * 3 / 2;
-    // Pre-allocate the full clip buffer up-front: total_frames_hint
-    // bounds the worst case.
-    let yuv_buffer = Vec::with_capacity(frame_bytes_size * params.total_frames_hint as usize);
-
-    let owned_shadows: Vec<OwnedShadowLayer> = shadows.iter().map(|s| OwnedShadowLayer {
-        message: s.message.to_string(),
-        passphrase: s.passphrase.to_string(),
-        files: s.files.to_vec(),
-    }).collect();
-
-    Ok(Oh264ShadowSessionState {
-        primary_message: primary_message.to_string(),
-        primary_files: primary_files.to_vec(),
-        primary_passphrase: primary_passphrase.to_string(),
-        shadows: owned_shadows,
-        yuv_buffer,
-        frames_pushed: 0,
-    })
-}
-
-#[cfg(feature = "h264-encoder")]
-fn oh264_shadow_push_frame(
-    params: &EncodeSessionParams,
-    state: &mut Oh264ShadowSessionState,
-    frame: YuvFrameRef<'_>,
-) -> Result<(), StegoError> {
-    if state.frames_pushed >= params.total_frames_hint {
-        return Err(StegoError::InvalidVideo(format!(
-            "shadow session pushed more frames than total_frames_hint ({} reached)",
-            params.total_frames_hint,
-        )));
-    }
-    // Same I420 tight-pack as the non-shadow path; appends to the
-    // clip buffer (no per-GOP drain).
-    pack_frame_into_buffer(params.width, params.height, &frame, &mut state.yuv_buffer)?;
-    state.frames_pushed += 1;
-    // Pass1Capture event per buffered frame for the smoothing engine.
-    emit_encode(
-        params,
-        EncodePhase::Pass1Capture {
-            frame_idx: state.frames_pushed,
-            total_frames: params.total_frames_hint,
-        },
-    );
-    Ok(())
-}
-
-#[cfg(feature = "h264-encoder")]
-fn oh264_shadow_finish(
-    params: &EncodeSessionParams,
-    state: Oh264ShadowSessionState,
-    out: &mut Vec<u8>,
-) -> Result<(), StegoError> {
-    if state.frames_pushed == 0 {
-        return Err(StegoError::InvalidVideo(
-            "shadow session finished with zero frames pushed".into(),
-        ));
-    }
-    // Build borrow-based ShadowLayer slice from owned storage.
-    let shadow_refs: Vec<crate::stego::shadow_layer::ShadowLayer<'_>> = state
-        .shadows
-        .iter()
-        .map(|s| crate::stego::shadow_layer::ShadowLayer {
-            message: &s.message,
-            passphrase: &s.passphrase,
-            files: &s.files,
-        })
-        .collect();
-
-    let opts = super::openh264_stego::EncodeOpts {
-        qp: params.qp,
-        intra_period: params.gop_size as i32,
-    };
-
-    let bytes = super::openh264_stego::h264_encode_with_shadows(
-        &state.yuv_buffer,
-        params.width,
-        params.height,
-        state.frames_pushed,
-        opts,
-        &state.primary_message,
-        &state.primary_files,
-        &state.primary_passphrase,
-        &shadow_refs,
-        &params.cost_weights,
-    )?;
-    out.extend_from_slice(&bytes);
-
     emit_encode(params, EncodePhase::Mux);
     emit_encode(params, EncodePhase::Done);
     Ok(())
@@ -1213,10 +1025,9 @@ fn pack_frame_into_buffer(
 //
 // **Shadow math** is the existing collision-limited formula from
 // `h264_stego_shadow_capacity`, working off the shadow-domain cover
-// pool. The streaming session DOES wire shadows through:
-// `StreamingEncodeSession::create_with_shadows` runs the n-shadow
-// orchestrator on the buffered clip (the `Oh264Shadow` path), and
-// `CapacityProbeResult::shadow_max_message_bytes` reports their budget.
+// pool. The shadow video encode is the per-GOP streaming pull path
+// (`h264_encode_with_shadows_streaming`, driven by a `GopYuvSource`); the
+// probe's `CapacityProbeResult::shadow_max_message_bytes` reports their budget.
 
 
 /// Result of a `StreamingProbeSession::finish` — raw cover bits, GOP
@@ -1640,7 +1451,6 @@ impl StreamingDecodeSession {
 
     /// Internal helper — invoke the progress callback if installed.
     /// Cheap no-op when no callback is registered.
-    #[allow(dead_code)]
     pub(crate) fn emit_progress(&self, phase: DecodePhase) {
         if let Some(cb) = &self.progress_callback {
             cb(phase);
@@ -1671,19 +1481,51 @@ impl StreamingDecodeSession {
             ));
         }
 
+        // Decode order mirrors the image `smart_decode` + AV1's
+        // `finish_shadow_*`: try the PRIMARY message first (common case,
+        // per-GOP chunk_frame), then fall back to the whole-video SHADOW
+        // scope. A clip can carry a primary AND any number of shadows under
+        // different passphrases; the one matching THIS passphrase wins.
+        // Since WV.6.a (#854) a shadow-encoded clip's primary is ALSO per-GOP
+        // chunk_frame (only the shadows stay whole-video), so
+        // `try_primary_decode` covers both the no-shadow and shadow-mode
+        // primary. The #852 whole-video-primary `m_total` brute-force stopgap
+        // is retired (WV.6.e) — no production clip carries a whole-video
+        // primary anymore.
+        match self.try_primary_decode(&slabs) {
+            Ok(result) => Ok(result),
+            // Per-GOP primary missed under this passphrase → try the whole-video
+            // SHADOW scope (bounded: parity tiers × fdl).
+            Err(primary_err) => self
+                .try_shadow_streaming()
+                // Nothing decoded under this passphrase. Surface the friendly
+                // crypto error (wrong passphrase / no hidden message) rather
+                // than the per-GOP path's internal `InvalidVideo("no v3 first
+                // chunk")`, which the mobile UI mislabels as "video format
+                // isn't supported" (#851). A genuine non-`InvalidVideo`
+                // primary error (e.g. a mid-stream truncation) is preserved.
+                .map_err(|_| match primary_err {
+                    StegoError::InvalidVideo(_) => StegoError::DecryptionFailed,
+                    other => other,
+                }),
+        }
+    }
+
+    /// Primary-message decode (chunk_frame v3 §5.2): accumulate per-GOP
+    /// payload until GOP 0's declared `total_bytes` is reached, then parse
+    /// + decrypt. `slabs` are the per-GOP Annex-B slices.
+    fn try_primary_decode(&self, slabs: &[&[u8]]) -> Result<DecodeSessionResult, StegoError> {
         // Derive the STC seed (same as encode side).
         let keys = CabacStegoMasterKeys::derive(&self.passphrase)?;
         let hhat_seed = keys
             .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
             .hhat_seed;
 
-        // chunk_frame v3 §5.2 — decode by accumulating payload until the
-        // first chunk's declared `total_bytes` is reached. GOP 0 is always a
-        // stego GOP carrying the u32 `total_bytes`; subsequent GOPs carry only
-        // `payload_len`. The decoder stops at `accumulated == total_bytes` and
-        // never walks the plain tail (`slabs[W..]`) — W is implicit, not on
-        // the wire (decode cost ∝ W, not n_gops).
-        let cover0 = h264_gop_cover_bits(&slabs[0], &self.cost_weights).ok_or_else(|| {
+        // GOP 0 is always a stego GOP carrying the u32 `total_bytes`;
+        // subsequent GOPs carry only `payload_len`. Stop at
+        // `accumulated == total_bytes` and never walk the plain tail (W is
+        // implicit, not on the wire — decode cost ∝ W, not n_gops).
+        let cover0 = h264_gop_cover_bits(slabs[0], &self.cost_weights).ok_or_else(|| {
             StegoError::InvalidVideo("decode session: GOP 0 cover walk failed".into())
         })?;
         let (total_bytes, payload0) =
@@ -1699,7 +1541,7 @@ impl StreamingDecodeSession {
         let mut frame_bytes = payload0;
         let mut gop_idx = 1usize;
         while frame_bytes.len() < total_bytes && gop_idx < slabs.len() {
-            let cover = h264_gop_cover_bits(&slabs[gop_idx], &self.cost_weights).ok_or_else(|| {
+            let cover = h264_gop_cover_bits(slabs[gop_idx], &self.cost_weights).ok_or_else(|| {
                 StegoError::InvalidVideo(format!("decode session: GOP {gop_idx} cover walk failed"))
             })?;
             let remaining = total_bytes - frame_bytes.len();
@@ -1723,17 +1565,11 @@ impl StreamingDecodeSession {
             )));
         }
 
-        // #474.2 — StcExtract: brute-force STC retrieval already
-        // happened inside the per-GOP v3 extract (combined walk
-        // + STC extract per slab). Fire StcExtract once here as the
-        // boundary marker between Walker and Decrypt — gives the
-        // smoothing engine a clean phase transition.
+        // #474.2 — StcExtract boundary marker between Walker and Decrypt.
         self.emit_progress(DecodePhase::StcExtract);
 
         let parsed = frame::parse_frame(&frame_bytes)?;
         // #474.2 — Decrypt fires immediately before crypto::decrypt.
-        // Always a single event (decrypt is sub-millisecond on short
-        // messages and not worth per-chunk granularity).
         self.emit_progress(DecodePhase::Decrypt);
         let plaintext = crypto::decrypt(
             &parsed.ciphertext,
@@ -1742,8 +1578,7 @@ impl StreamingDecodeSession {
             &parsed.nonce,
         )?;
         let payload_data = payload::decode_payload(&plaintext)?;
-        // #474.2 — Done boundary fires AFTER the message text is ready
-        // so the UI sees the final state before this function returns.
+        // #474.2 — Done boundary fires AFTER the message text is ready.
         self.emit_progress(DecodePhase::Done);
         Ok(DecodeSessionResult {
             text: payload_data.text,
@@ -1752,9 +1587,99 @@ impl StreamingDecodeSession {
         })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn passphrase(&self) -> &str {
-        &self.passphrase
+    /// #852 + WV.6.g (decode-side) — whole-video SHADOW decode, **O(GOP) walk**.
+    /// Replaces the monolithic whole-clip walk (one union cover + mvd_meta held
+    /// to the end = O(clip) heap). Splits the accumulated Annex-B into per-GOP
+    /// slabs, walks ONE GOP at a time, and accumulates ONLY the priority-ordered
+    /// `(priority, domain_rank, intra_index, bit)` tuples — **releasing each
+    /// GOP's cover + mvd_meta** — then brute-forces
+    /// [`decode_shadow_from_priority_lsbs`] over the accumulated bits.
+    ///
+    /// Bit-identical priority order to the whole-clip `priority_slots` it
+    /// replaces: each GOP's keys are GLOBAL-remapped (`frame_idx += frames so
+    /// far`, like the encoder's `gop_clean_cover`), eligibility mirrors
+    /// `priority_slots` (CSB + CSL + MSB always; MSL where `safe_msl`; `safe_csl
+    /// = None`), and the `(priority, domain_rank, intra_index)` sort reproduces
+    /// its stable-sort-with-domain-grouped-insertion order — so it recovers the
+    /// exact same shadow. Cascade-safety is frame-local, so the per-GOP
+    /// `safe_msl` assembles to the whole-clip mask.
+    ///
+    /// NOT true O(GOP): the decoder doesn't know the shadow size (up to
+    /// MAX_SHADOW_FRAME_BYTES), so the tuples are still O(eligible) — but ~half
+    /// the per-position size of the cover they replace, and the whole-clip
+    /// `mvd_meta` is gone (released per GOP). Returns the first shadow that
+    /// AES-authenticates, or `FrameCorrupted` / a crypto error if none match.
+    fn try_shadow_streaming(&self) -> Result<DecodeSessionResult, StegoError> {
+        use super::stego::inject::remap_cover_frame_idx;
+        use rand::{RngCore, SeedableRng};
+        use rand_chacha::ChaCha20Rng;
+
+        let perm_seed = crate::stego::crypto::derive_shadow_structural_key(&self.passphrase)?;
+        let mut rng = ChaCha20Rng::from_seed(*perm_seed);
+
+        // (priority, domain_rank, intra_index, bit) — the priority_slots order.
+        let mut slots: Vec<(u32, u8, usize, u8)> = Vec::new();
+        let mut offs = [0usize; 4]; // running global per-domain offsets
+        // Cumulative ACTUAL frames decoded so far — the global-remap base. The
+        // encoder's `streaming_shadow_verify` uses g*gop_size for the SAME base;
+        // the two agree iff every non-final GOP == gop_size (the remap-base
+        // contract, debug_assert'd encoder-side). Keep them in sync.
+        let mut frames_so_far: u32 = 0;
+
+        for slab in split_annex_b_into_gops(&self.accumulator) {
+            let walk = walk_annex_b_for_cover_with_options(
+                slab,
+                WalkOptions { record_mvd: true, ..Default::default() },
+            )
+            .map_err(|_| StegoError::FrameCorrupted)?;
+            let safe_msb = analyze_safe_mvd_subset(&walk.mvd_meta, walk.mb_w, walk.mb_h);
+            let mut cover = walk.cover;
+            let safe_msl = derive_msl_safe_from_msb(
+                &cover.mvd_sign_bypass.positions,
+                &safe_msb,
+                &cover.mvd_suffix_lsb.positions,
+            );
+            // GLOBAL-remap keys so priorities match the whole-clip priority_slots.
+            if frames_so_far > 0 {
+                remap_cover_frame_idx(&mut cover, frames_so_far);
+            }
+            // Eligibility + domain order via the shared `for_each_eligible_position`
+            // (safe_csl = None ⇒ all CSL; cascade-safe MSL only) — the exact rule
+            // `priority_slots` + the streaming verify use, so the priority order
+            // here is bit-identical to the whole-clip `priority_slots`.
+            for_each_eligible_position(&cover, None, Some(safe_msl.as_slice()), |domain, i, key| {
+                let bit = match domain {
+                    EmbedDomain::CoeffSignBypass => cover.coeff_sign_bypass.bits[i],
+                    EmbedDomain::CoeffSuffixLsb => cover.coeff_suffix_lsb.bits[i],
+                    EmbedDomain::MvdSignBypass => cover.mvd_sign_bypass.bits[i],
+                    EmbedDomain::MvdSuffixLsb => cover.mvd_suffix_lsb.bits[i],
+                };
+                rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
+                slots.push((rng.next_u32(), domain as u8, offs[domain as usize] + i, bit));
+            });
+            offs[0] += cover.coeff_sign_bypass.len();
+            offs[1] += cover.coeff_suffix_lsb.len();
+            offs[2] += cover.mvd_sign_bypass.len();
+            offs[3] += cover.mvd_suffix_lsb.len();
+            let mb_per_frame = (walk.mb_w as usize) * (walk.mb_h as usize);
+            if mb_per_frame > 0 {
+                frames_so_far += (walk.n_mb / mb_per_frame) as u32;
+            }
+            // `cover` + `walk` (incl. mvd_meta) drop here — O(GOP) peak.
+        }
+
+        // priority_slots' total order: stable sort by priority with domain-grouped
+        // insertion ⇒ (priority, domain_rank, intra_index) ascending.
+        slots.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let all_lsbs: Vec<u8> = slots.iter().map(|s| s.3).collect();
+
+        let payload = decode_shadow_from_priority_lsbs(&all_lsbs, &self.passphrase)?;
+        self.emit_progress(DecodePhase::Done);
+        Ok(DecodeSessionResult {
+            text: payload.text,
+            files: payload.files,
+            mode_id: 1, // Ghost = H.264 stego path
+        })
     }
 }
 
@@ -2192,7 +2117,20 @@ mod tests {
         }
 
         #[test]
-        fn streaming_session_oh264_rejects_overflow() {
+        fn streaming_session_oh264_accepts_overflow_as_plain_tail() {
+            // `oh264_push_frame` deliberately no longer hard-fails when more
+            // frames arrive than `total_frames_hint` predicted (#799 — the
+            // hint is an estimate; mobile streams the true count from
+            // AVAsset/MediaCodec). Surplus GOPs fall outside the stego
+            // window and route through `drain_one_gop` as PLAIN tail
+            // (the message is fully embedded in the leading window; the
+            // decoder ignores the extra slabs via its read-until-
+            // `total_bytes` loop). Only the u16 GOP-index wraparound
+            // (multi-million-frame pathology) still errors.
+            //
+            // Previously asserted that the 3rd frame errored; updated to
+            // assert it succeeds, since the new behavior is the intended
+            // one across all mobile / CLI overshoot scenarios.
             let _g = SESSION_TEST_MUTEX.lock().unwrap();
             const W: u32 = 320;
             const H: u32 = 240;
@@ -2218,15 +2156,15 @@ mod tests {
                 sess.push_frame(frame, &mut out).expect("push");
             }
             // First GOP completed → chunk_idx == total_chunks.
-            // A 3rd frame should now be rejected.
+            // A 3rd frame is accepted (plain-tail GOP).
             let (y, u, v) = synth_yuv_frame(W, H, 2);
             let frame = YuvFrameRef {
                 y: &y, y_stride: W as usize,
                 u: &u, u_stride: (W / 2) as usize,
                 v: &v, v_stride: (W / 2) as usize,
             };
-            let err = sess.push_frame(frame, &mut out).unwrap_err();
-            assert!(matches!(err, StegoError::InvalidVideo(_)));
+            sess.push_frame(frame, &mut out)
+                .expect("3rd frame should now be accepted as plain-tail GOP");
         }
         #[test]
         fn streaming_session_oh264_decode_session_roundtrip() {

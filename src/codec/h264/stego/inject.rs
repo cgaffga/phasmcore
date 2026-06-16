@@ -79,6 +79,32 @@ pub fn extract_mvd_sign_bits(slots: &[MvdSlot]) -> Vec<u8> {
         .collect()
 }
 
+/// Rebuild every `PositionKey` in `cover` with `frame_idx += base`. Relabels a
+/// standalone per-GOP walk (LOCAL frame_idx `0..gop`) to the GLOBAL frame_idx the
+/// whole-clip concatenation walk assigns. The emitted bytes do not depend on the
+/// `frame_idx_base` (see the encoder's `frame_idx_base` contract), so only the
+/// position keys move — `mb_addr` / `domain` / `syntax_path` are intra-frame and
+/// unchanged. Lives here (decode-available) so BOTH the encoder-side per-GOP
+/// helpers AND the decoder-side `try_shadow_streaming` can call it without the
+/// decoder depending on the encoder-gated `openh264_stego` module.
+pub(crate) fn remap_cover_frame_idx(cover: &mut DomainCover, base: u32) {
+    for db in [
+        &mut cover.coeff_sign_bypass,
+        &mut cover.coeff_suffix_lsb,
+        &mut cover.mvd_sign_bypass,
+        &mut cover.mvd_suffix_lsb,
+    ] {
+        for key in db.positions.iter_mut() {
+            *key = PositionKey::new(
+                key.frame_idx() + base,
+                key.mb_addr(),
+                key.domain(),
+                key.syntax_path(),
+            );
+        }
+    }
+}
+
 // ─── Cross-domain orchestration ──────────────────────────────────
 
 /// Per-domain summary of cover-side bits + positions for one GOP,

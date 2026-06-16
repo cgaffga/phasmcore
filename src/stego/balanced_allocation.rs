@@ -122,8 +122,26 @@ pub fn plan_safe_balanced(
     // t-statistic for 99.9% one-sided lower bound, df = K - 1.
     let t = t_critical_99_9(k);
 
+    // Standard error of the mean WITH the finite-population correction (FPC).
+    // Sampling k of N GOPs *without replacement* shrinks the SE by
+    // √((N − k) / (N − 1)); at full coverage (k == N == n_gops) the FPC is 0 —
+    // a census has no sampling uncertainty, so the lower bound is the measured
+    // mean itself. Without the FPC, high-variance full-coverage caps (an IDR
+    // GOP + varying motion, e.g. Artlist_CarPlane.mp4: caps
+    // [306,600,986,500,300,313,313]) drove `mu − t·σ/√k` negative → clamped to
+    // 0 → the planner declared a 55-byte message "too large" against 3318 B of
+    // real capacity. On iOS/Android that `MessageTooLarge` surfaced as the
+    // generic "This video format isn't supported" (#850).
+    let fpc = if n_gops > 1 {
+        (((n_gops.saturating_sub(k)) as f64) / ((n_gops - 1) as f64))
+            .max(0.0)
+            .sqrt()
+    } else {
+        0.0
+    };
+
     // Statistical lower bound on per-GOP cap.
-    let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt()).max(0.0);
+    let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt() * fpc).max(0.0);
 
     // Apply pessimism factor (heavy-tail / outlier defense).
     let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
@@ -294,6 +312,43 @@ mod tests {
 
     fn cal() -> AllocationCalibration {
         AllocationCalibration::AV1_1080P_QP30
+    }
+
+    #[test]
+    fn full_coverage_high_variance_caps_does_not_false_reject() {
+        // #850 regression — Artlist_CarPlane.mp4. All 7 GOPs measured (full
+        // coverage), caps vary widely: [306,600,986,500,300,313,313], Σ=3318 B.
+        // A 55-byte framed message ("Test") fits ~60× over. Before the
+        // finite-population correction, `μ − t·σ/√k` went NEGATIVE on this
+        // variance → clamped to 0 → false MessageTooLarge, which the iOS/Android
+        // encode hard-threw as "This video format isn't supported." With the
+        // FPC a census (k == n_gops) carries zero sampling uncertainty, so the
+        // message must commit.
+        let caps = [306usize, 600, 986, 500, 300, 313, 313];
+        let samples: Vec<(usize, usize)> =
+            caps.iter().enumerate().map(|(i, &c)| (i, c)).collect();
+        let r = plan_safe_balanced(
+            &samples,
+            caps.len(),
+            55,
+            30,
+            &AllocationCalibration::H264_1080P_QP26,
+        );
+        match r {
+            PlanOutcome::Plan { plan, window } => {
+                assert!(
+                    (1..=caps.len()).contains(&window),
+                    "window {window} out of range 1..={}",
+                    caps.len()
+                );
+                assert_eq!(
+                    plan.iter().sum::<usize>(),
+                    55,
+                    "plan must allocate the whole 55-byte message"
+                );
+            }
+            other => panic!("expected Plan (55 B fits in 3318 B of capacity), got {other:?}"),
+        }
     }
 
     #[test]

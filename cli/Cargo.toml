@@ -25,6 +25,11 @@ clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
 indicatif = "0.17"
 rpassword = "7"
+# Optional, video-only: mmap the decoded YUV temp file in the non-shadow
+# OH264 encode so a long clip's decoded YUV is evictable page cache, not a
+# non-evictable O(clip) heap allocation (OOM-safe). Same version phasm-core
+# pins for its `video` feature.
+memmap2 = { version = "0.9", optional = true }
 
 [features]
 default = []
@@ -33,7 +38,7 @@ default = []
 # H.264 code: no parser, no walker, no streaming session, no
 # `video-encode` / `video-capacity` subcommands. Forwards to
 # phasm-core's `video` feature.
-video = ["phasm-core/video"]
+video = ["phasm-core/video", "dep:memmap2"]
 # H.264 stego DECODE only — the pure-Rust bin-walker, no OpenH264 C
 # dependency and no encoder. Lets a source build decode phasm H.264
 # stego videos (e.g. on a machine that can't / won't link OpenH264).

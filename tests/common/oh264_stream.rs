@@ -157,15 +157,14 @@ pub fn encode_with_files(
     files: &[FileEntry],
     passphrase: &str,
 ) -> Result<Vec<u8>, StegoError> {
-    // Go through create_with_shadows with NO shadow layers — the same
-    // entry the bridges' video file-attachment FFI uses — to exercise the
-    // empty-shadows → per-GOP create_with_files delegation end to end.
-    let enc = StreamingEncodeSession::create_with_shadows(
+    // The per-GOP `create_with_files` path — the same entry the bridges'
+    // video file-attachment FFI uses. Files ride the per-GOP path as plain
+    // payload bytes (no whole-clip buffering).
+    let enc = StreamingEncodeSession::create_with_files(
         params(width, height, n_frames, qp, n_frames.max(1), CostWeights::default()),
         message,
         files,
         passphrase,
-        &[],
     )?;
     push_clip(enc, yuv, width, height, n_frames)
 }

@@ -109,9 +109,23 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
                                 .into(),
                         )));
                     }
+                    VideoCodec::Av1 => {
+                        #[cfg(feature = "av1-encoder")]
+                        { decode_av1_streaming(&file_bytes, &passphrase)? }
+                        #[cfg(not(feature = "av1-encoder"))]
+                        {
+                            return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+                                "AV1 video stego decode is not built into this binary. \
+                                 Rebuild from source: \
+                                 `cargo install phasm-cli --features av1-encoder`."
+                                    .into(),
+                            )));
+                        }
+                    }
                     VideoCodec::Unknown => {
                         return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                            "unsupported or unrecognised video codec (expected H.264)".into(),
+                            "unsupported or unrecognised video codec \
+                             (expected H.264 or AV1)".into(),
                         )));
                     }
                 };
@@ -194,4 +208,63 @@ fn decode_h264_cabac(
     })();
     let _ = std::fs::remove_file(&annex_b_temp);
     result
+}
+
+/// AV1 stego decode dispatch.
+///
+/// Walks the MP4 via the in-tree `codec::mp4::demux` (no ffmpeg
+/// shell-out), pulls each AV1 sample's OBU bytes from the av01 video
+/// track, and streams them into `Av1StreamingDecodeSession`. Finalization
+/// goes through `finish_primary_payload`, which decodes both the
+/// `payload::encode_payload`-framed shape (CLI v1, mobile) AND legacy
+/// plain-text streams via its internal fallback.
+///
+/// Returns `text + files` as a `PayloadData` — the same shape as the
+/// H.264 dispatch with the file follow-on already wired through.
+#[cfg(feature = "av1-encoder")]
+fn decode_av1_streaming(
+    file_bytes: &[u8],
+    passphrase: &str,
+) -> Result<phasm_core::PayloadData, CliError> {
+    use phasm_core::Av1StreamingDecodeSession;
+    let mp4 = phasm_core::codec::mp4::demux::demux(file_bytes).map_err(|e| {
+        CliError::from(phasm_core::StegoError::InvalidVideo(format!(
+            "AV1 MP4 demux failed: {e}"
+        )))
+    })?;
+    let idx = mp4.video_track_idx.ok_or_else(|| {
+        CliError::from(phasm_core::StegoError::InvalidVideo(
+            "AV1 decode: no video track found in MP4".into(),
+        ))
+    })?;
+    let track = &mp4.tracks[idx];
+    if !track.is_av1() {
+        return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
+            "AV1 decode: selected video track is not av01".into(),
+        )));
+    }
+
+    let mut session = Av1StreamingDecodeSession::create(passphrase);
+    // `build_mp4_av1` strips the `sequence_header_obu` from per-sample
+    // bytes (it lives in `av1C` per AV1-ISOBMFF § 2.2.1). Decoders that
+    // ingest raw sample bytes need to prepend it themselves; otherwise
+    // the OBU walker never finds an SH boundary and `finish` errors with
+    // "no sequence_header_obu in accumulated bytes". Mobile MediaExtractor /
+    // CMSampleBuffer hide this by exposing samples with the codec config
+    // already prepended; the in-tree mp4 demux exposes raw samples, so
+    // we splice av1C in once at session start.
+    if let Some(ref av1c) = track.av1c_data {
+        if !av1c.config_obus.is_empty() {
+            session.push_bytes(&av1c.config_obus);
+        }
+    }
+    for sample in &track.samples {
+        session.push_bytes(&sample.data);
+    }
+    let payload = session.finish_primary_payload().map_err(|e| {
+        CliError::from(phasm_core::StegoError::InvalidVideo(format!(
+            "AV1 decode failed: {e:?}"
+        )))
+    })?;
+    Ok(payload)
 }

@@ -27,6 +27,11 @@
 // `transform.rs` is its paired oracle. See
 // `docs/design/video/_RETIREMENT-PLAN.md` §8.
 //
+// WV.6.g (per-GOP shadow streaming, 2026-06-14) re-evaluated the KEEP:
+// the streaming shadow work is orthogonal — it never touches the 2-pass
+// DPB-correction path (`dpb_cover` stays `None` on every per-GOP encode),
+// so the #837 calculus is unchanged. Still inert, still `transform.rs`-paired.
+//
 // After each frame's CABAC emit (Pass 2), the wire_only path has
 // already written the stego bits to the bitstream but the encoder's
 // pDecPic (reconstruction buffer) still holds pre-flip pixel data.

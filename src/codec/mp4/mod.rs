@@ -99,6 +99,12 @@ pub struct Track {
     pub hvcc_data: Option<HvccData>,
     /// H.264/AVC decoder configuration (only for avc1/avc3 tracks).
     pub avcc_data: Option<AvccData>,
+    /// AV1 decoder configuration (only for `av01` tracks). The
+    /// `config_obus` field carries the `sequence_header_obu` decoders
+    /// need to prefix to the per-sample OBU stream — `build_mp4_av1`
+    /// strips the SH from per-sample bytes by spec, so decode-side
+    /// callers must prepend it manually.
+    pub av1c_data: Option<Av1cData>,
     /// Raw bytes of the stsd box (for non-video track passthrough during mux).
     pub stsd_raw: Vec<u8>,
     /// Raw bytes of the complete trak box (for non-video track passthrough).
@@ -421,6 +427,13 @@ impl Track {
     /// True if this is an HEVC/H.265 video track.
     pub fn is_hevc(&self) -> bool {
         self.codec == *b"hev1" || self.codec == *b"hvc1"
+    }
+
+    /// True if this is an AV1 video track. AV1-in-MP4 uses the `av01`
+    /// sample-entry fourcc (per ISO/IEC 14496-12 / AV1-ISOBMFF § 2.2.1).
+    /// Matches what phasm's own muxer emits via `build_mp4_av1`.
+    pub fn is_av1(&self) -> bool {
+        self.codec == *b"av01"
     }
 }
 

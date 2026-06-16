@@ -35,6 +35,12 @@ pub enum ModeId {
     GhostSiShadow = 4,
     Armor = 5,
     Decode = 6,
+    /// AV1 whole-video shadow encode (streaming Pass 1 per WV.6).
+    /// Peak prediction lives in
+    /// `predict_peak_memory_av1_whole_video_shadow` — the bytes_per_pixel
+    /// table doesn't apply because peak depends on n_frames + gop_size
+    /// (per-GOP working set + accumulators) rather than image area alone.
+    Av1WholeVideoShadow = 7,
 }
 
 /// Ladder rung selection for Ghost shadow encode. Rung 0 = default
@@ -125,7 +131,67 @@ fn bytes_per_pixel(mode: ModeId, rung: GhostShadowRung, n_workers: usize) -> usi
             // luma f64 + positions Vec + small scratch.
             10
         }
+        ModeId::Av1WholeVideoShadow => {
+            // Video peak doesn't fit the per-pixel-only model: it scales
+            // with n_frames + gop_size, not just width × height. Callers
+            // should use `predict_peak_memory_av1_whole_video_shadow`
+            // instead. Returning 0 here so a stray bytes_per_pixel call
+            // doesn't silently fabricate a budget number.
+            0
+        }
     }
+}
+
+/// Predict peak RSS for an AV1 whole-video shadow encode under the
+/// WV.6 streaming Pass 1 design.
+///
+/// Peak is bounded by:
+///   - one GOP's raw YUV (`width × height × 1.5 × gop_size`) — the
+///     `current_gop_yuv` working buffer; capacity preserved across
+///     GOPs so it doesn't re-allocate
+///   - `per_gop_natural` (~50 KB/frame for OBU bytes + recording)
+///     across all `n_frames` frames
+///   - `per_gop_harvests` (~60 KB/GOP for cover bits + costs vec)
+///     across all GOPs
+///   - cascade working set + growing output Vec (small; folded into
+///     the safety factor)
+///
+/// Plus the same ×1.5 safety factor used elsewhere.
+///
+/// Coefficients are static upper bounds calibrated from observed
+/// rav1e + dav1d encode output at 1080p; `perf_memory_audit` may
+/// refine them.
+pub fn predict_peak_memory_av1_whole_video_shadow(
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    gop_size: u32,
+) -> usize {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let frame_size = pixels.saturating_mul(3) / 2; // tight I420 = 1.5 bpp
+    let gs = (gop_size.max(1)) as usize;
+    let nf = n_frames as usize;
+    let n_gops = nf.div_ceil(gs);
+
+    // current_gop_yuv: peak-time = one full GOP of raw I420.
+    let one_gop_yuv = frame_size.saturating_mul(gs);
+
+    // per_gop_natural — OBU bytes + PhasmFrameRecording per frame.
+    // ~25 KB OBU + ~50 KB recording = ~75 KB/frame at 1080p; the
+    // 100 KB/frame upper bound here gives ~15% headroom.
+    const NATURAL_BYTES_PER_FRAME: usize = 100 * 1024;
+    let per_gop_natural = nf.saturating_mul(NATURAL_BYTES_PER_FRAME);
+
+    // per_gop_harvests — cover_bits + costs vec per GOP. ~60 KB at
+    // 1080p × gop_size=30 with ~5K cover positions/GOP.
+    const HARVEST_BYTES_PER_GOP: usize = 100 * 1024;
+    let per_gop_harvests = n_gops.saturating_mul(HARVEST_BYTES_PER_GOP);
+
+    let raw = one_gop_yuv
+        .saturating_add(per_gop_natural)
+        .saturating_add(per_gop_harvests)
+        .saturating_add(FIXED_OVERHEAD_BYTES);
+    raw.saturating_mul(SAFETY_FACTOR_NUM) / SAFETY_FACTOR_DEN
 }
 
 // ===== Public memory-budget API =====

@@ -598,6 +598,13 @@ fn main() {
             // neighbour mvd-context cache). Closes the iphone7 stego
             // "cascade ceiling" (decode failed above ~260 B/GOP).
             "11dab21100bc1900278db1dc7cd4b2876e1f2021",
+            // 2026-06-16: #813 fork-CI fix — exclude the 19 by-design-broken
+            // upstream encoder-output gtests from phasm-stego CI (the stego
+            // fork intentionally changes SPS output: V0.4.D constraint_set4/5
+            // + pic_order_cnt_type, emitted unconditionally). CI-only change;
+            // the built library is byte-identical to 11dab211 (codec/ source
+            // untouched), so the determinism pin (#835) is preserved.
+            "5fd1ad54f7f981ffbc7671a5e6aa42eae579c75f",
         ];
         let head_output = Command::new("git")
             .arg("-C")

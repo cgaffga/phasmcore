@@ -140,26 +140,38 @@ pub enum Av1PlanOutcome {
     MessageTooLarge,
 }
 
-/// Whole-video shadow accumulation state. When present, the session
-/// defers ALL encode work to `finish` and runs the whole-video shadow
-/// flow (`av1_stego_encode_whole_video_with_shadows`) on the full
-/// buffered YUV. Mirrors OH264's `Oh264ShadowSessionState` at
-/// `core/src/codec/h264/streaming_session.rs:281`.
+/// Whole-video shadow streaming state. Pass 1 runs incrementally as
+/// `push_frame` accumulates frames into `current_gop_yuv` and triggers
+/// `process_one_gop_pass1` at every GOP boundary (or the final frame
+/// for a partial tail). Per-GOP YUV is dropped after each pass-1
+/// completion — the streaming invariant. `finish` skips Pass 1
+/// entirely and calls the cascade-only path
+/// (`encode_whole_video_with_shadows_from_prepared`) over the
+/// accumulated `per_gop_natural` + `per_gop_harvests`.
 ///
-/// Per-GOP shadow scope (default) and whole-video shadow scope (this)
-/// coexist; the constructor picks. Whole-video scope is stealth-
-/// stronger but pays the whole-clip memory cost
-/// (~93 MB raw I420 at 1080p × 30 s).
+/// Memory profile: O(one-GOP YUV + per_gop_natural[N_GOPS] +
+/// per_gop_harvests[N_GOPS]). Replaces the pre-WV.6 buffer-all design
+/// that pre-allocated `frame_size × total_frames_hint` upfront
+/// (~2.8 GB at 1080p × 30 s).
 struct Av1WholeVideoState {
     primary_message: Vec<u8>,
     primary_passphrase: String,
     shadows: Vec<Av1ShadowSpec>,
     shadow_parity_len: usize,
-    /// Packed frame-by-frame tight I420 for the whole clip
-    /// (frame 0 Y|U|V, frame 1 Y|U|V, ...). Pre-allocated to
-    /// `frame_size × total_frames_hint` at create.
-    yuv_buffer: Vec<u8>,
+    /// Tight I420 bytes for the in-flight GOP, packed frame-by-frame.
+    /// Capacity is sized to `frame_size × gop_size` and preserved
+    /// across GOP boundaries via `clear()` (no re-allocation per GOP).
+    current_gop_yuv: Vec<u8>,
+    /// Frames accumulated into `current_gop_yuv` since the last GOP
+    /// drain. Resets to 0 when `process_one_gop_pass1` fires.
+    frames_in_current_gop: u32,
+    /// Total frames pushed so far. Used to detect end-of-clip + match
+    /// against `total_frames_hint` at finish.
     frames_pushed: u32,
+    /// Pass-1 accumulators. Grow by one entry per completed GOP.
+    /// At `finish`, length equals `n_gops`.
+    per_gop_natural: Vec<Vec<(Vec<u8>, PhasmFrameRecording<u8>)>>,
+    per_gop_harvests: Vec<super::whole_video::GopHarvest>,
 }
 
 /// Streaming AV1 stego encode session.
@@ -382,6 +394,32 @@ impl Av1StreamingEncodeSession {
             ));
         }
 
+        // Memory budget gate — refuse if predicted peak exceeds the
+        // process-wide budget set by the bridge at startup. Closes
+        // audit P4: previously the whole-video shadow path silently
+        // allocated multi-GB on memory-constrained devices.
+        if let Some(budget) = crate::stego::memory::get_memory_budget() {
+            let predicted = crate::stego::memory::predict_peak_memory_av1_whole_video_shadow(
+                params.width,
+                params.height,
+                params.total_frames_hint,
+                params.gop_size,
+            );
+            if predicted > budget {
+                return Err(Av1StegoError::InvalidPacket(format!(
+                    "session.create_whole_video_with_shadows: predicted peak {} MB \
+                     exceeds memory budget {} MB ({}×{} × {} frames, gop_size {}). \
+                     Try a shorter clip or lower resolution.",
+                    predicted / (1024 * 1024),
+                    budget / (1024 * 1024),
+                    params.width,
+                    params.height,
+                    params.total_frames_hint,
+                    params.gop_size,
+                )));
+            }
+        }
+
         let structural_key = crypto::derive_structural_key(passphrase)?;
         let hhat_seed: [u8; 32] = structural_key[32..]
             .try_into()
@@ -415,22 +453,25 @@ impl Av1StreamingEncodeSession {
             .map_err(Av1StegoError::Stego)?;
 
         let frame_size = expected_i420_size(params.width, params.height);
-        let buf_capacity = frame_size
-            .checked_mul(params.total_frames_hint as usize)
-            .ok_or_else(|| {
-                Av1StegoError::InvalidPacket(format!(
-                    "session.create_whole_video_with_shadows: total YUV size overflow ({} × {})",
-                    frame_size, params.total_frames_hint
-                ))
-            })?;
+        let gop_size = params.gop_size.max(1) as usize;
+        let current_gop_capacity = frame_size.checked_mul(gop_size).ok_or_else(|| {
+            Av1StegoError::InvalidPacket(format!(
+                "session.create_whole_video_with_shadows: per-GOP YUV size overflow ({} × {})",
+                frame_size, gop_size
+            ))
+        })?;
+        let n_gops_hint = expected_n_gops as usize;
 
         let whole_video = Av1WholeVideoState {
             primary_message: frame_bytes,
             primary_passphrase: passphrase.to_string(),
             shadows: shadows.clone(),
             shadow_parity_len,
-            yuv_buffer: Vec::with_capacity(buf_capacity),
+            current_gop_yuv: Vec::with_capacity(current_gop_capacity),
+            frames_in_current_gop: 0,
             frames_pushed: 0,
+            per_gop_natural: Vec::with_capacity(n_gops_hint),
+            per_gop_harvests: Vec::with_capacity(n_gops_hint),
         };
 
         Ok(Self {
@@ -681,7 +722,11 @@ impl Av1StreamingEncodeSession {
             )));
         }
 
-        // Whole-video mode: accumulate without draining.
+        // Whole-video mode: accumulate into current_gop_yuv; at GOP
+        // boundary (or the final frame for a partial tail) run Pass 1
+        // and drop the YUV. Bounds peak memory to one GOP worth of
+        // raw I420 + the per-GOP accumulators — never holds the
+        // whole clip.
         if let Some(wv) = self.whole_video.as_mut() {
             if wv.frames_pushed >= self.params.total_frames_hint {
                 return Err(Av1StegoError::InvalidPacket(format!(
@@ -690,9 +735,26 @@ impl Av1StreamingEncodeSession {
                     wv.frames_pushed, self.params.total_frames_hint
                 )));
             }
-            wv.yuv_buffer.extend_from_slice(yuv_i420);
+            wv.current_gop_yuv.extend_from_slice(yuv_i420);
+            wv.frames_in_current_gop += 1;
             wv.frames_pushed += 1;
             self.frames_pushed_total += 1;
+
+            let full_gop = wv.frames_in_current_gop >= self.params.gop_size;
+            let last_frame_with_tail = wv.frames_pushed
+                == self.params.total_frames_hint
+                && wv.frames_in_current_gop > 0;
+            if full_gop || last_frame_with_tail {
+                let (pf, harvest) = super::whole_video::process_one_gop_pass1(
+                    &wv.current_gop_yuv,
+                    wv.frames_in_current_gop,
+                    self.params,
+                )?;
+                wv.per_gop_natural.push(pf);
+                wv.per_gop_harvests.push(harvest);
+                wv.current_gop_yuv.clear(); // capacity preserved
+                wv.frames_in_current_gop = 0;
+            }
             return Ok(());
         }
 
@@ -859,14 +921,24 @@ impl Av1StreamingEncodeSession {
                     wv.frames_pushed, self.params.total_frames_hint
                 )));
             }
+            // Pass 1 ran incrementally during push_frame; the partial
+            // tail was drained when frames_pushed hit total_frames_hint.
+            // current_gop_yuv must be empty here — defensive check.
+            if wv.frames_in_current_gop != 0 {
+                return Err(Av1StegoError::InvalidPacket(format!(
+                    "session.finish (whole-video): {} frames left in current_gop_yuv \
+                     after streaming Pass 1 — invariant violated",
+                    wv.frames_in_current_gop
+                )));
+            }
             let shadow_refs: Vec<(&str, &[u8])> = wv
                 .shadows
                 .iter()
                 .map(|s| (s.passphrase.as_str(), s.message.as_slice()))
                 .collect();
-            let bytes = super::whole_video::av1_stego_encode_whole_video_with_shadows(
-                &wv.yuv_buffer,
-                wv.frames_pushed,
+            let bytes = super::whole_video::encode_whole_video_with_shadows_from_prepared(
+                &wv.per_gop_natural,
+                &wv.per_gop_harvests,
                 self.params,
                 &wv.primary_message,
                 &wv.primary_passphrase,
@@ -1032,6 +1104,32 @@ impl Av1StreamingDecodeSession {
         )
         .map_err(Av1StegoError::Stego)?;
         Ok(plaintext)
+    }
+
+    /// Same as `finish`, but interprets the decrypted bytes as a
+    /// `payload::encode_payload` frame and returns `(text, files)`.
+    ///
+    /// Use this when the encoder produced the primary message via
+    /// `payload::encode_payload(text, files)` — the canonical mobile
+    /// path (matching the H.264 streaming session's payload framing).
+    /// Falls back to `text-only` if the plaintext doesn't parse as a
+    /// payload frame (treats bytes as raw UTF-8 — only happens for
+    /// pre-FILE encoders that pushed raw text directly).
+    pub fn finish_primary_payload(
+        self,
+    ) -> Result<crate::stego::payload::PayloadData, Av1StegoError> {
+        let plaintext = self.finish()?;
+        match crate::stego::payload::decode_payload(&plaintext) {
+            Ok(pd) => Ok(pd),
+            Err(_) => {
+                let text = String::from_utf8(plaintext)
+                    .map_err(|_| Av1StegoError::ExtractionFailed)?;
+                Ok(crate::stego::payload::PayloadData {
+                    text,
+                    files: Vec::new(),
+                })
+            }
+        }
     }
 
     /// Extract a shadow message using a shadow-specific passphrase.
