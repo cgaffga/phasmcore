@@ -129,12 +129,15 @@ fn enable_coeff_capture() {
     unsafe { core_openh264_sys::phasm_set_post_quant_callback(Some(post_quant_callback)); }
 }
 
-fn disable_coeff_capture() {
-    unsafe { core_openh264_sys::phasm_set_post_quant_callback(None); }
-}
-
 fn take_coeff_capture() -> Vec<(u32, u16, u16, [i16; 256])> {
-    disable_coeff_capture();
+    // B-full.6b.3 (#894): do NOT unregister the global post-quant callback here
+    // (the old `disable_coeff_capture()` call is gone). The COEFF_CAPTURE buffer is
+    // thread_local (per-worker, safe), but `phasm_set_post_quant_callback(None)` is a
+    // PROCESS global — unregistering it would truncate an OVERLAPPING producer's
+    // capture mid-encode. Leaving the callback registered is correct: it fires
+    // per-thread, writes the calling thread's buffer, and no-ops when that buffer is
+    // None (so Pass-2 / plain / consumer encodes — capture off — stay byte-identical).
+    // `enable_coeff_capture`'s registration is idempotent (same fn ptr).
     COEFF_CAPTURE.with(|b| b.borrow_mut().take().unwrap_or_default())
 }
 
@@ -142,14 +145,16 @@ use core_openh264_sys::{
     encoder_pos_to_phasm_position_key, PHASM_MB_TYPE_OTHER, ZZ_SCAN_4X4,
 };
 
-use super::cabac::bin_decoder::slice::{walk_annex_b_for_cover_with_options, WalkOptions};
+use super::cabac::bin_decoder::slice::{
+    walk_annex_b_for_cover_with_options, CoverWalkOutput, WalkOptions,
+};
 use super::stego::cost_weights::{
     combine_bits_4domain, combine_cover_4domain, split_plan_4domain, CostWeights,
 };
 use super::stego::orchestrate::DomainCosts;
 use super::openh264::{
-    set_frame_num, set_pass_mode, Encoder, EncoderError, MbDecision, PassMode,
-    StegoHandlers, StegoSession,
+    set_frame_num, set_pass_mode, Encoder, EncoderError, MbDecision, PassMode, StegoHandlers,
+    StegoSession,
 };
 use super::pass2_cache::DecisionCache;
 use super::stego::hook::{BinKind, EmbedDomain, SyntaxPath};
@@ -280,26 +285,68 @@ pub fn h264_encode_gop_framed_bits(
     cascade_tier: super::stego::tier_filter::CascadeTier,
     headroom: f32,
 ) -> Result<(Vec<u8>, super::stego::tier_filter::CascadeTier), StegoError> {
-    validate_dims(yuv, width, height, n_frames)?;
-    let m_total = frame_bits.len();
-    if m_total == 0 {
-        return Err(StegoError::InvalidVideo("empty frame bits".into()));
-    }
+    // B-full.6b.1 (#894) — the per-GOP encode is split into a payload-INDEPENDENT
+    // producer (clean cover + costs) and a payload-DEPENDENT consumer (STC + emit).
+    // This wrapper preserves the original one-call contract; the streaming session
+    // (`embed_gop_roundtrip_safe`) calls `produce_gop_cover` ONCE then loops
+    // `consume_gop_emit` (shrink-carry) so the clean encode is not repeated per
+    // shrink — and N producers can run in parallel (4b, B-full per-instance state).
+    let products = produce_gop_cover(yuv, width, height, n_frames, opts)?;
+    consume_gop_emit(
+        &products, yuv, width, height, n_frames, opts, frame_bits, hhat_seed,
+        weights, cascade_tier, headroom,
+    )
+}
 
-    // #548 v1.0 BLOCKER fix (2026-05-18) — Reset libencoder-side fork
-    // statics before every encode session. Without this, two
-    // sequential `h264_encode_gop_framed_bits_auto` calls
-    // share fork-side state across the encoder-instance teardown:
-    // Call 2 produces 541 ChromaAc CS Sign diffs vs Call 1's 0
-    // diffs on the same YUV. The bypass scratch + last-MB sentinels
-    // + wire-only flag all carry state that breaks REPLAY-byte-
-    // identity guarantees on subsequent calls. Reproducer:
+/// Payload-INDEPENDENT products of the Pass-1 cover capture for one GOP —
+/// produced by [`produce_gop_cover`], consumed by [`consume_gop_emit`]. The
+/// split is the 4b (#894) parallelism seam: these products depend only on the
+/// GOP YUV + dims + opts, so N producers run concurrently (each its own encoder
+/// instance, B-full per-instance stego state) while the sequential consumer
+/// carries the cross-GOP STC cursor.
+#[cfg(feature = "h264-encoder")]
+pub(crate) struct GopCoverProducts {
+    /// Pass-1 clean bitstream (retained for the PHASM_PERF_TRACE symmetry probe).
+    baseline_bitstream: Vec<u8>,
+    /// 4-domain cover from the Pass-1 walk (record_mvd: true).
+    baseline_walk: CoverWalkOutput,
+    /// J-UNIWARD content costs with the cascade-safety MSL ∞-gate ALREADY applied.
+    /// (The tier filter is payload-dependent ⇒ applied in the consumer.)
+    content_costs: DomainCosts,
+    /// Captured coefficients for Pass-2 replay (P3.3b.4).
+    captured_coeffs: Vec<(u32, u16, u16, [i16; 256])>,
+    /// Pass-1 mode-decision cache for Pass-2 replay (wire_only); None off-path.
+    decision_cache: Option<Arc<Mutex<DecisionCache>>>,
+    /// Resolved wire_only flag — the consumer must use the SAME value so Pass-1
+    /// and Pass-2 take symmetric code paths through the fork.
+    wire_only: bool,
+}
+
+/// 4b producer (#894) — the payload-INDEPENDENT half of the per-GOP encode:
+/// Pass-1 clean+capture, the 4-domain walk, J-UNIWARD content costs, and the
+/// cascade-safety MSL ∞-gate. Byte-identical substitute for the front half of
+/// the old monolithic `h264_encode_gop_framed_bits` (gated by oh264_g4).
+#[cfg(feature = "h264-encoder")]
+pub(crate) fn produce_gop_cover(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+) -> Result<GopCoverProducts, StegoError> {
+    validate_dims(yuv, width, height, n_frames)?;
+
+    // #548 v1.0 BLOCKER fix (2026-05-18) — reset the libencoder-side fork
+    // statics before every encode session. On the production fork the per-MB
+    // bypass scratch + last-MB sentinels + wire-only flag are PROCESS-GLOBAL, so
+    // two sequential encode calls otherwise share fork state across the
+    // encoder-instance teardown: Call 2 produces 541 ChromaAc CS Sign diffs vs
+    // Call 1's 0 on the same YUV, breaking REPLAY byte-identity. Reproducer:
     // `oh264_wire_only_two_sequential_calls_bisect` in
     // `core/tests/oh264_streaming_530_repro.rs`.
     unsafe { core_openh264_sys::phasm_reset_encoder_session_state() };
 
     let trace = perf_trace();
-    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
     mem_trace("00 enter");
 
     let mb_width = width / 16;
@@ -399,7 +446,7 @@ pub fn h264_encode_gop_framed_bits(
     // PHASM_DIAG_UNIFORM_COSTS=1 forces uniform 1.0 costs for the
     // STEGO.A.10 cascade-leak diagnostic — isolates whether the
     // leak is Tier-3-induced or independent.
-    let t_stc = if trace { Some(std::time::Instant::now()) } else { None };
+    let t_cc = if trace { Some(std::time::Instant::now()) } else { None };
     let use_uniform_costs = std::env::var("PHASM_DIAG_UNIFORM_COSTS")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -410,13 +457,12 @@ pub fn h264_encode_gop_framed_bits(
             yuv, width, height, n_frames, &baseline_walk.cover, opts.qp,
         )?
     };
-    if let Some(t) = t_stc {
+    if let Some(t) = t_cc {
         eprintln!(
             "[PHASM_PERF_TRACE]   ├─ content_costs(J-UNIWARD) {:>8.1} ms",
             t.elapsed().as_secs_f64() * 1000.0
         );
     }
-    let t_after_costs = if trace { Some(std::time::Instant::now()) } else { None };
     mem_trace("03 after content_costs");
 
     // STEGO.A.10 fix — apply cascade-safety MSL gate as ∞-cost in
@@ -450,6 +496,75 @@ pub fn h264_encode_gop_framed_bits(
     for i in safe_msl_len..n_msl {
         content_costs.mvd_suffix_lsb[i] = f32::INFINITY;
     }
+
+    if trace {
+        let ms = |d: Option<std::time::Duration>| {
+            d.map(|x| x.as_secs_f64() * 1000.0).unwrap_or(0.0)
+        };
+        eprintln!(
+            "[PHASM_PERF_TRACE]   produce: pass1 {:>8.1} ms  walk {:>8.1} ms  pass1_bs={} bytes",
+            ms(dt_pass1), ms(dt_walk), pass1_bytes,
+        );
+    }
+
+    Ok(GopCoverProducts {
+        baseline_bitstream,
+        baseline_walk,
+        content_costs,
+        captured_coeffs,
+        decision_cache,
+        wire_only,
+    })
+}
+
+/// 4b consumer (#894) — the payload-DEPENDENT half: tier resolution, combine,
+/// the STC plan over the message bits, the override-map build, the Pass-2
+/// wire-only stego emit, and the diagnostics. The cross-GOP cursor-carry lives
+/// in the caller (`embed_gop_roundtrip_safe`), which loops this with shrinking
+/// `frame_bits` while reusing ONE [`GopCoverProducts`] (so the clean Pass-1 is
+/// not re-run per shrink). Byte-identical substitute for the back half of the
+/// old monolithic `h264_encode_gop_framed_bits` (gated by oh264_g4).
+#[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn consume_gop_emit(
+    products: &GopCoverProducts,
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    frame_bits: &[u8],
+    hhat_seed: &[u8; 32],
+    weights: &CostWeights,
+    cascade_tier: super::stego::tier_filter::CascadeTier,
+    headroom: f32,
+) -> Result<(Vec<u8>, super::stego::tier_filter::CascadeTier), StegoError> {
+    let m_total = frame_bits.len();
+    if m_total == 0 {
+        return Err(StegoError::InvalidVideo("empty frame bits".into()));
+    }
+
+    let trace = perf_trace();
+    let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+
+    let mb_width = width / 16;
+    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    // Reuse the producer's payload-independent cover. `content_costs` is cloned
+    // because the tier filter below mutates it in place and one `GopCoverProducts`
+    // is shared across shrink iterations (and, later, the parallel producers).
+    let baseline_bitstream = &products.baseline_bitstream;
+    let baseline_walk = &products.baseline_walk;
+    let mut content_costs = products.content_costs.clone();
+    let captured_coeffs = &products.captured_coeffs;
+    let decision_cache = products.decision_cache.clone();
+    let wire_only = products.wire_only;
+
+    let t_stc = if trace { Some(std::time::Instant::now()) } else { None };
+    let t_after_costs = if trace { Some(std::time::Instant::now()) } else { None };
 
     // D'.3-OH264 (#795) — Track 1 cascade-safety tier filter. Mirrors
     // the pure-Rust integration in encode_pixels.rs:975-1010. Resolves
@@ -676,7 +791,7 @@ pub fn h264_encode_gop_framed_bits(
         // Unit tests pass only on tiny synthetic fixtures where cascade is nil.
         None, // was: Some(&baseline_walk.cover),
         // P3.3b.4: pass captured coefficients for replay with STC flips.
-        Some(&captured_coeffs),
+        Some(captured_coeffs),
         0, // frame_idx_base: whole-clip / per-GOP no-shadow path (no offset)
     );
     /* #549 Bug 4 fix (2026-05-19): do NOT flip wire_only_global back to 0
@@ -999,14 +1114,13 @@ pub fn h264_encode_gop_framed_bits(
                 eprintln!("[PHASM_PERF_TRACE]   {label:<22} {ms:>9.1} ms  ({pct:>5.1}%)");
             }
         };
-        report("Pass 1 OH264 encode", dt_pass1);
-        report("walker (4-domain)", dt_walk);
-        report("combine + STC plan", dt_stc);
+        // (Pass-1 encode + walk are timed in `produce_gop_cover` now.)
+        report("tier + combine + STC", dt_stc);
         report("override map build", dt_overrides);
         report("Pass 2 OH264 stego", dt_pass2);
         eprintln!(
-            "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (100.0%)  pass1_bs={} bytes",
-            "TOTAL", dt_total.as_secs_f64() * 1000.0, pass1_bytes,
+            "[PHASM_PERF_TRACE]   {:<22} {:>9.1} ms  (consume half)",
+            "CONSUME TOTAL", dt_total.as_secs_f64() * 1000.0,
         );
     }
 
@@ -1153,7 +1267,7 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
     let n_cover = combined_cover.len();
     let embeddable = |payload: usize| -> bool {
         let body = cap2_trial_payload(payload);
-        let framed = match super::stego::chunk_frame::build_first_chunk_frame(
+        let framed = match super::stego::chunk_frame::build_first_chunk_frame_v3_1(
             body.len().max(1) as u32,
             &body,
         ) {
@@ -1185,7 +1299,7 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
     if !embeddable(0) {
         return 0;
     }
-    let header = super::stego::chunk_frame::CHUNK_FRAME_FIRST_HEADER_LEN;
+    let header = super::stego::chunk_frame::CHUNK_FRAME_FIRST_HEADER_LEN_V3_1;
     let hard_max = (n_cover / 8).saturating_sub(header);
     if hard_max == 0 {
         return 0;
@@ -1251,22 +1365,14 @@ pub(crate) fn h264_gop_capacity(
             }
         };
     }
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
-    let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
-    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
-    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let bitstream = encode_once(
-        gop_yuv, width, height, gop_n_frames, opts,
-        empty_map, mb_type_table, applied,
-        mb_width, mb_per_frame,
-        /* dual_recon = */ false,
-        PassMode::Passthrough,
-        None,
-        None,
-        None,
-        0, // frame_idx_base: whole-clip (no offset)
-    )?;
+    // 4a (#893): global-free clean cover — no StegoSession / fork-global touches,
+    // so the per-GOP probe is thread-safe for the parallel-GOP runner
+    // (`streaming_map_ordered`). Byte-identical to the prior
+    // `encode_once(Passthrough, dual_recon=false, frame_idx_base=0)` it replaces
+    // (B-lite.1 gate `blite1_clean_encode_matches_plain`), so capacity is
+    // unchanged. Everything downstream (walk / content costs / safe-MSL gate /
+    // STC trial) is already pure Rust.
+    let bitstream = clean_encode_gop(gop_yuv, width, height, gop_n_frames, opts)?;
     let baseline_walk = walk_annex_b_for_cover_with_options(
         &bitstream,
         WalkOptions { record_mvd: true, ..Default::default() },
@@ -1401,6 +1507,11 @@ pub(crate) fn oh264_plain_encode_gop(
     n_frames: u32,
     opts: EncodeOpts,
 ) -> Result<Vec<u8>, StegoError> {
+    // #548 v1.0 BLOCKER fix — reset the process-global fork statics (bypass
+    // scratch + last-MB sentinels + wire-only flag) before this encode session,
+    // exactly like the stego path. They are process-global on the production
+    // fork, so a prior GOP's state would otherwise leak into this plain-tail
+    // encode (see `produce_gop_cover`).
     unsafe { core_openh264_sys::phasm_reset_encoder_session_state() };
     let mb_width = width / 16;
     let mb_per_frame = ((width / 16) * (height / 16)) as usize;
@@ -1418,6 +1529,53 @@ pub(crate) fn oh264_plain_encode_gop(
         None,
         0, // frame_idx_base: whole-clip plain-tail GOP (no offset)
     )
+}
+
+/// Global-free clean cover encode of one GOP — a bare [`Encoder`]
+/// (`dual_recon=false`) with NO `StegoSession`, NO
+/// `phasm_reset_encoder_session_state`, NO `set_frame_num` / `set_pass_mode`.
+/// The encode loop is byte-for-byte the same as [`oh264_plain_encode_gop`]'s
+/// (same `Encoder` params, frame slicing, and `frame*33` timestamp) — the only
+/// differences are the omitted global touches, which are no-ops on the clean
+/// path: the sequential capacity probe (`h264_gop_capacity`) is its only caller
+/// and runs with no stego `StegoSession` registered, so the fork's MB hooks read
+/// the (null) process-global callbacks and no-op. Gated byte-identical to
+/// `oh264_plain_encode_gop` by `blite1_clean_encode_matches_plain`.
+#[cfg(feature = "h264-encoder")]
+pub(crate) fn clean_encode_gop(
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+) -> Result<Vec<u8>, StegoError> {
+    validate_dims(gop_yuv, width, height, n_frames)?;
+    let mut encoder = Encoder::new_with_dual_recon(
+        width as i32,
+        height as i32,
+        opts.qp,
+        opts.intra_period,
+        /* dual_recon = */ false,
+    )
+    .map_err(encoder_err_to_stego)?;
+
+    let frame_y = (width * height) as usize;
+    let frame_uv = (width * height / 4) as usize;
+    let frame_total = frame_y + 2 * frame_uv;
+
+    let mut out = vec![0u8; 4 * 1024 * 1024];
+    let mut bitstream = Vec::with_capacity(2 * 1024 * 1024);
+    for frame in 0..n_frames {
+        let base = (frame as usize) * frame_total;
+        let y = &gop_yuv[base..base + frame_y];
+        let u = &gop_yuv[base + frame_y..base + frame_y + frame_uv];
+        let v = &gop_yuv[base + frame_y + frame_uv..base + frame_total];
+        let (_, n) = encoder
+            .encode_frame(y, u, v, (frame as i64) * 33, &mut out)
+            .map_err(encoder_err_to_stego)?;
+        bitstream.extend_from_slice(&out[..n]);
+    }
+    Ok(bitstream)
 }
 
 fn encode_once(
@@ -1472,6 +1630,9 @@ fn encode_once(
     // base relabels positions without changing the emitted bytes.
     frame_idx_base: u32,
 ) -> Result<Vec<u8>, StegoError> {
+    // PHASM_PROFILE — the OpenH264 C encoder (per-GOP encode_frame loop). Called
+    // from every pass: probe / clean cover / Pass-2 stego re-emit / tier / sweeps.
+    let _prof = crate::codec::h264::profile::scope("oh264.encode_once");
     // Reset per-encode state.
     {
         let mut t = mb_type_table.lock().expect("mb_type lock");
@@ -1591,12 +1752,19 @@ fn encode_once(
         })),
         ..Default::default()
     };
-    let _session = StegoSession::register(handlers)
-        .map_err(|e| StegoError::InvalidVideo(format!("openh264 session: {e}")))?;
-
     let mut encoder =
         Encoder::new_with_dual_recon(width as i32, height as i32, opts.qp, opts.intra_period, dual_recon)
             .map_err(encoder_err_to_stego)?;
+
+    // Register the stego handlers process-globally for this encode. No
+    // per-instance `PhasmStegoState` is installed, so the fork's MB hooks fall
+    // back to the process-global callback table (`has_session_state == 0`): the
+    // Pass-1 capture / Pass-2 replay / emit-override dispatch all run through
+    // `handlers`. The `StegoSession` RAII guard unregisters on drop, and each
+    // `encode_once` scopes its own session — correct for the sequential encode
+    // path (producer Pass-1, then consumer Pass-2, never concurrent).
+    let _session = StegoSession::register(handlers)
+        .map_err(|e| StegoError::InvalidVideo(format!("openh264 session: {e}")))?;
 
     let frame_y = (width * height) as usize;
     let frame_uv = (width * height / 4) as usize;
@@ -1871,7 +2039,7 @@ fn embed_primary_per_gop_4domain(
     frame_bytes: &[u8],
     hhat_seed: &[u8; 32],
 ) -> Result<Vec<u8>, StegoError> {
-    use crate::stego::chunk_frame::{build_chunk_frame, build_first_chunk_frame};
+    use crate::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_v3_1};
 
     let n_cs = cover.coeff_sign_bypass.len();
     let n_csl = cover.coeff_suffix_lsb.len();
@@ -1955,9 +2123,9 @@ fn embed_primary_per_gop_4domain(
         loop {
             let chunk = &frame_bytes[cursor..cursor + want];
             let framed = if is_first {
-                build_first_chunk_frame(total_bytes, chunk)?
+                build_first_chunk_frame_v3_1(total_bytes, chunk)?
             } else {
-                build_chunk_frame(chunk)?
+                build_chunk_frame_v3_1(chunk)?
             };
             let frame_bits = bytes_to_bits_msb_first(&framed);
             let m = frame_bits.len();
@@ -2994,8 +3162,10 @@ pub fn h264_encode_with_shadows_streaming<'a>(
     let mut wrapped = ProgressYuvSource { inner: source, prog: &prog };
 
     // ── Tier (dep 3, O(GOP) pre-pass) + Sweep A. ──
+    let _t_tier = std::time::Instant::now();
     let tier_idx =
         streaming_tier_prepass(&mut wrapped, width, height, n_frames, opts, frame_bytes.len())?;
+    crate::codec::h264::profile::record("phase.1_tier_prepass", _t_tier.elapsed());
     // Capacity = n_total at the largest parity tier (select once; prefix per tier).
     let capacities: Vec<usize> = shadows
         .iter()
@@ -3006,10 +3176,12 @@ pub fn h264_encode_with_shadows_streaming<'a>(
             .map(|(bits, _)| bits.len())
         })
         .collect::<Result<_, _>>()?;
+    let _t_sa = std::time::Instant::now();
     let sa = sweep_a(
         &mut wrapped, width, height, n_frames, opts, &frame_bytes, &hhat_seed, shadows,
         &capacities, tier_idx, weights,
     )?;
+    crate::codec::h264::profile::record("phase.2_sweep_a", _t_sa.elapsed());
 
     // ── Phase 4: parity-tier cascade (Sweep B emit + streaming verify). ──
     let gop_size = opts.intra_period.max(1) as u32;
@@ -3028,10 +3200,12 @@ pub fn h264_encode_with_shadows_streaming<'a>(
             continue;
         }
 
+        let _t_sb = std::time::Instant::now();
         let (bytes, gop_lens) = sweep_b_emit(
             &mut wrapped, width, height, n_frames, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs,
             parity_len, tier_idx, weights,
         )?;
+        crate::codec::h264::profile::record("phase.3_sweep_b_emit", _t_sb.elapsed());
 
         // WV.6.g.5 — streaming verify: re-decode the emitted clip ONE GOP at a
         // time (no O(clip) walk_final), faithfully mirroring the decoder's
@@ -3039,10 +3213,13 @@ pub fn h264_encode_with_shadows_streaming<'a>(
         // Ticks `prog` per GOP (pass 4 of 4) so the bar keeps moving through verify.
         let n_totals_tier: Vec<usize> = shadow_rs.iter().map(|(bits, _)| bits.len()).collect();
         let mut verify_tick = || prog.tick();
-        if streaming_shadow_verify(
+        let _t_verify = std::time::Instant::now();
+        let verified = streaming_shadow_verify(
             &bytes, &gop_lens, width, height, gop_size, shadows, &n_totals_tier,
             Some(&mut verify_tick),
-        )? {
+        )?;
+        crate::codec::h264::profile::record("phase.4_shadow_verify", _t_verify.elapsed());
+        if verified {
             prog.finish();
             return Ok(bytes);
         }
@@ -3456,7 +3633,7 @@ fn embed_primary_one_gop(
     n_gops: u32,
     hhat_seed: &[u8; 32],
 ) -> Result<(Vec<u8>, usize), StegoError> {
-    use crate::stego::chunk_frame::{build_chunk_frame, build_first_chunk_frame};
+    use crate::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_v3_1};
 
     let total_bytes =
         u32::try_from(frame_bytes.len()).map_err(|_| StegoError::MessageTooLarge)?;
@@ -3481,9 +3658,9 @@ fn embed_primary_one_gop(
     loop {
         let chunk = &frame_bytes[cursor..cursor + want];
         let framed = if is_first {
-            build_first_chunk_frame(total_bytes, chunk)?
+            build_first_chunk_frame_v3_1(total_bytes, chunk)?
         } else {
-            build_chunk_frame(chunk)?
+            build_chunk_frame_v3_1(chunk)?
         };
         let frame_bits = bytes_to_bits_msb_first(&framed);
         let m = frame_bits.len();
@@ -4243,6 +4420,40 @@ mod tests {
             }
         }
         out
+    }
+
+    /// B-lite.1 (#890) gate — the global-free `clean_encode_gop` producer is
+    /// byte-identical to the production `oh264_plain_encode_gop` on the clean
+    /// path. Running plain FIRST leaves the fork globals clean (its StegoSession
+    /// drops to a null callback table; pass_mode reset to Passthrough), so the
+    /// clean producer (which touches none of them) sees the same state. A
+    /// divergence here means the StegoSession / reset / set_frame_num the clean
+    /// producer omits are NOT no-ops on the clean path.
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn blite1_clean_encode_matches_plain() {
+        let _g = SESSION_TEST_MUTEX.lock().unwrap();
+        const W: u32 = 176;
+        const H: u32 = 96;
+        const NF: u32 = 8;
+        let yuv = synth_yuv(W, H, NF);
+        let plain = oh264_plain_encode_gop(&yuv, W, H, NF, EncodeOpts { qp: 26, intra_period: 30 })
+            .expect("plain encode");
+        let clean = clean_encode_gop(&yuv, W, H, NF, EncodeOpts { qp: 26, intra_period: 30 })
+            .expect("clean encode");
+        assert!(plain.len() > 64, "plain encode suspiciously small: {}", plain.len());
+        assert_eq!(
+            clean,
+            plain,
+            "clean_encode_gop diverged from oh264_plain_encode_gop ({} vs {} bytes) — \
+             the omitted StegoSession/reset/set_frame_num are NOT no-ops on the clean path",
+            clean.len(),
+            plain.len()
+        );
+        eprintln!(
+            "blite1: clean_encode_gop byte-identical to oh264_plain_encode_gop ({} bytes, {W}x{H} {NF}f)",
+            clean.len()
+        );
     }
 
     // The full round-trip lives in the `openh264_stego_roundtrip`

@@ -101,6 +101,21 @@ pub struct VideoEncodeArgs {
     #[arg(long, default_value_t = 30)]
     pub gop_size: usize,
 
+    /// AV1 rav1e quantizer (0..=255). Higher = more compression / smaller
+    /// file / more distortion. Mobile bridges default to ~100; the AV1
+    /// CLI path defaulted to `PHASM_AV1_QUANTIZER` env-var or 100. When
+    /// set, this flag overrides both. Only used by `--codec av1`.
+    #[arg(long)]
+    pub av1_quantizer: Option<usize>,
+
+    /// AV1 rav1e speed preset (0..=10). 0 = slowest / best quality
+    /// + stealth fingerprint matching real-world rav1e; 10 = fastest
+    /// / simplified mode decisions. Default (when unset) is rav1e's
+    /// own default (currently 6). Translates to `PHASM_AV1_SPEED` so
+    /// the same knob works via env var too. Only used by `--codec av1`.
+    #[arg(long)]
+    pub av1_speed: Option<u8>,
+
     /// File attachment for the primary message (repeatable). Shadow video only.
     #[arg(long, action = clap::ArgAction::Append)]
     pub attach: Vec<PathBuf>,
@@ -216,11 +231,29 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                              is text-only for now; files ignored."
                         );
                     }
+                    // AV1 knob override: --av1-quantizer / --av1-speed
+                    // flags fold into the env vars the core layer already
+                    // reads. Keeps `run_av1_encode` signature stable.
+                    // SAFETY: single-threaded init (still in main, no rayon
+                    // worker pool yet).
+                    if let Some(q) = args.av1_quantizer {
+                        unsafe { std::env::set_var("PHASM_AV1_QUANTIZER", q.to_string()); }
+                    }
+                    if let Some(s) = args.av1_speed {
+                        unsafe { std::env::set_var("PHASM_AV1_SPEED", s.to_string()); }
+                    }
                     run_av1_encode(
                         &args.video, &message, &passphrase, &output_path,
                         args.gop_size, args.optimize,
                     )?;
                 } else {
+                    // SAFETY: see above.
+                    if let Some(q) = args.av1_quantizer {
+                        unsafe { std::env::set_var("PHASM_AV1_QUANTIZER", q.to_string()); }
+                    }
+                    if let Some(s) = args.av1_speed {
+                        unsafe { std::env::set_var("PHASM_AV1_SPEED", s.to_string()); }
+                    }
                     // WV.7.14 — streaming shadow path. O(GOP) working
                     // set via Av1FileYuvSource over the ffmpeg temp.
                     run_av1_shadow_encode_streaming(
@@ -349,7 +382,9 @@ fn run_oh264_encode(
         // O(GOP); the non-shadow probe + tier-report + encode passes still
         // index the whole clip, so this is the OOM-safe equivalent — true
         // O(GOP) here would need a streaming `h264_resolve_auto_tier`.)
-        transcode::decode_to_yuv(input, &yuv_temp)?;
+        let _t_decode = std::time::Instant::now();
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 16)?;
+        phasm_core::codec::h264::profile::record("phase.decode_ffmpeg", _t_decode.elapsed());
         let yuv_file = std::fs::File::open(&yuv_temp)?;
         // SAFETY: `yuv_temp` is our own freshly-written temp file (above), not
         // modified concurrently for the lifetime of this map.
@@ -449,6 +484,7 @@ fn run_oh264_encode(
         // (0.5, provisional — pending stealth-corpus calibration). Supersedes the 1.0
         // pure-proportional spread, whose r_target was inert.
         use phasm_core::codec::h264::stego::chunk_frame::CAP2_DEFAULT_R_TARGET;
+        let _t_probe = std::time::Instant::now();
         let per_gop_caps: Vec<usize> = {
             let mut probe_session = StreamingProbeSession::create(params.clone())?;
             for frame_idx in 0..probe.n_frames {
@@ -469,7 +505,9 @@ fn run_oh264_encode(
             let (_probe_result, caps) = probe_session.finish_with_per_gop()?;
             caps
         };
+        phasm_core::codec::h264::profile::record("phase.probe_pass", _t_probe.elapsed());
 
+        let _t_encode = std::time::Instant::now();
         let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
         if session.plan_proportional(&per_gop_caps, CAP2_DEFAULT_R_TARGET)? {
             eprintln!(
@@ -479,6 +517,11 @@ fn run_oh264_encode(
             );
         }
 
+        // Sequential per-GOP encode. (Parallel-GOP `encode_pull` was tried and
+        // REVERTED 2026-06-30: thread-parallel GOPs gave no speedup — N=cores was
+        // 2.1x slower — because per-GOP work is already multicore (rayon J-UNIWARD
+        // costs + auto-threaded OpenH264), so fanning out GOPs only oversubscribes.
+        // See docs/design/video/h264/oh264-parallel-gop-encode.md §3.1.)
         let mut annex_b: Vec<u8> = Vec::with_capacity(yuv_bytes.len() / 8);
         for frame_idx in 0..probe.n_frames {
             let frame_off = frame_idx * frame_bytes;
@@ -498,11 +541,17 @@ fn run_oh264_encode(
         }
         // Drain the final partial GOP (consumes the session).
         session.finish(&mut annex_b)?;
+        phasm_core::codec::h264::profile::record("phase.encode_pass", _t_encode.elapsed());
         drop(yuv_bytes); // free YUV before mux
 
+        let _t_mux = std::time::Instant::now();
         write_and_mux_oh264(
             &annex_b, &annex_b_temp, input, &probe, probe.n_frames, gop_size, output,
         )?;
+        phasm_core::codec::h264::profile::record("phase.mux", _t_mux.elapsed());
+        phasm_core::codec::h264::profile::dump(
+            "H.264 NON-shadow encode (CLI: probe pass + encode pass)",
+        );
         Ok(())
     })();
 
@@ -576,7 +625,7 @@ fn run_oh264_shadow_encode(
     use phasm_core::CostWeights;
 
     transcode::ensure_ffmpeg_available()?;
-    let probe = transcode::probe_video(input)?;
+    let mut probe = transcode::probe_video(input)?;
     eprintln!(
         "Encoding via OpenH264 (streaming shadow, {} shadow{}): {}x{} @ {} fps{}",
         shadows.len(),
@@ -590,7 +639,9 @@ fn run_oh264_shadow_encode(
     let mut cleanup_paths = vec![yuv_temp.clone(), annex_b_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
-        transcode::decode_to_yuv(input, &yuv_temp)?;
+        let _t_decode = std::time::Instant::now();
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 16)?;
+        phasm_core::codec::h264::profile::record("phase.decode_ffmpeg", _t_decode.elapsed());
 
         // Exact frame count from the file SIZE — no whole-clip load (O(GOP) RAM).
         let frame_size = (probe.width as usize) * (probe.height as usize) * 3 / 2;
@@ -633,16 +684,23 @@ fn run_oh264_shadow_encode(
                 let _ = std::io::Write::flush(&mut std::io::stderr());
             }
         };
+        let _t_enc = std::time::Instant::now();
         let annex_b = h264_encode_with_shadows_streaming(
             &mut source, probe.width, probe.height, n_frames, opts,
             message, primary_files, passphrase, &video_shadows, &weights,
             Some(&mut progress_cb),
         )?;
+        phasm_core::codec::h264::profile::record("phase.shadow_encode_total", _t_enc.elapsed());
         eprintln!(); // terminate the progress line
 
+        let _t_mux = std::time::Instant::now();
         write_and_mux_oh264(
             &annex_b, &annex_b_temp, input, &probe, n_frames as usize, GOP_SIZE, output,
         )?;
+        phasm_core::codec::h264::profile::record("phase.mux", _t_mux.elapsed());
+        phasm_core::codec::h264::profile::dump(
+            "H.264 SHADOW encode (streaming: tier + sweepA + sweepB + verify)",
+        );
         Ok(())
     })();
 
@@ -681,7 +739,7 @@ fn run_av1_shadow_encode_streaming(
     use phasm_core::Av1StreamingEncodeParams;
 
     transcode::ensure_ffmpeg_available()?;
-    let probe = transcode::probe_video(input)?;
+    let mut probe = transcode::probe_video(input)?;
     eprintln!(
         "Encoding via phasm-rav1e (AV1 streaming shadow, {} shadow{}): {}x{} × {} frames @ {} fps{}",
         shadows.len(),
@@ -689,13 +747,7 @@ fn run_av1_shadow_encode_streaming(
         probe.width, probe.height, probe.n_frames, probe.frame_rate,
         if probe.has_audio { " (with audio)" } else { "" },
     );
-    if probe.width % 8 != 0 || probe.height % 8 != 0 {
-        return Err(CliError::InvalidArgs(format!(
-            "AV1 encode requires 8-aligned dimensions; got {}x{} \
-             (crop / pre-scale with ffmpeg first)",
-            probe.width, probe.height,
-        )));
-    }
+    // Non-8-aligned sources are CROPPED in `decode_to_yuv_aligned` below.
     if shadows.iter().any(|s| !s.files.is_empty()) {
         eprintln!(
             "note: shadow --attach flags are not yet supported on the AV1 CLI \
@@ -707,7 +759,7 @@ fn run_av1_shadow_encode_streaming(
     let mut cleanup_paths = vec![yuv_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
-        transcode::decode_to_yuv(input, &yuv_temp)?;
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 8)?;
 
         // Exact frame count from file SIZE — no whole-clip load.
         let frame_size = (probe.width as usize) * (probe.height as usize) * 3 / 2;
@@ -853,15 +905,14 @@ fn run_av1_encode(
     optimize: bool,
 ) -> Result<(), CliError> {
     let _ = optimize; // matches the H.264 wiring-only TODO; video optimizer is a follow-on
-    use phasm_core::{
-        av1_capacity, Av1StegoError, Av1StreamingEncodeParams, Av1StreamingEncodeSession,
-        Av1StreamingProbeSession,
-    };
-    use phasm_core::codec::av1::stego::session::Av1PlanOutcome;
+    // #225 follow-up (AV1 merge 2026-06-30): the push API (Av1StreamingEncodeSession /
+    // Av1StreamingProbeSession / Av1PlanOutcome / plan_safe_balanced) was deleted; this
+    // body was migrated to the pull API (`av1_encode_streaming` over `Av1SliceYuvSource`,
+    // imported locally below). Only the dead imports remained — removed here.
+    use phasm_core::{av1_capacity, Av1StreamingEncodeParams};
     use phasm_core::codec::mp4::build::{
         build_mp4_av1, build_mp4_av1_with_audio, FrameTiming,
     };
-    use phasm_core::stego::calibration::AllocationCalibration;
     use phasm_core::stego::payload;
 
     transcode::ensure_ffmpeg_available()?;
@@ -872,22 +923,16 @@ fn run_av1_encode(
         if probe.has_audio { " (with audio)" } else { "" },
     );
 
-    // AV1 requires 8-byte alignment (vs H.264's 16-byte). Most real-world
-    // sources are 8-aligned (1920×1080, 1280×720, 640×480, …); flag a
-    // clear error rather than silently cropping.
-    if probe.width % 8 != 0 || probe.height % 8 != 0 {
-        return Err(CliError::InvalidArgs(format!(
-            "AV1 encode requires 8-aligned dimensions; got {}x{} \
-             (crop / pre-scale with ffmpeg first)",
-            probe.width, probe.height
-        )));
-    }
+    // AV1 requires 8-pixel alignment (vs H.264's 16). Non-8-aligned
+    // sources are CROPPED (top-left) to the nearest 8-grid in
+    // `decode_to_yuv_aligned` below (probe.width/height are updated to the
+    // encoded dims).
 
     let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
     let mut cleanup_paths = vec![yuv_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
-        transcode::decode_to_yuv(input, &yuv_temp)?;
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 8)?;
         let yuv_bytes = std::fs::read(&yuv_temp)?;
 
         // Reconcile container nb_frames vs decoded buffer (same gotcha
@@ -929,18 +974,17 @@ fn run_av1_encode(
             quantizer = 100;
         }
         let encode_gop_size: u32 = cli_gop_size.max(1) as u32;
-        let probe_params = Av1StreamingEncodeParams {
+        // T2.4: probe runs at the real encode_gop_size now (not
+        // gop_size=1). Single Av1StreamingEncodeParams shared by the
+        // closed-form `av1_capacity` announcement and the per-GOP
+        // `Av1StreamingProbeSession` below — both produce numbers
+        // calibrated against what the encode actually emits.
+        let encode_params = Av1StreamingEncodeParams {
             width: probe.width,
             height: probe.height,
             quantizer,
-            // Probe API contract: gop_size=1 (D-phase per-frame cover
-            // count). Encode session below uses the real encode_gop_size.
-            gop_size: 1,
-            total_frames_hint: probe.n_frames as u32,
-        };
-        let encode_params = Av1StreamingEncodeParams {
             gop_size: encode_gop_size,
-            ..probe_params
+            total_frames_hint: probe.n_frames as u32,
         };
 
         // Mobile reports a per-MB cap before encode runs. CLI mirrors
@@ -949,86 +993,62 @@ fn run_av1_encode(
         // invocation. Failure is best-effort (skip the announcement,
         // proceed with encode — the encode itself surfaces real
         // overflow as `MessageTooLarge`).
-        if let Ok(info) = av1_capacity(&yuv_bytes, probe_params) {
+        if let Ok(info) = av1_capacity(&yuv_bytes, encode_params) {
             eprintln!(
                 "  Tier 1 cover: {} bits   primary cap: {} B   payload: {} B",
                 info.cover_size_bits, info.primary_max_message_bytes, primary_bytes.len(),
             );
         }
 
-        // ── G.2.P4 per-GOP probe + plan_safe_balanced.
-        // Mirror of the Android transcoder's flow
-        // (`PhasmAv1Transcoder.kt::probePerGopCaps` + the
-        // `av1SessionPlanSafeBalanced` step). Runs the probe at
-        // gop_size=1, aggregates per-frame caps into per-encode-GOP
-        // caps, then installs the balanced plan in one
-        // `plan_safe_balanced` iteration with full-clip samples.
-        let per_frame_cover_bits: Vec<usize> = {
-            let mut probe_session = Av1StreamingProbeSession::create(probe_params)
-                .map_err(av1_err_to_cli)?;
-            for frame_idx in 0..probe.n_frames {
-                let off = frame_idx * frame_size;
-                probe_session
-                    .push_frame(&yuv_bytes[off..off + frame_size])
-                    .map_err(av1_err_to_cli)?;
-            }
-            probe_session.finish().per_gop_byte_caps()
+        // ── MOBOOM.T3.7: route the CLI no-shadow encode through the
+        // streaming pull-source entry. The legacy
+        // `Av1StreamingEncodeSession` push-loop + `plan_safe_balanced`
+        // path is replaced with `av1_encode_streaming` over an
+        // `Av1SliceYuvSource` (in-memory — yuv_bytes is already
+        // loaded for the capacity probe above so no duplicate IO).
+        //
+        // The probe + per-GOP balanced allocator is dropped from this
+        // path in v1: `av1_encode_streaming` uses even-split (one
+        // chunk per GOP) which works for typical CLI use cases.
+        // MessageTooLarge will surface at encode time. Threading
+        // per-GOP allocation through the streaming entry is the
+        // follow-on if real CLI clips hit it.
+        //
+        // Byte-identity to the legacy push-session is gated by core
+        // tests (`av1_no_shadow_streaming_byte_identical.rs`). Wire
+        // format unchanged for recipients.
+        use phasm_core::codec::av1::stego::whole_video::{
+            av1_encode_streaming, Av1SliceYuvSource,
         };
+        use phasm_core::stego::{crypto, frame};
 
-        // Aggregate the per-frame byte caps into per-encode-GOP caps.
-        // The probe yields one entry per frame (each frame = its own
-        // probe GOP); the encode uses `encode_gop_size`-frame GOPs.
-        let g = encode_gop_size as usize;
-        let n_encode_gops = (per_frame_cover_bits.len() + g - 1) / g.max(1);
-        let mut per_gop_caps: Vec<usize> = vec![0; n_encode_gops];
-        for (i, &c) in per_frame_cover_bits.iter().enumerate() {
-            per_gop_caps[i / g] = per_gop_caps[i / g].saturating_add(c);
-        }
+        // Two-stage primary framing — the streaming entry takes
+        // pre-encrypt + pre-frame::build_frame bytes. `primary_bytes`
+        // above is the inner `payload::encode_payload` framing; the
+        // session API does the outer encrypt+build_frame internally,
+        // the streaming entry doesn't.
+        let (ciphertext, nonce, salt) =
+            crypto::encrypt(&primary_bytes, passphrase).map_err(CliError::from)?;
+        let primary_framed =
+            frame::build_frame(primary_bytes.len(), &salt, &nonce, &ciphertext);
 
-        let mut session = Av1StreamingEncodeSession::create(passphrase, &primary_bytes, encode_params)
-            .map_err(av1_err_to_cli)?;
-
-        let samples: Vec<(usize, usize)> = per_gop_caps
-            .iter()
-            .copied()
-            .enumerate()
-            .collect();
-        match session.plan_safe_balanced(
-            &samples, g, &AllocationCalibration::AV1_1080P_QP30,
-        ).map_err(av1_err_to_cli)? {
-            Av1PlanOutcome::Installed { window } => {
-                eprintln!(
-                    "  balanced plan: W={} / n_gops={}",
-                    window, per_gop_caps.len()
-                );
-            }
-            Av1PlanOutcome::NeedMoreSamples { total_target, .. } => {
-                // Should not happen with full-clip samples — the planner
-                // has all caps available. Log + fall through to the
-                // default even-split (always safe).
-                eprintln!(
-                    "note: plan_safe_balanced unexpectedly NeedMoreSamples \
-                     (total_target={}) with full-clip samples; using even-split",
-                    total_target
-                );
-            }
-            Av1PlanOutcome::MessageTooLarge => {
-                return Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-                    "message exceeds AV1 cover-bit capacity at this video size \
-                     (run `phasm video-capacity --codec av1` to see the cap)"
-                        .into(),
-                )));
-            }
-        }
-
-        let mut obus: Vec<u8> = Vec::with_capacity(yuv_bytes.len() / 8);
-        for frame_idx in 0..probe.n_frames {
-            let off = frame_idx * frame_size;
-            session
-                .push_frame(&yuv_bytes[off..off + frame_size], &mut obus)
-                .map_err(av1_err_to_cli)?;
-        }
-        session.finish(&mut obus).map_err(av1_err_to_cli)?;
+        let n_frames = probe.n_frames as u32;
+        let mut source = Av1SliceYuvSource::new(
+            &yuv_bytes,
+            probe.width,
+            probe.height,
+            n_frames,
+            encode_gop_size,
+        );
+        let obus = av1_encode_streaming(
+            &mut source,
+            n_frames,
+            encode_params,
+            &primary_framed,
+            passphrase,
+            None,
+        )
+        .map_err(av1_err_to_cli)?;
 
         if obus.is_empty() {
             return Err(CliError::from(phasm_core::StegoError::InvalidVideo(

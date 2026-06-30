@@ -1052,26 +1052,21 @@ pub fn harvest_cover_bits_from_stego(
 /// frame from `cover_bits`. Returns `(total_bytes, payload)` on
 /// success.
 ///
-/// Iterates `w` ∈ `[1..]`, computing `m_total = n_cover / w` for each
-/// candidate. The encoder picks `w_e = max(1, n_cover / m_bits_e)`
-/// where `m_bits_e = (header + payload_len) * 8`; over-extraction at
-/// the decoder's m_total ≥ m_bits_e lands as trailing garbage and is
-/// harmless under length-strict parsing (see `parse_first_chunk_frame`).
+/// v3.1 semantics (#888, AV1 step 6):
+/// - 80-bit prefix `(u32 total_bytes + u32 m_total + u16 payload_len)`.
+/// - Exact `stored_m_total == iter_m_total` reject (1/2³² survival rate)
+///   replaces v3's canonicality + LEN_SENTINEL-bypass branching and
+///   collapses surviving candidates to ~1 full extract per slab.
+/// - Total_bytes sanity: ∈ (0, max_total_bytes].
+/// - Full extract + `parse_first_chunk_frame_v3_1` on prefix match.
 ///
-/// v3 semantics:
-/// - 48-bit prefix `(u32 total_bytes + u16 payload_len)` for fast reject.
-/// - Sanity check: `total_bytes ∈ (0, max_total_bytes]`.
-/// - Length-strict inline-form check: `m_total/8 == 6 + payload_len`
-///   when `payload_len != LEN_SENTINEL`.
-/// - Full extract + `parse_first_chunk_frame` on prefix match.
+/// Iterates `m_total += 8` (not `w in 1..=max_w` as v3 did), so the
+/// loop visits the encoder's chosen `m_total` value directly — required
+/// for the exact reject to land. Mirrors the H.264 v3.1 implementation
+/// in `core/src/codec/h264/streaming_session.rs::extract_first_chunk_frame_match`.
 ///
-/// `max_total_bytes` is a caller-supplied sanity ceiling (e.g.,
-/// `u32::MAX` for no upper bound, or a tighter bound from the
-/// transcoder's expected message-size class). Random wrong-passphrase
-/// candidates surviving the 48-bit prefix check are ~1 / 2^32 × the
-/// length-strict filter — effectively zero false-positives.
-///
-/// See `docs/design/video/chunk-frame-v3.md` for the wire format.
+/// See `docs/design/video/h264/chunk-frame-v3.1-decode.md` for the wire
+/// format and survivor-cost analysis.
 #[cfg(feature = "av1-decoder")]
 pub(crate) fn extract_first_chunk_frame_match(
     cover_bits: &[u8],
@@ -1079,96 +1074,74 @@ pub(crate) fn extract_first_chunk_frame_match(
     max_total_bytes: u32,
 ) -> Option<(u32, Vec<u8>)> {
     use crate::stego::chunk_frame::{
-        parse_first_chunk_frame, CHUNK_FRAME_FIRST_HEADER_LEN, LEN_SENTINEL,
+        parse_first_chunk_frame_v3_1, CHUNK_FRAME_FIRST_HEADER_LEN_V3_1,
     };
     use crate::stego::stc::extract::stc_extract_prefix;
 
     let n_cover = cover_bits.len();
-    let min_m = CHUNK_FRAME_FIRST_HEADER_LEN * 8; // 48 bits
+    let min_m = CHUNK_FRAME_FIRST_HEADER_LEN_V3_1 * 8; // 80 bits
     if n_cover < min_m {
         return None;
     }
-    let max_w = n_cover / min_m;
-
-    for w in 1..=max_w {
-        let m_total = n_cover / w;
-        if m_total < min_m {
+    let mut m_total = min_m;
+    while m_total <= n_cover {
+        let w = n_cover / m_total;
+        if w == 0 {
             break;
         }
         let used = m_total * w;
         let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
 
-        // 48-bit prefix: u32 total_bytes + u16 payload_len.
-        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 48);
-        if prefix_bits.len() < 48 {
+        // 80-bit prefix: u32 total_bytes + u32 m_total + u16 payload_len.
+        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 80);
+        if prefix_bits.len() < 80 {
+            m_total += 8;
             continue;
         }
-        let prefix_bytes = frame::bits_to_bytes(&prefix_bits);
-        if prefix_bytes.len() < 6 {
+        let pb = frame::bits_to_bytes(&prefix_bits);
+        if pb.len() < 10 {
+            m_total += 8;
             continue;
         }
-        let cand_total = u32::from_be_bytes([
-            prefix_bytes[0], prefix_bytes[1], prefix_bytes[2], prefix_bytes[3],
-        ]);
+        // Exact m_total checksum: only the encoder's candidate satisfies it
+        // (1/2³² random-match rate; supersedes v3's canonicality + sentinel
+        // bypass).
+        let stored_m_total = u32::from_be_bytes([pb[4], pb[5], pb[6], pb[7]]) as usize;
+        if stored_m_total != m_total {
+            m_total += 8;
+            continue;
+        }
+        let cand_total = u32::from_be_bytes([pb[0], pb[1], pb[2], pb[3]]);
         if cand_total == 0 || cand_total > max_total_bytes {
+            m_total += 8;
             continue;
         }
-        let cand_len_field = u16::from_be_bytes([prefix_bytes[4], prefix_bytes[5]]);
-        if cand_len_field != LEN_SENTINEL {
-            let payload_len = cand_len_field as usize;
-            // Inline-form filter 1: m_total/8 must be ≥ header + payload_len
-            // (encoder's w_e produces m_total ≥ m_bits_e).
-            if m_total / 8 < CHUNK_FRAME_FIRST_HEADER_LEN + payload_len {
-                continue;
-            }
-            // Inline-form filter 2: w-canonicality. Encoder picks
-            // `w_e = max(1, n_cover / m_bits_e)` where `m_bits_e =
-            // (header + payload_len) * 8`. Given the candidate
-            // payload_len, the encoder's deterministic w choice can
-            // be inverted: only iterations w == w_canonical(cand_len_field)
-            // are valid. Same ~1/max_w rejection power (≈ 99.99% reject)
-            // as a magic-byte filter — see
-            // `docs/design/video/chunk-frame-v3.md` for the
-            // brute-force-vs-magic-byte equivalence argument.
-            let m_bits_check =
-                (CHUNK_FRAME_FIRST_HEADER_LEN + payload_len).saturating_mul(8);
-            if m_bits_check == 0 || m_bits_check > n_cover {
-                continue;
-            }
-            let w_canonical = (n_cover / m_bits_check).max(1);
-            if w != w_canonical {
-                continue;
-            }
-        }
-        // (Extended-form sentinel case: full parse below handles. Rare —
-        // single-chunk ≥ 65 KB payloads.)
-
         // Prefix passed → full extract + canonical parse.
         let extracted = stc_extract(&cover_bits[..used], &hhat_matrix, w);
         let bits = &extracted[..m_total.min(extracted.len())];
         let bytes = frame::bits_to_bytes(bits);
-        if let Some((total_bytes, payload)) = parse_first_chunk_frame(&bytes) {
+        if let Some((total_bytes, _m, payload)) = parse_first_chunk_frame_v3_1(&bytes) {
             return Some((total_bytes, payload.to_vec()));
         }
+        m_total += 8;
     }
     None
 }
 
-/// Streaming decode (v3 wire format): extract a **subsequent-chunk**
-/// v3 frame from `cover_bits`. Returns `payload` on success.
+/// Streaming decode (v3.1 wire format): extract a **subsequent-chunk**
+/// v3.1 frame from `cover_bits`. Returns `payload` on success.
 ///
-/// - 16-bit prefix `u16 payload_len` for fast reject.
-/// - `payload_len ≤ max_remaining_bytes` filter (random wrong-w surviving
-///   this is ~`max_remaining_bytes / 65535` of candidates).
-/// - Length-strict inline-form check: `m_total/8 == 2 + payload_len`
-///   when `payload_len != LEN_SENTINEL`.
-/// - Full extract + `parse_chunk_frame` on prefix match.
+/// - 48-bit prefix `(u32 m_total + u16 payload_len)`. Exact m_total
+///   reject (1/2³² survival) — same mechanism as first-chunk variant.
+/// - `payload.len() ≤ max_remaining_bytes` upper-bound sanity filter.
+/// - Full extract + `parse_chunk_frame_v3_1` on prefix match.
 ///
 /// `max_remaining_bytes` is `total_bytes - accumulated_bytes` from the
-/// outer decode loop. This both serves as an upper-bound sanity filter
-/// and ensures the decoder never reads past the encoder's intent.
+/// outer decode loop. Sanity ceiling so the decoder never reads past
+/// the encoder's intent.
 ///
-/// See `docs/design/video/chunk-frame-v3.md` for the wire format.
+/// Iterates `m_total += 8` (mirrors H.264 v3.1 implementation).
+/// See `docs/design/video/h264/chunk-frame-v3.1-decode.md` (#888).
 #[cfg(feature = "av1-decoder")]
 pub(crate) fn extract_chunk_frame_match(
     cover_bits: &[u8],
@@ -1176,63 +1149,49 @@ pub(crate) fn extract_chunk_frame_match(
     max_remaining_bytes: usize,
 ) -> Option<Vec<u8>> {
     use crate::stego::chunk_frame::{
-        parse_chunk_frame, CHUNK_FRAME_NEXT_HEADER_LEN, LEN_SENTINEL,
+        parse_chunk_frame_v3_1, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1,
     };
     use crate::stego::stc::extract::stc_extract_prefix;
 
     let n_cover = cover_bits.len();
-    let min_m = CHUNK_FRAME_NEXT_HEADER_LEN * 8; // 16 bits
+    let min_m = CHUNK_FRAME_NEXT_HEADER_LEN_V3_1 * 8; // 48 bits
     if n_cover < min_m {
         return None;
     }
-    let max_w = n_cover / min_m;
-
-    for w in 1..=max_w {
-        let m_total = n_cover / w;
-        if m_total < min_m {
+    let mut m_total = min_m;
+    while m_total <= n_cover {
+        let w = n_cover / m_total;
+        if w == 0 {
             break;
         }
         let used = m_total * w;
         let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
 
-        // 16-bit prefix: u16 payload_len (or sentinel).
-        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 16);
-        if prefix_bits.len() < 16 {
+        // 48-bit prefix: u32 m_total + u16 payload_len. Exact m_total reject.
+        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 48);
+        if prefix_bits.len() < 48 {
+            m_total += 8;
             continue;
         }
-        let prefix_bytes = frame::bits_to_bytes(&prefix_bits);
-        if prefix_bytes.len() < 2 {
+        let pb = frame::bits_to_bytes(&prefix_bits);
+        if pb.len() < 6 {
+            m_total += 8;
             continue;
         }
-        let cand_len_field = u16::from_be_bytes([prefix_bytes[0], prefix_bytes[1]]);
-        if cand_len_field != LEN_SENTINEL {
-            let pl = cand_len_field as usize;
-            if pl > max_remaining_bytes {
-                continue;
-            }
-            if m_total / 8 < CHUNK_FRAME_NEXT_HEADER_LEN + pl {
-                continue;
-            }
-            // w-canonicality filter (see first-chunk variant above).
-            let m_bits_check = (CHUNK_FRAME_NEXT_HEADER_LEN + pl).saturating_mul(8);
-            if m_bits_check == 0 || m_bits_check > n_cover {
-                continue;
-            }
-            let w_canonical = (n_cover / m_bits_check).max(1);
-            if w != w_canonical {
-                continue;
-            }
+        let stored_m_total = u32::from_be_bytes([pb[0], pb[1], pb[2], pb[3]]) as usize;
+        if stored_m_total != m_total {
+            m_total += 8;
+            continue;
         }
-        // (Extended-form sentinel case: full parse below handles.)
-
         let extracted = stc_extract(&cover_bits[..used], &hhat_matrix, w);
         let bits = &extracted[..m_total.min(extracted.len())];
         let bytes = frame::bits_to_bytes(bits);
-        if let Some(payload) = parse_chunk_frame(&bytes) {
+        if let Some((_m, payload)) = parse_chunk_frame_v3_1(&bytes) {
             if payload.len() <= max_remaining_bytes {
                 return Some(payload.to_vec());
             }
         }
+        m_total += 8;
     }
     None
 }
@@ -1245,7 +1204,7 @@ pub(crate) fn extract_chunk_frame_match(
 /// Mirrors phasm-core's Ghost decode pattern (`pipeline.rs:1108`).
 /// The validator is what makes this generic — for legacy decode it
 /// runs `try_parse_and_decrypt`; for streaming decode it runs
-/// `parse_chunk_frame` + expected_chunk_idx match. Each STC extract
+/// `parse_chunk_frame_v3_1` + expected_chunk_idx match. Each STC extract
 /// is cheap; the validator gates wrong-w results from passing
 /// through.
 #[cfg(feature = "av1-decoder")]

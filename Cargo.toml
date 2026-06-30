@@ -110,6 +110,16 @@ required-features = ["h264-encoder", "h264-decoder"]
 name = "h264_stealth_sweep"
 required-features = ["h264-encoder", "h264-decoder"]
 
+# stealth-audit-2026-06-29: AV1 per-block histogram collector. Drives
+# dav1d (via core-dav1d-sys) with the new `block_hook` to walk every
+# decoded Av1Block and tally partition / mode / MV / ref distributions.
+# Output is TSV — feed both phasm and rav1e-CLI streams through and
+# compare via χ² / KS tests downstream. See
+# `docs/design/video/av1/stealth-audit-speed-preset-2026-06-29.md`.
+[[bin]]
+name = "av1_block_hist"
+required-features = ["av1-encoder", "av1-decoder"]
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

@@ -31,6 +31,65 @@ use phasm_rav1e::phasm_stego::{
 use phasm_rav1e::prelude::Sequence;
 use phasm_rav1e::EncoderConfig;
 
+/// Phasm AV1 production speed preset.
+///
+/// Default: **`speed = 9`** (locked in by the Layer-3 stealth audit
+/// 2026-06-29 — see `docs/design/video/av1/stealth-audit-speed-preset-2026-06-29.md`).
+/// rav1e's natural default is 6; phasm pins higher because the audit
+/// showed speed=9 has strictly better Layer-3 fingerprint alignment
+/// against rav1e CLI on partition + mode axes (and pays only a marginal
+/// MV-KS uptick), AND buys ~1.9× wall-clock vs speed=6.
+///
+/// Override with `PHASM_AV1_SPEED=N` env var (0..=10) for experiments.
+/// The CLI exposes `--av1-speed N` which sets this env var. Used by:
+///   - `encode_gop_natural` (this file; Pass 1 + cascade re-encode)
+///   - `session::encode_one_keyframe` (single-frame GOP, no-shadow path)
+///   - `session::encode_one_gop_multi` (multi-frame GOP, no-shadow path)
+///
+/// `multiref` defaults off (kept off for stealth-profile stability +
+/// the single-pass STC plan). The `PHASM_AV1_MULTIREF=1` env knob
+/// flips it to true for the 2026-06-29 stealth pre-experiment (see
+/// `av1-stealth-lookahead-plan-2026-06-29.md` § 2 / task #231) — not
+/// for production use. Production default unchanged.
+pub(super) fn apply_phasm_av1_speed(config: &mut EncoderConfig) {
+    let speed = std::env::var("PHASM_AV1_SPEED")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(9)
+        .min(10);
+    config.speed_settings = phasm_rav1e::prelude::SpeedSettings::from_preset(speed);
+    let multiref = std::env::var("PHASM_AV1_MULTIREF")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .map(|n| n != 0)
+        .unwrap_or(false);
+    config.speed_settings.multiref = multiref;
+}
+
+/// Phasm AV1 production sequence-level settings.
+///
+/// `enable_large_lru` default: **false** (current production state).
+/// The 2026-06-29 stealth audit identified `enable_large_lru = false`
+/// as the only sequence-level knob that diverges from rav1e CLI without
+/// a CLI flag to replicate — making it a likely contributor to phasm's
+/// pre-existing s6-vs-CLI partition divergence. The flip to `true` is
+/// being measured in a follow-on audit; keep default `false` until that
+/// completes to preserve the existing stealth posture.
+///
+/// Override with `PHASM_AV1_LARGE_LRU=1` (or `0` for explicit-default
+/// behaviour, useful inside experiment harnesses).
+///
+/// Called by every encoder construction site that builds a fresh
+/// `Sequence`.
+pub(super) fn apply_phasm_av1_sequence(sequence: &mut Sequence) {
+    let enable = std::env::var("PHASM_AV1_LARGE_LRU")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .map(|n| n != 0)
+        .unwrap_or(false);
+    sequence.enable_large_lru = enable;
+}
+
 use crate::codec::av1::stego::session::Av1StreamingEncodeParams;
 use crate::codec::av1::stego::shadow::{
     finalize_shadow_state_av1, prepare_shadow_pre_selection_av1,
@@ -39,7 +98,7 @@ use crate::codec::av1::stego::shadow::{
 };
 use crate::codec::av1::stego::writer::{replay_with_overrides, OverrideMap};
 use crate::stego::chunk_frame::{
-    build_chunk_frame, build_first_chunk_frame, split_message_into_chunks,
+    build_chunk_frame_v3_1, build_first_chunk_frame_v3_1, split_message_into_chunks,
 };
 use crate::stego::cost::av1_uniward::{
     compute_av1_uniward_costs_with_state, Av1FramePosition, FramePlanes,
@@ -49,9 +108,10 @@ use crate::stego::stc::hhat;
 use crate::stego::{frame, payload};
 
 use super::orchestrator::{
-    pack_visible_planes,
+    av1_stego_embed_payload_bits, av1_stego_encode_one_gop, pack_visible_planes,
     rebuild_obu_with_stego_tile_group, Av1StegoError,
 };
+use super::session::{encode_one_gop_multi, encode_one_keyframe};
 
 const STC_H: usize = 7;
 
@@ -123,6 +183,15 @@ pub struct Av1SliceYuvSource<'a> {
     height: u32,
     n_frames: u32,
     gop_size: u32,
+    /// Enforces the trait contract: callers must invoke `rewind()`
+    /// before the first `gop_yuv()`. Reads are inherently stateless on
+    /// a borrowed slice, but the *contract* is shared with stateful
+    /// sources (Av1CallbackYuvSource → AVAssetReader/MediaCodec) where
+    /// rewind opens the underlying decoder. If a streaming entry like
+    /// `av1_encode_streaming` forgets to call `rewind()` first, that
+    /// bug must surface in slice-backed byte-identity tests too —
+    /// otherwise the stateful FFI sources crash on first device run.
+    has_rewound: bool,
 }
 
 impl<'a> Av1SliceYuvSource<'a> {
@@ -139,12 +208,21 @@ impl<'a> Av1SliceYuvSource<'a> {
             height,
             n_frames,
             gop_size: gop_size.max(1),
+            has_rewound: false,
         }
     }
 }
 
 impl Av1GopYuvSource for Av1SliceYuvSource<'_> {
     fn gop_yuv(&mut self, gop_index: u32) -> Result<Vec<u8>, Av1StegoError> {
+        if !self.has_rewound {
+            return Err(Av1StegoError::InvalidPacket(
+                "Av1SliceYuvSource: gop_yuv called before rewind() — \
+                 contract violation that would crash stateful sources \
+                 (AVAssetReader / MediaCodec / ffmpeg pipe)"
+                    .into(),
+            ));
+        }
         let frame_bytes = expected_i420_size(self.width, self.height);
         let start_f = gop_index.saturating_mul(self.gop_size);
         if start_f >= self.n_frames {
@@ -163,7 +241,11 @@ impl Av1GopYuvSource for Av1SliceYuvSource<'_> {
     }
 
     fn rewind(&mut self) -> Result<(), Av1StegoError> {
-        Ok(()) // stateless — slicing reads directly from the borrowed buffer
+        // Reads are stateless — slicing pulls from the borrowed buffer
+        // directly. But we still flip `has_rewound` so gop_yuv()
+        // enforces the trait contract that mirrors stateful sources.
+        self.has_rewound = true;
+        Ok(())
     }
 }
 
@@ -411,16 +493,50 @@ pub fn av1_encode_with_shadows_streaming(
     // immediately. RAM held after Pass 1 = sum of GopHarvests (~60 KB
     // × n_gops). The natural+recording (~5 MB/GOP) is freed
     // gop-by-gop.
+    //
+    // `source.rewind()` is mandatory before the first `gop_yuv` call:
+    // stateful sources (AVAssetReader, MediaCodec, ffmpeg pipe) need
+    // it to open / position their underlying decoder. See the
+    // matching note in `av1_encode_streaming` (T3.1).
+    let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
+    let t_total = std::time::Instant::now();
+    if prof {
+        eprintln!(
+            "[AV1_PROF SHADOW] start: width={}, height={}, n_frames={}, n_gops={}, gop_size={}, n_shadows={}, parity_floor={}",
+            params.width, params.height, n_frames, n_gops, gop_size,
+            shadows.len(), shadow_parity_len_floor,
+        );
+    }
+    let t_pass1 = std::time::Instant::now();
+    source.rewind()?;
     let mut per_gop_harvests: Vec<GopHarvest> = Vec::with_capacity(n_gops_usize);
+    let mut p1_sum_pull = std::time::Duration::ZERO;
+    let mut p1_sum_proc = std::time::Duration::ZERO;
     for gop_idx in 0..n_gops {
+        let t_pull = std::time::Instant::now();
         let gop_yuv = source.gop_yuv(gop_idx)?;
+        let pull_dt = t_pull.elapsed();
+        p1_sum_pull += pull_dt;
         validate_gop_yuv(gop_idx, &gop_yuv)?;
+        let t_proc = std::time::Instant::now();
         let (per_frame, harvest) =
             process_one_gop_pass1(&gop_yuv, frames_in_gop(gop_idx), params)?;
-        // Drop the per-frame natural+recording immediately — Pass 2's
-        // cascade will re-encode for these.
+        let proc_dt = t_proc.elapsed();
+        p1_sum_proc += proc_dt;
+        if prof {
+            eprintln!(
+                "[AV1_PROF SHADOW] Pass1 gop {}: pull={:?}, encode+harvest={:?}, cover_bits={}",
+                gop_idx, pull_dt, proc_dt, harvest.cover_bits.len(),
+            );
+        }
         drop(per_frame);
         per_gop_harvests.push(harvest);
+    }
+    if prof {
+        eprintln!(
+            "[AV1_PROF SHADOW] Pass1 TOTAL: {:?}, sum_pull={:?}, sum_proc={:?}",
+            t_pass1.elapsed(), p1_sum_pull, p1_sum_proc,
+        );
     }
 
     // Per-GOP cover offsets into the union (= prefix sum of harvest
@@ -475,6 +591,10 @@ pub fn av1_encode_with_shadows_streaming(
     }
 
     for parity_len in parity_tiers {
+        let t_tier = std::time::Instant::now();
+        if prof {
+            eprintln!("[AV1_PROF SHADOW] === Tier parity_len={} ===", parity_len);
+        }
         // Cover-independent per-shadow state for THIS parity tier.
         let pre_selections: Vec<_> = match shadows
             .iter()
@@ -530,11 +650,19 @@ pub fn av1_encode_with_shadows_streaming(
         // is that `gop_yuv(g)` is callable with monotonically
         // increasing `g` within a sweep, and `rewind()` restarts the
         // forward stream for the next sweep.
+        let t_cascade = std::time::Instant::now();
         source.rewind()?;
         let mut output: Vec<u8> = Vec::new();
         let mut encode_ok = true;
+        let mut c_sum_pull = std::time::Duration::ZERO;
+        let mut c_sum_encode = std::time::Duration::ZERO;
+        let mut c_sum_cascade = std::time::Duration::ZERO;
+        let mut c_sum_verify = std::time::Duration::ZERO;
         for gop_idx in 0..n_gops {
+            let t_pull = std::time::Instant::now();
             let gop_yuv = source.gop_yuv(gop_idx)?;
+            let pull_dt = t_pull.elapsed();
+            c_sum_pull += pull_dt;
             validate_gop_yuv(gop_idx, &gop_yuv)?;
             // WV.7.7 — skip the J-UNIWARD harvest in Sweep B. Pass 1
             // already cached `per_gop_harvests[gop_idx]` (parity-
@@ -547,11 +675,14 @@ pub fn av1_encode_with_shadows_streaming(
             // `compute_av1_uniward_costs_with_state` walk (~0.1-0.3 s
             // per 1080p GOP) — ~10-20% wall savings on the streaming
             // encode at long-clip scale.
+            let t_enc = std::time::Instant::now();
             let per_frame = encode_gop_natural(
                 &gop_yuv,
                 frames_in_gop(gop_idx),
                 params,
             )?;
+            let enc_dt = t_enc.elapsed();
+            c_sum_encode += enc_dt;
             let gop_idx_usize = gop_idx as usize;
             let inputs = Av1CascadeGopInputs {
                 gop_idx: gop_idx_usize,
@@ -566,29 +697,63 @@ pub fn av1_encode_with_shadows_streaming(
                 shadow_states: &shadow_states,
                 hhat_seed: &hhat_seed,
             };
-            match cascade_one_gop(inputs, shared)? {
+            let t_casc = std::time::Instant::now();
+            let cascade_result = cascade_one_gop(inputs, shared)?;
+            let casc_dt = t_casc.elapsed();
+            c_sum_cascade += casc_dt;
+            match cascade_result {
                 Some(per_gop_bytes) => {
-                    // Feed THIS GOP's emitted bytes into the
-                    // streaming verify BEFORE accumulating into
-                    // output — the verify walk happens at peak per-
-                    // GOP working set and drops back to ~3 MB
-                    // before the next iteration.
+                    let t_ver = std::time::Instant::now();
                     streaming_verify.push_gop_bytes(&per_gop_bytes)?;
+                    let ver_dt = t_ver.elapsed();
+                    c_sum_verify += ver_dt;
+                    if prof {
+                        eprintln!(
+                            "[AV1_PROF SHADOW] Cascade gop {}: pull={:?}, encode={:?}, cascade={:?}, verify_push={:?}, packet={} B",
+                            gop_idx, pull_dt, enc_dt, casc_dt, ver_dt, per_gop_bytes.len()
+                        );
+                    }
                     output.extend_from_slice(&per_gop_bytes);
                 }
                 None => {
+                    if prof {
+                        eprintln!(
+                            "[AV1_PROF SHADOW] Cascade gop {}: cascade returned None — tier failed",
+                            gop_idx
+                        );
+                    }
                     encode_ok = false;
                     break;
                 }
             }
-            // `per_frame` is dropped here — peak per-GOP RAM
-            // released before advancing to the next GOP.
         }
 
         if !encode_ok {
+            if prof {
+                eprintln!(
+                    "[AV1_PROF SHADOW] Tier parity_len={} FAILED in {:?}",
+                    parity_len, t_tier.elapsed()
+                );
+            }
             continue;
         }
-        if streaming_verify.finish() {
+        let t_verfin = std::time::Instant::now();
+        let ok = streaming_verify.finish();
+        let verfin_dt = t_verfin.elapsed();
+        if prof {
+            eprintln!(
+                "[AV1_PROF SHADOW] Tier parity_len={} cascade_total={:?}, sum_pull={:?}, sum_encode={:?}, sum_cascade={:?}, sum_verify_push={:?}, verify_finish={:?} → ok={}",
+                parity_len, t_cascade.elapsed(),
+                c_sum_pull, c_sum_encode, c_sum_cascade, c_sum_verify, verfin_dt, ok,
+            );
+        }
+        if ok {
+            if prof {
+                eprintln!(
+                    "[AV1_PROF SHADOW] TOTAL: {:?}, output={} B (succeeded at tier parity_len={})",
+                    t_total.elapsed(), output.len(), parity_len
+                );
+            }
             return Ok(output);
         }
     }
@@ -596,6 +761,232 @@ pub fn av1_encode_with_shadows_streaming(
     Err(Av1StegoError::Stego(
         crate::stego::error::StegoError::FrameCorrupted,
     ))
+}
+
+/// MOBOOM.T3.1 — streaming AV1 encode for the NO-SHADOW case.
+///
+/// Sibling of [`av1_encode_with_shadows_streaming`] for clips without
+/// shadow embedding. Drives an [`Av1GopYuvSource`]: for each GOP the
+/// source delivers tight-I420 YUV in a fast burst, the function runs
+/// one rav1e encode + chunk_frame STC override, emits the GOP's stego
+/// bytes, drops the YUV. **No cascade tier loop, no streaming verify,
+/// no harvest cache** — none of that infrastructure is needed because
+/// there are no shadow bits to embed.
+///
+/// **Why this exists.** The legacy no-shadow encode path
+/// (`Av1StreamingEncodeSession::push_frame` → `drain_one_gop`) is
+/// driven by the *caller* pulling one frame at a time from
+/// `AVAssetReader` / `MediaCodec` and pushing it into a session that
+/// only emits OBU bytes at GOP boundaries. AVFoundation reads happen
+/// interleaved with multi-second rav1e calls on the same thread —
+/// AVAssetReader marks the session interrupted under that read
+/// cadence, surfacing as `MediaPlaneExtractorError.readerFailed("Operation Interrupted")`
+/// on cgPhone testing. The shadow-WV streaming entry already uses the
+/// pull-source pattern (reads happen in fast per-GOP bursts between
+/// rav1e calls); this entry brings the no-shadow case onto the same
+/// architecture so AVFoundation reads are no longer interleaved.
+///
+/// **Byte-identity with the legacy push-session.** For a given
+/// (passphrase, primary_framed, params) tuple this function produces
+/// **bit-for-bit identical output** to driving an
+/// `Av1StreamingEncodeSession` push-frame loop over the same YUV at
+/// the same `params.gop_size`. See `av1_no_shadow_streaming_byte_identical.rs`
+/// for the gate. The per-GOP encode primitives (`encode_one_keyframe`,
+/// `encode_one_gop_multi`) and the stego embed primitives
+/// (`av1_stego_embed_payload_bits`, `av1_stego_encode_one_gop`) are
+/// called in the same order with the same arguments.
+///
+/// `primary_framed` is the encrypt + `frame::build_frame` output for
+/// the primary message (same contract as the shadow streaming entry —
+/// the caller does crypto::encrypt + frame::build_frame upstream).
+///
+/// **Memory profile.** Per-GOP transient: one GOP's YUV (~90 MB at
+/// 1080p × gop=30) + one rav1e encode state (~120 MB at 1080p) — both
+/// dropped between GOPs. Persistent: the output Vec accumulating stego
+/// OBU bytes across all GOPs (O(clip) — same as today). At 30 min ×
+/// 1080p the output term is ~1 GB; dropping that to true streaming
+/// requires a GOP-incremental muxer and is future work.
+pub fn av1_encode_streaming(
+    source: &mut dyn Av1GopYuvSource,
+    n_frames: u32,
+    params: Av1StreamingEncodeParams,
+    primary_framed: &[u8],
+    primary_passphrase: &str,
+    // Optional 0.0–1.0 progress sink, ticked once per GOP after that
+    // GOP's stego encode completes. Mirror of H.264's
+    // `h264_encode_with_shadows_streaming` `progress` parameter. The
+    // no-shadow streaming entry is a single forward pass, so the
+    // emitted fraction is simply `(gop_idx + 1) / n_gops`.
+    mut on_progress: Option<&mut dyn FnMut(f32)>,
+) -> Result<Vec<u8>, Av1StegoError> {
+    if n_frames == 0 {
+        return Err(Av1StegoError::InvalidPacket(
+            "av1_encode_streaming: n_frames == 0".into(),
+        ));
+    }
+    let frame_size = expected_i420_size(params.width, params.height);
+    let gop_size = params.gop_size.max(1);
+    let n_gops = n_frames.div_ceil(gop_size);
+
+    // Per-GOP frame count helper. The trailing GOP may be partial.
+    let frames_in_gop = |gop_idx: u32| -> u32 {
+        let start = gop_idx * gop_size;
+        let end = (start + gop_size).min(n_frames);
+        end - start
+    };
+
+    let validate_gop_yuv = |gop_idx: u32, yuv: &[u8]| -> Result<(), Av1StegoError> {
+        let expected = (frames_in_gop(gop_idx) as usize) * frame_size;
+        if yuv.len() != expected {
+            return Err(Av1StegoError::InvalidPacket(format!(
+                "av1_encode_streaming: GOP {gop_idx} source returned {} bytes, \
+                 expected {} ({} frames × {} B)",
+                yuv.len(),
+                expected,
+                frames_in_gop(gop_idx),
+                frame_size,
+            )));
+        }
+        Ok(())
+    };
+
+    // Bound + cap the chunk count. Mirror of the session's
+    // `derived_total_gops`/`total_chunks` math, simplified: every GOP
+    // is a stego GOP (no `plan_safe_balanced` concentrate-tail in v1
+    // of this entry — if MessageTooLarge surfaces, threading per-GOP
+    // allocation through is the follow-on).
+    if n_gops == 0 || n_gops > u16::MAX as u32 {
+        return Err(Av1StegoError::InvalidPacket(format!(
+            "av1_encode_streaming: derived n_gops {n_gops} out of range [1..={}]",
+            u16::MAX
+        )));
+    }
+    if primary_framed.len() > u32::MAX as usize {
+        return Err(Av1StegoError::InvalidPacket(format!(
+            "av1_encode_streaming: primary_framed {} exceeds u32::MAX",
+            primary_framed.len()
+        )));
+    }
+    let total_message_bytes = primary_framed.len() as u32;
+    let total_chunks = n_gops as u16;
+    let chunks = split_message_into_chunks(primary_framed, total_chunks)
+        .map_err(Av1StegoError::Stego)?;
+
+    // Derive hhat seed from the primary passphrase — same path the
+    // session uses for chunk_frame's STC override. Single derive for
+    // the whole encode (hhat_seed is reused across GOPs).
+    let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
+        .map_err(Av1StegoError::Stego)?;
+    let hhat_seed: [u8; 32] = structural_key[32..]
+        .try_into()
+        .expect("derive_structural_key returns 64 bytes");
+
+    // Output accumulator. Reserve ~1 KB/frame as a starting guess —
+    // Vec doubles when full. Same reservation as the iOS session
+    // path's `obus.reserveCapacity(totalFrames * 1024)`.
+    let mut output: Vec<u8> = Vec::with_capacity((n_frames as usize).saturating_mul(1024));
+
+    // Per-GOP encode loop. Bounded by `n_gops` not by what the source
+    // yields — the source's contract is to deliver each GOP in order
+    // (forward-only). Trailing partial GOPs are first-class.
+    //
+    // `source.rewind()` is mandatory before the first `gop_yuv` call:
+    // stateful sources (Av1CallbackYuvSource backing the iOS
+    // AVAssetReader / Android MediaCodec / CLI ffmpeg pipe) need it to
+    // open / position their underlying decoder. Stateless sources
+    // (Av1SliceYuvSource) make it a no-op. Skipping this surfaces as
+    // `MediaPlaneGopSourceError.readerFailed("decode_gop before
+    // rewind")` on iOS — see commit history for T3.1/T3.5 root cause.
+    let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
+    let t_total = std::time::Instant::now();
+    if prof {
+        eprintln!(
+            "[AV1_PROF NO_SHADOW] start: width={}, height={}, n_frames={}, n_gops={}, gop_size={}, primary_framed_len={}",
+            params.width, params.height, n_frames, n_gops, gop_size, primary_framed.len()
+        );
+    }
+    let t_rewind = std::time::Instant::now();
+    source.rewind()?;
+    if prof {
+        eprintln!("[AV1_PROF NO_SHADOW] rewind: {:?}", t_rewind.elapsed());
+    }
+    let mut sum_pull = std::time::Duration::ZERO;
+    let mut sum_encode = std::time::Duration::ZERO;
+    let mut sum_embed = std::time::Duration::ZERO;
+    for gop_idx in 0..n_gops {
+        let t_pull = std::time::Instant::now();
+        let gop_yuv = source.gop_yuv(gop_idx)?;
+        let pull_dt = t_pull.elapsed();
+        sum_pull += pull_dt;
+        validate_gop_yuv(gop_idx, &gop_yuv)?;
+        let fig = frames_in_gop(gop_idx);
+
+        // Build this GOP's chunk_frame slice. First GOP carries the
+        // clip-level `total_message_bytes` header; subsequent GOPs
+        // carry only their `payload_len`. Mirror of the session's
+        // `drain_one_gop` chunk_frame logic.
+        let chunk_payload = &chunks[gop_idx as usize];
+        let framed = if gop_idx == 0 {
+            build_first_chunk_frame_v3_1(total_message_bytes, chunk_payload)
+        } else {
+            build_chunk_frame_v3_1(chunk_payload)
+        }
+        .map_err(Av1StegoError::Stego)?;
+        let payload_bits = frame::bytes_to_bits(&framed);
+
+        // Encode + embed. Dispatches on frames_in_gop the same way the
+        // session does — single-frame path uses `encode_one_keyframe`
+        // + `av1_stego_embed_payload_bits` (bit-exact to the legacy
+        // single-frame primitive); multi-frame uses `encode_one_gop_multi`
+        // + `av1_stego_encode_one_gop` for the IDR + P-frame chain.
+        let t_enc = std::time::Instant::now();
+        let stego_packet = if fig == 1 {
+            let (natural, recording) = encode_one_keyframe(&gop_yuv, params)?;
+            let enc_dt = t_enc.elapsed();
+            let t_embed = std::time::Instant::now();
+            let packet =
+                av1_stego_embed_payload_bits(natural, recording, &payload_bits, &hhat_seed)?;
+            let embed_dt = t_embed.elapsed();
+            sum_encode += enc_dt;
+            sum_embed += embed_dt;
+            if prof {
+                eprintln!(
+                    "[AV1_PROF NO_SHADOW] gop {}: fig=1, pull={:?}, encode={:?}, embed={:?}, packet={} B",
+                    gop_idx, pull_dt, enc_dt, embed_dt, packet.len()
+                );
+            }
+            packet
+        } else {
+            let per_frame = encode_one_gop_multi(&gop_yuv, fig, params)?;
+            let enc_dt = t_enc.elapsed();
+            let t_embed = std::time::Instant::now();
+            let packet = av1_stego_encode_one_gop(per_frame, &payload_bits, &hhat_seed)?;
+            let embed_dt = t_embed.elapsed();
+            sum_encode += enc_dt;
+            sum_embed += embed_dt;
+            if prof {
+                eprintln!(
+                    "[AV1_PROF NO_SHADOW] gop {}: fig={}, pull={:?}, encode={:?}, embed={:?}, packet={} B",
+                    gop_idx, fig, pull_dt, enc_dt, embed_dt, packet.len()
+                );
+            }
+            packet
+        };
+
+        output.extend_from_slice(&stego_packet);
+
+        if let Some(ref mut cb) = on_progress {
+            cb((gop_idx + 1) as f32 / n_gops as f32);
+        }
+    }
+
+    if prof {
+        eprintln!(
+            "[AV1_PROF NO_SHADOW] TOTAL: {:?}, sum_pull={:?}, sum_encode={:?}, sum_embed={:?}, output={} B",
+            t_total.elapsed(), sum_pull, sum_encode, sum_embed, output.len()
+        );
+    }
+    Ok(output)
 }
 
 /// Run Pass 1 on a single GOP: natural rav1e encode + dav1d harvest.
@@ -988,9 +1379,9 @@ pub(super) fn cascade_one_gop(
     // carries clip-level total_message_bytes; subsequent GOPs carry
     // only payload_len.
     let framed = if gop_idx == 0 {
-        build_first_chunk_frame(total_message_bytes, &chunks[gop_idx])
+        build_first_chunk_frame_v3_1(total_message_bytes, &chunks[gop_idx])
     } else {
-        build_chunk_frame(&chunks[gop_idx])
+        build_chunk_frame_v3_1(&chunks[gop_idx])
     }
     .map_err(Av1StegoError::Stego)?;
     let payload_bits = frame::bytes_to_bits(&framed);
@@ -1128,7 +1519,13 @@ fn expected_i420_size(width: u32, height: u32) -> usize {
 
 /// Encode one GOP naturally (mirror of session.rs::encode_one_gop_multi
 /// but inline-d here to avoid an inter-module pub dependency).
-fn encode_gop_natural(
+///
+/// Visibility raised to `pub(super)` at T2.4 so
+/// `Av1StreamingProbeSession::flush_current_gop` can use it directly
+/// (skipping `process_one_gop_pass1`'s J-UNIWARD harvest_gop pass —
+/// the probe only needs the natural-encode bit_tags, not per-position
+/// costs).
+pub(super) fn encode_gop_natural(
     gop_yuv: &[u8],
     frames_in_gop: u32,
     params: Av1StreamingEncodeParams,
@@ -1148,10 +1545,10 @@ fn encode_gop_natural(
         ..Default::default()
     };
     config.low_latency = true;
-    config.speed_settings.multiref = false;
+    apply_phasm_av1_speed(&mut config);
     let config = Arc::new(config);
     let mut sequence = Sequence::new(&config);
-    sequence.enable_large_lru = false;
+    apply_phasm_av1_sequence(&mut sequence);
     let sequence = Arc::new(sequence);
 
     let yuvs: Vec<Arc<phasm_rav1e::Frame<u8>>> = (0..frames_in_gop as usize)

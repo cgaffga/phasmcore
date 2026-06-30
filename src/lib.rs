@@ -114,8 +114,7 @@ pub use codec::h264::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM as CASCA
 // the H.264 surface above.
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::session::{
-    Av1ShadowSpec, Av1StreamingDecodeSession, Av1StreamingEncodeParams,
-    Av1StreamingEncodeSession,
+    Av1StreamingDecodeSession, Av1StreamingEncodeParams,
 };
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::capacity::{

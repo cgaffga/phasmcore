@@ -605,6 +605,76 @@ fn main() {
             // the built library is byte-identical to 11dab211 (codec/ source
             // untouched), so the determinism pin (#835) is preserved.
             "5fd1ad54f7f981ffbc7671a5e6aa42eae579c75f",
+            // 2026-06-29: #891 (B-lite.2, parallel-GOP) — thread_local
+            // g_phasm_dual_recon_enabled so parallel-GOP producers each pick
+            // their own dual_recon (clean producers want 0) without racing the
+            // consumer-emit (1). Single read site (InitDqLayers, on the init
+            // thread); byte-identical single-thread output, default unchanged.
+            "13a6af520a05049bd5816e4cef900e5af0f140db",
+            // 2026-06-29: #895 (B-full.1) — per-encoder PhasmStegoState scaffold
+            // (opaque pPhasmStego on sWelsEncCtx + alloc/free). Byte-identical;
+            // nothing reads it yet. B-full.2+ migrate the stego statics onto it.
+            "0cc0c70b84b0f0a0be7737ba0a19572df1e6dd66",
+            // 2026-06-29: #895 (B-full.2 read-side carrier) — pPhasmStego
+            // back-pointer on SCabacCtx (slice CABAC ctx), set at
+            // WelsInitSliceCabac. Read nowhere yet (byte-identical); the leaf
+            // bypass-bin emit hooks will read it when the scratch migrates off
+            // the process-global onto the per-encoder PhasmStegoState.
+            "36986548b9548c78020a078c56b7089e08a3495c",
+            // 2026-06-29: #895 (B-full.2b) — bypass scratch + per-MB sentinels
+            // migrated off process-globals onto PhasmStegoState (per encoder).
+            // Byte-identical on the serial path (9/9 streaming, 6/6 #548 repro
+            // incl. cross-call + 1080p wire_only). wire_only stays global until
+            // B-full.5 (FFI-takes-handle). Unblocks thread-safe parallel-GOP.
+            "5380312dd14c2d2df5d6654abaa7b78e9e6ec429",
+            // 2026-06-29: #895 (B-full.3a resolver) — phasm_isvc_get_stego_state
+            // (ISVCEncoder* -> sWelsEncCtx::pPhasmStego), the handle-FFI
+            // primitive the orchestrator uses to target per-encoder state. Read
+            // nowhere in the encode path (byte-identical); proven per-instance
+            // (two encoders resolve to distinct non-null states).
+            "9b495fbfa1d55bc7eaa2437e9de8bffbd14e1870",
+            // 2026-06-29: #895 (B-full.3) — frame_num/pass_mode/user_data
+            // migrated off the libcommon process-globals onto PhasmStegoState
+            // (the combined capture/replay/md_cost helper-cluster pass). Callback
+            // function pointers stay global; only per-session DATA goes per
+            // instance, read via phasm_stego_get_* with a has_session_state-gated
+            // global fallback. Production wires per-instance (phasm_stego_state_
+            // set_*); decoder + whole-video tests fall back to globals. Gate:
+            // oh264_g4_streaming_byte_identical 11/11 incl. pinned-seed
+            // determinism. Unblocks 4b (parallel-GOP producers ∥ consumer).
+            "f135aeb3ae369f65d815b2575c099a764f20d443",
+            // 2026-06-29: #895 (B-full.3 Linux CI fix) — extern "C" forward-decl
+            // for phasm_maybe_reset_for_mb. gcc rejected the C++-linkage decl vs
+            // the C-linkage def (def is inside the extern "C" block); clang was
+            // lenient, so the fork CI was red on ubuntu since 2b moved the def
+            // after the struct. Declaration-only, byte-identical to f135aeb3.
+            // phasm-stego CI now green (ubuntu + macos). This is the fork HEAD.
+            "83af40b94afeae6a77a7bd605c000f004b243eb1",
+            // 2026-06-29: #895 (B-full.3b) — ENCODER callbacks (enc_pre_emit /
+            // md_cost_capture / capture+replay_mb_decision) per-instance on
+            // PhasmStegoState, CORRECTING B-full.3's wrong "callbacks stay global"
+            // call above (clean 4b producers would otherwise fire the consumer's
+            // callbacks → corrupt covers + DecisionCache). adopt_global_callbacks
+            // mirrors the registered globals onto the consumer; producers skip it
+            // → per-instance NULL → no-op. Gate: oh264_g4 11/11 incl. pinned-seed
+            // determinism. phasm-stego CI green (ubuntu gcc + macos). Fork HEAD.
+            "5f5fd2895d4092009747f7287c1edc3ad339d93a",
+            // 2026-06-29: #895 (B-full.4) — gate phasm_set_dec_pic_y on stego-
+            // active (per-instance enc_pre_emit) so a 4b clean producer can't
+            // clobber the consumer's dec_pic_y in the libcommon global. Audit
+            // found this was the ONE unconditional per-MB scratch write; the rest
+            // (clean_pres/dirty/slice_override) are already enc_pre_emit/dr_active-
+            // gated (producer skips), and replay/D2/post_quant_cb are dormant.
+            // Gate: oh264_g4 11/11. phasm-stego CI green (ubuntu+macos). Fork HEAD.
+            "187afee316b43cb22ffc8d082f55adcf1052a3c9",
+            // 2026-06-29: #895 (B-full.6a) — phasm_stego_state_mark_clean: a 4b
+            // clean producer calls it after Encoder::new to mark itself session-
+            // active with NULL callbacks, so its hooks read per-instance NULL
+            // (no-op) instead of falling back to a concurrent consumer's global
+            // callbacks. Closes the fork-side per-instance mechanism. Gate:
+            // bfull6_clean_producer_isolated_from_registered_session (flip handler
+            // fires 0× on the producer). CI green (ubuntu+macos). Fork HEAD.
+            "8a71e46c7216f854f9fc66dd44463836a7cd5ad4",
         ];
         let head_output = Command::new("git")
             .arg("-C")

@@ -119,6 +119,13 @@ fn main() {
             // (8966e722) prior to push. Identical hook surface;
             // different SHA due to rebase.
             "8a8db27fc33d648962bf65b3b1d4813d9a7c1d0e",
+            // 2026-06-30 (AV1 merge): the AV1 session bumped phasm-dav1d to
+            // f2caf625 but built with PHASM_DAV1D_SHA_PIN_OVERRIDE and never
+            // formalized the pin. Verified empirically here: full AV1
+            // encode->decode round-trip (rav1e encode + this dav1d decode)
+            // recovers the exact embedded message, so the decoder hook surface
+            // is compatible.
+            "f2caf62554ba3b2c81832be007f344ae73536541",
         ];
 
         // phasm-rav1e PINNED_SHAS (parallel pin list — documentation

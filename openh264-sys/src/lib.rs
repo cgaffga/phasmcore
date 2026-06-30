@@ -792,9 +792,19 @@ unsafe extern "C" {
     /// `phasm_encoder_initialize`. enabled=0 skips ALL visual_recon work
     /// for the next encoder instance; the resulting bitstream is byte-
     /// identical to the dual_recon-enabled run (mirror is encoder-internal
-    /// only). Used by the Pass-1 cover probe path. Process-global —
-    /// caller serializes encoder instances.
+    /// only). Used by the Pass-1 cover probe + parallel-GOP clean producers.
+    ///
+    /// B-lite.2 (#891): the fork stores this flag `thread_local`, so each
+    /// thread's encoder construction is independent — a producer thread
+    /// setting 0 never disturbs the consumer thread's 1. Set it immediately
+    /// before `phasm_encoder_initialize` on the SAME thread (the flag has a
+    /// single read site at `InitDqLayers`, on the init thread).
     pub fn phasm_encoder_set_dual_recon_enabled(enabled: i32);
+
+    /// B-lite.2 (#891) — read the CALLING thread's dual_recon flag (stored
+    /// `thread_local` in the fork; defaults to 1). Used by the
+    /// thread-isolation gate.
+    pub fn phasm_get_dual_recon_enabled() -> i32;
 
     /// D2.1 — per-row completion callback for windowed STC.
     pub fn phasm_set_row_complete_callback(cb: Option<extern "C" fn(

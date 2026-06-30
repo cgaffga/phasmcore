@@ -1318,6 +1318,105 @@ mod tests {
         (y, u, v)
     }
 
+    /// B-lite.0 (#889) helper — encode an N-frame GOP via the per-handle
+    /// FFI ONLY. NO `StegoSession::register`, NO `set_frame_num`, NO
+    /// `phasm_encoder_set_dual_recon_enabled`: this path touches **zero**
+    /// phasm process-globals, so concurrent calls exercise only the
+    /// upstream OpenH264 encoder core + the per-handle shim state.
+    fn encode_gop_bare(width: i32, height: i32, qp: i32, gop_size: i32, n_frames: u32) -> Vec<u8> {
+        unsafe {
+            let h = phasm_encoder_create();
+            assert!(!h.is_null(), "encoder create");
+            let rv = phasm_encoder_initialize(h, width, height, qp, gop_size);
+            assert_eq!(rv, 0, "encoder initialize rv={}", rv);
+            let mut bitstream = Vec::new();
+            let mut out = vec![0u8; 1024 * 1024];
+            for f in 0..n_frames {
+                let (y, u, v) = synth_yuv_frame(width as usize, height as usize, f);
+                let mut written: i32 = 0;
+                let rv = phasm_encoder_encode_frame(
+                    h,
+                    y.as_ptr(),
+                    width,
+                    u.as_ptr(),
+                    width / 2,
+                    v.as_ptr(),
+                    width / 2,
+                    width,
+                    height,
+                    f as i64,
+                    out.as_mut_ptr(),
+                    out.len() as i32,
+                    &mut written,
+                );
+                assert!(rv >= 0, "encode_frame f={} rv={}", f, rv);
+                bitstream.extend_from_slice(&out[..written as usize]);
+            }
+            phasm_encoder_destroy(h);
+            bitstream
+        }
+    }
+
+    /// B-lite.0 (#889) — **upstream OpenH264 concurrency proof.**
+    ///
+    /// Phase 0 (#887, doc §4) found phasm's stego layer is process-global,
+    /// but it audited the *phasm* statics — not the upstream OpenH264
+    /// encoder core. Before investing in the B-lite fork refactor we must
+    /// confirm the upstream core has no shared mutable state across
+    /// *separate* encoder instances: N bare encoders (zero phasm globals
+    /// touched) running concurrently must produce byte-identical output to
+    /// a serial run. A diverging thread = upstream shared state (a real
+    /// blocker beyond the phasm refactor). Byte-identity = B-lite feasible
+    /// (the only remaining clean-path global is dual_recon → B-lite.2).
+    #[test]
+    fn blite0_concurrent_bare_encoders_match_serial() {
+        // Serialize vs other encoder/session tests that may write the
+        // dual_recon global via `Encoder::new` (our bare path reads no
+        // phasm global, but this keeps the run reproducible).
+        let _guard = SESSION_TEST_MUTEX.lock().unwrap();
+
+        const W: i32 = 176;
+        const H: i32 = 96;
+        const QP: i32 = 26;
+        const GOP: i32 = 30; // 1 IDR + 7 P
+        const FRAMES: u32 = 8;
+        const N_THREADS: usize = 4;
+
+        // Serial reference.
+        let serial = encode_gop_bare(W, H, QP, GOP, FRAMES);
+        assert!(
+            serial.len() > 64,
+            "serial bitstream suspiciously small: {}",
+            serial.len()
+        );
+
+        // N concurrent bare encoders, each its own instance.
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|_| std::thread::spawn(|| encode_gop_bare(W, H, QP, GOP, FRAMES)))
+            .collect();
+        for (i, jh) in handles.into_iter().enumerate() {
+            let out = jh.join().expect("encoder thread panicked");
+            assert_eq!(
+                out,
+                serial,
+                "thread {} bitstream diverged from serial ({} vs {} bytes) — \
+                 upstream OpenH264 has shared mutable state across instances",
+                i,
+                out.len(),
+                serial.len()
+            );
+        }
+        eprintln!(
+            "blite0: {} concurrent bare encoders all byte-identical to serial \
+             ({} bytes, {}x{} {}f) — upstream core is instance-isolated",
+            N_THREADS,
+            serial.len(),
+            W,
+            H,
+            FRAMES
+        );
+    }
+
     // ---------------- Phase B.9.1: decoder shim smoke ----------------
 
     /// Encode a 1-frame IDR via the OpenH264 fork, decode the resulting

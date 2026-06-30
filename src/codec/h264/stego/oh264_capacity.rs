@@ -163,14 +163,29 @@ pub fn h264_video_capacity(
     // `pass1_count_4domain` whole-video pass (the ~45 s/clip bottleneck the
     // probe profiling pinned).
     let mut shadow_pool_bits = 0usize;
-    for g in 0..n_gops {
-        let f0 = g * gop_size;
-        let f1 = ((g + 1) * gop_size).min(n_frames);
-        let gop_n = (f1 - f0) as u32;
-        let gop_yuv = &yuv[f0 * frame_size..f1 * frame_size];
-        let cap = super::super::openh264_stego::h264_gop_capacity(
-            gop_yuv, width, height, gop_n, opts, &weights, full_tiers,
-        )?;
+    // The per-GOP capacity probes are independent and the accumulation below is
+    // an order-independent sum. The GOPs are probed sequentially in GOP-index
+    // order. (Previously run concurrently under the pressure controller; reverted
+    // to sequential since the parallel-GOP encode was a net slowdown from
+    // oversubscription.)
+    let gop_slices: Vec<(u32, &[u8])> = (0..n_gops)
+        .map(|g| {
+            let f0 = g * gop_size;
+            let f1 = ((g + 1) * gop_size).min(n_frames);
+            let gop_n = (f1 - f0) as u32;
+            (gop_n, &yuv[f0 * frame_size..f1 * frame_size])
+        })
+        .collect();
+    let caps: Vec<_> = gop_slices
+        .iter()
+        .map(|&(gop_n, gop_yuv)| {
+            super::super::openh264_stego::h264_gop_capacity(
+                gop_yuv, width, height, gop_n, opts, &weights, full_tiers,
+            )
+        })
+        .collect();
+    for cap in caps {
+        let cap = cap?;
         cover_size_bits += cap.coeff_sign_cover_bits;
         shadow_pool_bits += cap.injectable_cover_bits;
         for t in 0..5 {

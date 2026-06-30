@@ -46,9 +46,15 @@ pub struct Av1SampleSplit {
     /// containing both frame header and tile data; optionally
     /// preceded by `metadata_obu`s belonging to that frame).
     ///
-    /// `sequence_header_obu`s and `temporal_delimiter_obu`s are
-    /// STRIPPED from the per-sample bytes (the SH lives in `av1C`,
-    /// TDs are optional and adding them to samples wastes bits).
+    /// **In-band SH emission (muxer-sh-in-band-fix, 2026-06-29):**
+    /// `sequence_header_obu`s are PREPENDED to sync samples (sample
+    /// where `sync[i] == true`). This makes the MP4 robust under
+    /// random-access seeks and decodable by ffmpeg/libdav1d/VLC etc.,
+    /// matching the convention real-world AV1 encoders use. The same
+    /// SH bytes also live in `av1C` (redundant per AV1-ISOBMFF § 2.2.1
+    /// but explicitly allowed). Non-sync samples carry no SH.
+    /// `temporal_delimiter_obu`s remain STRIPPED (optional per spec,
+    /// adding them wastes bits).
     pub samples: Vec<Vec<u8>>,
 
     /// `true` for samples that are AV1 keyframes — the frame
@@ -69,13 +75,21 @@ pub struct Av1SampleSplit {
 ///
 /// | OBU type        | Action |
 /// |-----------------|---------------------------------|
-/// | SEQUENCE_HEADER | Store first one for `av1C`; set `pending_keyframe` flag; STRIPPED from sample bytes |
+/// | SEQUENCE_HEADER | Store first one for `av1C`; cache most-recent bytes for next sync sample; set `pending_keyframe` |
 /// | TEMPORAL_DELIM  | STRIPPED (optional per spec) |
-/// | FRAME           | Starts new sample; sync = pending_keyframe (then cleared) |
-/// | FRAME_HEADER    | Starts new sample; sync = pending_keyframe (then cleared) |
+/// | FRAME           | Starts new sample; PREPEND cached SH bytes if `pending_keyframe`; sync = pending_keyframe (then cleared) |
+/// | FRAME_HEADER    | Starts new sample; PREPEND cached SH bytes if `pending_keyframe`; sync = pending_keyframe (then cleared) |
 /// | TILE_GROUP      | Appended to current sample (follows a FRAME_HEADER) |
 /// | METADATA        | Appended to current sample (belongs to upcoming/current frame) |
 /// | Other           | Appended to current sample if one exists, else discarded |
+///
+/// **In-band SH emission** (muxer-sh-in-band-fix, 2026-06-29): every sync
+/// sample's bytes start with the most-recently-seen `sequence_header_obu`.
+/// This makes the MP4 decodable by ffmpeg/libdav1d/VLC/Chromium (which
+/// don't carry SH state across random-access seek points), matching the
+/// convention real-world AV1 encoders use. av1C still carries the SH
+/// (mandatory per AV1-ISOBMFF § 2.3.1; in-band SH is allowed in
+/// addition per § 2.2.1).
 pub fn split_av1_into_samples(bytes: &[u8]) -> Result<Av1SampleSplit, Mp4Error> {
     let mut sequence_header_obu: Vec<u8> = Vec::new();
     let mut samples: Vec<Vec<u8>> = Vec::new();
@@ -83,6 +97,13 @@ pub fn split_av1_into_samples(bytes: &[u8]) -> Result<Av1SampleSplit, Mp4Error> 
 
     let mut current_sample: Option<Vec<u8>> = None;
     let mut pending_keyframe = false;
+    // Most-recently-seen SH bytes — prepended verbatim to the next sync
+    // sample. `pending_sh` is `Some` from the moment we see an SH until
+    // the FRAME/FH that consumes it. Real-world encoders (rav1e, libaom,
+    // SVT-AV1) emit identical SH bytes on every reset, but we keep the
+    // freshest bytes so streams that DO vary their SHs across GOPs
+    // (e.g. resolution change) are handled correctly.
+    let mut pending_sh: Option<Vec<u8>> = None;
 
     let mut cursor = 0usize;
     while cursor < bytes.len() {
@@ -120,9 +141,11 @@ pub fn split_av1_into_samples(bytes: &[u8]) -> Result<Av1SampleSplit, Mp4Error> 
                 if sequence_header_obu.is_empty() {
                     sequence_header_obu.extend_from_slice(obu_bytes);
                 }
-                // Subsequent SHs (per-GOP reset by streaming session)
-                // mark a keyframe boundary but are NOT emitted into
-                // samples — av1C carries the SH.
+                // Cache for in-band emission on the next sync sample.
+                // Per-GOP resets in phasm's streaming session re-emit the
+                // same SH bytes; refreshing the cache keeps us correct
+                // even if a future encoder varies them.
+                pending_sh = Some(obu_bytes.to_vec());
                 pending_keyframe = true;
             }
             OBU_TEMPORAL_DELIMITER => {
@@ -135,6 +158,15 @@ pub fn split_av1_into_samples(bytes: &[u8]) -> Result<Av1SampleSplit, Mp4Error> 
                     samples.push(s);
                 }
                 let mut new_sample = Vec::new();
+                // In-band SH on sync samples. Decoders without av1C
+                // splicing (ffmpeg + libdav1d / VLC / Chromium) need
+                // the SH inside the sample bytes; mid-clip seeks land
+                // here too — every sync sample carries its own SH.
+                if pending_keyframe {
+                    if let Some(sh) = pending_sh.take() {
+                        new_sample.extend_from_slice(&sh);
+                    }
+                }
                 new_sample.extend_from_slice(obu_bytes);
                 current_sample = Some(new_sample);
                 sync.push(pending_keyframe);

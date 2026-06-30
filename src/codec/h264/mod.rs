@@ -67,6 +67,11 @@ pub mod streaming_session;
 #[cfg(feature = "h264-decoder")]
 pub mod progress;
 
+/// `PHASM_PROFILE`-gated wall-clock profiling for the H.264 encode paths
+/// (pass count + per-primitive time breakdown). No-op unless `PHASM_PROFILE`
+/// is set; never affects output bytes.
+pub mod profile;
+
 use std::fmt;
 
 /// H.264/AVC parsing error.

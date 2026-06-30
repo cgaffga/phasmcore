@@ -11,6 +11,19 @@ authors = ["Christoph Gaffga"]
 name = "phasm"
 path = "src/main.rs"
 
+# One-off measurement helper for the AV1 W2 speed × QP sweep. Demuxes
+# an MP4 produced by phasm AV1 stego encode, splices the av1C
+# sequence_header_obu before every sync sample, and writes a raw
+# "section 5" OBU stream to stdout — feedable straight into the
+# stand-alone `dav1d` CLI. Required because ffmpeg's MP4 demuxer
+# does NOT splice av1C → samples; phasm's iOS / streaming-decoder
+# paths do. Gated behind `av1-encoder` (needs `codec::mp4` + Track::is_av1).
+[[bin]]
+name = "av1_obu_extract"
+path = "src/bin/av1_obu_extract.rs"
+required-features = ["av1-encoder"]
+
+
 [dependencies]
 # IMPORTANT: do NOT add `video` or any H.264 feature to phasm-core's
 # features here. The GitHub-release CLI binary distributed via

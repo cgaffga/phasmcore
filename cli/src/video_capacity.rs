@@ -107,7 +107,8 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
     let mut probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
-    transcode::decode_to_yuv(&args.video, &yuv_path)?;
+    // CROP any non-16-aligned source so capacity matches what encode accepts.
+    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, 16)?;
     let yuv = std::fs::read(&yuv_path).map_err(|e| {
         CliError::InvalidArgs(format!("read decoded YUV {}: {e}", yuv_path.display()))
     })?;
@@ -189,7 +190,8 @@ fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
     let mut probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
-    transcode::decode_to_yuv(&args.video, &yuv_path)?;
+    // CROP any non-8-aligned source so capacity matches what encode accepts.
+    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, 8)?;
     let yuv = std::fs::read(&yuv_path).map_err(|e| {
         CliError::InvalidArgs(format!("read decoded YUV {}: {e}", yuv_path.display()))
     })?;

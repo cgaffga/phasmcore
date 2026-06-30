@@ -3,7 +3,10 @@
 // https://github.com/cgaffga/phasmcore
 
 //! Per-GOP chunk framing for streaming video stego — wire format v3
-//! (codec-agnostic, locked 2026-06-08).
+//! (codec-agnostic, locked 2026-06-08) + v3.1 (#888, 2026-06-29): adds an
+//! explicit `m_total: u32` checksum per chunk header that kills the decode
+//! brute-force (~10–20×). H.264 emits/reads v3.1; AV1 migrates in step 6.
+//! See `docs/design/video/h264/chunk-frame-v3.1-decode.md`.
 //!
 //! Multi-GOP streaming stego splits the (already-encrypted+CRC'd)
 //! payload bytes across GOP boundaries. The first stego GOP carries
@@ -100,11 +103,11 @@ pub const CAP2_DEFAULT_R_TARGET: f64 = 0.5;
 
 /// Split `message_bytes` into `total_chunks` evenly-sized pieces. The
 /// final chunk may be smaller if the message length doesn't divide
-/// evenly. Returns the chunk payload slices ready for the v3 builders
-/// ([`build_first_chunk_frame`] on chunk 0, [`build_chunk_frame`]
+/// evenly. Returns the chunk payload slices ready for the v3.1 builders
+/// ([`build_first_chunk_frame_v3_1`] on chunk 0, [`build_chunk_frame_v3_1`]
 /// on subsequent).
 ///
-/// Wire-format-independent: just message splitting. v3 uses this same
+/// Wire-format-independent: just message splitting. v3.1 uses this same
 /// helper unchanged from the v2 era. Future planners (balanced safe
 /// allocation, etc.) may compute their own per-GOP byte counts and
 /// build chunks directly from a slice without this helper.
@@ -308,82 +311,101 @@ pub fn allocate_chunks_concentrate_tail(
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// Wire format v3 (codec-agnostic, AV1 + H.264 — locked 2026-06-08)
+// Wire format v3.1 (codec-agnostic). Locked 2026-06-08 as v3; #888 added the
+// explicit u32 m_total checksum and migrated both H.264 and AV1 — v3 is gone.
+// No backward compatibility: neither codec shipped a v3 installed base.
 // ═════════════════════════════════════════════════════════════════════════
 //
-// See `docs/design/video/chunk-frame-v3.md` for full spec, design
-// rationale, and m_total brute-force compatibility analysis.
+// Full spec + m_total reject mechanism: see the `chunk_frame v3.1` note below
+// and docs/design/video/h264/chunk-frame-v3.1-decode.md (#888).
 //
 // ## First chunk (GOP 0) wire layout
 //   inline (≤ 65 534 byte payload):
-//     u32 BE total_bytes (4) + u16 BE payload_len (2)   → 6-byte header
-//   extended (≥ 65 535 byte payload):
-//     u32 BE total_bytes (4) + 0xFFFF u16 (2) + u32 BE payload_len (4)
+//     u32 BE total_bytes (4) + u32 BE m_total (4) + u16 BE payload_len (2)
 //                                                       → 10-byte header
+//   extended (≥ 65 535 byte payload):
+//     u32 BE total_bytes (4) + u32 BE m_total (4) + 0xFFFF u16 (2)
+//       + u32 BE payload_len (4)                        → 14-byte header
 //
 // ## Subsequent chunks (GOP i > 0) wire layout
-//   inline:   u16 BE payload_len (2)                    → 2-byte header
-//   extended: 0xFFFF u16 (2) + u32 BE payload_len (4)   → 6-byte header
+//   inline:   u32 BE m_total (4) + u16 BE payload_len (2)   → 6-byte header
+//   extended: u32 BE m_total (4) + 0xFFFF u16 (2)
+//               + u32 BE payload_len (4)                    → 10-byte header
 //
 // ## Decoder stop condition
 //   Stop when `Σ payload_len == total_bytes` (W is implicit). Tail
 //   GOPs `i ≥ W` are fully natural — no chunk_frame, no STC, no cover
 //   hooks fire.
+
+// ── chunk_frame v3.1 ──────────────────────────────────────────────────────
 //
-// ## m_total brute-force compatibility
-//   Both parsers are length-strict: extracted byte count MUST equal
-//   `header_len + payload_len` exactly. Within a w-class, only the
-//   encoder's m_total satisfies the equality — this is the
-//   length-strict invariant preserved unchanged from v2.
+// v3.1 adds an explicit `m_total: u32` (framed message **bit** count) to every
+// chunk header — immediately after `total_bytes` (first chunk) / at the head
+// (subsequent). The decoder reads it in the cheap prefix extract and rejects
+// any STC candidate whose loop `m_total` != the stored value: an exact 1/2³²
+// reject that collapses the v3 brute-force survivors (canonicality
+// floor-collisions + LEN_SENTINEL bypass) to a single full extract per slab.
+// See docs/design/video/h264/chunk-frame-v3.1-decode.md (#888).
+//
+// `m_total` is a *checksum*, not free data: it always equals
+// `(header_len + payload_len) * 8`, so the builder derives it and the parser
+// re-validates it. Stored as a fixed `u32` with NO sentinel/extended form — its
+// width *is* its reject strength (u16's 1/2¹⁶ is too weak on large/4K slabs).
+// `payload_len` keeps its v3 `u16` + `0xFFFF`→`u32` escape.
 
-/// v3 first-chunk header size, inline form: `u32 total_bytes + u16 payload_len`.
-pub const CHUNK_FRAME_FIRST_HEADER_LEN: usize = 6;
+/// v3.1 first-chunk header, inline: `u32 total_bytes + u32 m_total + u16 payload_len`.
+pub const CHUNK_FRAME_FIRST_HEADER_LEN_V3_1: usize = 10;
+/// v3.1 first-chunk header, extended: base 10 + sentinel 2 + u32 = 14 bytes.
+pub const CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX: usize = 14;
+/// v3.1 subsequent-chunk header, inline: `u32 m_total + u16 payload_len`.
+pub const CHUNK_FRAME_NEXT_HEADER_LEN_V3_1: usize = 6;
+/// v3.1 subsequent-chunk header, extended: base 6 + sentinel 2 + u32 = 10 bytes.
+pub const CHUNK_FRAME_NEXT_HEADER_LEN_V3_1_MAX: usize = 10;
 
-/// v3 first-chunk header size, extended form: base 6 + sentinel 2 + u32 = 10 bytes.
-pub const CHUNK_FRAME_FIRST_HEADER_LEN_MAX: usize = 10;
+/// `m_total` for a framed chunk = framed message **bit** count =
+/// `(header_len + payload_len) * 8`. `None` if it would overflow `u32`
+/// (only for absurd >536 MB chunks — far beyond any cover capacity).
+#[inline]
+fn v3_1_m_total(header_len: usize, payload_len: usize) -> Option<u32> {
+    let bits = (header_len as u64)
+        .checked_add(payload_len as u64)?
+        .checked_mul(8)?;
+    u32::try_from(bits).ok()
+}
 
-/// v3 subsequent-chunk header size, inline form: `u16 payload_len`.
-pub const CHUNK_FRAME_NEXT_HEADER_LEN: usize = 2;
-
-/// v3 subsequent-chunk header size, extended form: sentinel 2 + u32 = 6 bytes.
-pub const CHUNK_FRAME_NEXT_HEADER_LEN_MAX: usize = 6;
-
-/// Build v3 first-chunk wire bytes.
-///
-/// `total_bytes` is the full AEAD-encrypted message length (u32, up to
-/// 4 GB). `payload` is this chunk's slice of the message.
-///
-/// Writes the inline `u16` payload length for `payload.len() <= 65 534`,
-/// or the `0xFFFF` + `u32` extended form otherwise. The sentinel is the
-/// same `LEN_SENTINEL = 0xFFFF` shared with v2 — `0` stays a valid
-/// inline value (empty chunks would be routine in v2; v3 doesn't emit
-/// them, but the parser still accepts them).
+/// Build v3.1 first-chunk wire bytes. `m_total` is derived + written here, so
+/// callers pass only `total_bytes` + `payload`, exactly as v3.
 ///
 /// # Errors
-/// * `InvalidVideo` if `total_bytes == 0` or `payload.len() > u32::MAX`.
-pub fn build_first_chunk_frame(
+/// * `InvalidVideo` if `total_bytes == 0`, `payload.len() > u32::MAX`, or the
+///   derived `m_total` would overflow `u32`.
+pub fn build_first_chunk_frame_v3_1(
     total_bytes: u32,
     payload: &[u8],
 ) -> Result<Vec<u8>, StegoError> {
     if total_bytes == 0 {
         return Err(StegoError::InvalidVideo(
-            "chunk_frame_v3: total_bytes must be > 0".into(),
+            "chunk_frame_v3_1: total_bytes must be > 0".into(),
         ));
     }
     if payload.len() > u32::MAX as usize {
         return Err(StegoError::InvalidVideo(format!(
-            "chunk_frame_v3: payload {} exceeds u32::MAX",
+            "chunk_frame_v3_1: payload {} exceeds u32::MAX",
             payload.len()
         )));
     }
     let extended = payload.len() >= LEN_SENTINEL as usize;
     let header_len = if extended {
-        CHUNK_FRAME_FIRST_HEADER_LEN_MAX
+        CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX
     } else {
-        CHUNK_FRAME_FIRST_HEADER_LEN
+        CHUNK_FRAME_FIRST_HEADER_LEN_V3_1
     };
+    let m_total = v3_1_m_total(header_len, payload.len()).ok_or_else(|| {
+        StegoError::InvalidVideo("chunk_frame_v3_1: m_total exceeds u32::MAX".into())
+    })?;
     let mut out = Vec::with_capacity(header_len + payload.len());
     out.extend_from_slice(&total_bytes.to_be_bytes());
+    out.extend_from_slice(&m_total.to_be_bytes());
     if extended {
         out.extend_from_slice(&LEN_SENTINEL.to_be_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -394,24 +416,28 @@ pub fn build_first_chunk_frame(
     Ok(out)
 }
 
-/// Build v3 subsequent-chunk wire bytes (no clip-level header).
+/// Build v3.1 subsequent-chunk wire bytes (no clip-level `total_bytes`).
 ///
 /// # Errors
-/// * `InvalidVideo` if `payload.len() > u32::MAX`.
-pub fn build_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, StegoError> {
+/// * `InvalidVideo` if `payload.len() > u32::MAX` or `m_total` overflows `u32`.
+pub fn build_chunk_frame_v3_1(payload: &[u8]) -> Result<Vec<u8>, StegoError> {
     if payload.len() > u32::MAX as usize {
         return Err(StegoError::InvalidVideo(format!(
-            "chunk_frame_v3: payload {} exceeds u32::MAX",
+            "chunk_frame_v3_1: payload {} exceeds u32::MAX",
             payload.len()
         )));
     }
     let extended = payload.len() >= LEN_SENTINEL as usize;
     let header_len = if extended {
-        CHUNK_FRAME_NEXT_HEADER_LEN_MAX
+        CHUNK_FRAME_NEXT_HEADER_LEN_V3_1_MAX
     } else {
-        CHUNK_FRAME_NEXT_HEADER_LEN
+        CHUNK_FRAME_NEXT_HEADER_LEN_V3_1
     };
+    let m_total = v3_1_m_total(header_len, payload.len()).ok_or_else(|| {
+        StegoError::InvalidVideo("chunk_frame_v3_1: m_total exceeds u32::MAX".into())
+    })?;
     let mut out = Vec::with_capacity(header_len + payload.len());
+    out.extend_from_slice(&m_total.to_be_bytes());
     if extended {
         out.extend_from_slice(&LEN_SENTINEL.to_be_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -422,78 +448,165 @@ pub fn build_chunk_frame(payload: &[u8]) -> Result<Vec<u8>, StegoError> {
     Ok(out)
 }
 
-/// Parse v3 first-chunk header. Returns `(total_bytes, payload_slice)`
-/// where `payload_slice.len()` equals the declared `payload_len` exactly
-/// (length-strict — short buffers return `None`, trailing-garbage
-/// buffers return only the declared length).
-///
-/// Validates:
-/// - Enough bytes for the header (inline or extended).
-/// - `total_bytes > 0` (sanity-floor against wrong-passphrase decode).
-/// - Extended-form length genuinely needed the escape (`>= LEN_SENTINEL`).
-/// - `bytes.len() >= header_len + payload_len` (length-strict).
-pub fn parse_first_chunk_frame(bytes: &[u8]) -> Option<(u32, &[u8])> {
-    if bytes.len() < CHUNK_FRAME_FIRST_HEADER_LEN {
+/// Parse a v3.1 first-chunk header → `(total_bytes, m_total, payload_slice)`.
+/// Length-strict, and re-validates the checksum invariant
+/// `m_total == (header_len + payload_len) * 8` — a mismatch returns `None`.
+pub fn parse_first_chunk_frame_v3_1(bytes: &[u8]) -> Option<(u32, u32, &[u8])> {
+    if bytes.len() < CHUNK_FRAME_FIRST_HEADER_LEN_V3_1 {
         return None;
     }
     let total_bytes = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     if total_bytes == 0 {
         return None;
     }
+    let m_total = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let len_field = u16::from_be_bytes([bytes[8], bytes[9]]);
+    let (payload_len, header_len) = if len_field == LEN_SENTINEL {
+        if bytes.len() < CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX {
+            return None;
+        }
+        let v = u32::from_be_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+        if v < LEN_SENTINEL as usize {
+            return None;
+        }
+        (v, CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX)
+    } else {
+        (len_field as usize, CHUNK_FRAME_FIRST_HEADER_LEN_V3_1)
+    };
+    if v3_1_m_total(header_len, payload_len)? != m_total {
+        return None;
+    }
+    let end = header_len.checked_add(payload_len)?;
+    if bytes.len() < end {
+        return None;
+    }
+    Some((total_bytes, m_total, &bytes[header_len..end]))
+}
+
+/// Parse a v3.1 subsequent-chunk header → `(m_total, payload_slice)`. Same
+/// length-strict + checksum-invariant validation as the first-chunk parser.
+pub fn parse_chunk_frame_v3_1(bytes: &[u8]) -> Option<(u32, &[u8])> {
+    if bytes.len() < CHUNK_FRAME_NEXT_HEADER_LEN_V3_1 {
+        return None;
+    }
+    let m_total = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let len_field = u16::from_be_bytes([bytes[4], bytes[5]]);
     let (payload_len, header_len) = if len_field == LEN_SENTINEL {
-        if bytes.len() < CHUNK_FRAME_FIRST_HEADER_LEN_MAX {
+        if bytes.len() < CHUNK_FRAME_NEXT_HEADER_LEN_V3_1_MAX {
             return None;
         }
         let v = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
         if v < LEN_SENTINEL as usize {
-            // Malformed: extended escape used for an inline-representable length.
             return None;
         }
-        (v, CHUNK_FRAME_FIRST_HEADER_LEN_MAX)
+        (v, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1_MAX)
     } else {
-        (len_field as usize, CHUNK_FRAME_FIRST_HEADER_LEN)
+        (len_field as usize, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1)
     };
+    if v3_1_m_total(header_len, payload_len)? != m_total {
+        return None;
+    }
     let end = header_len.checked_add(payload_len)?;
     if bytes.len() < end {
         return None;
     }
-    Some((total_bytes, &bytes[header_len..end]))
-}
-
-/// Parse v3 subsequent-chunk header. Returns `payload_slice` (length-strict).
-///
-/// Validates:
-/// - Enough bytes for the header.
-/// - Extended-form length genuinely needed the escape.
-/// - `bytes.len() >= header_len + payload_len` (length-strict).
-pub fn parse_chunk_frame(bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.len() < CHUNK_FRAME_NEXT_HEADER_LEN {
-        return None;
-    }
-    let len_field = u16::from_be_bytes([bytes[0], bytes[1]]);
-    let (payload_len, header_len) = if len_field == LEN_SENTINEL {
-        if bytes.len() < CHUNK_FRAME_NEXT_HEADER_LEN_MAX {
-            return None;
-        }
-        let v = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
-        if v < LEN_SENTINEL as usize {
-            return None;
-        }
-        (v, CHUNK_FRAME_NEXT_HEADER_LEN_MAX)
-    } else {
-        (len_field as usize, CHUNK_FRAME_NEXT_HEADER_LEN)
-    };
-    let end = header_len.checked_add(payload_len)?;
-    if bytes.len() < end {
-        return None;
-    }
-    Some(&bytes[header_len..end])
+    Some((m_total, &bytes[header_len..end]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- chunk_frame v3.1 (#888) ----
+
+    #[test]
+    fn v3_1_first_roundtrip_inline() {
+        let payload = vec![0xABu8; 200];
+        let total = 4096u32;
+        let framed = build_first_chunk_frame_v3_1(total, &payload).unwrap();
+        // layout: total(4) | m_total(4) | payload_len(2) | payload
+        assert_eq!(framed.len(), CHUNK_FRAME_FIRST_HEADER_LEN_V3_1 + payload.len());
+        assert_eq!(&framed[0..4], &total.to_be_bytes());
+        let m_field = u32::from_be_bytes([framed[4], framed[5], framed[6], framed[7]]);
+        assert_eq!(
+            m_field as usize,
+            (CHUNK_FRAME_FIRST_HEADER_LEN_V3_1 + payload.len()) * 8
+        );
+        let (rt_total, rt_m, rt_payload) = parse_first_chunk_frame_v3_1(&framed).unwrap();
+        assert_eq!(rt_total, total);
+        assert_eq!(rt_m, m_field);
+        assert_eq!(rt_payload, &payload[..]);
+    }
+
+    #[test]
+    fn v3_1_first_roundtrip_extended() {
+        let payload = vec![0xCDu8; LEN_SENTINEL as usize + 50]; // forces extended form
+        let total = 1_000_000u32;
+        let framed = build_first_chunk_frame_v3_1(total, &payload).unwrap();
+        assert_eq!(
+            framed.len(),
+            CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX + payload.len()
+        );
+        let (rt_total, rt_m, rt_payload) = parse_first_chunk_frame_v3_1(&framed).unwrap();
+        assert_eq!(rt_total, total);
+        assert_eq!(
+            rt_m as usize,
+            (CHUNK_FRAME_FIRST_HEADER_LEN_V3_1_MAX + payload.len()) * 8
+        );
+        assert_eq!(rt_payload, &payload[..]);
+    }
+
+    #[test]
+    fn v3_1_subsequent_roundtrip_inline() {
+        let payload = vec![0x12u8; 137];
+        let framed = build_chunk_frame_v3_1(&payload).unwrap();
+        assert_eq!(framed.len(), CHUNK_FRAME_NEXT_HEADER_LEN_V3_1 + payload.len());
+        let (rt_m, rt_payload) = parse_chunk_frame_v3_1(&framed).unwrap();
+        assert_eq!(
+            rt_m as usize,
+            (CHUNK_FRAME_NEXT_HEADER_LEN_V3_1 + payload.len()) * 8
+        );
+        assert_eq!(rt_payload, &payload[..]);
+    }
+
+    #[test]
+    fn v3_1_subsequent_roundtrip_extended() {
+        let payload = vec![0x34u8; LEN_SENTINEL as usize];
+        let framed = build_chunk_frame_v3_1(&payload).unwrap();
+        assert_eq!(
+            framed.len(),
+            CHUNK_FRAME_NEXT_HEADER_LEN_V3_1_MAX + payload.len()
+        );
+        let (_rt_m, rt_payload) = parse_chunk_frame_v3_1(&framed).unwrap();
+        assert_eq!(rt_payload, &payload[..]);
+    }
+
+    #[test]
+    fn v3_1_parse_rejects_corrupt_m_total() {
+        let payload = vec![0x55u8; 64];
+        let mut framed = build_first_chunk_frame_v3_1(4096, &payload).unwrap();
+        framed[5] ^= 0x01; // flip a bit in the m_total field → checksum invariant fails
+        assert!(parse_first_chunk_frame_v3_1(&framed).is_none());
+    }
+
+    #[test]
+    fn v3_1_parse_rejects_short_and_zero_total() {
+        assert!(parse_first_chunk_frame_v3_1(&[0u8; 4]).is_none()); // too short
+        let payload = vec![0u8; 16];
+        let mut framed = build_first_chunk_frame_v3_1(7, &payload).unwrap();
+        framed[0..4].copy_from_slice(&0u32.to_be_bytes()); // total_bytes = 0
+        assert!(parse_first_chunk_frame_v3_1(&framed).is_none());
+    }
+
+    #[test]
+    fn v3_1_length_strict_trailing_garbage() {
+        let payload = vec![0x99u8; 32];
+        let mut framed = build_first_chunk_frame_v3_1(4096, &payload).unwrap();
+        framed.extend_from_slice(&[0xFFu8; 20]); // trailing garbage
+        let (_t, _m, rt_payload) = parse_first_chunk_frame_v3_1(&framed).unwrap();
+        assert_eq!(rt_payload.len(), payload.len()); // length-strict: only declared len
+        assert_eq!(rt_payload, &payload[..]);
+    }
 
     // ---- allocate_chunks_proportional ----
 
@@ -676,181 +789,4 @@ mod tests {
         assert!(split_message_into_chunks(&[1, 2, 3], 0).is_err());
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // v3 wire format (codec-agnostic, locked 2026-06-08)
-    // ──────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn v3_header_constants_match_wire_layout() {
-        // First chunk: u32 total_bytes (4) + u16 payload_len (2) = 6 inline,
-        // extended adds 0xFFFF sentinel (2) + u32 (4) = 10.
-        assert_eq!(CHUNK_FRAME_FIRST_HEADER_LEN, 6);
-        assert_eq!(CHUNK_FRAME_FIRST_HEADER_LEN_MAX, 10);
-        // Subsequent chunk: u16 payload_len (2) inline, sentinel + u32 = 6 extended.
-        assert_eq!(CHUNK_FRAME_NEXT_HEADER_LEN, 2);
-        assert_eq!(CHUNK_FRAME_NEXT_HEADER_LEN_MAX, 6);
-    }
-
-    #[test]
-    fn v3_build_parse_first_chunk_roundtrip() {
-        let payload = b"hello world (first chunk)";
-        let framed = build_first_chunk_frame(1_234_567, payload).unwrap();
-        assert_eq!(framed.len(), CHUNK_FRAME_FIRST_HEADER_LEN + payload.len());
-        let (total, slice) = parse_first_chunk_frame(&framed).unwrap();
-        assert_eq!(total, 1_234_567);
-        assert_eq!(slice, payload);
-    }
-
-    #[test]
-    fn v3_build_parse_subsequent_chunk_roundtrip() {
-        let payload = b"hello world (subsequent chunk)";
-        let framed = build_chunk_frame(payload).unwrap();
-        assert_eq!(framed.len(), CHUNK_FRAME_NEXT_HEADER_LEN + payload.len());
-        let slice = parse_chunk_frame(&framed).unwrap();
-        assert_eq!(slice, payload);
-    }
-
-    #[test]
-    fn v3_build_parse_empty_payload_subsequent() {
-        // payload_len = 0 must stay a valid inline value (sentinel is 0xFFFF
-        // precisely because 0 is routine). Subsequent chunks may carry 0
-        // bytes in v3 if the allocator emits a final zero-payload terminator
-        // (currently no such mode, but parser must accept).
-        let framed = build_chunk_frame(b"").unwrap();
-        assert_eq!(framed.len(), CHUNK_FRAME_NEXT_HEADER_LEN);
-        let slice = parse_chunk_frame(&framed).unwrap();
-        assert!(slice.is_empty());
-    }
-
-    #[test]
-    fn v3_first_chunk_inline_boundary() {
-        // 65534 stays inline; 65535 escapes to extended.
-        let inline = vec![0xAAu8; (LEN_SENTINEL as usize) - 1];
-        let f_inline = build_first_chunk_frame(42, &inline).unwrap();
-        assert_eq!(f_inline.len(), CHUNK_FRAME_FIRST_HEADER_LEN + inline.len());
-        let (total, s) = parse_first_chunk_frame(&f_inline).unwrap();
-        assert_eq!(total, 42);
-        assert_eq!(s, &inline[..]);
-
-        let escaped = vec![0xBBu8; LEN_SENTINEL as usize];
-        let f_escaped = build_first_chunk_frame(99, &escaped).unwrap();
-        assert_eq!(f_escaped.len(), CHUNK_FRAME_FIRST_HEADER_LEN_MAX + escaped.len());
-        let (total, s2) = parse_first_chunk_frame(&f_escaped).unwrap();
-        assert_eq!(total, 99);
-        assert_eq!(s2, &escaped[..]);
-    }
-
-    #[test]
-    fn v3_subsequent_chunk_inline_boundary() {
-        let inline = vec![0xCCu8; (LEN_SENTINEL as usize) - 1];
-        let f_inline = build_chunk_frame(&inline).unwrap();
-        assert_eq!(f_inline.len(), CHUNK_FRAME_NEXT_HEADER_LEN + inline.len());
-        assert_eq!(parse_chunk_frame(&f_inline).unwrap(), &inline[..]);
-
-        let escaped = vec![0xDDu8; LEN_SENTINEL as usize];
-        let f_escaped = build_chunk_frame(&escaped).unwrap();
-        assert_eq!(f_escaped.len(), CHUNK_FRAME_NEXT_HEADER_LEN_MAX + escaped.len());
-        assert_eq!(parse_chunk_frame(&f_escaped).unwrap(), &escaped[..]);
-    }
-
-    #[test]
-    fn v3_extended_large_payload_roundtrip() {
-        let payload = vec![0x5Au8; 70_000];
-        let f_first = build_first_chunk_frame(70_000, &payload).unwrap();
-        assert_eq!(f_first.len(), CHUNK_FRAME_FIRST_HEADER_LEN_MAX + payload.len());
-        let (total, s) = parse_first_chunk_frame(&f_first).unwrap();
-        assert_eq!(total, 70_000);
-        assert_eq!(s, &payload[..]);
-
-        let f_next = build_chunk_frame(&payload).unwrap();
-        assert_eq!(f_next.len(), CHUNK_FRAME_NEXT_HEADER_LEN_MAX + payload.len());
-        assert_eq!(parse_chunk_frame(&f_next).unwrap(), &payload[..]);
-    }
-
-    #[test]
-    fn v3_parse_first_is_length_strict_rejects_truncation() {
-        // Length-strict invariant on first chunk: missing even one payload
-        // byte must NOT parse. Forces brute-force m_total search to land on
-        // the encoder's exact value, not the w-class minimum.
-        let payload = b"the exact length matters here too";
-        let framed = build_first_chunk_frame(1000, payload).unwrap();
-        let truncated = &framed[..framed.len() - 1];
-        assert!(parse_first_chunk_frame(truncated).is_none());
-    }
-
-    #[test]
-    fn v3_parse_subsequent_is_length_strict_rejects_truncation() {
-        let payload = b"abc subsequent";
-        let framed = build_chunk_frame(payload).unwrap();
-        let truncated = &framed[..framed.len() - 1];
-        assert!(parse_chunk_frame(truncated).is_none());
-    }
-
-    #[test]
-    fn v3_parse_ignores_trailing_bytes_returns_exact_payload() {
-        let payload = b"abc";
-        let mut framed = build_first_chunk_frame(3, payload).unwrap();
-        framed.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // garbage tail (e.g., over-extracted m_total in same w-class)
-        let (total, s) = parse_first_chunk_frame(&framed).unwrap();
-        assert_eq!(total, 3);
-        assert_eq!(s, payload);
-    }
-
-    #[test]
-    fn v3_parse_first_rejects_zero_total_bytes() {
-        // Sanity-floor: total_bytes=0 is wrong-passphrase or corruption.
-        // 4 bytes of zero + 2 bytes of payload_len + payload.
-        let bad = vec![0u8, 0, 0, 0, 0, 3, 1, 2, 3];
-        assert!(parse_first_chunk_frame(&bad).is_none());
-    }
-
-    #[test]
-    fn v3_build_first_rejects_zero_total_bytes() {
-        assert!(build_first_chunk_frame(0, b"data").is_err());
-    }
-
-    #[test]
-    fn v3_parse_rejects_false_sentinel_with_inline_value() {
-        // First chunk: u32 total + 0xFFFF sentinel + u32 < LEN_SENTINEL → malformed.
-        let bad = vec![
-            0, 0, 0, 100,           // total_bytes = 100
-            0xFF, 0xFF,             // sentinel
-            0, 0, 0, 10,            // payload_len = 10 (should have been inline)
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        ];
-        assert!(parse_first_chunk_frame(&bad).is_none());
-
-        // Subsequent chunk: 0xFFFF sentinel + u32 < LEN_SENTINEL → malformed.
-        let bad_next = vec![
-            0xFF, 0xFF,
-            0, 0, 0, 10,
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        ];
-        assert!(parse_chunk_frame(&bad_next).is_none());
-    }
-
-    #[test]
-    fn v3_parse_rejects_short_buffers() {
-        assert!(parse_first_chunk_frame(&[]).is_none());
-        assert!(parse_first_chunk_frame(&[0u8; 5]).is_none());
-        assert!(parse_chunk_frame(&[]).is_none());
-        assert!(parse_chunk_frame(&[0u8; 1]).is_none());
-    }
-
-    #[test]
-    fn v3_overhead_total_at_typical_w() {
-        // Sanity-check the v3 overhead formula at W=10 with 1 KB payload per
-        // chunk: first-chunk header 6 + (W-1) × subsequent-chunk header 2
-        // = 6 + 18 = 24 bytes total. The pre-v3 (chunk_idx + total_chunks
-        // + payload_len = 6 B/chunk) overhead at W=10 was 60 B; v3 cuts
-        // header bytes by ~60% at typical W. See chunk-frame-v3.md §2.4.
-        let w = 10;
-        let v3_overhead =
-            CHUNK_FRAME_FIRST_HEADER_LEN + (w - 1) * CHUNK_FRAME_NEXT_HEADER_LEN;
-        assert_eq!(v3_overhead, 24);
-        let v2_overhead_legacy: usize = 60; // historical reference, v2 retired
-        assert_eq!(v2_overhead_legacy, 60);
-        // 60% reduction at W=10.
-        assert!((v2_overhead_legacy - v3_overhead) * 100 / v2_overhead_legacy >= 60);
-    }
 }

@@ -108,6 +108,56 @@ pub type Dav1dPhasmMetaHook = Option<
     ),
 >;
 
+/// stealth-audit-2026-06-29: per-block metadata mirror. Field layout
+/// MUST match `Dav1dPhasmBlockInfo` in
+/// `vendor/phasm-dav1d/include/dav1d/dav1d.h`.
+///
+/// Fields populated by dav1d's decode_b at the end of per-block
+/// decode. Intra/inter unions are flattened: when `intra=1`,
+/// `y_mode`/`uv_mode` are set and inter fields are zero-init; when
+/// `intra=0`, ref/mv/inter_mode fields are set and intra fields are
+/// zero-init.
+///
+/// Used by the Layer-3 fingerprint comparison binary
+/// (`av1_block_hist`) to tally partition/mode/MV/ref distributions
+/// per encoded file.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Dav1dPhasmBlockInfo {
+    pub bx: u16,
+    pub by: u16,
+    pub bs: u8,
+    pub bl: u8,
+    pub bp: u8,
+    pub intra: u8,
+    pub skip: u8,
+    pub skip_mode: u8,
+    pub seg_id: u8,
+    pub y_mode: u8,
+    pub uv_mode: u8,
+    pub ref0: i8,
+    pub ref1: i8,
+    pub inter_mode: u8,
+    pub motion_mode: u8,
+    pub comp_type: u8,
+    pub mv0_x: i16,
+    pub mv0_y: i16,
+    pub mv1_x: i16,
+    pub mv1_y: i16,
+    pub frame_type: u8,
+    pub _pad0: u8,
+    pub frame_offset: u16,
+}
+
+/// stealth-audit-2026-06-29: block_hook callback type. Fires once
+/// per Av1Block at the end of dav1d's decode_b.
+pub type Dav1dPhasmBlockHook = Option<
+    unsafe extern "C" fn(
+        cookie: *mut core::ffi::c_void,
+        info: *const Dav1dPhasmBlockInfo,
+    ),
+>;
+
 /// Hook registration struct — embedded in `Dav1dSettings` (and copied
 /// down through `Dav1dContext` to each `MsacContext` per
 /// `dav1d-hook-sites.md` § 5).
@@ -123,6 +173,8 @@ pub struct Dav1dPhasmHooks {
     pub tag_hook: Dav1dPhasmTagHook,
     /// Phase B.1.1.b addition.
     pub meta_hook: Dav1dPhasmMetaHook,
+    /// stealth-audit-2026-06-29 addition.
+    pub block_hook: Dav1dPhasmBlockHook,
 }
 
 // ABI verification helpers exposed by the shim. Each returns the

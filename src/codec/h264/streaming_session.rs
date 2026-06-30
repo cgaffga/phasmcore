@@ -36,14 +36,14 @@ use super::progress::{
 // OH264 path imports — gated by the h264-encoder feature.
 #[cfg(feature = "h264-encoder")]
 use super::openh264_stego::{
-    bytes_to_bits_msb_first_pub, h264_encode_gop_framed_bits,
-    oh264_plain_encode_gop, EncodeOpts,
+    bytes_to_bits_msb_first_pub, consume_gop_emit, oh264_plain_encode_gop, produce_gop_cover,
+    EncodeOpts, GopCoverProducts,
 };
 #[cfg(feature = "h264-encoder")]
 use super::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM};
 // chunk_frame helpers — needed by BOTH the OH264 encode path and (post
 // #472.2) the pure-Rust encode path, so unconditional.
-use super::stego::chunk_frame::{build_chunk_frame, build_first_chunk_frame};
+use super::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_v3_1};
 
 // Decode-side imports (available within the h264-encoder gate that
 // already wraps this module; decode doesn't need h264-encoder).
@@ -53,8 +53,8 @@ use super::cabac::bin_decoder::slice::{
 use super::stego::{combine_cover_4domain, CostWeights};
 use super::stego::orchestrate::DomainCosts;
 use super::stego::chunk_frame::{
-    parse_chunk_frame, parse_first_chunk_frame, CHUNK_FRAME_FIRST_HEADER_LEN,
-    CHUNK_FRAME_NEXT_HEADER_LEN, LEN_SENTINEL,
+    parse_chunk_frame_v3_1, parse_first_chunk_frame_v3_1,
+    CHUNK_FRAME_FIRST_HEADER_LEN_V3_1, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1,
 };
 use super::stego::hook::EmbedDomain;
 use super::stego::keys::CabacStegoMasterKeys;
@@ -789,20 +789,53 @@ pub(crate) fn embed_gop_roundtrip_safe(
     hhat_seed: &[u8; 32],
     weights: &CostWeights,
 ) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
+    // B-full.6b.1/.2 (#894): the payload-INDEPENDENT clean cover (Pass-1 + walk +
+    // content_costs + safe_msl ∞-gate) is produced ONCE (`produce_gop_cover`), then
+    // the payload-DEPENDENT round-trip shrink-carry emit loop runs
+    // (`consume_gop_roundtrip_safe`). Byte-identical to the old per-shrink full
+    // 2-pass encode — gated by the non-shadow streaming round-trip tests.
+    let products = produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?;
+    consume_gop_roundtrip_safe(
+        &products, gop_yuv, width, height, frames_in_gop, opts, payload, chunk_idx,
+        total_bytes, hhat_seed, weights,
+    )
+}
+
+/// B-full.6b.2 (#894) — the payload-DEPENDENT half of [`embed_gop_roundtrip_safe`]:
+/// the round-trip-verified shrink-carry emit loop over a pre-produced
+/// [`GopCoverProducts`]. Tries `payload` (up to its full length); on encode-fail OR
+/// verify-fail (the J2 silent-loss zone) it shrinks `want` ~12%/step and retries,
+/// verifying with the SAME extract the real decoder uses (`verify_chunk_v3`). An
+/// empty chunk always round-trips, so the loop terminates.
+#[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn consume_gop_roundtrip_safe(
+    products: &GopCoverProducts,
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    frames_in_gop: u32,
+    opts: super::openh264_stego::EncodeOpts,
+    payload: &[u8],
+    chunk_idx: u16,
+    total_bytes: u32,
+    hhat_seed: &[u8; 32],
+    weights: &CostWeights,
+) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
     let mut want = payload.len();
     loop {
         let chunk = &payload[..want];
-        // chunk_frame v3 §2: GOP 0 carries the u32 total_bytes header;
-        // GOP ≥ 1 carries only its payload_len.
+        // chunk_frame v3.1 §4: GOP 0 carries u32 total_bytes + u32 m_total;
+        // GOP ≥ 1 carries u32 m_total + payload_len (#888).
         let framed = if chunk_idx == 0 {
-            build_first_chunk_frame(total_bytes, chunk)?
+            build_first_chunk_frame_v3_1(total_bytes, chunk)?
         } else {
-            build_chunk_frame(chunk)?
+            build_chunk_frame_v3_1(chunk)?
         };
         let frame_bits = bytes_to_bits_msb_first_pub(&framed);
-        match h264_encode_gop_framed_bits(
-            gop_yuv, width, height, frames_in_gop, opts, &frame_bits, hhat_seed, weights,
-            CascadeTier::Auto, DEFAULT_HEADROOM,
+        match consume_gop_emit(
+            products, gop_yuv, width, height, frames_in_gop, opts, &frame_bits, hhat_seed,
+            weights, CascadeTier::Auto, DEFAULT_HEADROOM,
         ) {
             // Empty chunk round-trips trivially; non-empty must decode back to
             // exactly the bytes embedded.
@@ -817,6 +850,40 @@ pub(crate) fn embed_gop_roundtrip_safe(
                 want -= 1usize.max(want / 8); // ~12% step, reaches 0
             }
             Err(e) => break Err(e),
+        }
+    }
+}
+
+/// CAP2.2 §12 / CAP2.3 §4 — how many payload bytes the stego GOP `chunk_idx`
+/// targets, given the optional precise per-GOP plan (carry-absorbing) or the
+/// online uniform-spread fallback. `window` = the count of leading stego GOPs
+/// (`stego_window` or `total_chunks`); the caller guarantees `chunk_idx < window`.
+/// Used by the sequential `drain_one_gop` path (B-full.6b.2, #894).
+#[cfg(feature = "h264-encoder")]
+fn gop_want(
+    gop_alloc_plan: Option<&[usize]>,
+    window: usize,
+    chunk_idx: usize,
+    cursor: usize,
+    msg_len: usize,
+) -> usize {
+    let gops_remaining = window - chunk_idx; // ≥ 1, incl. this GOP
+    let remaining = msg_len - cursor;
+    match gop_alloc_plan {
+        // CAP2.2 §12 — precise plan (probe two-pass). This GOP's target is its
+        // cumulative planned bytes minus what's already consumed, so a shortfall
+        // carried from a shrunk earlier GOP rolls into this one.
+        Some(plan) => {
+            let planned_through_now: usize = plan.iter().take(chunk_idx + 1).sum();
+            planned_through_now.saturating_sub(cursor).min(remaining)
+        }
+        // Fast path (§13): online uniform-spread + carry-remainder.
+        None => {
+            if gops_remaining <= 1 {
+                remaining
+            } else {
+                remaining.div_ceil(gops_remaining)
+            }
         }
     }
 }
@@ -861,26 +928,13 @@ fn drain_one_gop(
         // a GOP that cannot hold its share embeds less and carries the rest
         // forward (absorbed by later GOPs' headroom), so one weak GOP no
         // longer caps the clip.
-        let gops_remaining = (window - state.chunk_idx) as usize; // ≥ 1, incl. this GOP
-        let remaining = state.msg_frame.len() - state.cursor;
-        let want = match &state.gop_alloc_plan {
-            // CAP2.2 §12 — precise plan (probe two-pass). This GOP's target is
-            // its cumulative planned bytes minus what's already consumed, so a
-            // shortfall carried from a shrunk earlier GOP rolls into this one.
-            Some(plan) => {
-                let planned_through_now: usize =
-                    plan.iter().take(state.chunk_idx as usize + 1).sum();
-                planned_through_now.saturating_sub(state.cursor).min(remaining)
-            }
-            // Fast path (§13): online uniform-spread + carry-remainder.
-            None => {
-                if gops_remaining <= 1 {
-                    remaining
-                } else {
-                    remaining.div_ceil(gops_remaining)
-                }
-            }
-        };
+        let want = gop_want(
+            state.gop_alloc_plan.as_deref(),
+            window as usize,
+            state.chunk_idx as usize,
+            state.cursor,
+            state.msg_frame.len(),
+        );
 
         // CAP2.2 §14 — embed this GOP's share, ROUND-TRIP-VERIFIED with
         // shrink-carry. CAP2.3: the wire `total_chunks` carried by every stego
@@ -1149,10 +1203,15 @@ enum ProbeImpl {
 
 #[cfg(feature = "h264-encoder")]
 struct Oh264ProbeState {
-    /// Tight I420 GOP buffer.
+    /// Tight I420 GOP buffer (the in-progress GOP).
     gop_buffer: Vec<u8>,
     /// Frames buffered in `gop_buffer`.
     frames_buffered: u32,
+    /// Completed GOP `(gop_n_frames, yuv)` awaiting the per-GOP probe drain.
+    /// Holds at most one GOP — each completed GOP is probed (and the buffer
+    /// freed) immediately in `push_frame`; the final partial GOP is pushed here
+    /// in `finish`.
+    pending: Vec<(u32, Vec<u8>)>,
 }
 
 impl StreamingProbeSession {
@@ -1193,6 +1252,7 @@ impl StreamingProbeSession {
                     ProbeImpl::Oh264(Oh264ProbeState {
                         gop_buffer: Vec::with_capacity(gop_capacity),
                         frames_buffered: 0,
+                        pending: Vec::new(),
                     })
                 }
                 #[cfg(not(feature = "h264-encoder"))]
@@ -1271,7 +1331,13 @@ impl StreamingProbeSession {
                 pack_frame_into_buffer(self.params.width, self.params.height, &frame, &mut state.gop_buffer)?;
                 state.frames_buffered += 1;
                 if state.frames_buffered == self.params.gop_size {
-                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
+                    // Sequential per-GOP probe: drain this completed GOP immediately.
+                    // (The parallel-GOP batch was reverted — oversubscription made it
+                    // a net slowdown.)
+                    let gop_n = state.frames_buffered;
+                    state.pending.push((gop_n, std::mem::take(&mut state.gop_buffer)));
+                    state.frames_buffered = 0;
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
                     self.emit_estimate();
                 }
                 Ok(())
@@ -1309,7 +1375,13 @@ impl StreamingProbeSession {
             #[cfg(feature = "h264-encoder")]
             ProbeImpl::Oh264(state) => {
                 if state.frames_buffered > 0 {
-                    drain_one_gop_probe(&self.params, state, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
+                    let gop_n = state.frames_buffered;
+                    state.pending.push((gop_n, std::mem::take(&mut state.gop_buffer)));
+                    state.frames_buffered = 0;
+                }
+                if !state.pending.is_empty() {
+                    // Drain ALL remaining GOPs as the final parallel batch.
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
                     // Emit one final per-GOP event before returning so
                     // listeners that race a final-state read can see
                     // the full count rather than the second-last one.
@@ -1332,51 +1404,69 @@ impl StreamingProbeSession {
     }
 }
 
+/// Sequential per-GOP probe drain. Each completed GOP in `pending` is probed
+/// independently (`h264_gop_capacity`) and the results accumulate in GOP order,
+/// then `pending` is emptied. (Previously batched + run in parallel under the
+/// pressure controller; reverted to a sequential map since the parallel-GOP
+/// encode was a net slowdown from oversubscription.)
+///
+/// CAP2.1 — accurate per-GOP STC-trial capacity (same primitive the one-shot
+/// reporter uses, the same boundary the real encode hits before MessageTooLarge);
+/// `coeff_sign_cover_bits` feeds the #475 progress callback + shadow formula.
+///
+/// `h264-encoder`-gated: the per-GOP capacity probe calls
+/// `openh264_stego::h264_gop_capacity` (the OpenH264 encoder). Both callers
+/// (StreamingProbeSession::push_frame) are already in `h264-encoder` blocks;
+/// this gate keeps the decoder-only build (`video,h264-decoder`) clean — it
+/// was latently ungated and only surfaced in the phasmcore sync's decoder gate.
 #[cfg(feature = "h264-encoder")]
-fn drain_one_gop_probe(
+fn drain_pending_gops_probe(
     params: &EncodeSessionParams,
-    state: &mut Oh264ProbeState,
+    pending: &mut Vec<(u32, Vec<u8>)>,
     cover_bits: &mut usize,
     shadow_pool_bits: &mut usize,
     n_gops: &mut u32,
     per_gop_tier0: &mut Vec<usize>,
     per_tier_sum: &mut [usize; 5],
 ) -> Result<(), StegoError> {
-    let frames_in_gop = state.frames_buffered;
-    if frames_in_gop == 0 {
+    if pending.is_empty() {
         return Ok(());
     }
     let opts = super::openh264_stego::EncodeOpts {
         qp: params.qp,
         intra_period: params.gop_size as i32,
     };
-    // CAP2.1 — accurate per-GOP STC-trial capacity (same primitive the
-    // one-shot reporter uses, and the same boundary the real encode hits
-    // before MessageTooLarge), replacing the CoeffSign × 0.40 estimate.
-    // `coeff_sign_cover_bits` is still accumulated for the #475 progress
-    // callback + the shadow-capacity formula.
-    let cap = super::openh264_stego::h264_gop_capacity(
-        &state.gop_buffer,
-        params.width,
-        params.height,
-        frames_in_gop,
-        opts,
-        &params.cost_weights,
-        // #809 — progress-probe path: tier 0 only (5× faster).
-        false,
-    )?;
-    *cover_bits = cover_bits.saturating_add(cap.coeff_sign_cover_bits);
-    *shadow_pool_bits = shadow_pool_bits.saturating_add(cap.injectable_cover_bits);
-    *n_gops = n_gops.saturating_add(1);
-    for t in 0..5 {
-        // CAP2.2 §12 (#824) — Σ per tier = the true carry/proportional ceiling.
-        per_tier_sum[t] = per_tier_sum[t].saturating_add(cap.per_tier_payload[t]);
+    let caps: Vec<_> = pending
+        .iter()
+        .map(|gop| {
+            let (gop_n, buf) = gop;
+            super::openh264_stego::h264_gop_capacity(
+                buf,
+                params.width,
+                params.height,
+                *gop_n,
+                opts,
+                &params.cost_weights,
+                // #809 — progress-probe path: tier 0 only (5× faster).
+                false,
+            )
+        })
+        .collect();
+    // Accumulate in GOP order (the sequential map is already index-ordered).
+    for cap in caps {
+        let cap = cap?;
+        *cover_bits = cover_bits.saturating_add(cap.coeff_sign_cover_bits);
+        *shadow_pool_bits = shadow_pool_bits.saturating_add(cap.injectable_cover_bits);
+        *n_gops = n_gops.saturating_add(1);
+        for t in 0..5 {
+            // CAP2.2 §12 (#824) — Σ per tier = the true carry/proportional ceiling.
+            per_tier_sum[t] = per_tier_sum[t].saturating_add(cap.per_tier_payload[t]);
+        }
+        // CAP2.2 §12 — record this GOP's tier-0 cap (bytes) for proportional
+        // allocation; GOP order matches the encode's chunk order.
+        per_gop_tier0.push(cap.per_tier_payload[0]);
     }
-    // CAP2.2 §12 — record this GOP's tier-0 cap (bytes) for proportional
-    // allocation; GOP order matches the encode's chunk order.
-    per_gop_tier0.push(cap.per_tier_payload[0]);
-    state.frames_buffered = 0;
-    state.gop_buffer.clear();
+    pending.clear();
     Ok(())
 }
 
@@ -1743,23 +1833,23 @@ fn h264_gop_cover_bits(slab: &[u8], weights: &CostWeights) -> Option<Vec<u8>> {
     Some(cover_bits)
 }
 
-/// chunk_frame v3 first-chunk extract (GOP 0). Returns `(total_bytes,
-/// payload)` for the candidate parsing as a v3 first chunk, or `None`.
+/// chunk_frame v3.1 first-chunk extract (GOP 0). Returns `(total_bytes,
+/// payload)` for the candidate parsing as a v3.1 first chunk, or `None`.
 ///
-/// Mirrors `av1::extract_first_chunk_frame_match`, but keeps H.264's
-/// **`m_total` iteration** (8-bit steps): H.264's encoder fixes
-/// `m_total = framed_bits` exactly and derives `w = n_cover / m_total`,
-/// so the decoder must brute-force `m_total` (not `w` like AV1) to land
-/// on the encoder's value. The new fast-reject is the v3 §3.1
-/// w-canonicality check (`w == n_cover / m_bits`), replacing v2's
-/// chunk_idx match — same ~1/max_w rejection magnitude.
+/// Still iterates candidate `m_total` (the STC circularity: `w =
+/// n_cover / m_total` is needed before any prefix can be read), but the v3.1
+/// header carries the encoder's chosen `m_total` explicitly — an exact
+/// `stored_m_total == candidate` reject (1/2³²) replaces v3's canonicality +
+/// LEN_SENTINEL-bypass and collapses the false-positive survivors to a single
+/// full STC extract per slab. See
+/// docs/design/video/h264/chunk-frame-v3.1-decode.md (#888).
 fn extract_first_chunk_frame_match(
     cover_bits: &[u8],
     hhat_seed: &[u8; 32],
     max_total_bytes: u32,
 ) -> Option<(u32, Vec<u8>)> {
     let n_cover = cover_bits.len();
-    let min_m = CHUNK_FRAME_FIRST_HEADER_LEN * 8; // 48 bits
+    let min_m = CHUNK_FRAME_FIRST_HEADER_LEN_V3_1 * 8; // 80 bits
     if n_cover < min_m {
         return None;
     }
@@ -1775,14 +1865,20 @@ fn extract_first_chunk_frame_match(
         let used = m_total * w;
         let hhat = generate_hhat(STC_H, w, hhat_seed);
 
-        // 48-bit prefix: u32 total_bytes + u16 payload_len.
-        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 48);
-        if prefix_bits.len() < 48 {
+        // 80-bit prefix: u32 total_bytes + u32 m_total + u16 payload_len.
+        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 80);
+        if prefix_bits.len() < 80 {
             m_total += 8;
             continue;
         }
         let pb = bits_to_bytes_msb_first(&prefix_bits);
-        if pb.len() < 6 {
+        if pb.len() < 10 {
+            m_total += 8;
+            continue;
+        }
+        // Exact m_total checksum: only the encoder's candidate satisfies it.
+        let stored_m_total = u32::from_be_bytes([pb[4], pb[5], pb[6], pb[7]]) as usize;
+        if stored_m_total != m_total {
             m_total += 8;
             continue;
         }
@@ -1791,33 +1887,14 @@ fn extract_first_chunk_frame_match(
             m_total += 8;
             continue;
         }
-        let cand_len = u16::from_be_bytes([pb[4], pb[5]]);
-        if cand_len != LEN_SENTINEL {
-            let pl = cand_len as usize;
-            // Length sanity + v3 §3.1 w-canonicality fast-reject.
-            if m_total / 8 < CHUNK_FRAME_FIRST_HEADER_LEN + pl {
-                m_total += 8;
-                continue;
-            }
-            let m_bits_check = (CHUNK_FRAME_FIRST_HEADER_LEN + pl).saturating_mul(8);
-            if m_bits_check == 0 || m_bits_check > n_cover {
-                m_total += 8;
-                continue;
-            }
-            let w_canonical = (n_cover / m_bits_check).max(1);
-            if w != w_canonical {
-                m_total += 8;
-                continue;
-            }
-        }
         prefix_ok += 1;
         let extracted = stc_extract(&cover_bits[..used], &hhat, w);
         let bits = &extracted[..m_total.min(extracted.len())];
         let bytes = bits_to_bytes_msb_first(bits);
-        if let Some((total_bytes, payload)) = parse_first_chunk_frame(&bytes) {
+        if let Some((total_bytes, _m, payload)) = parse_first_chunk_frame_v3_1(&bytes) {
             if trace {
                 eprintln!(
-                    "[PHASM_PERF_TRACE v3_first] n_cover={n_cover} tries={tries} prefix_ok={prefix_ok} → HIT m_total={m_total} total_bytes={total_bytes}",
+                    "[PHASM_PERF_TRACE v3_1_first] n_cover={n_cover} tries={tries} prefix_ok={prefix_ok} → HIT m_total={m_total} total_bytes={total_bytes}",
                 );
             }
             return Some((total_bytes, payload.to_vec()));
@@ -1825,23 +1902,21 @@ fn extract_first_chunk_frame_match(
         m_total += 8;
     }
     if trace {
-        eprintln!("[PHASM_PERF_TRACE v3_first] n_cover={n_cover} tries={tries} prefix_ok={prefix_ok} → MISS");
+        eprintln!("[PHASM_PERF_TRACE v3_1_first] n_cover={n_cover} tries={tries} prefix_ok={prefix_ok} → MISS");
     }
     None
 }
 
-/// chunk_frame v3 subsequent-chunk extract (GOP ≥ 1). Returns `payload`.
-/// `max_remaining_bytes` (= `total_bytes − accumulated`) is an
-/// upper-bound filter that also stops the decoder reading past the
-/// encoder's intent. Mirrors `av1::extract_chunk_frame_match`; H.264
-/// keeps the `m_total` loop (see the first-chunk variant for why).
+/// chunk_frame v3.1 subsequent-chunk extract (GOP ≥ 1). Returns `payload`.
+/// `max_remaining_bytes` (= `total_bytes − accumulated`) bounds the final
+/// payload. Same exact-`m_total` reject as the first-chunk variant (#888).
 fn extract_chunk_frame_match(
     cover_bits: &[u8],
     hhat_seed: &[u8; 32],
     max_remaining_bytes: usize,
 ) -> Option<Vec<u8>> {
     let n_cover = cover_bits.len();
-    let min_m = CHUNK_FRAME_NEXT_HEADER_LEN * 8; // 16 bits
+    let min_m = CHUNK_FRAME_NEXT_HEADER_LEN_V3_1 * 8; // 48 bits
     if n_cover < min_m {
         return None;
     }
@@ -1854,43 +1929,26 @@ fn extract_chunk_frame_match(
         let used = m_total * w;
         let hhat = generate_hhat(STC_H, w, hhat_seed);
 
-        // 16-bit prefix: u16 payload_len (or sentinel).
-        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 16);
-        if prefix_bits.len() < 16 {
+        // 48-bit prefix: u32 m_total + u16 payload_len. Exact m_total reject.
+        let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 48);
+        if prefix_bits.len() < 48 {
             m_total += 8;
             continue;
         }
         let pb = bits_to_bytes_msb_first(&prefix_bits);
-        if pb.len() < 2 {
+        if pb.len() < 6 {
             m_total += 8;
             continue;
         }
-        let cand_len = u16::from_be_bytes([pb[0], pb[1]]);
-        if cand_len != LEN_SENTINEL {
-            let pl = cand_len as usize;
-            if pl > max_remaining_bytes {
-                m_total += 8;
-                continue;
-            }
-            if m_total / 8 < CHUNK_FRAME_NEXT_HEADER_LEN + pl {
-                m_total += 8;
-                continue;
-            }
-            let m_bits_check = (CHUNK_FRAME_NEXT_HEADER_LEN + pl).saturating_mul(8);
-            if m_bits_check == 0 || m_bits_check > n_cover {
-                m_total += 8;
-                continue;
-            }
-            let w_canonical = (n_cover / m_bits_check).max(1);
-            if w != w_canonical {
-                m_total += 8;
-                continue;
-            }
+        let stored_m_total = u32::from_be_bytes([pb[0], pb[1], pb[2], pb[3]]) as usize;
+        if stored_m_total != m_total {
+            m_total += 8;
+            continue;
         }
         let extracted = stc_extract(&cover_bits[..used], &hhat, w);
         let bits = &extracted[..m_total.min(extracted.len())];
         let bytes = bits_to_bytes_msb_first(bits);
-        if let Some(payload) = parse_chunk_frame(&bytes) {
+        if let Some((_m, payload)) = parse_chunk_frame_v3_1(&bytes) {
             if payload.len() <= max_remaining_bytes {
                 return Some(payload.to_vec());
             }

@@ -245,19 +245,16 @@ fn decode_av1_streaming(
     }
 
     let mut session = Av1StreamingDecodeSession::create(passphrase);
-    // `build_mp4_av1` strips the `sequence_header_obu` from per-sample
-    // bytes (it lives in `av1C` per AV1-ISOBMFF § 2.2.1). Decoders that
-    // ingest raw sample bytes need to prepend it themselves; otherwise
-    // the OBU walker never finds an SH boundary and `finish` errors with
-    // "no sequence_header_obu in accumulated bytes". Mobile MediaExtractor /
-    // CMSampleBuffer hide this by exposing samples with the codec config
-    // already prepended; the in-tree mp4 demux exposes raw samples, so
-    // we splice av1C in once at session start.
-    if let Some(ref av1c) = track.av1c_data {
-        if !av1c.config_obus.is_empty() {
-            session.push_bytes(&av1c.config_obus);
-        }
-    }
+    // muxer-sh-in-band-fix (2026-06-29) — phasm's MP4 muxer
+    // (`split_av1_into_samples`) now emits the `sequence_header_obu`
+    // IN-BAND at the start of every sync (keyframe) sample. The
+    // streaming decode session's `split_av1_into_gops` walker splits
+    // on those in-band SHs to recover per-GOP slabs. av1C still
+    // carries a redundant SH (mandatory per AV1-ISOBMFF § 2.3.1), but
+    // we no longer re-inject it before each sample — that would
+    // produce SH-only slabs interleaved with real GOPs and trip
+    // `NoCoverPositions`. The earlier MOBOOM.T3.11 workaround is
+    // retired here.
     for sample in &track.samples {
         session.push_bytes(&sample.data);
     }

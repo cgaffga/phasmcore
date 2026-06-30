@@ -49,27 +49,27 @@ use phasm_rav1e::prelude::Sequence;
 use phasm_rav1e::EncoderConfig;
 
 use crate::stego::chunk_frame::{
-    CHUNK_FRAME_FIRST_HEADER_LEN, CHUNK_FRAME_NEXT_HEADER_LEN,
+    CHUNK_FRAME_FIRST_HEADER_LEN_V3_1, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1,
 };
 use crate::stego::frame::FRAME_OVERHEAD;
 
-/// Maximum per-clip chunk_frame v3 overhead at a given GOP count.
-/// First GOP carries `CHUNK_FRAME_FIRST_HEADER_LEN` bytes (clip header);
-/// subsequent up to `n_gops - 1` GOPs carry `CHUNK_FRAME_NEXT_HEADER_LEN`
+/// Maximum per-clip chunk_frame v3.1 overhead at a given GOP count.
+/// First GOP carries `CHUNK_FRAME_FIRST_HEADER_LEN_V3_1` bytes (clip header);
+/// subsequent up to `n_gops - 1` GOPs carry `CHUNK_FRAME_NEXT_HEADER_LEN_V3_1`
 /// bytes each. Returns the **upper-bound** overhead under the assumption
 /// every GOP is a stego chunk (i.e., no Increment B natural tail) — the
 /// conservative case for capacity reporting.
 ///
-/// For comparison: v2's flat 6-byte-per-GOP overhead would have been
-/// `n_gops * 6`; v3's upper bound is `6 + 2*(n_gops-1) = 2*n_gops + 4`.
+/// v3.1 adds the 4-byte `m_total` checksum per chunk: first-chunk header is
+/// 10 B, subsequent 6 B → upper bound `10 + 6*(n_gops-1) = 6*n_gops + 4`.
 /// Real overhead under a balanced-W plan is lower still.
 #[inline]
-fn chunk_frame_v3_overhead_bytes(n_gops: usize) -> usize {
+fn chunk_frame_v3_1_overhead_bytes(n_gops: usize) -> usize {
     if n_gops == 0 {
         0
     } else {
-        CHUNK_FRAME_FIRST_HEADER_LEN
-            + CHUNK_FRAME_NEXT_HEADER_LEN.saturating_mul(n_gops.saturating_sub(1))
+        CHUNK_FRAME_FIRST_HEADER_LEN_V3_1
+            + CHUNK_FRAME_NEXT_HEADER_LEN_V3_1.saturating_mul(n_gops.saturating_sub(1))
     }
 }
 
@@ -88,8 +88,8 @@ use super::session::Av1StreamingEncodeParams;
 /// 2. The smoothness gate (default SMOOTHNESS=40 PENALTY=4) elevates
 ///    costs in smooth regions by 4×. STC strongly avoids those,
 ///    further shrinking the practically-usable cover.
-/// 3. The chunk_frame v3 header adds 6 bytes for the first stego GOP +
-///    2 bytes per subsequent stego GOP (≤ 2 × n_gops + 4 bytes total at
+/// 3. The chunk_frame v3.1 header adds 10 bytes for the first stego GOP
+///    + 6 bytes per subsequent stego GOP (≤ 6 × n_gops + 4 bytes total at
 ///    worst-case W = n_gops; less under Increment B's natural-tail
 ///    plans).
 ///
@@ -118,13 +118,34 @@ pub struct Av1StreamingProbeSession {
     /// Per-domain breakdown for diagnostics (Av1PerDomainBits).
     ac_sign_bits: usize,
     golomb_tail_bits: usize,
-    /// Per-GOP cover-bit count (one entry per `push_frame` call).
+    /// Per-GOP cover-bit count. Semantics depend on `params.gop_size`:
+    ///   - `gop_size == 1` (legacy): one entry per `push_frame` call —
+    ///     each frame is modeled as a standalone I-frame. Same shape
+    ///     `av1_calibrate` and the existing tests have always seen.
+    ///   - `gop_size > 1` (T2.4): one entry per **encode-shaped GOP**
+    ///     (1 IDR + (gop_size−1) P-frames). Internally the probe
+    ///     buffers YUV in `current_gop_yuv` until it has gop_size
+    ///     frames, then encodes the GOP via `encode_gop_natural` and
+    ///     counts Tier-1 tags on the rav1e recording. Match the
+    ///     encode's per-GOP cover production exactly (was systematic
+    ///     ~2× over-estimate at gop_size=1 because every frame was an
+    ///     I-frame, far more nonzero AC coefficients than P-frames).
+    ///
     /// Caller threads this through `set_gop_alloc_plan` /
     /// `plan_proportional` on the encode session for Increment B
-    /// concentrate+tail allocation. Stored in the same units as
-    /// `cover_bits`; convert to byte caps with
+    /// concentrate+tail allocation. Same units as `cover_bits`;
+    /// convert to byte caps with
     /// `Av1CapacityProbeResult::per_gop_byte_caps`.
     per_gop_cover_bits: Vec<usize>,
+    /// T2.4: per-GOP YUV accumulator for `gop_size > 1`. Drained on
+    /// flush. Empty when `gop_size == 1`. RAM held at peak =
+    /// `gop_size × width × height × 3 / 2` (e.g. 1080p × gop=30 =
+    /// ~90 MB transient — same shape as the encode's per-GOP buffer).
+    current_gop_yuv: Vec<u8>,
+    /// Frames already accumulated into `current_gop_yuv`. When this
+    /// hits `params.gop_size`, the GOP gets flushed and the buffer
+    /// is cleared. `finish()` flushes any trailing partial GOP.
+    frames_in_current_gop: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -140,11 +161,15 @@ pub struct Av1CapacityProbeResult {
 
 impl Av1StreamingProbeSession {
     pub fn create(params: Av1StreamingEncodeParams) -> Result<Self, Av1StegoError> {
-        if params.gop_size != 1 {
-            return Err(Av1StegoError::InvalidPacket(format!(
-                "probe.create: D-phase requires gop_size=1, got {}",
-                params.gop_size
-            )));
+        // T2.4: lifted the `gop_size != 1` hard reject. At gop_size=1
+        // we keep the legacy per-frame I-frame probe (calibration-bit-
+        // identical); at gop_size > 1 we run the real encode-shaped
+        // probe via `flush_current_gop`. See the `per_gop_cover_bits`
+        // doc on the struct for semantics.
+        if params.gop_size == 0 {
+            return Err(Av1StegoError::InvalidPacket(
+                "probe.create: gop_size must be >= 1".into(),
+            ));
         }
         if params.width == 0 || params.height == 0 {
             return Err(Av1StegoError::InvalidPacket(
@@ -158,12 +183,25 @@ impl Av1StreamingProbeSession {
             ac_sign_bits: 0,
             golomb_tail_bits: 0,
             per_gop_cover_bits: Vec::new(),
+            current_gop_yuv: Vec::new(),
+            frames_in_current_gop: 0,
         })
     }
 
-    /// Push one I420 frame. At gop_size=1 every frame is its own GOP;
-    /// drains immediately into a per-GOP natural encode and counts
-    /// Tier-1 cover bits.
+    /// Push one I420 frame.
+    ///
+    /// **gop_size = 1 (legacy fast path):** every frame is its own
+    /// GOP, encoded as a standalone I-frame via `probe_one_keyframe`.
+    /// Counts AC-sign + golomb-tail tags from the recording, appends
+    /// one entry to `per_gop_cover_bits`. Behavior bit-identical to
+    /// pre-T2.4.
+    ///
+    /// **gop_size > 1 (T2.4 new path):** the YUV is appended to the
+    /// per-GOP buffer; when the buffer hits `gop_size` frames the GOP
+    /// is flushed via `flush_current_gop` (calls `encode_gop_natural`
+    /// so the rav1e encode runs with the real frame-type pattern —
+    /// 1 IDR + (gop_size−1) P-frames — matching what the actual
+    /// encode produces).
     pub fn push_frame(&mut self, yuv_i420: &[u8]) -> Result<(), Av1StegoError> {
         let expected = expected_i420_size(self.params.width, self.params.height);
         if yuv_i420.len() != expected {
@@ -175,17 +213,39 @@ impl Av1StreamingProbeSession {
                 self.params.height,
             )));
         }
-        let (ac_sign, golomb_tail) = probe_one_keyframe(yuv_i420, self.params)?;
-        let this_gop_cover = ac_sign + golomb_tail;
-        self.ac_sign_bits += ac_sign;
-        self.golomb_tail_bits += golomb_tail;
-        self.cover_bits += this_gop_cover;
-        self.per_gop_cover_bits.push(this_gop_cover);
-        self.n_gops += 1;
+        if self.params.gop_size == 1 {
+            // Legacy path — bit-identical to pre-T2.4. Each frame is
+            // an isolated I-frame, no inter-frame prediction state.
+            let (ac_sign, golomb_tail) = probe_one_keyframe(yuv_i420, self.params)?;
+            let this_gop_cover = ac_sign + golomb_tail;
+            self.ac_sign_bits += ac_sign;
+            self.golomb_tail_bits += golomb_tail;
+            self.cover_bits += this_gop_cover;
+            self.per_gop_cover_bits.push(this_gop_cover);
+            self.n_gops += 1;
+        } else {
+            // T2.4 per-GOP path — buffer YUV, flush at boundary.
+            self.current_gop_yuv.extend_from_slice(yuv_i420);
+            self.frames_in_current_gop += 1;
+            if self.frames_in_current_gop >= self.params.gop_size {
+                self.flush_current_gop()?;
+            }
+        }
         Ok(())
     }
 
-    pub fn finish(self) -> Av1CapacityProbeResult {
+    pub fn finish(mut self) -> Av1CapacityProbeResult {
+        // T2.4: drain any trailing partial GOP. At gop_size=1 this
+        // can't happen (legacy path drains in push_frame). At
+        // gop_size > 1 the clip may end mid-GOP; the partial GOP gets
+        // encoded at its actual frame count (the encode does the same
+        // — partial trailing GOPs are first-class for the streaming
+        // session). Best-effort: if the flush errors, drop the
+        // partial measurement rather than panic; this matches the
+        // probe's "best-effort, fallback to even-split" contract.
+        if self.params.gop_size > 1 && self.frames_in_current_gop > 0 {
+            let _ = self.flush_current_gop();
+        }
         Av1CapacityProbeResult {
             cover_bits: self.cover_bits,
             ac_sign_bits: self.ac_sign_bits,
@@ -193,6 +253,46 @@ impl Av1StreamingProbeSession {
             n_gops: self.n_gops,
             per_gop_cover_bits: self.per_gop_cover_bits,
         }
+    }
+
+    /// T2.4: encode the accumulated GOP at the real frame-type pattern
+    /// and count Tier-1 tags on the resulting recording. Only called
+    /// when `gop_size > 1`. Pulls the natural-encode-only path
+    /// (`encode_gop_natural`) rather than `process_one_gop_pass1` —
+    /// the probe doesn't need the J-UNIWARD `harvest_gop` cost compute,
+    /// which is the dominant per-GOP CPU term in the streaming session
+    /// and would erase most of T2.4's wall-clock win otherwise.
+    fn flush_current_gop(&mut self) -> Result<(), Av1StegoError> {
+        let per_frame = super::whole_video::encode_gop_natural(
+            &self.current_gop_yuv,
+            self.frames_in_current_gop,
+            self.params,
+        )?;
+
+        let mut ac_sign = 0usize;
+        let mut golomb_tail = 0usize;
+        for (_natural, recording) in &per_frame {
+            if let Some(tile) = recording.tiles.first() {
+                for &tag in tile.bit_tags.iter() {
+                    if tag == PHASM_TAG_AC_COEFF_SIGN {
+                        ac_sign += 1;
+                    } else if tag == PHASM_TAG_GOLOMB_TAIL_LSB {
+                        golomb_tail += 1;
+                    }
+                }
+            }
+        }
+        let this_gop_cover = ac_sign + golomb_tail;
+
+        self.ac_sign_bits += ac_sign;
+        self.golomb_tail_bits += golomb_tail;
+        self.cover_bits += this_gop_cover;
+        self.per_gop_cover_bits.push(this_gop_cover);
+        self.n_gops += 1;
+
+        self.current_gop_yuv.clear();
+        self.frames_in_current_gop = 0;
+        Ok(())
     }
 }
 
@@ -218,7 +318,7 @@ impl Av1CapacityProbeResult {
             .iter()
             .map(|&cb| {
                 let bits = cb.saturating_mul(STC_PAYLOAD_RATIO_NUM) / STC_PAYLOAD_RATIO_DEN;
-                (bits / 8).saturating_sub(CHUNK_FRAME_NEXT_HEADER_LEN)
+                (bits / 8).saturating_sub(CHUNK_FRAME_NEXT_HEADER_LEN_V3_1)
             })
             .collect()
     }
@@ -226,13 +326,14 @@ impl Av1CapacityProbeResult {
 
 impl Av1CapacityProbeResult {
     /// Conservative primary payload byte cap:
-    /// `(cover_bits × 0.15 / 8) - chunk_frame_v3_overhead(n_gops) - FRAME_OVERHEAD`.
+    /// `(cover_bits × 0.15 / 8) - chunk_frame_v3_1_overhead(n_gops) - FRAME_OVERHEAD`.
     ///
-    /// Chunk_frame v3 overhead is `6 + 2 × (n_gops - 1)` bytes
-    /// (first-chunk clip header + subsequent per-chunk lengths). This is
+    /// Chunk_frame v3.1 overhead is `10 + 6 × (n_gops - 1)` bytes
+    /// (first-chunk clip header `u32 total_bytes + u32 m_total + u16 payload_len`
+    /// + subsequent per-chunk `u32 m_total + u16 payload_len`). This is
     /// the upper bound under the worst case (every GOP is stego'd);
-    /// Increment B balanced plans typically use fewer chunks and have
-    /// lower real overhead.
+    /// balanced plans typically use fewer chunks and have lower real
+    /// overhead.
     ///
     /// Returns 0 if any subtraction would underflow (degenerate
     /// tiny-cover cases). Callers can show "video too short" to the
@@ -242,7 +343,7 @@ impl Av1CapacityProbeResult {
             self.cover_bits.saturating_mul(STC_PAYLOAD_RATIO_NUM) / STC_PAYLOAD_RATIO_DEN;
         let primary_bytes_raw = primary_bits / 8;
         primary_bytes_raw
-            .saturating_sub(chunk_frame_v3_overhead_bytes(self.n_gops as usize))
+            .saturating_sub(chunk_frame_v3_1_overhead_bytes(self.n_gops as usize))
             .saturating_sub(FRAME_OVERHEAD)
     }
 

@@ -308,6 +308,9 @@ fn decode_with_recording_inner(
             bit_hook: Some(bit_hook_cb),
             tag_hook: None, // not used for v0.3 recording
             meta_hook: Some(meta_hook_cb),
+            block_hook: None, // not used for stego recording — only the
+                              // av1_block_hist stealth-audit binary
+                              // registers this
         };
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();

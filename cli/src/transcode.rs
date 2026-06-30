@@ -143,10 +143,13 @@ pub struct VideoProbe {
 
 /// Run `ffprobe` to read width/height/frame-count/rate from `input`.
 ///
-/// MB-alignment (16-multiple width+height) is enforced — H.264
-/// requires it and the v2 orchestrator rejects non-aligned inputs.
-/// Callers that need to handle non-aligned inputs should pre-crop
-/// via ffmpeg before this probe.
+/// Reports the RAW source dimensions (any size — no alignment enforced here).
+/// The encoder needs macroblock/transform alignment (H.264 = 16, AV1 = 8);
+/// callers pass the probe to [`decode_to_yuv_aligned`], which CROPS the
+/// decoded frames (top-left anchored) down to the nearest valid grid so any
+/// input size encodes without a manual pre-crop. Cropping (not scaling)
+/// matches the mobile floor-crop in `MediaPlaneExtractor`, and avoids the
+/// resample artifacts that would weaken stego stealth.
 #[cfg(feature = "video")]
 pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     use std::process::Command;
@@ -201,16 +204,9 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
         probe_n_frames_via_packet_count(input)?
     };
 
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(CliError::InvalidArgs(format!(
-            "input dimensions {width}x{height} are not 16-aligned. \
-             H.264 macroblock alignment is required. Pre-crop with:\n  \
-             ffmpeg -i input.mp4 -vf 'crop={w16}:{h16}' aligned.mp4",
-            w16 = (width / 16) * 16,
-            h16 = (height / 16) * 16,
-        )));
-    }
-
+    // Any size is accepted here — `decode_to_yuv_aligned` CROPS the decode
+    // (top-left) to the encoder's grid (H.264 = 16, AV1 = 8) so the caller
+    // never has to pre-crop. Reports the RAW source dims.
     let has_audio = probe_has_audio(input);
     Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio })
 }
@@ -258,20 +254,76 @@ fn probe_has_audio(input: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Largest multiple of `align` that is `<= d` (and `>= align`). The H.264
+/// encoder needs 16-aligned dimensions, AV1 8-aligned; [`decode_to_yuv_aligned`]
+/// CROPS the source to this grid so any input size encodes.
+#[cfg(feature = "video")]
+pub fn aligned_dim(d: u32, align: u32) -> u32 {
+    let a = align.max(1);
+    ((d / a) * a).max(a)
+}
+
 /// Decode the input MP4 to raw YUV420p planar frames at `output`.
 /// Used to feed the v2 streaming orchestrator, which takes raw YUV.
+/// Prefer [`decode_to_yuv_aligned`] for the encode/capacity paths — it CROPS
+/// any non-grid-aligned source so the encoder accepts it.
 #[cfg(feature = "video")]
 pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
+    decode_to_yuv_cropped(input, output, None)
+}
+
+/// Decode + CROP to the encoder's macroblock/transform grid: drops the
+/// right/bottom edge strip (at most `align - 1` px per axis) down to the nearest
+/// `align`-multiple so ANY source size encodes without a manual pre-crop. This
+/// matches the iOS/Android decode path (which floor-crops the same way) — no
+/// resampling, no aspect change, no padding. Mutates `probe.width`/
+/// `probe.height` to the encoded dims — the caller MUST use these for the
+/// session + frame_size + mux. `align` is 16 for H.264, 8 for AV1. No-op (clean
+/// passthrough decode) when the source is already aligned.
+#[cfg(feature = "video")]
+pub fn decode_to_yuv_aligned(
+    input: &Path,
+    output: &Path,
+    probe: &mut VideoProbe,
+    align: u32,
+) -> Result<(), CliError> {
+    let aw = aligned_dim(probe.width, align);
+    let ah = aligned_dim(probe.height, align);
+    let crop = (aw != probe.width || ah != probe.height).then_some((aw, ah));
+    if let Some((w, h)) = crop {
+        eprintln!(
+            "note: cropping {}x{} -> {w}x{h} ({align}-aligned for the encoder)",
+            probe.width, probe.height,
+        );
+    }
+    decode_to_yuv_cropped(input, output, crop)?;
+    probe.width = aw;
+    probe.height = ah;
+    Ok(())
+}
+
+/// Inner ffmpeg decode with an optional top-left `-vf crop=W:H:0:0`.
+#[cfg(feature = "video")]
+fn decode_to_yuv_cropped(
+    input: &Path,
+    output: &Path,
+    crop: Option<(u32, u32)>,
+) -> Result<(), CliError> {
     use std::process::Command;
-    let result = Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i").arg(input)
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(output)
-        .output()
-        .map_err(|e| CliError::InvalidArgs(format!(
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y").arg("-i").arg(input);
+    if let Some((w, h)) = crop {
+        // CROP (not scale): keep the top-left WxH, drop the right/bottom
+        // alignment strip (<= align-1 px). Anchored at 0,0 to match the mobile
+        // floor-crop exactly — no resampling, no aspect distortion, no padding.
+        cmd.args(["-vf", &format!("crop={w}:{h}:0:0")]);
+    }
+    cmd.args(["-f", "rawvideo", "-pix_fmt", "yuv420p"]).arg(output);
+    let result = cmd.output().map_err(|e| {
+        CliError::InvalidArgs(format!(
             "failed to spawn ffmpeg (decode_to_yuv): {e}\n\nInstall ffmpeg or pre-extract YUV manually:\n  {TRANSCODE_SUGGESTION}"
-        )))?;
+        ))
+    })?;
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let tail: String = stderr.lines().rev().take(15)

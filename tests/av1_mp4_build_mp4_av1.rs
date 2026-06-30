@@ -115,12 +115,13 @@ fn build_mp4_av1_single_keyframe_produces_valid_mp4() {
 
 #[test]
 fn build_mp4_av1_3_frame_gop_video_payload_sized_correctly() {
-    let mut stream = Vec::new();
-    stream.extend_from_slice(&make_obu(OBU_SEQUENCE_HEADER, 8));
+    let sh = make_obu(OBU_SEQUENCE_HEADER, 8);
     // 3 frames, varied sizes for distinct sample sizes.
     let f1 = make_obu(OBU_FRAME, 100);
     let f2 = make_obu(OBU_FRAME, 150);
     let f3 = make_obu(OBU_FRAME, 200);
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&sh);
     stream.extend_from_slice(&f1);
     stream.extend_from_slice(&f2);
     stream.extend_from_slice(&f3);
@@ -137,12 +138,15 @@ fn build_mp4_av1_3_frame_gop_video_payload_sized_correctly() {
         .find(|(fc, _)| fc == b"mdat")
         .expect("mdat box present");
 
-    // mdat payload should equal sum of sample sizes (= f1.len() + f2.len() + f3.len()).
+    // muxer-sh-in-band-fix: the first sample is sync → SH bytes are
+    // PREPENDED to f1's bytes in-band (av1C still carries a redundant
+    // copy too — the av1C bytes live in moov, not mdat, so they don't
+    // affect the mdat payload size). mdat payload = sh ‖ f1 ‖ f2 ‖ f3.
     let mdat_payload_len = mdat_range.1 - mdat_range.0;
-    let expected = f1.len() + f2.len() + f3.len();
+    let expected = sh.len() + f1.len() + f2.len() + f3.len();
     assert_eq!(
         mdat_payload_len, expected,
-        "mdat payload must equal sum of sample bytes"
+        "mdat payload must equal SH ‖ f1 ‖ f2 ‖ f3 (SH in-band on the sync sample)"
     );
 }
 

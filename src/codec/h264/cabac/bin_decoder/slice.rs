@@ -198,6 +198,9 @@ pub fn walk_annex_b_for_cover_with_options(
     annex_b: &[u8],
     opts: WalkOptions,
 ) -> Result<CoverWalkOutput, WalkError> {
+    // PHASM_PROFILE — the pure-Rust CABAC cover walk (per-GOP; runs in every
+    // encode pass + the round-trip verify + decode).
+    let _prof = crate::codec::h264::profile::scope("cover_walk");
     let trace = std::env::var("PHASM_PERF_TRACE")
         .map(|v| v == "1")
         .unwrap_or(false);
