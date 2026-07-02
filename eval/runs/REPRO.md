@@ -110,7 +110,7 @@ checkpoints + logs but not a narrative.
 These items extend this manifest into a TIFS-badge-eligible artifact:
 
 - [ ] Add `config.json` per run dir (current docs cover most but not all).
-- [ ] Compute SHA256 hash of each dataset slice and pin in `REPRO_DATASETS.md`.
+- [x] Compute SHA256 hash of each dataset slice and pin in `REPRO_DATASETS.md`. **DONE 2026-07-02** — BOSSbase 1.01 `.7z` + ALASKA-II 484-cover subset pinned in `eval/REPRO_DATASETS.md`.
 - [ ] Pin `phasm-core` git SHA per run via `eval/bin/MANIFEST.md`.
 - [ ] Build `eval/Dockerfile` with pinned Python + Rust + jpeglib + conseal.
 - [ ] Tag `paper-v1.0` on the `phasm` repo at submission time.

@@ -11,7 +11,7 @@
 #
 # Datasets (BOSSbase, ALASKA-II) are NOT baked into the image. They are
 # fetched on first repro run via prep/download_*.py (or manually per
-# anc/DATASET_HASHES.md) into a host-mounted volume.
+# eval/REPRO_DATASETS.md) into a host-mounted volume.
 #
 # Build context = phasmcore root:
 #   docker build -f eval/Dockerfile -t phasm-repro:v1.0 .
