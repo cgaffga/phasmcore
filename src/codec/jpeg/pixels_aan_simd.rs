@@ -1176,10 +1176,19 @@ pub(super) mod avx2 {
         // = row N+4 i16x8). Unpack i16 → i32 with sign-extend, store as
         // 8 i32 per row.
         let out_ptr = out.as_mut_ptr() as *mut __m256i;
-        store_row_as_i32(r0_4, out_ptr.add(0), out_ptr.add(8));
-        store_row_as_i32(r1_5, out_ptr.add(2), out_ptr.add(10));
-        store_row_as_i32(r2_6, out_ptr.add(4), out_ptr.add(12));
-        store_row_as_i32(r3_7, out_ptr.add(6), out_ptr.add(14));
+        // BUGFIX (2026-07-02): `out` is [i32;64] = 8 __m256i (one 8-i32 row each),
+        // so row N lives at __m256i offset N (dst_lo = row N, dst_hi = row N+4),
+        // matching the NEON/scalar row-major layout (row R at i32[R*8]). The
+        // offsets below were DOUBLED — add(8/10/12/14) wrote PAST the 64-element
+        // buffer, out-of-bounds clobbering the adjacent `qt` table (add(8) →
+        // qt[0..16], add(10) → qt[32..48]) with i32 coefficient data. UB that
+        // fires only under AVX2 (real x86: Intel Mac / Linux / Windows Armor
+        // builds); invisible on ARM(NEON) + x86 without AVX2. Surfaced as a
+        // div-by-zero in aan_dct_block when a clobbered qt entry became 0.
+        store_row_as_i32(r0_4, out_ptr.add(0), out_ptr.add(4));
+        store_row_as_i32(r1_5, out_ptr.add(1), out_ptr.add(5));
+        store_row_as_i32(r2_6, out_ptr.add(2), out_ptr.add(6));
+        store_row_as_i32(r3_7, out_ptr.add(3), out_ptr.add(7));
 
         _mm256_zeroupper();
     }

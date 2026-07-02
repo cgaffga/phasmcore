@@ -179,7 +179,12 @@ RUN cd eval && uv run python -c \
 # Bit-exact CI smoke test — verifies the build is consistent with
 # the §6.6 reproducibility claim. Optional; runs in ~5 s.
 # ----------------------------------------------------------------
-RUN cargo test --release --test cross_platform 2>&1 | tail -20
+# NB: do NOT pipe to `tail` directly — a pipeline's exit status is the LAST
+# command's (tail=0), which masks a cargo-test FAILURE and lets the build go
+# green on a broken bit-exact test. Capture to a file and propagate the real
+# exit code (tail only the tail on failure, for a readable build log).
+RUN cargo test --release --test cross_platform > /tmp/cross_platform.log 2>&1 \
+    || { echo "=== cross_platform bit-exact test FAILED ==="; tail -40 /tmp/cross_platform.log; exit 1; }
 
 # ----------------------------------------------------------------
 # Default: drop into bash so reviewers can run interactively.

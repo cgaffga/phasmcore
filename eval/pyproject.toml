@@ -68,6 +68,22 @@ dev = [
 
 # uv lockfile-driven; no constraint files needed.
 
+# --- CPU-only PyTorch on Linux (Docker / cloud reproducibility image) -------
+# A bare `torch>=2.5,<3` resolves the CUDA wheel on Linux (`torch 2.x+cuXXX`,
+# ~2.5 GB), which bloated the paper's reproducibility image to 11.8 GB and
+# contradicts App-D's "CPU-only PyTorch" claim. Pin torch/torchvision to the
+# CPU index on Linux ONLY — macOS/arm64 still resolves the default PyPI wheel
+# (MPS backend), keeping the local-first path frictionless (see the
+# dependencies note at the top of this file).
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 [build-system]
 # This is an application, not a library — no wheel build needed. Marking it
 # explicitly so uv doesn't try to package it.
