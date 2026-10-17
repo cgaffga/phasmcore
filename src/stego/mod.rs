@@ -166,6 +166,43 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
     result
 }
 
+/// Try Fortress, then Armor STDM + geometric recovery.
+///
+/// Shared by the serial and parallel `smart_decode_inner` so both order the
+/// Armor attempts identically. Returns `Some` on a successful decode.
+///
+/// Sets `saw_decryption_failed` when an attempt found a well-formed payload but
+/// the passphrase was wrong, so the caller reports `DecryptionFailed` rather
+/// than the misleading `FrameCorrupted`.
+fn try_armor_modes(
+    img: &crate::codec::jpeg::JpegImage,
+    stego_bytes: &[u8],
+    passphrase: &str,
+    saw_decryption_failed: &mut bool,
+) -> Option<(PayloadData, DecodeQuality)> {
+    use crate::stego::armor::fortress;
+    use crate::stego::armor::pipeline::armor_decode_no_fortress;
+
+    // Fortress first (fast).
+    if img.num_components() > 0
+        && let Ok(result) = fortress::fortress_decode(img, passphrase)
+    {
+        return Some(result);
+    }
+
+    // Armor STDM + geometric recovery (the geometric-recovery stage still
+    // re-parses internally — that path resamples the image, so it can't reuse
+    // the original parse).
+    match armor_decode_no_fortress(img, stego_bytes, passphrase) {
+        Ok(result) => Some(result),
+        Err(StegoError::DecryptionFailed) => {
+            *saw_decryption_failed = true;
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// Serial smart_decode implementation (default path and WASM).
 ///
 /// Tries Armor first (default mode, most common), then Ghost, then
@@ -181,8 +218,6 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::codec::jpeg::JpegImage;
-    use crate::stego::armor::fortress;
-    use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
     progress::init(0); // reset; try_armor_decode sets real total
     progress::check_cancelled()?;
@@ -191,36 +226,28 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let img = JpegImage::from_bytes(stego_bytes)?;
     let mut saw_decryption_failed = false;
 
-    // Real Armor / Fortress stego never naturally arrives larger
-    // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for Armor's
-    // recompression-survival design). Skip both attempts when input is
-    // larger — saves a full FFT pass at decode (~30-60s + ~16 bytes/px
-    // working set at 60 MP).
+    // Armor/Fortress is *designed* around a cover no larger than
+    // ARMOR_TARGET_DIMENSION, so on a bigger input it is the less likely mode —
+    // but it is NOT impossible. Nothing actually enforces that pre-resize, and
+    // full-resolution Armor stego exists in the wild (Armor is the default
+    // mode, so any phone photo encoded without resizing lands here).
+    //
+    // So order the attempts by likelihood rather than skipping: large inputs try
+    // Ghost first and fall back to Armor/Fortress at the end. That keeps the
+    // expensive Armor FFT (~30-60s, ~16 bytes/px at 60 MP) off the common path
+    // without ever making a real payload undecodable.
+    //
+    // Regression: an earlier version *skipped* Armor above this size, which
+    // silently broke decoding of every full-resolution default-mode encode.
     let fi = img.frame_info();
     let max_dim = fi.width.max(fi.height) as u32;
-    let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
+    let armor_first = max_dim <= ARMOR_TARGET_DIMENSION;
 
-    // Try Fortress (fast).
-    if try_armor
-        && img.num_components() > 0
-        && let Ok(result) = fortress::fortress_decode(&img, passphrase)
+    if armor_first
+        && let Some(result) =
+            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
     {
         return Ok(result);
-    }
-
-    // Try Armor STDM + geometric recovery (the geometric-recovery stage
-    // still re-parses internally — that path resamples the image, so it
-    // can't reuse the original parse).
-    if try_armor {
-        match armor_decode_no_fortress(&img, stego_bytes, passphrase) {
-            Ok(result) => return Ok(result),
-            Err(StegoError::DecryptionFailed) => {
-                saw_decryption_failed = true;
-            }
-            Err(_) => {
-                // Not Armor — try Ghost.
-            }
-        }
     }
 
     // Try Ghost — extend progress total instead of resetting to avoid the
@@ -271,6 +298,15 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         },
     }
 
+    // Deferred Armor/Fortress for large inputs: Ghost didn't match, so give the
+    // unlikely-but-possible full-resolution Armor case its turn.
+    if !armor_first
+        && let Some(result) =
+            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
+    {
+        return Ok(result);
+    }
+
     if saw_decryption_failed {
         Err(StegoError::DecryptionFailed)
     } else {
@@ -298,14 +334,15 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let img = JpegImage::from_bytes(stego_bytes)?;
 
-    // Real Armor / Fortress stego never naturally arrives larger
-    // than ARMOR_TARGET_DIMENSION (frontend pre-downsamples for
-    // Armor's recompression-survival design). Skip both attempts when
-    // input is larger — saves a full FFT pass at decode (~30-60s and
-    // ~16 bytes/px working set at 60 MP).
+    // See the serial path for the full rationale: Armor/Fortress is the less
+    // likely mode above ARMOR_TARGET_DIMENSION but NOT impossible, so large
+    // inputs *defer* the Armor attempts to a fallback stage below rather than
+    // skipping them. Deferring instead of running them inside the join also
+    // keeps the Armor FFT working set from overlapping Ghost's, which is what
+    // the original size check was really protecting.
     let fi = img.frame_info();
     let max_dim = fi.width.max(fi.height) as u32;
-    let try_armor = max_dim <= ARMOR_TARGET_DIMENSION;
+    let armor_first = max_dim <= ARMOR_TARGET_DIMENSION;
 
     // Compute shared Y-channel UNIWARD positions ONCE before the
     // rayon::join and clone for shadow. Avoids 2× concurrent
@@ -330,7 +367,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     let (fortress_result, (stdm_result, (ghost_result, shadow_result))) = rayon::join(
         || {
-            if try_armor && img.num_components() > 0 {
+            if armor_first && img.num_components() > 0 {
                 fortress::fortress_decode(&img, passphrase)
             } else {
                 Err(StegoError::FrameCorrupted)
@@ -338,7 +375,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         },
         || rayon::join(
             || {
-                if try_armor {
+                if armor_first {
                     armor_decode_no_fortress(&img, stego_bytes, passphrase)
                 } else {
                     Err(StegoError::FrameCorrupted)
@@ -378,10 +415,20 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 
     // All failed — determine the best error to report.
-    let saw_decryption_failed = matches!(&fortress_result, Err(StegoError::DecryptionFailed))
+    let mut saw_decryption_failed = matches!(&fortress_result, Err(StegoError::DecryptionFailed))
         || matches!(&stdm_result, Err(StegoError::DecryptionFailed))
         || matches!(&ghost_result, Err(StegoError::DecryptionFailed))
         || matches!(&shadow_result, Err(StegoError::DecryptionFailed));
+
+    // Deferred Armor/Fortress for large inputs (see `armor_first`): Ghost
+    // didn't match, so give full-resolution Armor its turn — now, with the
+    // parallel Ghost working set already released.
+    if !armor_first
+        && let Some(result) =
+            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
+    {
+        return Ok(result);
+    }
 
     if saw_decryption_failed {
         return Err(StegoError::DecryptionFailed);
