@@ -70,57 +70,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # the cleanest cross-Unix way; non-Unix targets fall through with
 # RSS=0 (the test still gates wall time on those).
 libc = "0.2"
-
-# `h264_cabac_decoder` is a standalone spec-direct CABAC decoder
-# (debugging aid) that imports the H.264 walker/parser modules at
-# module scope, so it only builds when the decode feature is present.
-# Without this gate it fails `cargo test` / `cargo build` in the
-# default (no-video) configuration. The two `openh264_*` examples are
-# self-gated via `#[cfg]/#[cfg(not)]` mains and need no entry here.
-[[example]]
-name = "h264_cabac_decoder"
-required-features = ["h264-decoder"]
-
-# `av1_calibrate` is the G.2 Phase 2 calibration measurement binary.
-# Same gating idiom — the file is `#![cfg(all(feature = "av1-encoder",
-# feature = "av1-decoder"))]` at module scope and Cargo would otherwise
-# fail with `main not found` on default-feature builds.
-[[bin]]
-name = "av1_calibrate"
-required-features = ["av1-encoder", "av1-decoder"]
-
-# `av1_stealth_sweep` — G.2 Phase 2 Tier 2 AUC-vs-utilization measurement
-# binary. Parameterizes the W6 self-steganalyzer's measurement loop on
-# utilization rate. Same gating as av1_calibrate.
-[[bin]]
-name = "av1_stealth_sweep"
-required-features = ["av1-encoder", "av1-decoder"]
-
-# `h264_calibrate` — #844 codec-parity Tier 1 calibration binary for the
-# H.264 path. Runs `StreamingProbeSession` at the production GOP size and
-# emits per-GOP cap-byte stats as JSON. Same module-scope `#![cfg(all(...))]`
-# gating idiom as the AV1 binaries.
-[[bin]]
-name = "h264_calibrate"
-required-features = ["h264-encoder", "h264-decoder"]
-
-# `h264_stealth_sweep` — #844 Tier 2 W6 AUC-vs-utilization measurement on the
-# H.264 CoeffSign domain. Same gating idiom as h264_calibrate.
-[[bin]]
-name = "h264_stealth_sweep"
-required-features = ["h264-encoder", "h264-decoder"]
-
-# stealth-audit-2026-06-29: AV1 per-block histogram collector. Drives
-# dav1d (via core-dav1d-sys) with the new `block_hook` to walk every
-# decoded Av1Block and tally partition / mode / MV / ref distributions.
-# Output is TSV — feed both phasm and rav1e-CLI streams through and
-# compare via χ² / KS tests downstream. See
-# `docs/design/video/av1/stealth-audit-speed-preset-2026-06-29.md`.
-[[bin]]
-name = "av1_block_hist"
-required-features = ["av1-encoder", "av1-decoder"]
-
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
