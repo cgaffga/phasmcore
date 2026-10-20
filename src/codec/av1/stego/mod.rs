@@ -77,14 +77,6 @@ pub mod capacity;
 #[cfg(any(feature = "av1-encoder", feature = "av1-decoder"))]
 pub mod shadow;
 
-// YUV-level convenience entry points for mobile bridges (iOS /
-// Android). Wraps the existing `av1_stego_embed` /
-// `av1_stego_extract` flow with the keyframe-encode bookkeeping the
-// bridge would otherwise have to replicate (and that lives only in
-// integration tests today).
-#[cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
-pub mod yuv_io;
-
 // Whole-video shadow encode flow. Ported from OH264's
 // `h264_encode_with_shadows`; AV1-simplified because
 // `replay_with_overrides` is wire-clean by construction (no

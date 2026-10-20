@@ -517,6 +517,115 @@ pub fn parse_chunk_frame_v3_1(bytes: &[u8]) -> Option<(u32, &[u8])> {
 mod tests {
     use super::*;
 
+    // ---- probe early-exit equivalence ----
+
+    /// The property `StreamingProbeSession::set_plan_target` relies on: if the
+    /// first `k` GOPs' rate-ceiled caps already cover the message, then
+    /// reporting every later GOP's capacity as 0 yields the SAME plan and the
+    /// SAME window as measuring them all.
+    ///
+    /// Swept rather than spot-checked, because the claim is about the
+    /// interaction of three whole-clip quantities (`sigma_cap`,
+    /// `sigma_ceiled`, the sequential drain) and a hand-picked case would miss
+    /// the boundaries. 4 r_targets × ~1200 random cap vectors × every message
+    /// length that satisfies the condition at some prefix.
+    #[test]
+    fn concentrate_tail_prefix_plan_equals_full_plan() {
+        let mut seed: u64 = 0xC0FF_EE42;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        let mut checked = 0usize;
+        let mut engaged = 0usize;
+        for &r_target in &[0.25f64, 0.5, 0.75, 1.0] {
+            for _ in 0..300 {
+                let n = 1 + (rand() % 24) as usize;
+                // Mix of zero, tiny and large caps so zero-capacity GOPs and
+                // a satisfied-at-GOP-0 prefix both occur.
+                let caps: Vec<usize> = (0..n)
+                    .map(|_| match rand() % 8 {
+                        0 => 0,
+                        1 => (rand() % 4) as usize,
+                        _ => (rand() % 4000) as usize,
+                    })
+                    .collect();
+
+                let r = r_target.clamp(0.0, 1.0);
+                let ceiled: Vec<usize> =
+                    caps.iter().map(|&c| ((r * c as f64) as usize).min(c)).collect();
+
+                for msg_len in [1usize, 7, 64, 500, 3000, 20_000] {
+                    // Find the smallest prefix that satisfies the condition.
+                    let mut acc = 0usize;
+                    let mut k = None;
+                    for (i, &ce) in ceiled.iter().enumerate() {
+                        acc += ce;
+                        if acc >= msg_len {
+                            k = Some(i + 1);
+                            break;
+                        }
+                    }
+                    let Some(k) = k else { continue }; // never satisfied — mode never engages
+
+                    let full = allocate_chunks_concentrate_tail(&caps, msg_len, r_target);
+                    // What the probe hands the allocator under early-exit:
+                    // measured prefix, then zeros.
+                    let mut truncated = caps.clone();
+                    for c in truncated.iter_mut().skip(k) {
+                        *c = 0;
+                    }
+                    let prefix = allocate_chunks_concentrate_tail(&truncated, msg_len, r_target);
+
+                    assert_eq!(
+                        full, prefix,
+                        "prefix plan diverged: r={r_target} msg_len={msg_len} k={k} caps={caps:?}"
+                    );
+                    assert!(full.is_some(), "condition holds yet allocation failed");
+                    checked += 1;
+                    if k < n {
+                        engaged += 1;
+                    }
+                }
+            }
+        }
+        // Guard against a vacuous pass: the sweep must actually exercise cases
+        // where GOPs went unprobed, not just ones where k == n.
+        assert!(checked > 2000, "sweep too small to be meaningful: {checked}");
+        assert!(
+            engaged > checked / 10,
+            "early-exit barely engaged ({engaged}/{checked}) — sweep is not testing the property"
+        );
+    }
+
+    /// The condition must be on the RATE-CEILED caps. Using raw caps is
+    /// unsound: a prefix can satisfy `Σ cap >= msg` while `Σ ceiled < msg`, so
+    /// the prefix takes `allocate`'s `use_full` branch and the full probe does
+    /// not — different plans. This pins that the naive version really does
+    /// break, so nobody "simplifies" the condition later.
+    #[test]
+    fn concentrate_tail_raw_cap_condition_would_be_unsound() {
+        let caps = vec![100usize, 100, 100];
+        let msg_len = 80; // Σ⌊0.5·100⌋ over prefix 1 = 50 < 80 ≤ cap[0] = 100
+        let r = 0.5;
+
+        let full = allocate_chunks_concentrate_tail(&caps, msg_len, r).unwrap();
+        // The unsound prefix: GOP 0 only, chosen because raw cap[0] >= msg_len.
+        let naive = allocate_chunks_concentrate_tail(&[100, 0, 0], msg_len, r).unwrap();
+        assert_ne!(
+            full, naive,
+            "raw-cap prefix happened to agree; pick a sharper case rather than \
+             relaxing the ceiled-cap condition in set_plan_target"
+        );
+        // And the sound condition is not satisfied by that prefix, so the
+        // implementation would never have stopped there.
+        let ceiled_prefix = ((r * 100.0) as usize).min(100);
+        assert!(ceiled_prefix < msg_len);
+    }
+
     // ---- chunk_frame v3.1 (#888) ----
 
     #[test]

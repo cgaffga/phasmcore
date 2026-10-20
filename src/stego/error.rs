@@ -50,7 +50,10 @@ impl fmt::Display for StegoError {
             Self::InvalidJpeg(e) => write!(f, "invalid JPEG: {e}"),
             Self::ImageTooSmall => write!(f, "image too small for embedding"),
             Self::ImageTooLarge => write!(f, "image too large (max 16384px / 200MP)"),
-            Self::MessageTooLarge => write!(f, "message too large for this image"),
+            // "cover", not "image": this variant is returned by the video
+            // paths too (per-GOP plan + STC trial), and "too large for this
+            // image" reached users verbatim over a .MOV on 2026-10-20.
+            Self::MessageTooLarge => write!(f, "message too large for this cover"),
             Self::FrameCorrupted => write!(f, "payload frame CRC mismatch"),
             Self::DecryptionFailed => write!(f, "decryption failed (wrong passphrase?)"),
             Self::InvalidUtf8 => write!(f, "extracted text is not valid UTF-8"),

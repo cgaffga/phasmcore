@@ -24,6 +24,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use phasm_core::codec::h264::cabac::bin_decoder::slice::walk_annex_b_for_cover;
 use phasm_core::codec::h264::openh264::{
     set_frame_num, Encoder, StegoHandlers, StegoSession,
@@ -59,7 +60,7 @@ fn corpus_root() -> std::path::PathBuf {
 /// Scale source mp4 to raw YUV at the target encode dim, cache at /tmp.
 fn ensure_yuv(spec: &FixtureSpec) -> Vec<u8> {
     let yuv_path = format!(
-        "/tmp/phasm_c812_{}_{}x{}_f{}.yuv",
+        "{}/phasm_c812_{}_{}x{}_f{}.yuv", common::scratch_dir(),
         spec.name, spec.encode_w, spec.encode_h, spec.n_frames
     );
     let frame_size = (spec.encode_w * spec.encode_h * 3 / 2) as usize;

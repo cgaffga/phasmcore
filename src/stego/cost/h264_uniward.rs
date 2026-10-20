@@ -118,15 +118,67 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
     // rows under `parallel`. Result is BIT-IDENTICAL to serial (no reduction
     // is reordered) and adds NO allocation, so the module's documented
     // ~32 MB-per-frame peak is preserved.
-    let fill_row = |y: usize, low_row: &mut [f32], high_row: &mut [f32]| {
-        for out_x in 0..padded_w {
+    //
+    // The row pass mirrors the #848 column-pass treatment: k-outer / x-inner
+    // over the shared `saxpy_inner` primitive (NEON / AVX / WASM-SIMD /
+    // scalar). The reflection here is on the SOURCE index rather than the
+    // output index, so unlike the column pass it does not vectorise over the
+    // whole row — but for `out_x in [pad, width)` no tap reflects for ANY `k`
+    // (`0 <= out_x - pad + k < width` holds for every `k in 0..=pad`), so that
+    // interior reads one fully-contiguous source span per tap. At 1080p that
+    // is 1905 of 1950 output columns (98%); the ~45 border columns keep the
+    // original scalar arithmetic verbatim.
+    //
+    // **Bit-identical by construction**, the same argument as #848: each
+    // `out_x` keeps its own f64 accumulator, taps are still summed in
+    // `k = 0..FILT_LEN` order, and nothing is FMA-fused. The one change in
+    // form is `coef * v` becoming `v * coef` inside `saxpy_inner`, which is
+    // exact (IEEE 754 multiplication is commutative). Widening the source row
+    // to f32 up front is also exact — a u8 is representable in f32, and
+    // `u8 as f32 as f64 == u8 as f64`.
+    //
+    // Scratch per thread: one f32 source row + two f64 accumulator rows
+    // (~39 KB at 1080p), the same order as the column pass's ~47 KB.
+    let interior = pad < width; // false only for a plane narrower than the filter
+    let fill_row = |scratch_wide: &mut Vec<f32>,
+                    scratch_acc: &mut Vec<f64>,
+                    y: usize,
+                    low_row: &mut [f32],
+                    high_row: &mut [f32]| {
+        let src_row = &y_plane[y * width..y * width + width];
+
+        if interior {
+            scratch_wide.clear();
+            scratch_wide.extend(src_row.iter().map(|&v| v as f32));
+            let (acc_low, acc_high) = scratch_acc.split_at_mut(padded_w);
+            let span = width - pad; // interior output columns [pad, width)
+            acc_low[..span].fill(0.0);
+            acc_high[..span].fill(0.0);
+            for k in 0..FILT_LEN {
+                // out_x = pad + i  ⇒  src_x = out_x - pad + k = i + k, all
+                // in-bounds across the whole span, hence one contiguous read.
+                let src = &scratch_wide[k..k + span];
+                super::uniward_simd::saxpy_inner(&mut acc_low[..span], src, lp[k]);
+                super::uniward_simd::saxpy_inner(&mut acc_high[..span], src, HPDF[k]);
+            }
+            for i in 0..span {
+                low_row[pad + i] = acc_low[i] as f32;
+                high_row[pad + i] = acc_high[i] as f32;
+            }
+        }
+
+        // Border columns (and the whole row when the plane is narrower than
+        // the filter): the original scalar path, reflection included.
+        let scalar_cols = (0..padded_w)
+            .filter(|&out_x| !interior || out_x < pad || out_x >= width);
+        for out_x in scalar_cols {
             let mut sum_low = 0.0f64;
             let mut sum_high = 0.0f64;
             for k in 0..FILT_LEN {
                 // src_x = out_x - pad + k
                 let src_x = out_x as isize - pad as isize + k as isize;
                 let clamped = symmetric_reflect(src_x, width as isize);
-                let v = y_plane[y * width + clamped as usize] as f64;
+                let v = src_row[clamped as usize] as f64;
                 sum_low += lp[k] * v;
                 sum_high += HPDF[k] * v;
             }
@@ -139,13 +191,24 @@ pub fn compute_three_subbands(y_plane: &[u8], width: usize, height: usize) -> Th
         .par_chunks_mut(padded_w)
         .zip(row_high.par_chunks_mut(padded_w))
         .enumerate()
-        .for_each(|(y, (low_row, high_row))| fill_row(y, low_row, high_row));
+        .for_each_init(
+            || (Vec::<f32>::with_capacity(width), vec![0.0f64; padded_w * 2]),
+            |(wide, acc), (y, (low_row, high_row))| {
+                fill_row(wide, acc, y, low_row, high_row)
+            },
+        );
     #[cfg(not(feature = "parallel"))]
-    row_low
-        .chunks_mut(padded_w)
-        .zip(row_high.chunks_mut(padded_w))
-        .enumerate()
-        .for_each(|(y, (low_row, high_row))| fill_row(y, low_row, high_row));
+    {
+        let mut wide = Vec::<f32>::with_capacity(width);
+        let mut acc = vec![0.0f64; padded_w * 2];
+        row_low
+            .chunks_mut(padded_w)
+            .zip(row_high.chunks_mut(padded_w))
+            .enumerate()
+            .for_each(|(y, (low_row, high_row))| {
+                fill_row(&mut wide, &mut acc, y, low_row, high_row)
+            });
+    }
 
     // Column-filter the row-filtered buffers to produce LH, HL, HH subbands.
     // Each subband is `padded_w × padded_h` with `pad` reflection on all four sides.
@@ -497,6 +560,148 @@ pub(crate) fn compute_position_cost(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row pass exactly as it was before the k-outer/SIMD restructure:
+    /// x-outer, k-inner, `symmetric_reflect` on every tap. Kept here as the
+    /// reference the fast path is held against — a whole-pipeline SHA pin
+    /// covers one fixture at one resolution, which is not enough to trust a
+    /// kernel rewrite.
+    fn reference_row_pass(
+        y_plane: &[u8],
+        width: usize,
+        height: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let pad = FILT_LEN - 1;
+        let padded_w = width + 2 * pad;
+        let lp = lpdf();
+        let mut row_low = vec![0.0f32; padded_w * height];
+        let mut row_high = vec![0.0f32; padded_w * height];
+        for y in 0..height {
+            for out_x in 0..padded_w {
+                let mut sum_low = 0.0f64;
+                let mut sum_high = 0.0f64;
+                for k in 0..FILT_LEN {
+                    let src_x = out_x as isize - pad as isize + k as isize;
+                    let clamped = symmetric_reflect(src_x, width as isize);
+                    let v = y_plane[y * width + clamped as usize] as f64;
+                    sum_low += lp[k] * v;
+                    sum_high += HPDF[k] * v;
+                }
+                row_low[y * padded_w + out_x] = sum_low as f32;
+                row_high[y * padded_w + out_x] = sum_high as f32;
+            }
+        }
+        (row_low, row_high)
+    }
+
+    /// Re-derive the row buffers from the shipped `compute_three_subbands` by
+    /// inverting the column pass — not possible, so instead assert the
+    /// property that matters end to end: the three subbands a plane produces
+    /// must be **bit-identical** to those produced with the reference row
+    /// pass feeding the same column pass. We get that by running the column
+    /// pass here over the reference row buffers.
+    fn reference_three_subbands(
+        y_plane: &[u8],
+        width: usize,
+        height: usize,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let pad = FILT_LEN - 1;
+        let padded_w = width + 2 * pad;
+        let padded_h = height + 2 * pad;
+        let lp = lpdf();
+        let (row_low, row_high) = reference_row_pass(y_plane, width, height);
+
+        let mut lh = vec![0.0f32; padded_w * padded_h];
+        let mut hl = vec![0.0f32; padded_w * padded_h];
+        let mut hh = vec![0.0f32; padded_w * padded_h];
+        for out_y in 0..padded_h {
+            for x in 0..padded_w {
+                let mut s_lh = 0.0f64;
+                let mut s_hl = 0.0f64;
+                let mut s_hh = 0.0f64;
+                for k in 0..FILT_LEN {
+                    let src_y = out_y as isize - pad as isize + k as isize;
+                    let c = symmetric_reflect(src_y, height as isize) as usize;
+                    let rl = row_low[c * padded_w + x] as f64;
+                    let rh = row_high[c * padded_w + x] as f64;
+                    s_lh += HPDF[k] * rl;
+                    s_hl += lp[k] * rh;
+                    s_hh += HPDF[k] * rh;
+                }
+                lh[out_y * padded_w + x] = s_lh as f32;
+                hl[out_y * padded_w + x] = s_hl as f32;
+                hh[out_y * padded_w + x] = s_hh as f32;
+            }
+        }
+        (lh, hl, hh)
+    }
+
+    /// Deterministic pseudo-texture — flat regions, edges and noise in one
+    /// plane, so the comparison covers both the vectorised interior and the
+    /// scalar border columns with non-trivial values.
+    fn synth_plane(width: usize, height: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(width * height);
+        let mut s: u32 = 0x1234_5678;
+        for y in 0..height {
+            for x in 0..width {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (s >> 24) as u8;
+                let px = match x * 4 / width.max(1) {
+                    0 => 16u8,                                  // flat dark
+                    1 => 235,                                   // flat bright
+                    2 => ((x * 7 + y * 3) % 256) as u8,         // ramp / edges
+                    _ => noise,                                 // noise
+                };
+                v.push(px);
+            }
+        }
+        v
+    }
+
+    /// The k-outer/SIMD row pass must be BIT-identical to the scalar original,
+    /// not merely close: these costs select STC flip positions, so a 1-ULP
+    /// difference is a different stego file and a broken cross-platform
+    /// determinism claim.
+    ///
+    /// Shapes chosen to hit every branch: widths above, equal to and below the
+    /// 15-column filter pad (the `interior` guard), an odd width, and a width
+    /// where the interior span is exactly one column.
+    #[test]
+    fn row_pass_simd_is_bit_identical_to_scalar_reference() {
+        for &(w, h) in &[
+            (64usize, 8usize),   // ordinary small plane
+            (240, 6),            // chroma-ish width
+            (97, 5),             // odd width, unaligned interior span
+            (16, 4),             // width = pad + 1 → interior span of 1
+            (15, 4),             // width = pad     → interior disabled
+            (8, 4),              // width < pad     → all-scalar path
+            (1, 3),              // degenerate single column
+            (1920, 3),           // production luma width (span 1905, odd)
+            (960, 3),            // production chroma width (span 945, odd)
+        ] {
+            let plane = synth_plane(w, h);
+            let got = compute_three_subbands(&plane, w, h);
+            let (lh, hl, hh) = reference_three_subbands(&plane, w, h);
+
+            assert_eq!(got.lh.len(), lh.len(), "{w}x{h}: LH length");
+            for (band, (a, b)) in [("LH", (&got.lh, &lh)), ("HL", (&got.hl, &hl)), ("HH", (&got.hh, &hh))]
+            {
+                let mismatches = a
+                    .iter()
+                    .zip(b.iter())
+                    .enumerate()
+                    .filter(|(_, (x, y))| x.to_bits() != y.to_bits())
+                    .take(4)
+                    .map(|(i, (x, y))| format!("[{i}] {x:e} vs {y:e}"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    mismatches.is_empty(),
+                    "{w}x{h} {band}: SIMD row pass diverges from scalar reference at {}",
+                    mismatches.join(", ")
+                );
+            }
+        }
+    }
 
     #[test]
     fn wavelets_of_constant_plane_are_zero_away_from_border() {

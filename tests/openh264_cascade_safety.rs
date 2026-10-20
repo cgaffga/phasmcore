@@ -29,6 +29,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use core_openh264_sys::PhasmStegoDomain;
 use phasm_core::codec::h264::cabac::bin_decoder::{
     walk_annex_b_for_cover_with_options, WalkOptions,
@@ -69,7 +70,7 @@ const GOP_SIZE: i32 = 30;
 
 fn yuv_path(fix: &Fixture) -> std::path::PathBuf {
     std::path::PathBuf::from(format!(
-        "/tmp/openh264_baseline_{}_{}x{}_f{}.yuv",
+        "{}/openh264_baseline_{}_{}x{}_f{}.yuv", common::scratch_dir(),
         fix.tag, fix.width, fix.height, N_FRAMES
     ))
 }

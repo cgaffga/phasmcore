@@ -118,8 +118,10 @@ pub use codec::av1::stego::session::{
 };
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::capacity::{
-    av1_capacity, av1_shadow_capacity, Av1CapacityInfo, Av1PerDomainBits,
-    Av1ShadowCapacityInfo, Av1StreamingProbeSession,
+    av1_capacity, av1_capacity_stratified, av1_capacity_stratified_with_progress,
+    av1_probe_gops_at, av1_probe_gops_at_with_progress, av1_shadow_capacity,
+    av1_shadow_capacity_for_n, Av1CapacityInfo, Av1PerDomainBits,
+    Av1StratifiedCapacity, Av1ShadowCapacityInfo, Av1StreamingProbeSession,
 };
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::orchestrator::Av1StegoError;

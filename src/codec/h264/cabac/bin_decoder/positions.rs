@@ -160,11 +160,19 @@ impl PositionRecorder {
         let single = [*slot];
 
         // MvdSignBypass.
+        //
+        // The magnitude is recorded alongside, as the coefficient domains
+        // already do. Flipping an MVD *sign* moves the macroblock's
+        // prediction by `2 * |mvd|` quarter-pels, so magnitude is what
+        // separates a harmless nudge from a block that visibly jumps — see
+        // `content_costs::mvd_displacement_qpel`. It used to be dropped
+        // (`push` records 0), which left the cost model blind to it.
+        let mvd_abs = u16::try_from(slot.value.unsigned_abs()).unwrap_or(u16::MAX);
         let positions = enumerate_mvd_sign_positions(&single, frame_idx, mb_addr);
         let bits = extract_mvd_sign_bits(&single);
         let pre_sign_len = self.cover.mvd_sign_bypass.len();
         for (p, b) in positions.iter().zip(bits.iter()) {
-            self.cover.mvd_sign_bypass.push(*b, *p);
+            self.cover.mvd_sign_bypass.push_with_magnitude(*b, *p, mvd_abs);
         }
         // Capture per-position metadata aligned with
         // mvd_sign_bypass. `enumerate_mvd_sign_positions` filters
@@ -181,11 +189,14 @@ impl PositionRecorder {
             });
         }
 
-        // MvdSuffixLsb.
+        // MvdSuffixLsb. Magnitude recorded for symmetry + diagnostics; the
+        // displacement of a suffix-LSB flip is a single quarter-pel
+        // regardless of how large the vector is, which is exactly why it is
+        // far cheaper visually than a sign flip.
         let positions = enumerate_mvd_suffix_lsb_positions(&single, frame_idx, mb_addr);
         let bits = extract_mvd_suffix_lsb_bits(&single);
         for (p, b) in positions.iter().zip(bits.iter()) {
-            self.cover.mvd_suffix_lsb.push(*b, *p);
+            self.cover.mvd_suffix_lsb.push_with_magnitude(*b, *p, mvd_abs);
         }
     }
 }

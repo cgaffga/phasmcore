@@ -620,6 +620,9 @@ fn gop_provisional_step_assembles_to_whole_clip() {
         let (gc, smp, nc) = gop_provisional_step(
             &yuv[bs..be], w, h, fig, start, opts, &frame_bytes, &hhat_seed,
             cursor, g, n_gops, tier_idx, &weights,
+            // No cache: these gates are the byte-identical REFERENCE the
+            // prefix cache is measured against, so they must keep recomputing.
+            None,
         )
         .expect("gop provisional step");
         cursor = nc;
@@ -723,6 +726,7 @@ fn sweep_a_selection_matches_whole_clip() {
     let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
     let result = sweep_a(
         &mut src, w, h, n, opts, &frame_bytes, &hhat_seed, &shadows, &[n_total], tier_idx, &weights,
+        None,
     )
     .expect("sweep_a");
     unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED") };
@@ -805,6 +809,7 @@ fn sweep_b_emit_matches_whole_clip() {
     let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
     let sa = sweep_a(
         &mut src, w, h, n, opts, &frame_bytes, &hhat_seed, &shadows, &capacities, tier_idx, &weights,
+        None,
     )
     .expect("sweep_a");
 
@@ -818,7 +823,7 @@ fn sweep_b_emit_matches_whole_clip() {
         let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
         let (bytes, _gop_lens) = sweep_b_emit(
             &mut src, w, h, n, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
-            &weights,
+            &weights, None,
         )
         .expect("sweep_b_emit");
         let first_diff = reference.iter().zip(bytes.iter()).position(|(a, b)| a != b);
@@ -884,6 +889,7 @@ fn streaming_shadow_verify_accepts_correct_rejects_wrong_pass() {
     let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
     let sa = sweep_a(
         &mut src, w, h, n, opts, &frame_bytes, &hhat_seed, &shadows, &capacities, tier_idx, &weights,
+        None,
     )
     .expect("sweep_a");
 
@@ -900,7 +906,7 @@ fn streaming_shadow_verify_accepts_correct_rejects_wrong_pass() {
         let mut src2 = SliceYuvSource::new(&yuv, w, h, n, gop);
         let (bytes, gop_lens) = sweep_b_emit(
             &mut src2, w, h, n, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
-            &weights,
+            &weights, None,
         )
         .expect("sweep_b_emit");
         let n_totals: Vec<usize> = shadow_rs.iter().map(|(b, _)| b.len()).collect();

@@ -147,8 +147,20 @@ pub fn plan_safe_balanced(
     let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
 
     // Sanity-check sample mean against table. Warn but don't fail.
+    //
+    // Unit basis (fixed 2026-10-18, see
+    // `docs/design/video/av1/pessimism-recalibration-2026-10-18.md`
+    // § 4.5): `payload_bits_per_frame_floor` is in POST-STC-RATIO
+    // payload bits per frame (= `cap_bytes_per_gop × 8 / gop_size`
+    // basis — matches `h264_calibrate.rs`'s
+    // `min_cap_bits_per_frame`). Converting to bytes-per-GOP via
+    // `× gop_size / 8` makes it directly comparable to `mu` (per-GOP
+    // cap_bytes). Pre-fix, AV1 stored RAW cover bits (80_000 →
+    // 300_000 pseudo-B/GOP) while H.264 stored payload bits
+    // (23 → 86 B/GOP), so this gate silently tripped on every AV1
+    // clip. Pre-STC-ratio-applied field unified the semantics.
     let table_pred =
-        (calibration.cover_bits_per_frame_floor as f64) * (gop_size as f64) / 8.0;
+        (calibration.payload_bits_per_frame_floor as f64) * (gop_size as f64) / 8.0;
     if table_pred > 0.0 {
         let ratio = mu / table_pred;
         if ratio > calibration.table_tolerance || ratio < 1.0 / calibration.table_tolerance {
@@ -158,7 +170,12 @@ pub fn plan_safe_balanced(
         }
     }
 
-    // Compute balanced W.
+    // Compute balanced W. Unchanged: W is the *spread* knob (how many GOPs
+    // the payload is smeared over), driven by `target_utilization`, and it is
+    // what keeps a 100-byte message from being diced into 1-byte chunks across
+    // a 600-GOP clip — every chunk pays a `chunk_frame` header, so smearing
+    // past the payload makes overhead dominate. Only the split *within* the
+    // window changes below.
     let target_cap_per_chunk =
         (calibration.target_utilization * cap_per_gop_safe).max(1.0);
     let w_util = (message_len as f64 / target_cap_per_chunk).ceil() as usize;
@@ -167,11 +184,73 @@ pub fn plan_safe_balanced(
         .max(((n_gops as f64) * calibration.w_floor_frac).ceil() as usize);
     let w = w_util.max(w_floor).min(n_gops);
 
-    // Pre-encode hard check: pessimistic total ≥ message × safety_margin.
-    let total_safe = cap_per_gop_safe * w as f64;
-    let required = message_len as f64 * calibration.safety_margin;
+    // Per-GOP allocation basis — the fix for #841's core defect.
+    //
+    // The planner is handed a vector of measured per-GOP caps and used to
+    // reduce it to its MEAN, then hand every GOP in the window an equal
+    // share (`uniform_split`). Two failures, one cause:
+    //
+    // - a GOP measured at 26 B was still assigned `message_len / W`, which it
+    //   provably cannot hold — the information was in hand and discarded;
+    // - a GOP measured at 6300 B was never asked for more than the even
+    //   share, so its surplus was unreachable.
+    //
+    // Those are not two bugs. Σ caps == `n_gops × mean`, so reporting Σ as
+    // the capacity (which `h264_video_capacity` does, and the HUD shows)
+    // assumes every GOP carries *its own* amount. Fill uniformly and the
+    // binding limit collapses to `n_gops × min(cap)`; on this corpus that is
+    // a median ~2× and worst-case 70× below the displayed number
+    // (`cap_corpus_min_mu_census`). Σ-reporting and uniform filling are
+    // mutually exclusive by arithmetic — `balanced-allocation-v3.md` §17.1
+    // already required the coupling: "Reporting Σ requires the encoder to
+    // *achieve* Σ → couple with proportional GOP allocation".
+    //
+    // So: allocate against what is actually known per GOP. Measured GOPs
+    // contribute their exact cap; unmeasured GOPs contribute the
+    // pessimism-discounted statistical lower bound.
+    //
+    // **`pessimism_factor` applies only to the imputed entries.** It is
+    // documented as a multiplier on the statistical lower bound
+    // `μ − t·σ/√K` — i.e. defence against *sampling* error. A GOP we
+    // measured carries no sampling error, so discounting it was halving a
+    // known-exact number. At full coverage (`fpc == 0`, the #850 census fix)
+    // that discount alone put the accept ceiling at `0.4545 × Σ`.
+    //
+    // This converges on truth as coverage grows, but it is NOT monotonically
+    // increasing: the imputed value bounds the *mean*, not the *minimum*, so
+    // probing a GOP that turns out worse than the bound (IMG_4138 has a 26 B
+    // GOP against μ = 1811) correctly lowers Σ basis and can flip a
+    // borderline message from accept to reject. What IS guaranteed is the
+    // property that was missing: a **measured** GOP is never over-allocated.
+    //
+    // That is what makes it safe to start encoding before the probe has
+    // finished — the planner uses whatever is known, and the residual risk
+    // sits only on GOPs nobody has looked at yet, absorbed by `safety_margin`
+    // plus the drain's per-GOP verify + shrink-carry (graceful
+    // `MessageTooLarge`, never silent loss).
+    //
+    // Corollary for the UI: a displayed estimate derived from this can still
+    // fall as probing proceeds. A never-falling display would need a
+    // conservative floor per unmeasured GOP rather than a bound on the mean,
+    // which costs displayed capacity early — a UX trade, not a correctness
+    // one.
+    let imputed = (cap_per_gop_lower * calibration.pessimism_factor).floor() as usize;
+    let mut basis = vec![imputed; n_gops];
+    for &(idx, cap) in samples {
+        if idx < n_gops {
+            basis[idx] = cap;
+        }
+    }
 
-    if total_safe < required {
+    // Pre-encode hard check against the basis over the window, not against
+    // `mean × W`. At full coverage this is the exact bound `Σ caps ≥
+    // message × safety_margin`; at partial coverage it degrades smoothly to
+    // the old pessimistic one.
+    let window_basis = &basis[..w];
+    let sigma_basis: usize = window_basis.iter().sum();
+    let required = (message_len as f64 * calibration.safety_margin).ceil() as usize;
+
+    if sigma_basis < required {
         if k >= n_gops {
             // Already at full corpus coverage — message genuinely doesn't fit.
             return PlanOutcome::MessageTooLarge;
@@ -186,9 +265,155 @@ pub fn plan_safe_balanced(
         };
     }
 
-    // Confident enough — distribute message uniformly across W GOPs.
-    let plan = uniform_split(message_len, w, n_gops);
+    // Cap-clamped proportional split within the window. `alloc[i] ≤ basis[i]`
+    // holds by construction (largest-remainder respects each entry's cap), so
+    // no GOP is handed more than it is known to hold and the drain's
+    // shrink-carry is demoted from "the mechanism that copes with
+    // heterogeneity" to "the absorber for J2 message-jitter". `r_target` is
+    // `target_utilization`, keeping the per-GOP rate bound and its documented
+    // soft ceiling (widen to full basis once the message exceeds
+    // `r × Σ basis`) — graceful stealth degradation exactly where stealth is
+    // already compromised.
+    let Some(window_plan) = crate::stego::chunk_frame::allocate_chunks_proportional(
+        window_basis,
+        message_len,
+        calibration.target_utilization,
+    ) else {
+        // Unreachable: `sigma_basis ≥ message_len × safety_margin > message_len`
+        // is the allocator's own `None` condition negated. Treat defensively
+        // as "needs more information" rather than panicking in production.
+        if k >= n_gops {
+            return PlanOutcome::MessageTooLarge;
+        }
+        let new_target = (k * 2).min(n_gops).max(k + 1);
+        let positions =
+            stratified_positions_excluding(new_target, n_gops, samples_idx_set(samples));
+        return PlanOutcome::NeedMoreSamples {
+            positions,
+            total_target: new_target,
+        };
+    };
+
+    let mut plan = vec![0usize; n_gops];
+    plan[..w].copy_from_slice(&window_plan);
     PlanOutcome::Plan { plan, window: w }
+}
+
+/// The largest message `plan_safe_balanced` would accept, given the same
+/// samples it will be given.
+///
+/// **This exists so the displayed capacity cannot disagree with the
+/// planner.** Before it, three different functions answered one question:
+/// `h264_video_capacity` reported `Σ caps − FRAME_OVERHEAD` (what the HUD
+/// showed), the planner's accept rule admitted `0.4545 × Σ`, and the drain
+/// delivered `n_gops × min(cap)`. The user saw the first, the planner
+/// enforced the second, reality was the third — a median ~2× and worst-case
+/// 70× gap (`cap_corpus_min_mu_census`). Deriving the display from this
+/// function makes the label true by construction rather than by audit, which
+/// is what `balanced-allocation-v3.md` §17.1 asks for ("Reporting Σ requires
+/// the encoder to *achieve* Σ").
+///
+/// Returns a message length in the same units `plan_safe_balanced` takes
+/// (post-`chunk_frame`-header payload bytes, i.e. framed bytes).
+///
+/// # Why this is a solve and not a bisection
+///
+/// Acceptance is **not** provably monotone in `message_len`, because `W`
+/// is itself a function of `message_len` and the window is a *prefix* of
+/// the clip. With caps `[1, 1, 1000]` a short message takes `W = 2`
+/// (capacity 2) and is refused, while a longer one takes `W = 3`
+/// (capacity 1002) and is admitted. A bisection would silently return a
+/// wrong answer on such a vector. In practice `W` saturates at `n_gops`
+/// early enough that real corpus vectors are monotone, but "in practice"
+/// is not a sound basis for the number shown to the user.
+///
+/// So this enumerates `W` instead. For a given `W` the planner admits
+/// exactly the messages that both *select* that `W` and *fit* in it:
+///
+/// ```text
+///     select:  message ∈ ( (W−1)·T , W·T ]      where T = target_cap_per_chunk
+///              (or (0, W_floor·T] at the floor)
+///     fit:     message ≤ Σ basis[..W] / safety_margin
+/// ```
+///
+/// The answer is the largest message over all `W` satisfying both, which is
+/// exact and `O(n_gops)`.
+pub fn max_message_len(
+    samples: &[(usize, usize)],
+    n_gops: usize,
+    calibration: &AllocationCalibration,
+) -> usize {
+    if n_gops == 0 || samples.is_empty() {
+        return 0;
+    }
+    let k = samples.len();
+    let caps: Vec<f64> = samples.iter().map(|&(_, c)| c as f64).collect();
+    let mu = caps.iter().sum::<f64>() / k as f64;
+    let var = if k > 1 {
+        caps.iter().map(|&c| (c - mu).powi(2)).sum::<f64>() / (k - 1) as f64
+    } else {
+        mu
+    };
+    let sigma = var.sqrt();
+    let t = t_critical_99_9(k);
+    let fpc = if n_gops > 1 {
+        (((n_gops.saturating_sub(k)) as f64) / ((n_gops - 1) as f64))
+            .max(0.0)
+            .sqrt()
+    } else {
+        0.0
+    };
+    let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt() * fpc).max(0.0);
+    let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
+
+    // Same basis the planner builds: measured caps where known, the
+    // pessimism-discounted bound where not.
+    let imputed = (cap_per_gop_lower * calibration.pessimism_factor).floor() as usize;
+    let mut basis = vec![imputed; n_gops];
+    for &(idx, cap) in samples {
+        if idx < n_gops {
+            basis[idx] = cap;
+        }
+    }
+
+    let target_cap_per_chunk =
+        (calibration.target_utilization * cap_per_gop_safe).max(1.0);
+    let w_floor = calibration
+        .w_floor_abs
+        .max(((n_gops as f64) * calibration.w_floor_frac).ceil() as usize)
+        .min(n_gops)
+        .max(1);
+
+    let mut best = 0usize;
+    let mut running: usize = basis[..w_floor.min(n_gops)].iter().sum();
+    for w in w_floor..=n_gops {
+        if w > w_floor {
+            running += basis[w - 1];
+        }
+        // Messages that select this W.
+        let window_lo = if w == w_floor {
+            0.0
+        } else {
+            (w - 1) as f64 * target_cap_per_chunk
+        };
+        // `plan_safe_balanced` CLAMPS `w` to `n_gops`, so the last window is
+        // open-ended: every message above `(n_gops−1)·T` also selects
+        // `w = n_gops`, and only the fit constraint binds there. Treating it
+        // as `w·T` understated iphone7's capacity by 3.6× (3803 vs 13831) —
+        // caught by `max_message_len_agrees_exactly_with_the_planner`.
+        let window_hi = if w == n_gops {
+            f64::INFINITY
+        } else {
+            w as f64 * target_cap_per_chunk
+        };
+        // Messages that fit in this W.
+        let fit = running as f64 / calibration.safety_margin;
+        let usable = window_hi.min(fit).floor();
+        if usable > window_lo && usable >= 1.0 {
+            best = best.max(usable as usize);
+        }
+    }
+    best
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -448,6 +673,360 @@ mod tests {
         match r {
             PlanOutcome::MessageTooLarge => {}
             other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+    }
+
+    // ── #841 cap-aware allocation: real corpus cap vectors ──────────────
+    //
+    // Vectors below are the measured per-GOP caps from
+    // `cap_corpus_min_mu_census` (qp=26, gop=30), not synthetic shapes. They
+    // are the two fixtures where `uniform_split` provably over-allocated.
+
+    /// iphone7, 1920x1072x510f, 17 GOPs, Σ = 15215, min = 320.
+    /// NOTE the minimum is the LAST GOP — the worst case for the drain's
+    /// forward-only shrink-carry, which has nothing after it to spill into.
+    const IPHONE7_CAPS: [usize; 17] = [
+        806, 1613, 1373, 720, 820, 1060, 586, 1026, 1140, 1526, 1133, 640, 700,
+        373, 546, 833, 320,
+    ];
+
+    /// IMG_4138, 1920x1072x600f, 20 GOPs, Σ = 36227, min = 26 (index 4).
+    /// min/μ = 0.014 — the 70× over-promise.
+    const IMG4138_CAPS: [usize; 20] = [
+        1833, 213, 120, 373, 26, 186, 1180, 2653, 5180, 2213, 4060, 8733, 953,
+        366, 1013, 833, 526, 1160, 2700, 1906,
+    ];
+
+    fn full_samples(caps: &[usize]) -> Vec<(usize, usize)> {
+        caps.iter().enumerate().map(|(i, &c)| (i, c)).collect()
+    }
+
+    /// The core invariant the old planner violated: no GOP is ever handed
+    /// more bytes than it was measured to hold.
+    fn assert_respects_caps(plan: &[usize], caps: &[usize], message_len: usize) {
+        assert_eq!(
+            plan.iter().sum::<usize>(),
+            message_len,
+            "plan must allocate the whole message",
+        );
+        for (i, (&got, &cap)) in plan.iter().zip(caps.iter()).enumerate() {
+            assert!(
+                got <= cap,
+                "GOP {i} allocated {got} B but was MEASURED at {cap} B \
+                 (plan={plan:?})",
+            );
+        }
+    }
+
+    #[test]
+    fn iphone7_at_the_size_that_used_to_fail_respects_every_measured_cap() {
+        // 6824 B framed = 45% of the displayed capacity. The app-planner gate
+        // measured 8/8 mid-encode MessageTooLarge here: `uniform_split` gave
+        // all 17 GOPs 6824/17 = 402 B, and the last GOP holds 320.
+        let caps = IPHONE7_CAPS;
+        let samples = full_samples(&caps);
+        let r = plan_safe_balanced(
+            &samples,
+            caps.len(),
+            6824,
+            30,
+            &AllocationCalibration::H264_1080P_QP26,
+        );
+        match r {
+            PlanOutcome::Plan { plan, window } => {
+                assert_eq!(window, caps.len(), "large message should span the clip");
+                assert_respects_caps(&plan, &caps, 6824);
+                // The specific byte that broke: the 320-cap tail GOP. Uniform
+                // gave it 402; proportional owes it ~6824×320/15215 ≈ 143.
+                assert!(
+                    plan[16] <= 320,
+                    "tail GOP got {} B against a 320 B cap",
+                    plan[16],
+                );
+            }
+            other => panic!("expected Plan at 45% of displayed capacity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn img4138_26_byte_gop_is_never_over_allocated() {
+        // The 70× case. At 40% of Σ (14490 B) `uniform_split` gave every one
+        // of the 20 GOPs 725 B — 28× what GOP 4 can hold.
+        let caps = IMG4138_CAPS;
+        let samples = full_samples(&caps);
+        let sigma: usize = caps.iter().sum();
+        let message_len = sigma * 40 / 100;
+        let r = plan_safe_balanced(
+            &samples,
+            caps.len(),
+            message_len,
+            30,
+            &AllocationCalibration::H264_1080P_QP26,
+        );
+        match r {
+            PlanOutcome::Plan { plan, .. } => {
+                assert_respects_caps(&plan, &caps, message_len);
+                assert!(
+                    plan[4] <= 26,
+                    "the 26 B GOP got {} B (uniform_split gave it 725)",
+                    plan[4],
+                );
+            }
+            other => panic!("expected Plan at 40% of Sigma, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_coverage_ceiling_is_sigma_over_margin_not_half_sigma() {
+        // `pessimism_factor` is documented as a multiplier on the statistical
+        // lower bound `μ − t·σ/√K` — defence against SAMPLING error. At full
+        // coverage `fpc == 0` (the #850 census fix) so that bound IS μ, and
+        // the old code still halved it, putting the accept ceiling at
+        // 0.4545 × Σ. With pessimism applied only to imputed entries the
+        // ceiling is Σ / safety_margin.
+        let caps = IPHONE7_CAPS;
+        let samples = full_samples(&caps);
+        let sigma: usize = caps.iter().sum(); // 15215
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        let ceiling = (sigma as f64 / cal.safety_margin) as usize; // ≈ 13831
+
+        // Comfortably under the new ceiling, but ABOVE the old 0.4545 × Σ
+        // (6916) that used to reject — this is the capacity that was lost.
+        let accept_len = 12_000;
+        assert!(accept_len > (0.4545 * sigma as f64) as usize);
+        match plan_safe_balanced(&samples, caps.len(), accept_len, 30, &cal) {
+            PlanOutcome::Plan { plan, .. } => assert_respects_caps(&plan, &caps, accept_len),
+            other => panic!("expected Plan at {accept_len} B (ceiling ~{ceiling}), got {other:?}"),
+        }
+
+        // Genuinely over Σ / margin — must still refuse, at full coverage,
+        // with MessageTooLarge rather than an escalation that can't help.
+        let reject_len = sigma; // margin makes this infeasible by construction
+        match plan_safe_balanced(&samples, caps.len(), reject_len, 30, &cal) {
+            PlanOutcome::MessageTooLarge => {}
+            other => panic!("expected MessageTooLarge at {reject_len} B, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_coverage_respects_measured_caps_and_imputes_the_rest() {
+        // Only the two weakest iphone7 GOPs measured (indices 13 and 16).
+        // Whatever the planner does with the 15 unmeasured GOPs, the two it
+        // KNOWS about must not be over-allocated. This is the incremental
+        // path: the user hit Encode before probing finished.
+        let caps = IPHONE7_CAPS;
+        let samples = vec![(13usize, caps[13]), (16usize, caps[16])];
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        match plan_safe_balanced(&samples, caps.len(), 3000, 30, &cal) {
+            PlanOutcome::Plan { plan, .. } => {
+                assert_eq!(plan.iter().sum::<usize>(), 3000);
+                assert!(
+                    plan[13] <= caps[13],
+                    "measured GOP 13 got {} B against cap {}",
+                    plan[13], caps[13],
+                );
+                assert!(
+                    plan[16] <= caps[16],
+                    "measured GOP 16 got {} B against cap {}",
+                    plan[16], caps[16],
+                );
+            }
+            // Escalation is a legitimate answer at 2/17 coverage — the point
+            // is that it must never commit a plan that over-fills a measured
+            // GOP.
+            PlanOutcome::NeedMoreSamples { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probing_a_gop_worse_than_the_bound_may_reduce_capacity() {
+        // Pins the NON-monotonicity documented in the planner body, so nobody
+        // later "fixes" it into a false guarantee. IMG_4138's GOP 4 holds
+        // 26 B against μ = 1811; discovering it must be allowed to shrink the
+        // feasible set rather than being papered over.
+        let caps = IMG4138_CAPS;
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        // Coverage that excludes the 26 B GOP, then the same plus GOP 4.
+        let without: Vec<(usize, usize)> =
+            (0..caps.len()).filter(|&i| i != 4).map(|i| (i, caps[i])).collect();
+        let with_it = full_samples(&caps);
+        let sigma_without: usize = without.iter().map(|&(_, c)| c).sum();
+        let sigma_with: usize = with_it.iter().map(|&(_, c)| c).sum();
+        assert!(
+            sigma_with < sigma_without + 1811,
+            "GOP 4 (26 B) must drag the total below what the mean implied",
+        );
+        // Whichever way each call resolves, a committed plan must respect
+        // every cap it was told about.
+        for samples in [&without, &with_it] {
+            if let PlanOutcome::Plan { plan, .. } =
+                plan_safe_balanced(samples, caps.len(), 8000, 30, &cal)
+            {
+                for &(i, cap) in samples.iter() {
+                    assert!(
+                        plan[i] <= cap,
+                        "measured GOP {i} got {} B against cap {cap}",
+                        plan[i],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn per_gop_allocation_is_monotone_in_message_size_across_the_soft_ceiling() {
+        // Bisects a corpus anomaly: `cap_proportional_success_rate_on_the_corpus`
+        // measured iphone5 at 0/4 round-trips at 60% of Sigma while passing 4/4
+        // at BOTH 80% and 45%. Under the allocator's own logic that should be
+        // impossible — a larger message gives every GOP a larger share of the
+        // same basis, so 60% asks strictly less of each GOP than 80% does.
+        //
+        // `allocate_chunks_proportional` has a discontinuity to rule out: it
+        // allocates against `floor(r*cap)` while the message fits under
+        // `r * Sigma`, then switches basis to the full caps above it. The
+        // `floor` biases small-cap GOPs differently in the two regimes, so the
+        // switch is not exactly continuous.
+        //
+        // If per-GOP allocation IS monotone here, the anomaly is downstream of
+        // the plan — per-GOP STC feasibility under specific message bits (J2),
+        // not an allocation bug. That is the bisection this test performs.
+        let caps: Vec<usize> = IPHONE7_CAPS.to_vec();
+        let sigma: usize = caps.iter().sum();
+        let cal = AllocationCalibration::H264_1080P_QP26;
+
+        // Sweep message sizes straight through the soft ceiling at
+        // r * Sigma = 0.5 * Sigma, in 2% steps.
+        let mut prev: Option<(usize, Vec<usize>)> = None;
+        for pct in (10..=90).step_by(2) {
+            let message_len = sigma * pct / 100;
+            let plan = match plan_safe_balanced(
+                &full_samples(&caps), caps.len(), message_len, 30, &cal,
+            ) {
+                PlanOutcome::Plan { plan, .. } => plan,
+                // Above Sigma/margin a refusal is correct; stop comparing.
+                PlanOutcome::MessageTooLarge => break,
+                other => panic!("unexpected {other:?} at {pct}%"),
+            };
+            assert_respects_caps(&plan, &caps, message_len);
+            if let Some((prev_pct, prev_plan)) = &prev {
+                for (i, (&now, &was)) in plan.iter().zip(prev_plan.iter()).enumerate() {
+                    assert!(
+                        now >= was,
+                        "GOP {i} allocation DROPPED as the message grew: \
+                         {prev_pct}% -> {pct}% of Sigma gave {was} -> {now} B \
+                         (cap {}). A non-monotone per-GOP fill would make a \
+                         larger message easier to embed than a smaller one, \
+                         which is what the iphone5 60%-vs-80% anomaly looks \
+                         like from the outside.",
+                        caps[i],
+                    );
+                }
+            }
+            prev = Some((pct, plan));
+        }
+        assert!(prev.is_some(), "swept no sizes");
+    }
+
+    /// Exhaustive agreement between `max_message_len` and the planner.
+    ///
+    /// This is the whole point of the function: the number shown to the user
+    /// must be the number the planner accepts. So rather than spot-check, scan
+    /// EVERY message length from 1 to Sigma, find the true largest one
+    /// `plan_safe_balanced` commits a plan for, and assert `max_message_len`
+    /// returns exactly that.
+    ///
+    /// Scanning also proves the absence of the non-monotonicity the function's
+    /// doc warns about, per vector: if any length above the reported maximum
+    /// were accepted, `true_max` would exceed it and this fails.
+    #[test]
+    fn max_message_len_agrees_exactly_with_the_planner() {
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        let vectors: Vec<(&str, Vec<usize>)> = vec![
+            ("iphone7", IPHONE7_CAPS.to_vec()),
+            ("img4138", IMG4138_CAPS.to_vec()),
+            // Pathological prefix ordering: a bisection returns a wrong answer
+            // on this shape because a short message selects a 2-GOP window of
+            // capacity 2 and is refused, while a longer one selects all 3 and
+            // is admitted.
+            ("tiny_prefix", vec![1, 1, 1000]),
+            ("all_equal", vec![500; 9]),
+            ("one_dead_gop", vec![4000, 4000, 1, 4000, 4000]),
+        ];
+
+        for (tag, caps) in vectors {
+            let samples = full_samples(&caps);
+            let n_gops = caps.len();
+            let sigma: usize = caps.iter().sum();
+            let reported = max_message_len(&samples, n_gops, &cal);
+
+            let accepts = |m: usize| {
+                matches!(
+                    plan_safe_balanced(&samples, n_gops, m, 30, &cal),
+                    PlanOutcome::Plan { .. }
+                )
+            };
+
+            let true_max = (1..=sigma).filter(|&m| accepts(m)).max().unwrap_or(0);
+            assert_eq!(
+                reported, true_max,
+                "{tag}: max_message_len said {reported} but the planner's true \
+                 maximum over 1..={sigma} is {true_max}. The displayed capacity \
+                 would {} what the planner accepts.",
+                if reported > true_max { "OVERSTATE" } else { "understate" },
+            );
+
+            if reported > 0 {
+                assert!(
+                    accepts(reported),
+                    "{tag}: planner refused its own reported maximum {reported}",
+                );
+                // And nothing above it is accepted — the scan above already
+                // establishes this, asserted explicitly for a clearer failure.
+                assert!(
+                    !(reported + 1..=sigma).any(accepts),
+                    "{tag}: a message LARGER than the reported maximum \
+                     {reported} is accepted — acceptance is non-monotone on \
+                     this vector and the display is wrong",
+                );
+            }
+        }
+    }
+
+    /// Pins where the planner's accept ceiling sits relative to the two
+    /// numbers it replaces, and prints all three so the gap is visible.
+    ///
+    /// `Σ` is the upper bound the HUD used to show. `n_gops × min(cap)` was
+    /// what the old uniform split could actually carry. The planner's ceiling
+    /// must land between them — above `n×min` (or the allocator fix bought
+    /// nothing) and below `Σ` (or the margin is not being applied).
+    #[test]
+    fn accept_ceiling_sits_between_n_times_min_and_sigma() {
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        for (tag, caps) in [
+            ("iphone7", IPHONE7_CAPS.to_vec()),
+            ("img4138", IMG4138_CAPS.to_vec()),
+        ] {
+            let n = caps.len();
+            let sigma: usize = caps.iter().sum();
+            let n_min = n * caps.iter().copied().min().unwrap();
+            let ceiling = max_message_len(&full_samples(&caps), n, &cal);
+            eprintln!(
+                "  {tag:<9} n={n:<3} Sigma={sigma:<7} n*min={n_min:<7} \
+                 planner ceiling={ceiling:<7} ({:.0}% of Sigma, {:.1}x n*min)",
+                100.0 * ceiling as f64 / sigma as f64,
+                ceiling as f64 / n_min as f64,
+            );
+            assert!(
+                ceiling > n_min,
+                "{tag}: ceiling {ceiling} is not above the old uniform limit {n_min} \
+                 — the cap-aware allocator would have bought nothing",
+            );
+            assert!(
+                ceiling < sigma,
+                "{tag}: ceiling {ceiling} is not below Sigma {sigma} — \
+                 safety_margin is not being applied",
+            );
         }
     }
 

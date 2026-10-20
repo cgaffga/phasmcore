@@ -18,6 +18,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use phasm_core::{
     h264_video_capacity,
     ColorParams, CostWeights, EncodeEngineChoice, EncodeSessionParams,
@@ -41,7 +42,7 @@ fn try_scale_yuv(src_mp4: &str, w: u32, h: u32, n: u32) -> Option<Vec<u8>> {
     // Cache key MUST include the source — otherwise different fixtures
     // at the same WxHxN collide and reuse the first-scaled YUV.
     let key: String = src_mp4.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
-    let yuv_path = format!("/tmp/phasm_hf797_{}_{}x{}_f{}.yuv", key, w, h, n);
+    let yuv_path = format!("{}/phasm_hf797_{}_{}x{}_f{}.yuv", common::scratch_dir(), key, w, h, n);
     let need = (w * h * 3 / 2) as usize * n as usize;
     if let Ok(d) = std::fs::read(&yuv_path) { if d.len() >= need { return Some(d[..need].to_vec()); } }
     let vf = format!("scale={}:{}", w, h);

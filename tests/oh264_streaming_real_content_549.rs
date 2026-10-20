@@ -60,7 +60,7 @@ fn corpus_root() -> PathBuf {
 /// frame count. Caches to /tmp so re-runs are cheap.
 fn ensure_real_yuv(source_mp4: &str, w: u32, h: u32, n_frames: u32) -> Vec<u8> {
     let yuv_path = format!(
-        "/tmp/phasm_oh264_real_content_549_{}_{}x{}_f{}.yuv",
+        "{}/phasm_oh264_real_content_549_{}_{}x{}_f{}.yuv", common::scratch_dir(),
         source_mp4.replace(['/', '.'], "_"),
         w, h, n_frames
     );

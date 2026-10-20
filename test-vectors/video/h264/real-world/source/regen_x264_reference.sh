@@ -1,5 +1,5 @@
 #!/bin/bash
-# Regenerate /tmp/img*_x264_reference.h264 — Annex-B reference clips
+# Regenerate $PHASM_TMP/img*_x264_reference.h264 — Annex-B reference clips
 # encoded with x264 (HandBrake "Fast 1080p30"-equivalent settings).
 #
 # Used by Phase 6E-A6 stealth-comparison work
@@ -13,13 +13,15 @@
 # committed artefact.
 
 set -e
+
+PHASM_TMP="${PHASM_TMP:-/tmp}"   # external-disk scratch; see root CLAUDE.md
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 regen_one() {
     local name=$1     # e.g. "IMG_4138"
     local out_tag=$2  # e.g. "4138"
     local mov="$SRC_DIR/$name.MOV"
-    local h264="/tmp/img${out_tag}_x264_reference.h264"
+    local h264="$PHASM_TMP/img${out_tag}_x264_reference.h264"
 
     if [ ! -f "$mov" ]; then
         echo "ERROR: $mov missing."
@@ -51,7 +53,7 @@ regen_one IMG_4138 4138
 regen_one IMG_4273 4273
 echo ""
 echo "Done. Run the histogram extractor against either reference:"
-echo "  python3 scripts/h264_mb_partition_histogram.py /tmp/img4138_x264_reference.h264"
+echo "  python3 scripts/h264_mb_partition_histogram.py $PHASM_TMP/img4138_x264_reference.h264"
 echo ""
 echo "The committed reference histogram lives at:"
 echo "  core/tests/data/x264_reference_mb_histogram.txt"

@@ -50,12 +50,20 @@ fn f2_shadow_frame_round_trip_various_sizes() {
 }
 
 #[test]
-fn f2_shadow_frame_overhead_constant_is_48() {
-    // WIDE: 4-byte plaintext_len + 16 salt + 12 nonce + 16 GCM tag = 48.
-    // Used by F.3's capacity math + F.4's brute-force lower bound.
+fn f2_shadow_frame_overhead_constant_is_v1() {
+    // Pre-existing rot (fixed 2026-10-18): the test used to assert
+    // the "WIDE" 48-byte overhead (4-byte plaintext_len). Commit
+    // `06ad8fb4 core/stego+codec + ios + android: unify shadow frame
+    // to v1/v2 dispatch` collapsed the layout so the default alias
+    // `AV1_SHADOW_FRAME_OVERHEAD` (= `SHADOW_FRAME_OVERHEAD_V1`)
+    // became the compact `2 + 16 + 12 + 16 = 46`. The test name +
+    // expected value were never updated — this test has been failing
+    // silently on main since. Pin to the current v1 layout; a wider
+    // v2 shape is picked at `shadow_frame_overhead_for(plaintext_len)`.
     assert_eq!(
-        AV1_SHADOW_FRAME_OVERHEAD, 48,
-        "AV1_SHADOW_FRAME_OVERHEAD must match the WIDE shadow frame layout"
+        AV1_SHADOW_FRAME_OVERHEAD, 46,
+        "AV1_SHADOW_FRAME_OVERHEAD must match the v1 shadow frame layout \
+         (2-byte plaintext_len + 16 salt + 12 nonce + 16 GCM tag)"
     );
 }
 

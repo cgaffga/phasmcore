@@ -158,7 +158,7 @@ to the matched J-UNI baseline at the corresponding QF.
 ## Manual commit (after applying the integration)
 
 \`\`\`bash
-cd /Users/cgaffga/Development/phasm
+cd /Volumes/EXTDISK/phasm-stego/phasm
 git add eval/runs/2026-05-16-e9-eval-vs-phasm-qf${QF}-pf${PAYLOAD_PAD} \\
         eval/runs/${RUN_NAME}/train.log
 git commit -m "eval: qf${QF}@${PAYLOAD} training + cross-stego complete"

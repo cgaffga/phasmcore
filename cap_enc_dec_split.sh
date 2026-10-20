@@ -6,8 +6,8 @@
 # residual (encode>decode) = correctness bug. All-zero confirms over-reports
 # are always graceful. 8-way cross-process (OH264 C-global state).
 set -u
-DIR=/Users/cgaffga/Development/phasm/core/test-vectors/video/h264/real-world/source
-BIN=$(ls -t /Users/cgaffga/Development/phasm/core/target/release/deps/cap_realworld_810-* 2>/dev/null | grep -v '\.d$' | head -1)
+DIR=/Volumes/EXTDISK/phasm-stego/phasm/core/test-vectors/video/h264/real-world/source
+BIN=$(ls -t /Volumes/EXTDISK/phasm-stego/phasm/core/target/release/deps/cap_realworld_810-* 2>/dev/null | grep -v '\.d$' | head -1)
 OUT=/tmp/cap814_encdec_corpus.txt
 GOP=30
 : > "$OUT"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Regenerate /tmp/openh264_baseline_*.h264 — Annex-B reference clips
+# Regenerate $PHASM_TMP/openh264_baseline_*.h264 — Annex-B reference clips
 # encoded with the OpenH264 fork (cgaffga/phasm-openh264) at constant
 # QP, no stego callbacks. Then run the histogram extractor and commit
 # the resulting tables to core/tests/data/openh264_baseline_*.txt.
@@ -21,6 +21,8 @@
 # iPhone VideoToolbox (both default IPPPP), not to x264-medium.
 
 set -e
+
+PHASM_TMP="${PHASM_TMP:-/tmp}"   # external-disk scratch; see root CLAUDE.md
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 # source/ -> real-world/ -> h264/ -> video/ -> test-vectors/ -> core/ -> repo root
 REPO_ROOT="$(cd "$SRC_DIR/../../../../../.." && pwd)"
@@ -61,7 +63,7 @@ fixtures=(
 build_example() {
     echo "Building example openh264_clean_encode --features h264-encoder ..."
     (cd "$REPO_ROOT/core" && cargo build --release --example openh264_clean_encode \
-        --features "h264-encoder video h264-encoder cabac-stego" >/dev/null 2>&1) \
+        --features "h264-encoder" >/dev/null 2>&1) \
         || { echo "ERROR: cargo build failed"; exit 1; }
 }
 
@@ -77,8 +79,8 @@ regen_one() {
 
     local width height
     read width height < <(get_target_dims "$mov")
-    local yuv="/tmp/openh264_baseline_${tag}_${width}x${height}_f${N_FRAMES}.yuv"
-    local h264="/tmp/openh264_baseline_${tag}.h264"
+    local yuv="$PHASM_TMP/openh264_baseline_${tag}_${width}x${height}_f${N_FRAMES}.yuv"
+    local h264="$PHASM_TMP/openh264_baseline_${tag}.h264"
     local hist="$REPO_ROOT/core/tests/data/openh264_baseline_${tag}_reference_mb_histogram.txt"
 
     if [ ! -f "$yuv" ] || [ "$mov" -nt "$yuv" ]; then

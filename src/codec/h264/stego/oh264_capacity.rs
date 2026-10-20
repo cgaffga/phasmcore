@@ -47,13 +47,34 @@ pub fn h264_shadow_capacity_for_n(pool_bits: usize, n_shadows: usize) -> usize {
 /// parity-tier cascade absorption at single-shadow load.
 #[derive(Debug, Clone, Copy)]
 pub struct H264StegoCapacityInfo {
-    /// Total injectable bits across the 3 bypass-bin domains used
-    /// by stego: `csb + csl + msb`. Excludes `msl` since
-    /// MvdSuffixLsb isn't injectable.
+    /// **CoeffSignBypass cover bits only**, summed over GOPs — NOT the
+    /// 3-domain injectable pool.
+    ///
+    /// Corrected 2026-10-19: this field was documented as
+    /// `csb + csl + msb` but the accumulation below only ever added
+    /// `GopCapacity::coeff_sign_cover_bits` (CSB). The 3-domain pool is a
+    /// separate quantity (`GopCapacity::injectable_cover_bits`, surfaced as
+    /// `CapacityProbeResult::shadow_pool_bits`) and is what the shadow
+    /// formula consumes; on real 1080p content CSB is ~75-87% of it, so the
+    /// two are not interchangeable.
+    ///
+    /// **This is a raw cover-position count, not a capacity.** It includes
+    /// positions that carry ∞ cost for the primary STC — on the real-world
+    /// corpus 61-70% of CSB positions are wet (DC coefficients; see
+    /// `content_costs::compute_cost_mask::coeff_is_wet`). Do not divide it by
+    /// 8 and call the result a message budget: that was the retired
+    /// `cover_bits × 0.40` heuristic, which over-reported 8-350×. Diagnostic
+    /// only.
     pub cover_size_bits: usize,
     /// Maximum primary message bytes (text + attached files
     /// combined) embeddable via the 4-domain orchestrator.
-    /// Equals `cover_size_bits/8 - FRAME_OVERHEAD`.
+    ///
+    /// `Σ per-GOP STC-trial payload − FRAME_OVERHEAD` (CAP2.1), i.e. the real
+    /// `stc_embed` feasibility boundary per GOP, which already accounts for
+    /// the ∞-cost positions natively in the Viterbi trellis. It has NO
+    /// closed-form relation to `cover_size_bits` — the stale
+    /// `cover_size_bits/8 - FRAME_OVERHEAD` claim this doc used to make was
+    /// the pre-CAP2.1 formula and over-reported by orders of magnitude.
     pub primary_max_message_bytes: usize,
     /// Maximum SHADOW message bytes per shadow at single-shadow
     /// (n_shadows = 1) load. For multi-shadow scenarios use
@@ -65,6 +86,29 @@ pub struct H264StegoCapacityInfo {
     /// less capacity but better visual quality. See
     /// `tier_filter::CascadeTier`.
     pub per_tier_primary_max_message_bytes: [usize; 5],
+    /// Largest message the ALLOCATION PLANNER will actually accept, in
+    /// message bytes (tier 0).
+    ///
+    /// `primary_max_message_bytes` above is a Σ-based **upper bound**: it is
+    /// only reachable if the encoder fills every GOP toward its own cap. The
+    /// shipped planner does fill proportionally now, but it also applies
+    /// `safety_margin` and a window rule, so its accept ceiling sits below
+    /// Σ. Surfacing only Σ is what let the HUD display a number the planner
+    /// would refuse — median ~2× and worst case 70× too high before the
+    /// allocator fix (`cap_corpus_min_mu_census`).
+    ///
+    /// Derived from
+    /// [`crate::stego::balanced_allocation::max_message_len`], i.e. from the
+    /// planner's OWN rule rather than a formula restated here, so the two
+    /// cannot drift. **This is the number a UI should show.**
+    ///
+    /// Additive on purpose: `primary_max_message_bytes` and
+    /// `per_tier_primary_max_message_bytes` keep their documented Σ-based
+    /// meaning, because `h264_stealth_sweep` sizes payloads as `u%` of them
+    /// (redefining them would silently re-scale the shipped Tier 2
+    /// calibration against its own doc), as do `h264_calibrate` and the CLI's
+    /// JSON output contract.
+    pub achievable_max_message_bytes: usize,
 }
 
 /// Resolve the auto-selected cascade tier for an OH264 encode.
@@ -184,10 +228,18 @@ pub fn h264_video_capacity(
             )
         })
         .collect();
+    // Retain the per-GOP tier-0 vector, not just its sum: the planner
+    // allocates against the vector, so the achievable ceiling cannot be
+    // recovered from Σ alone.
+    let mut gop_caps_t0: Vec<usize> = Vec::with_capacity(n_gops);
     for cap in caps {
         let cap = cap?;
+        // CSB-only, by design — `H264StegoCapacityInfo::cover_size_bits` is a
+        // diagnostic cover count, not a capacity. The 3-domain shadow pool is
+        // the separate `injectable_cover_bits` accumulation below.
         cover_size_bits += cap.coeff_sign_cover_bits;
         shadow_pool_bits += cap.injectable_cover_bits;
+        gop_caps_t0.push(cap.per_tier_payload[0]);
         for t in 0..5 {
             per_tier_sum[t] += cap.per_tier_payload[t];
         }
@@ -212,11 +264,27 @@ pub fn h264_video_capacity(
     let shadow_max_message_bytes =
         super::shadow_capacity::shadow_max_message_bytes_from_cover_bits(shadow_pool_bits, /* n_shadows */ 1);
 
+    // What the planner will accept, asked of the planner. `max_message_len`
+    // works in FRAMED bytes (the unit `plan_safe_balanced` takes), so the
+    // one-time crypto envelope comes off to express it as message bytes —
+    // the same conversion `per_tier_primary_max_message_bytes` applies.
+    let achievable_max_message_bytes = {
+        let samples: Vec<(usize, usize)> =
+            gop_caps_t0.iter().copied().enumerate().collect();
+        let framed_ceiling = crate::stego::balanced_allocation::max_message_len(
+            &samples,
+            gop_caps_t0.len(),
+            &crate::stego::calibration::AllocationCalibration::H264_1080P_QP26,
+        );
+        framed_ceiling.saturating_sub(FRAME_OVERHEAD)
+    };
+
     Ok(H264StegoCapacityInfo {
         cover_size_bits,
         primary_max_message_bytes,
         shadow_max_message_bytes,
         per_tier_primary_max_message_bytes,
+        achievable_max_message_bytes,
     })
 }
 

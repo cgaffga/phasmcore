@@ -7,7 +7,7 @@
 //!
 //! All constants are corpus-measured (not hand-tuned):
 //!
-//! - **Tier 1** (per-clip cover-bit distribution): `cover_bits_per_frame_floor`,
+//! - **Tier 1** (per-clip cover-bit distribution): `payload_bits_per_frame_floor`,
 //!   `pessimism_factor`, `K_min`, `table_tolerance`, `safety_margin`.
 //!   See [`calibration-spike-2026-06.md`](../../docs/design/video/calibration-spike-2026-06.md).
 //!
@@ -25,12 +25,25 @@
 /// their own constants as Tier 1 measurement gets re-run per surface.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AllocationCalibration {
-    /// Conservative cover-bits-per-frame floor for the (resolution, QP)
-    /// this calibration targets. Anchored to corpus minimum so the
-    /// planner over-deducts gracefully on hard content. Pre-probe
-    /// table lookup uses this; the K_min stratified probe validates
-    /// the actual content against it via `table_tolerance`.
-    pub cover_bits_per_frame_floor: usize,
+    /// Conservative **payload bits per frame** floor for the
+    /// (resolution, QP) this calibration targets, in units of
+    /// STC-ratio-applied capacity bits per frame — the same basis as
+    /// `(cap_bytes_per_gop × 8) / gop_size`. Anchored to corpus
+    /// minimum so the planner over-deducts gracefully on hard
+    /// content. Pre-probe table lookup uses this; the K_min
+    /// stratified probe validates the actual content against it via
+    /// `table_tolerance`.
+    ///
+    /// Renamed 2026-10-18 from `cover_bits_per_frame_floor`. The old
+    /// name was ambiguous: AV1 stored *raw* cover bits
+    /// (pre-STC-ratio) while H.264 stored *payload* bits
+    /// (post-STC-ratio, see `h264_calibrate.rs::write_json`'s
+    /// `min_cap_bits_per_frame` derivation). Unified on H.264's
+    /// post-STC-ratio basis — AV1's constant updated from
+    /// `80_000` → `12_000` (= `80_000 × STC_PAYLOAD_RATIO = 80_000
+    /// × 0.15`). See `docs/design/video/av1/pessimism-recalibration-
+    /// 2026-10-18.md` § 4.5 for the surfacing + reasoning.
+    pub payload_bits_per_frame_floor: usize,
 
     /// Multiplier applied to the statistical lower bound
     /// `μ − t × σ/√K` from the stratified probe. Combined with the
@@ -84,7 +97,14 @@ impl AllocationCalibration {
     ///   AUC=0.55 crossover at u_eff ≈ 0.018; u=0.05 picks the balanced
     ///   choice clearing the W6 v1.0 ceiling 0.60 with margin.
     pub const AV1_1080P_QP30: Self = Self {
-        cover_bits_per_frame_floor: 80_000,
+        // 2026-10-18: was `80_000` (raw cover bits per frame — the
+        // original Phase-1 spike measurement). Updated to the
+        // post-STC-ratio payload-bits basis so the planner's
+        // `table_pred` is unit-consistent with H.264's constant.
+        // Derivation: `79_188 cb/frame × STC_PAYLOAD_RATIO (= 0.15)
+        // ≈ 11_878 payload bits/frame`, rounded to the corpus floor
+        // `12_000` for conservative over-deduct.
+        payload_bits_per_frame_floor: 12_000,
         pessimism_factor: 0.5,
         target_utilization: 0.05,
         k_min: 8,
@@ -102,10 +122,11 @@ impl AllocationCalibration {
     /// - Tier 1 (per-GOP cap-byte distribution at the PRODUCTION gop_size,
     ///   not the AV1 spike's gop_size=1 upper bound): per-GOP cap yield
     ///   spans 190× (WomanSubway 88 B/GOP .. iPhone-5 16.7 KB/GOP grain).
-    ///   `cover_bits_per_frame_floor` is the H.264 per-GOP PAYLOAD basis
-    ///   (lowest clip mean 88 B/GOP × 8 / gop 30 ≈ 23 bits/frame) — NOT
-    ///   comparable to AV1's 80_000 raw-cover-bit floor. See
-    ///   `docs/design/video/calibration-h264-tier1-2026-06.md`.
+    ///   `payload_bits_per_frame_floor` is the H.264 per-GOP PAYLOAD basis
+    ///   (lowest clip mean 88 B/GOP × 8 / gop 30 ≈ 23 bits/frame). As of
+    ///   2026-10-18 this basis is also AV1's (= post-STC-ratio) — see
+    ///   the AV1 constant above. `docs/design/video/calibration-h264-
+    ///   tier1-2026-06.md` has the H.264 corpus detail.
     /// - Tier 2 (W6 AUC vs utilization): 4-clip × 8-seek, 1080p/GOP30/QP26.
     ///   AUC FLAT at ~0.51 across u ∈ {5..100}% — no 0.55 crossover (the
     ///   adaptive cost preserves the marginals W6 measures, so detectability
@@ -114,7 +135,7 @@ impl AllocationCalibration {
     ///   curve; `w_floor_*` still guarantees minimum spread). See
     ///   `docs/design/video/calibration-h264-tier2-2026-06.md`.
     pub const H264_1080P_QP26: Self = Self {
-        cover_bits_per_frame_floor: 23,
+        payload_bits_per_frame_floor: 23,
         pessimism_factor: 0.5,
         target_utilization: 0.50,
         k_min: 8,
@@ -139,7 +160,7 @@ mod tests {
         // Regression guard — these are corpus-measured, not hand-tuned.
         // Any change requires a fresh calibration spike + design doc update.
         let c = AllocationCalibration::AV1_1080P_QP30;
-        assert_eq!(c.cover_bits_per_frame_floor, 80_000);
+        assert_eq!(c.payload_bits_per_frame_floor, 12_000);
         assert!((c.pessimism_factor - 0.5).abs() < 1e-9);
         assert!((c.target_utilization - 0.05).abs() < 1e-9);
         assert_eq!(c.k_min, 8);
@@ -154,7 +175,7 @@ mod tests {
         // #844 — corpus-measured (Tier 1) + W6-swept (Tier 2), not hand-tuned.
         // Any change requires a fresh H.264 calibration spike + doc update.
         let c = AllocationCalibration::H264_1080P_QP26;
-        assert_eq!(c.cover_bits_per_frame_floor, 23);
+        assert_eq!(c.payload_bits_per_frame_floor, 23);
         assert!((c.pessimism_factor - 0.5).abs() < 1e-9);
         assert!((c.target_utilization - 0.50).abs() < 1e-9);
         assert_eq!(c.k_min, 8);

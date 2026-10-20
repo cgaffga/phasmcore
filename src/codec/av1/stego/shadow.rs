@@ -950,6 +950,41 @@ fn peek_fdl_from_first_block_av1(
 ///
 /// Mirror of H.264 `shadow_extract` at
 /// `core/src/codec/h264/stego/shadow.rs:814-878`.
+/// Cap on priority slots the DECODE path keeps in memory. The
+/// `priority_slots` whole-clip Vec would materialise one entry per
+/// cover position in the clip's joint Tier 1 union — ~80 k positions
+/// per 1080p frame × 30 min × 30 fps × ~12 B ≈ **50 GB**. Even on a
+/// 1-min clip it reaches ~1 GB — mobile OOM-kill territory, flagged
+/// by the T2.6 code review and the top-of-file WV.7 comment at
+/// shadow.rs:552 ("whole-clip priority_slots Vec INSIDE
+/// av1_shadow_extract: ~50 GB").
+///
+/// This decode-side cap bounds the practical top-N scan to the
+/// largest shadow message any realistic mobile caller would send.
+/// 8 M bits = 1 MB packed → `try_single_fdl` can scan up to a 1 MB
+/// shadow codeword at every parity tier. The encoder's hard cap is
+/// `MAX_SHADOW_FRAME_BYTES = 16 MB`, well above what fits in a
+/// mobile cover; even an unrealistically large shadow (hundreds of
+/// KB) stays under this bound.
+///
+/// Memory: 8 M × ~12 B/entry (BinaryHeap<Av1TopNEntry>) ≈ **96 MB**
+/// peak during the sweep, dropped before `bits_to_bytes` runs. On a
+/// 1080p × 10-sec clip (~2.4 M cover positions) the heap never
+/// exceeds the cover size itself, so this cap is a no-op; it only
+/// kicks in on long clips where it also bounds decode CPU
+/// proportionally.
+///
+/// **Correctness contract.** Any shadow whose encoded footprint
+/// exceeds `SHADOW_DECODE_TOP_N_CAP` bits in the global priority
+/// order will not decode — same symptom as a wrong-passphrase
+/// decode (AES-authentication fails). The 1 MB bound exceeds the
+/// mobile apps' hard shadow-message size limits (text + file
+/// attachments typically kilobytes), so this surfaces only on
+/// adversarially large shadows a mobile UI couldn't produce today.
+/// If a long-form shadow use case ever lands, lift this constant +
+/// re-run the memory-bound test.
+const SHADOW_DECODE_TOP_N_CAP: usize = 8 * 1024 * 1024;
+
 pub fn av1_shadow_extract(
     cover_bits: &[u8],
     passphrase: &str,
@@ -959,7 +994,19 @@ pub fn av1_shadow_extract(
     }
     let perm_seed_zero = derive_shadow_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = (*perm_seed_zero).into();
-    let slots = priority_slots(cover_bits.len(), &perm_seed);
+    // Streaming top-N selection — same primitive the encode-side
+    // WV.7 shadow pipeline uses to avoid the whole-clip
+    // `priority_slots` Vec. For small clips (cover ≤ cap) this is
+    // bit-identical to `priority_slots(cover_size)` (every slot is
+    // kept, same order). For long clips it caps at the top
+    // `SHADOW_DECODE_TOP_N_CAP` priority positions — enough for any
+    // realistic shadow message size, bounded in memory.
+    let top_n_cap = cover_bits.len().min(SHADOW_DECODE_TOP_N_CAP);
+    let mut top_n = Av1StreamingTopN::new(&perm_seed, top_n_cap);
+    for cover_index in 0..cover_bits.len() {
+        top_n.push(cover_index);
+    }
+    let slots = top_n.into_sorted();
 
     // Bit-pack once across all parity tiers (RS tries are expensive;
     // keep the bit-pack out of the hot loop).

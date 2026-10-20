@@ -1,5 +1,5 @@
 # H.264 mb-partition histogram
-# source: /tmp/openh264_baseline_img4273.h264
+# source: openh264_baseline_img4273.h264
 # resolution: 1920x1072 (8040 MBs/frame)
 
 ## I-frame (1 frames, 8040 MBs)

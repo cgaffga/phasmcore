@@ -100,7 +100,7 @@ fn probe_baseline_dims(spec: &Fixture) -> (u32, u32) {
 
 fn ensure_yuv(spec: &Fixture, w: u32, h: u32) -> Vec<u8> {
     let yuv_path = format!(
-        "/tmp/openh264_baseline_{}_{}x{}_f{}.yuv",
+        "{}/openh264_baseline_{}_{}x{}_f{}.yuv", common::scratch_dir(),
         spec.name, w, h, spec.n_frames
     );
     let frame_size = (w * h * 3 / 2) as usize;

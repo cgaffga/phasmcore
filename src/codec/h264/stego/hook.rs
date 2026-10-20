@@ -264,6 +264,18 @@ impl PositionKey {
         self.0
     }
 
+    /// Inverse of [`raw`](Self::raw) — rebuild a key from its packed form.
+    ///
+    /// For round-tripping a key through a byte buffer (the shadow GOP cache's
+    /// disk spill). Unlike [`new`](Self::new) this does no field validation,
+    /// because the value it takes came from `raw()` on a key that was already
+    /// validated when constructed. Do not use it to synthesize keys from
+    /// arbitrary integers.
+    #[inline]
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     #[inline]
     pub fn frame_idx(self) -> u32 {
         (self.0 & 0xFF_FFFF) as u32

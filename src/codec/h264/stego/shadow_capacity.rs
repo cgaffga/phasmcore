@@ -20,6 +20,39 @@
 /// √(1024·pool/(N−1)), capped by the raw pool. Worst-case RS parity
 /// (128 B) is then subtracted, and the v1/v2 frame envelope is applied
 /// by `max_shadow_plaintext_bytes`.
+///
+/// ## The pool INTENTIONALLY counts primary-wet positions — do not "fix" this
+///
+/// Verified 2026-10-19. A raw-cover-count capacity figure is usually a bug
+/// (the caller must exclude ∞-cost positions), and this one looks like one:
+/// `injectable_cover_bits` is a plain `bits.len()` sum, and 46-60% of those
+/// positions carry `f32::INFINITY` in the primary cost vector
+/// (`content_costs::compute_cost_mask`) on the real-world corpus. It is
+/// nevertheless **correct**, because ∞-cost is a statement about the PRIMARY
+/// embedder, not about the position:
+///
+/// - The primary uses STC, so its cost vector gates which positions the
+///   Viterbi may flip. ∞ ⇒ never flipped.
+/// - Shadows use **direct LSB writes**, not STC, and select positions by hash
+///   priority alone. `shadow::for_each_eligible_position` — the single source
+///   of truth for shadow eligibility — takes `(cover, safe_csl, safe_msl)` and
+///   **no cost vector at all**. A DC coefficient's sign bin is just as
+///   writable at the CABAC bypass-emit site as an AC one.
+/// - The ∞ overlay runs the OPPOSITE way round: `shadow::overlay_infinity_costs`
+///   marks the chosen SHADOW positions ∞ so the primary's STC leaves them
+///   alone.
+///
+/// Empirically: ~46-60% of the top-N slots a real shadow encode consumes are
+/// primary-wet, and `oh264_video_shadow_roundtrip` is green — impossible if
+/// those slots were unusable, since RS absorbs ~128 B of parity, not 50%
+/// symbol noise. Narrowing the pool to finite-cost positions would understate
+/// shadow capacity by ~√2 and surface a smaller number than the encoder can
+/// actually carry.
+///
+/// (Conservative in the other direction, left as-is deliberately: the pool
+/// omits the cascade-safe `MvdSuffixLsb` positions that production shadow
+/// selection *does* include — 1.5-4.1% of the real pool. See
+/// `GopCapacity::injectable_cover_bits`.)
 pub(crate) fn shadow_max_message_bytes_from_cover_bits(
     cover_size_bits: usize,
     n_shadows: usize,

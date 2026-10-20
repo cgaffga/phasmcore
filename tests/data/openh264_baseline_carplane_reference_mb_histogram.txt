@@ -1,5 +1,5 @@
 # H.264 mb-partition histogram
-# source: /tmp/openh264_baseline_carplane.h264
+# source: openh264_baseline_carplane.h264
 # resolution: 1072x1920 (8040 MBs/frame)
 
 ## I-frame (1 frames, 8040 MBs)

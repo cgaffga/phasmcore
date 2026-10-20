@@ -23,7 +23,7 @@
 
 use phasm_core::codec::h264::stego::CostWeights;
 use phasm_core::codec::h264::streaming_session::{
-    ColorParams, DecodeSessionResult, EncodeEngineChoice, EncodeSessionParams,
+    CapacityProbeResult, ColorParams, DecodeSessionResult, EncodeEngineChoice, EncodeSessionParams,
     StreamingDecodeSession, StreamingEncodeSession, StreamingProbeSession, YuvFrameRef,
 };
 use phasm_core::stego::payload::FileEntry;
@@ -169,6 +169,111 @@ pub fn encode_with_files(
     push_clip(enc, yuv, width, height, n_frames)
 }
 
+/// What an instrumented encode saw, beyond the bitstream itself.
+pub struct EncodeReport {
+    pub annex_b: Vec<u8>,
+    /// `StreamingEncodeSession::framed_message_len()` — the exact byte count
+    /// the session framed.
+    ///
+    /// A fill-level harness needs this: the capacity probe's budget is
+    /// denominated in framed bytes
+    /// (`CapacityProbeResult::achievable_max_message_bytes` is
+    /// `framed_ceiling − FRAME_OVERHEAD`), so "N% full" can only be *verified*
+    /// against the number the session actually framed — not against the blob
+    /// size the caller chose, which still has the payload envelope and (for
+    /// compressible content) Brotli in between.
+    pub framed_len: usize,
+    /// `StreamingEncodeSession::resolved_tier()` — which cascade-safety tier
+    /// `CascadeTier::Auto` resolved to for this payload.
+    ///
+    /// This is load-bearing for any quality measurement: `auto_select_tier`
+    /// picks the **highest** (tightest) tier whose CSB+CSL capacity covers the
+    /// message, and the tier filter sets ∞ cost on coefficient positions while
+    /// leaving the MVD domains untouched. So payload size changes *which
+    /// domains* carry the message, not just how many symbols flip — and the
+    /// damage curve need not be monotonic in payload.
+    ///
+    /// `None` when the backend isn't OH264, or when no GOP drained before
+    /// `finish()` (only possible if `gop_size > n_frames`).
+    pub resolved_tier: Option<u8>,
+}
+
+/// `encode_with_files`, instrumented — returns the bitstream plus the framed
+/// length and the resolved cascade tier.
+///
+/// The tier is read after the last `push_frame` and before `finish()`, because
+/// `finish` consumes the session. With the single-GOP shape this helper uses
+/// (`gop_size == n_frames`) the one GOP drains on the final `push_frame`, so
+/// the tier is already resolved at that point.
+pub fn encode_with_files_reported(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<EncodeReport, StegoError> {
+    let mut enc = StreamingEncodeSession::create_with_files(
+        params(width, height, n_frames, qp, n_frames.max(1), CostWeights::default()),
+        message,
+        files,
+        passphrase,
+    )?;
+    let framed_len = enc.framed_message_len().unwrap_or(0);
+    let mut out = Vec::new();
+    for f in 0..n_frames as usize {
+        enc.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)), &mut out)?;
+    }
+    let resolved_tier = enc.resolved_tier();
+    enc.finish(&mut out)?;
+    Ok(EncodeReport {
+        annex_b: out,
+        framed_len,
+        resolved_tier,
+    })
+}
+
+/// Encode a flat I420 clip with **no stego at all** — the low-level
+/// `Encoder` API with no stego handlers registered (mirrors
+/// `examples/openh264_clean_encode.rs`).
+///
+/// This is the only honest "clean reference" for a visual measurement. The
+/// obvious alternative — a stego encode carrying a 1-character message — is
+/// NOT clean: `FRAME_OVERHEAD` alone frames 50 bytes, so on a clip whose whole
+/// capacity is a few hundred bytes the "1-char baseline" is already a
+/// double-digit-percent fill and costs real dB. Measured 2026-10-20 on a
+/// 480×256×6 clip (capacity 282 B): the 1-char baseline sat 24.8-34.3 dB from
+/// source depending only on the passphrase, i.e. on which cover positions the
+/// STC happened to pick.
+pub fn encode_clean(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+) -> Vec<u8> {
+    use phasm_core::codec::h264::openh264::Encoder;
+    let luma = (width * height) as usize;
+    let chroma = ((width / 2) * (height / 2)) as usize;
+    let frame_bytes = luma + 2 * chroma;
+    let mut enc = Encoder::new(width as i32, height as i32, qp, gop_size as i32)
+        .expect("openh264 clean Encoder::new");
+    let mut nal_buf = vec![0u8; frame_bytes * 2];
+    let mut out = Vec::with_capacity(frame_bytes / 4 * n_frames as usize);
+    for i in 0..n_frames as usize {
+        let (y, u, v) = frame_planes(yuv, width, height, i);
+        let ts = (i as i64) * 33;
+        let (_ft, n) = enc
+            .encode_frame(y, u, v, ts, &mut nal_buf)
+            .expect("openh264 clean encode_frame");
+        out.extend_from_slice(&nal_buf[..n]);
+    }
+    out
+}
+
 /// Decode the full result (text + file attachments) from stego Annex-B.
 pub fn decode_full(annex_b: &[u8], passphrase: &str) -> Result<DecodeSessionResult, StegoError> {
     let mut dec = StreamingDecodeSession::create(passphrase)?;
@@ -203,4 +308,35 @@ pub fn probe_cover_bits(
         probe.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)))?;
     }
     Ok(probe.finish()?.cover_bits)
+}
+
+/// Full capacity probe — the same `StreamingProbeSession` →
+/// `finish_with_per_gop()` call the mobile HUD and the CLI two-pass
+/// orchestrator make, returning the whole `CapacityProbeResult` (so callers
+/// can read `achievable_max_message_bytes`, i.e. **the number the app shows
+/// the user**) plus the per-GOP tier-0 payload vector.
+///
+/// Prefer this over `probe_cover_bits` for anything user-visible:
+/// `cover_bits` is the raw CoeffSign cover count and is explicitly *not* the
+/// capacity any more (see `CapacityProbeResult`'s docs).
+pub fn probe_capacity(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+) -> Result<(CapacityProbeResult, Vec<usize>), StegoError> {
+    let mut probe = StreamingProbeSession::create(params(
+        width,
+        height,
+        n_frames,
+        qp,
+        gop_size,
+        CostWeights::default(),
+    ))?;
+    for f in 0..n_frames as usize {
+        probe.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)))?;
+    }
+    probe.finish_with_per_gop()
 }

@@ -22,6 +22,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingDecodeSession,
     StreamingEncodeSession, YuvFrameRef,
@@ -41,7 +42,7 @@ fn corpus_root() -> std::path::PathBuf {
 fn try_scale_yuv(src_mp4: &str, tag: &str, w: u32, h: u32, n: u32) -> Option<Vec<u8>> {
     let src = corpus_root().join(src_mp4);
     if !src.exists() { return None; }
-    let yuv_path = format!("/tmp/phasm_modeb_{}_{}x{}_f{}.yuv", tag, w, h, n);
+    let yuv_path = format!("{}/phasm_modeb_{}_{}x{}_f{}.yuv", common::scratch_dir(), tag, w, h, n);
     let need = (w * h * 3 / 2) as usize * n as usize;
     if let Ok(d) = std::fs::read(&yuv_path) { if d.len() >= need { return Some(d[..need].to_vec()); } }
     let vf = format!("scale={}:{}", w, h);

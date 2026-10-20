@@ -148,7 +148,7 @@ juni_native = {
 
 Then re-render:
 \`\`\`bash
-cd /Users/cgaffga/Development/phasm/eval
+cd /Volumes/EXTDISK/phasm-stego/phasm/eval
 .venv/bin/python scripts/build_paper_figures.py
 \`\`\`
 
@@ -170,7 +170,7 @@ And append to the §6.2 cross-stego section:
 ### 4. Commit (review then run)
 
 \`\`\`bash
-cd /Users/cgaffga/Development/phasm/marketing
+cd /Volumes/EXTDISK/phasm-stego/phasm/marketing
 git add research/paper/sections/6_evaluation.tex \\
         research/paper/anc/REPRO.md \\
         research/figures/fig_eval_singlemsg_pe.pdf \\
@@ -178,11 +178,11 @@ git add research/paper/sections/6_evaluation.tex \\
 git commit -m "research: §6.2 0.50 cells filled (deferred handler)"
 
 # If build_paper_figures.py itself was edited, commit it in the parent repo:
-#   cd /Users/cgaffga/Development/phasm
+#   cd /Volumes/EXTDISK/phasm-stego/phasm
 #   git add eval/scripts/build_paper_figures.py
 #   git commit -m "eval: figure script — add 0.50 data point"
 
-cd /Users/cgaffga/Development/phasm
+cd /Volumes/EXTDISK/phasm-stego/phasm
 git add eval/runs/2026-05-16-e9-eval-vs-phasm-pf050 \\
         eval/runs/2026-05-16-e9-eval-vs-phasm/phasm_qf75_pf050.json \\
         eval/runs/2026-05-16-e9-eval-vs-phasm/cover_qf75_byDet050.json \\

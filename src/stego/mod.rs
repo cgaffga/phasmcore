@@ -24,6 +24,7 @@ pub mod stc;
 pub mod crypto;
 pub mod frame;
 pub mod chunk_frame;
+pub mod gop_cache;
 pub mod calibration;
 pub mod balanced_allocation;
 pub mod permute;

@@ -155,7 +155,10 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     } else {
         println!("CABAC v2 capacity ({}x{}, {} frames, gop={}):",
             probe.width, probe.height, probe.n_frames, gop_size);
-        println!("  cover bits (3 injectable domains): {}", info.cover_size_bits);
+        // CSB-only, and a raw position count (∞-cost positions included) —
+        // NOT a capacity and NOT the 3-domain shadow pool, which the old
+        // label here wrongly claimed. See `H264StegoCapacityInfo`.
+        println!("  cover bits (CoeffSign domain):     {}", info.cover_size_bits);
         println!("  primary max message bytes:         {}", info.primary_max_message_bytes);
         println!("  shadow max message bytes (n=1):    {}", info.shadow_max_message_bytes);
         println!();

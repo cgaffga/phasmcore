@@ -35,7 +35,7 @@
 use std::time::Instant;
 
 use phasm_core::codec::av1::stego::whole_video::{
-    av1_encode_with_shadows_streaming, Av1SliceYuvSource,
+    av1_encode_with_shadows_streaming, Av1SliceYuvSource, Pass1CacheBudget,
 };
 use phasm_core::stego::{crypto, frame, payload};
 use phasm_core::Av1StreamingEncodeParams;
@@ -60,6 +60,36 @@ fn peak_rss_bytes() -> u64 {
 #[cfg(not(unix))]
 fn peak_rss_bytes() -> u64 {
     0
+}
+
+/// Synthetic deterministic YUV — same pattern the stratified-probe
+/// tests use. The smoke companion exercises the streaming WV-shadow
+/// code path without needing the corpus fixture (which is gitignored
+/// on fresh checkouts) and without the ~82 s wall of the real
+/// corpus-sized gate.
+fn make_yuv_synthetic(w: u32, h: u32, n: u32) -> Vec<u8> {
+    let y_size = (w * h) as usize;
+    let uv_size = (w / 2) as usize * (h / 2) as usize;
+    let frame = y_size + 2 * uv_size;
+    let mut out = vec![0u8; frame * n as usize];
+    for f in 0..n as usize {
+        let base = f * frame;
+        for yy in 0..h as usize {
+            for xx in 0..w as usize {
+                out[base + yy * w as usize + xx] =
+                    ((xx + yy + f * 7) & 0xff) as u8;
+            }
+        }
+        for yy in 0..(h / 2) as usize {
+            for xx in 0..(w / 2) as usize {
+                let v = (((xx * 2) + (yy * 3) + f * 5) & 0xff) as u8;
+                out[base + y_size + yy * (w / 2) as usize + xx] = v;
+                out[base + y_size + uv_size + yy * (w / 2) as usize + xx] =
+                    v.wrapping_add(32);
+            }
+        }
+    }
+    out
 }
 
 /// Pull corpus YUV via ffmpeg. Real content so rav1e's RDO has signal
@@ -169,6 +199,7 @@ fn wv_streaming_pull_peak_rss_720p_1shadow() {
         primary_pass,
         shadows,
         4, // parity floor — start at lowest tier
+        Pass1CacheBudget::from_env_or_default(),
     )
     .expect("streaming WV-shadow encode");
     let wall = t0.elapsed();
@@ -197,4 +228,89 @@ fn wv_streaming_pull_peak_rss_720p_1shadow() {
             PEAK_RSS_LIMIT_BYTES / (1024 * 1024)
         );
     }
+}
+
+/// Smoke companion to the ignored 720p × 60f × 1-shadow gate above.
+/// Runs the same code path (`av1_encode_with_shadows_streaming` with
+/// the per-GOP streaming cascade) on the small deterministic fixture
+/// used by `av1_pull_whole_video_shadow_roundtrip` + the stratified-
+/// probe tests, so CI exercises the production memory-bounded flow on
+/// every build without the ~82 s wall of the real-corpus gate.
+///
+/// The RSS bound here is INTENTIONALLY generous — small-fixture
+/// macOS runs are dominated by allocator/mmap noise, so a tight
+/// threshold would false-positive. The point is to catch an outright
+/// O(clip²) regression (whole-video YUV re-materialization, etc.)
+/// without a 1-min CI wait.
+#[test]
+fn wv_streaming_pull_smoke_small_fixture() {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 144;
+    const N_FRAMES: u32 = 8;
+    const GOP_SIZE: u32 = 4;
+    // Small-fixture smoke bound — 1 GB would catch an O(clip) explosion
+    // without flagging allocator-mmap noise.
+    const PEAK_RSS_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+
+    let params = Av1StreamingEncodeParams {
+        width: WIDTH,
+        height: HEIGHT,
+        quantizer: 30,
+        gop_size: GOP_SIZE,
+        total_frames_hint: N_FRAMES,
+    };
+
+    let primary_text = "WV-shadow smoke — primary payload";
+    let primary_pass = "wv-smoke-primary";
+    let shadow_pass = "wv-smoke-shadow";
+    let shadow_payload =
+        payload::encode_payload("shadow smoke", &[]).expect("encode shadow");
+    let shadows: &[(&str, &[u8])] = &[(shadow_pass, &shadow_payload)];
+
+    let primary_payload =
+        payload::encode_payload(primary_text, &[]).expect("encode primary");
+    let (cipher, nonce, salt) =
+        crypto::encrypt(&primary_payload, primary_pass).expect("encrypt primary");
+    let primary_framed =
+        frame::build_frame(primary_payload.len(), &salt, &nonce, &cipher);
+
+    let yuv = make_yuv_synthetic(WIDTH, HEIGHT, N_FRAMES);
+    let rss_baseline = peak_rss_bytes();
+
+    let mut src = Av1SliceYuvSource::new(&yuv, WIDTH, HEIGHT, N_FRAMES, GOP_SIZE);
+
+    let t0 = Instant::now();
+    let stego = av1_encode_with_shadows_streaming(
+        &mut src,
+        N_FRAMES,
+        params,
+        &primary_framed,
+        primary_pass,
+        shadows,
+        16, // parity floor — matches the roundtrip test
+        Pass1CacheBudget::from_env_or_default(),
+    )
+    .expect("streaming WV-shadow smoke encode");
+    let wall = t0.elapsed();
+
+    let rss_after = peak_rss_bytes();
+    let rss_delta = rss_after.saturating_sub(rss_baseline);
+
+    eprintln!(
+        "[av1_pull_mem_smoke] wall={:.2}s rss_after={:.1}MB delta={:.1}MB out={}B",
+        wall.as_secs_f64(),
+        rss_after as f64 / 1_048_576.0,
+        rss_delta as f64 / 1_048_576.0,
+        stego.len()
+    );
+
+    assert!(!stego.is_empty(), "smoke encode produced no bytes");
+
+    #[cfg(unix)]
+    assert!(
+        rss_delta < PEAK_RSS_LIMIT_BYTES,
+        "smoke RSS delta {:.1} MB exceeded limit {} MB",
+        rss_delta as f64 / 1_048_576.0,
+        PEAK_RSS_LIMIT_BYTES / (1024 * 1024)
+    );
 }

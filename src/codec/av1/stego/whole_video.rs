@@ -31,6 +31,77 @@ use phasm_rav1e::phasm_stego::{
 use phasm_rav1e::prelude::Sequence;
 use phasm_rav1e::EncoderConfig;
 
+/// Pass 1 cache budget — RAM + disk thresholds and the scratch-dir parent
+/// used by `av1_encode_with_shadows_streaming` to hold decoded per-GOP
+/// payloads between Pass 1 and the cascade re-encode.
+///
+/// Callers construct this explicitly (`Pass1CacheBudget::new`) when they
+/// know device-aware budgets (iOS / Android bridges query device RAM +
+/// cache dir), or use `from_env_or_default` for CLI / dev parity with
+/// the env-var-driven behaviour that preceded 2026-10-19.
+///
+/// Semantics are unchanged from the preceding env-driven form:
+///   - `ram_bytes = 0`   → disable the RAM cache
+///   - `disk_bytes = 0`  → disable the disk spill (V1 behaviour)
+///   - overflow past both tiers falls through to the pre-cache cascade
+///     (encoder re-encodes the GOP), so clips of any length still finish.
+#[derive(Debug, Clone)]
+pub struct Pass1CacheBudget {
+    pub ram_bytes: usize,
+    pub disk_bytes: usize,
+    pub scratch_parent: std::path::PathBuf,
+}
+
+impl Pass1CacheBudget {
+    /// Default desktop budget: 500 MB RAM, 8 GB disk, scratch under
+    /// `std::env::temp_dir()`. Baked here so no caller has to know
+    /// about `$PHASM_TMP` or honour the env fall-through — it just
+    /// gets the same answer the pre-2026-10-19 inline code produced.
+    pub const DEFAULT_RAM_BYTES: usize = 500 * 1024 * 1024;
+    pub const DEFAULT_DISK_BYTES: usize = 8 * 1024 * 1024 * 1024;
+
+    /// Explicit budget. Mobile bridges use this with device-aware
+    /// `ram_bytes` + a bridge-chosen cache dir.
+    pub fn new(
+        ram_bytes: usize,
+        disk_bytes: usize,
+        scratch_parent: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            ram_bytes,
+            disk_bytes,
+            scratch_parent,
+        }
+    }
+
+    /// CLI / dev / test parity: respect the three
+    /// `PHASM_AV1_PASS1_CACHE_*` env vars when set, otherwise fall
+    /// back to the 500 MB / 8 GB / `temp_dir()` default. This is a
+    /// pure function of the environment at call time — pass the
+    /// resulting value into the encode fn once.
+    pub fn from_env_or_default() -> Self {
+        let ram_bytes = std::env::var("PHASM_AV1_PASS1_CACHE_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(Self::DEFAULT_RAM_BYTES);
+        let disk_bytes = std::env::var("PHASM_AV1_PASS1_CACHE_DISK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(Self::DEFAULT_DISK_BYTES);
+        let scratch_parent = std::env::var("PHASM_AV1_PASS1_CACHE_DISK_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        Self {
+            ram_bytes,
+            disk_bytes,
+            scratch_parent,
+        }
+    }
+}
+
 /// Phasm AV1 production speed preset.
 ///
 /// Default: **`speed = 9`** (locked in by the Layer-3 stealth audit
@@ -64,20 +135,37 @@ pub(super) fn apply_phasm_av1_speed(config: &mut EncoderConfig) {
         .map(|n| n != 0)
         .unwrap_or(false);
     config.speed_settings.multiref = multiref;
+    // Perf #2 scaffold (2026-10-18) — override rdo_lookahead_frames so
+    // the dedicated stealth audit can measure speed=9 w/ lookahead=1
+    // without a rebuild. speed=9 inherits lookahead=10 from speed=8
+    // (`vendor/phasm-rav1e/src/api/config/speedsettings.rs:169`); under
+    // phasm's `low_latency=true` + `multiref=false` posture that state
+    // is largely wasted — the hypothesis the audit tests.
+    // Env unset → preserves the speed preset's shipped value. See
+    // `docs/design/video/av1/stealth-audit-perf-levers-plan-2026-10-18.md`.
+    if let Some(lookahead) = std::env::var("PHASM_AV1_LOOKAHEAD")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        config.speed_settings.rdo_lookahead_frames = lookahead;
+    }
 }
 
 /// Phasm AV1 production sequence-level settings.
 ///
-/// `enable_large_lru` default: **false** (current production state).
-/// The 2026-06-29 stealth audit identified `enable_large_lru = false`
-/// as the only sequence-level knob that diverges from rav1e CLI without
-/// a CLI flag to replicate — making it a likely contributor to phasm's
-/// pre-existing s6-vs-CLI partition divergence. The flip to `true` is
-/// being measured in a follow-on audit; keep default `false` until that
-/// completes to preserve the existing stealth posture.
+/// `enable_large_lru` default: **true** — matches rav1e's `Sequence`
+/// constructor default (`vendor/phasm-rav1e/src/encoder.rs:315`) and
+/// closes the only sequence-level divergence from rav1e CLI that the
+/// 2026-06-29 audit identified. Flipped on 2026-10-20 after the
+/// 2026-10-19 full-corpus audit confirmed the forensic axes are
+/// invariant under the flip (byte-identical BS/BL/Y/UV/INTER_MODE/
+/// MV_MAG histograms across all 4 fixtures). See
+/// `docs/design/video/av1/stealth-audit-perf-levers-verdict-2026-10-18.md`
+/// § 6.
 ///
-/// Override with `PHASM_AV1_LARGE_LRU=1` (or `0` for explicit-default
-/// behaviour, useful inside experiment harnesses).
+/// Override with `PHASM_AV1_LARGE_LRU=0` to force the pre-2026-10-20
+/// behaviour (useful inside experiment harnesses). `=1` is a no-op
+/// against the new default.
 ///
 /// Called by every encoder construction site that builds a fresh
 /// `Sequence`.
@@ -86,7 +174,7 @@ pub(super) fn apply_phasm_av1_sequence(sequence: &mut Sequence) {
         .ok()
         .and_then(|s| s.parse::<u8>().ok())
         .map(|n| n != 0)
-        .unwrap_or(false);
+        .unwrap_or(true);
     sequence.enable_large_lru = enable;
 }
 
@@ -447,6 +535,7 @@ pub fn av1_encode_with_shadows_streaming(
     primary_passphrase: &str,
     shadows: &[(&str, &[u8])],
     shadow_parity_len_floor: usize,
+    pass1_cache_budget: Pass1CacheBudget,
 ) -> Result<Vec<u8>, Av1StegoError> {
     if shadows.is_empty() {
         return Err(Av1StegoError::InvalidPacket(
@@ -507,6 +596,52 @@ pub fn av1_encode_with_shadows_streaming(
             shadows.len(), shadow_parity_len_floor,
         );
     }
+    // Perf #1 V2 (2026-10-18) — Pass 1 cache with disk spill.
+    //
+    // The cascade loop below re-encodes every GOP via
+    // `encode_gop_natural` purely to recover the per-frame
+    // `(natural_packet, PhasmFrameRecording)` pair that Pass 1
+    // already produced and dropped. Tier-N re-encode is
+    // deterministic + bit-identical to Pass 1's. Caching
+    // per_frame lets cascade skip the rav1e call entirely —
+    // ~2× wall speedup on first-tier-success.
+    //
+    // **Arbitrary clip length — two-tier budget.** Short clips
+    // fit entirely in RAM (`pass1_cache_budget.ram_bytes`).
+    // When RAM is exhausted, overflow spills to disk
+    // (`pass1_cache_budget.disk_bytes`) under a session-unique
+    // scratch dir inside `pass1_cache_budget.scratch_parent`
+    // (which the caller selects — CLI/dev defaults preserve the
+    // 500 MB / 8 GB / `temp_dir()` behaviour via
+    // `Pass1CacheBudget::from_env_or_default`; mobile bridges
+    // pass device-aware budgets). The scratch dir is
+    // `remove_dir_all`'d on `Pass1Cache` drop. When BOTH budgets
+    // are exhausted the overflow GOP falls through to the
+    // pre-cache behaviour (cascade re-encodes it) — the encoder
+    // therefore works on clips of any length; truly massive clips
+    // just see diminishing returns past the combined budget.
+    //
+    // `ram_bytes = 0` disables the RAM cache; `disk_bytes = 0`
+    // disables the disk spill (= V1 behaviour).
+    let pass1_cache_ram_budget = pass1_cache_budget.ram_bytes;
+    let pass1_cache_disk_budget = pass1_cache_budget.disk_bytes;
+    let pass1_cache_scratch_parent = pass1_cache_budget.scratch_parent.clone();
+    let mut pass1_cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Payload>::new(
+        n_gops_usize,
+        pass1_cache_ram_budget,
+        pass1_cache_disk_budget,
+        pass1_cache_scratch_parent.clone(),
+        AV1_PASS1_CACHE_TAG,
+    );
+    // Reclaim debris from a run that was killed mid-encode: `Drop` never runs
+    // under `panic = "abort"`, jetsam or SIGKILL. Own-pid exempt, tag-scoped,
+    // age-guarded — see `gop_cache::sweep_orphans`.
+    crate::stego::gop_cache::sweep_orphans(
+        &pass1_cache_scratch_parent,
+        AV1_PASS1_CACHE_TAG,
+        crate::stego::gop_cache::ORPHAN_MAX_AGE,
+    );
+
     let t_pass1 = std::time::Instant::now();
     source.rewind()?;
     let mut per_gop_harvests: Vec<GopHarvest> = Vec::with_capacity(n_gops_usize);
@@ -529,8 +664,26 @@ pub fn av1_encode_with_shadows_streaming(
                 gop_idx, pull_dt, proc_dt, harvest.cover_bits.len(),
             );
         }
-        drop(per_frame);
+        // Perf #1 V2 — Pass1Cache stores in RAM, spills to disk
+        // when RAM is exhausted, overflows to None (re-encode in
+        // cascade) when both budgets are exhausted.
+        // Infallible: failing to cache must never fail an encode.
+        pass1_cache.insert(gop_idx as usize, per_frame);
         per_gop_harvests.push(harvest);
+    }
+    if prof {
+        eprintln!(
+            "[AV1_PROF SHADOW] Pass1 cache: {} RAM / {} disk / {} overflow (of {} GOPs); \
+             {} MB RAM used, {} MB disk used; budgets {} / {} MB",
+            pass1_cache.stats().cached_in_ram,
+            pass1_cache.stats().spilled_to_disk,
+            pass1_cache.stats().overflowed,
+            n_gops_usize,
+            pass1_cache.stats().ram_used / (1024 * 1024),
+            pass1_cache.stats().disk_used / (1024 * 1024),
+            pass1_cache_ram_budget / (1024 * 1024),
+            pass1_cache_disk_budget / (1024 * 1024),
+        );
     }
     if prof {
         eprintln!(
@@ -675,21 +828,31 @@ pub fn av1_encode_with_shadows_streaming(
             // `compute_av1_uniward_costs_with_state` walk (~0.1-0.3 s
             // per 1080p GOP) — ~10-20% wall savings on the streaming
             // encode at long-clip scale.
+            // Perf #1 V2 — fetch from Pass1Cache; miss (over budget
+            // or disk I/O error) falls back to `encode_gop_natural`
+            // (= pre-cache behaviour).
+            let gop_idx_usize = gop_idx as usize;
             let t_enc = std::time::Instant::now();
-            let per_frame = encode_gop_natural(
-                &gop_yuv,
-                frames_in_gop(gop_idx),
-                params,
-            )?;
+            let per_frame_owned: Vec<(Vec<u8>, PhasmFrameRecording<u8>)> =
+                match pass1_cache.fetch(gop_idx_usize) {
+                    Some(frames) => frames,
+                    // A miss — never cached, over budget, or an unreadable
+                    // spill — recomputes and is byte-identical.
+                    None => encode_gop_natural(
+                        &gop_yuv,
+                        frames_in_gop(gop_idx),
+                        params,
+                    )?,
+                };
+            let per_frame: &Vec<(Vec<u8>, PhasmFrameRecording<u8>)> = &per_frame_owned;
             let enc_dt = t_enc.elapsed();
             c_sum_encode += enc_dt;
-            let gop_idx_usize = gop_idx as usize;
             let inputs = Av1CascadeGopInputs {
                 gop_idx: gop_idx_usize,
                 gop_offset: per_gop_cover_offsets[gop_idx_usize],
                 gop_n: per_gop_cover_lens[gop_idx_usize],
                 harvest: &per_gop_harvests[gop_idx_usize],
-                frames: &per_frame,
+                frames: per_frame,
             };
             let shared = Av1CascadeGopShared {
                 chunks: &chunks,
@@ -749,9 +912,19 @@ pub fn av1_encode_with_shadows_streaming(
         }
         if ok {
             if prof {
+                let cs = pass1_cache.stats();
+                let hits = cs.ram_hits.saturating_add(cs.disk_hits);
+                let total_lookups = hits.saturating_add(cs.misses);
+                let hit_pct = if total_lookups > 0 {
+                    (hits as f64 * 100.0) / (total_lookups as f64)
+                } else {
+                    0.0
+                };
                 eprintln!(
-                    "[AV1_PROF SHADOW] TOTAL: {:?}, output={} B (succeeded at tier parity_len={})",
-                    t_total.elapsed(), output.len(), parity_len
+                    "[AV1_PROF SHADOW] TOTAL: {:?}, output={} B (succeeded at tier parity_len={}); \
+                     pass1_cache ram_hits={} disk_hits={} misses={} ({:.1}% hit)",
+                    t_total.elapsed(), output.len(), parity_len,
+                    cs.ram_hits, cs.disk_hits, cs.misses, hit_pct,
                 );
             }
             return Ok(output);
@@ -1004,305 +1177,6 @@ pub(super) fn process_one_gop_pass1(
     Ok((pf, harvest))
 }
 
-pub fn av1_stego_encode_whole_video_with_shadows(
-    yuv: &[u8],
-    n_frames: u32,
-    params: Av1StreamingEncodeParams,
-    primary_framed: &[u8],
-    primary_passphrase: &str,
-    shadows: &[(&str, &[u8])],
-    shadow_parity_len_floor: usize,
-) -> Result<Vec<u8>, Av1StegoError> {
-    if shadows.is_empty() {
-        return Err(Av1StegoError::InvalidPacket(
-            "av1_stego_encode_whole_video_with_shadows: empty shadows — caller \
-             should route to per-GOP path instead"
-                .into(),
-        ));
-    }
-    if n_frames == 0 {
-        return Err(Av1StegoError::InvalidPacket(
-            "av1_stego_encode_whole_video_with_shadows: n_frames == 0".into(),
-        ));
-    }
-    let frame_size = expected_i420_size(params.width, params.height);
-    let expected_total = frame_size
-        .checked_mul(n_frames as usize)
-        .ok_or_else(|| {
-            Av1StegoError::InvalidPacket(format!(
-                "yuv size overflow ({} × {})",
-                frame_size, n_frames
-            ))
-        })?;
-    if yuv.len() != expected_total {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "yuv length {} != expected {} ({} frames × {} bytes)",
-            yuv.len(),
-            expected_total,
-            n_frames,
-            frame_size
-        )));
-    }
-
-    let gop_size = params.gop_size.max(1);
-    let n_gops = n_frames.div_ceil(gop_size);
-
-    // Pass 1: encode every GOP naturally + harvest per-GOP Tier-1 cover.
-    // Buffer-all path: walks the full YUV in a single function call,
-    // used by tests and the legacy whole-clip API. Production
-    // `Av1StreamingEncodeSession` drives Pass 1 incrementally via
-    // `process_one_gop_pass1` and calls the cascade-only path
-    // (`encode_whole_video_with_shadows_from_prepared`) directly,
-    // bounding peak memory to ~one GOP of YUV rather than the whole
-    // clip.
-    let mut per_gop_natural: Vec<Vec<(Vec<u8>, PhasmFrameRecording<u8>)>> = Vec::with_capacity(n_gops as usize);
-    let mut per_gop_harvests: Vec<GopHarvest> = Vec::with_capacity(n_gops as usize);
-
-    for gop_idx in 0..n_gops as usize {
-        let start_frame = gop_idx as u32 * gop_size;
-        let end_frame = (start_frame + gop_size).min(n_frames);
-        let frames_in_gop = end_frame - start_frame;
-        let gop_yuv = &yuv[(start_frame as usize * frame_size)
-            ..(end_frame as usize * frame_size)];
-        let (pf, harvest) = process_one_gop_pass1(gop_yuv, frames_in_gop, params)?;
-        per_gop_natural.push(pf);
-        per_gop_harvests.push(harvest);
-    }
-
-    encode_whole_video_with_shadows_from_prepared(
-        &per_gop_natural,
-        &per_gop_harvests,
-        params,
-        primary_framed,
-        primary_passphrase,
-        shadows,
-        shadow_parity_len_floor,
-    )
-}
-
-/// Cascade-only path: takes Pass 1 outputs and runs the cascade loop
-/// (shadow position derivation over the union cover + per-GOP STC +
-/// replay + verify) to produce the final stego AV1 bytes.
-///
-/// Called by `Av1StreamingEncodeSession::finish` in whole-video mode
-/// once `push_frame` has streamed Pass 1 GOP-by-GOP. No YUV needed —
-/// everything required for the cascade is in `per_gop_natural` (the
-/// natural OBU bytes + per-frame `PhasmFrameRecording`s for replay) and
-/// `per_gop_harvests` (per-GOP cover bits + costs).
-pub(super) fn encode_whole_video_with_shadows_from_prepared(
-    per_gop_natural: &[Vec<(Vec<u8>, PhasmFrameRecording<u8>)>],
-    per_gop_harvests: &[GopHarvest],
-    params: Av1StreamingEncodeParams,
-    primary_framed: &[u8],
-    primary_passphrase: &str,
-    shadows: &[(&str, &[u8])],
-    shadow_parity_len_floor: usize,
-) -> Result<Vec<u8>, Av1StegoError> {
-    if shadows.is_empty() {
-        return Err(Av1StegoError::InvalidPacket(
-            "encode_whole_video_with_shadows_from_prepared: empty shadows".into(),
-        ));
-    }
-    if per_gop_natural.len() != per_gop_harvests.len() {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "encode_whole_video_with_shadows_from_prepared: per_gop_natural ({}) \
-             != per_gop_harvests ({})",
-            per_gop_natural.len(),
-            per_gop_harvests.len()
-        )));
-    }
-    let n_gops_usize = per_gop_natural.len();
-    let total_chunks = u16::try_from(n_gops_usize).map_err(|_| {
-        Av1StegoError::InvalidPacket(format!("n_gops {} exceeds u16::MAX", n_gops_usize))
-    })?;
-    if total_chunks == 0 {
-        return Err(Av1StegoError::InvalidPacket(
-            "encode_whole_video_with_shadows_from_prepared: n_gops == 0".into(),
-        ));
-    }
-    // Clip-level total_bytes goes in the first chunk header (v3 wire format).
-    if primary_framed.len() > u32::MAX as usize {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "primary_framed {} exceeds u32::MAX",
-            primary_framed.len()
-        )));
-    }
-    let total_message_bytes = primary_framed.len() as u32;
-    let chunks = split_message_into_chunks(primary_framed, total_chunks)
-        .map_err(Av1StegoError::Stego)?;
-
-    let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
-        .map_err(Av1StegoError::Stego)?;
-    let hhat_seed: [u8; 32] = structural_key[32..]
-        .try_into()
-        .expect("derive_structural_key returns 64 bytes");
-
-    let n_gops = n_gops_usize as u32;
-    let _ = n_gops; // value retained for future log/diagnostics if needed
-
-    // Compute union cover length + per-GOP offsets.
-    let per_gop_cover_lens: Vec<usize> = per_gop_harvests
-        .iter()
-        .map(|h| h.cover_bits.len())
-        .collect();
-    let mut per_gop_cover_offsets: Vec<usize> = Vec::with_capacity(n_gops as usize);
-    let mut offset = 0usize;
-    for &n in &per_gop_cover_lens {
-        per_gop_cover_offsets.push(offset);
-        offset += n;
-    }
-    let union_n = offset;
-
-    // Cascade loop over SHADOW_PARITY_TIERS starting at the
-    // caller-provided floor. Default floor matches `create_with_shadows`'s
-    // 16 unless caller overrode.
-    let parity_tiers: Vec<usize> = AV1_SHADOW_PARITY_TIERS
-        .iter()
-        .copied()
-        .filter(|&p| p >= shadow_parity_len_floor)
-        .collect();
-
-    if parity_tiers.is_empty() {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "shadow_parity_len_floor {} exceeds all SHADOW_PARITY_TIERS",
-            shadow_parity_len_floor
-        )));
-    }
-
-    // `union_n` retained for diagnostics + the message-too-large guard
-    // surfaced by the sweep's `finish()` (it returns
-    // `StegoError::MessageTooLarge` iff the union doesn't hold a
-    // shadow's n_total — same semantics as the pre-WV.7.3
-    // `prepare_shadows(union_n, ...)` call).
-    let _ = union_n;
-
-    for parity_len in parity_tiers {
-        // WV.7.3 — Prepare shadow states via streaming selection over
-        // the per-GOP cover slices, NOT via the whole-clip
-        // `priority_slots(union_n, ...).take(n_total)` materialisation
-        // we used pre-WV.7.3.
-        //
-        // Step 1 (cover-independent): compute each shadow's `(perm_seed,
-        // n_total, bits, parity_len, frame_data_len)`. ~µs per shadow.
-        let pre_selections: Vec<_> = match shadows
-            .iter()
-            .map(|(p, m)| prepare_shadow_pre_selection_av1(p, m, parity_len))
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(v) => v,
-            Err(_) => continue, // crypto/RS failure at this parity → try next
-        };
-
-        // Step 2 (cover-dependent): drive the streaming sweep over
-        // per-GOP cover sizes. Bit-identical to
-        // `priority_slots(union_n, perm_seed).take(n_total)` by the
-        // WV.7.1 (order-independence) + WV.7.2 (multi-shadow glue)
-        // gates. The sweep holds O(n_total × n_shadows) entries — vs
-        // the pre-WV.7.3 path's O(union_n × n_shadows) slot vector.
-        let specs: Vec<_> = pre_selections
-            .iter()
-            .map(|p| p.to_selection_spec())
-            .collect();
-        let mut sweep = Av1ShadowSelectionSweep::new(&specs);
-        for &gop_n in &per_gop_cover_lens {
-            sweep.push_gop(gop_n);
-        }
-        let per_shadow_positions = match sweep.finish() {
-            Ok(v) => v,
-            Err(_) => continue, // capacity exhausted at this parity → try next
-        };
-
-        // Capture clones for the streaming verify (WV.7.6) before
-        // pre_selections is consumed into shadow_states. The
-        // streaming verifier needs n_total + parity_len +
-        // frame_data_len + perm_seed per shadow at finish; cheaper
-        // to clone the small pre_selections (n_total bits + ~80 B
-        // overhead per shadow) than to plumb a second pass through
-        // the shadow data.
-        let pre_selections_for_verify = pre_selections.clone();
-        let passphrases_for_verify: Vec<String> =
-            shadows.iter().map(|(p, _)| (*p).to_string()).collect();
-
-        // Step 3: combine into Av1ShadowStates. Byte-identical to
-        // what `prepare_shadows(union_n, ...)` produced pre-WV.7.3
-        // (both bits and positions identical).
-        let shadow_states: Vec<Av1ShadowState> = pre_selections
-            .into_iter()
-            .zip(per_shadow_positions)
-            .map(|(pre, positions)| finalize_shadow_state_av1(pre, positions))
-            .collect();
-
-        // WV.7.6 — streaming verify: as each GOP emits, walk its
-        // bytes via dav1d, push the harvested cover bits (with global
-        // cover_index) into per-shadow Av1ShadowBitTopN heaps. After
-        // all GOPs, finish() drains heaps + runs RS-decode + AES auth
-        // per shadow. No whole-clip cover_bits / priority_slots Vec
-        // materialised — drops ~55 GB of verify-time RAM at 30 min
-        // vs the legacy verify_shadows_round_trip path.
-        let mut streaming_verify = Av1StreamingShadowVerify::new(
-            pre_selections_for_verify,
-            passphrases_for_verify,
-        );
-
-        // For each GOP, encode the GOP with the slice of shadow
-        // positions that fall in that GOP's union range.
-        let mut output: Vec<u8> = Vec::new();
-        let mut encode_ok = true;
-        for (gop_idx, harvest) in per_gop_harvests.iter().enumerate() {
-            let inputs = Av1CascadeGopInputs {
-                gop_idx,
-                gop_offset: per_gop_cover_offsets[gop_idx],
-                gop_n: per_gop_cover_lens[gop_idx],
-                harvest,
-                frames: &per_gop_natural[gop_idx],
-            };
-            let shared = Av1CascadeGopShared {
-                chunks: &chunks,
-                total_message_bytes,
-                shadow_states: &shadow_states,
-                hhat_seed: &hhat_seed,
-            };
-            match cascade_one_gop(inputs, shared)? {
-                Some(per_gop_bytes) => {
-                    // WV.7.6 — feed per-GOP bytes through the
-                    // streaming verifier as they emit, instead of
-                    // walking the assembled whole-clip output at the
-                    // end. Drops the ~55 GB verify-time peak at
-                    // 30 min (whole-clip cover_bits Vec + the
-                    // whole-clip `priority_slots` Vec inside the
-                    // legacy `av1_shadow_extract`). The output Vec
-                    // itself is still O(clip) on this legacy path —
-                    // its accumulator is the next term to cut, but
-                    // requires a session-API change.
-                    streaming_verify.push_gop_bytes(&per_gop_bytes)?;
-                    output.extend_from_slice(&per_gop_bytes);
-                }
-                None => {
-                    encode_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if !encode_ok {
-            continue;
-        }
-
-        // WV.7.6 — drain per-shadow heaps + run RS-decode + AES
-        // auth per shadow. Replaces the legacy
-        // `verify_shadows_round_trip(&output, shadows)` whole-clip
-        // walk. Same authenticated round-trip contract; ALL shadows
-        // must verify or the parity tier is rejected.
-        if streaming_verify.finish() {
-            return Ok(output);
-        }
-    }
-
-    Err(Av1StegoError::Stego(
-        crate::stego::error::StegoError::FrameCorrupted,
-    ))
-}
-
 // ────────────────────────────────────────────────────────────────
 // WV.7.4 — per-GOP cascade body (the API for WV.7.5+ streaming)
 // ────────────────────────────────────────────────────────────────
@@ -1352,11 +1226,11 @@ pub(super) struct Av1CascadeGopShared<'a> {
 /// GOP at this parity tier (caller advances to the next parity rung,
 /// matching the pre-WV.7.4 `encode_ok = false; break;` semantics).
 ///
-/// Extracted from `encode_whole_video_with_shadows_from_prepared` at
-/// WV.7.4 — pure refactor, same per-GOP byte output. Sets up WV.7.5+
-/// to drive the cascade from a streaming `Av1GopYuvSource` instead
-/// of the `per_gop_natural[]` accumulator (which currently dominates
-/// the O(clip) memory term at long clips, ~75-100 KB/frame at 1080p).
+/// Extracted at WV.7.4 as a pure refactor, same per-GOP byte output;
+/// now drives the cascade from a streaming `Av1GopYuvSource` instead
+/// of the `per_gop_natural[]` accumulator that previously dominated
+/// the O(clip) memory term at long clips (~75-100 KB/frame at 1080p).
+/// Pre-WV.7 whole-clip entry point was removed CR#5 (2026-10-18).
 pub(super) fn cascade_one_gop(
     inputs: Av1CascadeGopInputs<'_>,
     shared: Av1CascadeGopShared<'_>,
@@ -1525,6 +1399,287 @@ fn expected_i420_size(width: u32, height: u32) -> usize {
 /// (skipping `process_one_gop_pass1`'s J-UNIWARD harvest_gop pass —
 /// the probe only needs the natural-encode bit_tags, not per-position
 /// costs).
+// ────────────────────────────────────────────────────────────────
+// Perf #1 V2 — Pass 1 cache with disk spill (2026-10-18)
+// ────────────────────────────────────────────────────────────────
+//
+// V1 shipped an in-RAM-only cache with a configurable budget;
+// over-budget GOPs fell back to re-encode (correct but
+// diminishing-returns on long clips). V2 adds disk spill: when
+// RAM is exhausted but a disk budget allows, the overflow entry
+// is flat-packed to a scratch file and read back on cascade. The
+// result works on clips of arbitrary length: short clips stay
+// in RAM, mid-length clips spill the overflow to disk, truly
+// huge clips (where even disk exceeds `PHASM_AV1_PASS1_CACHE_DISK_MB`)
+// fall through to the V1 re-encode semantics.
+//
+// **Scratch dir lifecycle.** `Pass1Cache` owns a session-unique
+// subdirectory under `std::env::temp_dir()` (or `PHASM_AV1_PASS1_
+// CACHE_DISK_DIR`), creates it lazily on first spill, and the
+// `Drop` impl `remove_dir_all`s it unconditionally. The subdir
+// name embeds pid + ns-timestamp so parallel encodes on the same
+// host never collide.
+//
+// **File format** (per GOP). Single contiguous flat-packed blob,
+// hand-rolled (no serde / bincode dependency). Little-endian;
+// u64 length prefixes; raw-byte casts for POD tuples
+// (`(u16,u16,u16)` 6 B, `(u32,u16)` 8 B). On read, every length
+// is bounded against `cover_bits.len() × 2` and the file size
+// to defend against truncated / corrupted files; a parse error
+// surfaces as `Av1StegoError::InvalidPacket` and the caller
+// re-encodes that GOP. Format version byte at the head so a
+// future layout change can hard-fail old files instead of
+// silently misparsing.
+
+/// Pass 1 cache storage slot. `None` means the GOP wasn't cached
+/// (over-budget — cascade will re-encode); `InRam` means the full
+/// per-frame data is live in memory; `OnDisk` means the entry has
+/// been spilled to a scratch file at `PathBuf`.
+/// Scratch-directory tag for the AV1 Pass 1 cache. Scopes `sweep_orphans` so
+/// the AV1 sweep never deletes the H.264 shadow cache's trees, or vice versa.
+pub const AV1_PASS1_CACHE_TAG: &str = "av1-pass1";
+
+/// Pass 1 output for one GOP: per-frame `(natural bytes, recording)`.
+///
+/// Migrated onto the shared [`crate::stego::gop_cache::BoundedGopCache`]
+/// (2026-10-18) so AV1 and the H.264 shadow path use one container instead of
+/// two copies. The bespoke `Pass1Cache` this replaces had the right shape; only
+/// its payload was welded in, and the three flat-pack helpers below are
+/// unchanged — they are now the trait impl's bodies.
+pub type Pass1Payload = Vec<(Vec<u8>, PhasmFrameRecording<u8>)>;
+
+impl crate::stego::gop_cache::GopCachePayload for Pass1Payload {
+    fn cached_size(&self) -> usize {
+        estimate_per_frame_bytes(self)
+    }
+    fn flat_pack(&self) -> Vec<u8> {
+        flat_pack_per_frame(self)
+    }
+    fn flat_unpack(bytes: &[u8]) -> Result<Self, String> {
+        flat_unpack_per_frame(bytes)
+    }
+}
+
+
+// Flat-pack format version. Bump on wire change; old files hard-fail.
+const PASS1_CACHE_FORMAT_V1: u8 = 1;
+
+/// Serialize `per_frame` to a hand-rolled flat byte format for
+/// `Pass1Cache`'s disk spill. Little-endian; u64 length prefixes;
+/// POD tuples are written field-by-field (6 B per `(u16,u16,u16)`,
+/// 6 B per `(u32,u16)` — packed on disk even though the in-memory
+/// `(u32,u16)` tuple has 8 B stride on 64-bit arches).
+///
+/// Only the fields `cascade_one_gop` actually reads are
+/// serialized: natural bytes, per-tile `(storage, bit_positions)`,
+/// and the four frame-level usize offsets. `bit_tags`, `bit_meta`,
+/// `reconstructed_planes`, `frame_qindex`, and `loop_filter_state`
+/// are reconstructed to safe defaults on `flat_unpack`.
+fn flat_pack_per_frame(
+    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
+) -> Vec<u8> {
+    // Pre-size roughly for the common 1 tile / frame case.
+    let mut cap = 1 + 4;
+    for (natural, recording) in per_frame {
+        cap += 8 + natural.len() + 4;
+        for tile in &recording.tiles {
+            cap += 8 + tile.storage.len() * 6
+                + 8 + tile.bit_positions.len() * 6;
+        }
+        cap += 8 * 4;
+    }
+    let mut out = Vec::with_capacity(cap);
+    out.push(PASS1_CACHE_FORMAT_V1);
+    out.extend_from_slice(&(per_frame.len() as u32).to_le_bytes());
+
+    for (natural, recording) in per_frame {
+        out.extend_from_slice(&(natural.len() as u64).to_le_bytes());
+        out.extend_from_slice(natural);
+        out.extend_from_slice(&(recording.tiles.len() as u32).to_le_bytes());
+        for tile in &recording.tiles {
+            // storage: Vec<(u16, u16, u16)> → 6 bytes/entry.
+            out.extend_from_slice(&(tile.storage.len() as u64).to_le_bytes());
+            for &(a, b, c) in &tile.storage {
+                out.extend_from_slice(&a.to_le_bytes());
+                out.extend_from_slice(&b.to_le_bytes());
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+            // bit_positions: Vec<(u32, u16)> → 6 bytes/entry.
+            out.extend_from_slice(&(tile.bit_positions.len() as u64).to_le_bytes());
+            for &(a, b) in &tile.bit_positions {
+                out.extend_from_slice(&a.to_le_bytes());
+                out.extend_from_slice(&b.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&(recording.tile_group_offset as u64).to_le_bytes());
+        out.extend_from_slice(&(recording.tile_group_len as u64).to_le_bytes());
+        out.extend_from_slice(&(recording.frame_header_len as u64).to_le_bytes());
+        out.extend_from_slice(&(recording.frame_obu_start as u64).to_le_bytes());
+    }
+    out
+}
+
+/// Deserialize a flat-packed Pass 1 cache file into a usable
+/// `Vec<(Vec<u8>, PhasmFrameRecording<u8>)>`. Reconstructs
+/// `PhasmFrameRecording` with empty `bit_tags`/`bit_meta`
+/// (unused by cascade) and a dummy 2×2 `reconstructed_planes`
+/// Arc (also unused by cascade — J-UNIWARD harvest ran in Pass 1
+/// and cached its result in `per_gop_harvests` before this
+/// unpack).
+fn flat_unpack_per_frame(
+    bytes: &[u8],
+) -> Result<Vec<(Vec<u8>, PhasmFrameRecording<u8>)>, String> {
+    use phasm_rav1e::ec::{PhasmFrameLoopFilterState, PhasmTileRecording};
+
+    let mut cur = 0usize;
+    if bytes.is_empty() {
+        return Err("empty flat-pack buffer".into());
+    }
+    let version = bytes[0];
+    if version != PASS1_CACHE_FORMAT_V1 {
+        return Err(format!(
+            "unsupported Pass 1 cache format version {version}"
+        ));
+    }
+    cur += 1;
+    if cur + 4 > bytes.len() {
+        return Err("truncated n_frames".into());
+    }
+    let n_frames = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
+    cur += 4;
+
+    let dummy_frame: std::sync::Arc<phasm_rav1e::Frame<u8>> = std::sync::Arc::new(
+        make_frame::<u8>(2, 2, phasm_rav1e::color::ChromaSampling::Cs420),
+    );
+
+    let read_u16 = |bytes: &[u8], cur: &mut usize| -> Result<u16, String> {
+        if *cur + 2 > bytes.len() {
+            return Err("truncated u16".into());
+        }
+        let v = u16::from_le_bytes(bytes[*cur..*cur + 2].try_into().unwrap());
+        *cur += 2;
+        Ok(v)
+    };
+    let read_u32 = |bytes: &[u8], cur: &mut usize| -> Result<u32, String> {
+        if *cur + 4 > bytes.len() {
+            return Err("truncated u32".into());
+        }
+        let v = u32::from_le_bytes(bytes[*cur..*cur + 4].try_into().unwrap());
+        *cur += 4;
+        Ok(v)
+    };
+    let read_u64 = |bytes: &[u8], cur: &mut usize| -> Result<u64, String> {
+        if *cur + 8 > bytes.len() {
+            return Err("truncated u64".into());
+        }
+        let v = u64::from_le_bytes(bytes[*cur..*cur + 8].try_into().unwrap());
+        *cur += 8;
+        Ok(v)
+    };
+
+    let mut out: Vec<(Vec<u8>, PhasmFrameRecording<u8>)> =
+        Vec::with_capacity(n_frames as usize);
+    for _ in 0..n_frames {
+        let natural_len = read_u64(bytes, &mut cur)? as usize;
+        if cur + natural_len > bytes.len() {
+            return Err("truncated natural".into());
+        }
+        let natural: Vec<u8> = bytes[cur..cur + natural_len].to_vec();
+        cur += natural_len;
+
+        let n_tiles = read_u32(bytes, &mut cur)? as usize;
+        let mut tiles: Vec<PhasmTileRecording> = Vec::with_capacity(n_tiles);
+        for _ in 0..n_tiles {
+            let storage_len = read_u64(bytes, &mut cur)? as usize;
+            let mut storage: Vec<(u16, u16, u16)> = Vec::with_capacity(storage_len);
+            for _ in 0..storage_len {
+                let a = read_u16(bytes, &mut cur)?;
+                let b = read_u16(bytes, &mut cur)?;
+                let c = read_u16(bytes, &mut cur)?;
+                storage.push((a, b, c));
+            }
+            let bitpos_len = read_u64(bytes, &mut cur)? as usize;
+            let mut bit_positions: Vec<(u32, u16)> = Vec::with_capacity(bitpos_len);
+            for _ in 0..bitpos_len {
+                let a = read_u32(bytes, &mut cur)?;
+                let b = read_u16(bytes, &mut cur)?;
+                bit_positions.push((a, b));
+            }
+            tiles.push(PhasmTileRecording {
+                storage,
+                bit_positions,
+                // Cascade does not read these; empty on unpack.
+                bit_tags: Vec::new(),
+                bit_meta: Vec::new(),
+            });
+        }
+
+        let tile_group_offset = read_u64(bytes, &mut cur)? as usize;
+        let tile_group_len = read_u64(bytes, &mut cur)? as usize;
+        let frame_header_len = read_u64(bytes, &mut cur)? as usize;
+        let frame_obu_start = read_u64(bytes, &mut cur)? as usize;
+
+        let recording = PhasmFrameRecording::<u8> {
+            tiles,
+            tile_group_offset,
+            tile_group_len,
+            frame_header_len,
+            frame_obu_start,
+            reconstructed_planes: dummy_frame.clone(),
+            frame_qindex: 0,
+            loop_filter_state: PhasmFrameLoopFilterState::default(),
+        };
+        out.push((natural, recording));
+    }
+    if cur != bytes.len() {
+        return Err(format!(
+            "trailing {} bytes after frame data",
+            bytes.len() - cur
+        ));
+    }
+    Ok(out)
+}
+
+/// Approximate memory footprint of a cached Pass 1 per-frame
+/// payload. Used by `av1_encode_with_shadows_streaming` to enforce
+/// the `PHASM_AV1_PASS1_CACHE_MB` budget without having to walk
+/// every nested Vec. Covers the dominant terms:
+///
+///   - Natural OBU bytes (per frame) — the biggest single term,
+///     ~75-150 KB at 1080p QP30.
+///   - `storage: Vec<(u16, u16, u16)>` per tile — 6 bytes per
+///     emission (≥80 K emissions at 1080p × 30 ≈ 500 KB/frame).
+///   - `bit_positions: Vec<(u32, u16)>` per tile — 8 bytes per
+///     tagged emission (plus padding on most arches).
+///   - `bit_tags: Vec<u8>` + `bit_meta: Vec<AcSignMeta>` per tile.
+///
+/// Approximation uses `Vec::capacity()` to catch allocator slack
+/// but ignores the small `tile_group_offset`/`tile_group_len`
+/// usize fields (negligible). Error band ±20 % — well within the
+/// safety margin on the 500 MB default budget.
+fn estimate_per_frame_bytes(
+    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
+) -> usize {
+    let mut total = 0usize;
+    for (natural, recording) in per_frame {
+        total = total.saturating_add(natural.capacity());
+        total = total.saturating_add(32); // header overhead
+        for tile in &recording.tiles {
+            total = total.saturating_add(
+                tile.storage.capacity() * std::mem::size_of::<(u16, u16, u16)>(),
+            );
+            total = total.saturating_add(
+                tile.bit_positions.capacity() * std::mem::size_of::<(u32, u16)>(),
+            );
+            total = total.saturating_add(tile.bit_tags.capacity());
+            total = total.saturating_add(
+                tile.bit_meta.capacity() * std::mem::size_of::<AcSignMeta>(),
+            );
+        }
+    }
+    total
+}
+
 pub(super) fn encode_gop_natural(
     gop_yuv: &[u8],
     frames_in_gop: u32,

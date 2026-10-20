@@ -5,13 +5,14 @@
 
 #![cfg(feature = "h264-decoder")]
 
+mod common;
 use phasm_core::codec::h264::cabac::bin_decoder::{walk_annex_b_for_cover_with_options, WalkOptions};
 use phasm_core::codec::h264::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
 use phasm_core::codec::h264::stego::shadow::shadow_extract;
 
 #[test]
 fn shadow_extract_only_on_user_video() {
-    let annex_b = match std::fs::read("/tmp/stego.h264") {
+    let annex_b = match std::fs::read(&common::scratch_path("stego.h264")) {
         Ok(b) => b,
         Err(e) => { eprintln!("skip: /tmp/stego.h264 missing ({e})"); return; }
     };

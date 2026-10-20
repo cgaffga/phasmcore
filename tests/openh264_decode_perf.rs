@@ -83,7 +83,7 @@ fn corpus_root() -> PathBuf {
 }
 
 fn ensure_yuv(tag: &str, src: &str, w: u32, h: u32, n_frames: u32) -> Vec<u8> {
-    let yuv_path = format!("/tmp/openh264_decperf_{tag}_{w}x{h}_f{n_frames}.yuv");
+    let yuv_path = format!("{}/openh264_decperf_{tag}_{w}x{h}_f{n_frames}.yuv", common::scratch_dir());
     let frame_size = (w * h * 3 / 2) as usize;
     let need = frame_size * n_frames as usize;
     if let Ok(d) = std::fs::read(&yuv_path) {

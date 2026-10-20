@@ -52,7 +52,7 @@ fn try_scale_yuv(source_mp4: &str, w: u32, h: u32, n_frames: u32) -> Option<Vec<
     if !src.exists() {
         return None;
     }
-    let yuv_path = format!("/tmp/phasm_v04b_perf_{}x{}_f{}.yuv", w, h, n_frames);
+    let yuv_path = format!("{}/phasm_v04b_perf_{}x{}_f{}.yuv", common::scratch_dir(), w, h, n_frames);
     let frame_size = (w * h * 3 / 2) as usize;
     let need = frame_size * (n_frames as usize);
     if let Ok(data) = std::fs::read(&yuv_path) {

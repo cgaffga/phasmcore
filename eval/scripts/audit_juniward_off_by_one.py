@@ -52,7 +52,10 @@ def run_phasm_dump(jpeg_path: Path, out_path: Path) -> dict:
     env = dict(os.environ)
     env["PHASM_AUDIT_INPUT"] = str(jpeg_path)
     env["PHASM_AUDIT_OUTPUT"] = str(out_path)
-    env.setdefault("CARGO_TARGET_DIR", "/tmp/phasm-audit-build")
+    # Keep the audit build off the internal disk; $PHASM_TMP redirects it
+    # (see root CLAUDE.md). Falls back to /tmp.
+    _scratch = os.environ.get("PHASM_TMP", "/tmp")
+    env.setdefault("CARGO_TARGET_DIR", f"{_scratch}/phasm-audit-build")
     proc = subprocess.run(
         ["cargo", "test", "--release", "--test", "juniward_audit",
          "--", "dump_cost_map", "--exact", "--nocapture"],

@@ -18,12 +18,13 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use phasm_core::codec::h264::openh264_stego::{h264_encode_gop_framed_bits_auto, EncodeOpts};
 use phasm_core::codec::h264::stego::CostWeights;
 
 /// Demux the real CarPlane corpus clip to tight-I420 YUV (ffmpeg = fixture prep).
 fn real_carplane_yuv(w: u32, h: u32, n: u32) -> Vec<u8> {
-    let path = format!("/tmp/phasm_g1_carplane_{w}x{h}_f{n}.yuv");
+    let path = format!("{}/phasm_g1_carplane_{w}x{h}_f{n}.yuv", common::scratch_dir());
     let need = (w * h * 3 / 2) as usize * n as usize;
     if let Ok(d) = std::fs::read(&path) {
         if d.len() >= need {

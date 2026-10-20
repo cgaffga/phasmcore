@@ -151,8 +151,8 @@ def main() -> int:
             "[generate_phasm_ghost] `phasm` binary not found.\n"
             "  Looked in: $PHASM_BIN, eval/bin/phasm-*, $PATH\n"
             "  Build via: cd ~/Development/phasm/core && \\\n"
-            "    CARGO_TARGET_DIR=/tmp/phasm-build cargo build --release -p phasm-cli\n"
-            "  Then: cp /tmp/phasm-build/release/phasm <eval-bin>/phasm-<sha>-<date>",
+            "    CARGO_TARGET_DIR=\"${PHASM_TMP:-/tmp}/phasm-build\" cargo build --release -p phasm-cli\n"
+            "  Then: cp \"${PHASM_TMP:-/tmp}\"/phasm-build/release/phasm <eval-bin>/phasm-<sha>-<date>",
             file=sys.stderr,
         )
         return 2

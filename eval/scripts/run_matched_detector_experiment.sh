@@ -26,7 +26,7 @@
 # Monitor:  tail -f eval/runs/2026-06-08-matched-detector-exp/run.log
 # ============================================================================
 set -u
-R=/Users/cgaffga/Development/phasm/eval
+R=/Volumes/EXTDISK/phasm-stego/phasm/eval
 PY="$R/.venv/bin/python"
 EXP="$R/runs/2026-06-08-matched-detector-exp"
 mkdir -p "$EXP"

@@ -5,8 +5,8 @@
 # C-global state → cross-process is the only safe parallelism).
 # Each process emits one `RESULT ...` line (reported vs true max + ratio).
 set -u
-DIR=/Users/cgaffga/Development/phasm/core/test-vectors/video/h264/real-world/source
-BIN=$(ls -t /Users/cgaffga/Development/phasm/core/target/release/deps/cap_realworld_810-* 2>/dev/null | grep -v '\.d$' | head -1)
+DIR=/Volumes/EXTDISK/phasm-stego/phasm/core/test-vectors/video/h264/real-world/source
+BIN=$(ls -t /Volumes/EXTDISK/phasm-stego/phasm/core/target/release/deps/cap_realworld_810-* 2>/dev/null | grep -v '\.d$' | head -1)
 OUT=/tmp/cap810_results.txt
 GOP=30
 : > "$OUT"

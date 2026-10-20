@@ -133,3 +133,56 @@ fn oh264_video_primary_plus_one_shadow_roundtrip() {
         "shdw", "s",
     );
 }
+
+/// D1 regression (2026-10-20) — `h264_encode_with_shadows_streaming` must
+/// REFUSE an empty shadow slice instead of quietly reassembling the whole
+/// decoded clip and delegating to the whole-clip encoder.
+///
+/// That fallback was reachable from both mobile bridges: the encode
+/// coordinators routed any clip with a FILE ATTACHMENT here even with zero
+/// shadows, because the no-shadow session create FFI had no files parameter.
+/// It cost ~1.68 GB of buffered YUV on an 18 s 1080p clip (the kernel killed
+/// the app) and it allocated the payload with the legacy even split, whose
+/// ceiling is `n_gops * min(cap)` rather than the proportional planner's
+/// `~0.91 * sum(cap)` that the capacity bar displays — so an attachment the
+/// green bar promised would fit came back `MessageTooLarge`.
+///
+/// Both bridges now carry files through
+/// `StreamingEncodeSession::create_with_files`. Nothing should ask this entry
+/// point for a primary-only encode again, and if something does it must say so
+/// rather than silently taking the expensive, differently-allocated route.
+///
+/// Fast: the guard fires before any encode work, so this needs no `#[ignore]`.
+#[test]
+fn d1_streaming_shadow_encode_refuses_empty_shadows() {
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const N: u32 = 4;
+    let frame_bytes = (W * H * 3 / 2) as usize;
+    let mut yuv = Vec::with_capacity(frame_bytes * N as usize);
+    for f in 0..N {
+        let (y, u, v) = synth_yuv(W, H, f);
+        yuv.extend_from_slice(&y);
+        yuv.extend_from_slice(&u);
+        yuv.extend_from_slice(&v);
+    }
+    let opts = EncodeOpts { qp: 26, intra_period: 2 };
+    let mut src = SliceYuvSource::new(&yuv, W, H, N, 2);
+    let err = h264_encode_with_shadows_streaming(
+        &mut src, W, H, N, opts,
+        "primary only", &[], "primary-pass",
+        &[], // no shadows — the misuse this guard catches
+        &CostWeights::default(),
+        None,
+    )
+    .expect_err("empty shadows must be refused, not silently rerouted");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("at least one shadow"),
+        "the refusal must name the cause and point at the right API, got: {msg}"
+    );
+    assert!(
+        msg.contains("create_with_files"),
+        "the refusal must point at the planned O(GOP) alternative, got: {msg}"
+    );
+}

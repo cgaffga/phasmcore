@@ -50,6 +50,14 @@ fn report_resolved_auto_tier(
     }
 }
 
+/// True when the probe left at least one trailing GOP unmeasured — i.e. the
+/// per-GOP vector ends in zeros. A genuinely zero-capacity GOP in the middle
+/// of a clip is possible, so this only looks at the tail.
+#[cfg(feature = "h264-encoder")]
+fn probe_session_exited_early(caps: &[usize]) -> bool {
+    caps.last().is_some_and(|&c| c == 0) && caps.iter().any(|&c| c > 0)
+}
+
 #[derive(Parser)]
 pub struct VideoEncodeArgs {
     /// Cover MP4 video file
@@ -116,7 +124,8 @@ pub struct VideoEncodeArgs {
     #[arg(long)]
     pub av1_speed: Option<u8>,
 
-    /// File attachment for the primary message (repeatable). Shadow video only.
+    /// File attachment for the primary message (repeatable). Works with or
+    /// without shadow messages (H.264); AV1 no-shadow is still text-only.
     #[arg(long, action = clap::ArgAction::Append)]
     pub attach: Vec<PathBuf>,
 
@@ -196,8 +205,8 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                 let shadows = collect_video_shadows(&args)?;
                 if shadows.is_empty() {
                     run_oh264_encode(
-                        &args.video, &message, &passphrase, &output_path,
-                        args.gop_size, args.optimize,
+                        &args.video, &message, &primary_files, &passphrase, &output_path,
+                        args.gop_size, args.optimize, args.verbose,
                     )?;
                 } else {
                     run_oh264_shadow_encode(
@@ -244,7 +253,7 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                     }
                     run_av1_encode(
                         &args.video, &message, &passphrase, &output_path,
-                        args.gop_size, args.optimize,
+                        args.gop_size, args.optimize, args.verbose,
                     )?;
                 } else {
                     // SAFETY: see above.
@@ -334,10 +343,18 @@ fn write_and_mux_oh264(
 /// since the pure-Rust encoder retirement (see
 /// `docs/design/video/h264/phase-c8-visual-recon-plan.md` §C.8.14).
 ///
-/// This is the NON-shadow path (primary message only). Shadow messages +
-/// attachments on the CLI route through `run_oh264_shadow_encode` (WV.6.g — the
-/// O(GOP) streaming pull encode), dispatched from `run()` when
+/// This is the NON-shadow path. It carries the primary message AND any
+/// `--attach` file attachments (through `create_with_files`, whose per-GOP
+/// stego channel is byte-identical to the text-only path — only the payload
+/// framing differs). Shadow messages route through `run_oh264_shadow_encode`
+/// (WV.6.g — the O(GOP) streaming pull encode), dispatched from `run()` when
 /// `--shadow-message-2..--shadow-message-9` are set.
+///
+/// 2026-10-20: `--attach` used to be loaded in `run()` and then silently
+/// dropped here, because this fn took no files and the shadow path was the
+/// only route that accepted them. A `phasm video-encode --attach f.pdf` with
+/// no shadow messages produced a stego video with the text and no file, and
+/// said nothing. See `docs/notes/2026-10-20-video-encode-ux-defects.md` D1.
 ///
 /// v1.0 notes:
 ///  - mux uses the in-tree HandBrake/x264 profile
@@ -347,6 +364,7 @@ fn write_and_mux_oh264(
 fn run_oh264_encode(
     input: &PathBuf,
     message: &str,
+    primary_files: &[phasm_core::FileEntry],
     passphrase: &str,
     output: &PathBuf,
     cli_gop_size: usize,
@@ -355,6 +373,9 @@ fn run_oh264_encode(
     // the optimizer toggle). Functional optimizer pass for video lands
     // as a follow-on.
     optimize: bool,
+    // Gates the auto-tier announcement, which costs a whole-clip encode +
+    // walk — see the call site.
+    verbose: bool,
 ) -> Result<(), CliError> {
     let _ = optimize; // TODO: thread into EncodeSessionParams when video optimizer ships
     use phasm_core::{
@@ -428,11 +449,25 @@ fn run_oh264_encode(
         // screen "Quality mode: High Quality (auto)" UX). The encoder
         // resolves the same tier internally; this is purely the
         // user-facing announcement before the (slower) encode runs.
-        report_resolved_auto_tier(
-            &yuv_bytes, probe.width, probe.height, probe.n_frames,
-            gop_size as usize, message.len(),
-            phasm_core::CASCADE_DEFAULT_HEADROOM,
-        );
+        //
+        // **`--verbose` only, because it is not cheap**: `h264_resolve_auto_tier`
+        // runs a full whole-clip OpenH264 encode plus a whole-clip CABAC walk
+        // to produce one line of text whose value nothing consumes. On 1080p ×
+        // 510 frames that measured ~11 s of a ~49 s run — and it was invisible,
+        // falling outside every `phase.*` bucket, which is how it went unnoticed
+        // for months. It is now recorded as its own phase so it can never hide
+        // again.
+        if verbose {
+            let _t_tier = std::time::Instant::now();
+            report_resolved_auto_tier(
+                &yuv_bytes, probe.width, probe.height, probe.n_frames,
+                gop_size as usize, message.len(),
+                phasm_core::CASCADE_DEFAULT_HEADROOM,
+            );
+            phasm_core::codec::h264::profile::record(
+                "phase.auto_tier_report", _t_tier.elapsed(),
+            );
+        }
 
         let params = EncodeSessionParams {
             width: probe.width,
@@ -484,9 +519,27 @@ fn run_oh264_encode(
         // (0.5, provisional — pending stealth-corpus calibration). Supersedes the 1.0
         // pure-proportional spread, whose r_target was inert.
         use phasm_core::codec::h264::stego::chunk_frame::CAP2_DEFAULT_R_TARGET;
+
+        // Build the encode session BEFORE the probe, purely to learn the exact
+        // framed message length, which is what lets the probe stop early (see
+        // `set_plan_target`). `build_oh264_state` only encodes + encrypts the
+        // payload — no encoder instance, no OpenH264 fork globals — so the
+        // reorder cannot perturb the probe. Verified, not assumed: with
+        // PHASM_DETERMINISTIC_SEED pinned the output SHA is unchanged.
+        let mut session = StreamingEncodeSession::create_with_files(
+            params.clone(), message, primary_files, passphrase,
+        )?;
+        let framed_len = session.framed_message_len();
+
         let _t_probe = std::time::Instant::now();
         let per_gop_caps: Vec<usize> = {
             let mut probe_session = StreamingProbeSession::create(params.clone())?;
+            // Measure only as far as the plan can be affected. On a clip whose
+            // message fits in the first GOP or two, this skips the clean
+            // encode + CABAC walk + STC trial for every GOP after that.
+            if let Some(framed) = framed_len {
+                probe_session.set_plan_target(framed, CAP2_DEFAULT_R_TARGET);
+            }
             for frame_idx in 0..probe.n_frames {
                 let frame_off = frame_idx * frame_bytes;
                 let y_start = frame_off;
@@ -502,13 +555,23 @@ fn run_oh264_encode(
                     v_stride: chroma_w,
                 })?;
             }
+            // `_probe_result`'s cover/shadow/per-tier sums are PARTIAL under
+            // early-exit and are deliberately discarded; only the per-GOP
+            // vector is used, and that stays correct for planning.
             let (_probe_result, caps) = probe_session.finish_with_per_gop()?;
+            if probe_session_exited_early(&caps) {
+                eprintln!(
+                    "  probe: measured {} of {} GOPs (message fits the prefix; \
+                     the rest cannot change the plan)",
+                    caps.iter().filter(|&&c| c > 0).count(),
+                    caps.len(),
+                );
+            }
             caps
         };
         phasm_core::codec::h264::profile::record("phase.probe_pass", _t_probe.elapsed());
 
         let _t_encode = std::time::Instant::now();
-        let mut session = StreamingEncodeSession::create(params, message, passphrase)?;
         if session.plan_proportional(&per_gop_caps, CAP2_DEFAULT_R_TARGET)? {
             eprintln!(
                 "  concentrate+tail across {} GOPs (r_target={})",
@@ -624,6 +687,25 @@ fn run_oh264_shadow_encode(
     use phasm_core::stego::shadow_layer::ShadowLayer as VideoShadowLayer;
     use phasm_core::CostWeights;
 
+    // Desktop budgets for the per-GOP prefix cache. The library default is
+    // deliberately mobile-safe (64 MB RAM, disk off) because the H.264 shadow
+    // encode is the mobile path; a desktop run has no reason to be that
+    // frugal, so the policy is applied HERE, at the call site, rather than
+    // baked into core. 500 MB / 8 GB matches the AV1 Pass 1 cache so there is
+    // one set of numbers to reason about.
+    //
+    // Set either variable yourself to override; `PHASM_H264_SHADOW_CACHE_MB=0`
+    // disables the cache, which is how to measure what it is worth.
+    // SAFETY: single-threaded, before any encode work starts.
+    unsafe {
+        if std::env::var_os("PHASM_H264_SHADOW_CACHE_MB").is_none() {
+            std::env::set_var("PHASM_H264_SHADOW_CACHE_MB", "500");
+        }
+        if std::env::var_os("PHASM_H264_SHADOW_CACHE_DISK_MB").is_none() {
+            std::env::set_var("PHASM_H264_SHADOW_CACHE_DISK_MB", "8192");
+        }
+    }
+
     transcode::ensure_ffmpeg_available()?;
     let mut probe = transcode::probe_video(input)?;
     eprintln!(
@@ -730,7 +812,7 @@ fn run_av1_shadow_encode_streaming(
     cli_gop_size: usize,
 ) -> Result<(), CliError> {
     use phasm_core::codec::av1::stego::whole_video::{
-        av1_encode_with_shadows_streaming, Av1FileYuvSource,
+        av1_encode_with_shadows_streaming, Av1FileYuvSource, Pass1CacheBudget,
     };
     use phasm_core::codec::mp4::build::{
         build_mp4_av1, build_mp4_av1_with_audio, FrameTiming,
@@ -835,6 +917,7 @@ fn run_av1_shadow_encode_streaming(
             &primary_framed, passphrase,
             &shadow_borrows,
             SHADOW_PARITY_LEN_FLOOR,
+            Pass1CacheBudget::from_env_or_default(),
         )
         .map_err(av1_err_to_cli)?;
 
@@ -903,8 +986,12 @@ fn run_av1_encode(
     output: &PathBuf,
     cli_gop_size: usize,
     optimize: bool,
+    verbose: bool,
 ) -> Result<(), CliError> {
     let _ = optimize; // matches the H.264 wiring-only TODO; video optimizer is a follow-on
+    let _ = verbose; // added 2026-10-18 to match the H.264 call-site added in 49fe26700;
+                     // AV1 progress reporting is a follow-on (hooks into the same
+                     // PhasmProbeProgressListener contract the shadow probe added)
     // #225 follow-up (AV1 merge 2026-06-30): the push API (Av1StreamingEncodeSession /
     // Av1StreamingProbeSession / Av1PlanOutcome / plan_safe_balanced) was deleted; this
     // body was migrated to the pull API (`av1_encode_streaming` over `Av1SliceYuvSource`,

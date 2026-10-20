@@ -25,7 +25,7 @@
 
 use phasm_core::codec::av1::stego::session::Av1StreamingDecodeSession;
 use phasm_core::codec::av1::stego::whole_video::{
-    av1_encode_with_shadows_streaming, Av1SliceYuvSource,
+    av1_encode_with_shadows_streaming, Av1SliceYuvSource, Pass1CacheBudget,
 };
 use phasm_core::stego::{crypto, frame, payload};
 use phasm_core::Av1StreamingEncodeParams;
@@ -61,9 +61,13 @@ fn corpus_yuv_concat(w: u32, h: u32, n: u32) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "AV1 streaming whole-video shadow encode ~30-60 s; run with \
-            --ignored --test-threads=1"]
 fn pull_whole_video_one_shadow_roundtrip() {
+    // Measured 1.37 s wall on the small deterministic fixture
+    // (256×144 × 8f × gop=4 × 1 shadow). Formerly `#[ignore]`'d
+    // under the assumption of a 30-60 s encode; un-ignored
+    // 2026-10-18 so CI exercises the production streaming WV-shadow
+    // round-trip (`av1_encode_with_shadows_streaming` + both
+    // `Av1StreamingDecodeSession::finish_*` sinks) on every build.
     // Mirror of the deleted `wv_round_trip_gop_size_4_one_shadow_8_frames`
     // fixture (256×144 × 8 frames, gop=4, 1 shadow) — known good
     // cover-capacity ratio for the WV-shadow flow.
@@ -107,6 +111,7 @@ fn pull_whole_video_one_shadow_roundtrip() {
         primary_pass,
         shadows,
         16, // parity floor — matches the pre-deletion test
+        Pass1CacheBudget::from_env_or_default(),
     )
     .expect("streaming WV-shadow encode");
     assert!(!stego.is_empty(), "encoder produced no bytes");

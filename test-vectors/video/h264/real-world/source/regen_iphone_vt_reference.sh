@@ -27,6 +27,8 @@
 # script to refresh.
 
 set -e
+
+PHASM_TMP="${PHASM_TMP:-/tmp}"   # external-disk scratch; see root CLAUDE.md
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 # source/ -> real-world/ -> h264/ -> video/ -> test-vectors/ -> core/ -> repo root
 REPO_ROOT="$(cd "$SRC_DIR/../../../../../.." && pwd)"
@@ -76,7 +78,7 @@ flavour2_one() {
     local src=$1
     local tag=$2
     local mov="$SRC_DIR/$src"
-    local yuv="/tmp/iphone_vt_${tag}_1080p_f${N_FRAMES}.yuv"
+    local yuv="$PHASM_TMP/iphone_vt_${tag}_1080p_f${N_FRAMES}.yuv"
     local h264="$OUT_DIR/macos_vt_${tag}.h264"
     local hist="$OUT_DIR/macos_vt_${tag}_reference_mb_histogram.txt"
 

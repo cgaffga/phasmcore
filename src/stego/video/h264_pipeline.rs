@@ -154,9 +154,15 @@ fn try_streaming_decode_mp4(
     let mut session = StreamingDecodeSession::create(passphrase).ok()?;
     session.push_annex_b(&annex_b).ok()?;
     let result = session.finish().ok()?;
+    // D15 (2026-10-20) — `files` used to be hardcoded `Vec::new()` here, the
+    // same drop the CLI had (D13): the session HAD already recovered the
+    // attachments and this constructor threw them away. Every caller of
+    // `h264_ghost_decode` — the iOS `phasm_h264_decode` FFI, the Android
+    // `h264Decode` JNI entry — therefore saw a text-only payload for a video
+    // that provably carried a file.
     Some(crate::stego::payload::PayloadData {
         text: result.text,
-        files: Vec::new(),
+        files: result.files,
     })
 }
 

@@ -139,6 +139,7 @@ fn cross_arch_determinism_record_hash() {
     //   - 2026-05-23 post-#691:    8ba4002b2ecec7662e1e1e04f24cb9720dafdb63354bc54099794220bd793ddf (47118 bytes, dynamic LEVEL_2_1, PRO_MAIN)
     //   - 2026-05-23 post-V0.4.C:  c3a4d284e1b51741d0301ce469ffd9d0a886cae3885e1066c1f3049b555897b5 (47119 bytes, PRO_HIGH, set1=0)
     //   - 2026-06 Phase 6 (cf v2): 597e1db6e403e98454a9218bae3c8dc4178581c0302677668cb1a94dd618236d (47128 bytes, 4-domain streaming, chunk_frame v2)
+    //   - 2026-06-11 (cf v3, #839): 54c11576e2dd28607e84a20303388aeef8c4d46b141b021168d3d864c6aea911 (47128 bytes, chunk_frame v3)
     //
     // If this assert ever fires:
     //   1. Print both hashes so the diff is captured in the log.
@@ -148,20 +149,27 @@ fn cross_arch_determinism_record_hash() {
     //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
-    // Re-baselined 2026-06-11 for chunk_frame WIRE FORMAT v3 (#839). The
-    // v2-era Phase-6 pin (597e1db6…, in the audit trail above) went stale the
-    // moment #839 migrated the streaming session to chunk_frame v3 — the v3
-    // header layout changes the embedded-message bytes (SAME total length,
-    // 47128 B; different content). `git bisect` localized the change to the
-    // #839 cluster (1f20526c #839 + merge 30e2d835); the J-UNIWARD FP cost
-    // path is untouched, so the later perf work (parallel cost/MVD loops,
-    // delta-field memoize, wavelet SIMD #848) is bit-exact and NOT the cause —
-    // the output was already this hash before all of them. Pinned from macOS
-    // aarch64; CI MUST STILL confirm the Linux x86_64 + aarch64 hashes match it
-    // (the cross-arch determinism claim, #835) per the workflow_dispatch
-    // re-pin protocol documented above.
+    // Re-baselined 2026-10-18 for chunk_frame WIRE FORMAT v3.1 (#888). Exactly
+    // the same class of staleness as the v2→v3 case below: #888 added an
+    // explicit `m_total: u32` to every chunk header (and `1be08ce5` deleted v3
+    // outright), which changes the embedded-message bytes while leaving the
+    // bitstream length untouched (47128 B both before and after). The v3 pin
+    // (54c11576…) could not be reproduced by any build after 2026-06-29
+    // because the format that produced it no longer exists in tree.
+    //
+    // Verified NOT a non-determinism bug before re-pinning: two consecutive
+    // release runs on macOS aarch64 both produced f20434ed…, and the only
+    // OpenH264 fork movement since the v3 pin (11dab211 → 5fd1ad54) is a
+    // CI-workflow-only diff with zero encoder-source change. The J-UNIWARD
+    // cost path (parallel cost/MVD loops, delta-field memoize, wavelet SIMD
+    // #848) remains bit-exact and is not implicated.
+    //
+    // Pinned from macOS aarch64 only. CI MUST STILL confirm the Linux x86_64 +
+    // aarch64 hashes match it (the cross-arch determinism claim, #835) per the
+    // workflow_dispatch re-pin protocol documented above — that confirmation is
+    // owed for BOTH this pin and the v3 one it replaces.
     const PINNED_SHA256: &str =
-        "54c11576e2dd28607e84a20303388aeef8c4d46b141b021168d3d864c6aea911";
+        "f20434ed2845e63caee017d107836d3cdf770289a54a6e4cc602d51fc7f7a1ca";
     const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,

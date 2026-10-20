@@ -198,12 +198,15 @@ fn decode_h264_cabac(
         let mut session = StreamingDecodeSession::create(passphrase)?;
         session.push_annex_b(&annex_b)?;
         let res = session.finish()?;
-        // `DecodeSessionResult` also carries `res.files`, but this CLI path
-        // does not yet surface attached files — it returns a PayloadData
-        // with `text` only. Wiring `res.files` through is v1.1 polish.
+        // 2026-10-20 — `res.files` used to be DISCARDED here ("v1.1 polish").
+        // The attachment was in the video the whole time: the stego channel is
+        // payload-agnostic, `create_with_files` embedded it, the session
+        // decoded it, and this line threw it away. `phasm decode --extract`
+        // therefore reported the text and wrote no file, with no error. See
+        // `docs/notes/2026-10-20-video-encode-ux-defects.md` D13.
         Ok(phasm_core::PayloadData {
             text: res.text,
-            files: Vec::new(),
+            files: res.files,
         })
     })();
     let _ = std::fs::remove_file(&annex_b_temp);

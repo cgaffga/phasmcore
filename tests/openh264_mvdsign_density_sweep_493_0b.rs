@@ -38,6 +38,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use core_openh264_sys::PhasmStegoDomain;
 use phasm_core::codec::h264::cabac::bin_decoder::{
     walk_annex_b_for_cover_with_options, WalkOptions,
@@ -401,7 +402,8 @@ fn density_sweep_real_corpus() {
     let mut any = false;
     for &(tag, width, height) in fixtures {
         let path = std::path::PathBuf::from(format!(
-            "/tmp/openh264_baseline_{tag}_{width}x{height}_f{n_frames}.yuv"
+            "{}/openh264_baseline_{tag}_{width}x{height}_f{n_frames}.yuv",
+            common::scratch_dir()
         ));
         let yuv = match read_yuv(&path) {
             Some(b) => b,

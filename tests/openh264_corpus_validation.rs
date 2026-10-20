@@ -93,7 +93,7 @@ fn probe_aligned_dims(spec: &Fixture) -> (u32, u32) {
 
 fn ensure_yuv(spec: &Fixture, w: u32, h: u32) -> Vec<u8> {
     let yuv_path = format!(
-        "/tmp/phasm_oh264_corpus_{}_{}x{}_f{}.yuv",
+        "{}/phasm_oh264_corpus_{}_{}x{}_f{}.yuv", common::scratch_dir(),
         spec.name, w, h, spec.n_frames
     );
     let frame_size = (w * h * 3 / 2) as usize;

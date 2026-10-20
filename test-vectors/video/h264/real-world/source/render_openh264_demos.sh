@@ -15,6 +15,8 @@
 # Run after regen_openh264_baseline.sh has built the example.
 
 set -e
+
+PHASM_TMP="${PHASM_TMP:-/tmp}"   # external-disk scratch; see root CLAUDE.md
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SRC_DIR/../../../../../.." && pwd)"
 DESK="$HOME/Desktop"
@@ -55,7 +57,7 @@ build_example() {
     (cd "$REPO_ROOT/core" && cargo build --release \
         --example openh264_clean_encode \
         --example openh264_visual_demo \
-        --features "h264-encoder video h264-encoder cabac-stego" >/dev/null 2>&1)
+        --features "h264-encoder" >/dev/null 2>&1)
 }
 
 render_one() {
@@ -70,9 +72,9 @@ render_one() {
 
     local width height
     read width height < <(get_target_dims "$mov")
-    local yuv="/tmp/openh264_demo_${tag}_${width}x${height}_f${N_FRAMES}.yuv"
-    local clean_h264="/tmp/openh264_demo_${tag}_clean.h264"
-    local stego_h264="/tmp/openh264_demo_${tag}_stego.h264"
+    local yuv="$PHASM_TMP/openh264_demo_${tag}_${width}x${height}_f${N_FRAMES}.yuv"
+    local clean_h264="$PHASM_TMP/openh264_demo_${tag}_clean.h264"
+    local stego_h264="$PHASM_TMP/openh264_demo_${tag}_stego.h264"
     local clean_mp4="$DESK/openh264_${tag}_clean.mp4"
     local stego_mp4="$DESK/openh264_${tag}_stego.mp4"
 

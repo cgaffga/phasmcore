@@ -72,7 +72,7 @@
 
 use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, PositionKey, SyntaxPath};
-use crate::codec::h264::stego::inject::DomainCover;
+use crate::codec::h264::stego::inject::{DomainBits, DomainCover};
 use crate::codec::h264::stego::orchestrate::DomainCosts;
 use crate::stego::cost::h264_uniward::{
     accumulate_cost_from_field, compute_delta_field, compute_three_subbands,
@@ -88,9 +88,76 @@ use rayon::prelude::*;
 /// `EncodeOpts::default().qp` (=26) in the OH264 path.
 const DEFAULT_QP: i32 = 26;
 
-/// Stabilisation constant for the MVD-domain texture proxy. Avoids
-/// division by zero in flat-MB regions.
+/// Stabilisation constant for the MVD-domain texture proxy. Avoids a
+/// zero-cost position in perfectly flat macroblocks, which STC would
+/// otherwise flood.
 const MVD_COST_SIGMA: f32 = 1e-3;
+
+/// Scale bringing the MVD damage model onto the same footing as the
+/// coefficient costs so the domain weights mean what they say.
+///
+/// Measured on `iphone7_smoke` (`core/tests/mvd_cost_model.rs`, 2026-10-20),
+/// per-position cost as the STC trellis receives it, BEFORE domain weights:
+///
+/// ```text
+///   CoeffSign   median 2149.8   (range 90.9 .. 28022.8)
+///   MvdSign     median    0.1485 (range  0.019 ..     1.75)
+/// ```
+///
+/// After the shipped 1:3:10:10 domain weights that is still ~1400x cheaper,
+/// so STC spent its budget on MVD positions FIRST — the exact opposite of
+/// what `cost_weights.rs` documents ("MvdSign / MvdSuffix only fire when
+/// CoeffSign capacity is exhausted"). A 10x domain weight cannot bridge a
+/// 14000x scale gap. This constant is what makes the weights the actual
+/// knob again; it is a normalisation, not a tuning parameter.
+const MVD_COST_SCALE: f32 = 1.0;
+
+/// How far a flip in each MVD domain moves the macroblock's prediction,
+/// in quarter-pel units.
+///
+/// * `MvdSignBypass` sends the vector from `+d` to `-d`, so the block
+///   displaces by `2·|d|`. On the smoke fixture `|d|` reaches 55 — a
+///   **27-pixel** jump, and under the old cost function those were among
+///   the CHEAPEST positions in the whole cover.
+/// * `MvdSuffixLsb` flips the low bit of the Exp-Golomb suffix, moving the
+///   block by a single quarter-pel no matter how large the vector is.
+///
+/// That asymmetry is enormous and the shipped model did not represent it at
+/// all: both domains carried the same weight and the same `1/texture` cost.
+fn mvd_displacement_qpel(domain: EmbedDomain, magnitude: u16) -> f32 {
+    match domain {
+        EmbedDomain::MvdSignBypass => 2.0 * magnitude as f32,
+        // Suffix LSB: ±1 quarter-pel, independent of |d|.
+        _ => 1.0,
+    }
+}
+
+/// Predicted squared reconstruction error of an MVD flip.
+///
+/// The wire-only emit changes the motion vector WITHOUT recomputing the
+/// residual (by design — the encoder's state stays clean). So the decoder
+/// reconstructs `pred(MV') + residual(MV)` and the error is
+///
+/// ```text
+///     err = pred(MV) - pred(MV')  ≈  |∇I| · Δ
+/// ```
+///
+/// the local spatial gradient times the displacement. `texture` (mean
+/// |LH|+|HL|+|HH| over the macroblock) is a gradient-magnitude proxy, so
+/// squared error goes as `(texture · Δpx)²`.
+///
+/// This is the opposite relationship to the one the code shipped with.
+/// `1/(texture + σ)` is the right instinct for a COEFFICIENT change, which
+/// perturbs one block's own texture and is masked by busy content. A motion
+/// vector is not masked by busy content — busy content is precisely what
+/// makes a displacement visible, because the prediction it lands on no
+/// longer matches. Measured correlation between the old cost and this model
+/// was NEGATIVE (-0.08 on MvdSign, -0.36 on MvdSuffix): the shipped function
+/// preferred exactly the positions this one penalises.
+fn mvd_position_cost(texture: f32, displacement_qpel: f32) -> f32 {
+    let err = texture * (displacement_qpel / 4.0);
+    (MVD_COST_SCALE * err * err).max(MVD_COST_SIGMA)
+}
 
 /// Compute Tier 3 content-adaptive costs for the 4-domain cover.
 ///
@@ -291,12 +358,18 @@ fn fill_frame_costs(
             EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.positions,
             _ => return None,
         };
+        let magnitudes = match domain {
+            EmbedDomain::MvdSignBypass => &cover.mvd_sign_bypass.magnitudes,
+            EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.magnitudes,
+            _ => return None,
+        };
         let &key = positions.get(idx)?;
         let mb_addr = key.mb_addr();
         let mb_x = (mb_addr as usize) % mb_width;
         let mb_y = (mb_addr as usize) / mb_width;
         let texture = mb_y_texture(&y_wavelets, mb_x, mb_y, width, height);
-        let cost = 1.0 / (texture + MVD_COST_SIGMA);
+        let magnitude = magnitudes.get(idx).copied().unwrap_or(0);
+        let cost = mvd_position_cost(texture, mvd_displacement_qpel(domain, magnitude));
         Some((domain, idx, cost))
     };
     #[cfg(feature = "parallel")]
@@ -314,6 +387,152 @@ fn fill_frame_costs(
     }
 
     wav_elapsed
+}
+
+/// Structural ∞/finite mask over the 4-domain cover — the capacity probe's
+/// stand-in for [`compute_content_costs_yuv`].
+///
+/// ## Why this is exact, not an approximation
+///
+/// The capacity probe ([`super::super::openh264_stego::h264_gop_capacity`])
+/// consumes costs for exactly one purpose: deciding whether
+/// `stc_embed(...).is_some()` for a trial payload, bisected to find the
+/// largest embeddable size. `stc_embed`'s inline path fails on **one**
+/// condition — `best_cost == inf`, i.e. no finite-cost path exists through
+/// the Viterbi trellis (`crate::stego::stc::embed`). Finite cost
+/// *magnitudes* steer which flips STC picks; they cannot change whether a
+/// solution exists. `combine_bits_4domain` only multiplies each cost by a
+/// positive per-domain weight, which maps finite→finite and ∞→∞.
+///
+/// So the probe's answer is a function of the cost vector's ∞ pattern alone,
+/// and that pattern is structural: it follows from each position's
+/// [`SyntaxPath`] (DC coefficients, 8×8 luma, chroma DC, luma DC of
+/// Intra16×16 and MVD paths are kept wet) plus the out-of-range frame check —
+/// none of which needs the YUV planes, the wavelet decomposition or the
+/// delta-field accumulation. Skipping them makes the probe's cost step O(n)
+/// pointer-chasing instead of a per-GOP wavelet + 19×19×3 per-position
+/// reduction, which measured at **41% of total probe wall time** on 1080p
+/// (2026-10-18: 15.8 s of 38.5 s, `PHASM_CAP_PROFILE=1`).
+///
+/// MVD-domain positions are always finite here: `fill_frame_costs` gives them
+/// `mvd_position_cost(texture, displacement)`, which is a product of finite
+/// non-negative terms floored at `MVD_COST_SIGMA` — finite and non-zero, and
+/// positive for every in-range position. The cascade-safety `safe_msl` gate
+/// that wets most of `mvd_suffix_lsb` is applied by the caller *after* this,
+/// exactly as it is applied after the real costs.
+///
+/// The one place this could in principle diverge from the real computation is
+/// [`coeff_position_cost`]'s data-dependent tail, which maps a computed cost
+/// to ∞ unless it is finite and `> 0.0`. That cannot fire for real content (a
+/// zero cost needs an identically-zero delta field over the whole in-bounds
+/// 19×19 window), but "cannot" is not "does not": the equivalence is pinned
+/// empirically over the real-world corpus by
+/// `core/tests/cap2_mask_equivalence.rs`, which asserts identical
+/// `per_tier_payload` from both paths. If that gate ever fires, the probe is
+/// wrong — fix it, don't re-baseline it.
+pub(crate) fn compute_cost_mask(cover: &DomainCover, n_frames: u32) -> DomainCosts {
+    // `1.0`, not the real cost: any finite value yields the same reachability,
+    // and a constant makes it obvious at a glance that magnitudes are unused.
+    const FINITE: f32 = 1.0;
+
+    /// Mirrors [`coeff_position_cost`]'s ∞ returns for the coefficient
+    /// domains. Kept adjacent to it on purpose — the two must agree, and a
+    /// new wet `SyntaxPath` arm has to be added in both places.
+    ///
+    /// ## Why each arm is wet — all three reasons are INTENTIONAL
+    ///
+    /// Established 2026-10-19 by code reading + a per-domain wet census over
+    /// the real-world corpus at native 1080p (horse_flag / iphone7 / lumix_g9,
+    /// 30f, QP 26). Recording it here because the rationale differs per arm
+    /// and the predicate had no note at this call site.
+    ///
+    /// 1. **DC positions** — `Luma4x4 { coeff_idx: 0 }`,
+    ///    `ChromaAc { coeff_idx: 0 }`, `ChromaDc`, `LumaDcIntra16x16`. Two
+    ///    independent reasons, either sufficient: (a) the J-UNIWARD field
+    ///    table ([`build_field_table`]) is built for AC scan positions
+    ///    `1..=15` only — there is no DC entry to look up, by construction;
+    ///    (b) a DC sign flip propagates *coherently* over the whole parent
+    ///    macroblock (256 luma / 64 chroma pixels shift brightness by
+    ///    2N·qstep) instead of the mostly-cancelling 16-pixel IDCT response
+    ///    of an AC flip — the `-8.77 dB` IDR damage that motivated the 16×
+    ///    DC cost multiplier in `orchestrate::ResidualPathKind::cost_multiplier`
+    ///    (commit a29c7748). **This, not `Luma8x8`, is what drives the
+    ///    measured wet fraction**: of the 70.1% wet `CoeffSignBypass`
+    ///    positions on horse_flag, 131354 are Luma4x4 DC, 124411
+    ///    `LumaDcIntra16x16`, 47479 `ChromaDc` and 2528 `ChromaAc{0}` —
+    ///    and **zero** are `Luma8x8`.
+    ///
+    /// 2. **`Luma8x8`** — a missing 8×8 J-UNIWARD cost model, NOT a
+    ///    cascade-safety exclusion. The wavelet machinery
+    ///    ([`crate::stego::cost::h264_uniward`]) is built on the 4×4 integer
+    ///    transform basis; there is no 8×8 basis to compute a cost against,
+    ///    so the position cannot be priced and is kept wet rather than
+    ///    mispriced. Wet since the predicate's introduction (commit 817b3431,
+    ///    STEGO.A.1) — see the `v1.1` note on
+    ///    [`coeff_position_cost`]'s matching arm.
+    ///
+    ///    In the **production OH264 path this arm is vacuous**: the pinned
+    ///    OpenH264 fork has no 8×8-transform implementation at all
+    ///    (`Transform8x8`/`DCT8x8` do not exist in the encoder source), so it
+    ///    emits `transform_8x8_mode_flag = 0` in every PPS and block
+    ///    category 5 never occurs — see the encoder-contract note in
+    ///    `core/openh264-sys/src/lib.rs` and
+    ///    `openh264.rs`'s "none expected at our config". The census confirms
+    ///    it empirically: 0 `Luma8x8` positions on all three fixtures. The
+    ///    arm earns its keep only because the CABAC *walker* parses I_8x8
+    ///    residual from arbitrary Annex-B input
+    ///    (`cabac::bin_decoder::slice`, gated on the stream's own
+    ///    `pps.transform_8x8_mode_flag`), so a third-party High-profile cover
+    ///    can reach it. Dropping the arm would price those positions with the
+    ///    wrong basis; adding an 8×8 basis is the only real fix.
+    ///
+    /// 3. **`Mvd`** — unreachable here (this predicate is only ever applied to
+    ///    the two coefficient domains; MVD positions go through `mvd_mask`,
+    ///    which keeps them finite). Kept as a defensive arm so the `match`
+    ///    stays exhaustive over `SyntaxPath`.
+    ///
+    /// Capacity consequence, so a future reader does not "fix" it: these ∞
+    /// positions are wet for the **primary STC only**. The shadow layer
+    /// selects positions with no reference to this cost vector at all
+    /// (`shadow::for_each_eligible_position` takes cover + cascade masks, no
+    /// costs), so `GopCapacity::injectable_cover_bits` is right to count
+    /// them — ~46-60% of the slots a real shadow encode uses are ∞-cost here.
+    fn coeff_is_wet(key: PositionKey) -> bool {
+        match key.syntax_path() {
+            SyntaxPath::Luma4x4 { coeff_idx, .. } => coeff_idx == 0,
+            SyntaxPath::ChromaAc { coeff_idx, .. } => coeff_idx == 0,
+            SyntaxPath::Luma8x8 { .. }
+            | SyntaxPath::ChromaDc { .. }
+            | SyntaxPath::LumaDcIntra16x16 { .. }
+            | SyntaxPath::Mvd { .. } => true,
+        }
+    }
+
+    let coeff_mask = |positions: &[PositionKey]| -> Vec<f32> {
+        positions
+            .iter()
+            .map(|&k| {
+                if k.frame_idx() >= n_frames || coeff_is_wet(k) {
+                    f32::INFINITY
+                } else {
+                    FINITE
+                }
+            })
+            .collect()
+    };
+    let mvd_mask = |positions: &[PositionKey]| -> Vec<f32> {
+        positions
+            .iter()
+            .map(|&k| if k.frame_idx() >= n_frames { f32::INFINITY } else { FINITE })
+            .collect()
+    };
+
+    DomainCosts {
+        coeff_sign_bypass: coeff_mask(&cover.coeff_sign_bypass.positions),
+        coeff_suffix_lsb: coeff_mask(&cover.coeff_suffix_lsb.positions),
+        mvd_sign_bypass: mvd_mask(&cover.mvd_sign_bypass.positions),
+        mvd_suffix_lsb: mvd_mask(&cover.mvd_suffix_lsb.positions),
+    }
 }
 
 /// Per-frame work bucket: indices into the original `DomainCover` for
@@ -401,11 +620,19 @@ fn coeff_position_cost(
                 (y_wavelets, img_w, img_h, block_px_x, block_px_y, coeff_idx, class)
             }
             SyntaxPath::Luma8x8 { .. } => {
-                // 8x8 transform — cost machinery currently targets 4x4
-                // basis. Approximate by treating the 8x8 block as the
-                // sub-4x4 at its top-left corner; covers the same
-                // pixel region for cost-proxy purposes. v1.1 — add
-                // proper 8x8 J-UNIWARD basis.
+                // 8×8 transform — the cost machinery targets the 4×4 basis,
+                // so there is nothing correct to price this against: kept
+                // WET (intentional). v1.1 — add a proper 8×8 J-UNIWARD
+                // basis; until then do NOT substitute a 4×4 proxy (an
+                // earlier draft of this comment proposed re-using the
+                // top-left sub-4×4, which was never implemented and would
+                // misprice the other 48 coefficients).
+                //
+                // Vacuous on the production OH264 cover — the pinned fork
+                // emits `transform_8x8_mode_flag = 0` always, so BC=5 never
+                // occurs. Reachable only via the walker on third-party
+                // High-profile input. Full rationale + the corpus census:
+                // `compute_cost_mask::coeff_is_wet`.
                 return f32::INFINITY;
             }
             SyntaxPath::ChromaAc { plane, block_idx, coeff_idx, kind } => {
@@ -494,6 +721,144 @@ fn mb_y_texture(
         }
     }
     if n == 0 { 0.0 } else { sum / n as f32 }
+}
+
+#[cfg(test)]
+mod prefix_cache_tests {
+    use super::*;
+
+    use crate::stego::gop_cache::{BoundedGopCache, GopCachePayload};
+
+    fn dom(n: usize, seed: u64) -> DomainBits {
+        DomainBits {
+            bits: (0..n).map(|i| ((i as u64 + seed) % 2) as u8).collect(),
+            positions: (0..n)
+                .map(|i| PositionKey::from_raw(0x0123_4567_89AB_CDEF ^ (i as u64) ^ seed))
+                .collect(),
+            magnitudes: (0..n).map(|i| ((i * 7 + seed as usize) % 65535) as u16).collect(),
+        }
+    }
+
+    fn costs(n: usize, with_inf: bool) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                if with_inf && i % 3 == 0 {
+                    f32::INFINITY
+                } else {
+                    // Deliberately awkward values: denormals and a negative
+                    // zero would survive a to_bits round trip but not a
+                    // decimal one.
+                    (i as f32) * 1.000_000_1_f32 + f32::MIN_POSITIVE
+                }
+            })
+            .collect()
+    }
+
+    fn sample() -> ShadowGopPrefix {
+        ShadowGopPrefix {
+            cover: DomainCover {
+                coeff_sign_bypass: dom(37, 1),
+                coeff_suffix_lsb: dom(5, 2),
+                mvd_sign_bypass: dom(11, 3),
+                mvd_suffix_lsb: dom(0, 4), // empty domain must round-trip too
+            },
+            costs: DomainCosts {
+                coeff_sign_bypass: costs(37, true),
+                coeff_suffix_lsb: costs(5, true),
+                mvd_sign_bypass: costs(11, false),
+                mvd_suffix_lsb: Vec::new(),
+            },
+        }
+    }
+
+    fn assert_same(a: &ShadowGopPrefix, b: &ShadowGopPrefix) {
+        for (name, x, y) in [
+            ("csb", &a.cover.coeff_sign_bypass, &b.cover.coeff_sign_bypass),
+            ("csl", &a.cover.coeff_suffix_lsb, &b.cover.coeff_suffix_lsb),
+            ("msb", &a.cover.mvd_sign_bypass, &b.cover.mvd_sign_bypass),
+            ("msl", &a.cover.mvd_suffix_lsb, &b.cover.mvd_suffix_lsb),
+        ] {
+            assert_eq!(x.bits, y.bits, "{name} bits");
+            assert_eq!(
+                x.positions.iter().map(|p| p.raw()).collect::<Vec<_>>(),
+                y.positions.iter().map(|p| p.raw()).collect::<Vec<_>>(),
+                "{name} positions"
+            );
+            assert_eq!(x.magnitudes, y.magnitudes, "{name} magnitudes");
+        }
+        for (name, x, y) in [
+            ("csb", &a.costs.coeff_sign_bypass, &b.costs.coeff_sign_bypass),
+            ("csl", &a.costs.coeff_suffix_lsb, &b.costs.coeff_suffix_lsb),
+            ("msb", &a.costs.mvd_sign_bypass, &b.costs.mvd_sign_bypass),
+            ("msl", &a.costs.mvd_suffix_lsb, &b.costs.mvd_suffix_lsb),
+        ] {
+            assert_eq!(x.len(), y.len(), "{name} cost len");
+            for (i, (p, q)) in x.iter().zip(y.iter()).enumerate() {
+                // BIT equality, not ==: ∞ must survive exactly (it is what
+                // marks a position unflippable, so a lossy round trip would
+                // change which flips STC picks), and NaN != NaN under `==`.
+                assert_eq!(p.to_bits(), q.to_bits(), "{name} cost[{i}] bits");
+            }
+        }
+    }
+
+    /// The payload must survive pack → unpack bit-for-bit. A wrong unpack
+    /// would hand sweep B a plausible-but-different cover and emit a file
+    /// that encodes without error and decodes to garbage.
+    #[test]
+    fn shadow_gop_prefix_round_trips_bit_exactly() {
+        let a = sample();
+        let bytes = a.flat_pack();
+        let b = ShadowGopPrefix::flat_unpack(&bytes).expect("unpack");
+        assert_same(&a, &b);
+    }
+
+    #[test]
+    fn shadow_gop_prefix_rejects_truncation_and_garbage() {
+        let bytes = sample().flat_pack();
+        assert!(ShadowGopPrefix::flat_unpack(&[]).is_err(), "empty");
+        assert!(ShadowGopPrefix::flat_unpack(&[99]).is_err(), "bad version");
+        for cut in [1usize, 8, bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                ShadowGopPrefix::flat_unpack(&bytes[..cut]).is_err(),
+                "truncated at {cut} must not unpack"
+            );
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(ShadowGopPrefix::flat_unpack(&extra).is_err(), "trailing byte");
+    }
+
+    /// End-to-end through the cache, including the disk tier — this is the
+    /// path that actually runs when the RAM budget is small.
+    #[test]
+    fn round_trips_through_the_disk_tier() {
+        let scratch = std::env::var("PHASM_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let a = sample();
+        // ram_budget = 0 forces the disk tier.
+        let mut cache: BoundedGopCache<ShadowGopPrefix> =
+            BoundedGopCache::new(2, 0, 1 << 20, scratch, "h264-prefix-test");
+        cache.insert(0, a.clone());
+        assert!(cache.spilled(), "should have used the disk tier");
+        let b = cache.fetch(0).expect("disk hit");
+        assert_same(&a, &b);
+        assert_eq!(cache.stats().disk_hits, 1);
+    }
+
+    #[test]
+    fn cached_size_matches_the_15_bytes_per_position_model() {
+        let p = ShadowGopPrefix {
+            cover: DomainCover {
+                coeff_sign_bypass: dom(100, 0),
+                ..Default::default()
+            },
+            costs: DomainCosts { coeff_sign_bypass: costs(100, false), ..Default::default() },
+        };
+        // 100 positions x (1 bit + 8 position + 2 magnitude) + 100 x 4 costs
+        assert_eq!(p.cached_size(), 100 * 11 + 100 * 4);
+    }
 }
 
 #[cfg(test)]
@@ -714,5 +1079,182 @@ mod tests {
             textured_cost < smooth_cost,
             "textured cost {textured_cost} should be < smooth cost {smooth_cost}",
         );
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Shadow-sweep GOP cache payload
+// ═════════════════════════════════════════════════════════════════════════
+
+/// The per-GOP prefix both shadow sweeps compute identically, cached so the
+/// second sweep can skip it.
+///
+/// `gop_provisional_step` (sweep A) and `sweep_b_emit` (sweep B) each run the
+/// same five steps per GOP: clean OpenH264 encode → CABAC walk →
+/// [`compute_content_costs_yuv`] → `analyze_safe_mvd_subset` /
+/// `derive_msl_safe_from_msb` → `apply_safe_msl_gate`. Measured on a 2-GOP
+/// shadow encode, the wavelet inside step 3 alone was 3.83 s of 12.39 s wall —
+/// exactly 2 GOPs × 2 sweeps.
+///
+/// **What is NOT in here, and why:**
+/// * `clean_bytes` — consumed only to produce the walk; nothing downstream
+///   reads it.
+/// * `mvd_meta` / `mb_w` / `mb_h` — consumed only to derive the safe-MSL
+///   baseline, which is already applied to `costs`.
+/// * the **tier** gate — `apply_tier_gate` is the one genuinely per-tier step,
+///   and sweep B runs per parity tier. So the cache holds costs **after** the
+///   safe-MSL gate and **before** the tier gate, and the caller applies the
+///   tier gate on every fetch. Caching post-tier would make each entry valid
+///   for one tier only and multiply the footprint by the tier count.
+///
+/// Footprint: `DomainBits` is 11 B/position (`bits` u8 + `positions`
+/// [`PositionKey`] u64 + `magnitudes` u16) and `DomainCosts` is 4 B/position,
+/// so ~15 B/position — about **6.9 MB** for a 1080p 30-frame GOP (~461k
+/// positions). See `docs/design/video/gop-cache-budgets.md`.
+#[derive(Clone)]
+pub struct ShadowGopPrefix {
+    pub cover: DomainCover,
+    /// Post-safe-MSL, pre-tier. See the type docs.
+    pub costs: DomainCosts,
+}
+
+/// Flat little-endian layout. Version-prefixed so a stale file hard-fails
+/// rather than unpacking into plausible garbage; there is no cross-run
+/// compatibility obligation (the scratch tree is removed on drop), so the
+/// version only has to change when this layout does.
+const SHADOW_GOP_PREFIX_FORMAT_V1: u8 = 1;
+
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn take_u32(b: &[u8], at: &mut usize) -> Result<u32, String> {
+    let end = at.checked_add(4).ok_or("u32 offset overflow")?;
+    let s = b.get(*at..end).ok_or("truncated u32")?;
+    *at = end;
+    Ok(u32::from_le_bytes(s.try_into().map_err(|_| "u32 slice")?))
+}
+
+fn pack_domain(out: &mut Vec<u8>, d: &DomainBits) {
+    // The three vectors are index-aligned by construction (`DomainBits::len`
+    // debug-asserts it), but pack each length anyway: a mismatch must surface
+    // as an unpack error, not as a silently truncated cover.
+    put_u32(out, d.bits.len() as u32);
+    put_u32(out, d.positions.len() as u32);
+    put_u32(out, d.magnitudes.len() as u32);
+    out.extend_from_slice(&d.bits);
+    for p in &d.positions {
+        out.extend_from_slice(&p.raw().to_le_bytes());
+    }
+    for m in &d.magnitudes {
+        out.extend_from_slice(&m.to_le_bytes());
+    }
+}
+
+fn unpack_domain(b: &[u8], at: &mut usize) -> Result<DomainBits, String> {
+    let n_bits = take_u32(b, at)? as usize;
+    let n_pos = take_u32(b, at)? as usize;
+    let n_mag = take_u32(b, at)? as usize;
+
+    let end = at.checked_add(n_bits).ok_or("bits overflow")?;
+    let bits = b.get(*at..end).ok_or("truncated bits")?.to_vec();
+    *at = end;
+
+    let mut positions = Vec::with_capacity(n_pos);
+    for _ in 0..n_pos {
+        let end = at.checked_add(8).ok_or("position overflow")?;
+        let s = b.get(*at..end).ok_or("truncated position")?;
+        *at = end;
+        positions.push(PositionKey::from_raw(u64::from_le_bytes(
+            s.try_into().map_err(|_| "position slice")?,
+        )));
+    }
+
+    let mut magnitudes = Vec::with_capacity(n_mag);
+    for _ in 0..n_mag {
+        let end = at.checked_add(2).ok_or("magnitude overflow")?;
+        let s = b.get(*at..end).ok_or("truncated magnitude")?;
+        *at = end;
+        magnitudes.push(u16::from_le_bytes(s.try_into().map_err(|_| "magnitude slice")?));
+    }
+
+    Ok(DomainBits { bits, positions, magnitudes })
+}
+
+fn pack_costs(out: &mut Vec<u8>, c: &[f32]) {
+    put_u32(out, c.len() as u32);
+    for v in c {
+        // to_bits, not to_le_bytes on the float: ∞ and the exact bit pattern
+        // must survive, because ∞ is load-bearing (it is what marks a position
+        // unflippable) and a lossy round trip would change which flips STC
+        // picks.
+        out.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+}
+
+fn unpack_costs(b: &[u8], at: &mut usize) -> Result<Vec<f32>, String> {
+    let n = take_u32(b, at)? as usize;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let end = at.checked_add(4).ok_or("cost overflow")?;
+        let s = b.get(*at..end).ok_or("truncated cost")?;
+        *at = end;
+        v.push(f32::from_bits(u32::from_le_bytes(
+            s.try_into().map_err(|_| "cost slice")?,
+        )));
+    }
+    Ok(v)
+}
+
+impl crate::stego::gop_cache::GopCachePayload for ShadowGopPrefix {
+    fn cached_size(&self) -> usize {
+        let dom = |d: &DomainBits| d.bits.len() + d.positions.len() * 8 + d.magnitudes.len() * 2;
+        dom(&self.cover.coeff_sign_bypass)
+            + dom(&self.cover.coeff_suffix_lsb)
+            + dom(&self.cover.mvd_sign_bypass)
+            + dom(&self.cover.mvd_suffix_lsb)
+            + (self.costs.coeff_sign_bypass.len()
+                + self.costs.coeff_suffix_lsb.len()
+                + self.costs.mvd_sign_bypass.len()
+                + self.costs.mvd_suffix_lsb.len())
+                * 4
+    }
+
+    fn flat_pack(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.cached_size() + 64);
+        out.push(SHADOW_GOP_PREFIX_FORMAT_V1);
+        pack_domain(&mut out, &self.cover.coeff_sign_bypass);
+        pack_domain(&mut out, &self.cover.coeff_suffix_lsb);
+        pack_domain(&mut out, &self.cover.mvd_sign_bypass);
+        pack_domain(&mut out, &self.cover.mvd_suffix_lsb);
+        pack_costs(&mut out, &self.costs.coeff_sign_bypass);
+        pack_costs(&mut out, &self.costs.coeff_suffix_lsb);
+        pack_costs(&mut out, &self.costs.mvd_sign_bypass);
+        pack_costs(&mut out, &self.costs.mvd_suffix_lsb);
+        out
+    }
+
+    fn flat_unpack(bytes: &[u8]) -> Result<Self, String> {
+        let ver = *bytes.first().ok_or("empty payload")?;
+        if ver != SHADOW_GOP_PREFIX_FORMAT_V1 {
+            return Err(format!("unknown ShadowGopPrefix format {ver}"));
+        }
+        let mut at = 1usize;
+        let cover = DomainCover {
+            coeff_sign_bypass: unpack_domain(bytes, &mut at)?,
+            coeff_suffix_lsb: unpack_domain(bytes, &mut at)?,
+            mvd_sign_bypass: unpack_domain(bytes, &mut at)?,
+            mvd_suffix_lsb: unpack_domain(bytes, &mut at)?,
+        };
+        let costs = DomainCosts {
+            coeff_sign_bypass: unpack_costs(bytes, &mut at)?,
+            coeff_suffix_lsb: unpack_costs(bytes, &mut at)?,
+            mvd_sign_bypass: unpack_costs(bytes, &mut at)?,
+            mvd_suffix_lsb: unpack_costs(bytes, &mut at)?,
+        };
+        if at != bytes.len() {
+            return Err(format!("trailing bytes: consumed {at} of {}", bytes.len()));
+        }
+        Ok(Self { cover, costs })
     }
 }

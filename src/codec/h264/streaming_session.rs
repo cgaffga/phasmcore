@@ -846,12 +846,119 @@ pub(crate) fn consume_gop_roundtrip_safe(
                 break Ok((b, t, want));
             }
             Ok(_) | Err(StegoError::MessageTooLarge) => {
-                debug_assert!(want > 0, "empty chunk must always succeed");
+                // A GOP that cannot carry even an EMPTY chunk frame leaves the
+                // loop nothing to shrink. The `debug_assert` that used to
+                // stand here ("empty chunk must always succeed") is compiled
+                // OUT in release, so `want -= 1usize.max(0)` underflowed to
+                // usize::MAX and the next iteration panicked on
+                // `&payload[..usize::MAX]` — a release-mode crash, i.e. the app
+                // dying rather than reporting a full cover. Reproduced
+                // 2026-10-20 with reduced-domain cost weights; also reachable
+                // on a pathological low-capacity GOP under the production
+                // weights. Report it instead.
+                if want == 0 {
+                    break Err(StegoError::MessageTooLarge);
+                }
                 want -= 1usize.max(want / 8); // ~12% step, reaches 0
             }
             Err(e) => break Err(e),
         }
     }
+}
+
+// ─── DIAGNOSTIC surfaces (measurement only, `#[doc(hidden)]`) ──────────
+//
+// These answer "what does the encoder ACTUALLY do with this GOP", which is
+// what distinguishing a probe over-report from an encoder defect requires.
+// They mirror the existing `h264_gop_cost_mask_divergence` /
+// `h264_gop_capacity_per_tier_with_costs` diagnostics in `openh264_stego`.
+
+/// How many bytes of `payload` this GOP actually holds, under the encoder\'s
+/// REAL acceptance test (shrink-carry loop included). `consumed <
+/// payload.len()` means the loop had to shrink.
+#[doc(hidden)]
+#[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
+pub fn h264_diag_verified_gop_consumed(
+    gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32,
+    gop_size: u32, payload: &[u8], chunk_idx: u16, total_bytes: u32,
+    hhat_seed: &[u8; 32], weights: &CostWeights,
+) -> Result<usize, StegoError> {
+    let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
+    let (_bs, _tier, consumed) = embed_gop_roundtrip_safe(
+        gop_yuv, width, height, frames_in_gop, opts, payload, chunk_idx,
+        total_bytes, hhat_seed, weights,
+    )?;
+    Ok(consumed)
+}
+
+/// ONE emit attempt at the full `payload`, no shrink loop — so a FAILING
+/// attempt is observable. Returns the bitstream (empty when the emit refused
+/// with `MessageTooLarge`) and whether `verify_chunk_v3` read it back.
+///
+/// This is what established that the refusals are STC FEASIBILITY failures,
+/// not verification leaks: the emit returns `MessageTooLarge`, so
+/// `verify_chunk_v3` is never reached.
+#[doc(hidden)]
+#[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
+pub fn h264_diag_gop_emit_once(
+    gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32,
+    gop_size: u32, payload: &[u8], chunk_idx: u16, total_bytes: u32,
+    hhat_seed: &[u8; 32], weights: &CostWeights,
+) -> Result<(Vec<u8>, bool), StegoError> {
+    let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
+    let products = produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?;
+    let framed = if chunk_idx == 0 {
+        build_first_chunk_frame_v3_1(total_bytes, payload)?
+    } else {
+        build_chunk_frame_v3_1(payload)?
+    };
+    let frame_bits = bytes_to_bits_msb_first_pub(&framed);
+    match consume_gop_emit(
+        &products, gop_yuv, width, height, frames_in_gop, opts, &frame_bits,
+        hhat_seed, weights, CascadeTier::Auto, DEFAULT_HEADROOM,
+    ) {
+        Ok((b, _t)) => {
+            let ok = verify_chunk_v3(&b, hhat_seed, chunk_idx, total_bytes, payload, weights);
+            Ok((b, ok))
+        }
+        Err(StegoError::MessageTooLarge) => Ok((Vec::new(), false)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Emit-side 4-domain cover lengths. See
+/// [`GopCoverProducts::cover_domain_lens`].
+#[doc(hidden)]
+#[cfg(feature = "h264-encoder")]
+pub fn h264_diag_emit_cover_lens(
+    gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32, gop_size: u32,
+) -> Result<[usize; 4], StegoError> {
+    let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
+    Ok(produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?.cover_domain_lens())
+}
+
+/// Emit-side cover CONTENT checksums. See
+/// [`GopCoverProducts::cover_domain_checksums`].
+#[doc(hidden)]
+#[cfg(feature = "h264-encoder")]
+pub fn h264_diag_emit_cover_checksums(
+    gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32, gop_size: u32,
+) -> Result<[(u64, u64); 4], StegoError> {
+    let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
+    Ok(produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?.cover_domain_checksums())
+}
+
+/// ∞-cost (wet) profile of the cost vector the trellis receives. See
+/// [`GopCoverProducts::cost_infinity_profile`].
+#[doc(hidden)]
+#[cfg(feature = "h264-encoder")]
+pub fn h264_diag_gop_cost_profile(
+    gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32, gop_size: u32,
+) -> Result<[(usize, usize); 4], StegoError> {
+    let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
+    Ok(produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?.cost_infinity_profile())
 }
 
 /// CAP2.2 §12 / CAP2.3 §4 — how many payload bytes the stego GOP `chunk_idx`
@@ -1111,6 +1218,12 @@ pub struct CapacityProbeResult {
     /// round-trip verify + shrink-carry (graceful `MessageTooLarge`, never data
     /// loss) and the #807 upper-bound HUD framing.
     pub per_tier_sum_payload: [usize; 5],
+    /// Largest message the ALLOCATION PLANNER will accept — **the number a UI
+    /// should show**. See `achievable_bytes_from_probed`.
+    ///
+    /// `primary_max_message_bytes_at_tier` remains the Σ-based upper bound, so
+    /// the calibration binaries and the CLI JSON contract are unaffected.
+    pub achievable_max_message_bytes: usize,
 }
 
 impl CapacityProbeResult {
@@ -1192,6 +1305,27 @@ pub struct StreamingProbeSession {
     /// a refining estimated-capacity in the HUD. `None` when no
     /// progressive estimate is wanted (e.g. CLI batch use).
     progress_callback: Option<super::progress::CapacityProbeCallback>,
+    /// Opt-in probe early-exit target — see [`set_plan_target`](
+    /// StreamingProbeSession::set_plan_target). `None` (the default) probes
+    /// every GOP, which is what a capacity *display* needs.
+    plan_target: Option<ProbePlanTarget>,
+}
+
+/// State for the probe early-exit: once the GOPs probed so far can hold the
+/// whole framed message under the rate ceiling, probing the rest cannot change
+/// the plan `allocate_chunks_concentrate_tail` will produce, so it stops.
+#[derive(Clone, Copy)]
+struct ProbePlanTarget {
+    /// `StreamingEncodeSession::framed_message_len()` — the exact byte count
+    /// the plan must account for. An over-estimate is safe (it only probes
+    /// more GOPs than needed); an under-estimate is NOT.
+    framed_len: usize,
+    /// Must be the same `r_target` later handed to `plan_proportional`.
+    r_target: f64,
+    /// Running Σ⌊r·cap⌋ over probed GOPs, computed exactly as the allocator
+    /// computes `ceiled`.
+    ceiled_sum: usize,
+    satisfied: bool,
 }
 
 enum ProbeImpl {
@@ -1269,7 +1403,67 @@ impl StreamingProbeSession {
             per_gop_tier0_payload: Vec::new(),
             per_tier_sum_payload: [0; 5],
             progress_callback: None,
+            plan_target: None,
         })
+    }
+
+    /// Opt in to **probe early-exit**: stop measuring GOP capacity as soon as
+    /// the GOPs already probed can hold the whole framed message under the
+    /// rate ceiling.
+    ///
+    /// `framed_len` must be [`StreamingEncodeSession::framed_message_len`] and
+    /// `r_target` must be the same value later handed to
+    /// [`StreamingEncodeSession::plan_proportional`].
+    ///
+    /// ## Why this does not change the plan
+    ///
+    /// `allocate_chunks_concentrate_tail` is a sequential fill from GOP 0.
+    /// Its only whole-clip quantities are `sigma_cap` (the `None` guard) and
+    /// `sigma_ceiled` (the `use_full` branch). If the first `k` probed GOPs
+    /// satisfy `Σ_{i<k} ceiled_i >= framed_len`, then:
+    ///
+    /// * `sigma_ceiled >= Σ_{i<k} ceiled_i >= framed_len` ⇒ `use_full = false`,
+    ///   independent of every unprobed GOP;
+    /// * `sigma_cap >= sigma_ceiled >= framed_len` ⇒ never `None`;
+    /// * the fill drains inside the prefix ⇒ `plan[i] = 0` for `i >= k` and
+    ///   `window <= k`.
+    ///
+    /// Reporting an unprobed GOP's capacity as 0 therefore yields a
+    /// **bit-identical plan**. Note the test is on the rate-ceiled caps, not
+    /// the raw ones: `Σ_{i<k} cap_i >= framed_len` would NOT do, because the
+    /// prefix could then take the `use_full` branch while the full probe does
+    /// not, and the two plans would diverge.
+    ///
+    /// ## What it costs you
+    ///
+    /// [`CapacityProbeResult`]'s `cover_bits`, `shadow_pool_bits` and
+    /// `per_tier_sum_payload` become **partial** — they only cover the probed
+    /// prefix. That is why this is opt-in: a caller that renders a capacity
+    /// number (the mobile HUD) must not use it. The per-GOP vector from
+    /// [`finish_with_per_gop`](Self::finish_with_per_gop) stays correct for
+    /// planning, which is the one thing this mode promises.
+    ///
+    /// Only the `plan_proportional` → `allocate_chunks_concentrate_tail` path
+    /// is covered. The apps plan with `plan_safe_balanced` (#841) instead,
+    /// whose t-stat lower bound genuinely depends on how many GOPs were
+    /// sampled — truncating ITS sample set changes the plan and risks the
+    /// #850 false-`MessageTooLarge` class. Do not reuse this for that path.
+    #[cfg(feature = "h264-encoder")]
+    pub fn set_plan_target(&mut self, framed_len: usize, r_target: f64) {
+        self.plan_target = Some(ProbePlanTarget {
+            framed_len,
+            r_target,
+            ceiled_sum: 0,
+            // A zero-length message needs no GOP to carry it, so the prefix
+            // condition holds vacuously from the start.
+            satisfied: framed_len == 0,
+        });
+    }
+
+    /// Whether early-exit engaged, i.e. at least one GOP went unprobed.
+    /// Diagnostic only.
+    pub fn plan_target_satisfied(&self) -> bool {
+        self.plan_target.as_ref().is_some_and(|t| t.satisfied)
     }
 
     /// #475 — install a callback that fires after each GOP probe
@@ -1297,6 +1491,51 @@ impl StreamingProbeSession {
     /// (all GOPs probed) this lands exactly on `primary_max_message_bytes`, so
     /// the HUD refines toward — and converges on — the final number. Callers
     /// must use this value DIRECTLY (no ×0.40, no re-extrapolation).
+    /// Largest message the PLANNER will accept, given the per-GOP caps probed
+    /// so far — the number a UI should show.
+    ///
+    /// Not `Σ caps − FRAME_OVERHEAD`. That is an upper bound only reachable if
+    /// the encoder fills every GOP toward its own cap; the planner also applies
+    /// `safety_margin` and a window rule, so its accept ceiling sits below Σ.
+    /// Showing Σ is what let the HUD display a number the planner would refuse
+    /// — median ~2× and worst case 70× too high before the allocator fix
+    /// (`cap_corpus_min_mu_census`).
+    ///
+    /// Derived from `max_message_len`, i.e. the planner's OWN rule rather than
+    /// a formula restated here, so display and accept decision cannot drift.
+    ///
+    /// **Climbs rather than retracts.** `max_message_len` imputes unprobed GOPs
+    /// with the pessimism-discounted statistical lower bound, so with one GOP
+    /// measured the answer is very conservative and it rises as coverage grows,
+    /// converging exactly on the full-coverage value. The live estimate and the
+    /// final number are therefore the SAME quantity — without that, the HUD
+    /// would drop ~9% at the end, reintroducing the retraction CAP2.5 #821 was
+    /// fixed to remove.
+    fn achievable_bytes_from_probed(&self) -> usize {
+        let total_gops = self
+            .params
+            .total_frames_hint
+            .div_ceil(self.params.gop_size)
+            .max(1) as usize;
+        // A partial GOP on the last drain can push the probed count past the
+        // hint; the planner needs `n_gops >= samples.len()`.
+        let n_gops = total_gops.max(self.per_gop_tier0_payload.len()).max(1);
+        let samples: Vec<(usize, usize)> = self
+            .per_gop_tier0_payload
+            .iter()
+            .copied()
+            .enumerate()
+            .collect();
+        if samples.is_empty() {
+            return 0;
+        }
+        // The H.264 calibration both mobile bridges pass (ios-bridge,
+        // android-bridge). Kept in sync with them deliberately.
+        let cal = crate::stego::calibration::AllocationCalibration::H264_1080P_QP26;
+        let framed = crate::stego::balanced_allocation::max_message_len(&samples, n_gops, &cal);
+        framed.saturating_sub(frame::FRAME_OVERHEAD)
+    }
+
     fn emit_estimate(&self) {
         if let Some(cb) = self.progress_callback.as_ref() {
             // Total GOPs target = ceil(total_frames_hint / gop_size).
@@ -1307,17 +1546,19 @@ impl StreamingProbeSession {
             let total_gops = self.params.total_frames_hint
                 .div_ceil(self.params.gop_size)
                 .max(1);
-            // CAP2.2 §12 (#824) — extrapolate the running Σ per-GOP capacity to
-            // all GOPs: `(Σ_probed / gops_probed) × total_gops`. The carry/
-            // proportional encoders fill each GOP to its own cap, so the ceiling
-            // is Σ, not `n_gops × min`. At finish (all GOPs probed) this lands
-            // exactly on the final `primary_max_message_bytes`, so the live HUD
-            // refines toward — and converges on — the final number (no jump).
-            let sum0 = self.per_tier_sum_payload[0];
-            let probed = self.n_gops.max(1) as u128;
-            let est_total = (sum0 as u128).saturating_mul(total_gops as u128) / probed;
-            let est_bytes = (est_total as usize).saturating_sub(frame::FRAME_OVERHEAD);
-            cb(self.n_gops, total_gops, est_bytes);
+            // Report what the PLANNER will accept, not Σ.
+            //
+            // This extrapolated `(Σ_probed / probed) × total_gops`, which
+            // converges on `primary_max_message_bytes` — a Σ-based UPPER bound
+            // the planner refuses well below. Now it converges on the
+            // achievable ceiling instead, so the number the user types against
+            // is the number the encode admits.
+            //
+            // Also changes the direction of travel: the Σ extrapolation
+            // started optimistic (GOP 0 is an IDR GOP and unusually roomy) and
+            // fell, while this starts conservative and CLIMBS, so a message
+            // that fits the figure on screen still fits a moment later.
+            cb(self.n_gops, total_gops, self.achievable_bytes_from_probed());
         }
     }
 
@@ -1328,6 +1569,21 @@ impl StreamingProbeSession {
         match &mut self.inner {
             #[cfg(feature = "h264-encoder")]
             ProbeImpl::Oh264(state) => {
+                if self.plan_target.as_ref().is_some_and(|t| t.satisfied) {
+                    // Past the point where any further measurement can change
+                    // the plan. Count frames so the GOP count (and therefore
+                    // the plan length) stays right, and skip both the pack —
+                    // ~93 MB of memcpy per 1080p GOP — and the probe itself.
+                    // `gop_buffer` is empty here: `satisfied` can only flip
+                    // inside the drain below, which `take`s the buffer first.
+                    state.frames_buffered += 1;
+                    if state.frames_buffered == self.params.gop_size {
+                        state.frames_buffered = 0;
+                        self.n_gops = self.n_gops.saturating_add(1);
+                        self.per_gop_tier0_payload.push(0);
+                    }
+                    return Ok(());
+                }
                 pack_frame_into_buffer(self.params.width, self.params.height, &frame, &mut state.gop_buffer)?;
                 state.frames_buffered += 1;
                 if state.frames_buffered == self.params.gop_size {
@@ -1337,7 +1593,7 @@ impl StreamingProbeSession {
                     let gop_n = state.frames_buffered;
                     state.pending.push((gop_n, std::mem::take(&mut state.gop_buffer)));
                     state.frames_buffered = 0;
-                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
                     self.emit_estimate();
                 }
                 Ok(())
@@ -1374,6 +1630,25 @@ impl StreamingProbeSession {
         match &mut self.inner {
             #[cfg(feature = "h264-encoder")]
             ProbeImpl::Oh264(state) => {
+                if self.plan_target.as_ref().is_some_and(|t| t.satisfied) {
+                    // Early-exit mode: a trailing partial GOP still counts
+                    // towards the GOP total (the plan must span every GOP),
+                    // it just carries no measured capacity.
+                    if state.frames_buffered > 0 {
+                        state.frames_buffered = 0;
+                        self.n_gops = self.n_gops.saturating_add(1);
+                        self.per_gop_tier0_payload.push(0);
+                    }
+                    let result = CapacityProbeResult {
+                        cover_bits: self.cover_bits,
+                        shadow_pool_bits: self.shadow_pool_bits,
+                        n_gops: self.n_gops,
+                        per_tier_sum_payload: self.per_tier_sum_payload,
+                        achievable_max_message_bytes: self.achievable_bytes_from_probed(),
+                    };
+                    let per_gop = std::mem::take(&mut self.per_gop_tier0_payload);
+                    return Ok((result, per_gop));
+                }
                 if state.frames_buffered > 0 {
                     let gop_n = state.frames_buffered;
                     state.pending.push((gop_n, std::mem::take(&mut state.gop_buffer)));
@@ -1381,7 +1656,7 @@ impl StreamingProbeSession {
                 }
                 if !state.pending.is_empty() {
                     // Drain ALL remaining GOPs as the final parallel batch.
-                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload)?;
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
                     // Emit one final per-GOP event before returning so
                     // listeners that race a final-state read can see
                     // the full count rather than the second-last one.
@@ -1392,6 +1667,7 @@ impl StreamingProbeSession {
                     shadow_pool_bits: self.shadow_pool_bits,
                     n_gops: self.n_gops,
                     per_tier_sum_payload: self.per_tier_sum_payload,
+                    achievable_max_message_bytes: self.achievable_bytes_from_probed(),
                 };
                 let per_gop = std::mem::take(&mut self.per_gop_tier0_payload);
                 Ok((result, per_gop))
@@ -1428,6 +1704,7 @@ fn drain_pending_gops_probe(
     n_gops: &mut u32,
     per_gop_tier0: &mut Vec<usize>,
     per_tier_sum: &mut [usize; 5],
+    plan_target: &mut Option<ProbePlanTarget>,
 ) -> Result<(), StegoError> {
     if pending.is_empty() {
         return Ok(());
@@ -1465,6 +1742,22 @@ fn drain_pending_gops_probe(
         // CAP2.2 §12 — record this GOP's tier-0 cap (bytes) for proportional
         // allocation; GOP order matches the encode's chunk order.
         per_gop_tier0.push(cap.per_tier_payload[0]);
+
+        // Probe early-exit bookkeeping. `ceiled` is computed exactly as
+        // `allocate_chunks_concentrate_tail` computes it — any drift here
+        // would make the prefix plan differ from the full plan, which is the
+        // one thing `set_plan_target` promises cannot happen.
+        if let Some(t) = plan_target.as_mut() {
+            if !t.satisfied {
+                let c = cap.per_tier_payload[0];
+                let r = t.r_target.clamp(0.0, 1.0);
+                let ceiled = ((r * c as f64) as usize).min(c);
+                t.ceiled_sum = t.ceiled_sum.saturating_add(ceiled);
+                if t.ceiled_sum >= t.framed_len {
+                    t.satisfied = true;
+                }
+            }
+        }
     }
     pending.clear();
     Ok(())

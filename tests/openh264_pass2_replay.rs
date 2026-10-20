@@ -20,6 +20,7 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
 use phasm_core::codec::h264::openh264::{
     abi_version, header_abi_version, set_frame_num, set_pass_mode, Encoder, FrameType, MbDecision,
     PassMode, StegoHandlers, StegoSession,
@@ -2066,7 +2067,7 @@ fn pass1_capture_vs_pass2_replay_byte_identity_real_carplane() {
     const N_P_FRAMES: u32 = 11;
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_1072x1920_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_1072x1920_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => {
@@ -2264,7 +2265,7 @@ fn pass1_capture_vs_pass2_replay_byte_identity_real_carplane_480p_minimal() {
     const N_P_FRAMES: u32 = 2; // P1 + P2 — divergence appears at P2 per the 1080p run
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => {
@@ -2451,7 +2452,7 @@ fn pass1_capture_vs_pass2_replay_with_forced_cache_miss() {
     const N_P_FRAMES: u32 = 2;
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => {
@@ -2628,7 +2629,7 @@ fn pass1_no_flips_vs_pass2_with_flips_real_carplane_480p() {
     const N_P_FRAMES: u32 = 2;
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => {
@@ -2793,7 +2794,7 @@ fn pass2_walker_sees_single_cs_flip_real_carplane_480p() {
     const N_P_FRAMES: u32 = 2;
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
@@ -2968,7 +2969,7 @@ fn pass2_walker_sees_N_cs_flips_real_carplane_480p() {
     const N_FRAMES: u32 = N_P_FRAMES + 1;
     const FLIP_EVERY: usize = 10; // higher density: every 10th CS fire
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
@@ -3096,7 +3097,7 @@ fn pass2_walker_sees_N_4domain_flips_real_carplane_480p() {
     const N_FRAMES: u32 = N_P_FRAMES + 1;
     const FLIP_EVERY: usize = 50;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
@@ -3229,7 +3230,7 @@ fn pass2_walker_sees_mvdsign_only_real_carplane_480p() {
     const N_P_FRAMES: u32 = 11;
     const N_FRAMES: u32 = N_P_FRAMES + 1;
 
-    let yuv_path = "/tmp/phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv";
+    let yuv_path = &common::scratch_path("phasm_oh264_real_content_549_Artlist_CarPlane_mp4_480x272_f12.yuv");
     let yuv = match std::fs::read(yuv_path) {
         Ok(d) => d,
         Err(e) => { eprintln!("fixture missing: {e} — skipping."); return; }
