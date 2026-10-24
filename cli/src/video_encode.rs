@@ -895,7 +895,7 @@ fn run_av1_shadow_encode_streaming(
         av1_encode_with_shadows_streaming, Av1FileYuvSource, Pass1CacheBudget,
     };
     use phasm_core::codec::mp4::build::{
-        build_mp4_av1, build_mp4_av1_with_audio, FrameTiming,
+        build_mp4_av1_timed, FrameTiming,
     };
     use phasm_core::stego::{crypto, frame, payload};
     use phasm_core::Av1StreamingEncodeParams;
@@ -1011,12 +1011,20 @@ fn run_av1_shadow_encode_streaming(
         // best-effort via the in-tree muxer's source-MP4 path.
         let (fps_num, fps_den) = transcode::parse_frame_rate(&probe.frame_rate);
         let timing = FrameTiming { fps_num, fps_den };
-        let mp4 = if probe.has_audio {
-            let source_bytes = std::fs::read(input).map_err(CliError::from)?;
-            build_mp4_av1_with_audio(&obus, probe.width, probe.height, timing, &source_bytes)
+        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den);
+        let source_bytes = if probe.has_audio {
+            Some(std::fs::read(input).map_err(CliError::from)?)
         } else {
-            build_mp4_av1(&obus, probe.width, probe.height, timing)
-        }
+            None
+        };
+        let mp4 = build_mp4_av1_timed(
+            &obus,
+            probe.width,
+            probe.height,
+            timing,
+            &frame_times,
+            source_bytes.as_deref(),
+        )
         .map_err(|e| CliError::InvalidArgs(format!("AV1 MP4 mux failed: {e}")))?;
         std::fs::write(output, &mp4).map_err(CliError::from)?;
         Ok(())
@@ -1078,7 +1086,7 @@ fn run_av1_encode(
     // imported locally below). Only the dead imports remained — removed here.
     use phasm_core::{av1_capacity, Av1StreamingEncodeParams};
     use phasm_core::codec::mp4::build::{
-        build_mp4_av1, build_mp4_av1_with_audio, FrameTiming,
+        build_mp4_av1_timed, FrameTiming,
     };
     use phasm_core::stego::payload;
 
@@ -1213,6 +1221,7 @@ fn run_av1_encode(
             encode_params,
             &primary_framed,
             passphrase,
+            phasm_core::codec::av1::stego::whole_video::Pass1CacheBudget::from_env_or_default(),
             None,
         )
         .map_err(av1_err_to_cli)?;
@@ -1229,12 +1238,20 @@ fn run_av1_encode(
         // Audio passthrough via the in-tree muxer's source-MP4 path
         // (mirror of `phasm_av1_build_mp4` in ios-bridge). Read failure
         // falls back to video-only mux — never blocks on audio.
-        let mp4 = if probe.has_audio {
-            let source_bytes = std::fs::read(input).map_err(CliError::from)?;
-            build_mp4_av1_with_audio(&obus, probe.width, probe.height, timing, &source_bytes)
+        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den);
+        let source_bytes = if probe.has_audio {
+            Some(std::fs::read(input).map_err(CliError::from)?)
         } else {
-            build_mp4_av1(&obus, probe.width, probe.height, timing)
-        }
+            None
+        };
+        let mp4 = build_mp4_av1_timed(
+            &obus,
+            probe.width,
+            probe.height,
+            timing,
+            &frame_times,
+            source_bytes.as_deref(),
+        )
         .map_err(|e| {
             CliError::from(phasm_core::StegoError::InvalidVideo(format!(
                 "AV1 MP4 mux failed: {e}"
@@ -1257,4 +1274,19 @@ fn av1_err_to_cli(e: phasm_core::Av1StegoError) -> CliError {
     CliError::from(phasm_core::StegoError::InvalidVideo(format!(
         "AV1 encode failed: {e:?}"
     )))
+}
+
+/// Nominal presentation times (µs) of `n` frames at `num/den` fps, for the
+/// AV1 muxer, which snaps them to an exact timing (29.97 → 60000 / 2002) that
+/// the untimed `fps × 512` timescale cannot represent (30000/1001 came out
+/// as 29.969 fps). The CLI decodes through ffmpeg, so a source lead-in is not
+/// visible here — the mobile apps pass the real frame times instead.
+#[cfg(feature = "av1-encoder")]
+fn nominal_frame_times_us(n: u32, num: u32, den: u32) -> Vec<i64> {
+    if num == 0 {
+        return Vec::new();
+    }
+    (0..n as i64)
+        .map(|i| (i * den as i64 * 1_000_000 + num as i64 / 2) / num as i64)
+        .collect()
 }

@@ -28,11 +28,37 @@ pub enum OutputMode {
 
 // ── Encode output ──
 
+/// What happened to the cover before embedding, for the report.
+pub struct CoverInfo {
+    /// Input dimensions (after EXIF orientation).
+    pub source: (u32, u32),
+    /// Dimensions of the cover that was encoded.
+    pub encoded: (u32, u32),
+    /// Quality the cover was re-encoded at; None when it passed through.
+    pub qf: Option<u8>,
+}
+
+impl CoverInfo {
+    /// "4032x3024 -> 1600x1200, re-encoded at QF65"; None when the file
+    /// passed through untouched.
+    fn summary(&self) -> Option<String> {
+        let qf = self.qf?;
+        let (sw, sh) = self.source;
+        let (w, h) = self.encoded;
+        Some(if (sw, sh) == (w, h) {
+            format!("{w}x{h}, re-encoded at QF{qf}")
+        } else {
+            format!("{sw}x{sh} -> {w}x{h}, re-encoded at QF{qf}")
+        })
+    }
+}
+
 pub fn print_encode_result(
     output_path: &str,
     quality: &EncodeQuality,
     deep_cover: bool,
     mode_name: &str,
+    cover: &CoverInfo,
     elapsed: Duration,
     mode: OutputMode,
 ) {
@@ -41,18 +67,25 @@ pub fn print_encode_result(
         OutputMode::Json => {
             let dc = if deep_cover { "true" } else { "false" };
             println!(
-                "{{\"output\":\"{}\",\"mode\":\"{}\",\"deepCover\":{},\"score\":{},\"hint\":\"{}\"}}",
+                "{{\"output\":\"{}\",\"mode\":\"{}\",\"deepCover\":{},\"score\":{},\"hint\":\"{}\",\"width\":{},\"height\":{},\"sourceWidth\":{},\"sourceHeight\":{}}}",
                 json_escape(output_path),
                 json_escape(mode_name),
                 dc,
                 quality.score,
                 json_escape(&quality.hint_key),
+                cover.encoded.0,
+                cover.encoded.1,
+                cover.source.0,
+                cover.source.1,
             );
         }
         OutputMode::Verbose => {
             let dc_label = if deep_cover { " (Deep Cover)" } else { "" };
             println!("Encoded: {output_path}");
             println!("Mode: {mode_name}{dc_label}");
+            if let Some(c) = cover.summary() {
+                println!("Cover: {c}");
+            }
             let label = if quality.mode == 1 { "Stealth" } else { "Robustness" };
             println!("{label}: {}% — {}", quality.score, score_word(quality.score));
             println!("Hint: {}", quality.hint_key);
@@ -62,6 +95,9 @@ pub fn print_encode_result(
             let dc_label = if deep_cover { " (Deep Cover)" } else { "" };
             println!("Encoded: {output_path}");
             println!("Mode: {mode_name}{dc_label}");
+            if let Some(c) = cover.summary() {
+                println!("Cover: {c}");
+            }
             let label = if quality.mode == 1 { "Stealth" } else { "Robustness" };
             println!("{label}: {}% — {}", quality.score, score_word(quality.score));
         }
@@ -167,26 +203,29 @@ pub fn print_capacity(
     armor: usize,
     fortress: usize,
     shadow: usize,
+    armor_cover: (u32, u32),
     mode_filter: Option<&str>,
     json: bool,
 ) {
+    let (aw, ah) = armor_cover;
     if json {
         println!(
-            "{{\"ghost\":{ghost},\"ghostDeepCover\":{ghost_si},\"armor\":{armor},\"fortress\":{fortress},\"shadow\":{shadow}}}"
+            "{{\"ghost\":{ghost},\"ghostDeepCover\":{ghost_si},\"armor\":{armor},\"fortress\":{fortress},\"shadow\":{shadow},\"armorWidth\":{aw},\"armorHeight\":{ah}}}"
         );
         return;
     }
+    let armor_line = format!("Armor:   {armor} bytes (Fortress: {fortress} bytes) on the {aw}x{ah} cover");
     match mode_filter {
         Some("ghost") => {
             println!("Ghost:   {ghost} bytes (Deep Cover: {ghost_si} bytes)");
             println!("Shadows: {shadow} bytes per layer");
         }
         Some("armor") => {
-            println!("Armor:   {armor} bytes (Fortress: {fortress} bytes)");
+            println!("{armor_line}");
         }
         _ => {
             println!("Ghost:   {ghost} bytes (Deep Cover: {ghost_si} bytes)");
-            println!("Armor:   {armor} bytes (Fortress: {fortress} bytes)");
+            println!("{armor_line}");
             println!("Shadows: {shadow} bytes per layer");
         }
     }

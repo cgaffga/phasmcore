@@ -1037,6 +1037,122 @@ fn build_stts_uniform(sample_count: u32) -> Vec<u8> {
     wrap_box(b"stts", &content)
 }
 
+/// Run-length `stts` over per-sample deltas. All-equal deltas give exactly
+/// the [`build_stts_uniform`] bytes when the delta is
+/// `STTS_DELTA_PER_FRAME`.
+fn build_stts(deltas: &[u32]) -> Vec<u8> {
+    let mut runs: Vec<(u32, u32)> = Vec::new(); // (sample_count, delta)
+    for &d in deltas {
+        match runs.last_mut() {
+            Some((n, last)) if *last == d => *n += 1,
+            _ => runs.push((1, d)),
+        }
+    }
+    let mut content = Vec::with_capacity(8 + 8 * runs.len());
+    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
+    content.extend_from_slice(&(runs.len() as u32).to_be_bytes());
+    for (n, d) in runs {
+        content.extend_from_slice(&n.to_be_bytes());
+        content.extend_from_slice(&d.to_be_bytes());
+    }
+    wrap_box(b"stts", &content)
+}
+
+/// AV1 video-track timing: `mdhd` timescale, one `stts` delta per sample,
+/// and the movie duration (ms) it implies.
+struct VideoTimeline {
+    timescale: u32,
+    deltas: Vec<u32>,
+    movie_duration_ms: u64,
+}
+
+impl VideoTimeline {
+    /// `n` frames at the nominal `timing` rate, 512 ticks each at
+    /// `fps × 512` — the untimed muxer's layout, byte for byte.
+    fn uniform(timing: FrameTiming, n: usize) -> Self {
+        Self {
+            timescale: handbrake::mdhd_timescale(timing.fps_num, timing.fps_den),
+            deltas: vec![handbrake::STTS_DELTA_PER_FRAME; n],
+            movie_duration_ms: (n as u64) * 1000 * (timing.fps_den as u64)
+                / (timing.fps_num as u64),
+        }
+    }
+
+    /// Timing from the source's frame presentation times (µs, one per
+    /// sample, presentation order). `None` for fewer than two frames.
+    ///
+    /// - **Constant rate** when the clip is one: the closer of an integer
+    ///   rate N and an NTSC rate M·1000/1001 to the mean frame period,
+    ///   accepted within 0.05 % with every frame within a quarter period of
+    ///   its slot. Integer → `N × 512` / delta 512 (the untimed layout);
+    ///   NTSC → `M × 2000` / delta 2002 (60000 @ 29.97, HandBrake's).
+    /// - **Otherwise** (variable rate) 90 kHz ticks from the real gaps.
+    /// - **Lead-in:** a first frame later than 0 (a leading empty edit in
+    ///   the source) extends sample 0's duration by it — frame 0 is held
+    ///   from 0 and every later frame lands on its source time against the
+    ///   passed-through audio. The muxer emits no edit list, like HandBrake.
+    ///
+    /// Integer and basic f64 arithmetic only (no transcendental functions),
+    /// so every platform derives the same timeline.
+    fn from_frame_times(frame_times_us: &[i64]) -> Option<Self> {
+        let n = frame_times_us.len();
+        if n < 2 {
+            return None;
+        }
+        let mut t = frame_times_us.to_vec();
+        for i in 1..n {
+            if t[i] <= t[i - 1] {
+                t[i] = t[i - 1] + 1;
+            }
+        }
+        let lead_us = t[0].max(0) as f64;
+        let rel: Vec<i64> = t.iter().map(|&x| x - t[0]).collect();
+        let period = rel[n - 1] as f64 / (n - 1) as f64;
+
+        // (timescale, delta, exact period in µs) for the two CFR families.
+        let mut candidates: Vec<(u32, u32, f64)> = Vec::new();
+        let int_fps = (1_000_000.0 / period).round();
+        if int_fps >= 1.0 && int_fps <= 1000.0 {
+            candidates.push((int_fps as u32 * 512, 512, 1_000_000.0 / int_fps));
+        }
+        let ntsc_m = (1_001_000.0 / period).round();
+        if ntsc_m >= 1.0 && ntsc_m <= 1000.0 {
+            candidates.push((ntsc_m as u32 * 2000, 2002, 1_001_000.0 / ntsc_m));
+        }
+        let cfr = candidates
+            .into_iter()
+            .min_by(|a, b| (period - a.2).abs().total_cmp(&(period - b.2).abs()))
+            .filter(|&(_, _, p)| {
+                (period - p).abs() <= p * 0.0005
+                    && rel.iter().enumerate().all(|(i, &r)| (r as f64 - i as f64 * p).abs() <= p / 4.0)
+            });
+
+        let (timescale, mut deltas) = match cfr {
+            Some((ts, delta, _)) => (ts, vec![delta; n]),
+            None => {
+                let mut ticks: Vec<u64> = rel.iter().map(|&r| (r as f64 * 0.09).round() as u64).collect();
+                for i in 1..n {
+                    if ticks[i] <= ticks[i - 1] {
+                        ticks[i] = ticks[i - 1] + 1;
+                    }
+                }
+                let mut d: Vec<u32> = ticks.windows(2).map(|w| (w[1] - w[0]) as u32).collect();
+                d.push(*d.last().expect("n >= 2"));
+                (90_000, d)
+            }
+        };
+        let lead_ticks = (lead_us * timescale as f64 / 1_000_000.0).round() as u64;
+        deltas[0] = (deltas[0] as u64 + lead_ticks).min(u32::MAX as u64) as u32;
+
+        let total: u64 = deltas.iter().map(|&d| d as u64).sum();
+        Some(Self {
+            timescale,
+            movie_duration_ms: total * (handbrake::MVHD_TIMESCALE as u64) / timescale as u64,
+            deltas,
+        })
+    }
+}
+
 fn build_stsc(chunk_sizes: &[u32]) -> Vec<u8> {
     // Compress runs of equal-sized chunks into a single stsc entry.
     // HandBrake convention: one chunk per GOP, so equal-size GOPs
@@ -1151,7 +1267,7 @@ pub fn build_mp4_av1(
     height: u32,
     timing: FrameTiming,
 ) -> Result<Vec<u8>, Mp4Error> {
-    build_mp4_av1_inner(av1_obus, width, height, timing, None)
+    build_mp4_av1_inner(av1_obus, width, height, timing, None, None)
 }
 
 /// VP.M.4 — same as [`build_mp4_av1`] but also passes through the
@@ -1172,7 +1288,35 @@ pub fn build_mp4_av1_with_audio(
     source_mp4: &[u8],
 ) -> Result<Vec<u8>, Mp4Error> {
     let audio = AudioPassthrough::extract_first(source_mp4)?;
-    build_mp4_av1_inner(av1_obus, width, height, timing, audio.as_ref())
+    build_mp4_av1_inner(av1_obus, width, height, timing, audio.as_ref(), None)
+}
+
+/// [`build_mp4_av1`] / [`build_mp4_av1_with_audio`] with the video track
+/// timed from the source's frame presentation times (µs, one per frame, in
+/// presentation order — e.g. the decode pass's output times).
+///
+/// The untimed muxers stamp every frame at the nominal integer rate from 0:
+/// 29.97 / 23.976 sources run 0.1 % fast against the passed-through audio
+/// (~120 ms after two minutes), a variable-rate clip loses its cadence, and
+/// a lead-in (a leading empty edit in the source) is lost. Here the exact
+/// rate, the real cadence and the lead-in are kept — see
+/// `VideoTimeline::from_frame_times`.
+///
+/// When `frame_times_us` does not have one time per frame (or fewer than
+/// two), the result is exactly the untimed muxer's at `timing`.
+pub fn build_mp4_av1_timed(
+    av1_obus: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    frame_times_us: &[i64],
+    source_mp4: Option<&[u8]>,
+) -> Result<Vec<u8>, Mp4Error> {
+    let audio = match source_mp4 {
+        Some(src) => AudioPassthrough::extract_first(src)?,
+        None => None,
+    };
+    build_mp4_av1_inner(av1_obus, width, height, timing, audio.as_ref(), Some(frame_times_us))
 }
 
 fn build_mp4_av1_inner(
@@ -1181,6 +1325,7 @@ fn build_mp4_av1_inner(
     height: u32,
     timing: FrameTiming,
     audio: Option<&AudioPassthrough<'_>>,
+    frame_times_us: Option<&[i64]>,
 ) -> Result<Vec<u8>, Mp4Error> {
     use super::av1_obu_split::split_av1_into_samples;
 
@@ -1277,13 +1422,15 @@ fn build_mp4_av1_inner(
         Ok::<Vec<u8>, Mp4Error>(trak)
     }).transpose()?;
 
-    // 7. moov.
-    let mdhd_timescale = handbrake::mdhd_timescale(timing.fps_num, timing.fps_den);
-    let frame_count = sample_sizes.len() as u32;
-    let track_duration_media: u64 =
-        (frame_count as u64) * (handbrake::STTS_DELTA_PER_FRAME as u64);
-    let movie_duration_ms_video: u64 =
-        (frame_count as u64) * 1000 * (timing.fps_den as u64) / (timing.fps_num as u64);
+    // 7. moov. Video timing from the source's frame times when there is
+    // one per frame, else the nominal rate.
+    let timeline = frame_times_us
+        .filter(|t| t.len() == sample_sizes.len())
+        .and_then(VideoTimeline::from_frame_times)
+        .unwrap_or_else(|| VideoTimeline::uniform(timing, sample_sizes.len()));
+    let mdhd_timescale = timeline.timescale;
+    let track_duration_media: u64 = timeline.deltas.iter().map(|&d| d as u64).sum();
+    let movie_duration_ms_video: u64 = timeline.movie_duration_ms;
     // mvhd.duration must cover the longest track. Convert the audio
     // track's mdhd-timescale duration into movie-timescale (1000 ms/s)
     // and take the max.
@@ -1305,6 +1452,7 @@ fn build_mp4_av1_inner(
         sample_sizes: &sample_sizes,
         sample_offsets: &sample_offsets,
         sync_samples: &sync_samples,
+        stts_deltas: &timeline.deltas,
         av1c: &av1c,
         audio_trak: audio_trak_patched.as_deref(),
     });
@@ -1371,6 +1519,8 @@ struct MoovParamsAv1<'a> {
     sample_sizes: &'a [u32],
     sample_offsets: &'a [u64],
     sync_samples: &'a [u32],
+    /// One `stts` delta per sample, in `mdhd_timescale` units.
+    stts_deltas: &'a [u32],
     av1c: &'a Av1cData,
     /// VP.M.4 — pre-patched audio `trak` box bytes (track_id=2 +
     /// rewritten stco/co64 offsets). None → video-only mux.
@@ -1435,7 +1585,7 @@ fn build_stbl_av01(p: &MoovParamsAv1<'_>) -> Vec<u8> {
     let chunk_offsets = chunk_offsets_for_layout(&chunks, p.sample_offsets);
 
     let stsd = build_stsd_av01(p.width, p.height, p.av1c);
-    let stts = build_stts_uniform(p.sample_sizes.len() as u32);
+    let stts = build_stts(p.stts_deltas);
     let stsc = build_stsc(&chunks);
     let stsz = build_stsz(p.sample_sizes);
     let stco = build_stco(&chunk_offsets);

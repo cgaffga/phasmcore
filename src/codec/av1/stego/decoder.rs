@@ -241,15 +241,15 @@ pub fn decode_with_recording_with_pixels(
 /// extraction test in the integration suite verifies the planes
 /// decode to the expected content for the v0.3 corpus.
 #[repr(C)]
-struct Dav1dPictureView {
+pub(super) struct Dav1dPictureView {
     _seq_hdr: *mut core::ffi::c_void,
     _frame_hdr: *mut core::ffi::c_void,
-    data: [*mut core::ffi::c_void; 3],
-    stride: [isize; 2],
-    p_w: i32,
-    p_h: i32,
-    p_layout: i32, // Dav1dPixelLayout: 0=MONO 1=I420 2=I422 3=I444
-    _p_bpc: i32,
+    pub(super) data: [*mut core::ffi::c_void; 3],
+    pub(super) stride: [isize; 2],
+    pub(super) p_w: i32,
+    pub(super) p_h: i32,
+    pub(super) p_layout: i32, // Dav1dPixelLayout: 0=MONO 1=I420 2=I422 3=I444
+    pub(super) p_bpc: i32,
 }
 
 /// Copy the visible region of one plane (luma or chroma) out of a
@@ -262,7 +262,7 @@ struct Dav1dPictureView {
 /// `data` must be a valid non-null pointer into a live Dav1dPicture's
 /// plane buffer, `stride >= width`, and `width × height` bytes must
 /// be readable starting at `(data + row × stride)` for row ∈ [0, h).
-unsafe fn copy_plane(
+pub(super) unsafe fn copy_plane(
     data: *const u8,
     stride: isize,
     width: usize,
@@ -311,6 +311,8 @@ fn decode_with_recording_inner(
             block_hook: None, // not used for stego recording — only the
                               // av1_block_hist stealth-audit binary
                               // registers this
+            sym_hook: None,
+            mag_hook: None,
         };
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
@@ -1062,6 +1064,50 @@ mod tests {
                  vs Context API config alignment.",
                 encoder_ac_count, decoder_ac_count, diff, tolerance
             );
+        }
+
+        /// Hookless decode speed (Pass-2 rebuild, 2026-10-24): the msac
+        /// dispatchers add one branch per symbol while no `sym_hook` is
+        /// registered. Decodes one 1080p q100 GOP of IMG_4138 with the
+        /// usual bit + meta hooks (`sym_hook` NULL, so asm msac) three times
+        /// and prints the median — compared by hand against a build with
+        /// `PHASM_MSAC_NO_DISPATCH` defined in the fork's `src/msac.h`.
+        #[test]
+        #[ignore = "timing; needs ffmpeg + corpus; run alone with --ignored --nocapture"]
+        fn hookless_decode_timing() {
+            let (w, h, n) = (1920u32, 1080u32, 30u32);
+            let clip = format!(
+                "{}/test-vectors/video/h264/real-world/source/IMG_4138.MOV",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let vf = format!("scale={w}:{h}:force_original_aspect_ratio=disable");
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-i", &clip])
+                .args(["-frames:v", &n.to_string(), "-vf", &vf])
+                .args(["-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+                .output()
+                .expect("ffmpeg");
+            assert!(out.status.success(), "ffmpeg yuv extract failed");
+            let params = crate::codec::av1::stego::session::Av1StreamingEncodeParams {
+                width: w,
+                height: h,
+                quantizer: 100,
+                gop_size: n,
+                total_frames_hint: n,
+            };
+            let gop = crate::codec::av1::stego::whole_video::encode_gop_natural(&out.stdout, n, params)
+                .expect("encode");
+            let stream: Vec<u8> = gop.iter().flat_map(|(p, _)| p.iter().copied()).collect();
+            let mut secs: Vec<f64> = (0..3)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    let pos = decode_with_recording(&stream).expect("decode");
+                    assert!(!pos.is_empty());
+                    t.elapsed().as_secs_f64()
+                })
+                .collect();
+            secs.sort_by(f64::total_cmp);
+            eprintln!("[hookless_decode_timing] runs {secs:?} median {:.4}s", secs[1]);
         }
     }
 }

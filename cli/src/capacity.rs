@@ -3,6 +3,7 @@
 // https://github.com/cgaffga/phasmcore
 
 use crate::error::CliError;
+use crate::image_conv::prepare_image;
 use crate::output;
 use phasm_core::{
     armor_capacity, armor_capacity_info, estimate_shadow_capacity, ghost_capacity,
@@ -21,6 +22,11 @@ pub struct CapacityArgs {
     #[arg(long)]
     pub mode: Option<String>,
 
+    /// Armor: measure the original resolution instead of the 1600 px cover
+    /// `encode` uses by default
+    #[arg(long)]
+    pub full_res: bool,
+
     /// JSON output
     #[arg(long)]
     pub json: bool,
@@ -32,10 +38,13 @@ pub fn run(args: CapacityArgs) -> Result<(), CliError> {
 
     let ghost = ghost_capacity(&img)?;
     let ghost_si = ghost_capacity_si(&img)?;
-    let armor = armor_capacity(&img)?;
     let shadow = estimate_shadow_capacity(&img)?;
 
-    let fortress = match armor_capacity_info(&jpeg_bytes) {
+    // Armor is measured on the cover `encode` would actually embed into.
+    let cover = prepare_image(&args.image, "armor", None, None, false, args.full_res)?;
+    let armor_img = JpegImage::from_bytes(&cover.jpeg_bytes)?;
+    let armor = armor_capacity(&armor_img)?;
+    let fortress = match armor_capacity_info(&cover.jpeg_bytes) {
         Ok(info) => info.fortress_capacity,
         Err(_) => 0,
     };
@@ -46,6 +55,7 @@ pub fn run(args: CapacityArgs) -> Result<(), CliError> {
         armor,
         fortress,
         shadow,
+        (cover.width, cover.height),
         args.mode.as_deref(),
         args.json,
     );

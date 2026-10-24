@@ -126,6 +126,18 @@ fn main() {
             // recovers the exact embedded message, so the decoder hook surface
             // is compatible.
             "f2caf62554ba3b2c81832be007f344ae73536541",
+            // 2026-10-24 (Pass-2 rebuild): sym_hook + mag_hook symbol
+            // recording + msac dispatch (hooked C decoders only while a
+            // sym_hook is registered). On phasm-stego.
+            // Bit-exact against phasm-rav1e recordings over 86 M symbols;
+            // hookless decode ~1.00x (interleaved A/B). Per
+            // dav1d-hook-sites.md § 11.
+            "2399d680b5f9708cf23404087bb587c805467acd",
+            // 2026-10-24 (Pass-2 rebuild hardening): dav1d_default_settings
+            // zeroes phasm_hooks, so a caller that skips zero-init cannot
+            // leave a stale sym_hook rerouting every msac decode. Same
+            // branch; pinned by default_settings_clears_phasm_hooks.
+            "acadfd78b7e066749696cb4f7012e049bc3450c2",
         ];
 
         // phasm-rav1e PINNED_SHAS (parallel pin list — documentation

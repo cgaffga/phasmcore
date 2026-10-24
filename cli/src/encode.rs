@@ -11,7 +11,7 @@ use phasm_core::{
     compressed_payload_size, ghost_encode_si_with_shadows_quality,
     ghost_encode_with_shadows_quality, armor_encode_with_quality,
     ghost_encode_si_with_files_quality, ghost_encode_with_files_quality,
-    EncodeQuality, FileEntry, ShadowLayer,
+    EncodeQuality, FileEntry, ShadowLayer, ARMOR_TARGET_DIMENSION,
 };
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -74,9 +74,15 @@ pub struct EncodeArgs {
     #[arg(long)]
     pub qf: Option<u8>,
 
-    /// Resize longest edge to max pixels
+    /// Resize longest edge to max pixels (Armor default: 1600)
     #[arg(long)]
     pub resize: Option<u32>,
+
+    /// Armor: keep the original resolution instead of the default 1600 px
+    /// cover re-encoded at QF65. The message still decodes, but will not
+    /// survive recompression or resizing (e.g. by messengers).
+    #[arg(long, conflicts_with = "resize")]
+    pub full_res: bool,
 
     /// Run texture-adaptive cover optimizer
     #[arg(long)]
@@ -122,9 +128,29 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
     // 4. Load primary file attachments
     let files = load_files(&args.attach)?;
 
-    // 5. Prepare image (format conversion, resize, optimize)
-    let prepared = prepare_image(&args.image, mode, args.qf, args.resize, args.optimize)?;
-    let deep_cover = prepared.raw_pixels.is_some();
+    if args.full_res && mode != "armor" {
+        return Err(CliError::InvalidArgs("--full-res applies to Armor only.".into()));
+    }
+
+    // 5. Prepare image (format conversion, resize, optimize; Armor's 1600 px cover)
+    let prepared = prepare_image(
+        &args.image, mode, args.qf, args.resize, args.optimize, args.full_res,
+    )?;
+    // Deep Cover is side-informed Ghost; Armor ignores the raw pixels.
+    let deep_cover = mode == "ghost" && prepared.raw_pixels.is_some();
+    if mode == "armor" && prepared.exceeds_armor_target() && !args.quiet {
+        let why = if args.full_res {
+            "--full-res".to_string()
+        } else {
+            format!("--resize {}", args.resize.unwrap_or_default())
+        };
+        eprintln!(
+            "warning: {why}: the Armor cover is {}x{}, larger than {ARMOR_TARGET_DIMENSION} px. \
+             The message decodes, but will not survive recompression or resizing \
+             (e.g. by messengers).",
+            prepared.width, prepared.height,
+        );
+    }
 
     // 6. Progress bar
     let progress_handle = if args.progress {
@@ -159,7 +185,12 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
     // 10. Display result
     let out_mode = output_mode(&args);
     let mode_name = if mode == "ghost" { "Ghost" } else { "Armor" };
-    output::print_encode_result(&output_path, &quality, deep_cover, mode_name, elapsed, out_mode);
+    let cover = output::CoverInfo {
+        source: (prepared.source_width, prepared.source_height),
+        encoded: (prepared.width, prepared.height),
+        qf: prepared.reencoded_qf,
+    };
+    output::print_encode_result(&output_path, &quality, deep_cover, mode_name, &cover, elapsed, out_mode);
 
     Ok(())
 }

@@ -11,7 +11,8 @@
 //! construction (encoder state never sees stego flips), so the
 //! provisional Pass 2 the OH264 path needs is elided. Pass 1
 //! produces both natural OBU bytes AND the cover the decoder will
-//! see; the cascade loop runs once-through.
+//! see; the cascade loop runs once-through, rebuilding each GOP's
+//! replay data from its cached natural packets (`rebuild`).
 //!
 //! Design: see
 //! `docs/design/video/av1/phase-c-wv-whole-video-shadow.md` § 3.2.
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use phasm_rav1e::color::ChromaSampling;
-use phasm_rav1e::ec::{PhasmFrameRecording, WriterEncoder};
+use phasm_rav1e::ec::{PhasmFrameLoopFilterState, PhasmFrameRecording, WriterEncoder};
 use phasm_rav1e::phasm_stego::{
     encode_gop_with_phasm_tee, make_frame, AcSignMeta,
     PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_GOLOMB_TAIL_LSB,
@@ -32,8 +33,9 @@ use phasm_rav1e::prelude::Sequence;
 use phasm_rav1e::EncoderConfig;
 
 /// Pass 1 cache budget — RAM + disk thresholds and the scratch-dir parent
-/// used by `av1_encode_with_shadows_streaming` to hold decoded per-GOP
-/// payloads between Pass 1 and the cascade re-encode.
+/// both encode paths use to hold each GOP's natural packets between Pass 1
+/// and Pass 2 (1–2.4 MB per 1080p GOP; Pass 2 rebuilds the rest with a
+/// dav1d decode).
 ///
 /// Callers construct this explicitly (`Pass1CacheBudget::new`) when they
 /// know device-aware budgets (iOS / Android bridges query device RAM +
@@ -43,8 +45,8 @@ use phasm_rav1e::EncoderConfig;
 /// Semantics are unchanged from the preceding env-driven form:
 ///   - `ram_bytes = 0`   → disable the RAM cache
 ///   - `disk_bytes = 0`  → disable the disk spill (V1 behaviour)
-///   - overflow past both tiers falls through to the pre-cache cascade
-///     (encoder re-encodes the GOP), so clips of any length still finish.
+///   - overflow past both tiers falls through to re-encoding the GOP from
+///     the source in Pass 2, so clips of any length still finish.
 #[derive(Debug, Clone)]
 pub struct Pass1CacheBudget {
     pub ram_bytes: usize,
@@ -113,9 +115,10 @@ impl Pass1CacheBudget {
 ///
 /// Override with `PHASM_AV1_SPEED=N` env var (0..=10) for experiments.
 /// The CLI exposes `--av1-speed N` which sets this env var. Used by:
-///   - `encode_gop_natural` (this file; Pass 1 + cascade re-encode)
-///   - `session::encode_one_keyframe` (single-frame GOP, no-shadow path)
-///   - `session::encode_one_gop_multi` (multi-frame GOP, no-shadow path)
+///   - `encode_gop_natural` (this file): every GOP of both encode paths,
+///     1-frame GOPs included — byte-identical to the retired single-frame
+///     keyframe primitive (checked 2026-10-24 at 64×64 … 1080p, noise and
+///     real content, before it was deleted)
 ///
 /// `multiref` defaults off (kept off for stealth-profile stability +
 /// the single-pass STC plan). The `PHASM_AV1_MULTIREF=1` env knob
@@ -154,18 +157,33 @@ pub(super) fn apply_phasm_av1_speed(config: &mut EncoderConfig) {
 /// Phasm AV1 production sequence-level settings.
 ///
 /// `enable_large_lru` default: **true** — matches rav1e's `Sequence`
-/// constructor default (`vendor/phasm-rav1e/src/encoder.rs:315`) and
-/// closes the only sequence-level divergence from rav1e CLI that the
-/// 2026-06-29 audit identified. Flipped on 2026-10-20 after the
-/// 2026-10-19 full-corpus audit confirmed the forensic axes are
-/// invariant under the flip (byte-identical BS/BL/Y/UV/INTER_MODE/
-/// MV_MAG histograms across all 4 fixtures). See
+/// constructor default (`vendor/phasm-rav1e/src/encoder.rs:315`).
+///
+/// Note: at phasm's shipping speed preset (speed=9), this field is
+/// INERT. rav1e's preset sets `speed_settings.lrf = false` for
+/// speed ≥ 8 (`vendor/phasm-rav1e/src/api/config/speedsettings.rs:170`),
+/// which propagates to `sequence.enable_restoration = false`
+/// (`vendor/phasm-rav1e/src/encoder.rs:313`). Every live consumer of
+/// `enable_large_lru` (`RestorationState::new` in `lrf.rs:1329`,
+/// `write_frame_lrf` in `header.rs:1121-1162`, per-SB `write_lrf` at
+/// `encoder.rs:3443-3450`) is gated on `enable_restoration`. With LRF
+/// off, nothing LRU-related reaches the bitstream regardless of this
+/// value.
+///
+/// Flipped on 2026-10-20 anyway because: (a) the 2026-10-19 full-corpus
+/// audit confirmed the forensic axes are invariant (byte-identical
+/// BS/BL/Y/UV/INTER_MODE/MV_MAG histograms across all 4 fixtures —
+/// unsurprising once we knew the knob is inert), (b) matching rav1e's
+/// constructor default removes a divergent explicit override, (c)
+/// future-proofs against any speed < 8 preset where LRF would turn on.
+/// Investigation that caught the "likely alignment win" framing error:
 /// `docs/design/video/av1/stealth-audit-perf-levers-verdict-2026-10-18.md`
-/// § 6.
+/// § 6 (corrected 2026-10-20).
 ///
 /// Override with `PHASM_AV1_LARGE_LRU=0` to force the pre-2026-10-20
-/// behaviour (useful inside experiment harnesses). `=1` is a no-op
-/// against the new default.
+/// explicit-false behaviour (useful inside experiment harnesses that
+/// want to pin the historical posture). `=1` is a no-op against the
+/// new default; and at speed=9 it is a no-op regardless.
 ///
 /// Called by every encoder construction site that builds a fresh
 /// `Sequence`.
@@ -186,7 +204,7 @@ use crate::codec::av1::stego::shadow::{
 };
 use crate::codec::av1::stego::writer::{replay_with_overrides, OverrideMap};
 use crate::stego::chunk_frame::{
-    build_chunk_frame_v3_1, build_first_chunk_frame_v3_1, split_message_into_chunks,
+    build_chunk_frame_v3_1, build_first_chunk_frame_v3_1,
 };
 use crate::stego::cost::av1_uniward::{
     compute_av1_uniward_costs_with_state, Av1FramePosition, FramePlanes,
@@ -195,11 +213,12 @@ use crate::stego::stc::embed::stc_embed;
 use crate::stego::stc::hhat;
 use crate::stego::{frame, payload};
 
-use super::orchestrator::{
-    av1_stego_embed_payload_bits, av1_stego_encode_one_gop, pack_visible_planes,
-    rebuild_obu_with_stego_tile_group, Av1StegoError,
+use super::encode_progress::{
+    Av1EncodePhase, Av1EncodeProgress, RecomputeForecast, WorkProgress, EMBED_WEIGHT,
 };
-use super::session::{encode_one_gop_multi, encode_one_keyframe};
+use super::orchestrator::{
+    pack_cost_planes, rebuild_obu_with_stego_tile_group, Av1StegoError,
+};
 
 const STC_H: usize = 7;
 
@@ -486,47 +505,68 @@ impl Av1GopYuvSource for Av1FileYuvSource {
     }
 }
 
+/// Shadow-occupied cover positions per GOP — wet for the primary STC, so
+/// the primary plan sizes each GOP net of them. `offsets` / `lens` are the
+/// per-GOP cover offsets into the union cover and the cover counts.
+fn shadow_wet_bits_per_gop(
+    shadow_states: &[Av1ShadowState],
+    offsets: &[usize],
+    lens: &[usize],
+) -> Vec<usize> {
+    let mut wet = vec![0usize; lens.len()];
+    for state in shadow_states {
+        for slot in state.positions.iter().take(state.n_total) {
+            // Last GOP starting at or before this position (later GOPs win
+            // ties, so empty GOPs sharing an offset are skipped).
+            let g = offsets.partition_point(|&o| o <= slot.cover_index).saturating_sub(1);
+            if slot.cover_index < offsets[g] + lens[g] {
+                wet[g] += 1;
+            }
+        }
+    }
+    wet
+}
+
 /// WV.7.5 — streaming entry point for the AV1 whole-video shadow encode.
 ///
 /// Production-shaped per-GOP streaming flow (no whole-clip
 /// `per_gop_natural[]` accumulator). Design B from the WV.7.4→7.5
 /// design analysis:
 ///
-/// **Pass 1** (once, parity-independent): pull each GOP's YUV from
-/// `source`, run `process_one_gop_pass1`, **keep** the harvest
-/// (~60 KB/GOP), **drop** the per-frame natural OBU bytes + recording
-/// (~5 MB/GOP) immediately. Total Pass-1 RAM: O(n_gops × 60 KB) ≈
-/// 108 MB at 30 min.
+/// **Pass 1** (once, parity-independent, [`run_pass1`]): pull each GOP's
+/// YUV from `source`, natural-encode it, count its cover bits
+/// and cache its natural packets (1–2.4 MB per 1080p GOP) in the bounded
+/// Pass-1 cache.
 ///
 /// **Cascade** (per parity tier, retried until verify passes):
 /// 1. Re-run the shadow position sweep over the cached `cover_lens`
 ///    (no encode work — sweep is heap operations only). Yields
 ///    per-shadow `Av1ShadowState` for THIS parity tier.
-/// 2. For each GOP: `source.gop_yuv(g)` → `process_one_gop_pass1`
-///    → `cascade_one_gop` with the cached harvest + freshly-encoded
-///    natural+recording → emit per-GOP bytes → DROP the per-GOP
-///    natural+recording before advancing.
-/// 3. Verify the assembled clip via `harvest_cover_bits_from_stego`
-///    + per-shadow `av1_shadow_extract`; on success return; on
-///    failure advance to the next parity tier (and re-run the
-///    per-GOP encode + cascade loop from scratch).
+/// 2. For each GOP: rebuild its recordings + harvest from the cached
+///    packets with one dav1d decode ([`pass1_entry_for`]; a GOP over the
+///    cache budget is re-encoded from `source` instead) →
+///    `cascade_one_gop` → emit per-GOP bytes → drop the entry before
+///    advancing.
+/// 3. Verify the assembled clip per GOP (`Av1StreamingShadowVerify`); on
+///    success return; on failure advance to the next parity tier.
 ///
-/// **Memory at 30 min × 1080p × 8 shadows (Design B target):**
-/// `current_gop_yuv` (~93 MB) + `per_gop_harvests` cache (~108 MB)
-/// + rav1e encode transient (~500 MB peak) + cascade scratch
-/// (~3 MB) + output Vec (~1.1 GB — O(clip)) ⇒ **~1.7 GB peak**.
-/// Streaming the output to a sink (a follow-on after this commit)
-/// drops the last term and gets us to ~625 MB — mobile-safe.
+/// **Memory at 30 min × 1080p × 8 shadows:** one GOP's YUV (~93 MB, Pass
+/// 1 and re-encodes only) + rav1e encode transient (~500 MB peak, Pass 1)
+/// + one GOP's rebuild + windowed harvest in Pass 2 (~470 MB peak at
+/// 1080p, measured 2026-10-24) + the Pass-1 cache
+/// (bounded by `Pass1CacheBudget`, ~1–2.4 MB per GOP) + output Vec
+/// (~1.1 GB — O(clip)).
 ///
-/// **Wall cost:** Pass 1 = 1× per-GOP encode total. Cascade = 1× per
-/// per-GOP per parity tier. First-tier-success (common): 2×
-/// per-GOP encode total. Worst case (5-tier cascade): 6×. Vs current
-/// whole-clip path's 1× encode.
+/// **Wall cost:** Pass 1 = 1× per-GOP encode total. Each cascade tier adds
+/// ~4–5 % of that per cached GOP (decode + harvest + STC + replay; see
+/// `encode_progress::EMBED_WEIGHT`) and a full encode per GOP the cache
+/// could not hold.
 ///
 /// The shadow priority is position-local + parity-independent (only
 /// `n_total` changes per tier — the priority order over the union
-/// cover is fixed by `perm_seed`). So Pass 1's harvest cache is
-/// reusable across all parity tiers; only the heap capacity changes.
+/// cover is fixed by `perm_seed`). So Pass 1's packet cache serves every
+/// parity tier; each tier rebuilds and harvests its GOPs again, and only
+/// the heap capacity changes.
 pub fn av1_encode_with_shadows_streaming(
     source: &mut dyn Av1GopYuvSource,
     n_frames: u32,
@@ -549,7 +589,13 @@ pub fn av1_encode_with_shadows_streaming(
             "av1_encode_with_shadows_streaming: n_frames == 0".into(),
         ));
     }
-    let frame_size = expected_i420_size(params.width, params.height);
+    // Refuse what no decoder will read back, before Pass 1 spends a full
+    // natural encode on it.
+    if primary_framed.len() > frame::VIDEO_MAX_FRAME_BYTES {
+        return Err(Av1StegoError::Stego(
+            crate::stego::error::StegoError::MessageTooLarge,
+        ));
+    }
     let gop_size = params.gop_size.max(1);
     let n_gops = n_frames.div_ceil(gop_size);
     let n_gops_usize = n_gops as usize;
@@ -561,27 +607,9 @@ pub fn av1_encode_with_shadows_streaming(
         end - start
     };
 
-    // ── Helper: validate a GOP YUV pulled from `source`.
-    let validate_gop_yuv =
-        |gop_idx: u32, yuv: &[u8]| -> Result<(), Av1StegoError> {
-            let expected = (frames_in_gop(gop_idx) as usize) * frame_size;
-            if yuv.len() != expected {
-                return Err(Av1StegoError::InvalidPacket(format!(
-                    "av1_encode_with_shadows_streaming: GOP {gop_idx} source \
-                     returned {} bytes, expected {} ({} frames × {} B)",
-                    yuv.len(),
-                    expected,
-                    frames_in_gop(gop_idx),
-                    frame_size,
-                )));
-            }
-            Ok(())
-        };
-
-    // ── Pass 1: per-GOP encode → harvest only. Drops natural+recording
-    // immediately. RAM held after Pass 1 = sum of GopHarvests (~60 KB
-    // × n_gops). The natural+recording (~5 MB/GOP) is freed
-    // gop-by-gop.
+    // ── Pass 1 (`run_pass1`): per-GOP natural encode; each GOP's natural
+    // packets go to the bounded Pass-1 cache, and only the per-GOP cover
+    // counts stay in RAM outside it.
     //
     // `source.rewind()` is mandatory before the first `gop_yuv` call:
     // stateful sources (AVAssetReader, MediaCodec, ffmpeg pipe) need
@@ -596,108 +624,15 @@ pub fn av1_encode_with_shadows_streaming(
             shadows.len(), shadow_parity_len_floor,
         );
     }
-    // Perf #1 V2 (2026-10-18) — Pass 1 cache with disk spill.
-    //
-    // The cascade loop below re-encodes every GOP via
-    // `encode_gop_natural` purely to recover the per-frame
-    // `(natural_packet, PhasmFrameRecording)` pair that Pass 1
-    // already produced and dropped. Tier-N re-encode is
-    // deterministic + bit-identical to Pass 1's. Caching
-    // per_frame lets cascade skip the rav1e call entirely —
-    // ~2× wall speedup on first-tier-success.
-    //
-    // **Arbitrary clip length — two-tier budget.** Short clips
-    // fit entirely in RAM (`pass1_cache_budget.ram_bytes`).
-    // When RAM is exhausted, overflow spills to disk
-    // (`pass1_cache_budget.disk_bytes`) under a session-unique
-    // scratch dir inside `pass1_cache_budget.scratch_parent`
-    // (which the caller selects — CLI/dev defaults preserve the
-    // 500 MB / 8 GB / `temp_dir()` behaviour via
-    // `Pass1CacheBudget::from_env_or_default`; mobile bridges
-    // pass device-aware budgets). The scratch dir is
-    // `remove_dir_all`'d on `Pass1Cache` drop. When BOTH budgets
-    // are exhausted the overflow GOP falls through to the
-    // pre-cache behaviour (cascade re-encodes it) — the encoder
-    // therefore works on clips of any length; truly massive clips
-    // just see diminishing returns past the combined budget.
-    //
-    // `ram_bytes = 0` disables the RAM cache; `disk_bytes = 0`
-    // disables the disk spill (= V1 behaviour).
-    let pass1_cache_ram_budget = pass1_cache_budget.ram_bytes;
-    let pass1_cache_disk_budget = pass1_cache_budget.disk_bytes;
-    let pass1_cache_scratch_parent = pass1_cache_budget.scratch_parent.clone();
-    let mut pass1_cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Payload>::new(
-        n_gops_usize,
-        pass1_cache_ram_budget,
-        pass1_cache_disk_budget,
-        pass1_cache_scratch_parent.clone(),
-        AV1_PASS1_CACHE_TAG,
-    );
-    // Reclaim debris from a run that was killed mid-encode: `Drop` never runs
-    // under `panic = "abort"`, jetsam or SIGKILL. Own-pid exempt, tag-scoped,
-    // age-guarded — see `gop_cache::sweep_orphans`.
-    crate::stego::gop_cache::sweep_orphans(
-        &pass1_cache_scratch_parent,
-        AV1_PASS1_CACHE_TAG,
-        crate::stego::gop_cache::ORPHAN_MAX_AGE,
-    );
+    // Pass 2 rebuilds each tier's per-GOP recordings and harvest from the
+    // cached packets (one dav1d decode per GOP) instead of re-encoding;
+    // only a GOP over both budgets of `pass1_cache_budget` (RAM, then a
+    // scratch-dir spill) is re-encoded from the source. See the "Pass 1 →
+    // Pass 2" section below.
+    let (mut pass1_cache, per_gop_cover_lens) =
+        run_pass1(source, n_frames, params, &pass1_cache_budget, &mut |_, _| {})?;
 
-    let t_pass1 = std::time::Instant::now();
-    source.rewind()?;
-    let mut per_gop_harvests: Vec<GopHarvest> = Vec::with_capacity(n_gops_usize);
-    let mut p1_sum_pull = std::time::Duration::ZERO;
-    let mut p1_sum_proc = std::time::Duration::ZERO;
-    for gop_idx in 0..n_gops {
-        let t_pull = std::time::Instant::now();
-        let gop_yuv = source.gop_yuv(gop_idx)?;
-        let pull_dt = t_pull.elapsed();
-        p1_sum_pull += pull_dt;
-        validate_gop_yuv(gop_idx, &gop_yuv)?;
-        let t_proc = std::time::Instant::now();
-        let (per_frame, harvest) =
-            process_one_gop_pass1(&gop_yuv, frames_in_gop(gop_idx), params)?;
-        let proc_dt = t_proc.elapsed();
-        p1_sum_proc += proc_dt;
-        if prof {
-            eprintln!(
-                "[AV1_PROF SHADOW] Pass1 gop {}: pull={:?}, encode+harvest={:?}, cover_bits={}",
-                gop_idx, pull_dt, proc_dt, harvest.cover_bits.len(),
-            );
-        }
-        // Perf #1 V2 — Pass1Cache stores in RAM, spills to disk
-        // when RAM is exhausted, overflows to None (re-encode in
-        // cascade) when both budgets are exhausted.
-        // Infallible: failing to cache must never fail an encode.
-        pass1_cache.insert(gop_idx as usize, per_frame);
-        per_gop_harvests.push(harvest);
-    }
-    if prof {
-        eprintln!(
-            "[AV1_PROF SHADOW] Pass1 cache: {} RAM / {} disk / {} overflow (of {} GOPs); \
-             {} MB RAM used, {} MB disk used; budgets {} / {} MB",
-            pass1_cache.stats().cached_in_ram,
-            pass1_cache.stats().spilled_to_disk,
-            pass1_cache.stats().overflowed,
-            n_gops_usize,
-            pass1_cache.stats().ram_used / (1024 * 1024),
-            pass1_cache.stats().disk_used / (1024 * 1024),
-            pass1_cache_ram_budget / (1024 * 1024),
-            pass1_cache_disk_budget / (1024 * 1024),
-        );
-    }
-    if prof {
-        eprintln!(
-            "[AV1_PROF SHADOW] Pass1 TOTAL: {:?}, sum_pull={:?}, sum_proc={:?}",
-            t_pass1.elapsed(), p1_sum_pull, p1_sum_proc,
-        );
-    }
-
-    // Per-GOP cover offsets into the union (= prefix sum of harvest
-    // cover_bits.len()).
-    let per_gop_cover_lens: Vec<usize> = per_gop_harvests
-        .iter()
-        .map(|h| h.cover_bits.len())
-        .collect();
+    // Per-GOP cover offsets into the union (= prefix sum of cover lens).
     let mut per_gop_cover_offsets: Vec<usize> = Vec::with_capacity(n_gops_usize);
     let mut offset = 0usize;
     for &n in &per_gop_cover_lens {
@@ -720,8 +655,6 @@ pub fn av1_encode_with_shadows_streaming(
         )));
     }
     let total_message_bytes = primary_framed.len() as u32;
-    let chunks = split_message_into_chunks(primary_framed, total_chunks)
-        .map_err(Av1StegoError::Stego)?;
 
     let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
         .map_err(Av1StegoError::Stego)?;
@@ -729,8 +662,9 @@ pub fn av1_encode_with_shadows_streaming(
         .try_into()
         .expect("derive_structural_key returns 64 bytes");
 
-    // Parity-tier cascade. Each tier re-runs the per-GOP re-encode
-    // because the per-GOP natural+recording was dropped after Pass 1.
+    // Parity-tier cascade. Each tier re-runs Pass 2 from the Pass-1
+    // cache, with its own primary plan (the shadow positions it adds are
+    // wet for the primary STC).
     let parity_tiers: Vec<usize> = AV1_SHADOW_PARITY_TIERS
         .iter()
         .copied()
@@ -787,147 +721,184 @@ pub fn av1_encode_with_shadows_streaming(
             .map(|(pre, positions)| finalize_shadow_state_av1(pre, positions))
             .collect();
 
-        // WV.7.6 — streaming verify: as each GOP emits, walk its
-        // bytes via dav1d, push the harvested cover bits (with global
-        // cover_index) into per-shadow Av1ShadowBitTopN heaps. After
-        // all GOPs, finish() drains heaps + runs RS-decode + AES auth
-        // per shadow. No whole-clip cover_bits / priority_slots Vec
-        // materialised — drops ~55 GB of verify-time RAM at 30 min
-        // vs the legacy verify_shadows_round_trip path.
-        let mut streaming_verify = Av1StreamingShadowVerify::new(
-            pre_selections_for_verify,
-            passphrases_for_verify,
-        );
+        // Primary plan for THIS tier: each GOP's capacity net of the
+        // shadow positions it holds (wet for the primary STC). A higher
+        // tier only adds wet positions, so a primary that does not fit
+        // here fits no later tier either — `plan_primary`'s
+        // `MessageTooLarge` ends the encode.
+        let wet = shadow_wet_bits_per_gop(&shadow_states, &per_gop_cover_offsets, &per_gop_cover_lens);
+        let mut caps = super::primary_plan::gop_primary_caps(&per_gop_cover_lens, &wet);
+        let mut attempts = 0usize;
+        let tier_output = loop {
+            let mut plan = super::primary_plan::plan_primary(&caps, primary_framed.len())?;
+            attempts += 1;
 
-        // Per-GOP re-encode + cascade. Source rewind: the contract
-        // is that `gop_yuv(g)` is callable with monotonically
-        // increasing `g` within a sweep, and `rewind()` restarts the
-        // forward stream for the next sweep.
-        let t_cascade = std::time::Instant::now();
-        source.rewind()?;
-        let mut output: Vec<u8> = Vec::new();
-        let mut encode_ok = true;
-        let mut c_sum_pull = std::time::Duration::ZERO;
-        let mut c_sum_encode = std::time::Duration::ZERO;
-        let mut c_sum_cascade = std::time::Duration::ZERO;
-        let mut c_sum_verify = std::time::Duration::ZERO;
-        for gop_idx in 0..n_gops {
-            let t_pull = std::time::Instant::now();
-            let gop_yuv = source.gop_yuv(gop_idx)?;
-            let pull_dt = t_pull.elapsed();
-            c_sum_pull += pull_dt;
-            validate_gop_yuv(gop_idx, &gop_yuv)?;
-            // WV.7.7 — skip the J-UNIWARD harvest in Sweep B. Pass 1
-            // already cached `per_gop_harvests[gop_idx]` (parity-
-            // independent — perm_seed determines priority, parity_len
-            // only changes heap capacity which we re-run via the
-            // sweep). `cascade_one_gop` reads the cached harvest's
-            // cover_bits + costs + combined_index, so the fresh
-            // harvest would be discarded anyway. Calling
-            // `encode_gop_natural` directly skips the per-frame
-            // `compute_av1_uniward_costs_with_state` walk (~0.1-0.3 s
-            // per 1080p GOP) — ~10-20% wall savings on the streaming
-            // encode at long-clip scale.
-            // Perf #1 V2 — fetch from Pass1Cache; miss (over budget
-            // or disk I/O error) falls back to `encode_gop_natural`
-            // (= pre-cache behaviour).
-            let gop_idx_usize = gop_idx as usize;
-            let t_enc = std::time::Instant::now();
-            let per_frame_owned: Vec<(Vec<u8>, PhasmFrameRecording<u8>)> =
-                match pass1_cache.fetch(gop_idx_usize) {
-                    Some(frames) => frames,
-                    // A miss — never cached, over budget, or an unreadable
-                    // spill — recomputes and is byte-identical.
-                    None => encode_gop_natural(
-                        &gop_yuv,
-                        frames_in_gop(gop_idx),
-                        params,
-                    )?,
-                };
-            let per_frame: &Vec<(Vec<u8>, PhasmFrameRecording<u8>)> = &per_frame_owned;
-            let enc_dt = t_enc.elapsed();
-            c_sum_encode += enc_dt;
-            let inputs = Av1CascadeGopInputs {
-                gop_idx: gop_idx_usize,
-                gop_offset: per_gop_cover_offsets[gop_idx_usize],
-                gop_n: per_gop_cover_lens[gop_idx_usize],
-                harvest: &per_gop_harvests[gop_idx_usize],
-                frames: per_frame,
-            };
-            let shared = Av1CascadeGopShared {
-                chunks: &chunks,
-                total_message_bytes,
-                shadow_states: &shadow_states,
-                hhat_seed: &hhat_seed,
-            };
-            let t_casc = std::time::Instant::now();
-            let cascade_result = cascade_one_gop(inputs, shared)?;
-            let casc_dt = t_casc.elapsed();
-            c_sum_cascade += casc_dt;
-            match cascade_result {
-                Some(per_gop_bytes) => {
-                    let t_ver = std::time::Instant::now();
-                    streaming_verify.push_gop_bytes(&per_gop_bytes)?;
-                    let ver_dt = t_ver.elapsed();
-                    c_sum_verify += ver_dt;
-                    if prof {
-                        eprintln!(
-                            "[AV1_PROF SHADOW] Cascade gop {}: pull={:?}, encode={:?}, cascade={:?}, verify_push={:?}, packet={} B",
-                            gop_idx, pull_dt, enc_dt, casc_dt, ver_dt, per_gop_bytes.len()
-                        );
-                    }
-                    output.extend_from_slice(&per_gop_bytes);
-                }
-                None => {
-                    if prof {
-                        eprintln!(
-                            "[AV1_PROF SHADOW] Cascade gop {}: cascade returned None — tier failed",
-                            gop_idx
-                        );
-                    }
-                    encode_ok = false;
-                    break;
-                }
-            }
-        }
-
-        if !encode_ok {
-            if prof {
-                eprintln!(
-                    "[AV1_PROF SHADOW] Tier parity_len={} FAILED in {:?}",
-                    parity_len, t_tier.elapsed()
-                );
-            }
-            continue;
-        }
-        let t_verfin = std::time::Instant::now();
-        let ok = streaming_verify.finish();
-        let verfin_dt = t_verfin.elapsed();
-        if prof {
-            eprintln!(
-                "[AV1_PROF SHADOW] Tier parity_len={} cascade_total={:?}, sum_pull={:?}, sum_encode={:?}, sum_cascade={:?}, sum_verify_push={:?}, verify_finish={:?} → ok={}",
-                parity_len, t_cascade.elapsed(),
-                c_sum_pull, c_sum_encode, c_sum_cascade, c_sum_verify, verfin_dt, ok,
+            // WV.7.6 — streaming verify: as each GOP emits, walk its
+            // bytes via dav1d, push the harvested cover bits (with global
+            // cover_index) into per-shadow Av1ShadowBitTopN heaps. After
+            // all GOPs, finish() drains heaps + runs RS-decode + AES auth
+            // per shadow. No whole-clip cover_bits / priority_slots Vec
+            // materialised — drops ~55 GB of verify-time RAM at 30 min
+            // vs the legacy verify_shadows_round_trip path. One verifier
+            // per sweep: a re-planned sweep starts it afresh.
+            let mut streaming_verify = Av1StreamingShadowVerify::new(
+                pre_selections_for_verify.clone(),
+                passphrases_for_verify.clone(),
             );
-        }
-        if ok {
-            if prof {
-                let cs = pass1_cache.stats();
-                let hits = cs.ram_hits.saturating_add(cs.disk_hits);
-                let total_lookups = hits.saturating_add(cs.misses);
-                let hit_pct = if total_lookups > 0 {
-                    (hits as f64 * 100.0) / (total_lookups as f64)
-                } else {
-                    0.0
+
+            // Per-GOP cascade. The source is only read for a GOP the
+            // Pass-1 cache could not hold; a fresh puller per sweep restarts
+            // it from GOP 0 (the source contract).
+            let t_cascade = std::time::Instant::now();
+            let mut puller = LazyGopPuller::new(&mut *source);
+            let mut output: Vec<u8> = Vec::new();
+            let mut sent = 0usize;
+            let mut replan = false;
+            let mut c_sum_entry = std::time::Duration::ZERO;
+            let mut c_sum_cascade = std::time::Duration::ZERO;
+            let mut c_sum_verify = std::time::Duration::ZERO;
+            for gop_idx in 0..n_gops {
+                // A cancel stops before the next GOP's rebuild or re-encode.
+                crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
+                // The GOP's entry — rebuilt from its cached natural packets,
+                // or re-encoded on a miss — carries the frames and the
+                // J-UNIWARD harvest. Both are parity-independent (perm_seed
+                // fixes the shadow priority; parity_len only changes heap
+                // capacity, re-run via the sweep), so every tier reuses
+                // Pass 1's cache.
+                let g = gop_idx as usize;
+                let t_entry = std::time::Instant::now();
+                let (entry, _) = pass1_entry_for(
+                    &mut pass1_cache,
+                    &mut puller,
+                    frames_in_gop(gop_idx),
+                    params,
+                    gop_idx,
+                    per_gop_cover_lens[g],
+                )?;
+                let entry_dt = t_entry.elapsed();
+                c_sum_entry += entry_dt;
+
+                // Every GOP runs the cascade — it also stamps the shadow
+                // bits — so once the primary is complete the GOP carries a
+                // header-only chunk the decoder never reaches.
+                let planned = if sent == primary_framed.len() { 0 } else { plan[g] };
+                let mut want = planned;
+                let t_casc = std::time::Instant::now();
+                let cascade_result = loop {
+                    let inputs = Av1CascadeGopInputs {
+                        gop_idx: g,
+                        gop_offset: per_gop_cover_offsets[g],
+                        gop_n: per_gop_cover_lens[g],
+                        harvest: &entry.harvest,
+                        frames: &entry.frames,
+                        chunk: &primary_framed[sent..sent + want],
+                    };
+                    let shared = Av1CascadeGopShared {
+                        total_message_bytes,
+                        shadow_states: &shadow_states,
+                        hhat_seed: &hhat_seed,
+                    };
+                    if let Some(bytes) = cascade_one_gop(inputs, shared)? {
+                        break Some(bytes);
+                    }
+                    // `stc_embed` also returns `None` when the user cancelled;
+                    // that is not a capacity signal, so never learn from it.
+                    crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
+                    if want == 0 {
+                        break None;
+                    }
+                    want = super::primary_plan::shrink_step(want);
                 };
+                let casc_dt = t_casc.elapsed();
+                c_sum_cascade += casc_dt;
+                let Some(per_gop_bytes) = cascade_result else {
+                    // Not even a header-only chunk fits. Every GOP of a
+                    // shadow encode carries a chunk (the cascade also stamps
+                    // its shadow bits), and higher parity tiers only add wet
+                    // positions — no plan and no tier can succeed.
+                    return Err(Av1StegoError::InvalidPacket(format!(
+                        "GOP {gop_idx} has too little cover ({} bits) to carry a chunk frame; \
+                         shadow messages need every GOP to hold one",
+                        per_gop_cover_lens[g]
+                    )));
+                };
+                let t_ver = std::time::Instant::now();
+                streaming_verify.push_gop_bytes(&per_gop_bytes)?;
+                let ver_dt = t_ver.elapsed();
+                c_sum_verify += ver_dt;
+                if prof {
+                    eprintln!(
+                        "[AV1_PROF SHADOW] Cascade gop {}: entry={:?}, cascade={:?}, verify_push={:?}, packet={} B, chunk={want}/{planned} B",
+                        gop_idx, entry_dt, casc_dt, ver_dt, per_gop_bytes.len()
+                    );
+                }
+                output.extend_from_slice(&per_gop_bytes);
+                sent += want;
+                if want < planned {
+                    // Learned: this GOP carries less than planned. Carry the
+                    // shortfall forward, or re-plan the whole message.
+                    super::primary_plan::learn_cap(&mut caps, g, Some(want));
+                    match super::primary_plan::replan_from(&caps, g + 1, primary_framed.len() - sent) {
+                        Some(rest) => plan[g + 1..].copy_from_slice(&rest),
+                        None => {
+                            replan = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if replan || sent != primary_framed.len() {
+                if attempts >= MAX_PRIMARY_PASSES {
+                    return Err(super::primary_plan::message_too_large(&caps, primary_framed.len()));
+                }
+                if prof {
+                    eprintln!("[AV1_PROF SHADOW] Tier parity_len={parity_len}: re-planning the primary");
+                }
+                continue;
+            }
+            let t_verfin = std::time::Instant::now();
+            let ok = streaming_verify.finish();
+            let verfin_dt = t_verfin.elapsed();
+            if prof {
                 eprintln!(
-                    "[AV1_PROF SHADOW] TOTAL: {:?}, output={} B (succeeded at tier parity_len={}); \
-                     pass1_cache ram_hits={} disk_hits={} misses={} ({:.1}% hit)",
-                    t_total.elapsed(), output.len(), parity_len,
-                    cs.ram_hits, cs.disk_hits, cs.misses, hit_pct,
+                    "[AV1_PROF SHADOW] Tier parity_len={} cascade_total={:?}, sum_entry={:?}, sum_cascade={:?}, sum_verify_push={:?}, verify_finish={:?} → ok={}",
+                    parity_len, t_cascade.elapsed(),
+                    c_sum_entry, c_sum_cascade, c_sum_verify, verfin_dt, ok,
                 );
             }
-            return Ok(output);
+            break ok.then_some(output);
+        };
+
+        match tier_output {
+            Some(output) => {
+                if prof {
+                    let cs = pass1_cache.stats();
+                    let hits = cs.ram_hits.saturating_add(cs.disk_hits);
+                    let total_lookups = hits.saturating_add(cs.misses);
+                    let hit_pct = if total_lookups > 0 {
+                        (hits as f64 * 100.0) / (total_lookups as f64)
+                    } else {
+                        0.0
+                    };
+                    eprintln!(
+                        "[AV1_PROF SHADOW] TOTAL: {:?}, output={} B (succeeded at tier parity_len={}); \
+                         pass1_cache ram_hits={} disk_hits={} misses={} ({:.1}% hit)",
+                        t_total.elapsed(), output.len(), parity_len,
+                        cs.ram_hits, cs.disk_hits, cs.misses, hit_pct,
+                    );
+                }
+                return Ok(output);
+            }
+            None => {
+                if prof {
+                    eprintln!(
+                        "[AV1_PROF SHADOW] Tier parity_len={} FAILED in {:?}",
+                        parity_len, t_tier.elapsed()
+                    );
+                }
+            }
         }
     }
 
@@ -936,230 +907,296 @@ pub fn av1_encode_with_shadows_streaming(
     ))
 }
 
+/// Most Pass-2 sweeps one [`av1_encode_streaming`] runs: the first, plus a
+/// re-plan each time a sweep learns that a GOP carries less than planned
+/// and the shortfall cannot be carried forward. Every re-plan lowers at
+/// least one GOP's capacity, so this only bounds pathological clips —
+/// they end in `MessageTooLarge`.
+///
+/// Each sweep rebuilds every cached GOP it embeds (a dav1d decode +
+/// harvest, a few % of its encode) but re-encodes — a full rav1e pass — any
+/// GOP the Pass-1 cache could not hold. On an overflowing cache the bound
+/// therefore matters for time: up to this many re-encodes of those GOPs.
+const MAX_PRIMARY_PASSES: usize = 8;
+
 /// MOBOOM.T3.1 — streaming AV1 encode for the NO-SHADOW case.
 ///
 /// Sibling of [`av1_encode_with_shadows_streaming`] for clips without
-/// shadow embedding. Drives an [`Av1GopYuvSource`]: for each GOP the
-/// source delivers tight-I420 YUV in a fast burst, the function runs
-/// one rav1e encode + chunk_frame STC override, emits the GOP's stego
-/// bytes, drops the YUV. **No cascade tier loop, no streaming verify,
-/// no harvest cache** — none of that infrastructure is needed because
-/// there are no shadow bits to embed.
+/// shadow embedding, driving an [`Av1GopYuvSource`] that delivers each
+/// GOP's tight-I420 YUV in a fast burst between rav1e calls (so
+/// AVAssetReader / MediaCodec reads never interleave with an encode —
+/// the T3.1 "Operation Interrupted" fix).
 ///
-/// **Why this exists.** The legacy no-shadow encode path
-/// (`Av1StreamingEncodeSession::push_frame` → `drain_one_gop`) is
-/// driven by the *caller* pulling one frame at a time from
-/// `AVAssetReader` / `MediaCodec` and pushing it into a session that
-/// only emits OBU bytes at GOP boundaries. AVFoundation reads happen
-/// interleaved with multi-second rav1e calls on the same thread —
-/// AVAssetReader marks the session interrupted under that read
-/// cadence, surfacing as `MediaPlaneExtractorError.readerFailed("Operation Interrupted")`
-/// on cgPhone testing. The shadow-WV streaming entry already uses the
-/// pull-source pattern (reads happen in fast per-GOP bursts between
-/// rav1e calls); this entry brings the no-shadow case onto the same
-/// architecture so AVFoundation reads are no longer interleaved.
+/// **Two passes, proportional primary (2026-10-23).** Pass 1
+/// ([`run_pass1`]) natural-encodes every GOP once, caching its natural
+/// packets in the bounded Pass-1 cache and counting its exact cover. The primary is then planned per GOP in proportion to that
+/// cover ([`primary_plan`](super::primary_plan)), and Pass 2 embeds each
+/// GOP after rebuilding its replay data and harvest from the cached packets
+/// with one dav1d decode ([`pass1_entry_for`], 2026-10-24). Until 2026-10-23 this entry split the primary
+/// evenly in a single pass, so a GOP with little cover — almost always the
+/// trailing partial GOP — was asked for a full share and the encode failed
+/// there after every earlier GOP was done; measured in
+/// `docs/design/video/av1/capacity-split-and-payload-limits-2026-10-23.md`.
+/// The encode work is one natural encode per GOP plus a decode per GOP. A message larger than the measured capacity is
+/// refused after Pass 1, before any embed.
 ///
-/// **Byte-identity with the legacy push-session.** For a given
-/// (passphrase, primary_framed, params) tuple this function produces
-/// **bit-for-bit identical output** to driving an
-/// `Av1StreamingEncodeSession` push-frame loop over the same YUV at
-/// the same `params.gop_size`. See `av1_no_shadow_streaming_byte_identical.rs`
-/// for the gate. The per-GOP encode primitives (`encode_one_keyframe`,
-/// `encode_one_gop_multi`) and the stego embed primitives
-/// (`av1_stego_embed_payload_bits`, `av1_stego_encode_one_gop`) are
-/// called in the same order with the same arguments.
+/// If a GOP's STC is infeasible despite the plan (the payload ratio is an
+/// estimate), its chunk shrinks step by step and the shortfall is
+/// re-planned over the later GOPs; only a shortfall nothing can absorb is
+/// `MessageTooLarge`. GOPs after the message is complete are emitted
+/// natural — the decoder stops once it has `total_message_bytes`.
 ///
-/// `primary_framed` is the encrypt + `frame::build_frame` output for
-/// the primary message (same contract as the shadow streaming entry —
-/// the caller does crypto::encrypt + frame::build_frame upstream).
+/// `primary_framed` is the encrypt + `frame::build_frame` output for the
+/// primary message (the caller frames it, as for the shadow entry).
+/// `on_progress` gets an [`Av1EncodeProgress`] after every GOP of each pass:
+/// the phase, the GOP, and a whole-encode fraction proportional to the work
+/// (`encode_progress`) — Pass 2 costs a few % of Pass 1 per cached GOP
+/// (rebuild + embed) but a full re-encode per GOP the cache could not hold,
+/// which is forecast while Pass 1 fills the cache. The fraction never decreases and is 1.0 only on
+/// the final event.
 ///
-/// **Memory profile.** Per-GOP transient: one GOP's YUV (~90 MB at
-/// 1080p × gop=30) + one rav1e encode state (~120 MB at 1080p) — both
-/// dropped between GOPs. Persistent: the output Vec accumulating stego
-/// OBU bytes across all GOPs (O(clip) — same as today). At 30 min ×
-/// 1080p the output term is ~1 GB; dropping that to true streaming
-/// requires a GOP-incremental muxer and is future work.
+/// **Memory profile.** Per-GOP transient: Pass 1 one GOP's YUV (~90 MB at
+/// 1080p × gop=30) + one rav1e encode state (~120 MB); Pass 2 one GOP's
+/// rebuild + windowed harvest (~470 MB peak at 1080p, ~1.0 GB at
+/// 2720×1530; `HARVEST_WINDOW`). Between the passes: the Pass-1 cache of natural
+/// packets, bounded by `pass1_cache_budget` (spills to disk, then
+/// re-encodes). Pass 2 reads the source only for GOPs it re-encodes. Persistent: the output Vec of stego OBU bytes (O(clip);
+/// ~1 GB at 30 min × 1080p — true streaming needs a GOP-incremental muxer).
 pub fn av1_encode_streaming(
     source: &mut dyn Av1GopYuvSource,
     n_frames: u32,
     params: Av1StreamingEncodeParams,
     primary_framed: &[u8],
     primary_passphrase: &str,
-    // Optional 0.0–1.0 progress sink, ticked once per GOP after that
-    // GOP's stego encode completes. Mirror of H.264's
-    // `h264_encode_with_shadows_streaming` `progress` parameter. The
-    // no-shadow streaming entry is a single forward pass, so the
-    // emitted fraction is simply `(gop_idx + 1) / n_gops`.
-    mut on_progress: Option<&mut dyn FnMut(f32)>,
+    pass1_cache_budget: Pass1CacheBudget,
+    mut on_progress: Option<&mut dyn FnMut(Av1EncodeProgress)>,
 ) -> Result<Vec<u8>, Av1StegoError> {
     if n_frames == 0 {
         return Err(Av1StegoError::InvalidPacket(
             "av1_encode_streaming: n_frames == 0".into(),
         ));
     }
-    let frame_size = expected_i420_size(params.width, params.height);
-    let gop_size = params.gop_size.max(1);
-    let n_gops = n_frames.div_ceil(gop_size);
-
-    // Per-GOP frame count helper. The trailing GOP may be partial.
-    let frames_in_gop = |gop_idx: u32| -> u32 {
-        let start = gop_idx * gop_size;
-        let end = (start + gop_size).min(n_frames);
-        end - start
-    };
-
-    let validate_gop_yuv = |gop_idx: u32, yuv: &[u8]| -> Result<(), Av1StegoError> {
-        let expected = (frames_in_gop(gop_idx) as usize) * frame_size;
-        if yuv.len() != expected {
-            return Err(Av1StegoError::InvalidPacket(format!(
-                "av1_encode_streaming: GOP {gop_idx} source returned {} bytes, \
-                 expected {} ({} frames × {} B)",
-                yuv.len(),
-                expected,
-                frames_in_gop(gop_idx),
-                frame_size,
-            )));
-        }
-        Ok(())
-    };
-
-    // Bound + cap the chunk count. Mirror of the session's
-    // `derived_total_gops`/`total_chunks` math, simplified: every GOP
-    // is a stego GOP (no `plan_safe_balanced` concentrate-tail in v1
-    // of this entry — if MessageTooLarge surfaces, threading per-GOP
-    // allocation through is the follow-on).
-    if n_gops == 0 || n_gops > u16::MAX as u32 {
+    // Refuse what no decoder will read back, before any GOP is encoded.
+    if primary_framed.len() > frame::VIDEO_MAX_FRAME_BYTES {
+        return Err(Av1StegoError::Stego(
+            crate::stego::error::StegoError::MessageTooLarge,
+        ));
+    }
+    let n_gops = n_frames.div_ceil(params.gop_size.max(1));
+    if n_gops > u16::MAX as u32 {
         return Err(Av1StegoError::InvalidPacket(format!(
             "av1_encode_streaming: derived n_gops {n_gops} out of range [1..={}]",
             u16::MAX
         )));
     }
-    if primary_framed.len() > u32::MAX as usize {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "av1_encode_streaming: primary_framed {} exceeds u32::MAX",
-            primary_framed.len()
-        )));
-    }
-    let total_message_bytes = primary_framed.len() as u32;
-    let total_chunks = n_gops as u16;
-    let chunks = split_message_into_chunks(primary_framed, total_chunks)
-        .map_err(Av1StegoError::Stego)?;
 
-    // Derive hhat seed from the primary passphrase — same path the
-    // session uses for chunk_frame's STC override. Single derive for
-    // the whole encode (hhat_seed is reused across GOPs).
+    // hhat seed from the primary passphrase — the same derive the decoder
+    // runs; one per encode, reused across GOPs.
     let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
         .map_err(Av1StegoError::Stego)?;
     let hhat_seed: [u8; 32] = structural_key[32..]
         .try_into()
         .expect("derive_structural_key returns 64 bytes");
 
-    // Output accumulator. Reserve ~1 KB/frame as a starting guess —
-    // Vec doubles when full. Same reservation as the iOS session
-    // path's `obus.reserveCapacity(totalFrames * 1024)`.
-    let mut output: Vec<u8> = Vec::with_capacity((n_frames as usize).saturating_mul(1024));
-
-    // Per-GOP encode loop. Bounded by `n_gops` not by what the source
-    // yields — the source's contract is to deliver each GOP in order
-    // (forward-only). Trailing partial GOPs are first-class.
-    //
-    // `source.rewind()` is mandatory before the first `gop_yuv` call:
-    // stateful sources (Av1CallbackYuvSource backing the iOS
-    // AVAssetReader / Android MediaCodec / CLI ffmpeg pipe) need it to
-    // open / position their underlying decoder. Stateless sources
-    // (Av1SliceYuvSource) make it a no-op. Skipping this surfaces as
-    // `MediaPlaneGopSourceError.readerFailed("decode_gop before
-    // rewind")` on iOS — see commit history for T3.1/T3.5 root cause.
     let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
     let t_total = std::time::Instant::now();
-    if prof {
-        eprintln!(
-            "[AV1_PROF NO_SHADOW] start: width={}, height={}, n_frames={}, n_gops={}, gop_size={}, primary_framed_len={}",
-            params.width, params.height, n_frames, n_gops, gop_size, primary_framed.len()
-        );
-    }
-    let t_rewind = std::time::Instant::now();
-    source.rewind()?;
-    if prof {
-        eprintln!("[AV1_PROF NO_SHADOW] rewind: {:?}", t_rewind.elapsed());
-    }
-    let mut sum_pull = std::time::Duration::ZERO;
-    let mut sum_encode = std::time::Duration::ZERO;
-    let mut sum_embed = std::time::Duration::ZERO;
-    for gop_idx in 0..n_gops {
-        let t_pull = std::time::Instant::now();
-        let gop_yuv = source.gop_yuv(gop_idx)?;
-        let pull_dt = t_pull.elapsed();
-        sum_pull += pull_dt;
-        validate_gop_yuv(gop_idx, &gop_yuv)?;
-        let fig = frames_in_gop(gop_idx);
 
-        // Build this GOP's chunk_frame slice. First GOP carries the
-        // clip-level `total_message_bytes` header; subsequent GOPs
-        // carry only their `payload_len`. Mirror of the session's
-        // `drain_one_gop` chunk_frame logic.
-        let chunk_payload = &chunks[gop_idx as usize];
-        let framed = if gop_idx == 0 {
-            build_first_chunk_frame_v3_1(total_message_bytes, chunk_payload)
-        } else {
-            build_chunk_frame_v3_1(chunk_payload)
+    // ── Progress, in frame-encode units: Pass 1 is one unit per frame; a
+    // Pass-2 sweep is EMBED_WEIGHT per frame plus a full unit per frame of
+    // every GOP the cache could not hold (re-encoded). The re-encode share is
+    // forecast as Pass 1 fills the cache and exact once Pass 1 is done.
+    let gop_size = params.gop_size.max(1);
+    let gop_frames: Vec<u32> = (0..n_gops).map(|g| gop_frame_count(n_frames, gop_size, g)).collect();
+    let all_frames: f64 = gop_frames.iter().map(|&f| f as f64).sum();
+    let one_sweep = all_frames * EMBED_WEIGHT;
+    let mut progress = WorkProgress::new(all_frames + one_sweep);
+    let mut forecast = RecomputeForecast::new(
+        pass1_cache_budget.ram_bytes,
+        pass1_cache_budget.disk_bytes,
+        gop_frames.clone(),
+    );
+    let mut emit = |fraction: f32, phase: Av1EncodePhase, gop: u32| {
+        if let Some(cb) = on_progress.as_mut() {
+            cb(Av1EncodeProgress { fraction, phase, gop, n_gops });
         }
-        .map_err(Av1StegoError::Stego)?;
-        let payload_bits = frame::bytes_to_bits(&framed);
+    };
 
-        // Encode + embed. Dispatches on frames_in_gop the same way the
-        // session does — single-frame path uses `encode_one_keyframe`
-        // + `av1_stego_embed_payload_bits` (bit-exact to the legacy
-        // single-frame primitive); multi-frame uses `encode_one_gop_multi`
-        // + `av1_stego_encode_one_gop` for the IDR + P-frame chain.
-        let t_enc = std::time::Instant::now();
-        let stego_packet = if fig == 1 {
-            let (natural, recording) = encode_one_keyframe(&gop_yuv, params)?;
-            let enc_dt = t_enc.elapsed();
-            let t_embed = std::time::Instant::now();
-            let packet =
-                av1_stego_embed_payload_bits(natural, recording, &payload_bits, &hhat_seed)?;
-            let embed_dt = t_embed.elapsed();
-            sum_encode += enc_dt;
-            sum_embed += embed_dt;
-            if prof {
-                eprintln!(
-                    "[AV1_PROF NO_SHADOW] gop {}: fig=1, pull={:?}, encode={:?}, embed={:?}, packet={} B",
-                    gop_idx, pull_dt, enc_dt, embed_dt, packet.len()
-                );
-            }
-            packet
-        } else {
-            let per_frame = encode_one_gop_multi(&gop_yuv, fig, params)?;
-            let enc_dt = t_enc.elapsed();
-            let t_embed = std::time::Instant::now();
-            let packet = av1_stego_encode_one_gop(per_frame, &payload_bits, &hhat_seed)?;
-            let embed_dt = t_embed.elapsed();
-            sum_encode += enc_dt;
-            sum_embed += embed_dt;
-            if prof {
-                eprintln!(
-                    "[AV1_PROF NO_SHADOW] gop {}: fig={}, pull={:?}, encode={:?}, embed={:?}, packet={} B",
-                    gop_idx, fig, pull_dt, enc_dt, embed_dt, packet.len()
-                );
-            }
-            packet
-        };
+    // ── Pass 1: natural encode of every GOP; packets cached, cover counted.
+    let (mut pass1_cache, cover_lens) = run_pass1(
+        source,
+        n_frames,
+        params,
+        &pass1_cache_budget,
+        &mut |g, cache| {
+            forecast.observe(cache.stats());
+            progress.set_total(all_frames + one_sweep + forecast.predicted_recompute_frames());
+            let fraction = progress.advance(gop_frames[g as usize] as f64);
+            emit(fraction, Av1EncodePhase::Encode, g + 1);
+        },
+    )?;
+    // Exact from here on: which GOPs Pass 2 re-encodes is known.
+    progress.set_total(all_frames + one_sweep + forecast.unstored_frames());
 
-        output.extend_from_slice(&stego_packet);
-
-        if let Some(ref mut cb) = on_progress {
-            cb((gop_idx + 1) as f32 / n_gops as f32);
+    // ── Plan + Pass 2: per-GOP chunk sizes from the measured cover, then
+    // embed each GOP from its Pass-1 entry. Over capacity is refused by
+    // the plan, before any embed. A sweep that learns a GOP carries less
+    // than planned and cannot carry the shortfall forward re-plans with
+    // what it learned and sweeps again (from the cache — no re-encode).
+    let mut caps =
+        super::primary_plan::gop_primary_caps(&cover_lens, &vec![0; cover_lens.len()]);
+    let mut shrinks = 0usize;
+    let mut output = None;
+    for sweep in 0..MAX_PRIMARY_PASSES {
+        if sweep > 0 {
+            // A re-plan runs one more full sweep.
+            progress.set_total(progress.done() + one_sweep + forecast.unstored_frames());
+        }
+        let plan = super::primary_plan::plan_primary(&caps, primary_framed.len())?;
+        output = embed_primary_pass(
+            source,
+            &mut pass1_cache,
+            n_frames,
+            params,
+            &cover_lens,
+            &mut caps,
+            plan,
+            primary_framed,
+            &hhat_seed,
+            &mut shrinks,
+            &mut |g, recomputed| {
+                let frames = gop_frames[g as usize] as f64;
+                if recomputed && forecast.stored(g as usize) {
+                    // A miss the forecast did not expect (unreadable spill).
+                    progress.set_total(progress.total() + frames);
+                }
+                let fraction =
+                    progress.advance(frames * EMBED_WEIGHT + if recomputed { frames } else { 0.0 });
+                emit(fraction, Av1EncodePhase::Embed, g + 1);
+            },
+        )?;
+        if output.is_some() {
+            break;
         }
     }
+    let output = output
+        .ok_or_else(|| super::primary_plan::message_too_large(&caps, primary_framed.len()))?;
+    emit(progress.finish(), Av1EncodePhase::Embed, n_gops);
 
     if prof {
+        let s = pass1_cache.stats();
         eprintln!(
-            "[AV1_PROF NO_SHADOW] TOTAL: {:?}, sum_pull={:?}, sum_encode={:?}, sum_embed={:?}, output={} B",
-            t_total.elapsed(), sum_pull, sum_encode, sum_embed, output.len()
+            "[AV1_PROF NO_SHADOW] TOTAL: {:?}, output={} B, {n_gops} GOPs, {shrinks} chunk shrinks; \
+             pass1_cache ram_hits={} disk_hits={} misses={}",
+            t_total.elapsed(),
+            output.len(),
+            s.ram_hits,
+            s.disk_hits,
+            s.misses,
         );
     }
     Ok(output)
+}
+
+/// One Pass-2 sweep of [`av1_encode_streaming`]: embed every GOP from its
+/// Pass-1 entry following `plan`. An infeasible chunk shrinks
+/// ([`shrink_step`](super::primary_plan::shrink_step)) until it fits, the
+/// GOP's achieved size is recorded in `caps`
+/// ([`learn_cap`](super::primary_plan::learn_cap)), and the shortfall is
+/// re-planned over the GOPs still to come. `Ok(None)` means it could not
+/// be — the caller re-plans the whole message with the learned caps and
+/// sweeps again. GOPs after the message is complete are emitted natural.
+/// `on_gop_done(g, recomputed)` fires after GOP `g`; `recomputed` is true
+/// when the Pass-1 cache did not hold it and it was natural-encoded again
+/// (otherwise it was rebuilt from its cached packets). The source is only
+/// read for such GOPs ([`LazyGopPuller`]).
+#[allow(clippy::too_many_arguments)]
+fn embed_primary_pass(
+    source: &mut dyn Av1GopYuvSource,
+    cache: &mut crate::stego::gop_cache::BoundedGopCache<Pass1Packets>,
+    n_frames: u32,
+    params: Av1StreamingEncodeParams,
+    cover_lens: &[usize],
+    caps: &mut [super::primary_plan::GopPrimaryCap],
+    mut plan: Vec<usize>,
+    primary_framed: &[u8],
+    hhat_seed: &[u8; 32],
+    shrinks: &mut usize,
+    on_gop_done: &mut dyn FnMut(u32, bool),
+) -> Result<Option<Vec<u8>>, Av1StegoError> {
+    use super::primary_plan::{learn_cap, replan_from, shrink_step};
+
+    let gop_size = params.gop_size.max(1);
+    // ≤ VIDEO_MAX_FRAME_BYTES (checked by the caller), so it fits the
+    // first chunk's u32 header.
+    let total_message_bytes = primary_framed.len() as u32;
+    let mut output: Vec<u8> = Vec::with_capacity((n_frames as usize).saturating_mul(1024));
+    let mut sent = 0usize;
+    let mut puller = LazyGopPuller::new(source);
+    for gop_idx in 0..n_frames.div_ceil(gop_size) {
+        // A cancel stops before the next GOP's rebuild or re-encode.
+        crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
+        let g = gop_idx as usize;
+        let fig = gop_frame_count(n_frames, gop_size, gop_idx);
+
+        let recomputed = if sent == primary_framed.len() {
+            // Message complete: natural tail, which the decoder stops before.
+            // Only the packets are needed — no rebuild, no harvest.
+            let (packets, recomputed) = pass1_packets_for(cache, &mut puller, fig, params, gop_idx)?;
+            for natural in &packets {
+                output.extend_from_slice(natural);
+            }
+            recomputed
+        } else {
+            let (entry, recomputed) =
+                pass1_entry_for(cache, &mut puller, fig, params, gop_idx, cover_lens[g])?;
+            let planned = plan[g];
+            let mut want = planned;
+            let packet = loop {
+                let inputs = Av1CascadeGopInputs {
+                    gop_idx: g,
+                    gop_offset: 0,
+                    gop_n: cover_lens[g],
+                    harvest: &entry.harvest,
+                    frames: &entry.frames,
+                    chunk: &primary_framed[sent..sent + want],
+                };
+                let shared = Av1CascadeGopShared {
+                    total_message_bytes,
+                    shadow_states: &[],
+                    hhat_seed,
+                };
+                if let Some(packet) = cascade_one_gop(inputs, shared)? {
+                    break packet;
+                }
+                // `stc_embed` also returns `None` when the user cancelled;
+                // that is not a capacity signal, so never learn from it.
+                crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
+                if want == 0 {
+                    // Not even a header-only chunk fits, and the decoder
+                    // needs a chunk in every GOP until the message is
+                    // complete: the window has to end before this GOP.
+                    learn_cap(caps, g, None);
+                    return Ok(None);
+                }
+                want = shrink_step(want);
+                *shrinks += 1;
+            };
+            output.extend_from_slice(&packet);
+            sent += want;
+            if want < planned {
+                learn_cap(caps, g, Some(want));
+                match replan_from(caps, g + 1, primary_framed.len() - sent) {
+                    Some(rest) => plan[g + 1..].copy_from_slice(&rest),
+                    None => return Ok(None),
+                }
+            }
+            recomputed
+        };
+        on_gop_done(gop_idx, recomputed);
+    }
+    // The plan sums to the message, so this holds; never return a stream
+    // the decoder cannot complete.
+    Ok((sent == primary_framed.len()).then_some(output))
 }
 
 /// Run Pass 1 on a single GOP: natural rav1e encode + dav1d harvest.
@@ -1173,7 +1210,7 @@ pub(super) fn process_one_gop_pass1(
     params: Av1StreamingEncodeParams,
 ) -> Result<(Vec<(Vec<u8>, PhasmFrameRecording<u8>)>, GopHarvest), Av1StegoError> {
     let pf = encode_gop_natural(gop_yuv, frames_in_gop, params)?;
-    let harvest = harvest_gop(&pf)?;
+    let harvest = harvest_gop(&pf, params.width, params.height)?;
     Ok((pf, harvest))
 }
 
@@ -1181,11 +1218,10 @@ pub(super) fn process_one_gop_pass1(
 // WV.7.4 — per-GOP cascade body (the API for WV.7.5+ streaming)
 // ────────────────────────────────────────────────────────────────
 
-/// Per-GOP inputs to [`cascade_one_gop`]. Borrows from the existing
-/// `per_gop_harvests` + `per_gop_natural` accumulators today; WV.7.5+
-/// will populate this struct from a re-encode driven by a
-/// [`Av1GopYuvSource`](super::Av1GopYuvSource) so the accumulators
-/// can be dropped entirely.
+/// Per-GOP inputs to [`cascade_one_gop`]. Borrows from the GOP's
+/// [`Pass1Entry`] (rebuilt from its cached packets, or re-encoded, by
+/// `pass1_entry_for`) plus the
+/// chunk the primary plan assigned it.
 pub(super) struct Av1CascadeGopInputs<'a> {
     pub gop_idx: usize,
     /// This GOP's first cover bit's offset into the union cover.
@@ -1196,16 +1232,16 @@ pub(super) struct Av1CascadeGopInputs<'a> {
     pub gop_n: usize,
     pub harvest: &'a GopHarvest,
     pub frames: &'a [(Vec<u8>, PhasmFrameRecording<u8>)],
+    /// This GOP's primary message bytes (may be empty: a header-only
+    /// chunk). GOP 0's chunk also carries the clip-level
+    /// `total_message_bytes` header.
+    pub chunk: &'a [u8],
 }
 
 /// Whole-clip-scope inputs shared across every GOP within one parity
 /// tier of the cascade loop. Borrowed for the duration of one
 /// [`cascade_one_gop`] call.
 pub(super) struct Av1CascadeGopShared<'a> {
-    /// chunk_frame v3 per-GOP message bytes. `chunks[gop_idx]` is
-    /// this GOP's slice; `chunks[0]` is the only one that carries
-    /// the clip-level total_message_bytes header.
-    pub chunks: &'a [Vec<u8>],
     /// Whole-clip total framed message length, for the chunk_frame
     /// v3 first-chunk header.
     pub total_message_bytes: u32,
@@ -1241,9 +1277,9 @@ pub(super) fn cascade_one_gop(
         gop_n,
         harvest,
         frames,
+        chunk,
     } = inputs;
     let Av1CascadeGopShared {
-        chunks,
         total_message_bytes,
         shadow_states,
         hhat_seed,
@@ -1253,9 +1289,9 @@ pub(super) fn cascade_one_gop(
     // carries clip-level total_message_bytes; subsequent GOPs carry
     // only payload_len.
     let framed = if gop_idx == 0 {
-        build_first_chunk_frame_v3_1(total_message_bytes, &chunks[gop_idx])
+        build_first_chunk_frame_v3_1(total_message_bytes, chunk)
     } else {
-        build_chunk_frame_v3_1(&chunks[gop_idx])
+        build_chunk_frame_v3_1(chunk)
     }
     .map_err(Av1StegoError::Stego)?;
     let payload_bits = frame::bytes_to_bits(&framed);
@@ -1391,295 +1427,392 @@ fn expected_i420_size(width: u32, height: u32) -> usize {
     y + 2 * uv
 }
 
-/// Encode one GOP naturally (mirror of session.rs::encode_one_gop_multi
-/// but inline-d here to avoid an inter-module pub dependency).
-///
-/// Visibility raised to `pub(super)` at T2.4 so
-/// `Av1StreamingProbeSession::flush_current_gop` can use it directly
-/// (skipping `process_one_gop_pass1`'s J-UNIWARD harvest_gop pass —
-/// the probe only needs the natural-encode bit_tags, not per-position
-/// costs).
 // ────────────────────────────────────────────────────────────────
-// Perf #1 V2 — Pass 1 cache with disk spill (2026-10-18)
+// Pass 1 → Pass 2: cached natural packets, rebuilt by decoding
 // ────────────────────────────────────────────────────────────────
 //
-// V1 shipped an in-RAM-only cache with a configurable budget;
-// over-budget GOPs fell back to re-encode (correct but
-// diminishing-returns on long clips). V2 adds disk spill: when
-// RAM is exhausted but a disk budget allows, the overflow entry
-// is flat-packed to a scratch file and read back on cascade. The
-// result works on clips of arbitrary length: short clips stay
-// in RAM, mid-length clips spill the overflow to disk, truly
-// huge clips (where even disk exceeds `PHASM_AV1_PASS1_CACHE_DISK_MB`)
-// fall through to the V1 re-encode semantics.
-//
-// **Scratch dir lifecycle.** `Pass1Cache` owns a session-unique
-// subdirectory under `std::env::temp_dir()` (or `PHASM_AV1_PASS1_
-// CACHE_DISK_DIR`), creates it lazily on first spill, and the
-// `Drop` impl `remove_dir_all`s it unconditionally. The subdir
-// name embeds pid + ns-timestamp so parallel encodes on the same
-// host never collide.
-//
-// **File format** (per GOP). Single contiguous flat-packed blob,
-// hand-rolled (no serde / bincode dependency). Little-endian;
-// u64 length prefixes; raw-byte casts for POD tuples
-// (`(u16,u16,u16)` 6 B, `(u32,u16)` 8 B). On read, every length
-// is bounded against `cover_bits.len() × 2` and the file size
-// to defend against truncated / corrupted files; a parse error
-// surfaces as `Av1StegoError::InvalidPacket` and the caller
-// re-encodes that GOP. Format version byte at the head so a
-// future layout change can hard-fail old files instead of
-// silently misparsing.
+// Pass 1 natural-encodes every GOP and counts its cover; Pass 2 embeds each GOP
+// by replaying its recorded range-coder symbols with overrides, which
+// needs the full recording (storage tuples, bit positions, harvest) —
+// 300–400 MB per detailed 1080p GOP. Pass 1 therefore keeps only each
+// GOP's natural packets (1–2.4 MB per 1080p GOP) in the bounded
+// `BoundedGopCache` (RAM, then a scratch-dir disk spill), and Pass 2
+// rebuilds the recording from one dav1d decode of them
+// (`rebuild::rebuild_gop_recordings`, ~0.3 s per 1080p GOP) plus the
+// harvest. A GOP over both budgets (or whose spill fails to read back) is
+// natural-encoded again from the source instead — deterministic and
+// byte-identical to Pass 1, just ~45 s per 1080p GOP. Measurements and the
+// decision: `docs/design/video/av1/capacity-split-and-payload-limits-
+// 2026-10-23.md` § 4.6–4.7.
 
-/// Pass 1 cache storage slot. `None` means the GOP wasn't cached
-/// (over-budget — cascade will re-encode); `InRam` means the full
-/// per-frame data is live in memory; `OnDisk` means the entry has
-/// been spilled to a scratch file at `PathBuf`.
 /// Scratch-directory tag for the AV1 Pass 1 cache. Scopes `sweep_orphans` so
 /// the AV1 sweep never deletes the H.264 shadow cache's trees, or vice versa.
 pub const AV1_PASS1_CACHE_TAG: &str = "av1-pass1";
 
-/// Pass 1 output for one GOP: per-frame `(natural bytes, recording)`.
-///
-/// Migrated onto the shared [`crate::stego::gop_cache::BoundedGopCache`]
-/// (2026-10-18) so AV1 and the H.264 shadow path use one container instead of
-/// two copies. The bespoke `Pass1Cache` this replaces had the right shape; only
-/// its payload was welded in, and the three flat-pack helpers below are
-/// unchanged — they are now the trait impl's bodies.
+/// What Pass 1 caches for a GOP: its natural packets, one per frame. Pass 2
+/// rebuilds everything else from them ([`pass1_entry_for`]).
+#[derive(Clone)]
+pub(super) struct Pass1Packets(pub Vec<Vec<u8>>);
+
+/// Flat-pack format of [`Pass1Packets`], little-endian:
+/// `[3][u64 n][n × (u64 len, len bytes)]`. Versions 1 and 2 held the full
+/// recordings; any other version byte is a cache miss, never a misparse.
+const PASS1_CACHE_FORMAT_V3: u8 = 3;
+
+impl crate::stego::gop_cache::GopCachePayload for Pass1Packets {
+    fn cached_size(&self) -> usize {
+        self.0.iter().map(|p| p.len() + 24).sum::<usize>() + 24
+    }
+
+    fn flat_pack(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + self.0.iter().map(|p| 8 + p.len()).sum::<usize>());
+        out.push(PASS1_CACHE_FORMAT_V3);
+        out.extend_from_slice(&(self.0.len() as u64).to_le_bytes());
+        for p in &self.0 {
+            out.extend_from_slice(&(p.len() as u64).to_le_bytes());
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    fn flat_unpack(bytes: &[u8]) -> Result<Self, String> {
+        let take = |cur: &mut usize, len: usize| -> Result<&[u8], String> {
+            let end = cur.checked_add(len).filter(|&e| e <= bytes.len());
+            let end = end.ok_or_else(|| "truncated Pass1Packets".to_string())?;
+            let s = &bytes[*cur..end];
+            *cur = end;
+            Ok(s)
+        };
+        let read_len = |cur: &mut usize| -> Result<usize, String> {
+            let v = u64::from_le_bytes(take(cur, 8)?.try_into().unwrap());
+            usize::try_from(v).map_err(|_| "Pass1Packets length overflow".to_string())
+        };
+        let mut cur = 0usize;
+        let version = take(&mut cur, 1)?[0];
+        if version != PASS1_CACHE_FORMAT_V3 {
+            return Err(format!("unsupported Pass1Packets format version {version}"));
+        }
+        let n = read_len(&mut cur)?;
+        // Every packet costs at least its 8-byte length: bound `n` by the
+        // blob before allocating for it.
+        if n > (bytes.len() - cur) / 8 {
+            return Err("truncated Pass1Packets".to_string());
+        }
+        let mut packets = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = read_len(&mut cur)?;
+            packets.push(take(&mut cur, len)?.to_vec());
+        }
+        if cur != bytes.len() {
+            return Err("trailing bytes after Pass1Packets".to_string());
+        }
+        Ok(Pass1Packets(packets))
+    }
+}
+
+/// Pass 2's working set for one GOP: the natural packets with their
+/// recordings (rebuilt, or re-encoded on a cache miss) and the harvest the
+/// embed runs against. Lives for one GOP; never cached.
+#[derive(Clone)]
+pub(super) struct Pass1Entry {
+    pub frames: Pass1Payload,
+    pub harvest: GopHarvest,
+}
+
+/// Per-frame `(natural packet, recording)` of one GOP, as
+/// [`encode_gop_natural`] and `rebuild::rebuild_gop_recordings` return it.
 pub type Pass1Payload = Vec<(Vec<u8>, PhasmFrameRecording<u8>)>;
 
-impl crate::stego::gop_cache::GopCachePayload for Pass1Payload {
-    fn cached_size(&self) -> usize {
-        estimate_per_frame_bytes(self)
-    }
-    fn flat_pack(&self) -> Vec<u8> {
-        flat_pack_per_frame(self)
-    }
-    fn flat_unpack(bytes: &[u8]) -> Result<Self, String> {
-        flat_unpack_per_frame(bytes)
+/// What a harvested frame keeps instead of its planes: one shared 2×2
+/// frame (the recording type requires planes; the cascade reads none).
+fn dummy_planes() -> Arc<phasm_rav1e::Frame<u8>> {
+    Arc::new(make_frame::<u8>(2, 2, ChromaSampling::Cs420))
+}
+
+/// Once the harvest is taken the cascade reads no planes; dropping them
+/// keeps ~3 MB per 1080p frame out of Pass 2's working set.
+fn drop_planes(frames: &mut [(Vec<u8>, PhasmFrameRecording<u8>)]) {
+    let dummy = dummy_planes();
+    for (_, recording) in frames.iter_mut() {
+        recording.reconstructed_planes = dummy.clone();
     }
 }
 
+/// Pass 2's access to the source: untouched while every GOP comes from the
+/// Pass-1 cache — on a phone that saves a second full decode of the input
+/// video. The first GOP that has to be re-encoded rewinds the source and
+/// pulls forward to it, discarding the GOPs in between, so the source
+/// contract (rewind, then increasing indices, no gaps) holds. One puller
+/// per Pass-2 sweep or parity tier.
+pub(super) struct LazyGopPuller<'a> {
+    source: &'a mut dyn Av1GopYuvSource,
+    /// Next GOP the source will deliver; `None` until the first pull.
+    next: Option<u32>,
+}
 
-// Flat-pack format version. Bump on wire change; old files hard-fail.
-const PASS1_CACHE_FORMAT_V1: u8 = 1;
+impl<'a> LazyGopPuller<'a> {
+    pub(super) fn new(source: &'a mut dyn Av1GopYuvSource) -> Self {
+        Self { source, next: None }
+    }
 
-/// Serialize `per_frame` to a hand-rolled flat byte format for
-/// `Pass1Cache`'s disk spill. Little-endian; u64 length prefixes;
-/// POD tuples are written field-by-field (6 B per `(u16,u16,u16)`,
-/// 6 B per `(u32,u16)` — packed on disk even though the in-memory
-/// `(u32,u16)` tuple has 8 B stride on 64-bit arches).
+    /// GOP `g`'s YUV. `g` must not precede a GOP already pulled.
+    pub(super) fn gop(&mut self, g: u32) -> Result<Vec<u8>, Av1StegoError> {
+        let mut next = match self.next {
+            Some(next) => next,
+            None => {
+                self.source.rewind()?;
+                0
+            }
+        };
+        if g < next {
+            return Err(Av1StegoError::InvalidPacket(format!(
+                "Pass 2: GOP {g} requested after GOP {} was pulled",
+                next - 1
+            )));
+        }
+        loop {
+            let yuv = self.source.gop_yuv(next)?;
+            next += 1;
+            self.next = Some(next);
+            if next > g {
+                return Ok(yuv);
+            }
+        }
+    }
+}
+
+/// Frames in GOP `gop_idx` of an `n_frames` clip; the trailing GOP may be
+/// partial.
+fn gop_frame_count(n_frames: u32, gop_size: u32, gop_idx: u32) -> u32 {
+    let start = gop_idx * gop_size;
+    (start + gop_size).min(n_frames) - start
+}
+
+/// Pass 1 of both encode paths: rewind `source`, then natural-encode every
+/// GOP once, counting its cover bits and caching its natural packets under
+/// `budget`.
+/// Returns the cache and each GOP's cover-bit count — what the primary plan
+/// is sized from. `on_gop_done(g, cache)` fires after GOP `g` is inserted
+/// (the cache's stats show whether it was stored).
 ///
-/// Only the fields `cascade_one_gop` actually reads are
-/// serialized: natural bytes, per-tile `(storage, bit_positions)`,
-/// and the four frame-level usize offsets. `bit_tags`, `bit_meta`,
-/// `reconstructed_planes`, `frame_qindex`, and `loop_filter_state`
-/// are reconstructed to safe defaults on `flat_unpack`.
-fn flat_pack_per_frame(
-    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
-) -> Vec<u8> {
-    // Pre-size roughly for the common 1 tile / frame case.
-    let mut cap = 1 + 4;
-    for (natural, recording) in per_frame {
-        cap += 8 + natural.len() + 4;
-        for tile in &recording.tiles {
-            cap += 8 + tile.storage.len() * 6
-                + 8 + tile.bit_positions.len() * 6;
-        }
-        cap += 8 * 4;
-    }
-    let mut out = Vec::with_capacity(cap);
-    out.push(PASS1_CACHE_FORMAT_V1);
-    out.extend_from_slice(&(per_frame.len() as u32).to_le_bytes());
+/// `source.rewind()` comes first: stateful sources (AVAssetReader,
+/// MediaCodec, ffmpeg pipe) need it to open their decoder.
+fn run_pass1(
+    source: &mut dyn Av1GopYuvSource,
+    n_frames: u32,
+    params: Av1StreamingEncodeParams,
+    budget: &Pass1CacheBudget,
+    on_gop_done: &mut dyn FnMut(u32, &crate::stego::gop_cache::BoundedGopCache<Pass1Packets>),
+) -> Result<(crate::stego::gop_cache::BoundedGopCache<Pass1Packets>, Vec<usize>), Av1StegoError> {
+    let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
+    let gop_size = params.gop_size.max(1);
+    let n_gops = n_frames.div_ceil(gop_size);
+    let frame_size = expected_i420_size(params.width, params.height);
 
-    for (natural, recording) in per_frame {
-        out.extend_from_slice(&(natural.len() as u64).to_le_bytes());
-        out.extend_from_slice(natural);
-        out.extend_from_slice(&(recording.tiles.len() as u32).to_le_bytes());
-        for tile in &recording.tiles {
-            // storage: Vec<(u16, u16, u16)> → 6 bytes/entry.
-            out.extend_from_slice(&(tile.storage.len() as u64).to_le_bytes());
-            for &(a, b, c) in &tile.storage {
-                out.extend_from_slice(&a.to_le_bytes());
-                out.extend_from_slice(&b.to_le_bytes());
-                out.extend_from_slice(&c.to_le_bytes());
-            }
-            // bit_positions: Vec<(u32, u16)> → 6 bytes/entry.
-            out.extend_from_slice(&(tile.bit_positions.len() as u64).to_le_bytes());
-            for &(a, b) in &tile.bit_positions {
-                out.extend_from_slice(&a.to_le_bytes());
-                out.extend_from_slice(&b.to_le_bytes());
-            }
-        }
-        out.extend_from_slice(&(recording.tile_group_offset as u64).to_le_bytes());
-        out.extend_from_slice(&(recording.tile_group_len as u64).to_le_bytes());
-        out.extend_from_slice(&(recording.frame_header_len as u64).to_le_bytes());
-        out.extend_from_slice(&(recording.frame_obu_start as u64).to_le_bytes());
-    }
-    out
-}
-
-/// Deserialize a flat-packed Pass 1 cache file into a usable
-/// `Vec<(Vec<u8>, PhasmFrameRecording<u8>)>`. Reconstructs
-/// `PhasmFrameRecording` with empty `bit_tags`/`bit_meta`
-/// (unused by cascade) and a dummy 2×2 `reconstructed_planes`
-/// Arc (also unused by cascade — J-UNIWARD harvest ran in Pass 1
-/// and cached its result in `per_gop_harvests` before this
-/// unpack).
-fn flat_unpack_per_frame(
-    bytes: &[u8],
-) -> Result<Vec<(Vec<u8>, PhasmFrameRecording<u8>)>, String> {
-    use phasm_rav1e::ec::{PhasmFrameLoopFilterState, PhasmTileRecording};
-
-    let mut cur = 0usize;
-    if bytes.is_empty() {
-        return Err("empty flat-pack buffer".into());
-    }
-    let version = bytes[0];
-    if version != PASS1_CACHE_FORMAT_V1 {
-        return Err(format!(
-            "unsupported Pass 1 cache format version {version}"
-        ));
-    }
-    cur += 1;
-    if cur + 4 > bytes.len() {
-        return Err("truncated n_frames".into());
-    }
-    let n_frames = u32::from_le_bytes(bytes[cur..cur + 4].try_into().unwrap());
-    cur += 4;
-
-    let dummy_frame: std::sync::Arc<phasm_rav1e::Frame<u8>> = std::sync::Arc::new(
-        make_frame::<u8>(2, 2, phasm_rav1e::color::ChromaSampling::Cs420),
+    let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+        n_gops as usize,
+        budget.ram_bytes,
+        budget.disk_bytes,
+        budget.scratch_parent.clone(),
+        AV1_PASS1_CACHE_TAG,
+    );
+    // Reclaim debris from a run that was killed mid-encode: `Drop` never runs
+    // under `panic = "abort"`, jetsam or SIGKILL. Own-pid exempt, tag-scoped,
+    // age-guarded — see `gop_cache::sweep_orphans`.
+    crate::stego::gop_cache::sweep_orphans(
+        &budget.scratch_parent,
+        AV1_PASS1_CACHE_TAG,
+        crate::stego::gop_cache::ORPHAN_MAX_AGE,
     );
 
-    let read_u16 = |bytes: &[u8], cur: &mut usize| -> Result<u16, String> {
-        if *cur + 2 > bytes.len() {
-            return Err("truncated u16".into());
+    let t_pass1 = std::time::Instant::now();
+    source.rewind()?;
+    let mut cover_lens: Vec<usize> = Vec::with_capacity(n_gops as usize);
+    for gop_idx in 0..n_gops {
+        // A user cancel stops before the next rav1e encode, not after Pass 1.
+        crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
+        let fig = gop_frame_count(n_frames, gop_size, gop_idx);
+        let t_pull = std::time::Instant::now();
+        let gop_yuv = source.gop_yuv(gop_idx)?;
+        let pull_dt = t_pull.elapsed();
+        if gop_yuv.len() != fig as usize * frame_size {
+            return Err(Av1StegoError::InvalidPacket(format!(
+                "Pass 1: GOP {gop_idx} source returned {} bytes, expected {} \
+                 ({fig} frames × {frame_size} B)",
+                gop_yuv.len(),
+                fig as usize * frame_size,
+            )));
         }
-        let v = u16::from_le_bytes(bytes[*cur..*cur + 2].try_into().unwrap());
-        *cur += 2;
-        Ok(v)
-    };
-    let read_u32 = |bytes: &[u8], cur: &mut usize| -> Result<u32, String> {
-        if *cur + 4 > bytes.len() {
-            return Err("truncated u32".into());
+        let t_proc = std::time::Instant::now();
+        let frames = encode_gop_natural(&gop_yuv, fig, params)?;
+        if frames.iter().any(|(_, recording)| recording.tiles.is_empty()) {
+            return Err(Av1StegoError::EmptyRecording);
         }
-        let v = u32::from_le_bytes(bytes[*cur..*cur + 4].try_into().unwrap());
-        *cur += 4;
-        Ok(v)
-    };
-    let read_u64 = |bytes: &[u8], cur: &mut usize| -> Result<u64, String> {
-        if *cur + 8 > bytes.len() {
-            return Err("truncated u64".into());
+        // Only the cover count is kept: Pass 2 harvests each GOP from its
+        // rebuild, so a Pass-1 harvest would be thrown away.
+        let cover = count_cover_bits(&frames);
+        if prof {
+            eprintln!(
+                "[AV1_PROF PASS1] gop {gop_idx}: pull={pull_dt:?}, encode={:?}, cover_bits={cover}",
+                t_proc.elapsed(),
+            );
         }
-        let v = u64::from_le_bytes(bytes[*cur..*cur + 8].try_into().unwrap());
-        *cur += 8;
-        Ok(v)
-    };
-
-    let mut out: Vec<(Vec<u8>, PhasmFrameRecording<u8>)> =
-        Vec::with_capacity(n_frames as usize);
-    for _ in 0..n_frames {
-        let natural_len = read_u64(bytes, &mut cur)? as usize;
-        if cur + natural_len > bytes.len() {
-            return Err("truncated natural".into());
-        }
-        let natural: Vec<u8> = bytes[cur..cur + natural_len].to_vec();
-        cur += natural_len;
-
-        let n_tiles = read_u32(bytes, &mut cur)? as usize;
-        let mut tiles: Vec<PhasmTileRecording> = Vec::with_capacity(n_tiles);
-        for _ in 0..n_tiles {
-            let storage_len = read_u64(bytes, &mut cur)? as usize;
-            let mut storage: Vec<(u16, u16, u16)> = Vec::with_capacity(storage_len);
-            for _ in 0..storage_len {
-                let a = read_u16(bytes, &mut cur)?;
-                let b = read_u16(bytes, &mut cur)?;
-                let c = read_u16(bytes, &mut cur)?;
-                storage.push((a, b, c));
-            }
-            let bitpos_len = read_u64(bytes, &mut cur)? as usize;
-            let mut bit_positions: Vec<(u32, u16)> = Vec::with_capacity(bitpos_len);
-            for _ in 0..bitpos_len {
-                let a = read_u32(bytes, &mut cur)?;
-                let b = read_u16(bytes, &mut cur)?;
-                bit_positions.push((a, b));
-            }
-            tiles.push(PhasmTileRecording {
-                storage,
-                bit_positions,
-                // Cascade does not read these; empty on unpack.
-                bit_tags: Vec::new(),
-                bit_meta: Vec::new(),
-            });
-        }
-
-        let tile_group_offset = read_u64(bytes, &mut cur)? as usize;
-        let tile_group_len = read_u64(bytes, &mut cur)? as usize;
-        let frame_header_len = read_u64(bytes, &mut cur)? as usize;
-        let frame_obu_start = read_u64(bytes, &mut cur)? as usize;
-
-        let recording = PhasmFrameRecording::<u8> {
-            tiles,
-            tile_group_offset,
-            tile_group_len,
-            frame_header_len,
-            frame_obu_start,
-            reconstructed_planes: dummy_frame.clone(),
-            frame_qindex: 0,
-            loop_filter_state: PhasmFrameLoopFilterState::default(),
-        };
-        out.push((natural, recording));
+        cover_lens.push(cover);
+        // Infallible: failing to cache must never fail an encode — a GOP
+        // over both budgets is re-encoded in Pass 2.
+        cache.insert(gop_idx as usize, Pass1Packets(frames.into_iter().map(|(p, _)| p).collect()));
+        on_gop_done(gop_idx, &cache);
     }
-    if cur != bytes.len() {
-        return Err(format!(
-            "trailing {} bytes after frame data",
-            bytes.len() - cur
-        ));
+    if prof {
+        let s = cache.stats();
+        eprintln!(
+            "[AV1_PROF PASS1] TOTAL {:?}: {} RAM / {} disk / {} overflow (of {n_gops} GOPs); \
+             {} MB RAM, {} MB disk used",
+            t_pass1.elapsed(),
+            s.cached_in_ram,
+            s.spilled_to_disk,
+            s.overflowed,
+            s.ram_used / (1024 * 1024),
+            s.disk_used / (1024 * 1024),
+        );
     }
-    Ok(out)
+    Ok((cache, cover_lens))
 }
 
-/// Approximate memory footprint of a cached Pass 1 per-frame
-/// payload. Used by `av1_encode_with_shadows_streaming` to enforce
-/// the `PHASM_AV1_PASS1_CACHE_MB` budget without having to walk
-/// every nested Vec. Covers the dominant terms:
+/// Pass 2's [`Pass1Entry`] for GOP `gop_idx`. A GOP whose packets the cache
+/// holds is rebuilt from them with one dav1d decode
+/// (`rebuild::rebuild_gop_recordings`) and harvested; a miss (never cached,
+/// over both budgets, unreadable spill) is natural-encoded again from the
+/// source through `puller` — deterministic and byte-identical to Pass 1.
+/// Either way the planes are dropped once harvested.
 ///
-///   - Natural OBU bytes (per frame) — the biggest single term,
-///     ~75-150 KB at 1080p QP30.
-///   - `storage: Vec<(u16, u16, u16)>` per tile — 6 bytes per
-///     emission (≥80 K emissions at 1080p × 30 ≈ 500 KB/frame).
-///   - `bit_positions: Vec<(u32, u16)>` per tile — 8 bytes per
-///     tagged emission (plus padding on most arches).
-///   - `bit_tags: Vec<u8>` + `bit_meta: Vec<AcSignMeta>` per tile.
+/// A rebuild that fails — a corrupt spill, a dav1d error, a failed
+/// self-check, a cover count that disagrees with Pass 1 — is treated as a
+/// miss too: logged and re-encoded (a cancel still ends the encode). A
+/// systematic rebuild failure therefore costs time, not correctness;
+/// `pull_no_shadow_pass2_leaves_source_alone_when_cached` is its canary
+/// (it would see the source pulled).
 ///
-/// Approximation uses `Vec::capacity()` to catch allocator slack
-/// but ignores the small `tile_group_offset`/`tile_group_len`
-/// usize fields (negligible). Error band ±20 % — well within the
-/// safety margin on the 500 MB default budget.
-fn estimate_per_frame_bytes(
-    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
-) -> usize {
-    let mut total = 0usize;
-    for (natural, recording) in per_frame {
-        total = total.saturating_add(natural.capacity());
-        total = total.saturating_add(32); // header overhead
-        for tile in &recording.tiles {
-            total = total.saturating_add(
-                tile.storage.capacity() * std::mem::size_of::<(u16, u16, u16)>(),
-            );
-            total = total.saturating_add(
-                tile.bit_positions.capacity() * std::mem::size_of::<(u32, u16)>(),
-            );
-            total = total.saturating_add(tile.bit_tags.capacity());
-            total = total.saturating_add(
-                tile.bit_meta.capacity() * std::mem::size_of::<AcSignMeta>(),
-            );
+/// Returns the entry and whether it had to be re-encoded.
+///
+/// `pass1_cover` is the cover count Pass 1 measured (the plan was sized
+/// from it). A re-encode that disagrees is an error: the cascade slices the
+/// harvest by that count, and an out-of-range slice would abort the app
+/// (`panic = "abort"` on mobile) instead of failing the encode.
+fn pass1_entry_for(
+    cache: &mut crate::stego::gop_cache::BoundedGopCache<Pass1Packets>,
+    puller: &mut LazyGopPuller<'_>,
+    frames_in_gop: u32,
+    params: Av1StreamingEncodeParams,
+    gop_idx: u32,
+    pass1_cover: usize,
+) -> Result<(Pass1Entry, bool), Av1StegoError> {
+    // Each frame's harvest job is taken the moment the decode hands the
+    // frame over, and costed a window of frames at a time; the recording
+    // keeps no planes. At most a window of pictures and cost working sets
+    // is alive, instead of a whole GOP's (`rebuild::rebuild_gop_streamed`).
+    let rebuild = |packets: &[Vec<u8>]| -> Result<(Pass1Payload, GopHarvest), Av1StegoError> {
+        let (w, h) = (params.width, params.height);
+        let dummy = dummy_planes();
+        let window = harvest_window();
+        let mut builder = GopHarvestBuilder::with_frames(packets.len());
+        let mut pending: Vec<FrameHarvestJob> = Vec::with_capacity(window);
+        let frames = super::rebuild::rebuild_gop_streamed(packets, w, h, &mut |_, (_, recording)| {
+            // The job keeps the planes; the recording drops its reference.
+            pending.push(FrameHarvestJob::new(recording)?);
+            recording.reconstructed_planes = dummy.clone();
+            if pending.len() == window {
+                run_harvest_window(std::mem::take(&mut pending), w, h, &mut builder);
+            }
+            Ok(())
+        })?;
+        run_harvest_window(pending, w, h, &mut builder);
+        let harvest = builder.finish();
+        if harvest.cover_bits.len() != pass1_cover {
+            return Err(Av1StegoError::InvalidPacket(format!(
+                "rebuild sees {} cover bits, Pass 1 measured {pass1_cover}",
+                harvest.cover_bits.len()
+            )));
         }
+        Ok((frames, harvest))
+    };
+    let rebuilt = match cache.fetch(gop_idx as usize) {
+        Some(Pass1Packets(packets)) => match rebuild(&packets) {
+            Ok(entry) => Some(entry),
+            Err(Av1StegoError::Stego(crate::stego::error::StegoError::Cancelled)) => {
+                return Err(Av1StegoError::Stego(crate::stego::error::StegoError::Cancelled));
+            }
+            Err(err) => {
+                eprintln!("[phasm-av1] GOP {gop_idx}: rebuild failed ({err:?}); re-encoding it");
+                None
+            }
+        },
+        None => None,
+    };
+    let (mut frames, harvest, recomputed) = match rebuilt {
+        Some((frames, harvest)) => (frames, harvest, false),
+        None => {
+            let gop_yuv = puller.gop(gop_idx)?;
+            let expected =
+                frames_in_gop as usize * expected_i420_size(params.width, params.height);
+            if gop_yuv.len() != expected {
+                return Err(Av1StegoError::InvalidPacket(format!(
+                    "Pass 2: GOP {gop_idx} source returned {} bytes, expected {expected} \
+                     ({frames_in_gop} frames)",
+                    gop_yuv.len(),
+                )));
+            }
+            let (frames, harvest) = process_one_gop_pass1(&gop_yuv, frames_in_gop, params)?;
+            (frames, harvest, true)
+        }
+    };
+    if harvest.cover_bits.len() != pass1_cover {
+        return Err(Av1StegoError::InvalidPacket(format!(
+            "GOP {gop_idx}: Pass 2 sees {} cover bits, Pass 1 measured {pass1_cover} \
+             (non-deterministic re-encode)",
+            harvest.cover_bits.len(),
+        )));
     }
-    total
+    drop_planes(&mut frames);
+    Ok((Pass1Entry { frames, harvest }, recomputed))
 }
 
+/// The natural packets of GOP `gop_idx`, for a GOP Pass 2 emits unmodified
+/// (the message is already complete): the cached packets as they are, or —
+/// on a miss — a natural re-encode from the source through `puller`,
+/// without the harvest. Neither path decodes or costs anything.
+///
+/// Returns the packets and whether the GOP had to be re-encoded.
+fn pass1_packets_for(
+    cache: &mut crate::stego::gop_cache::BoundedGopCache<Pass1Packets>,
+    puller: &mut LazyGopPuller<'_>,
+    frames_in_gop: u32,
+    params: Av1StreamingEncodeParams,
+    gop_idx: u32,
+) -> Result<(Vec<Vec<u8>>, bool), Av1StegoError> {
+    if let Some(Pass1Packets(packets)) = cache.fetch(gop_idx as usize) {
+        return Ok((packets, false));
+    }
+    let gop_yuv = puller.gop(gop_idx)?;
+    let expected = frames_in_gop as usize * expected_i420_size(params.width, params.height);
+    if gop_yuv.len() != expected {
+        return Err(Av1StegoError::InvalidPacket(format!(
+            "Pass 2: GOP {gop_idx} source returned {} bytes, expected {expected} \
+             ({frames_in_gop} frames)",
+            gop_yuv.len(),
+        )));
+    }
+    let frames = encode_gop_natural(&gop_yuv, frames_in_gop, params)?;
+    Ok((frames.into_iter().map(|(packet, _)| packet).collect(), true))
+}
+
+/// Encode one GOP naturally: per frame the natural packet and the
+/// encoder's recording (replay storage, cover positions + meta,
+/// reconstructed planes, loop-filter state).
+///
+/// `pub(super)` so `Av1StreamingProbeSession::flush_current_gop` can use it
+/// directly (the probe only needs the natural-encode bit tags, not the
+/// J-UNIWARD harvest `process_one_gop_pass1` adds).
 pub(super) fn encode_gop_natural(
     gop_yuv: &[u8],
     frames_in_gop: u32,
@@ -1733,6 +1866,7 @@ pub(super) fn encode_gop_natural(
 /// `pub(super)` so `Av1StreamingEncodeSession::Av1WholeVideoState` can
 /// hold a `Vec<GopHarvest>` as a Pass-1 accumulator. Field access stays
 /// internal to this module — sessions just push opaque entries.
+#[derive(Clone)]
 pub(super) struct GopHarvest {
     cover_bits: Vec<u8>,
     costs: Vec<f32>,
@@ -1752,106 +1886,197 @@ impl GopHarvest {
     }
 }
 
-/// Per-frame Pass-1 work for one frame's recording: walks the
-/// bit_positions/tags/meta to pull AC_COEFF_SIGN + GOLOMB_TAIL_LSB
-/// entries, packs the reconstructed planes, and runs the J-UNIWARD
-/// cost compute. Returns the frame's cursors, cover bits, and per-
-/// position costs in walk order. Pure function — no shared state —
-/// so the outer harvest_gop can call it in parallel across the
-/// frames of a GOP under `feature = "parallel"`.
-fn process_one_frame_harvest(
-    recording: &PhasmFrameRecording<u8>,
-) -> Result<(Vec<u64>, Vec<u8>, Vec<f32>), Av1StegoError> {
-    if recording.tiles.is_empty() {
-        return Err(Av1StegoError::EmptyRecording);
-    }
-    let tile = &recording.tiles[0];
-
-    let mut frame_cursors: Vec<u64> = Vec::new();
-    let mut frame_bits: Vec<u8> = Vec::new();
-    let mut frame_metas: Vec<AcSignMeta> = Vec::new();
-
-    for (cursor, ((&(_, value), &tag), &meta)) in tile
-        .bit_positions
-        .iter()
-        .zip(tile.bit_tags.iter())
-        .zip(tile.bit_meta.iter())
-        .enumerate()
-    {
-        if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
-            frame_cursors.push(cursor as u64);
-            frame_bits.push(value as u8);
-            frame_metas.push(meta);
-        }
+#[cfg(test)]
+impl GopHarvest {
+    /// Same cover, bit-identical costs, same back-index.
+    pub(super) fn bit_identical(&self, other: &GopHarvest) -> bool {
+        self.cover_bits == other.cover_bits
+            && self.costs.len() == other.costs.len()
+            && self.costs.iter().zip(&other.costs).all(|(a, b)| a.to_bits() == b.to_bits())
+            && self.combined_index == other.combined_index
+            && self.frame_starts == other.frame_starts
     }
 
-    let frame_planes = pack_visible_planes(&recording.reconstructed_planes);
-    let av1_positions: Vec<Av1FramePosition> = frame_metas
-        .iter()
-        .map(|m| Av1FramePosition {
-            plane: m.plane,
-            plane_px_x: m.plane_px_x,
-            plane_px_y: m.plane_px_y,
-            tx_width_log2: m.tx_width_log2,
-            tx_height_log2: m.tx_height_log2,
-            tx_type: m.tx_type,
-            scan_pos: m.scan_pos,
-            coeff_magnitude: m.coeff_magnitude,
-        })
-        .collect();
-    let frame_costs = compute_av1_uniward_costs_with_state(
-        &frame_planes,
-        &av1_positions,
-        recording.frame_qindex,
-        Some(recording.loop_filter_state),
-    );
-
-    Ok((frame_cursors, frame_bits, frame_costs))
+    pub(super) fn cover_len(&self) -> usize {
+        self.cover_bits.len()
+    }
 }
 
-fn harvest_gop(
-    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
-) -> Result<GopHarvest, Av1StegoError> {
-    // Per-frame Pass-1 work is independent across frames within the
-    // same GOP — each frame has its own recording, planes, and qindex.
-    // Run the expensive part (pack_visible_planes + J-UNIWARD cost
-    // compute, audit P1) in parallel under `feature = "parallel"`;
-    // fall back to sequential on no-parallel builds. Output order is
-    // preserved by collect-into-Vec; the subsequent accumulation
-    // stays sequential to keep the cover bit cursor monotonic.
-    #[cfg(feature = "parallel")]
-    let per_frame_outputs: Vec<(Vec<u64>, Vec<u8>, Vec<f32>)> = per_frame
-        .par_iter()
-        .map(|(_, recording)| process_one_frame_harvest(recording))
-        .collect::<Result<Vec<_>, _>>()?;
-    #[cfg(not(feature = "parallel"))]
-    let per_frame_outputs: Vec<(Vec<u64>, Vec<u8>, Vec<f32>)> = per_frame
+/// A GOP's cover-bit count — what [`harvest_gop`] would return as
+/// `cover_bits.len()` — read straight from the encoder's tags, without the
+/// J-UNIWARD cost compute. Pass 1 only needs the count (the plan is sized
+/// from it); Pass 2 harvests each GOP again anyway, from its rebuild.
+fn count_cover_bits(per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)]) -> usize {
+    per_frame
         .iter()
-        .map(|(_, recording)| process_one_frame_harvest(recording))
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|(_, recording)| recording.tiles.first())
+        .map(|tile| {
+            // Same walk as `FrameHarvestJob::new`: the parallel
+            // vectors zipped, enrolled tags counted.
+            tile.bit_positions
+                .iter()
+                .zip(&tile.bit_tags)
+                .zip(&tile.bit_meta)
+                .filter(|((_, tag), _)| {
+                    **tag == PHASM_TAG_AC_COEFF_SIGN || **tag == PHASM_TAG_GOLOMB_TAIL_LSB
+                })
+                .count()
+        })
+        .sum()
+}
 
-    let mut cover_bits: Vec<u8> = Vec::new();
-    let mut costs: Vec<f32> = Vec::new();
-    let mut combined_index: Vec<(usize, u64)> = Vec::new();
-    let mut frame_starts: Vec<usize> = Vec::with_capacity(per_frame.len());
+/// One frame's harvest, split so the cheap walk runs as the frame arrives
+/// and the J-UNIWARD cost compute can run later, a few frames in parallel:
+/// the frame's AC_COEFF_SIGN + GOLOMB_TAIL_LSB entries (cursor, natural bit,
+/// position) and what the costs need (planes, qindex, loop-filter state).
+struct FrameHarvestJob {
+    cursors: Vec<u64>,
+    bits: Vec<u8>,
+    positions: Vec<Av1FramePosition>,
+    planes: Arc<phasm_rav1e::Frame<u8>>,
+    qindex: u8,
+    loop_filter: PhasmFrameLoopFilterState,
+}
 
-    for (frame_idx, (frame_cursors, frame_bits, frame_costs)) in
-        per_frame_outputs.into_iter().enumerate()
-    {
-        frame_starts.push(cover_bits.len());
-        for c in &frame_cursors {
-            combined_index.push((frame_idx, *c));
+impl FrameHarvestJob {
+    /// Walk `recording`'s 50/50 positions (a `planes` reference is taken,
+    /// so the recording's own may be dropped right after).
+    fn new(recording: &PhasmFrameRecording<u8>) -> Result<Self, Av1StegoError> {
+        let tile = recording.tiles.first().ok_or(Av1StegoError::EmptyRecording)?;
+        let mut job = FrameHarvestJob {
+            cursors: Vec::new(),
+            bits: Vec::new(),
+            positions: Vec::new(),
+            planes: Arc::clone(&recording.reconstructed_planes),
+            qindex: recording.frame_qindex,
+            loop_filter: recording.loop_filter_state,
+        };
+        for (cursor, ((&(_, value), &tag), m)) in tile
+            .bit_positions
+            .iter()
+            .zip(tile.bit_tags.iter())
+            .zip(tile.bit_meta.iter())
+            .enumerate()
+        {
+            if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
+                job.cursors.push(cursor as u64);
+                job.bits.push(value as u8);
+                job.positions.push(Av1FramePosition {
+                    plane: m.plane,
+                    plane_px_x: m.plane_px_x,
+                    plane_px_y: m.plane_px_y,
+                    tx_width_log2: m.tx_width_log2,
+                    tx_height_log2: m.tx_height_log2,
+                    tx_type: m.tx_type,
+                    scan_pos: m.scan_pos,
+                    coeff_magnitude: m.coeff_magnitude,
+                });
+            }
         }
-        cover_bits.extend_from_slice(&frame_bits);
-        costs.extend_from_slice(&frame_costs);
+        Ok(job)
     }
 
-    Ok(GopHarvest {
-        cover_bits,
-        costs,
-        combined_index,
-        frame_starts,
-    })
+    /// The frame's `(cursors, cover bits, costs)`; the planes are released.
+    fn run(self, width: u32, height: u32) -> (Vec<u64>, Vec<u8>, Vec<f32>) {
+        let frame_planes = pack_cost_planes(&self.planes, width as usize, height as usize);
+        drop(self.planes);
+        let costs = compute_av1_uniward_costs_with_state(
+            &frame_planes,
+            &self.positions,
+            self.qindex,
+            Some(self.loop_filter),
+        );
+        (self.cursors, self.bits, costs)
+    }
+}
+
+/// How many frames' J-UNIWARD costs are computed at once. The cost compute
+/// is parallel within a frame only in its final per-position pass, so
+/// costing frames one by one is ~4–5× slower; costing a whole GOP at once
+/// held every frame's wavelet working set together (1.2–1.4 GB at 1080p,
+/// ~2.5 GB at 2720×1530). A small window keeps most of the speed at a
+/// bounded peak. `PHASM_AV1_HARVEST_WINDOW` overrides it (dev / measurement).
+fn harvest_window() -> usize {
+    std::env::var("PHASM_AV1_HARVEST_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(HARVEST_WINDOW)
+}
+
+const HARVEST_WINDOW: usize = 4;
+
+/// Run `jobs` (one harvest window) and push their outputs in frame order.
+fn run_harvest_window(
+    jobs: Vec<FrameHarvestJob>,
+    width: u32,
+    height: u32,
+    builder: &mut GopHarvestBuilder,
+) {
+    #[cfg(feature = "parallel")]
+    let outputs: Vec<_> = jobs.into_par_iter().map(|job| job.run(width, height)).collect();
+    #[cfg(not(feature = "parallel"))]
+    let outputs: Vec<_> = jobs.into_iter().map(|job| job.run(width, height)).collect();
+    for output in outputs {
+        builder.push(output);
+    }
+}
+
+/// `width`×`height` is the visible frame size: the cost input repeats its
+/// edge into rav1e's alignment padding ([`pack_cost_planes`]), so a harvest
+/// of the encoder's recording and of a decode of the same packets agree.
+pub(super) fn harvest_gop(
+    per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)],
+    width: u32,
+    height: u32,
+) -> Result<GopHarvest, Av1StegoError> {
+    // Frames are independent; their J-UNIWARD costs are computed a window
+    // at a time ([`harvest_window`]), in parallel within the window, and
+    // accumulated in frame order to keep the cover cursor monotonic.
+    let mut builder = GopHarvestBuilder::with_frames(per_frame.len());
+    for window in per_frame.chunks(harvest_window()) {
+        let jobs = window
+            .iter()
+            .map(|(_, recording)| FrameHarvestJob::new(recording))
+            .collect::<Result<Vec<_>, _>>()?;
+        run_harvest_window(jobs, width, height, &mut builder);
+    }
+    Ok(builder.finish())
+}
+
+/// Assembles a [`GopHarvest`] from per-frame [`FrameHarvestJob::run`]
+/// outputs pushed in frame order — the one place the GOP-wide cover cursor
+/// and back-index are built, for both the whole-GOP [`harvest_gop`] and
+/// Pass 2's frame-by-frame harvest of a streamed rebuild.
+struct GopHarvestBuilder {
+    harvest: GopHarvest,
+}
+
+impl GopHarvestBuilder {
+    fn with_frames(n_frames: usize) -> Self {
+        Self {
+            harvest: GopHarvest {
+                cover_bits: Vec::new(),
+                costs: Vec::new(),
+                combined_index: Vec::new(),
+                frame_starts: Vec::with_capacity(n_frames),
+            },
+        }
+    }
+
+    /// The next frame's `(cursors, cover bits, costs)`.
+    fn push(&mut self, (frame_cursors, frame_bits, frame_costs): (Vec<u64>, Vec<u8>, Vec<f32>)) {
+        let h = &mut self.harvest;
+        let frame_idx = h.frame_starts.len();
+        h.frame_starts.push(h.cover_bits.len());
+        h.combined_index.extend(frame_cursors.iter().map(|&c| (frame_idx, c)));
+        h.cover_bits.extend_from_slice(&frame_bits);
+        h.costs.extend_from_slice(&frame_costs);
+    }
+
+    fn finish(self) -> GopHarvest {
+        self.harvest
+    }
 }
 
 // `verify_shadows_round_trip` (whole-clip dav1d walk + av1_shadow_extract
@@ -1861,3 +2086,463 @@ fn harvest_gop(
 // cover_bits Vec (~4 GB at 30 min) AND the whole-clip priority_slots
 // Vec inside av1_shadow_extract (~50 GB at 30 min) from verify-time
 // peak.
+
+/// An `n`-frame `w`×`h` GOP over xorshift-noise luma, and its params.
+#[cfg(test)]
+pub(super) fn noise_gop_sized(
+    w: u32,
+    h: u32,
+    n: u32,
+) -> (Vec<u8>, Av1StreamingEncodeParams) {
+    let frame = expected_i420_size(w, h);
+    let luma = (w * h) as usize;
+    let mut s: u32 = 0x1234_5678;
+    let mut yuv = vec![128u8; frame * n as usize];
+    for f in 0..n as usize {
+        for px in &mut yuv[f * frame..f * frame + luma] {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *px = (s >> 24) as u8;
+        }
+    }
+    let params = Av1StreamingEncodeParams {
+        width: w,
+        height: h,
+        quantizer: 60,
+        gop_size: n,
+        total_frames_hint: n,
+    };
+    (yuv, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::av1::stego::orchestrator::pack_visible_planes;
+    use crate::stego::gop_cache::GopCachePayload;
+
+    /// Two-frame 64×64 GOP over xorshift-noise luma (flat grey can yield an
+    /// empty cover) and its encode params.
+    fn noise_gop() -> (Vec<u8>, Av1StreamingEncodeParams) {
+        noise_gop_sized(64, 64, 2)
+    }
+
+    /// Pass 2's entry for a GOP — rebuilt from cached packets (hit) or
+    /// re-encoded from the source (miss) — must carry the cover count Pass 1
+    /// measured; one that does not is an error, never an out-of-range slice
+    /// (= abort on mobile).
+    #[test]
+    fn pass2_entry_must_match_pass1_cover() {
+        let (yuv, params) = noise_gop();
+        let (frames, harvest) = process_one_gop_pass1(&yuv, 2, params).unwrap();
+        let pass1_cover = harvest.cover_bits.len();
+        let packets = Pass1Packets(frames.into_iter().map(|(p, _)| p).collect());
+        let scratch = std::env::temp_dir();
+        for cached in [true, false] {
+            let ram = if cached { 64 << 20 } else { 0 };
+            let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+                1, ram, 0, scratch.clone(), AV1_PASS1_CACHE_TAG,
+            );
+            cache.insert(0, packets.clone());
+            for (cover, ok) in [(pass1_cover, true), (pass1_cover + 1, false)] {
+                if cached {
+                    cache.insert(0, packets.clone());
+                }
+                let mut src = Av1SliceYuvSource::new(&yuv, 64, 64, 2, 2);
+                let mut puller = LazyGopPuller::new(&mut src);
+                let got = pass1_entry_for(&mut cache, &mut puller, 2, params, 0, cover);
+                match got {
+                    Ok((_, recomputed)) => {
+                        assert!(ok, "cached={cached}: cover {cover} accepted");
+                        assert_eq!(recomputed, !cached, "cached={cached}");
+                    }
+                    Err(Av1StegoError::InvalidPacket(_)) => assert!(!ok, "cached={cached}"),
+                    Err(e) => panic!("cached={cached}: {e:?}"),
+                }
+            }
+        }
+    }
+
+    /// A cached GOP whose packets do not rebuild (a corrupt spill, a dav1d
+    /// error, a failed self-check) is treated as a cache miss: re-encoded
+    /// from the source, pulled in contract order, with Pass 1's cover.
+    #[test]
+    fn pass2_rebuild_failure_falls_back_to_reencode() {
+        struct LoggingSource<'a> {
+            inner: Av1SliceYuvSource<'a>,
+            log: Vec<Option<u32>>,
+        }
+        impl Av1GopYuvSource for LoggingSource<'_> {
+            fn gop_yuv(&mut self, gop_index: u32) -> Result<Vec<u8>, Av1StegoError> {
+                self.log.push(Some(gop_index));
+                self.inner.gop_yuv(gop_index)
+            }
+            fn rewind(&mut self) -> Result<(), Av1StegoError> {
+                self.log.push(None);
+                self.inner.rewind()
+            }
+        }
+
+        let (yuv, params) = noise_gop();
+        let (frames, harvest) = process_one_gop_pass1(&yuv, 2, params).unwrap();
+        let pass1_cover = harvest.cover_bits.len();
+        // Each packet loses its last 16 bytes: the rebuild cannot reproduce
+        // the tile bytes (or dav1d rejects it) — never a valid entry.
+        let broken = Pass1Packets(
+            frames.into_iter().map(|(p, _)| p[..p.len() - 16].to_vec()).collect(),
+        );
+        let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+            1,
+            64 << 20,
+            0,
+            std::env::temp_dir(),
+            AV1_PASS1_CACHE_TAG,
+        );
+        cache.insert(0, broken);
+        let mut src = LoggingSource { inner: Av1SliceYuvSource::new(&yuv, 64, 64, 2, 2), log: Vec::new() };
+        let mut puller = LazyGopPuller::new(&mut src);
+        let (entry, recomputed) = pass1_entry_for(&mut cache, &mut puller, 2, params, 0, pass1_cover)
+            .expect("a failed rebuild falls back to re-encoding");
+        drop(puller);
+        assert!(recomputed, "the GOP was re-encoded");
+        assert_eq!(entry.harvest.cover_bits.len(), pass1_cover);
+        assert_eq!(src.log, vec![None, Some(0)], "re-encoded from the source, in contract order");
+    }
+
+    /// Pass 1 counts a GOP's cover bits straight from the encoder's tags
+    /// instead of running the J-UNIWARD harvest it would throw away; the
+    /// count must be exactly the harvest's (the plan is sized from it and
+    /// Pass 2 checks against it).
+    #[test]
+    fn pass1_cover_count_matches_harvest() {
+        for (w, h) in [(64u32, 64u32), (250, 142)] {
+            let (yuv, params) = noise_gop_sized(w, h, 2);
+            let (frames, harvest) = process_one_gop_pass1(&yuv, 2, params).unwrap();
+            assert!(!harvest.cover_bits.is_empty(), "{w}x{h}: fixture must have cover");
+            assert_eq!(count_cover_bits(&frames), harvest.cover_bits.len(), "{w}x{h}");
+        }
+    }
+
+    /// A GOP emitted unmodified after the message is complete needs only its
+    /// natural packets: a cache hit hands them over as stored — no decode
+    /// (these bytes are not AV1, so a decode would fail) — and the source
+    /// stays untouched.
+    #[test]
+    fn pass1_packets_for_uses_cached_packets_without_decoding() {
+        let (_, params) = noise_gop();
+        let stored = Pass1Packets(vec![vec![1, 2, 3], vec![4]]);
+        let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+            1, 64 << 20, 0, std::env::temp_dir(), AV1_PASS1_CACHE_TAG,
+        );
+        cache.insert(0, stored.clone());
+        let mut src = MockSource::default();
+        let mut puller = LazyGopPuller::new(&mut src);
+        let (packets, recomputed) = pass1_packets_for(&mut cache, &mut puller, 2, params, 0).unwrap();
+        drop(puller);
+        assert_eq!(packets, stored.0);
+        assert!(!recomputed);
+        assert!(src.log.is_empty(), "a cache hit must not read the source");
+    }
+
+    /// On a miss the packets are natural-encoded again from the source —
+    /// the same bytes Pass 1 produced, without the harvest.
+    #[test]
+    fn pass1_packets_for_reencodes_a_miss() {
+        let (yuv, params) = noise_gop();
+        let pass1: Vec<Vec<u8>> =
+            process_one_gop_pass1(&yuv, 2, params).unwrap().0.into_iter().map(|(p, _)| p).collect();
+        let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+            1, 0, 0, std::env::temp_dir(), AV1_PASS1_CACHE_TAG,
+        );
+        let mut src = Av1SliceYuvSource::new(&yuv, 64, 64, 2, 2);
+        let mut puller = LazyGopPuller::new(&mut src);
+        let (packets, recomputed) = pass1_packets_for(&mut cache, &mut puller, 2, params, 0).unwrap();
+        assert_eq!(packets, pass1);
+        assert!(recomputed);
+    }
+
+    #[test]
+    fn pass1_packets_flat_roundtrip() {
+        let packets = Pass1Packets(vec![Vec::new(), vec![7], (0..1000u32).map(|i| i as u8).collect()]);
+        let blob = packets.flat_pack();
+        assert_eq!(Pass1Packets::flat_unpack(&blob).expect("unpack").0, packets.0);
+        assert!(Pass1Packets::flat_unpack(&blob[..blob.len() - 1]).is_err(), "truncated");
+        let mut v2 = blob.clone();
+        v2[0] = 2;
+        assert!(Pass1Packets::flat_unpack(&v2).is_err(), "old format byte");
+        assert_eq!(packets.cached_size(), 1001 + 24 * 3 + 24);
+    }
+
+    /// Logs `None` for a rewind and `Some(g)` per GOP; GOP `g`'s YUV is
+    /// four bytes of `g`.
+    #[derive(Default)]
+    struct MockSource {
+        log: Vec<Option<u32>>,
+    }
+
+    impl Av1GopYuvSource for MockSource {
+        fn gop_yuv(&mut self, gop_index: u32) -> Result<Vec<u8>, Av1StegoError> {
+            self.log.push(Some(gop_index));
+            Ok(vec![gop_index as u8; 4])
+        }
+        fn rewind(&mut self) -> Result<(), Av1StegoError> {
+            self.log.push(None);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lazy_puller_untouched_until_first_call() {
+        let mut src = MockSource::default();
+        let puller = LazyGopPuller::new(&mut src);
+        drop(puller);
+        assert!(src.log.is_empty());
+    }
+
+    /// The source contract holds on a miss after hits: one rewind, then
+    /// every GOP in order up to the one needed.
+    #[test]
+    fn lazy_puller_pulls_forward_in_order() {
+        let mut src = MockSource::default();
+        let mut puller = LazyGopPuller::new(&mut src);
+        assert_eq!(puller.gop(2).unwrap(), vec![2; 4]);
+        assert_eq!(puller.gop(3).unwrap(), vec![3; 4]);
+        assert!(matches!(puller.gop(1), Err(Av1StegoError::InvalidPacket(_))));
+        drop(puller);
+        assert_eq!(src.log, vec![None, Some(0), Some(1), Some(2), Some(3)]);
+    }
+
+    /// Overwrite every pixel of `rec`'s planes past the visible `w`×`h`
+    /// (luma; chroma at half), up to the aligned plane size, with `v`.
+    fn fill_alignment_padding(rec: &mut PhasmFrameRecording<u8>, w: usize, h: usize, v: u8) {
+        let mut f = (*rec.reconstructed_planes).clone();
+        for (i, p) in f.planes.iter_mut().enumerate() {
+            let (vw, vh) = if i == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
+            let (pw, ph) = (p.cfg.width, p.cfg.height);
+            let (stride, xo, yo) = (p.cfg.stride, p.cfg.xorigin, p.cfg.yorigin);
+            for y in 0..ph {
+                for x in 0..pw {
+                    if x >= vw || y >= vh {
+                        p.data[(yo + y) * stride + xo + x] = v;
+                    }
+                }
+            }
+        }
+        rec.reconstructed_planes = Arc::new(f);
+    }
+
+    /// J-UNIWARD costs depend only on pixels a viewer sees: rav1e aligns
+    /// plane width and height to 8, and what it reconstructs in that
+    /// padding is cropped on output and not reproduced by a decoder.
+    #[test]
+    fn harvest_ignores_alignment_padding() {
+        let (w, h) = (250u32, 142u32);
+        let (yuv, params) = noise_gop_sized(w, h, 2);
+        let mut frames = encode_gop_natural(&yuv, 2, params).expect("encode");
+        assert_eq!(frames[0].1.reconstructed_planes.planes[0].cfg.width, 256, "rav1e aligns to 8");
+        let before = harvest_gop(&frames, w, h).expect("harvest");
+        for (_, rec) in &mut frames {
+            fill_alignment_padding(rec, w as usize, h as usize, 255);
+        }
+        let after = harvest_gop(&frames, w, h).expect("harvest");
+        assert_eq!(after.cover_bits, before.cover_bits);
+        let changed = before
+            .costs
+            .iter()
+            .zip(&after.costs)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(changed, 0, "{changed} of {} costs read the padding", before.costs.len());
+    }
+
+    /// The cost input repeats the last visible column and row into rav1e's
+    /// alignment padding, and leaves the visible region alone.
+    #[test]
+    fn pack_cost_planes_replicates_visible_edge() {
+        let (w, h) = (250usize, 142usize);
+        let mut f = make_frame::<u8>(w, h, ChromaSampling::Cs420);
+        for (i, p) in f.planes.iter_mut().enumerate() {
+            let (stride, xo, yo) = (p.cfg.stride, p.cfg.xorigin, p.cfg.yorigin);
+            for y in 0..p.cfg.height {
+                for x in 0..p.cfg.width {
+                    p.data[(yo + y) * stride + xo + x] = ((x * 7 + y * 13 + i * 29) % 251) as u8;
+                }
+            }
+        }
+        let rec = Arc::new(f);
+        let raw = pack_visible_planes(&rec);
+        let got = pack_cost_planes(&rec, w, h);
+        assert_eq!((got.luma_width, got.luma_height), (256, 144));
+        assert_eq!((got.chroma_width, got.chroma_height), (128, 72));
+        let check = |name: &str, got: &[u8], raw: &[u8], pw: usize, ph: usize, vw: usize, vh: usize| {
+            for y in 0..ph {
+                for x in 0..pw {
+                    let want = raw[y.min(vh - 1) * pw + x.min(vw - 1)];
+                    assert_eq!(got[y * pw + x], want, "{name} ({x},{y})");
+                }
+            }
+        };
+        check("Y", &got.y, &raw.y, 256, 144, w, h);
+        check("U", &got.cb, &raw.cb, 128, 72, 125, 71);
+        check("V", &got.cr, &raw.cr, 128, 72, 125, 71);
+    }
+
+    /// The streamed rebuild hands each frame over in order, as soon as it
+    /// is decoded, with its full planes; Pass 2's hit path harvests it there
+    /// and drops the planes, and must end up with exactly the entry a whole-
+    /// GOP rebuild + `harvest_gop` gives: same packets, same storage, a
+    /// bit-identical harvest — and only the shared dummy planes kept.
+    #[test]
+    fn streamed_rebuild_hit_path_matches_rebuild_then_harvest() {
+        for (w, h) in [(256u32, 144u32), (250, 142)] {
+            let (yuv, params) = noise_gop_sized(w, h, 4);
+            let frames = encode_gop_natural(&yuv, 4, params).unwrap();
+            let cover = count_cover_bits(&frames);
+            let packets: Vec<Vec<u8>> = frames.iter().map(|(p, _)| p.clone()).collect();
+            let rebuilt = super::super::rebuild::rebuild_gop_recordings(&packets, w, h).unwrap();
+            let reference = harvest_gop(&rebuilt, w, h).unwrap();
+
+            let mut seen = Vec::new();
+            let streamed = super::super::rebuild::rebuild_gop_streamed(&packets, w, h, &mut |k, entry| {
+                assert!(entry.1.reconstructed_planes.planes[0].cfg.width >= w as usize, "full planes");
+                seen.push(k);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen, vec![0, 1, 2, 3], "{w}x{h}: frames handed over in order");
+            assert_eq!(streamed.len(), 4);
+
+            let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+                1, 64 << 20, 0, std::env::temp_dir(), AV1_PASS1_CACHE_TAG,
+            );
+            cache.insert(0, Pass1Packets(packets.clone()));
+            let mut src = MockSource::default();
+            let (entry, recomputed) = {
+                let mut puller = LazyGopPuller::new(&mut src);
+                pass1_entry_for(&mut cache, &mut puller, 4, params, 0, cover).unwrap()
+            };
+            assert!(!recomputed && src.log.is_empty(), "{w}x{h}: hit path fell back");
+            assert!(entry.harvest.bit_identical(&reference), "{w}x{h}: harvest differs");
+            let dummy_width = dummy_planes().planes[0].cfg.width;
+            for ((p, r), (rp, rr)) in entry.frames.iter().zip(&rebuilt) {
+                assert_eq!(p, rp);
+                assert_eq!(r.tiles[0].storage, rr.tiles[0].storage);
+                assert_eq!(r.tiles[0].bit_positions, rr.tiles[0].bit_positions);
+                assert_eq!(r.reconstructed_planes.planes[0].cfg.width, dummy_width, "planes dropped");
+            }
+        }
+    }
+
+    // ── Pass-2 peak-memory measurement (two ignored tests, separate
+    // processes, so rav1e's encode peak does not mask the rebuild's).
+    //
+    //   PHASM_TMP=… cargo test … --lib pass2_rss_write_packets -- --ignored --nocapture
+    //   PHASM_TMP=… cargo test … --lib pass2_rss_rebuild -- --ignored --nocapture
+    //
+    // Env: PHASM_O3_CLIP (default IMG_4138), PHASM_O3_W / _H (1920×1080),
+    // PHASM_O3_FRAMES (30), PHASM_O3_Q (100).
+
+    fn rss_env_u32(k: &str, d: u32) -> u32 {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+
+    /// `$PHASM_TMP/phasm-pass2-rss/packets_<W>x<H>.bin` for the env size.
+    fn rss_packets_path() -> std::path::PathBuf {
+        let base = std::env::var("PHASM_TMP")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let (w, h) = (rss_env_u32("PHASM_O3_W", 1920), rss_env_u32("PHASM_O3_H", 1080));
+        base.join("phasm-pass2-rss").join(format!("packets_{w}x{h}.bin"))
+    }
+
+    fn peak_rss_bytes() -> u64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+            return 0;
+        }
+        // macOS reports bytes, Linux KiB.
+        if cfg!(target_os = "macos") { ru.ru_maxrss as u64 } else { ru.ru_maxrss as u64 * 1024 }
+    }
+
+    /// Encode one GOP and write `[w][h][frames][pass1_cover][Pass1Packets]`.
+    #[test]
+    #[ignore = "measurement: writes packets for pass2_rss_rebuild"]
+    fn pass2_rss_write_packets() {
+        let clip = std::env::var("PHASM_O3_CLIP").unwrap_or_else(|_| {
+            format!("{}/test-vectors/video/h264/real-world/source/IMG_4138.MOV", env!("CARGO_MANIFEST_DIR"))
+        });
+        let (w, h) = (rss_env_u32("PHASM_O3_W", 1920), rss_env_u32("PHASM_O3_H", 1080));
+        let n = rss_env_u32("PHASM_O3_FRAMES", 30);
+        let q = rss_env_u32("PHASM_O3_Q", 100) as usize;
+        let vf = format!("scale={w}:{h}:force_original_aspect_ratio=disable");
+        let out = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i", &clip, "-frames:v", &n.to_string(), "-vf", &vf])
+            .args(["-pix_fmt", "yuv420p", "-f", "rawvideo", "-"])
+            .output()
+            .expect("ffmpeg");
+        assert!(out.status.success(), "ffmpeg failed on {clip}");
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n };
+        let frames = encode_gop_natural(&out.stdout, n, params).expect("encode");
+        let cover = count_cover_bits(&frames);
+        let packets = Pass1Packets(frames.into_iter().map(|(p, _)| p).collect());
+        let mut blob = Vec::new();
+        for v in [w, h, n] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&(q as u32).to_le_bytes());
+        blob.extend_from_slice(&(cover as u64).to_le_bytes());
+        blob.extend_from_slice(&packets.flat_pack());
+        let path = rss_packets_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &blob).unwrap();
+        eprintln!("[pass2_rss] wrote {} ({w}x{h} x{n} q{q}, cover {cover}, {} B)", path.display(), blob.len());
+    }
+
+    /// Run Pass 2's cache-hit path on the written GOP and report peak RSS.
+    #[test]
+    #[ignore = "measurement: run after pass2_rss_write_packets, in its own process"]
+    fn pass2_rss_rebuild() {
+        let blob = std::fs::read(rss_packets_path()).expect("run pass2_rss_write_packets first");
+        let u32_at = |i: usize| u32::from_le_bytes(blob[i..i + 4].try_into().unwrap());
+        let (w, h, n, q) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12) as usize);
+        let cover = u64::from_le_bytes(blob[16..24].try_into().unwrap()) as usize;
+        let packets = Pass1Packets::flat_unpack(&blob[24..]).expect("packets");
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n };
+        let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
+            1, 1 << 30, 0, std::env::temp_dir(), AV1_PASS1_CACHE_TAG,
+        );
+        cache.insert(0, packets);
+        let rss_before = peak_rss_bytes();
+        if std::env::var("PHASM_RSS_REBUILD_ONLY").is_ok() {
+            // Attribution: the decode-side rebuild alone, no harvest.
+            let packets = cache.fetch(0).unwrap().0;
+            let t = std::time::Instant::now();
+            let frames = super::super::rebuild::rebuild_gop_recordings(&packets, w, h).unwrap();
+            eprintln!(
+                "[pass2_rss] {w}x{h} x{n}: rebuild only {:.3}s, {} frames, peak RSS {:.1} MB",
+                t.elapsed().as_secs_f64(),
+                frames.len(),
+                peak_rss_bytes() as f64 / (1 << 20) as f64
+            );
+            return;
+        }
+        // A pull would mean the rebuild failed and fell back to a re-encode.
+        let mut src = MockSource::default();
+        let t = std::time::Instant::now();
+        let (entry, recomputed) = {
+            let mut puller = LazyGopPuller::new(&mut src);
+            pass1_entry_for(&mut cache, &mut puller, n, params, 0, cover).expect("hit path")
+        };
+        let dt = t.elapsed();
+        assert!(!recomputed && src.log.is_empty(), "the rebuild fell back to a re-encode");
+        assert_eq!(entry.harvest.cover_bits.len(), cover);
+        let rss = peak_rss_bytes();
+        eprintln!(
+            "[pass2_rss] {w}x{h} x{n}: hit path {:.3}s, peak RSS {:.1} MB (before the call {:.1} MB)",
+            dt.as_secs_f64(),
+            rss as f64 / (1 << 20) as f64,
+            rss_before as f64 / (1 << 20) as f64
+        );
+    }
+}

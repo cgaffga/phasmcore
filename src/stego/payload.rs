@@ -47,6 +47,20 @@ const BROTLI_LG_WINDOW_SIZE: u32 = 22;
 /// Maximum raw file size before compression (hard reject).
 pub const MAX_RAW_FILE_SIZE: usize = 2 * 1024 * 1024; // 2 MB
 
+/// Maximum serialized inner payload (text + file entries, before compression).
+///
+/// One bound for both directions: `encode_payload` refuses anything larger
+/// and `decode_payload` refuses to decompress past it, so the decoder can
+/// never cut short a payload the encoder accepted. (Until 2026-10-23 the
+/// decoder silently truncated at 128 KiB while the encoder had no total
+/// bound at all — a compressible attachment over 128 KiB encoded fine and
+/// then failed to decode, and long text came back cut off.)
+///
+/// Sized for video, the largest carrier: AV1 already reaches ~550 KB on a
+/// 12 s 1080p clip and capacity grows with clip length. 16 MiB still bounds
+/// what a decompression bomb can make the decoder allocate.
+pub const MAX_INNER_PAYLOAD_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 /// A file entry embedded in the payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -68,8 +82,9 @@ pub struct PayloadData {
 ///
 /// Tries Brotli compression and uses it only if it produces a smaller result.
 ///
-/// Returns an error if any file exceeds `MAX_RAW_FILE_SIZE` or has a filename
-/// longer than 255 bytes.
+/// Returns an error if any file exceeds `MAX_RAW_FILE_SIZE`, has a filename
+/// longer than 255 bytes, or the serialized payload exceeds
+/// `MAX_INNER_PAYLOAD_BYTES`.
 pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoError> {
     for file in files {
         if file.content.len() > MAX_RAW_FILE_SIZE {
@@ -80,6 +95,9 @@ pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoE
         }
     }
     let inner = serialize_inner(text, files);
+    if inner.len() > MAX_INNER_PAYLOAD_BYTES {
+        return Err(StegoError::MessageTooLarge);
+    }
     Ok(try_compress(&inner))
 }
 
@@ -245,14 +263,22 @@ fn compress_brotli(data: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Decompress Brotli data.
+/// Decompress Brotli data, refusing output past `MAX_INNER_PAYLOAD_BYTES`
+/// (decompression-bomb bound).
+///
+/// Reads one byte past the bound so that overflow is an error rather than a
+/// silent truncation: `take(limit)` alone returns `Ok` with the first `limit`
+/// bytes, which is how text over the old 128 KiB bound came back cut off.
 fn decompress_brotli(data: &[u8]) -> Result<Vec<u8>, StegoError> {
     let mut output = Vec::new();
     let decompressor = brotli::Decompressor::new(data, 4096);
-    // Limit decompressed size to prevent decompression bombs
-    let limit = 128 * 1024; // 128 KB generous limit
-    decompressor.take(limit as u64).read_to_end(&mut output)
+    decompressor
+        .take(MAX_INNER_PAYLOAD_BYTES as u64 + 1)
+        .read_to_end(&mut output)
         .map_err(|_| StegoError::FrameCorrupted)?;
+    if output.len() > MAX_INNER_PAYLOAD_BYTES {
+        return Err(StegoError::FrameCorrupted);
+    }
     Ok(output)
 }
 
@@ -354,6 +380,62 @@ mod tests {
         assert_eq!(encoded[0] & COMPRESS_MASK, COMPRESS_BROTLI);
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.files[0].content.len(), 13000);
+    }
+
+    /// Regression: the decoder used to `take()` 128 KiB of decompressed
+    /// output, so this came back `Ok` with the text cut to 131 072 bytes.
+    #[test]
+    fn compressible_text_over_128k_roundtrips() {
+        let text = "The quick brown fox jumps over the lazy dog. ".repeat(4600); // ~207 KB
+        let encoded = encode_payload(&text, &[]).unwrap();
+        assert_eq!(encoded[0] & COMPRESS_MASK, COMPRESS_BROTLI);
+        let decoded = decode_payload(&encoded).unwrap();
+        assert_eq!(decoded.text.len(), text.len());
+        assert_eq!(decoded.text, text);
+    }
+
+    /// Regression: same truncation, but landing inside a file entry, so the
+    /// decode failed outright (`FrameCorrupted`) on a payload that compresses
+    /// to ~10 KB — small enough for almost any cover.
+    #[test]
+    fn compressible_file_over_128k_roundtrips() {
+        let content: Vec<u8> = (0..20_000)
+            .flat_map(|i| format!("{i},sensor-{},{}.{}\n", i % 7, i % 100, i % 10).into_bytes())
+            .collect();
+        assert!(content.len() > 128 * 1024);
+        let files = vec![FileEntry {
+            filename: "log.csv".to_string(),
+            content: content.clone(),
+        }];
+        let encoded = encode_payload("see attached", &files).unwrap();
+        let decoded = decode_payload(&encoded).unwrap();
+        assert_eq!(decoded.text, "see attached");
+        assert_eq!(decoded.files[0].content, content);
+    }
+
+    #[test]
+    fn encode_rejects_payload_over_inner_limit() {
+        let text = "a".repeat(MAX_INNER_PAYLOAD_BYTES + 1);
+        assert!(matches!(
+            encode_payload(&text, &[]),
+            Err(StegoError::MessageTooLarge)
+        ));
+    }
+
+    /// Past the bound the decoder must fail loudly, never hand back a prefix.
+    #[test]
+    fn decode_rejects_decompression_past_inner_limit() {
+        let mut bomb = Vec::new();
+        {
+            let mut w = brotli::CompressorWriter::new(&mut bomb, 4096, 1, BROTLI_LG_WINDOW_SIZE);
+            w.write_all(&vec![b'a'; MAX_INNER_PAYLOAD_BYTES + 1]).unwrap();
+        }
+        let mut data = vec![COMPRESS_BROTLI];
+        data.extend_from_slice(&bomb);
+        assert!(matches!(
+            decode_payload(&data),
+            Err(StegoError::FrameCorrupted)
+        ));
     }
 
     #[test]

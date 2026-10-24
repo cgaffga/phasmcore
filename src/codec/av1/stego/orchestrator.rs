@@ -397,33 +397,8 @@ pub fn av1_stego_embed_payload_bits_with_shadows_parity(
     // textured regions get LOW cost (safe to flip — the perturbation
     // hides in existing wavelet energy); positions in smooth regions
     // get HIGH cost.
-    let frame_planes = pack_visible_planes(&recording.reconstructed_planes);
-    let av1_positions: Vec<Av1FramePosition> = metas_used
-        .iter()
-        .map(|m| Av1FramePosition {
-            plane: m.plane,
-            plane_px_x: m.plane_px_x,
-            plane_px_y: m.plane_px_y,
-            tx_width_log2: m.tx_width_log2,
-            tx_height_log2: m.tx_height_log2,
-            tx_type: m.tx_type,
-            scan_pos: m.scan_pos,
-            // Carry encoder-side coefficient magnitude through for
-            // cascade-safety v2's pre-filter + upper-bound + cache key.
-            coeff_magnitude: m.coeff_magnitude,
-        })
-        .collect();
-    // Pass the frame-level loop-filter state captured by the
-    // fork-patch through to cost compute. This activates the
-    // three-tier dispatch (|coeff|-based safe/reject bands + forward
-    // model for the middle), replacing the earlier magnitude-proxy
-    // path that wasn't discriminating cascade-amplified positions.
-    let mut costs = crate::stego::cost::av1_uniward::compute_av1_uniward_costs_with_state(
-        &frame_planes,
-        &av1_positions,
-        recording.frame_qindex,
-        Some(recording.loop_filter_state),
-    );
+    let (width, height) = av1_visible_frame_size(&natural_packet)?;
+    let mut costs = frame_costs(&recording, metas_used, width, height);
 
     // Overlay INF cost at IN-RANGE shadow positions so primary STC's
     // Viterbi routes around them. With shadow bits already injected
@@ -566,6 +541,9 @@ pub(crate) fn av1_stego_encode_one_gop_with_shadows_parity(
         return Err(Av1StegoError::EmptyRecording);
     }
     let n_frames = per_frame.len();
+    // Every frame of the GOP has the size its keyframe's sequence header
+    // declares.
+    let (width, height) = av1_visible_frame_size(&per_frame[0].0)?;
 
     // Per-frame harvest: Tier-1 cover bits + meta + global cursors +
     // per-position J-UNIWARD cost.
@@ -604,26 +582,7 @@ pub(crate) fn av1_stego_encode_one_gop_with_shadows_parity(
         // frame's reconstructed planes + frame_qindex +
         // loop_filter_state — frames have independent quality
         // characteristics.
-        let frame_planes = pack_visible_planes(&recording.reconstructed_planes);
-        let av1_positions: Vec<Av1FramePosition> = metas
-            .iter()
-            .map(|m| Av1FramePosition {
-                plane: m.plane,
-                plane_px_x: m.plane_px_x,
-                plane_px_y: m.plane_px_y,
-                tx_width_log2: m.tx_width_log2,
-                tx_height_log2: m.tx_height_log2,
-                tx_type: m.tx_type,
-                scan_pos: m.scan_pos,
-                coeff_magnitude: m.coeff_magnitude,
-            })
-            .collect();
-        let costs = crate::stego::cost::av1_uniward::compute_av1_uniward_costs_with_state(
-            &frame_planes,
-            &av1_positions,
-            recording.frame_qindex,
-            Some(recording.loop_filter_state),
-        );
+        let costs = frame_costs(recording, &metas, width, height);
 
         frames_harvest.push(FrameHarvest {
             global_cursors,
@@ -862,6 +821,194 @@ pub(crate) fn pack_visible_planes(
         chroma_width: chroma_w,
         chroma_height: chroma_h,
     }
+}
+
+/// [`pack_visible_planes`] for J-UNIWARD's cost input: the aligned planes,
+/// with the visible `width`×`height` frame's last column and row repeated
+/// into rav1e's 8-alignment padding (chroma at half size, rounded up).
+///
+/// rav1e aligns plane width and height to 8, and what it reconstructs in
+/// that padding is cropped on output: a decoder does not reproduce it, and
+/// no viewer or steganalyst sees it. Costs taken over it would differ
+/// between the encoder's recording and a decode of the same packets (the
+/// Pass-2 rebuild), so both sides cost the replicated edge instead. At
+/// sizes that are multiples of 8 this equals `pack_visible_planes`.
+#[cfg(feature = "av1-encoder")]
+pub(crate) fn pack_cost_planes(
+    rec: &std::sync::Arc<phasm_rav1e::Frame<u8>>,
+    width: usize,
+    height: usize,
+) -> FramePlanes {
+    let mut planes = pack_visible_planes(rec);
+    let replicate = |buf: &mut [u8], pw: usize, ph: usize, vw: usize, vh: usize| {
+        let (vw, vh) = (vw.clamp(1, pw), vh.clamp(1, ph));
+        for y in 0..vh {
+            let row = &mut buf[y * pw..(y + 1) * pw];
+            let edge = row[vw - 1];
+            row[vw..].fill(edge);
+        }
+        for y in vh..ph {
+            buf.copy_within((vh - 1) * pw..vh * pw, y * pw);
+        }
+    };
+    let (lw, lh) = (planes.luma_width, planes.luma_height);
+    let (cw, ch) = (planes.chroma_width, planes.chroma_height);
+    replicate(&mut planes.y, lw, lh, width, height);
+    replicate(&mut planes.cb, cw, ch, width.div_ceil(2), height.div_ceil(2));
+    replicate(&mut planes.cr, cw, ch, width.div_ceil(2), height.div_ceil(2));
+    planes
+}
+
+/// The visible frame size an AV1 packet's sequence header declares
+/// (`max_frame_width` × `max_frame_height`) — the encode's frame size, as
+/// rav1e never sets `frame_size_override_flag`. Every keyframe packet
+/// carries one; an inter frame's packet does not, which is an error.
+///
+/// The research embed paths read it here because they get only packets and
+/// recordings, and rav1e's reconstructed planes are 8-aligned. (The fuller
+/// parser in `codec::mp4::av1_obu_split` is behind the `video` feature.)
+#[cfg(feature = "av1-encoder")]
+pub(crate) fn av1_visible_frame_size(packet: &[u8]) -> Result<(usize, usize), Av1StegoError> {
+    let mut pos = 0usize;
+    while pos < packet.len() {
+        let header = packet[pos];
+        if header & 0x80 != 0 || (header >> 1) & 1 == 0 {
+            break; // forbidden bit, or no size field: not walkable
+        }
+        let ext = ((header >> 2) & 1) as usize;
+        let Some((size, leb_len)) = decode_uleb128(packet, pos + 1 + ext) else {
+            break;
+        };
+        let start = pos + 1 + ext + leb_len;
+        let Some(end) = usize::try_from(size)
+            .ok()
+            .and_then(|s| start.checked_add(s))
+            .filter(|&e| e <= packet.len())
+        else {
+            break;
+        };
+        if (header >> 3) & 0xf == OBU_SEQUENCE_HEADER {
+            return sequence_header_frame_size(&packet[start..end]).ok_or_else(|| {
+                Av1StegoError::InvalidPacket("unparseable AV1 sequence header".into())
+            });
+        }
+        pos = end;
+    }
+    Err(Av1StegoError::InvalidPacket(
+        "no AV1 sequence header in the packet (embed into a keyframe / the GOP's first packet)"
+            .into(),
+    ))
+}
+
+/// `max_frame_width` × `max_frame_height` from a `sequence_header_obu`
+/// payload (AV1 spec § 5.5.1), skipping the fields before them.
+#[cfg(feature = "av1-encoder")]
+fn sequence_header_frame_size(payload: &[u8]) -> Option<(usize, usize)> {
+    let mut pos = 0usize;
+    let mut f = |n: u32| -> Option<u64> {
+        let mut v = 0u64;
+        for _ in 0..n {
+            let byte = *payload.get(pos / 8)?;
+            v = (v << 1) | u64::from((byte >> (7 - pos % 8)) & 1);
+            pos += 1;
+        }
+        Some(v)
+    };
+    let _seq_profile = f(3)?;
+    let _still_picture = f(1)?;
+    let reduced_still_picture_header = f(1)? == 1;
+    if reduced_still_picture_header {
+        f(5)?; // seq_level_idx[0]
+    } else {
+        let timing_info_present = f(1)? == 1;
+        let mut decoder_model_info_present = false;
+        let mut buffer_delay_length = 0u32;
+        if timing_info_present {
+            f(32)?; // num_units_in_display_tick
+            f(32)?; // time_scale
+            if f(1)? == 1 {
+                // equal_picture_interval: num_ticks_per_picture_minus_1, uvlc()
+                let mut leading_zeros = 0u32;
+                while f(1)? == 0 {
+                    leading_zeros += 1;
+                    if leading_zeros >= 32 {
+                        return None;
+                    }
+                }
+                f(leading_zeros)?;
+            }
+            decoder_model_info_present = f(1)? == 1;
+            if decoder_model_info_present {
+                buffer_delay_length = f(5)? as u32 + 1;
+                f(32)?; // num_units_in_decoding_tick
+                f(5)?; // buffer_removal_time_length_minus_1
+                f(5)?; // frame_presentation_time_length_minus_1
+            }
+        }
+        let initial_display_delay_present = f(1)? == 1;
+        let operating_points = f(5)? + 1;
+        for _ in 0..operating_points {
+            f(12)?; // operating_point_idc
+            if f(5)? > 7 {
+                f(1)?; // seq_tier
+            }
+            if decoder_model_info_present && f(1)? == 1 {
+                f(buffer_delay_length)?; // decoder_buffer_delay
+                f(buffer_delay_length)?; // encoder_buffer_delay
+                f(1)?; // low_delay_mode_flag
+            }
+            if initial_display_delay_present && f(1)? == 1 {
+                f(4)?; // initial_display_delay_minus_1
+            }
+        }
+    }
+    let width_bits = f(4)? as u32 + 1;
+    let height_bits = f(4)? as u32 + 1;
+    let width = f(width_bits)? as usize + 1;
+    let height = f(height_bits)? as usize + 1;
+    Some((width, height))
+}
+
+/// J-UNIWARD cost of flipping each of a frame's enrolled positions
+/// (`metas`, in cover order), for the research embed paths. Each cost
+/// reflects how much the flip would perturb the Daubechies-8 wavelet
+/// decomposition of the post-LR reconstructed plane it lives in: positions
+/// in textured regions get LOW cost (the perturbation hides in existing
+/// wavelet energy), smooth regions HIGH cost. The frame's loop-filter state
+/// activates cascade-safety v2's three-tier dispatch (|coeff|-based
+/// safe/reject bands + forward model for the middle), and
+/// `coeff_magnitude` feeds its pre-filter, upper bound and cache key.
+///
+/// `width`×`height` is the visible frame size: the cost input repeats its
+/// edge into rav1e's 8-alignment padding ([`pack_cost_planes`]), whose
+/// pixels are cropped on output.
+#[cfg(feature = "av1-encoder")]
+fn frame_costs(
+    recording: &PhasmFrameRecording,
+    metas: &[AcSignMeta],
+    width: usize,
+    height: usize,
+) -> Vec<f32> {
+    let frame_planes = pack_cost_planes(&recording.reconstructed_planes, width, height);
+    let av1_positions: Vec<Av1FramePosition> = metas
+        .iter()
+        .map(|m| Av1FramePosition {
+            plane: m.plane,
+            plane_px_x: m.plane_px_x,
+            plane_px_y: m.plane_px_y,
+            tx_width_log2: m.tx_width_log2,
+            tx_height_log2: m.tx_height_log2,
+            tx_type: m.tx_type,
+            scan_pos: m.scan_pos,
+            coeff_magnitude: m.coeff_magnitude,
+        })
+        .collect();
+    crate::stego::cost::av1_uniward::compute_av1_uniward_costs_with_state(
+        &frame_planes,
+        &av1_positions,
+        recording.frame_qindex,
+        Some(recording.loop_filter_state),
+    )
 }
 
 /// Encode a u64 as an AV1 ULEB128 byte sequence (LSB-first 7-bit
@@ -1427,5 +1574,77 @@ mod tests {
             "stego bytes must decode as valid AV1; got {:?}",
             decode_result.as_ref().err()
         );
+    }
+
+    /// Overwrite every pixel of `rec`'s planes past the visible `w`×`h`
+    /// (luma; chroma at half, rounded up) with `v`.
+    fn fill_alignment_padding(rec: &mut PhasmFrameRecording, w: usize, h: usize, v: u8) {
+        let mut f = (*rec.reconstructed_planes).clone();
+        for (i, p) in f.planes.iter_mut().enumerate() {
+            let (vw, vh) = if i == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
+            let (stride, xo, yo) = (p.cfg.stride, p.cfg.xorigin, p.cfg.yorigin);
+            for y in 0..p.cfg.height {
+                for x in 0..p.cfg.width {
+                    if x >= vw || y >= vh {
+                        p.data[(yo + y) * stride + xo + x] = v;
+                    }
+                }
+            }
+        }
+        rec.reconstructed_planes = Arc::new(f);
+    }
+
+    /// Enrolled (AC sign / golomb tail LSB) meta of a frame, in cover order.
+    fn enrolled_metas(rec: &PhasmFrameRecording) -> Vec<AcSignMeta> {
+        let t = &rec.tiles[0];
+        t.bit_tags
+            .iter()
+            .zip(&t.bit_meta)
+            .filter(|(tag, _)| **tag == PHASM_TAG_AC_COEFF_SIGN || **tag == PHASM_TAG_GOLOMB_TAIL_LSB)
+            .map(|(_, m)| *m)
+            .collect()
+    }
+
+    /// The research embed paths cost the visible frame only, like the
+    /// production harvest: rav1e aligns planes to 8 and what it
+    /// reconstructs in that padding is cropped on output. At 250×142 no
+    /// cost may change when only the padding pixels do, and both research
+    /// paths still embed (reading the visible size from the stream).
+    #[test]
+    fn research_embed_ignores_alignment_padding() {
+        let (w, h) = (250usize, 142usize);
+        let (yuv, params) = crate::codec::av1::stego::whole_video::noise_gop_sized(w as u32, h as u32, 2);
+        let frames = crate::codec::av1::stego::whole_video::encode_gop_natural(&yuv, 2, params)
+            .expect("encode");
+        assert_eq!(frames[0].1.reconstructed_planes.planes[0].cfg.width, 256, "rav1e aligns to 8");
+        assert_eq!(av1_visible_frame_size(&frames[0].0).expect("sequence header"), (w, h));
+        assert!(av1_visible_frame_size(&frames[1].0).is_err(), "an inter frame has no sequence header");
+        let padded = |v: u8| {
+            let mut f = frames.clone();
+            for (_, rec) in &mut f {
+                fill_alignment_padding(rec, w, h, v);
+            }
+            f
+        };
+        let (zero, full) = (padded(0), padded(255));
+
+        for (i, ((_, a), (_, b))) in zero.iter().zip(&full).enumerate() {
+            let metas = enrolled_metas(a);
+            let (ca, cb) = (frame_costs(a, &metas, w, h), frame_costs(b, &metas, w, h));
+            let changed = ca.iter().zip(&cb).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            assert_eq!(changed, 0, "frame {i}: {changed} of {} costs read the padding", ca.len());
+        }
+
+        let cover: usize = frames.iter().map(|(_, r)| enrolled_metas(r).len()).sum();
+        let bits: Vec<u8> = (0..cover / 40).map(|i| ((i * 7 + 3) % 5 < 2) as u8).collect();
+        let seed = [3u8; 32];
+        let gop = |f: Vec<(Vec<u8>, PhasmFrameRecording)>| av1_stego_encode_one_gop(f, &bits, &seed);
+        assert!(gop(zero.clone()).expect("GOP embed") == gop(full.clone()).expect("GOP embed"));
+        let one = |f: &Vec<(Vec<u8>, PhasmFrameRecording)>| {
+            let (packet, rec) = f[0].clone();
+            let n = enrolled_metas(&rec).len();
+            av1_stego_embed_payload_bits(packet, rec, &bits[..n / 40], &seed).expect("frame embed")
+        };
+        assert!(one(&zero) == one(&full));
     }
 }

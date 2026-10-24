@@ -53,29 +53,10 @@
 //! carries, this pins every STC extract to the encoder's exact w-class —
 //! a 1/2³² reject that replaces v3's m_total brute-force search (#888).
 
-use std::sync::Arc;
 
-use phasm_rav1e::color::ChromaSampling;
-use phasm_rav1e::ec::PhasmFrameRecording;
-use phasm_rav1e::phasm_stego::{
-    encode_frame_with_phasm_tee, encode_gop_with_phasm_tee, make_frame, make_inter_config,
-    FrameInvariants, FrameState,
-};
-use phasm_rav1e::prelude::Sequence;
-use phasm_rav1e::EncoderConfig;
-
-use crate::stego::chunk_frame::{
-    allocate_chunks_concentrate_tail, build_chunk_frame_v3_1, build_first_chunk_frame_v3_1,
-    split_message_into_chunks,
-};
 use crate::stego::{crypto, frame};
 
 use super::orchestrator::Av1StegoError;
-#[cfg(feature = "av1-encoder")]
-use super::orchestrator::{
-    av1_stego_embed_payload_bits, av1_stego_encode_one_gop,
-    av1_stego_encode_one_gop_with_shadows_parity,
-};
 #[cfg(feature = "av1-decoder")]
 use super::orchestrator::{
     extract_chunk_frame_match, extract_first_chunk_frame_match,
@@ -171,6 +152,9 @@ impl Av1StreamingDecodeSession {
         const MAX_TOTAL_PAYLOAD_BYTES: u32 = 256 * 1024 * 1024;
 
         for (gop_idx, slab) in gop_slabs.iter().enumerate() {
+            // A cancel (the bridges run decodes on the Decode channel) stops
+            // at the next GOP instead of decoding the whole clip.
+            crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
             let cover_bits = harvest_cover_bits_from_stego(slab)?;
             if gop_idx == 0 {
                 let (total_bytes, payload) = extract_first_chunk_frame_match(
@@ -220,7 +204,10 @@ impl Av1StreamingDecodeSession {
             )));
         }
 
-        let parsed = frame::parse_frame(&assembled).map_err(Av1StegoError::Stego)?;
+        // Video bound, not the image one: a whole-clip frame is split into
+        // per-GOP chunks, so it may legitimately exceed `MAX_FRAME_BYTES`.
+        let parsed = frame::parse_frame_with_max(&assembled, frame::VIDEO_MAX_FRAME_BYTES)
+            .map_err(Av1StegoError::Stego)?;
         let plaintext = crypto::decrypt(
             &parsed.ciphertext,
             &self.passphrase,
@@ -282,6 +269,7 @@ impl Av1StreamingDecodeSession {
             ));
         }
         for slab in &gop_slabs {
+            crate::stego::progress::check_cancelled()?;
             // For each slab, run the shadow-extract pipeline. The
             // first GOP that yields a valid AES-authenticated shadow
             // wins; subsequent slabs aren't explored to keep cost
@@ -314,156 +302,29 @@ impl Av1StreamingDecodeSession {
         if self.accumulator.is_empty() {
             return Err(crate::stego::error::StegoError::FrameCorrupted);
         }
-        // Walk the WHOLE accumulator as one stream — no per-GOP
-        // split. `harvest_cover_bits_from_stego` produces the union
-        // Tier-1 cover (AC_COEFF_SIGN + GOLOMB_TAIL_LSB) across all
-        // OBUs in walker emit order. That's the same cover the
-        // encoder's verify gate operated on.
-        let cover = super::orchestrator::harvest_cover_bits_from_stego(&self.accumulator)
-            .map_err(|e| match e {
-                super::orchestrator::Av1StegoError::Stego(s) => s,
-                _ => crate::stego::error::StegoError::FrameCorrupted,
-            })?;
+        // The union Tier-1 cover (AC_COEFF_SIGN + GOLOMB_TAIL_LSB) across
+        // all GOPs in emit order — the cover the encoder's verify gate
+        // operated on. Harvested GOP by GOP (each starts at a keyframe, and
+        // the union is the per-GOP covers concatenated in GOP order, exactly
+        // as the encoder lays it out) so a cancel stops at the next GOP
+        // instead of after decoding the whole clip. A stream the walker
+        // cannot split is harvested in one walk, as before.
+        let to_stego = |e: super::orchestrator::Av1StegoError| match e {
+            super::orchestrator::Av1StegoError::Stego(s) => s,
+            _ => crate::stego::error::StegoError::FrameCorrupted,
+        };
+        let gop_slabs = split_av1_into_gops(&self.accumulator);
+        let cover = if gop_slabs.is_empty() {
+            crate::stego::progress::check_cancelled()?;
+            harvest_cover_bits_from_stego(&self.accumulator).map_err(to_stego)?
+        } else {
+            let mut cover = Vec::new();
+            for slab in &gop_slabs {
+                crate::stego::progress::check_cancelled()?;
+                cover.extend_from_slice(&harvest_cover_bits_from_stego(slab).map_err(to_stego)?);
+            }
+            cover
+        };
         super::shadow::av1_shadow_extract(&cover, shadow_pass)
     }
-}
-
-fn expected_i420_size(width: u32, height: u32) -> usize {
-    let y = (width as usize) * (height as usize);
-    let uv = ((width as usize) / 2) * ((height as usize) / 2);
-    y + 2 * uv
-}
-
-/// Encode an N-frame GOP via the phasm-rav1e fork's
-/// `encode_gop_with_phasm_tee` helper. Frame 0 is the keyframe; frames
-/// 1..N are P-frames referencing the prior reconstructions. Returns
-/// per-frame `(natural_packet, recording)` pairs that the orchestrator
-/// consumes via `av1_stego_encode_one_gop`.
-///
-/// `gop_buffer` is the packed I420 YUV for ALL `frames_in_gop` frames
-/// (frame 0 Y|U|V, frame 1 Y|U|V, ..., frame N-1 Y|U|V). Length must
-/// equal `frames_in_gop × frame_size`.
-///
-/// MOBOOM.T3.1: visibility raised to `pub(super)` so the new
-/// `av1_encode_streaming` no-shadow streaming entry in `whole_video.rs`
-/// can call this directly (must mirror the session's per-GOP encode
-/// byte-for-byte for the T3.2 byte-identity gate).
-pub(super) fn encode_one_gop_multi(
-    gop_buffer: &[u8],
-    frames_in_gop: u32,
-    params: Av1StreamingEncodeParams,
-) -> Result<Vec<(Vec<u8>, PhasmFrameRecording<u8>)>, Av1StegoError> {
-    let w = params.width as usize;
-    let h = params.height as usize;
-    let y_size = w * h;
-    let uv_size = (w / 2) * (h / 2);
-    let frame_size = y_size + 2 * uv_size;
-    let expected_total = frame_size * frames_in_gop as usize;
-    if gop_buffer.len() != expected_total {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "encode_one_gop_multi: gop_buffer len {} != frames_in_gop {} × frame_size {}",
-            gop_buffer.len(),
-            frames_in_gop,
-            frame_size,
-        )));
-    }
-
-    // low_latency = true is load-bearing: it disables frame reorder
-    // + B-frames. The per-GOP stego flow emits frames in input order
-    // and runs a single STC plan over the combined cover; B-frame
-    // reorder would break both. multiref also off — keeps ref
-    // selection deterministic for stealth profile stability.
-    let mut config = EncoderConfig {
-        width: w,
-        height: h,
-        bit_depth: 8,
-        chroma_sampling: ChromaSampling::Cs420,
-        quantizer: params.quantizer,
-        ..Default::default()
-    };
-    config.low_latency = true;
-    super::whole_video::apply_phasm_av1_speed(&mut config);
-    let config = Arc::new(config);
-    let mut sequence = Sequence::new(&config);
-    super::whole_video::apply_phasm_av1_sequence(&mut sequence);
-    let sequence = Arc::new(sequence);
-
-    let yuvs: Vec<Arc<phasm_rav1e::Frame<u8>>> = (0..frames_in_gop as usize)
-        .map(|i| {
-            let off = i * frame_size;
-            let mut frame_in = make_frame::<u8>(w, h, ChromaSampling::Cs420);
-            frame_in.planes[0].copy_from_raw_u8(&gop_buffer[off..off + y_size], w, 1);
-            frame_in.planes[1].copy_from_raw_u8(
-                &gop_buffer[off + y_size..off + y_size + uv_size],
-                w / 2,
-                1,
-            );
-            frame_in.planes[2].copy_from_raw_u8(
-                &gop_buffer[off + y_size + uv_size..off + frame_size],
-                w / 2,
-                1,
-            );
-            Arc::new(frame_in)
-        })
-        .collect();
-
-    Ok(encode_gop_with_phasm_tee::<u8>(&yuvs, config, sequence))
-}
-
-/// Encode one keyframe to AV1 OBU bytes + recording. The
-/// `frames_buffered_in_gop == 1` path uses this for byte-exact
-/// parity with the legacy single-frame primitive (kept for
-/// capacity-probe math + existing test expectations). The `> 1` path
-/// goes through `encode_one_gop_multi` instead.
-/// MOBOOM.T3.1: visibility raised to `pub(super)` so the new
-/// `av1_encode_streaming` no-shadow streaming entry can mirror the
-/// session's gop_size=1 path byte-for-byte (T3.2 byte-identity gate).
-pub(super) fn encode_one_keyframe(
-    yuv_i420: &[u8],
-    params: Av1StreamingEncodeParams,
-) -> Result<(Vec<u8>, PhasmFrameRecording<u8>), Av1StegoError> {
-    let mut config_inner = EncoderConfig {
-        width: params.width as usize,
-        height: params.height as usize,
-        bit_depth: 8,
-        chroma_sampling: ChromaSampling::Cs420,
-        quantizer: params.quantizer,
-        ..Default::default()
-    };
-    super::whole_video::apply_phasm_av1_speed(&mut config_inner);
-    let config = Arc::new(config_inner);
-    let mut sequence = Sequence::new(&config);
-    super::whole_video::apply_phasm_av1_sequence(&mut sequence);
-    let mut fi = FrameInvariants::<u8>::new_key_frame(
-        config.clone(),
-        Arc::new(sequence),
-        0,
-        Box::new([]),
-    );
-    fi.enable_segmentation = false;
-
-    let w = params.width as usize;
-    let h = params.height as usize;
-    let y_size = w * h;
-    let uv_size = (w / 2) * (h / 2);
-    if yuv_i420.len() != y_size + 2 * uv_size {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "encode_one_keyframe: yuv len {} != y_size+uv*2 {}",
-            yuv_i420.len(),
-            y_size + 2 * uv_size
-        )));
-    }
-
-    let mut frame_in = make_frame::<u8>(w, h, ChromaSampling::Cs420);
-    frame_in.planes[0].copy_from_raw_u8(&yuv_i420[..y_size], w, 1);
-    frame_in.planes[1].copy_from_raw_u8(&yuv_i420[y_size..y_size + uv_size], w / 2, 1);
-    frame_in.planes[2].copy_from_raw_u8(
-        &yuv_i420[y_size + uv_size..y_size + 2 * uv_size],
-        w / 2,
-        1,
-    );
-
-    let mut fs = FrameState::new_with_frame(&fi, Arc::new(frame_in));
-    let inter_cfg = make_inter_config(&config);
-    Ok(encode_frame_with_phasm_tee(&fi, &mut fs, &inter_cfg))
 }

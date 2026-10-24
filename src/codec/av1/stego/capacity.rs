@@ -53,6 +53,7 @@ use crate::stego::chunk_frame::{
     CHUNK_FRAME_FIRST_HEADER_LEN_V3_1, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1,
 };
 use crate::stego::frame::FRAME_OVERHEAD;
+use crate::stego::payload::MAX_INNER_PAYLOAD_BYTES;
 
 /// Maximum per-clip chunk_frame v3.1 overhead at a given GOP count.
 /// First GOP carries `CHUNK_FRAME_FIRST_HEADER_LEN_V3_1` bytes (clip header);
@@ -100,8 +101,8 @@ use super::session::Av1StreamingEncodeParams;
 /// allocator follow-on (see docs/design/video/av1/phase-c-capacity-api.md)
 /// that gives a tight bound by running STC at incrementally larger m_bits
 /// until it fails.
-const STC_PAYLOAD_RATIO_NUM: usize = 15;
-const STC_PAYLOAD_RATIO_DEN: usize = 100;
+pub(crate) const STC_PAYLOAD_RATIO_NUM: usize = 15;
+pub(crate) const STC_PAYLOAD_RATIO_DEN: usize = 100;
 
 /// Session-shape capacity probe. Runs the same per-GOP encode
 /// as `Av1StreamingEncodeSession` but skips STC + override apply,
@@ -346,6 +347,8 @@ impl Av1CapacityProbeResult {
         primary_bytes_raw
             .saturating_sub(chunk_frame_v3_1_overhead_bytes(self.n_gops as usize))
             .saturating_sub(FRAME_OVERHEAD)
+            // Never advertise more than `encode_payload` accepts.
+            .min(MAX_INNER_PAYLOAD_BYTES)
     }
 
     /// Shadow collision formula. `m_max_bits ≤ sqrt(1024 × C / max(1, N-1))`,
@@ -646,10 +649,12 @@ pub fn av1_probe_gops_at_with_progress(
 
 /// Stratified-sample capacity estimate for a streaming
 /// [`Av1GopYuvSource`](super::whole_video::Av1GopYuvSource). Pulls
-/// `calibration.k_min` GOPs at stratified positions, encodes them
-/// naturally (no STC) and extrapolates the whole-clip capacity via
-/// the same 99.9%-confidence statistical lower bound +
-/// `pessimism_factor` the planner uses.
+/// `calibration.k_min` full GOPs at stratified positions (at least one
+/// whenever the clip has a full GOP) plus the partial trailing GOP, if
+/// any, encodes them naturally (no STC) and extrapolates the whole-clip
+/// capacity: the full GOPs via the same 99.9%-confidence statistical
+/// lower bound + `pessimism_factor` the planner uses, the tail from its
+/// exact cover (see [`Av1StratifiedCapacity`]).
 ///
 /// **Why this exists:** `av1_capacity` requires the entire clip in
 /// RAM and probes every GOP (wall-clock ≈ full encode). Stratified
@@ -713,49 +718,32 @@ pub fn av1_capacity_stratified_with_progress(
     }
     let gop_size = params.gop_size.max(1);
     let n_gops = n_frames.div_ceil(gop_size);
-    let k_target = calibration.k_min.min(n_gops as usize).max(1);
-    let positions: Vec<u32> = stratified_positions(k_target, n_gops as usize)
-        .into_iter()
-        .map(|p| p as u32)
-        .collect();
+    // A partial trailing GOP is not a sample of the full-GOP population: it
+    // holds `n_frames % gop_size` frames and correspondingly less cover.
+    // Treated as one, it widened the lower bound for every GOP (iphone5,
+    // 363 vs 360 frames: 341 828 vs 552 612 B advertised). It is probed
+    // exactly instead and added on top of the full-GOP extrapolation.
+    let (positions, n_full, tail_gop) =
+        stratified_probe_positions(n_frames, gop_size, calibration.k_min);
 
     let samples = av1_probe_gops_at_with_progress(
         source, n_frames, params, &positions, progress_fn,
     )?;
-    let k = samples.len();
-    if k == 0 {
+    if samples.is_empty() {
         return Err(Av1StegoError::InvalidPacket(
             "av1_capacity_stratified: no samples collected".into(),
         ));
     }
-
-    // Mirror the statistical-lower-bound math from
-    // `plan_safe_balanced` (balanced_allocation.rs:109-147).
-    // `cap_per_gop_lower = (μ − t·σ/√K · fpc).max(0.0)`;
-    // `cap_per_gop_safe = cap_per_gop_lower × pessimism_factor`.
-    let caps: Vec<f64> = samples.iter().map(|&(_, c)| c as f64).collect();
-    let mu = caps.iter().sum::<f64>() / k as f64;
-    let var = if k > 1 {
-        caps.iter().map(|&c| (c - mu).powi(2)).sum::<f64>() / (k - 1) as f64
-    } else {
-        mu // single-sample degenerate — force a pessimistic estimate
-    };
-    let sigma = var.sqrt();
-    let t = t_critical_99_9(k);
-    let fpc = if (n_gops as usize) > 1 {
-        (((n_gops as usize).saturating_sub(k)) as f64
-            / ((n_gops as usize - 1) as f64))
-            .max(0.0)
-            .sqrt()
-    } else {
-        0.0
-    };
-    let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt() * fpc).max(0.0);
-    let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
-
-    // Extrapolate to whole-clip cover bits via the safe per-GOP mean.
-    let extrapolated_cover_bits =
-        (cap_per_gop_safe * (n_gops as f64)) as usize;
+    let full: Vec<usize> = samples
+        .iter()
+        .filter(|&&(g, _)| g < n_full)
+        .map(|&(_, c)| c)
+        .collect();
+    let tail_cover = tail_gop.and_then(|t| {
+        samples.iter().find(|&&(g, _)| g == t).map(|&(_, c)| c)
+    });
+    let (mu, cap_per_gop_lower, cap_per_gop_safe, extrapolated_cover_bits) =
+        stratified_cover_estimate(&full, n_full, tail_cover, calibration);
 
     // Primary/shadow byte caps mirror `Av1CapacityProbeResult` math.
     let primary_bits = extrapolated_cover_bits
@@ -763,7 +751,9 @@ pub fn av1_capacity_stratified_with_progress(
         / STC_PAYLOAD_RATIO_DEN;
     let primary_max_message_bytes = (primary_bits / 8)
         .saturating_sub(chunk_frame_v3_1_overhead_bytes(n_gops as usize))
-        .saturating_sub(FRAME_OVERHEAD);
+        .saturating_sub(FRAME_OVERHEAD)
+        // Never advertise more than `encode_payload` accepts.
+        .min(MAX_INNER_PAYLOAD_BYTES);
 
     // Shadow (N=1) via collision formula.
     let shadow_n1_bits = (extrapolated_cover_bits as f64).min(
@@ -785,30 +775,109 @@ pub fn av1_capacity_stratified_with_progress(
     })
 }
 
-/// Result of [`av1_capacity_stratified`]. `samples` is the raw
-/// `(gop_idx, cover_bits)` list the planner wants (feed directly into
-/// `plan_safe_balanced`); the derived fields are the convenience
-/// capacity-estimate numbers for UI reporting.
+/// The GOPs [`av1_capacity_stratified_with_progress`] probes, ascending:
+/// `k_min` stratified full GOPs, plus the partial trailing GOP if the clip
+/// has one. Returns `(positions, n_full, tail_gop)`.
+fn stratified_probe_positions(
+    n_frames: u32,
+    gop_size: u32,
+    k_min: usize,
+) -> (Vec<u32>, usize, Option<usize>) {
+    let n_full = (n_frames / gop_size) as usize;
+    let tail_gop = (n_frames % gop_size != 0).then_some(n_full);
+    // At least one full GOP whenever there is one: an estimate from the
+    // partial tail alone (or from nothing) says nothing about the clip.
+    let k_target = k_min.max(1).min(n_full);
+    let mut positions: Vec<u32> = stratified_positions(k_target, n_full)
+        .into_iter()
+        .map(|p| p as u32)
+        .collect();
+    if let Some(t) = tail_gop {
+        positions.push(t as u32); // the last index, so `positions` stays ascending
+    }
+    (positions, n_full, tail_gop)
+}
+
+/// Result of [`av1_capacity_stratified`]: the raw probe samples and the
+/// capacity estimate derived from them, for UI reporting (the encoder
+/// measures every GOP itself in Pass 1 and plans from that).
+///
+/// The clip's `n_full = n_frames / gop_size` full GOPs are the sampled
+/// population; a partial trailing GOP is not a sample of it (it holds
+/// fewer frames and correspondingly less cover), so it is probed exactly
+/// and added on top. The per-GOP statistics below describe full GOPs only.
 #[derive(Debug, Clone)]
 pub struct Av1StratifiedCapacity {
-    /// `(gop_idx, cover_bits)` samples, suitable for
-    /// `plan_safe_balanced`.
+    /// `(gop_idx, cover_bits)` for every probed GOP, ascending: the
+    /// stratified full GOPs, then the partial trailing GOP (index
+    /// `n_full`) if the clip has one. Not a pure full-GOP sample — filter
+    /// out the tail before treating it as one.
     pub samples: Vec<(usize, usize)>,
-    /// Total GOPs in the clip (used by the planner / FPC).
+    /// Total GOPs in the clip, the partial trailing GOP included.
     pub n_gops: u32,
-    /// Per-GOP cover-bit mean across sampled GOPs.
+    /// Mean cover bits over the sampled full GOPs (0 when the clip is
+    /// shorter than one GOP).
     pub cover_bits_mean_per_gop: usize,
-    /// 99.9% statistical lower bound on per-GOP cover bits.
+    /// One-sided 99.9 % lower bound on a full GOP's cover bits, with the
+    /// finite-population correction over `n_full` (0 when the clip is
+    /// shorter than one GOP).
     pub cover_bits_lower_99_9_per_gop: usize,
-    /// Lower bound × `pessimism_factor` — the capacity floor the
-    /// planner would use for allocation.
+    /// `cover_bits_lower_99_9_per_gop × pessimism_factor`.
     pub cover_bits_pessimism_adjusted_per_gop: usize,
-    /// Extrapolated whole-clip cover bits (pessimism-adjusted × n_gops).
+    /// Whole-clip estimate: `(lower × n_full + tail_cover) ×
+    /// pessimism_factor`, with `tail_cover` the trailing GOP's exact cover
+    /// (0 without one).
     pub extrapolated_cover_bits_total: usize,
-    /// Primary payload byte cap at the pessimism-adjusted estimate.
+    /// Primary payload byte cap from `extrapolated_cover_bits_total`: the
+    /// STC payload ratio, minus the chunk-frame overhead for `n_gops` GOPs
+    /// and the frame overhead, capped at `MAX_INNER_PAYLOAD_BYTES`.
     pub primary_max_message_bytes: usize,
-    /// Shadow byte cap for N=1 at the pessimism-adjusted estimate.
+    /// Shadow (N = 1) byte cap from `extrapolated_cover_bits_total`, via
+    /// the collision formula `min(n, √(1024·n))` bits, minus the
+    /// worst-case RS parity and the frame overhead.
     pub shadow_max_message_bytes_n1: usize,
+}
+
+/// Whole-clip cover estimate from stratified full-GOP samples, plus the
+/// exactly probed partial tail GOP (`tail_cover`), if the clip has one.
+///
+/// Mirrors the statistical-lower-bound math of `plan_safe_balanced`
+/// (balanced_allocation.rs): `lower = (μ − t·σ/√K · fpc).max(0)` over the
+/// `n_full` full GOPs, `safe = lower × pessimism_factor`, and
+/// `extrapolated = (lower × n_full + tail_cover) × pessimism_factor`.
+/// Returns `(mu, lower, safe, extrapolated)`. With no full-GOP samples (a
+/// clip shorter than one GOP) the estimate is the tail alone.
+fn stratified_cover_estimate(
+    full_samples: &[usize],
+    n_full: usize,
+    tail_cover: Option<usize>,
+    cal: &AllocationCalibration,
+) -> (f64, f64, f64, usize) {
+    let k = full_samples.len();
+    let (mu, lower) = if k == 0 {
+        (0.0, 0.0)
+    } else {
+        let caps: Vec<f64> = full_samples.iter().map(|&c| c as f64).collect();
+        let mu = caps.iter().sum::<f64>() / k as f64;
+        let var = if k > 1 {
+            caps.iter().map(|&c| (c - mu).powi(2)).sum::<f64>() / (k - 1) as f64
+        } else {
+            mu // single-sample degenerate — force a pessimistic estimate
+        };
+        let fpc = if n_full > 1 {
+            ((n_full.saturating_sub(k)) as f64 / (n_full - 1) as f64)
+                .max(0.0)
+                .sqrt()
+        } else {
+            0.0
+        };
+        let lower = (mu - t_critical_99_9(k) * var.sqrt() / (k as f64).sqrt() * fpc).max(0.0);
+        (mu, lower)
+    };
+    let safe = lower * cal.pessimism_factor;
+    let extrapolated =
+        ((lower * n_full as f64 + tail_cover.unwrap_or(0) as f64) * cal.pessimism_factor) as usize;
+    (mu, lower, safe, extrapolated)
 }
 
 /// Stratified GOP positions: k evenly-spaced points at stratum
@@ -865,7 +934,9 @@ fn t_critical_99_9(k: usize) -> f64 {
 /// **Speed/sequence alignment (2026-10-18, probe-vs-encoder parity):**
 /// applies the production stealth-locked encoder config
 /// (`apply_phasm_av1_speed` → speed=9 default; `apply_phasm_av1_sequence`
-/// → `enable_large_lru=true` default as of 2026-10-20, was `false`).
+/// → `enable_large_lru=true` default as of 2026-10-20, was `false`;
+/// inert at speed ≥ 8 since LRF is disabled there — see
+/// `apply_phasm_av1_sequence`'s doc comment for why we still set it).
 /// Before this fix the probe
 /// built an `EncoderConfig::default()` which inherited rav1e's default
 /// speed=6, and every production encode downstream ran at speed=9 —
@@ -931,4 +1002,54 @@ fn probe_one_keyframe(
         }
     }
     Ok((ac_sign, golomb_tail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_does_not_widen_the_lower_bound() {
+        let (_, lower, _, extrapolated) = stratified_cover_estimate(
+            &[5_000_000; 8],
+            12,
+            Some(642_285),
+            &AllocationCalibration::AV1_1080P_QP30,
+        );
+        assert_eq!(lower, 5_000_000.0);
+        assert_eq!(extrapolated, ((5_000_000 * 12 + 642_285) as f64 * 0.5) as usize);
+    }
+
+    #[test]
+    fn adding_a_tail_never_lowers_the_estimate() {
+        let cal = AllocationCalibration::AV1_1080P_QP30;
+        let samples = [5_000_000usize; 8];
+        let without = stratified_cover_estimate(&samples, 12, None, &cal).3;
+        let with = stratified_cover_estimate(&samples, 12, Some(1), &cal).3;
+        assert!(with >= without, "{with} < {without}");
+    }
+
+    /// A clip shorter than one GOP has only a tail: estimate from it alone.
+    #[test]
+    fn probe_samples_a_full_gop_even_with_k_min_zero() {
+        // k_min 0 must not leave a clip with full GOPs estimated from its
+        // partial tail alone (or from nothing).
+        let (positions, n_full, tail) = stratified_probe_positions(95, 30, 0);
+        assert_eq!((n_full, tail), (3, Some(3)));
+        assert!(
+            positions.iter().any(|&g| (g as usize) < n_full),
+            "no full GOP sampled: {positions:?}"
+        );
+        let (positions, _, _) = stratified_probe_positions(90, 30, 0);
+        assert_eq!(positions.len(), 1, "one full GOP, no tail: {positions:?}");
+        // No full GOP at all: only the tail is probed.
+        assert_eq!(stratified_probe_positions(20, 30, 0).0, vec![0]);
+    }
+
+    #[test]
+    fn clip_shorter_than_one_gop_is_estimated_from_its_tail() {
+        let cal = AllocationCalibration::AV1_1080P_QP30;
+        let extrapolated = stratified_cover_estimate(&[], 0, Some(400_000), &cal).3;
+        assert_eq!(extrapolated, (400_000.0 * 0.5) as usize);
+    }
 }

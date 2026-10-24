@@ -66,6 +66,20 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024; // 256 KB
 /// Maximum payload frame size in bits.
 pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;
 
+/// Maximum payload frame size for VIDEO carriers (AV1 + H.264 streaming).
+///
+/// Video splits the frame into per-GOP chunks before STC, so each GOP's
+/// STC only ever sees its own chunk and the STC-memory rationale behind
+/// [`MAX_FRAME_BYTES`] does not apply. The bound is instead the largest
+/// frame `payload::encode_payload` can produce: the inner-payload bound,
+/// plus its flags byte, plus the extended (v2) frame overhead.
+///
+/// Video decoders parse with [`parse_frame_with_max`] at this bound. Until
+/// 2026-10-23 they used [`parse_frame`]'s image bound, so a video message
+/// over 256 KiB encoded "successfully" and then could never be decoded.
+pub const VIDEO_MAX_FRAME_BYTES: usize =
+    crate::stego::payload::MAX_INNER_PAYLOAD_BYTES + 1 + FRAME_OVERHEAD_EXT;
+
 /// Build a payload frame from encrypted components.
 ///
 /// Uses v1 format (2-byte u16 length) when `plaintext_len` fits in u16,
@@ -122,8 +136,18 @@ pub struct ParsedFrame {
 /// The input `data` may be larger than the actual frame (e.g. zero-padded).
 ///
 /// Returns `Err(StegoError::FrameCorrupted)` if the CRC check fails or the
-/// frame is truncated.
+/// frame is truncated. Frames over [`MAX_FRAME_BYTES`] are rejected — the
+/// image-carrier bound; video decoders use [`parse_frame_with_max`].
 pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
+    parse_frame_with_max(data, MAX_FRAME_BYTES)
+}
+
+/// [`parse_frame`] with an explicit frame-size bound, for carriers whose
+/// bound is not the image one (video: [`VIDEO_MAX_FRAME_BYTES`]).
+pub fn parse_frame_with_max(
+    data: &[u8],
+    max_frame_bytes: usize,
+) -> Result<ParsedFrame, StegoError> {
     if data.len() < 2 {
         return Err(StegoError::FrameCorrupted);
     }
@@ -146,7 +170,7 @@ pub fn parse_frame(data: &[u8]) -> Result<ParsedFrame, StegoError> {
     let ciphertext_len = plaintext_len + 16; // AES-GCM-SIV auth tag
     let total_frame_len = header_len + SALT_LEN + NONCE_LEN + ciphertext_len + 4;
 
-    if total_frame_len > MAX_FRAME_BYTES || data.len() < total_frame_len {
+    if total_frame_len > max_frame_bytes || data.len() < total_frame_len {
         return Err(StegoError::FrameCorrupted);
     }
 
@@ -313,6 +337,32 @@ mod tests {
         assert_eq!(parsed.salt, salt);
         assert_eq!(parsed.nonce, nonce);
         assert_eq!(parsed.ciphertext, ciphertext);
+    }
+
+    /// A video-sized frame (over the 256 KiB image bound) is rejected by the
+    /// image parser but must parse under the video bound — the video
+    /// decoders used `parse_frame`, so such messages could never be decoded.
+    #[test]
+    fn video_frame_over_image_bound_parses_with_video_bound() {
+        let plaintext_len = 300 * 1024;
+        let salt = [4u8; SALT_LEN];
+        let nonce = [5u8; NONCE_LEN];
+        let ciphertext: Vec<u8> = (0..plaintext_len + 16).map(|i| (i % 251) as u8).collect();
+        let frame = build_frame(plaintext_len, &salt, &nonce, &ciphertext);
+        assert!(frame.len() > MAX_FRAME_BYTES);
+
+        assert!(matches!(parse_frame(&frame), Err(StegoError::FrameCorrupted)));
+        let parsed = parse_frame_with_max(&frame, VIDEO_MAX_FRAME_BYTES).unwrap();
+        assert_eq!(parsed.plaintext_len as usize, plaintext_len);
+        assert_eq!(parsed.ciphertext, ciphertext);
+    }
+
+    /// The video bound must admit the largest frame `encode_payload` output
+    /// can produce, or encode and decode disagree again.
+    #[test]
+    fn video_bound_admits_largest_encodable_payload() {
+        let largest_payload = crate::stego::payload::MAX_INNER_PAYLOAD_BYTES + 1; // + flags byte
+        assert_eq!(largest_payload + FRAME_OVERHEAD_EXT, VIDEO_MAX_FRAME_BYTES);
     }
 
     #[test]

@@ -1963,7 +1963,9 @@ impl StreamingDecodeSession {
         // #474.2 — StcExtract boundary marker between Walker and Decrypt.
         self.emit_progress(DecodePhase::StcExtract);
 
-        let parsed = frame::parse_frame(&frame_bytes)?;
+        // Video bound, not the image one: a whole-clip frame is split into
+        // per-GOP chunks, so it may legitimately exceed `MAX_FRAME_BYTES`.
+        let parsed = frame::parse_frame_with_max(&frame_bytes, frame::VIDEO_MAX_FRAME_BYTES)?;
         // #474.2 — Decrypt fires immediately before crypto::decrypt.
         self.emit_progress(DecodePhase::Decrypt);
         let plaintext = crypto::decrypt(

@@ -175,6 +175,52 @@ pub struct Dav1dPhasmHooks {
     pub meta_hook: Dav1dPhasmMetaHook,
     /// stealth-audit-2026-06-29 addition.
     pub block_hook: Dav1dPhasmBlockHook,
+    /// Pass-2 rebuild (2026-10-24): per-symbol range-coder tuple.
+    /// Non-NULL routes dav1d's msac through hooked C decoders.
+    pub sym_hook: Dav1dPhasmSymHook,
+    /// Pass-2 rebuild (2026-10-24): per-coefficient full magnitude.
+    pub mag_hook: Dav1dPhasmMagHook,
+}
+
+/// Per-symbol `(fl, fh, nms, tracked)` callback — the tuple phasm-rav1e's
+/// `WriterRecorder` stores for the same emission, in decode order;
+/// `tracked` is 1 for a 50/50 `bool_equi` decode. Contract in
+/// `docs/design/video/av1/dav1d-hook-sites.md` § 11.
+pub type Dav1dPhasmSymHook = Option<
+    unsafe extern "C" fn(
+        cookie: *mut core::ffi::c_void,
+        fl: u16,
+        fh: u16,
+        nms: u16,
+        tracked: core::ffi::c_uint,
+    ),
+>;
+
+/// Per-coefficient magnitude callback: fires once per nonzero coefficient
+/// once its full quantized magnitude (golomb tail included) is known.
+pub type Dav1dPhasmMagHook =
+    Option<unsafe extern "C" fn(cookie: *mut core::ffi::c_void, magnitude: core::ffi::c_uint)>;
+
+/// The frame-header fields phasm-rav1e's
+/// `PhasmFrameLoopFilterState` + `frame_qindex` carry, read by the shim.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PhasmDav1dFrameLf {
+    pub base_q_idx: u8,
+    pub deblock_levels: [u8; 4],
+    pub cdef_y_strengths: [u8; 8],
+    pub cdef_uv_strengths: [u8; 8],
+    pub cdef_bits: u8,
+    pub cdef_enabled: u8,
+}
+
+unsafe extern "C" {
+    /// Fill `out` from `pic`'s frame + sequence header (Pass-2 rebuild).
+    /// `pic` is a `*const Dav1dPicture`. Returns 0, or -1 without headers.
+    pub fn phasm_dav1d_frame_lf_state(
+        pic: *const core::ffi::c_void,
+        out: *mut PhasmDav1dFrameLf,
+    ) -> core::ffi::c_int;
 }
 
 // ABI verification helpers exposed by the shim. Each returns the
@@ -644,6 +690,31 @@ mod tests {
 
             dav1d_close(&mut ctx);
             assert!(ctx.is_null(), "dav1d_close should null out the context pointer");
+        }
+    }
+
+    /// `dav1d_default_settings` clears the phasm hooks: a caller that does
+    /// not zero-initialise `Dav1dSettings` must not leave a garbage
+    /// `sym_hook` (which would reroute every msac decode) or any other
+    /// stale callback in place.
+    #[test]
+    fn default_settings_clears_phasm_hooks() {
+        if cfg!(phasm_dav1d_stub) {
+            return;
+        }
+        unsafe {
+            let mut settings = core::mem::MaybeUninit::<Dav1dSettings>::uninit();
+            core::ptr::write_bytes(settings.as_mut_ptr(), 0xAB, 1);
+            dav1d_default_settings(settings.as_mut_ptr());
+            let hooks = core::ptr::addr_of!((*settings.as_ptr()).phasm_hooks);
+            let bytes = core::slice::from_raw_parts(
+                hooks as *const u8,
+                core::mem::size_of::<Dav1dPhasmHooks>(),
+            );
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "phasm_hooks not cleared by dav1d_default_settings: {bytes:02x?}"
+            );
         }
     }
 }

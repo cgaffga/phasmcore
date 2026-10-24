@@ -593,7 +593,8 @@ const SEGMENTED_THRESHOLD: usize = 1_000_000;
 /// - `message`: message bits to embed (length m)
 /// - `hhat_matrix`: the H-hat submatrix (h rows × w columns)
 /// - `h`: constraint length (must be ≤ 7 so 2^h fits in u128)
-/// - `w`: submatrix width (should be ceil(n/m))
+/// - `w`: submatrix width, at most `n / m` (floor): the trellis needs
+///   m·w cover positions, and a shorter cover is infeasible (`None`)
 ///
 /// Returns the stego bit sequence that encodes the message with minimum
 /// distortion, or `None` if embedding is infeasible.
@@ -622,6 +623,13 @@ pub fn stc_embed(
             total_cost: 0.0,
             num_modifications: 0,
         });
+    }
+    // The trellis checks one message bit per `w` positions, so m bits need
+    // m·w of them. Fewer would leave the tail of the message unenforced —
+    // a plan that silently drops bits. The segmented path always refused
+    // this (`InMemoryCoverFetch::new`); the inline path now does too.
+    if m.checked_mul(w).is_none_or(|needed| n < needed) {
+        return None;
     }
 
     if n > SEGMENTED_THRESHOLD {
@@ -703,19 +711,15 @@ pub fn stc_is_feasible(
     if m == 0 {
         return true;
     }
+    // Both paths refuse a cover shorter than m·w (see `stc_embed`).
+    let Some(needed) = m.checked_mul(w).filter(|&needed| needed <= n) else {
+        return false;
+    };
     if costs.iter().take(n).any(|c| c.is_nan() || *c == f32::NEG_INFINITY) {
         return stc_embed(cover_bits, costs, message, hhat_matrix, h, w).is_some();
     }
-    // The segmented path walks only the first m·w positions and rejects a
-    // shorter cover outright (`InMemoryCoverFetch::new` → None).
-    let n_walk = if n > SEGMENTED_THRESHOLD {
-        if n < m * w {
-            return false;
-        }
-        m * w
-    } else {
-        n
-    };
+    // The segmented path walks only the first m·w positions.
+    let n_walk = if n > SEGMENTED_THRESHOLD { needed } else { n };
 
     let columns: Vec<u128> = (0..w)
         .map(|c| hhat::column_packed(hhat_matrix, c) as u128)
@@ -1209,6 +1213,31 @@ mod tests {
     /// constraint lengths, exact and ragged `n` vs `m·w` (incl. a cover shorter
     /// than `m·w`), wet fractions from 0 to 100 % (both outcomes must occur
     /// often), a non-0/1 message byte, and the NaN fallback.
+    /// A message needs m·w cover positions: the trellis checks one message
+    /// bit per w positions. With fewer, the inline path used to enforce only
+    /// the first n / w bits and return a plan that silently dropped the rest
+    /// (release builds; debug builds panicked in the extract check). Both
+    /// paths must call it infeasible, as the segmented path always did.
+    #[test]
+    fn stc_rejects_a_message_longer_than_its_cover() {
+        let mut s = 0x5EED_0C0F_u64;
+        // (n, m, w): m > n at w = 1, and m·w > n with n > m (w rounded up).
+        for &(n, m, w) in &[(30usize, 40usize, 1usize), (100, 30, 4), (64, 64, 2)] {
+            let (cover, costs, _, _, _) = random_instance(&mut s, 7, n, 1, 0);
+            let msg: Vec<u8> = (0..m).map(|_| (lcg(&mut s) & 1) as u8).collect();
+            let mut seed = [0u8; 32];
+            for b in seed.iter_mut() {
+                *b = lcg(&mut s) as u8;
+            }
+            let hhat = generate_hhat(7, w, &seed);
+            assert!(
+                stc_embed(&cover, &costs, &msg, &hhat, 7, w).is_none(),
+                "n={n} m={m} w={w}: stc_embed accepted a message longer than its cover"
+            );
+            assert!(!stc_is_feasible(&cover, &costs, &msg, &hhat, 7, w), "n={n} m={m} w={w}");
+        }
+    }
+
     #[test]
     fn stc_is_feasible_matches_stc_embed_exhaustively() {
         let mut s = 0xFEA5_1B1E_u64;

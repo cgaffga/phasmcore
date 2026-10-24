@@ -70,6 +70,18 @@ pub mod session;
 #[cfg(feature = "av1-encoder")]
 pub mod capacity;
 
+// Per-GOP primary allocation: how many message bytes each GOP's chunk
+// carries, in proportion to its measured cover. See
+// `docs/design/video/av1/capacity-split-and-payload-limits-2026-10-23.md` § 4.
+#[cfg(feature = "av1-encoder")]
+pub mod primary_plan;
+
+// Whole-encode progress (fraction + phase + GOP) for the AV1 streaming
+// encodes: proportional to the rav1e work, monotone while the total is
+// re-estimated.
+#[cfg(feature = "av1-encoder")]
+pub mod encode_progress;
+
 // Shadow messages — multi-message plausible deniability. Data
 // structures + ChaCha20 position priority + embed + extract +
 // multi-shadow cascade + session integration. See
@@ -86,3 +98,8 @@ pub mod shadow;
 // decoder hook (`harvest_cover_bits_from_stego`).
 #[cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 pub mod whole_video;
+
+// Pass-2 rebuild (2026-10-24): a GOP's replay data from a decode of its
+// natural packets, so Pass 1 caches only the packets.
+#[cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
+pub(super) mod rebuild;

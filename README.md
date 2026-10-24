@@ -76,6 +76,8 @@ Optimizes for **survivability**. Uses Spread Transform Dither Modulation (STDM) 
 
 Armor is the **default mode** on all platforms.
 
+Armor's robustness depends on the cover: it survives recompression and resizing only when the cover's longest edge is at most `ARMOR_TARGET_DIMENSION` (1600 px) and it has been re-encoded at QF65 first. The apps, the website and the `phasm` CLI prepare that cover automatically (the CLI's `--full-res` opts out, with a warning). If you call `armor_encode` from the library, prepare it yourself: a full-resolution Armor image still decodes, but does not survive a messenger's resize.
+
 #### Fortress Sub-Mode
 
 For short messages, Armor automatically activates **Fortress** — a [BA-QIM (Block-Average Quantization Index Modulation)](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) scheme that embeds one bit per 8x8 block into the block-average brightness. Fortress exploits [three invariants of JPEG recompression](https://phasm.app/blog/jpeg-recompression-invariants) — block averages, brightness ordering, and coefficient signs — that persist even through aggressive re-encoding.

@@ -137,3 +137,32 @@ unsigned phasm_dav1d_abi_settings_phasm_hooks_offset(void) {
 int phasm_dav1d_eagain_err(void) {
     return -EAGAIN;
 }
+
+/* phasm-stego (Pass-2 rebuild, 2026-10-24): the frame-header fields phasm-rav1e's
+ * PhasmFrameLoopFilterState + frame_qindex carry. Layout mirrored by
+ * PhasmDav1dFrameLf in core-dav1d-sys src/lib.rs. */
+typedef struct PhasmDav1dFrameLf {
+    uint8_t base_q_idx;
+    uint8_t deblock_levels[4];
+    uint8_t cdef_y_strengths[8];
+    uint8_t cdef_uv_strengths[8];
+    uint8_t cdef_bits;
+    uint8_t cdef_enabled;
+} PhasmDav1dFrameLf;
+
+int phasm_dav1d_frame_lf_state(const Dav1dPicture *pic, PhasmDav1dFrameLf *out) {
+    if (!pic || !pic->frame_hdr || !pic->seq_hdr || !out) return -1;
+    const Dav1dFrameHeader *h = pic->frame_hdr;
+    out->base_q_idx = h->quant.yac;
+    out->deblock_levels[0] = h->loopfilter.level_y[0];
+    out->deblock_levels[1] = h->loopfilter.level_y[1];
+    out->deblock_levels[2] = h->loopfilter.level_u;
+    out->deblock_levels[3] = h->loopfilter.level_v;
+    for (int i = 0; i < 8; i++) {
+        out->cdef_y_strengths[i] = h->cdef.y_strength[i];
+        out->cdef_uv_strengths[i] = h->cdef.uv_strength[i];
+    }
+    out->cdef_bits = h->cdef.n_bits;
+    out->cdef_enabled = pic->seq_hdr->cdef;
+    return 0;
+}
