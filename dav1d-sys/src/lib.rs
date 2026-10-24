@@ -421,6 +421,12 @@ unsafe extern "C" {
         out: *mut Dav1dPicture,
     ) -> core::ffi::c_int;
     pub fn dav1d_picture_unref(p: *mut Dav1dPicture);
+
+    /// Masks the CPU flags dav1d picks its DSP functions from; `0` forces
+    /// the C paths. Global, and read when a decoder initialises its DSP
+    /// tables, so it applies to decoders opened after the call. Test use
+    /// (`tests/av1_cross_arch_determinism.rs`).
+    pub fn dav1d_set_cpu_flags_mask(mask: core::ffi::c_uint);
 }
 
 // phasm-stego helper to retrieve platform-specific DAV1D_ERR(EAGAIN)

@@ -1,0 +1,194 @@
+# AV1 assembly + cross-arch determinism check (2026-10-24).
+#
+# phasm-core builds rav1e with its `asm` feature and dav1d with its
+# assembly. On aarch64 that was verified locally (NEON, byte-identical to
+# the pure-Rust kernels); x86_64's SSE/AVX2/AVX-512 kernels need real x86
+# hardware — Rosetta has no AVX2 — so this workflow runs on GitHub's.
+#
+# Runs on Linux x86_64, Linux arm64 and macOS arm64:
+#
+#   1. `tests/av1_cross_arch_determinism.rs` — stego-encodes three
+#      synthetic clips at every rav1e CPU level the runner supports
+#      (RAV1E_CPU_TARGET=RUST … AVX512ICL / NEON) plus once with dav1d
+#      forced to its C paths. All must give the same bytes, decode back to
+#      the message, and match the hash pinned on macOS aarch64.
+#   2. The AV1 lib tests (`codec::av1`): rebuild parity, decoder parity,
+#      Pass-2 wiring — with rav1e and dav1d assembly on, including the
+#      hooked dav1d decode Pass 2 uses.
+#
+# ─────────────────────────────────────────────────────────────────────
+# NO BINARY PERSISTENCE.
+# ─────────────────────────────────────────────────────────────────────
+#
+# AV1 itself is royalty-free (rav1e BSD-2 + AOMedia Patent License 1.0,
+# dav1d BSD-2), but project policy is that no video build is left on
+# GitHub, so this follows openh264-cross-arch.yml exactly:
+#
+#   - permissions: contents: read  → no commits, releases, packages.
+#   - NO actions/cache             → target/ never persists.
+#   - NO actions/upload-artifact   → no downloadable build outputs.
+#   - NO if: failure() upload step.
+#   - ulimit -c 0                  → no core dumps.
+#   - Explicit rm -rf at job end, though the runner VM is destroyed
+#     regardless.
+#   - The test prints target, level, sizes and hex hashes ONLY — never
+#     stream bytes.
+#
+# What persists: the text job log (90-day retention). No binary.
+#
+# This workflow builds no H.264 code: `h264-encoder` stays off and the
+# OpenH264 fork is not checked out.
+#
+# Trigger: workflow_dispatch only.
+
+name: av1-cross-arch-determinism
+
+on:
+  workflow_dispatch:
+    inputs:
+      rav1e_ref:
+        description: "phasm-rav1e commit (the monorepo's vendor/phasm-rav1e pin)"
+        default: "abe19cd8b369a051bb08ca2c53aceabb920bc00c"
+      dav1d_ref:
+        description: "phasm-dav1d commit (must be in dav1d-sys/build.rs's known-good list)"
+        default: "acadfd78b7e066749696cb4f7012e049bc3450c2"
+
+permissions:
+  contents: read
+
+jobs:
+  av1-asm:
+    name: av1-asm (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+          - os: macos-latest
+            label: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      # The mirror carries no vendor/ submodules. Check the forks out as
+      # siblings where the manifests look for them: `../vendor/phasm-rav1e`
+      # from Cargo.toml, `../../vendor/phasm-dav1d` from dav1d-sys/build.rs.
+      - name: Checkout phasmcore
+        uses: actions/checkout@v4
+        with:
+          path: phasmcore
+
+      - name: Checkout phasm-rav1e
+        uses: actions/checkout@v4
+        with:
+          repository: cgaffga/phasm-rav1e
+          ref: ${{ inputs.rav1e_ref }}
+          path: vendor/phasm-rav1e
+
+      - name: Checkout phasm-dav1d
+        uses: actions/checkout@v4
+        with:
+          repository: cgaffga/phasm-dav1d
+          ref: ${{ inputs.dav1d_ref }}
+          path: vendor/phasm-dav1d
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # meson + ninja build dav1d; nasm assembles dav1d's and rav1e's x86
+      # kernels (unused on arm64).
+      - name: Install meson + ninja + nasm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends meson ninja-build nasm
+          ulimit -c 0
+
+      - name: Install meson + ninja (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install meson ninja
+          ulimit -c 0
+
+      - name: Show toolchain, pins and CPU
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          echo "matrix label: ${{ matrix.label }}"
+          echo "phasm-rav1e: $(git -C vendor/phasm-rav1e rev-parse HEAD)"
+          echo "phasm-dav1d: $(git -C vendor/phasm-dav1d rev-parse HEAD)"
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'model name' /proc/cpuinfo || true
+            echo "x86 SIMD flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
+              | grep -E '^(sse4_1|avx2|avx512(f|bw|vl|vnni|vbmi2|bitalg))$' | tr '\n' ' ')"
+          else
+            sysctl -n machdep.cpu.brand_string || true
+          fi
+
+      # The mirror STRIPS the AV1 features + their path dependencies (the
+      # forks are out of the mirrored tree). Re-add them to this transient
+      # checkout ONLY — never pushed — with rav1e's `asm` + `threading`, the
+      # features phasm-core ships with.
+      - name: Re-enable AV1 on the mirror checkout (CI-only, never pushed)
+        working-directory: phasmcore
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          s = re.sub(r'members = \[([^\]]*)\]',
+                     lambda m: m.group(0) if '"dav1d-sys"' in m.group(1)
+                     else 'members = [' + m.group(1) + ', "dav1d-sys"]', s, count=1)
+          if "\nav1-encoder =" not in s:
+              s = s.replace('h264-decoder = ["video"]',
+                            'h264-decoder = ["video"]\n'
+                            'av1-decoder = ["dep:core-dav1d-sys"]\n'
+                            'av1-encoder = ["av1-decoder", "dep:phasm-rav1e", "parallel"]', 1)
+          if "\nphasm-rav1e =" not in s:
+              s = s.replace("[dependencies]\n",
+                            '[dependencies]\n'
+                            'core-dav1d-sys = { path = "dav1d-sys", optional = true }\n'
+                            'phasm-rav1e = { path = "../vendor/phasm-rav1e", package = "rav1e", '
+                            'optional = true, default-features = false, features = ["asm", "threading"] }\n', 1)
+          p.write_text(s)
+          PY
+          echo "--- re-enabled AV1 wiring (CI-only) ---"
+          grep -nE 'members =|^av1-(en|de)coder =|^core-dav1d-sys =|^phasm-rav1e =' Cargo.toml
+
+      - name: Run AV1 asm + cross-arch determinism test
+        working-directory: phasmcore
+        shell: bash
+        run: |
+          ulimit -c 0
+          cargo test --release \
+            --features av1-encoder \
+            --test av1_cross_arch_determinism \
+            --no-fail-fast \
+            -- --nocapture
+
+      - name: Run AV1 lib tests (asm on)
+        working-directory: phasmcore
+        shell: bash
+        run: |
+          ulimit -c 0
+          cargo test --release \
+            --features av1-encoder \
+            --lib codec::av1 \
+            --no-fail-fast
+
+      # Belt-and-suspenders: erase the build dirs and fork checkouts before
+      # the runner VM tears down.
+      - name: Erase build outputs (post-run cleanup)
+        if: always()
+        shell: bash
+        run: |
+          rm -rf phasmcore/target vendor/phasm-rav1e vendor/phasm-dav1d
+
+      # EXPLICITLY ABSENT, per the policy block at the top:
+      #   - actions/upload-artifact
+      #   - actions/cache
+      #   - if: failure() upload step
+      #   - docker push / ghcr.io publish

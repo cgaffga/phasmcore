@@ -45,11 +45,13 @@ pub struct Av1EncodeProgress {
 /// it in Pass 1. Measured 2026-10-24 with every GOP cached (IMG_4138 1080p
 /// q100, 2 GOPs of 30, `pull_no_shadow_pass2_cost_ratio`) on a machine
 /// under varying load: 0.041–0.047 while Pass 1 still harvested, 0.023–
-/// 0.030 since it only counts cover. The ratio moves with load (Pass 2's
-/// decode is single-threaded, rav1e is not), so the weight sits above every
-/// measurement: too high only slows the bar in Pass 1, too low would park
-/// it near the end.
-pub(crate) const EMBED_WEIGHT: f64 = 0.05;
+/// 0.030 since it only counts cover. On cgPhone (iPhone 16 Pro, the iphone5
+/// 1080p clip, `ios/Phasm/Debug/Av1EncodeBench.swift`) it was 0.065 — 40.5 s
+/// against 627.5 s, MP4 mux included, thermal "fair". The ratio moves with
+/// load and device (Pass 2's decode is single-threaded, rav1e is not), so
+/// the weight sits above every measurement: too high only slows the bar in
+/// Pass 1, too low would park it near the end.
+pub(crate) const EMBED_WEIGHT: f64 = 0.07;
 
 /// Monotone fraction of a job whose total is re-estimated while it runs.
 ///
