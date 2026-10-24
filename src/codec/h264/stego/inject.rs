@@ -358,11 +358,29 @@ pub fn record_residual_block_into_cover<F>(
         }
     }
 
-    // Scalar fallback (also handles 8×8, partial ranges, and
-    // architectures without a NEON kernel).
-    //
-    // Reverse scan order matches the decoder's bypass-bin emission
-    // order. The encoder also writes signs in reverse scan order.
+    record_residual_block_scalar(
+        cover, scan_coeffs, start_idx, end_idx, frame_idx, mb_addr, &mut path_for_coeff,
+    );
+}
+
+/// Scalar body of [`record_residual_block_into_cover`] (also handles
+/// 8×8, partial ranges, and architectures without a NEON kernel). A
+/// separate function so the parity tests can run it against the NEON
+/// path on the same input.
+///
+/// Reverse scan order matches the decoder's bypass-bin emission
+/// order. The encoder also writes signs in reverse scan order.
+fn record_residual_block_scalar<F>(
+    cover: &mut DomainCover,
+    scan_coeffs: &[i32],
+    start_idx: usize,
+    end_idx: usize,
+    frame_idx: u32,
+    mb_addr: u32,
+    mut path_for_coeff: F,
+) where
+    F: FnMut(u8, BinKind) -> SyntaxPath,
+{
     for i in (start_idx..=end_idx).rev() {
         let v = scan_coeffs[i];
         if v == 0 {
@@ -614,6 +632,144 @@ mod tests {
         ];
         let positions = enumerate_mvd_suffix_lsb_positions(&slots, 0, 0);
         assert!(positions.is_empty());
+    }
+
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s >> 33
+    }
+
+    /// Non-zero coefficient values that sit on every boundary the walk
+    /// cares about: the |coeff| ≥ 16 suffix-LSB threshold, the u16
+    /// magnitude clamp, and the i32 extremes (`unsigned_abs(i32::MIN)`).
+    const EDGE_VALUES: [i32; 14] = [
+        1, -1, 15, -15, 16, -16, 17, -17, 65_535, -65_536, 65_537, i32::MAX, i32::MIN, i32::MIN + 1,
+    ];
+
+    fn nonzero_value(s: &mut u64) -> i32 {
+        let v = match lcg(s) % 3 {
+            0 => EDGE_VALUES[(lcg(s) % EDGE_VALUES.len() as u64) as usize],
+            1 => (lcg(s) % 64) as i32 - 32,
+            _ => ((lcg(s) << 1) ^ lcg(s)) as u32 as i32, // full 32-bit range
+        };
+        if v == 0 { 1 } else { v }
+    }
+
+    /// Runs the dispatched recorder (NEON fast path where compiled) and the
+    /// scalar walk on the same input and asserts identical covers and an
+    /// identical sequence of `path_for_coeff` calls.
+    fn assert_recorder_paths_agree(scan: &[i32], start: usize, end: usize) {
+        let path = |ci: u8, kind: BinKind| SyntaxPath::Luma4x4 { block_idx: 5, coeff_idx: ci, kind };
+        let mut calls_d: Vec<(u8, BinKind)> = Vec::new();
+        let mut cover_d = DomainCover::default();
+        record_residual_block_into_cover(&mut cover_d, scan, start, end, 3, 77, |ci, k| {
+            calls_d.push((ci, k));
+            path(ci, k)
+        });
+        let mut calls_s: Vec<(u8, BinKind)> = Vec::new();
+        let mut cover_s = DomainCover::default();
+        record_residual_block_scalar(&mut cover_s, scan, start, end, 3, 77, |ci, k| {
+            calls_s.push((ci, k));
+            path(ci, k)
+        });
+        let ctx = format!("scan={scan:?} start={start} end={end}");
+        assert_eq!(calls_d, calls_s, "path_for_coeff call order, {ctx}");
+        for (name, d, s) in [
+            ("coeff_sign_bypass", &cover_d.coeff_sign_bypass, &cover_s.coeff_sign_bypass),
+            ("coeff_suffix_lsb", &cover_d.coeff_suffix_lsb, &cover_s.coeff_suffix_lsb),
+            ("mvd_sign_bypass", &cover_d.mvd_sign_bypass, &cover_s.mvd_sign_bypass),
+            ("mvd_suffix_lsb", &cover_d.mvd_suffix_lsb, &cover_s.mvd_suffix_lsb),
+        ] {
+            assert_eq!(d.bits, s.bits, "{name} bits, {ctx}");
+            assert_eq!(d.positions, s.positions, "{name} positions, {ctx}");
+            assert_eq!(d.magnitudes, s.magnitudes, "{name} magnitudes, {ctx}");
+        }
+        // Scalar-walk sanity: one sign bin per non-zero coefficient.
+        let nz = scan[start..=end].iter().filter(|&&v| v != 0).count();
+        assert_eq!(cover_s.coeff_sign_bypass.len(), nz, "{ctx}");
+    }
+
+    /// The NEON fast path of `record_residual_block_into_cover` (full
+    /// 16-coefficient ranges) must match the scalar walk on every input:
+    /// bits, positions, magnitudes and `path_for_coeff` call order. Every one
+    /// of the 2^16 zero/non-zero patterns of a 16-coefficient block runs
+    /// natively, so every NEON lane is covered on both sides of its compare. The
+    /// test also runs the 16-window at an offset inside a longer slice (the NEON path
+    /// again) and the ranges the NEON path must leave to scalar: Luma AC
+    /// (start 1), short end, Chroma DC (4), 8×8 (64) and a single coefficient.
+    /// Off aarch64+simd both calls take the scalar walk; the range handling is
+    /// still pinned.
+    #[test]
+    fn residual_block_fast_path_matches_scalar() {
+        let mut s = 0x1264_C0DE_u64;
+
+        // Every zero/non-zero mask of the 16-coefficient block.
+        let masks: Vec<u32> = if cfg!(miri) {
+            let mut m: Vec<u32> = vec![0, 0xFFFF, 0x8001, 0x5555, 0xAAAA];
+            m.extend((0..16).map(|b| 1u32 << b));
+            m.extend((0..16).map(|_| (lcg(&mut s) & 0xFFFF) as u32));
+            m
+        } else {
+            (0..=0xFFFFu32).collect()
+        };
+        for &mask in &masks {
+            let scan: Vec<i32> = (0..16)
+                .map(|i| if mask >> i & 1 == 1 { nonzero_value(&mut s) } else { 0 })
+                .collect();
+            assert_recorder_paths_agree(&scan, 0, 15);
+        }
+
+        // (slice len, start, end).
+        let shapes: [(usize, usize, usize); 10] = [
+            (16, 0, 15),
+            (17, 1, 16),
+            (64, 16, 31),
+            (64, 48, 63),
+            (16, 1, 15),
+            (16, 0, 14),
+            (15, 0, 14),
+            (4, 0, 3),
+            (64, 0, 63),
+            (1, 0, 0),
+        ];
+        let trials = if cfg!(miri) { 4 } else { 3000 };
+        for &(len, start, end) in &shapes {
+            for _ in 0..trials {
+                let density = lcg(&mut s) % 5; // 0 → all zero … 4 → dense
+                let scan: Vec<i32> = (0..len)
+                    .map(|_| if lcg(&mut s) % 4 < density { nonzero_value(&mut s) } else { 0 })
+                    .collect();
+                assert_recorder_paths_agree(&scan, start, end);
+            }
+        }
+    }
+
+    /// `nonzero_mask_neon_16` lane-by-lane against the scalar definition,
+    /// for every one of the 2^16 masks natively (a sample under Miri).
+    #[cfg(all(target_arch = "aarch64", feature = "simd"))]
+    #[test]
+    fn nonzero_mask_neon_16_matches_scalar() {
+        let mut s = 0x0E0E_u64;
+        let masks: Vec<u32> = if cfg!(miri) {
+            let mut m: Vec<u32> = vec![0, 0xFFFF];
+            m.extend((0..16).map(|b| 1u32 << b));
+            m.extend((0..16).map(|b| 0xFFFF ^ (1u32 << b)));
+            m
+        } else {
+            (0..=0xFFFFu32).collect()
+        };
+        for &mask in &masks {
+            let scan: Vec<i32> = (0..16)
+                .map(|i| if mask >> i & 1 == 1 { nonzero_value(&mut s) } else { 0 })
+                .collect();
+            let want = scan
+                .iter()
+                .enumerate()
+                .fold(0u16, |m, (i, &v)| m | (((v != 0) as u16) << i));
+            assert_eq!(want as u32, mask);
+            let got = unsafe { nonzero_mask_neon_16(&scan) };
+            assert_eq!(got, want, "scan={scan:?}");
+        }
     }
 
     #[test]

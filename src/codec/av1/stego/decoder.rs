@@ -49,6 +49,9 @@ pub enum Av1DecodeError {
     DavxdSendDataFailed(i32),
     /// `dav1d_get_picture` returned a non-zero, non-EAGAIN error code.
     DavxdGetPictureFailed(i32),
+    /// Pixel capture copies 8-bit 4:2:0 planes only; the stream decoded
+    /// to another layout (`Dav1dPixelLayout`) or bit depth.
+    UnsupportedPicture { layout: i32, bpc: i32 },
 }
 
 /// A single L(1) cover position from a decoded AV1 frame. Mirror of
@@ -362,11 +365,19 @@ fn decode_with_recording_inner(
                 // single-frame so this is fine.
                 if capture_pixels {
                     let view = &*(&pic as *const Dav1dPicture as *const Dav1dPictureView);
-                    assert_eq!(
-                        view.p_layout, 1,
-                        "pixel capture only handles 4:2:0 (Dav1dPixelLayout I420 == 1), got {}",
-                        view.p_layout
-                    );
+                    // 8-bit 4:2:0 only (Dav1dPixelLayout I420 == 1): other
+                    // layouts size the chroma planes differently, and a
+                    // higher bit depth stores 16-bit samples.
+                    if view.p_layout != 1 || view.p_bpc != 8 {
+                        let err = Av1DecodeError::UnsupportedPicture {
+                            layout: view.p_layout,
+                            bpc: view.p_bpc,
+                        };
+                        dav1d_picture_unref(&mut pic);
+                        dav1d_data_unref(&mut data);
+                        dav1d_close(&mut ctx);
+                        return Err(err);
+                    }
                     let luma_w = view.p_w as usize;
                     let luma_h = view.p_h as usize;
                     let chroma_w = (luma_w + 1) / 2;
@@ -580,6 +591,71 @@ mod tests {
                 }
             }
             all_bytes
+        }
+
+        /// One 64x64 key frame at `bit_depth` / `cs`, as OBU bytes.
+        fn encode_one_frame_as<T: phasm_rav1e::prelude::Pixel>(
+            bit_depth: usize,
+            cs: phasm_rav1e::color::ChromaSampling,
+        ) -> Vec<u8> {
+            use phasm_rav1e::phasm_stego::make_frame;
+
+            let enc_cfg = EncoderConfig {
+                width: 64,
+                height: 64,
+                bit_depth,
+                chroma_sampling: cs,
+                quantizer: 30,
+                ..Default::default()
+            };
+            let cfg = Config::new().with_encoder_config(enc_cfg).with_threads(1);
+            let mut ctx: phasm_rav1e::Context<T> = cfg.new_context().unwrap();
+            let mut frame = make_frame::<T>(64, 64, cs);
+            for plane in frame.planes.iter_mut() {
+                for (i, px) in plane.data.iter_mut().enumerate() {
+                    *px = T::cast_from(((i * 7) & 0xff) as u8);
+                }
+            }
+            ctx.send_frame(Arc::new(frame)).unwrap();
+            ctx.flush();
+            let mut bytes = Vec::new();
+            loop {
+                match ctx.receive_packet() {
+                    Ok(packet) => bytes.extend_from_slice(&packet.data),
+                    Err(phasm_rav1e::EncoderStatus::Encoded)
+                    | Err(phasm_rav1e::EncoderStatus::NeedMoreData) => {}
+                    Err(_) => break,
+                }
+            }
+            bytes
+        }
+
+        /// Pixel capture copies 8-bit 4:2:0 planes only. Any other picture
+        /// is an error, not a panic with the dav1d context still open (a
+        /// leak, or an abort under panic=abort) and not 16-bit samples
+        /// read as bytes.
+        #[test]
+        fn pixel_capture_rejects_non_8bit_420_pictures() {
+            use phasm_rav1e::color::ChromaSampling;
+
+            let yuv444 = encode_one_frame_as::<u8>(8, ChromaSampling::Cs444);
+            assert!(matches!(
+                decode_with_recording_with_pixels(&yuv444),
+                Err(Av1DecodeError::UnsupportedPicture { layout: 3, bpc: 8 })
+            ));
+            let ten_bit = encode_one_frame_as::<u16>(10, ChromaSampling::Cs420);
+            assert!(matches!(
+                decode_with_recording_with_pixels(&ten_bit),
+                Err(Av1DecodeError::UnsupportedPicture { layout: 1, bpc: 10 })
+            ));
+            // Recording without pixel capture does not care.
+            assert!(decode_with_recording(&ten_bit).is_ok());
+            let eight_bit = encode_one_frame_as::<u8>(8, ChromaSampling::Cs420);
+            let planes = decode_with_recording_with_pixels(&eight_bit)
+                .expect("8-bit 4:2:0 capture")
+                .planes
+                .expect("planes");
+            assert_eq!((planes.luma_width, planes.chroma_width), (64, 32));
         }
 
         /// Run encode_tile::<WriterRecorder> on a 64x64 gradient

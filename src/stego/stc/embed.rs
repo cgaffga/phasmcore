@@ -271,15 +271,20 @@ unsafe fn viterbi_step_simd128_no_bp(
     }
 }
 
-/// T3.6.C — SSE2 / SSE4.1 2-lane f64 intrinsic kernel (x86_64).
+/// T3.6.C — SSE2 2-lane f64 intrinsic kernel (x86_64).
 ///
 /// Same pair-wise lane layout as NEON. `_mm_cmplt_pd` returns
 /// all-1 mask lanes (negative f64 bit-pattern) for true; bit-pack
 /// uses `_mm_movemask_pd` which extracts the 2 sign bits directly
 /// — cleanest mask extraction across the three SIMD ISAs.
 ///
-/// Phasm's `.cargo/config.toml` enables `+sse4.1` baseline for
-/// x86_64, so `_mm_blendv_pd` is available for the select step.
+/// SSE2 only, the one SIMD level every x86_64 target guarantees. The
+/// select must not use SSE4.1 `_mm_blendv_pd`: this kernel is gated on
+/// `target_arch` alone, and the x86_64-unknown-linux-gnu and
+/// x86_64-pc-windows-msvc baselines (phasmcore's release builds, and any
+/// crates.io build) have no SSE4.1. There, `_mm_blendv_pd` was an
+/// out-of-line call per state pair that ran an SSE4.1 instruction with no
+/// feature check (undefined behaviour; SIGILL on a CPU without SSE4.1).
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn viterbi_step_sse(
@@ -309,8 +314,9 @@ unsafe fn viterbi_step_sse(
         let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
         let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
         let cmp_mask = _mm_cmplt_pd(v_c1, v_c0); // c1 < c0 → all-1 lanes
-        // _mm_blendv_pd(a, b, mask): mask-bit-1 → b, else a.
-        let v_curr = _mm_blendv_pd(v_c0, v_c1, cmp_mask);
+        // Bitwise select: mask lanes are all-1 or all-0, so
+        // (mask & c1) | (!mask & c0) picks c1 exactly where c1 < c0.
+        let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
         _mm_storeu_pd(curr_ptr.add(s), v_curr);
         // movmskpd returns 2-bit integer (0b{lane1}{lane0}).
         let mask_bits = _mm_movemask_pd(cmp_mask) as u128;
@@ -347,7 +353,7 @@ unsafe fn viterbi_step_sse_no_bp(
         let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
         let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
         let cmp_mask = _mm_cmplt_pd(v_c1, v_c0);
-        let v_curr = _mm_blendv_pd(v_c0, v_c1, cmp_mask);
+        let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
         _mm_storeu_pd(curr_ptr.add(s), v_curr);
     }
 }
@@ -364,19 +370,23 @@ fn viterbi_step(
     cost_s0: f64,
     cost_s1: f64,
 ) -> u128 {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    unsafe {
-        return viterbi_step_neon(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+    // The SIMD kernels walk the states in pairs and have no scalar tail.
+    // State counts are powers of two, so the only odd one is the
+    // single-state h = 0 trellis, which takes the scalar kernel.
+    if prev_cost.len() % 2 == 0 {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            return viterbi_step_neon(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            return viterbi_step_sse(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            return viterbi_step_simd128(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
     }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        return viterbi_step_sse(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    unsafe {
-        return viterbi_step_simd128(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
-    }
-    #[allow(unreachable_code)]
     viterbi_step_scalar(prev_cost, curr_cost, prev_cost_perm, bp_byte, col, cost_s0, cost_s1)
 }
 
@@ -389,19 +399,21 @@ fn viterbi_step_no_bp(
     cost_s0: f64,
     cost_s1: f64,
 ) {
-    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    unsafe {
-        return viterbi_step_neon_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+    // Odd state count (h = 0) → scalar; see `viterbi_step`.
+    if prev_cost.len() % 2 == 0 {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            return viterbi_step_neon_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            return viterbi_step_sse_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            return viterbi_step_simd128_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
+        }
     }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        return viterbi_step_sse_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
-    }
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    unsafe {
-        return viterbi_step_simd128_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1);
-    }
-    #[allow(unreachable_code)]
     viterbi_step_scalar_no_bp(prev_cost, curr_cost, prev_cost_perm, col, cost_s0, cost_s1)
 }
 
@@ -1466,6 +1478,137 @@ mod tests {
 
         assert_eq!(inline.stego_bits, segmented.stego_bits, "stego bits differ");
         assert_eq!(inline.total_cost, segmented.total_cost, "total cost differs");
+    }
+
+    /// NaN payloads are unspecified in Rust (and randomized under Miri), so
+    /// two NaNs compare equal here; every other value must match bit-for-bit.
+    fn same_f64(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    /// The dispatched Viterbi kernels (NEON / SSE2 / SIMD128) must be
+    /// bit-identical to `viterbi_step_scalar` on every input: a SIMD-less
+    /// build runs the scalar kernel, and the stego bits must not depend on the
+    /// platform. Covers every state count `stc_embed` accepts (h = 0..=7, incl.
+    /// the one-state h = 0 trellis), every `col`, ∞ / NaN / ±0 / subnormal /
+    /// huge costs, and exact ties (`c1 == c0` must keep `c0`). Output buffers
+    /// start as a sentinel so a lane the kernel never writes shows up.
+    #[test]
+    fn viterbi_step_matches_scalar_for_every_state_count() {
+        let mut s = 0x51D_7E11_u64;
+        let pick = |s: &mut u64| -> f64 {
+            match lcg(s) % 9 {
+                0 => f64::INFINITY,
+                1 => 0.0,
+                2 => -0.0,
+                3 => 1.0, // repeats → ties between the two predecessors
+                4 => f64::NAN,
+                5 => 3.0e38,
+                6 => f64::from_bits(1), // smallest subnormal
+                7 => -2.5,
+                _ => (lcg(s) % 100_000) as f64 * 0.37,
+            }
+        };
+        const SENTINEL: f64 = -7.0;
+        let mut checked = 0usize;
+        for h in 0..=7usize {
+            let ns = 1usize << h;
+            // Miri interprets every intrinsic: a strided `col` sweep that still
+            // hits 0, 1 and the top state keeps it to seconds.
+            let cols: Vec<usize> = if cfg!(miri) {
+                let mut c: Vec<usize> = (0..ns).step_by((ns / 4).max(1)).collect();
+                c.push(ns - 1);
+                c.push(1 % ns);
+                c
+            } else {
+                (0..ns).collect()
+            };
+            let trials = if cfg!(miri) { 2 } else { 6 };
+            for &col in &cols {
+                for t in 0..trials {
+                    let prev: Vec<f64> = (0..ns).map(|_| pick(&mut s)).collect();
+                    let c = pick(&mut s);
+                    let (cost_s0, cost_s1) = match t % 3 {
+                        0 => (0.0, c),
+                        1 => (c, 0.0),
+                        _ => (c, c), // tie on every state whose two predecessors match
+                    };
+
+                    let mut curr_ref = vec![SENTINEL; ns];
+                    let mut perm_ref = vec![SENTINEL; ns];
+                    let mut bp_ref = vec![0u8; ns];
+                    let want = viterbi_step_scalar(
+                        &prev, &mut curr_ref, &mut perm_ref, &mut bp_ref, col, cost_s0, cost_s1,
+                    );
+
+                    let mut curr = vec![SENTINEL; ns];
+                    let mut perm = vec![SENTINEL; ns];
+                    let mut bp = vec![0u8; ns];
+                    let got = viterbi_step(
+                        &prev, &mut curr, &mut perm, &mut bp, col, cost_s0, cost_s1,
+                    );
+                    let ctx = format!("h={h} col={col} cost_s0={cost_s0} cost_s1={cost_s1}");
+                    assert_eq!(got, want, "packed back pointers differ, {ctx}");
+                    for st in 0..ns {
+                        assert!(
+                            same_f64(curr[st], curr_ref[st]),
+                            "curr_cost[{st}]: simd={} scalar={}, {ctx}", curr[st], curr_ref[st]
+                        );
+                        assert!(
+                            same_f64(perm[st], perm_ref[st]),
+                            "prev_cost_perm[{st}]: simd={} scalar={}, {ctx}", perm[st], perm_ref[st]
+                        );
+                    }
+
+                    let mut curr_nb = vec![SENTINEL; ns];
+                    let mut perm_nb = vec![SENTINEL; ns];
+                    viterbi_step_no_bp(&prev, &mut curr_nb, &mut perm_nb, col, cost_s0, cost_s1);
+                    let mut curr_nb_ref = vec![SENTINEL; ns];
+                    let mut perm_nb_ref = vec![SENTINEL; ns];
+                    viterbi_step_scalar_no_bp(
+                        &prev, &mut curr_nb_ref, &mut perm_nb_ref, col, cost_s0, cost_s1,
+                    );
+                    for st in 0..ns {
+                        assert!(
+                            same_f64(curr_nb[st], curr_nb_ref[st]),
+                            "no_bp curr_cost[{st}]: simd={} scalar={}, {ctx}",
+                            curr_nb[st], curr_nb_ref[st]
+                        );
+                        assert!(same_f64(curr_nb[st], curr_ref[st]), "no_bp vs bp, {ctx}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    /// `stc_embed` accepts h = 0: one trellis state, every column 0, so only
+    /// an all-zero message fits and the optimal plan leaves the cover alone.
+    /// Pins that the SIMD kernels (which walk states in pairs) do not drop
+    /// the single state — when they did, every back pointer came out 0, the
+    /// plan zeroed the cover, and an infeasible message was accepted.
+    #[test]
+    fn stc_embed_h0_keeps_the_cover() {
+        let (n, m, w) = (40usize, 4usize, 10usize);
+        let hhat = generate_hhat(0, w, &[7u8; 32]);
+        let cover: Vec<u8> = (0..n).map(|i| ((i * 7 + 1) % 3 == 0) as u8).collect();
+        assert!(cover.contains(&1));
+        let costs = vec![1.0f32; n];
+
+        let r = stc_embed(&cover, &costs, &[0u8; 4], &hhat, 0, w)
+            .expect("an all-zero message is feasible at h = 0");
+        assert_eq!(r.stego_bits, cover);
+        assert_eq!(r.num_modifications, 0);
+        assert_eq!(r.total_cost, 0.0);
+
+        let msg = [0u8, 1, 0, 0];
+        assert_eq!(msg.len(), m);
+        assert!(
+            stc_embed(&cover, &costs, &msg, &hhat, 0, w).is_none(),
+            "a 1 bit cannot be embedded with h = 0"
+        );
+        assert!(!stc_is_feasible(&cover, &costs, &msg, &hhat, 0, w));
     }
 
     /// Segmented path with a single segment (m ≤ K).

@@ -174,11 +174,10 @@ fn ee_e_smooth_penalty() -> f64 {
 /// SIMD determinism gate, lifted from H.264's
 /// `core/src/codec/h264/encoder/simd/mod.rs:62-119` pattern. Returns
 /// `true` unless the `PHASM_AV1_DISABLE_SIMD` env var is set at first
-/// call (cached via `OnceLock`). Currently informational — av1_uniward
-/// has no SIMD code paths yet — but the gate ships from day 1 so any
-/// future AVX2 / NEON / SIMD128 inner loops can branch on it and be
-/// verified against scalar fallback (CI gate: SIMD-on output ==
-/// SIMD-off output byte-for-byte; see phase-b31-embed-perf.md § 3).
+/// call (cached via `OnceLock`). Gates the B.3.2.1 NEON kernel in
+/// [`cost_accum_kernel`]; the scalar fallback adds in the same order, so
+/// SIMD-on output == SIMD-off output byte-for-byte (phase-b31-embed-perf.md
+/// § 3) and x86_64 (scalar) matches aarch64 (NEON).
 #[allow(dead_code)]
 pub(crate) fn phasm_av1_simd_enabled() -> bool {
     use std::sync::OnceLock;
@@ -683,7 +682,8 @@ fn compute_position_cost(
 /// else falls through to the scalar reference path (CI byte-
 /// equivalence gate per phase-b31-embed-perf.md § 3).
 ///
-/// All six slices have the same length `n`. Caller-validated bounds.
+/// All six slices must have the same length. Checked in release builds
+/// too: the NEON kernel reads `d_lh.len()` cells from every slice.
 #[inline]
 fn cost_accum_kernel(
     d_lh: &[f32],
@@ -694,11 +694,11 @@ fn cost_accum_kernel(
     w_hh: &[f32],
     sigma: f32,
 ) -> f32 {
-    debug_assert_eq!(d_lh.len(), d_hl.len());
-    debug_assert_eq!(d_lh.len(), d_hh.len());
-    debug_assert_eq!(d_lh.len(), w_lh.len());
-    debug_assert_eq!(d_lh.len(), w_hl.len());
-    debug_assert_eq!(d_lh.len(), w_hh.len());
+    assert_eq!(d_lh.len(), d_hl.len());
+    assert_eq!(d_lh.len(), d_hh.len());
+    assert_eq!(d_lh.len(), w_lh.len());
+    assert_eq!(d_lh.len(), w_hl.len());
+    assert_eq!(d_lh.len(), w_hh.len());
 
     #[cfg(target_arch = "aarch64")]
     if phasm_av1_simd_enabled() {
@@ -712,6 +712,12 @@ fn cost_accum_kernel(
 }
 
 /// Scalar fallback / byte-equivalence reference.
+///
+/// Adds in the NEON kernel's order, so the two are bit-exact (f32
+/// addition is not associative): four lane accumulators over 4-cell
+/// chunks, cell `i + l` into lane `l`; the lanes reduced pairwise as
+/// `vaddvq_f32` does, `(l0 + l1) + (l2 + l3)`; then the 0-3 tail cells
+/// one by one.
 #[inline]
 fn cost_accum_kernel_scalar(
     d_lh: &[f32],
@@ -722,11 +728,24 @@ fn cost_accum_kernel_scalar(
     w_hh: &[f32],
     sigma: f32,
 ) -> f32 {
-    let mut cost = 0.0f32;
-    for i in 0..d_lh.len() {
+    let n = d_lh.len();
+    let mut acc = [0.0f32; 4];
+    let mut i = 0;
+    while i + 4 <= n {
+        for (l, lane) in acc.iter_mut().enumerate() {
+            let c = i + l;
+            *lane += d_lh[c].abs() / (w_lh[c].abs() + sigma);
+            *lane += d_hl[c].abs() / (w_hl[c].abs() + sigma);
+            *lane += d_hh[c].abs() / (w_hh[c].abs() + sigma);
+        }
+        i += 4;
+    }
+    let mut cost = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    while i < n {
         cost += d_lh[i].abs() / (w_lh[i].abs() + sigma);
         cost += d_hl[i].abs() / (w_hl[i].abs() + sigma);
         cost += d_hh[i].abs() / (w_hh[i].abs() + sigma);
+        i += 1;
     }
     cost
 }
@@ -1355,5 +1374,145 @@ mod tests {
         }];
         let costs = compute_av1_uniward_costs(&planes, &positions, 30);
         assert_eq!(costs, vec![1.0]);
+    }
+
+    // ---- cost_accum_kernel: SIMD vs scalar parity ----
+
+    /// splitmix64: deterministic test data with no RNG dependency.
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// Uniform in [0, 1).
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        /// A signed value from one of several magnitude classes: signed
+        /// zero, subnormal, tiny, ordinary, large, and (if `extreme`)
+        /// huge / `f32::MAX`, whose quotients overflow to infinity.
+        fn value(&mut self, extreme: bool) -> f32 {
+            let sign = if self.next() & 1 == 0 { 1.0f32 } else { -1.0 };
+            let classes = if extreme { 9 } else { 7 };
+            match self.next() % classes {
+                0 => sign * 0.0,
+                1 => sign * f32::from_bits(self.next() as u32 & 0x007F_FFFF),
+                2 => sign * self.unit() * 1.0e-3,
+                3 => sign * self.unit() * 1.0e6,
+                7 => sign * self.unit() * 1.0e30,
+                8 => sign * f32::MAX,
+                _ => sign * self.unit() * 4.0,
+            }
+        }
+
+        /// One row's six kernel inputs: `[d_lh, d_hl, d_hh, w_lh, w_hl, w_hh]`.
+        fn row(&mut self, n: usize, extreme: bool) -> [Vec<f32>; 6] {
+            core::array::from_fn(|_| (0..n).map(|_| self.value(extreme)).collect())
+        }
+    }
+
+    /// Lengths 0..=80 cover every 0-3 tail and every row width the cost
+    /// loop can pass (`impact_w = tx_w + 15`, up to 79 for 64-wide TX).
+    const PARITY_MAX_LEN: usize = 80;
+
+    fn parity_seeds() -> u64 {
+        if cfg!(miri) { 2 } else { 32 }
+    }
+
+    /// The NEON kernel must be bit-exact with the scalar reference, as
+    /// `phasm_av1_simd_enabled` and the B.3.2.1 comment promise: same
+    /// result with `PHASM_AV1_DISABLE_SIMD`, and the same costs on x86_64
+    /// (scalar) as on aarch64 (NEON). Calls the NEON kernel directly so the
+    /// env gate cannot route this test to scalar.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn cost_accum_kernel_neon_bit_exact_with_scalar() {
+        let sigma = SIGMA as f32;
+        for seed in 0..parity_seeds() {
+            let mut rng = SplitMix(seed);
+            for n in 0..=PARITY_MAX_LEN {
+                let extreme = seed % 2 == 1;
+                let [dlh, dhl, dhh, wlh, whl, whh] = rng.row(n, extreme);
+                let scalar = cost_accum_kernel_scalar(&dlh, &dhl, &dhh, &wlh, &whl, &whh, sigma);
+                // SAFETY: NEON is baseline on aarch64; all six slices have length n.
+                let neon =
+                    unsafe { cost_accum_kernel_neon(&dlh, &dhl, &dhh, &wlh, &whl, &whh, sigma) };
+                assert_eq!(
+                    neon.to_bits(),
+                    scalar.to_bits(),
+                    "seed {seed} n {n}: neon {neon:e} != scalar {scalar:e}"
+                );
+            }
+        }
+    }
+
+    /// Cross-architecture pin: the dispatched kernel's bits over a fixed
+    /// input set, hashed. NEON (aarch64) and scalar (x86_64, or
+    /// `PHASM_AV1_DISABLE_SIMD`) must reproduce the same value.
+    #[test]
+    fn cost_accum_kernel_cross_arch_pin() {
+        let sigma = SIGMA as f32;
+        let mut hash = 0xCBF2_9CE4_8422_2325u64; // FNV-1a
+        for seed in 0..4u64 {
+            let mut rng = SplitMix(0xA1_0000 + seed);
+            for n in 0..=PARITY_MAX_LEN {
+                let [dlh, dhl, dhh, wlh, whl, whh] = rng.row(n, seed % 2 == 1);
+                let got = cost_accum_kernel(&dlh, &dhl, &dhh, &wlh, &whl, &whh, sigma);
+                for b in got.to_bits().to_le_bytes() {
+                    hash = (hash ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
+                }
+            }
+        }
+        assert_eq!(hash, 0x49f0_6aa4_b776_8065, "cost_accum_kernel cross-arch pin: {hash:#018x}");
+    }
+
+    /// Both the dispatched kernel (NEON on aarch64, scalar elsewhere) and
+    /// the scalar reference compute `sum |d| / (|w| + sigma)` over all
+    /// three subbands of every cell: checked against an f64 sum of the
+    /// same f32 terms, within the f32 summation error bound. Catches a
+    /// lane, offset, tail or subband mix-up on every architecture.
+    #[test]
+    fn cost_accum_kernel_matches_f64_reference() {
+        let sigma = SIGMA as f32;
+        for seed in 0..parity_seeds() {
+            let mut rng = SplitMix(0x5EED_0000 + seed);
+            for n in 0..=PARITY_MAX_LEN {
+                let [dlh, dhl, dhh, wlh, whl, whh] = rng.row(n, false);
+                let mut reference = 0.0f64;
+                for i in 0..n {
+                    for (d, w) in [(&dlh, &wlh), (&dhl, &whl), (&dhh, &whh)] {
+                        reference += (d[i].abs() / (w[i].abs() + sigma)) as f64;
+                    }
+                }
+                // Recursive f32 summation of 3n nonnegative terms.
+                let tol = (3 * n + 1) as f64 * f32::EPSILON as f64 * reference;
+                let scalar = cost_accum_kernel_scalar(&dlh, &dhl, &dhh, &wlh, &whl, &whh, sigma);
+                let dispatched = cost_accum_kernel(&dlh, &dhl, &dhh, &wlh, &whl, &whh, sigma);
+                for (name, got) in [("scalar", scalar), ("dispatched", dispatched)] {
+                    assert!(
+                        (got as f64 - reference).abs() <= tol,
+                        "seed {seed} n {n}: {name} {got:e} vs f64 reference {reference:e} (tol {tol:e})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The NEON kernel reads `d_lh.len()` cells from all six slices, so a
+    /// shorter one must stop the call before the loads, in release builds
+    /// too (where `debug_assert` is compiled out).
+    #[test]
+    #[should_panic]
+    fn cost_accum_kernel_rejects_mismatched_lengths() {
+        let full = vec![1.0f32; 8];
+        let short = vec![1.0f32; 5];
+        cost_accum_kernel(&full, &full, &full, &full, &full, &short, SIGMA as f32);
     }
 }

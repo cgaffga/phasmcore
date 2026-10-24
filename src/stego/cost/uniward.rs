@@ -2838,6 +2838,189 @@ mod tests {
         );
     }
 
+    /// Scalar-only copy of `compute_coefficient_cost_precomputed`: the
+    /// pair loop + 1-element tail with no SIMD block in front, i.e. what
+    /// a target without NEON / SSE2 / SIMD128 runs. The production
+    /// kernel always takes its SIMD block where one is compiled in, so
+    /// its own scalar pair loop never runs there and cannot serve as the
+    /// reference.
+    fn cost_precomputed_scalar_reference(
+        abs_lh: &[f64],
+        abs_hl: &[f64],
+        abs_hh: &[f64],
+        cw: &ThreeSubbands,
+        br: usize,
+        bc: usize,
+        img_w: usize,
+        img_h: usize,
+        pad: usize,
+    ) -> f64 {
+        let mut cost = 0.0;
+        let bc8 = (bc * 8) as isize;
+        let abs_x_start = bc8 - pad as isize;
+        let out_c_lo = if abs_x_start < 0 {
+            ((-abs_x_start) as usize).min(IMPACT_SIZE)
+        } else {
+            0
+        };
+        let max_via_image = img_w as isize - abs_x_start;
+        let out_c_hi = if max_via_image <= 0 { 0 } else { (max_via_image as usize).min(IMPACT_SIZE) };
+        if out_c_lo >= out_c_hi {
+            return 0.0;
+        }
+        let w = |v: f32| (v as f64).abs() + SIGMA;
+        for out_r in 0..IMPACT_SIZE {
+            let abs_y = (br * 8) as isize + out_r as isize - pad as isize;
+            if abs_y < 0 || abs_y as usize >= img_h {
+                continue;
+            }
+            let row_idx_base = (abs_y as usize - cw.y_offset) * cw.width;
+            let row_base = out_r * IMPACT_SIZE;
+            let mut out_c = out_c_lo;
+            while out_c + 1 < out_c_hi {
+                let i0 = row_idx_base + (bc8 + out_c as isize - pad as isize) as usize;
+                let (i1, c0, c1) = (i0 + 1, row_base + out_c, row_base + out_c + 1);
+                let lane0 = (abs_lh[c0] / w(cw.lh[i0]) + abs_hl[c0] / w(cw.hl[i0]))
+                    + abs_hh[c0] / w(cw.hh[i0]);
+                let lane1 = (abs_lh[c1] / w(cw.lh[i1]) + abs_hl[c1] / w(cw.hl[i1]))
+                    + abs_hh[c1] / w(cw.hh[i1]);
+                cost += lane0 + lane1;
+                out_c += 2;
+            }
+            if out_c < out_c_hi {
+                let i = row_idx_base + (bc8 + out_c as isize - pad as isize) as usize;
+                let c = row_base + out_c;
+                cost += (abs_lh[c] / w(cw.lh[i]) + abs_hl[c] / w(cw.hl[i]))
+                    + abs_hh[c] / w(cw.hh[i]);
+            }
+        }
+        cost
+    }
+
+    /// The NEON / SSE2 / SIMD128 blocks of `compute_coefficient_cost_precomputed`
+    /// must be bit-identical (f64 `to_bits`) to the scalar sum order, which is
+    /// what a SIMD-less target runs. This test covers production data: the real
+    /// |delta| table and the wavelets of a 64×64 cover, every block and
+    /// coefficient. The pinned-hash test checks the same geometry but against
+    /// a hash, not the scalar order. See
+    /// `cost_precompute_simd_matches_scalar_reference_random` for the edge
+    /// cases.
+    #[test]
+    fn cost_precompute_simd_matches_scalar_reference_fixture() {
+        let pad = FILT_LEN - 1;
+        let mut cover = DctGrid::new(8, 8);
+        for br in 0..8 {
+            for bc in 0..8 {
+                cover.set(br, bc, 0, 0, 120);
+                for i in 0..8 {
+                    for j in 0..8 {
+                        if i == 0 && j == 0 { continue; }
+                        let val = (((br * 13 + bc * 5 + i * 7 + j * 3) % 23) as i16) - 11;
+                        if val != 0 {
+                            cover.set(br, bc, i, j, val);
+                        }
+                    }
+                }
+            }
+        }
+        let qt = standard_qt();
+        let wv = compute_cover_wavelets(&cover, &qt);
+        let table = AbsDeltaTable::precompute(&qt);
+        let coefs: Vec<(usize, usize)> = if cfg!(miri) {
+            vec![(0, 1), (3, 5), (7, 7)]
+        } else {
+            (0..64).filter(|&k| k != 0).map(|k| (k / 8, k % 8)).collect()
+        };
+        let blocks: Vec<(usize, usize)> = if cfg!(miri) {
+            vec![(0, 0), (0, 7), (7, 0), (3, 4), (1, 1)]
+        } else {
+            (0..64).map(|k| (k / 8, k % 8)).collect()
+        };
+        for &(br, bc) in &blocks {
+            for &(fi, fj) in &coefs {
+                let (lh, hl, hh) = table.slice_at(fi, fj);
+                let got = compute_coefficient_cost_precomputed(
+                    lh, hl, hh, &wv.inner, br, bc, wv.img_w, wv.img_h, pad,
+                );
+                let want = cost_precomputed_scalar_reference(
+                    lh, hl, hh, &wv.inner, br, bc, wv.img_w, wv.img_h, pad,
+                );
+                assert_eq!(got.to_bits(), want.to_bits(), "fixture br={br} bc={bc} fi={fi} fj={fj}: {got} vs {want}");
+            }
+        }
+    }
+
+    /// Same bit-exactness as `cost_precompute_simd_matches_scalar_reference_fixture`,
+    /// on random geometry: odd image widths, a subband stride wider than the
+    /// image, strip `y_offset`, and blocks clipped on every side or entirely
+    /// outside the image. That gives every `out_c` span length 0..=23, so the
+    /// pair loop, the 1-element tail, and the all-tail rows are all exercised.
+    /// Wavelets include ±0, ±inf, f32::MAX, subnormals and negative values.
+    /// The |delta| tables hold zeros, subnormals and 1e300, which overflows
+    /// the sum to inf. The kernel's inputs are built directly, with no IDCT,
+    /// so this test also runs under Miri on aarch64. Miri cannot run the NEON
+    /// IDCT the fixture test needs.
+    #[test]
+    fn cost_precompute_simd_matches_scalar_reference_random() {
+        let pad = FILT_LEN - 1;
+        let cells = AbsDeltaTable::CELLS;
+        let mut seed = 0xC057_5EED_u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let wavelet_pick = |r: u64, r2: u64| -> f32 {
+            match r % 12 {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::INFINITY,
+                3 => f32::NEG_INFINITY,
+                4 => f32::MAX,
+                5 => -f32::MAX,
+                6 => f32::from_bits(1), // smallest subnormal
+                7 => -1.0e-39,
+                _ => ((r2 % 200_001) as f32 - 100_000.0) * 0.013,
+            }
+        };
+        let delta_pick = |r: u64, r2: u64| -> f64 {
+            match r % 8 {
+                0 => 0.0,
+                1 => f64::from_bits(3),
+                2 => 1.0e300,
+                _ => (r2 % 1_000_000) as f64 * 1.7e-4,
+            }
+        };
+        let trials = if cfg!(miri) { 24 } else { 3000 };
+        for t in 0..trials {
+            let img_w = 1 + (next() % 40) as usize;
+            let width = img_w + (next() % 4) as usize;
+            // Every 4th trial is a strip: rows start at y_offset > 0 and the
+            // block row is chosen so all of its 23 impact rows are present.
+            let (y_offset, rows, img_h, br) = if t % 4 == 3 {
+                let y_offset = 1 + (next() % 9) as usize;
+                let br = (y_offset + pad).div_ceil(8) + (next() % 2) as usize;
+                let rows = br * 8 + 8 - y_offset + (next() % 3) as usize;
+                (y_offset, rows, y_offset + rows, br)
+            } else {
+                let img_h = 1 + (next() % 40) as usize;
+                (0, img_h, img_h, (next() % (img_h as u64 / 8 + 3)) as usize)
+            };
+            let bc = (next() % (img_w as u64 / 8 + 4)) as usize;
+            let n = width * rows;
+            let mut band = || -> Vec<f32> { (0..n).map(|_| wavelet_pick(next(), next())).collect() };
+            let cw = ThreeSubbands { lh: band(), hl: band(), hh: band(), width, y_offset };
+            let mut tab = || -> Vec<f64> { (0..cells).map(|_| delta_pick(next(), next())).collect() };
+            let (lh, hl, hh) = (tab(), tab(), tab());
+            let got = compute_coefficient_cost_precomputed(&lh, &hl, &hh, &cw, br, bc, img_w, img_h, pad);
+            let want = cost_precomputed_scalar_reference(&lh, &hl, &hh, &cw, br, bc, img_w, img_h, pad);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "trial {t}: img {img_w}x{img_h} width={width} y_offset={y_offset} br={br} bc={bc}: {got} vs {want}"
+            );
+        }
+    }
+
     /// T3.2.G — dual-output must produce position-for-position
     /// equality with two separate calls to compute_positions_from_wavelets
     /// (one with SI, one without). f32 bit-exact on the same shared

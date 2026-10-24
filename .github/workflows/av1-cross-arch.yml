@@ -5,7 +5,8 @@
 # the pure-Rust kernels); x86_64's SSE/AVX2/AVX-512 kernels need real x86
 # hardware — Rosetta has no AVX2 — so this workflow runs on GitHub's.
 #
-# Runs on Linux x86_64, Linux arm64 and macOS arm64:
+# Runs on Linux x86_64, Linux arm64 and macOS arm64, plus Linux x86_64
+# under Intel SDE emulating an Ice Lake CPU for the AVX-512 kernels:
 #
 #   1. `tests/av1_cross_arch_determinism.rs` — stego-encodes three
 #      synthetic clips at every rav1e CPU level the runner supports
@@ -69,7 +70,15 @@ jobs:
             label: linux-arm64
           - os: macos-latest
             label: macos-arm64
+          # AVX-512: GitHub's x86 runners have been AMD Zen 3 (no AVX-512),
+          # so this leg runs the same tests under Intel's Software
+          # Development Emulator as an Ice Lake server CPU (`-icx`, which
+          # has everything rav1e's and dav1d's AVX512ICL level needs).
+          - os: ubuntu-latest
+            label: linux-x86_64-avx512-sde
+            sde: true
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
     steps:
       # The mirror carries no vendor/ submodules. Check the forks out as
       # siblings where the manifests look for them: `../vendor/phasm-rav1e`
@@ -158,7 +167,26 @@ jobs:
           echo "--- re-enabled AV1 wiring (CI-only) ---"
           grep -nE 'members =|^av1-(en|de)coder =|^core-dav1d-sys =|^phasm-rav1e =' Cargo.toml
 
+      # Intel SDE is a free download behind a license click-through, so the
+      # kit comes from the setup-sde action's GitHub re-host and is checked
+      # against the SHA-256 Intel publishes on its download page (ID 684897)
+      # — the re-host is trusted for availability only. SDE runs the test
+      # binaries under Pin, which needs ptrace (Ubuntu's yama blocks it).
+      - name: Install Intel SDE (AVX-512 leg)
+        if: matrix.sde
+        shell: bash
+        run: |
+          kit=sde-external-10.13.1-2026-07-28-lin
+          curl -fsSL -o "$RUNNER_TEMP/$kit.tar.xz" \
+            "https://github.com/petarpetrovt/setup-sde/releases/download/binaries/$kit.tar.xz"
+          echo "94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50  $RUNNER_TEMP/$kit.tar.xz" \
+            | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$kit.tar.xz" -C "$RUNNER_TEMP"
+          echo "SDE=$RUNNER_TEMP/$kit/sde64" >> "$GITHUB_ENV"
+          echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
       - name: Run AV1 asm + cross-arch determinism test
+        if: ${{ !matrix.sde }}
         working-directory: phasmcore
         shell: bash
         run: |
@@ -170,6 +198,7 @@ jobs:
             -- --nocapture
 
       - name: Run AV1 lib tests (asm on)
+        if: ${{ !matrix.sde }}
         working-directory: phasmcore
         shell: bash
         run: |
@@ -179,13 +208,33 @@ jobs:
             --lib codec::av1 \
             --no-fail-fast
 
+      # Same two test runs, built natively and executed under SDE.
+      - name: Run AV1 tests under SDE as Ice Lake (AVX-512)
+        if: matrix.sde
+        working-directory: phasmcore
+        shell: bash
+        run: |
+          ulimit -c 0
+          bins=$(cargo test --release --features av1-encoder \
+                   --lib --test av1_cross_arch_determinism --no-run \
+                   --message-format=json \
+                 | jq -r 'select(.profile.test == true) | .executable | select(. != null)')
+          echo "$bins"
+          xarch=$(echo "$bins" | grep '/av1_cross_arch_determinism-')
+          lib=$(echo "$bins" | grep -v '/av1_cross_arch_determinism-')
+          status=0
+          "$SDE" -icx -- "$xarch" --nocapture || status=1
+          "$SDE" -icx -- "$lib" codec::av1 || status=1
+          exit $status
+
       # Belt-and-suspenders: erase the build dirs and fork checkouts before
       # the runner VM tears down.
       - name: Erase build outputs (post-run cleanup)
         if: always()
         shell: bash
         run: |
-          rm -rf phasmcore/target vendor/phasm-rav1e vendor/phasm-dav1d
+          rm -rf phasmcore/target vendor/phasm-rav1e vendor/phasm-dav1d \
+            "$RUNNER_TEMP"/sde-external-*
 
       # EXPLICITLY ABSENT, per the policy block at the top:
       #   - actions/upload-artifact

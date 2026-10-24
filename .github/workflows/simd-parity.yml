@@ -14,9 +14,15 @@
 # Two complementary gates:
 #   * lib-tests  — the full lib suite natively, where the hardware has the
 #                  instructions. Catches any SIMD/scalar divergence.
-#   * miri-avx2  — the SIMD modules interpreted by Miri with AVX2 enabled.
-#                  Catches out-of-bounds and aliasing undefined behaviour
-#                  even when the output happens to come out right.
+#   * miri       — the SIMD parity tests interpreted by Miri, once with AVX2
+#                  and once at the plain SSE2 baseline that phasmcore's
+#                  release builds use (no .cargo/config.toml here, so no
+#                  SSE4.1). Catches out-of-bounds, aliasing and
+#                  missing-target-feature undefined behaviour even when the
+#                  output happens to come out right. The SSE2 run is what
+#                  caught the STC Viterbi kernel calling SSE4.1 `blendvpd`
+#                  unchecked (2026-10-24); the AVX2 run cannot see that,
+#                  because AVX2 implies SSE4.1.
 
 name: simd-parity
 
@@ -68,8 +74,16 @@ jobs:
         shell: bash
         run: cargo test --release --lib
 
-  miri-avx2:
-    name: Miri, x86_64 + AVX2 (SIMD modules)
+  miri:
+    name: Miri, x86_64 ${{ matrix.name }} (SIMD parity)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AVX2
+            features: -C target-feature=+avx2
+          - name: SSE2 baseline
+            features: -C target-feature=+sse2
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,9 +98,12 @@ jobs:
       - name: Miri setup
         run: cargo +nightly miri setup --target x86_64-unknown-linux-gnu
 
-      - name: SIMD modules under Miri
+      - name: SIMD parity tests under Miri
         env:
-          RUSTFLAGS: -C target-feature=+avx2
+          RUSTFLAGS: ${{ matrix.features }}
         run: >
           cargo +nightly miri test --target x86_64-unknown-linux-gnu --lib --
           pixels_aan uniward_simd fft2d_simd optimizer_simd embedding_simd
+          viterbi_step_matches_scalar_for_every_state_count
+          stc_embed_h0_keeps_the_cover
+          cost_precompute_simd_matches_scalar_reference_random

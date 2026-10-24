@@ -60,14 +60,6 @@ zeroize = "1"
 memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
-# rav1e's NEON assembly on aarch64 (iOS, Android arm64, Apple-silicon
-# macOS): 3.55x faster on a 1080p GOP with a byte-identical bitstream
-# (golden + rebuild parity, 2026-10-24). Without it rav1e runs its
-# pure-Rust kernels. x86_64 keeps the Rust paths until its SSE/AVX2
-# assembly is verified on real AVX2 hardware — Rosetta has no AVX2 and
-# Miri cannot run asm, while the x86_64 Android build ships to
-# Chromebooks. Cargo unions this with the `[dependencies]` entry above.
-[target.'cfg(target_arch = "aarch64")'.dependencies]
 # Dev-only deps. Used by the M1 memory-audit harness
 # (core/tests/perf_memory_audit.rs) to synthesize JPEG fixtures at
 # arbitrary MP without bundling huge binary blobs in test-vectors/.
