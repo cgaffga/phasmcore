@@ -78,12 +78,15 @@ jobs:
         with:
           components: miri, rust-src
 
+      # `+nightly` is required: rust-toolchain.toml pins a stable channel
+      # (the paper's reproducibility pin), which would otherwise win over the
+      # nightly installed above, and stable has no Miri.
       - name: Miri setup
-        run: cargo miri setup --target x86_64-unknown-linux-gnu
+        run: cargo +nightly miri setup --target x86_64-unknown-linux-gnu
 
       - name: SIMD modules under Miri
         env:
           RUSTFLAGS: -C target-feature=+avx2
         run: >
-          cargo miri test --target x86_64-unknown-linux-gnu --lib --
+          cargo +nightly miri test --target x86_64-unknown-linux-gnu --lib --
           pixels_aan uniward_simd fft2d_simd optimizer_simd embedding_simd
