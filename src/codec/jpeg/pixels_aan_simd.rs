@@ -1154,43 +1154,70 @@ pub(super) mod avx2 {
         let in2_6 = _mm256_permute2x128_si256::<0x20>(in2_3, in6_7);
         let in7_5 = _mm256_permute2x128_si256::<0x31>(in6_7, in4_5);
 
-        // Pass 1.
+        // Pass 1 (columns): returns output rows packed (0|1, 3|2, 4|5, 7|6).
         let (d0_1, d3_2, d4_5, d7_6) = dodct_idct::<1>(in0_4, in3_1, in2_6, in7_5);
 
-        // Transpose: 4 ymm (2 rows packed) → 4 ymm (2 cols packed).
-        let (t0_4, t1_5, t2_6, t3_7) = dotranspose(d0_1, d3_2, d4_5, d7_6);
+        // BUGFIX (2026-10-24): the inter-pass and final register packing.
+        // `dotranspose` (shared with the fdct, which uses it correctly)
+        // puts its columns in row order only when the rows come packed
+        // (N | N+4) — (0|4, 1|5, 2|6, 3|7) — and it returns columns packed
+        // (1|0, 3|2, 4|5, 6|7). This kernel fed it pass 1's (0|1, 3|2, 4|5,
+        // 7|6) as they were, so every column came out in row order 0 3 4 7
+        // 1 2 5 6, then assumed the transpose returned (0|4, 1|5, 2|6, 3|7)
+        // and repacked only two registers for pass 2; the end of the kernel
+        // made the same two assumptions. Every AVX2 IDCT block was wrong —
+        // a DC-only block came out as +32 / −32 halves — on every x86 CPU
+        // with AVX2, from the day the kernel landed. Found by Denny Wong's
+        // scalar-parity check under Miri (denwong47/phasmcore); confirmed
+        // here with the same method. The 2026-07-02 store-offset fix below
+        // removed the out-of-bounds write but not this.
+        let (c1_0, c3_2, c4_5, c6_7) = transpose_rows_0_1_3_2_4_5_7_6(d0_1, d3_2, d4_5, d7_6);
 
-        // Re-pack for pass 2: pass 2 wants (in0_4, in3_1, in2_6, in7_5)
-        // again. After dotranspose: (col0_4, col1_5, col2_6, col3_7).
-        // Need to compute (in7_5, in3_1) from those.
-        let in7_5_p2 = _mm256_permute2x128_si256::<0x31>(t3_7, t1_5);
-        let in3_1_p2 = _mm256_permute2x128_si256::<0x20>(t3_7, t1_5);
+        // Pass 2 (rows) takes (in0_4, in3_1, in2_6, in7_5) again, now
+        // indexed by horizontal frequency.
+        let in0_4 = _mm256_permute2x128_si256::<0x21>(c1_0, c4_5);
+        let in3_1 = _mm256_permute2x128_si256::<0x20>(c3_2, c1_0);
+        let in2_6 = _mm256_permute2x128_si256::<0x21>(c3_2, c6_7);
+        let in7_5 = _mm256_permute2x128_si256::<0x31>(c6_7, c4_5);
+        let (d0_1, d3_2, d4_5, d7_6) = dodct_idct::<2>(in0_4, in3_1, in2_6, in7_5);
 
-        // Pass 2.
-        let (d0_1, d3_2, d4_5, d7_6) = dodct_idct::<2>(t0_4, in3_1_p2, t2_6, in7_5_p2);
+        // Pass 2 returned output COLUMNS packed (0|1, 3|2, 4|5, 7|6); the
+        // same repack + transpose turns them into rows packed (1|0, 3|2,
+        // 4|5, 6|7).
+        let (r1_0, r3_2, r4_5, r6_7) = transpose_rows_0_1_3_2_4_5_7_6(d0_1, d3_2, d4_5, d7_6);
 
-        // Transpose back: 4 ymm packed (row N, row N+4) → row-major.
-        let (r0_4, r1_5, r2_6, r3_7) = dotranspose(d0_1, d3_2, d4_5, d7_6);
-
-        // Each ymm holds 2 rows packed (low-128 = row N i16x8, high-128
-        // = row N+4 i16x8). Unpack i16 → i32 with sign-extend, store as
-        // 8 i32 per row.
+        // Each ymm holds two output rows (low-128 / high-128, i16x8 each).
+        // Unpack i16 → i32 with sign-extend, store as 8 i32 per row. `out`
+        // is [i32;64] = 8 __m256i, row N at __m256i offset N. (2026-07-02:
+        // these offsets used to be doubled — add(8/10/12/14) wrote past the
+        // 64-element buffer into the adjacent `qt` table.)
         let out_ptr = out.as_mut_ptr() as *mut __m256i;
-        // BUGFIX (2026-07-02): `out` is [i32;64] = 8 __m256i (one 8-i32 row each),
-        // so row N lives at __m256i offset N (dst_lo = row N, dst_hi = row N+4),
-        // matching the NEON/scalar row-major layout (row R at i32[R*8]). The
-        // offsets below were DOUBLED — add(8/10/12/14) wrote PAST the 64-element
-        // buffer, out-of-bounds clobbering the adjacent `qt` table (add(8) →
-        // qt[0..16], add(10) → qt[32..48]) with i32 coefficient data. UB that
-        // fires only under AVX2 (real x86: Intel Mac / Linux / Windows Armor
-        // builds); invisible on ARM(NEON) + x86 without AVX2. Surfaced as a
-        // div-by-zero in aan_dct_block when a clobbered qt entry became 0.
-        store_row_as_i32(r0_4, out_ptr.add(0), out_ptr.add(4));
-        store_row_as_i32(r1_5, out_ptr.add(1), out_ptr.add(5));
-        store_row_as_i32(r2_6, out_ptr.add(2), out_ptr.add(6));
-        store_row_as_i32(r3_7, out_ptr.add(3), out_ptr.add(7));
+        store_row_as_i32(r1_0, out_ptr.add(1), out_ptr.add(0));
+        store_row_as_i32(r3_2, out_ptr.add(3), out_ptr.add(2));
+        store_row_as_i32(r4_5, out_ptr.add(4), out_ptr.add(5));
+        store_row_as_i32(r6_7, out_ptr.add(6), out_ptr.add(7));
 
         _mm256_zeroupper();
+    }
+
+    /// Transpose a dodct_idct result — rows packed (0|1, 3|2, 4|5, 7|6) —
+    /// into columns packed (1|0, 3|2, 4|5, 6|7): repack to the (N | N+4)
+    /// layout `dotranspose` needs, then transpose.
+    #[inline(always)]
+    unsafe fn transpose_rows_0_1_3_2_4_5_7_6(
+        d0_1: __m256i,
+        d3_2: __m256i,
+        d4_5: __m256i,
+        d7_6: __m256i,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        unsafe {
+            dotranspose(
+                _mm256_permute2x128_si256::<0x20>(d0_1, d4_5), // rows 0 | 4
+                _mm256_permute2x128_si256::<0x31>(d0_1, d4_5), // rows 1 | 5
+                _mm256_permute2x128_si256::<0x31>(d3_2, d7_6), // rows 2 | 6
+                _mm256_permute2x128_si256::<0x20>(d3_2, d7_6), // rows 3 | 7
+            )
+        }
     }
 
     /// Unpack the low-128 and high-128 halves of a packed (rowN, rowN+4)

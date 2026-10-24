@@ -733,7 +733,28 @@ fn main() {
 
     let build_dir = out_dir.join("openh264-static");
 
-    // Meson setup (skip if already configured).
+    // Meson setup — skipped when the dir is already configured, but ONLY if it
+    // was configured against THIS source tree.
+    //
+    // A meson build dir records the absolute source path it was set up for,
+    // and `ninja` regenerates against that path whenever the build script
+    // reruns. Reusing the dir on `build.ninja`'s existence alone therefore
+    // broke every build after the tree moved: on 2026-10-23, after the
+    // 2026-10-18 move from ~/Development/phasm to /Volumes/EXTDISK, a target
+    // dir configured before the move failed with "Neither source directory
+    // '/Users/cgaffga/Development/phasm/vendor/phasm-openh264' nor build
+    // directory '.' contain a build file meson.build" — the first time
+    // anything made this script rerun there. The stamp below names the
+    // source a dir was configured for; a missing or different stamp means
+    // the dir is someone else's and is rebuilt from scratch.
+    let stamp = build_dir.join(".phasm-configured-source");
+    let configured_for = std::fs::read_to_string(&stamp).ok();
+    let source_id = submodule_path.display().to_string();
+    let stale = build_dir.join("build.ninja").exists()
+        && configured_for.as_deref() != Some(source_id.as_str());
+    if stale {
+        std::fs::remove_dir_all(&build_dir).expect("remove stale meson build dir");
+    }
     let needs_setup = !build_dir.join("build.ninja").exists();
     if needs_setup {
         std::fs::create_dir_all(&build_dir).expect("create build dir");
@@ -752,6 +773,7 @@ fn main() {
         if !status.success() {
             panic!("meson setup failed (exit {:?}); check output above", status.code());
         }
+        std::fs::write(&stamp, &source_id).expect("write meson source stamp");
     }
 
     // Ninja build. We deliberately build all default targets — Meson's
@@ -804,8 +826,40 @@ fn main() {
 
     // C++ stdlib link. Use the cargo TARGET, not the host cfg, so cross-
     // builds for iOS / Android / etc. pick the right one. macOS + iOS use
-    // libc++; Android also uses libc++ (NDK bundles it); Linux uses
-    // libstdc++; Windows MSVC bundles its stdlib.
+    // libc++ (the platform ships it); Linux uses libstdc++; Windows MSVC
+    // bundles its stdlib.
+    //
+    // ANDROID IS NOT LIKE THE OTHERS, and getting it wrong ships an app that
+    // cannot start. The NDK's `-lc++` is a linker SCRIPT resolving to the
+    // SHARED `libc++_shared.so`. The NDK provides that library to link
+    // against, but Android does NOT ship it — it is absent from
+    // /system/etc/public.libraries.txt, so an app may only use it by
+    // packaging a copy of its own. For a long time nothing here did, so the
+    // emitted `libphasm_android.so` carried a `DT_NEEDED libc++_shared.so`
+    // that `dlopen()` could never satisfy, and `System.loadLibrary()` threw
+    // at launch.
+    //
+    // This shipped. versionCode 25 (1.8.0) was REJECTED by Google Play on
+    // 2026-10-23 for "App stability — the app crashed during testing", as was
+    // 1.7.0 before it. It escaped notice because the live build (versionCode
+    // 23, 2026-03-21) predates the 2026-05-14 flip of the mobile bridges to
+    // the OpenH264 backend (`eab065b4`): before that the bridge linked no C++
+    // at all, so there was no dependency to miss.
+    //
+    // The library is now PACKAGED — `android-bridge/build-android.sh` copies
+    // the NDK's `libc++_shared.so` into `jniLibs/<abi>/` beside our own `.so`
+    // and then verifies that every `DT_NEEDED` entry is either an Android
+    // public library or present in that directory, so a reintroduction fails
+    // the build instead of reaching a store.
+    //
+    // (The NDK's other option, the static libc++, is a better fit on paper —
+    // one self-contained `.so`, no runtime dependency — and it links clean
+    // for arm64. It is NOT usable here: on x86_64 it pulls in the NDK's
+    // non-PIC compiler-rt builtins and the link dies with "relocation
+    // R_X86_64_PC32 cannot be used against symbol `__cpu_model`; recompile
+    // with -fPIC". Dropping the x86_64 ABI to get it is not worth it — that
+    // is the emulator ABI, which is what Play's review lab and every
+    // contributor without an Android phone runs.)
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "macos" | "ios" | "android" => println!("cargo:rustc-link-lib=c++"),

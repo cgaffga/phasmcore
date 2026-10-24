@@ -24,6 +24,8 @@
 
 #![cfg(feature = "h264-encoder")]
 
+mod common;
+
 use phasm_core::codec::h264::openh264_stego::{
     gop_clean_cover, gop_provisional_step, gop_safe_msl_prov, h264_encode_with_shadows,
     h264_encode_with_shadows_streaming, prep_primary_payload, streaming_provisional_plan,
@@ -822,7 +824,7 @@ fn sweep_b_emit_matches_whole_clip() {
             .collect();
         let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
         let (bytes, _gop_lens) = sweep_b_emit(
-            &mut src, w, h, n, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
+            &mut src, w, h, n, opts, &frame_bytes, None, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
             &weights, None,
         )
         .expect("sweep_b_emit");
@@ -905,7 +907,7 @@ fn streaming_shadow_verify_accepts_correct_rejects_wrong_pass() {
         }
         let mut src2 = SliceYuvSource::new(&yuv, w, h, n, gop);
         let (bytes, gop_lens) = sweep_b_emit(
-            &mut src2, w, h, n, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
+            &mut src2, w, h, n, opts, &frame_bytes, None, &hhat_seed, &sa, &shadow_rs, parity, tier_idx,
             &weights, None,
         )
         .expect("sweep_b_emit");
@@ -961,7 +963,7 @@ fn callback_yuv_source_byte_identical_to_slice() {
     // Reference: the whole-buffer slicer.
     let mut src1 = SliceYuvSource::new(&yuv, w, h, n, gop);
     let bytes_slice = h264_encode_with_shadows_streaming(
-        &mut src1, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None,
+        &mut src1, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None, None,
     )
     .expect("slice-source encode");
 
@@ -978,7 +980,7 @@ fn callback_yuv_source_byte_identical_to_slice() {
     };
     let mut src2 = CallbackYuvSource::new(decode_gop, || Ok(()));
     let bytes_cb = h264_encode_with_shadows_streaming(
-        &mut src2, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None,
+        &mut src2, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None, None,
     )
     .expect("callback-source encode");
 
@@ -1029,7 +1031,7 @@ fn streaming_shadow_byte_identical_to_whole_clip() {
     eprintln!("=== g.4 gate: streaming encode (SliceYuvSource) ===");
     let mut src = SliceYuvSource::new(&yuv, w, h, n, gop);
     let streamed = h264_encode_with_shadows_streaming(
-        &mut src, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None,
+        &mut src, w, h, n, opts, primary_msg, &[], primary_pass, &shadows, &weights, None, None,
     )
     .expect("streaming encode");
 
@@ -1062,11 +1064,11 @@ fn file_yuv_source_matches_slice_yuv_source() {
     let (w, h, gop, n) = (64u32, 48u32, 4u32, 11u32); // 11 frames, gop 4 → 3 GOPs (4+4+3)
     let yuv = synth_yuv(w, h, n);
 
-    // Write the clip to a unique temp file.
-    let path = std::env::temp_dir().join(format!(
+    // Write the clip to a unique scratch file (`$PHASM_TMP`, see `common::scratch_dir`).
+    let path = std::path::PathBuf::from(common::scratch_path(&format!(
         "phasm_fileyuvsource_gate_{}.yuv",
         std::process::id()
-    ));
+    )));
     std::fs::write(&path, &yuv).expect("write temp yuv");
 
     let mut slice = SliceYuvSource::new(&yuv, w, h, n, gop);

@@ -36,14 +36,10 @@ mod common;
 use common::oh264_stream;
 
 use phasm_core::codec::h264::openh264::{extract_cover_bits_via_decoder, Decoder};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
-}
+// Session guard + the cached scale-to-I420 are shared in `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, session_guard, ScaleRecipe};
 
 /// Local copy of `openh264.rs::split_annex_b_per_frame` so the test
 /// doesn't widen the crate's public API for a test-only need. Splits
@@ -76,32 +72,8 @@ fn split_annex_b_per_frame(bytes: &[u8]) -> Vec<Vec<u8>> {
     chunks
 }
 
-fn corpus_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
-
 fn ensure_yuv(tag: &str, src: &str, w: u32, h: u32, n_frames: u32) -> Vec<u8> {
-    let yuv_path = format!("{}/openh264_decperf_{tag}_{w}x{h}_f{n_frames}.yuv", common::scratch_dir());
-    let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * n_frames as usize;
-    if let Ok(d) = std::fs::read(&yuv_path) {
-        if d.len() >= need { return d; }
-    }
-    let src_path = corpus_root().join(src);
-    assert!(src_path.exists(), "corpus fixture missing: {}", src_path.display());
-    let vf = format!("scale={w}:{h},format=yuv420p");
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src_path)
-        .args(["-frames:v", &n_frames.to_string(),
-               "-vf", &vf, "-f", "rawvideo"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {src}");
-    std::fs::read(&yuv_path).expect("read yuv")
+    ensure_scaled_yuv(src, "openh264_decperf", tag, w, h, n_frames, ScaleRecipe::FormatFilter)
 }
 
 /// Time `extract_cover_bits_via_decoder` over `runs` invocations,

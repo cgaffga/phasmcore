@@ -76,7 +76,8 @@ use crate::codec::h264::stego::inject::{DomainBits, DomainCover};
 use crate::codec::h264::stego::orchestrate::DomainCosts;
 use crate::stego::cost::h264_uniward::{
     accumulate_cost_from_field, compute_delta_field, compute_three_subbands,
-    precompute_unit_basis, DeltaField, ThreeSubbands,
+    compute_three_subbands_for, precompute_unit_basis, DeltaField, SubbandDemand,
+    SubbandDemandBuilder, ThreeSubbands,
 };
 use crate::stego::error::StegoError;
 use std::collections::HashMap;
@@ -187,6 +188,19 @@ pub fn compute_content_costs_yuv(
     cover: &DomainCover,
     qp: i32,
 ) -> Result<DomainCosts, StegoError> {
+    compute_content_costs_yuv_with_mode(yuv, width, height, n_frames, cover, qp, wavelet_demand_mode())
+}
+
+fn compute_content_costs_yuv_with_mode(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    cover: &DomainCover,
+    qp: i32,
+    demand_mode: WaveletDemandMode,
+) -> Result<DomainCosts, StegoError> {
+    let _prof = crate::codec::h264::profile::scope("cost.content_costs");
     if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
         return Err(StegoError::InvalidVideo(format!(
             "dimensions must be 16-aligned, got {width}x{height}"
@@ -251,7 +265,7 @@ pub fn compute_content_costs_yuv(
         // variant via `fill_frame_costs` (bit-identical — same arithmetic).
         let dt = fill_frame_costs(
             y_plane, cb_plane, cr_plane, bucket, cover, &field_table,
-            width as usize, height as usize, mb_width, &mut costs,
+            width as usize, height as usize, mb_width, &mut costs, demand_mode,
         );
         if trace_cc {
             t_wav += dt;
@@ -284,12 +298,46 @@ fn fill_frame_costs(
     height: usize,
     mb_width: usize,
     costs: &mut DomainCosts,
+    demand_mode: WaveletDemandMode,
 ) -> std::time::Duration {
     let tw = std::time::Instant::now();
-    let y_wavelets = compute_three_subbands(y_plane, width, height);
-    let cb_wavelets = compute_three_subbands(cb_plane, width / 2, height / 2);
-    let cr_wavelets = compute_three_subbands(cr_plane, width / 2, height / 2);
+    // Band-limited wavelet: evaluate each plane's three subbands only where a
+    // position priced below will read them (its 19×19 impact window, or for
+    // MVD positions the macroblock area `mb_y_texture` averages). On real
+    // 1080p content that is ~20% of luma and ~1-3% of chroma per frame. Every
+    // computed sample is bit-identical to the full decomposition and no other
+    // sample is read — see `compute_three_subbands_for` and
+    // `band_limited_wavelet_costs_are_bit_identical_to_full`.
+    let y_wavelets = {
+        let _p = crate::codec::h264::profile::scope("cost.wavelet_luma");
+        if demand_mode == WaveletDemandMode::All {
+            let d = luma_demand(bucket, cover, width, height, mb_width);
+            trace_demand("luma", &d, width, height);
+            compute_three_subbands_for(y_plane, width, height, &d)
+        } else {
+            compute_three_subbands(y_plane, width, height)
+        }
+    };
+    let (cb_wavelets, cr_wavelets) = {
+        let _p = crate::codec::h264::profile::scope("cost.wavelet_chroma");
+        let (cw, ch) = (width / 2, height / 2);
+        if demand_mode == WaveletDemandMode::Off {
+            (
+                compute_three_subbands(cb_plane, cw, ch),
+                compute_three_subbands(cr_plane, cw, ch),
+            )
+        } else {
+            let (d_cb, d_cr) = chroma_demand(bucket, cover, cw, ch, mb_width);
+            trace_demand("cb", &d_cb, cw, ch);
+            trace_demand("cr", &d_cr, cw, ch);
+            (
+                compute_three_subbands_for(cb_plane, cw, ch, &d_cb),
+                compute_three_subbands_for(cr_plane, cw, ch, &d_cr),
+            )
+        }
+    };
     let wav_elapsed = tw.elapsed();
+    let _prof_pos = crate::codec::h264::profile::scope("cost.position_loops");
 
     // Coefficient-domain positions: per-position wavelet cost.
     // #perf 2026-06: this per-position loop is the cover-scaling serial
@@ -576,6 +624,198 @@ fn group_positions_by_frame(cover: &DomainCover) -> HashMap<u32, FrameBucket> {
     out
 }
 
+/// Which cost-wavelet plane a coefficient position reads.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum CostPlane {
+    Y,
+    Cb,
+    Cr,
+}
+
+/// Where a coefficient-domain position's J-UNIWARD cost reads the cover
+/// wavelets: the plane, the top-left pixel of its 4×4 block in that plane, its
+/// zigzag scan position and its bin kind. `None` for positions kept WET
+/// without reading anything (DC, chroma DC, Intra16x16 luma DC, 8×8, MVD).
+///
+/// The single source of truth for BOTH [`coeff_position_cost`] (which reads
+/// the 19×19 window around the block) and the demand the band-limited wavelet
+/// is computed for ([`chroma_demand`] / [`luma_demand`]). Keeping the two on
+/// one function is what makes the band-limited decomposition lossless: a
+/// position can only ever read a window this function also demanded.
+#[derive(Copy, Clone, Debug)]
+struct CoeffCostSite {
+    plane: CostPlane,
+    block_px_x: usize,
+    block_px_y: usize,
+    scan_pos: u8,
+    kind: BinKind,
+}
+
+fn coeff_cost_site(key: PositionKey, mb_width: usize) -> Option<CoeffCostSite> {
+    let mb_addr = key.mb_addr();
+    let mb_x = (mb_addr as usize) % mb_width;
+    let mb_y = (mb_addr as usize) / mb_width;
+    match key.syntax_path() {
+        SyntaxPath::Luma4x4 { block_idx, coeff_idx, kind } => {
+            if coeff_idx == 0 {
+                // DC of luma 4x4 — kept wet.
+                return None;
+            }
+            let (bx, by) = BLOCK_INDEX_TO_POS[block_idx as usize];
+            Some(CoeffCostSite {
+                plane: CostPlane::Y,
+                block_px_x: mb_x * 16 + bx as usize * 4,
+                block_px_y: mb_y * 16 + by as usize * 4,
+                scan_pos: coeff_idx,
+                kind,
+            })
+        }
+        SyntaxPath::Luma8x8 { .. } => {
+            // 8×8 transform — the cost machinery targets the 4×4 basis,
+            // so there is nothing correct to price this against: kept
+            // WET (intentional). v1.1 — add a proper 8×8 J-UNIWARD
+            // basis; until then do NOT substitute a 4×4 proxy (an
+            // earlier draft of this comment proposed re-using the
+            // top-left sub-4×4, which was never implemented and would
+            // misprice the other 48 coefficients).
+            //
+            // Vacuous on the production OH264 cover — the pinned fork
+            // emits `transform_8x8_mode_flag = 0` always, so BC=5 never
+            // occurs. Reachable only via the walker on third-party
+            // High-profile input. Full rationale + the corpus census:
+            // `compute_cost_mask::coeff_is_wet`.
+            None
+        }
+        SyntaxPath::ChromaAc { plane, block_idx, coeff_idx, kind } => {
+            if coeff_idx == 0 {
+                return None;
+            }
+            let bx = (block_idx as usize) % 2;
+            let by = (block_idx as usize) / 2;
+            Some(CoeffCostSite {
+                plane: if plane == 0 { CostPlane::Cb } else { CostPlane::Cr },
+                block_px_x: mb_x * 8 + bx * 4,
+                block_px_y: mb_y * 8 + by * 4,
+                scan_pos: coeff_idx,
+                kind,
+            })
+        }
+        SyntaxPath::ChromaDc { .. }
+        | SyntaxPath::LumaDcIntra16x16 { .. }
+        | SyntaxPath::Mvd { .. } => None,
+    }
+}
+
+/// Iterate the coefficient positions of `bucket` that [`fill_frame_costs`]
+/// will price, as their [`CoeffCostSite`]s. Mirrors the `cost_of` closure's
+/// lookup exactly (`positions.get(idx)`), so demand and pricing see the same
+/// set.
+fn bucket_coeff_sites<'a>(
+    bucket: &'a FrameBucket,
+    cover: &'a DomainCover,
+    mb_width: usize,
+) -> impl Iterator<Item = CoeffCostSite> + 'a {
+    bucket.coeff_positions.iter().filter_map(move |slot| {
+        let positions = match slot.domain {
+            EmbedDomain::CoeffSignBypass => &cover.coeff_sign_bypass.positions,
+            EmbedDomain::CoeffSuffixLsb => &cover.coeff_suffix_lsb.positions,
+            _ => return None,
+        };
+        let &key = positions.get(slot.idx)?;
+        coeff_cost_site(key, mb_width)
+    })
+}
+
+/// Demand for the two chroma planes: the 19×19 windows of every priced
+/// `ChromaAc` position. Chroma is read by nothing else (`mb_y_texture` is
+/// luma-only), so this is the plane's complete read set.
+fn chroma_demand(
+    bucket: &FrameBucket,
+    cover: &DomainCover,
+    chroma_w: usize,
+    chroma_h: usize,
+    mb_width: usize,
+) -> (SubbandDemand, SubbandDemand) {
+    let mut cb = SubbandDemandBuilder::new(chroma_w, chroma_h);
+    let mut cr = SubbandDemandBuilder::new(chroma_w, chroma_h);
+    for site in bucket_coeff_sites(bucket, cover, mb_width) {
+        match site.plane {
+            CostPlane::Cb => cb.add_coeff_block(site.block_px_x, site.block_px_y),
+            CostPlane::Cr => cr.add_coeff_block(site.block_px_x, site.block_px_y),
+            CostPlane::Y => {}
+        }
+    }
+    (cb.build(), cr.build())
+}
+
+/// Demand for the luma plane: the 19×19 windows of every priced `Luma4x4`
+/// position, plus the 16×16 macroblock area `mb_y_texture` reads for every
+/// MVD position.
+fn luma_demand(
+    bucket: &FrameBucket,
+    cover: &DomainCover,
+    width: usize,
+    height: usize,
+    mb_width: usize,
+) -> SubbandDemand {
+    let mut y = SubbandDemandBuilder::new(width, height);
+    for site in bucket_coeff_sites(bucket, cover, mb_width) {
+        if site.plane == CostPlane::Y {
+            y.add_coeff_block(site.block_px_x, site.block_px_y);
+        }
+    }
+    for slot in &bucket.mvd_positions {
+        let positions = match slot.domain {
+            EmbedDomain::MvdSignBypass => &cover.mvd_sign_bypass.positions,
+            EmbedDomain::MvdSuffixLsb => &cover.mvd_suffix_lsb.positions,
+            _ => continue,
+        };
+        if let Some(&key) = positions.get(slot.idx) {
+            let mb_addr = key.mb_addr() as usize;
+            y.add_mb_area((mb_addr % mb_width) * 16, (mb_addr / mb_width) * 16);
+        }
+    }
+    y.build()
+}
+
+/// Which planes get the band-limited wavelet. Output-identical in every mode
+/// (that is the claim the tests pin); the modes exist for A/B measurement.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WaveletDemandMode {
+    /// Full decomposition of every plane (the pre-band-limiting behaviour).
+    Off,
+    /// Band-limited chroma only — kept so the A/B can attribute the saving.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Chroma,
+    /// Band-limited luma and chroma — production.
+    All,
+}
+
+/// Production: band-limited on all planes. `PHASM_H264_FULL_WAVELET=1`
+/// restores the full decomposition, for A/B timing on a quiet machine (the
+/// output is the same either way).
+fn wavelet_demand_mode() -> WaveletDemandMode {
+    if std::env::var("PHASM_H264_FULL_WAVELET").as_deref() == Ok("1") {
+        WaveletDemandMode::Off
+    } else {
+        WaveletDemandMode::All
+    }
+}
+
+/// `PHASM_WAVELET_DEMAND_TRACE=1`: print each plane's demanded fraction per
+/// frame (how much of the decomposition the band-limiting skips).
+fn trace_demand(label: &str, d: &SubbandDemand, w: usize, h: usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("PHASM_WAVELET_DEMAND_TRACE").is_some()) {
+        eprintln!(
+            "[wavelet-demand] {label} {:.4} ({} of {} px)",
+            d.demanded_px() as f64 / (w * h).max(1) as f64,
+            d.demanded_px(),
+            w * h
+        );
+    }
+}
+
 /// Compute J-UNIWARD-style wavelet cost for a coefficient-domain
 /// position. Returns `f32::INFINITY` for DC positions, chroma DC, and
 /// positions whose syntax_path isn't a coefficient form.
@@ -590,10 +830,6 @@ fn coeff_position_cost(
     img_h: usize,
     mb_width: usize,
 ) -> f32 {
-    let mb_addr = key.mb_addr();
-    let mb_x = (mb_addr as usize) % mb_width;
-    let mb_y = (mb_addr as usize) / mb_width;
-
     // Magnitude class for the field-table lookup. A sign flip swings the
     // coefficient +M↔−M (δ = 2·|coeff|); clamp |coeff| to 32 so a single
     // high-magnitude outlier can't dominate the cost vector (at QP ≤ 32,
@@ -603,59 +839,19 @@ fn coeff_position_cost(
     // magnitude LSB (δ=1) → class 0.
     let sign_class = (magnitude as usize).clamp(1, 32);
 
-    let (wavelets, plane_w, plane_h, block_px_x, block_px_y, scan_pos, class) =
-        match key.syntax_path() {
-            SyntaxPath::Luma4x4 { block_idx, coeff_idx, kind } => {
-                if coeff_idx == 0 {
-                    // DC of luma 4x4 — kept wet.
-                    return f32::INFINITY;
-                }
-                let (bx, by) = BLOCK_INDEX_TO_POS[block_idx as usize];
-                let block_px_x = mb_x * 16 + bx as usize * 4;
-                let block_px_y = mb_y * 16 + by as usize * 4;
-                let class = match kind {
-                    BinKind::Sign => sign_class,
-                    BinKind::SuffixLsb => 0,
-                };
-                (y_wavelets, img_w, img_h, block_px_x, block_px_y, coeff_idx, class)
-            }
-            SyntaxPath::Luma8x8 { .. } => {
-                // 8×8 transform — the cost machinery targets the 4×4 basis,
-                // so there is nothing correct to price this against: kept
-                // WET (intentional). v1.1 — add a proper 8×8 J-UNIWARD
-                // basis; until then do NOT substitute a 4×4 proxy (an
-                // earlier draft of this comment proposed re-using the
-                // top-left sub-4×4, which was never implemented and would
-                // misprice the other 48 coefficients).
-                //
-                // Vacuous on the production OH264 cover — the pinned fork
-                // emits `transform_8x8_mode_flag = 0` always, so BC=5 never
-                // occurs. Reachable only via the walker on third-party
-                // High-profile input. Full rationale + the corpus census:
-                // `compute_cost_mask::coeff_is_wet`.
-                return f32::INFINITY;
-            }
-            SyntaxPath::ChromaAc { plane, block_idx, coeff_idx, kind } => {
-                if coeff_idx == 0 {
-                    return f32::INFINITY;
-                }
-                let bx = (block_idx as usize) % 2;
-                let by = (block_idx as usize) / 2;
-                let chroma_w = img_w / 2;
-                let chroma_h = img_h / 2;
-                let block_px_x = mb_x * 8 + bx * 4;
-                let block_px_y = mb_y * 8 + by * 4;
-                let class = match kind {
-                    BinKind::Sign => sign_class,
-                    BinKind::SuffixLsb => 0,
-                };
-                let wv = if plane == 0 { cb_wavelets } else { cr_wavelets };
-                (wv, chroma_w, chroma_h, block_px_x, block_px_y, coeff_idx, class)
-            }
-            SyntaxPath::ChromaDc { .. } => return f32::INFINITY,
-            SyntaxPath::LumaDcIntra16x16 { .. } => return f32::INFINITY,
-            SyntaxPath::Mvd { .. } => return f32::INFINITY,
-        };
+    let Some(site) = coeff_cost_site(key, mb_width) else {
+        return f32::INFINITY;
+    };
+    let class = match site.kind {
+        BinKind::Sign => sign_class,
+        BinKind::SuffixLsb => 0,
+    };
+    let (wavelets, plane_w, plane_h) = match site.plane {
+        CostPlane::Y => (y_wavelets, img_w, img_h),
+        CostPlane::Cb => (cb_wavelets, img_w / 2, img_h / 2),
+        CostPlane::Cr => (cr_wavelets, img_w / 2, img_h / 2),
+    };
+    let (block_px_x, block_px_y, scan_pos) = (site.block_px_x, site.block_px_y, site.scan_pos);
 
     // Look up the precomputed position-independent impact field for this
     // (scan_pos, class) and accumulate it against the cover wavelets at this
@@ -1027,6 +1223,407 @@ mod tests {
         let costs_a = compute_content_costs_yuv(&yuv, 64, 64, 2, &cover, 26).unwrap();
         let costs_b = compute_content_costs_yuv(&yuv, 64, 64, 2, &cover, 26).unwrap();
         assert_eq!(costs_a.coeff_sign_bypass, costs_b.coeff_sign_bypass);
+    }
+
+    /// The band-limited wavelet (computed only where a priced position reads
+    /// it) must give BIT-identical costs to the full decomposition, in every
+    /// domain, for every kind of position — including chroma/luma blocks on
+    /// the plane borders, wet positions, MVD positions, positions of a frame
+    /// with no chroma AC at all, and out-of-range frames. A 1-ULP difference
+    /// here is a different STC plan, i.e. a different stego file.
+    #[test]
+    fn band_limited_wavelet_costs_are_bit_identical_to_full() {
+        use crate::codec::h264::stego::hook::Axis;
+        let (w, h, n_frames) = (160u32, 96u32, 3u32);
+        let yuv = synth_yuv(w, h, n_frames);
+        let n_mb = (w / 16) * (h / 16);
+        let mut s: u64 = 0x5EED_0F_C0575;
+        let mut rnd = |m: u32| -> u32 {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) as u32) % m
+        };
+        let mut csb = crate::codec::h264::stego::inject::DomainBits::default();
+        let mut csl = crate::codec::h264::stego::inject::DomainBits::default();
+        let mut msb = crate::codec::h264::stego::inject::DomainBits::default();
+        let mut msl = crate::codec::h264::stego::inject::DomainBits::default();
+        // Frame 2 deliberately gets NO chroma positions (empty chroma demand).
+        // Frame index n_frames is out of range (skipped by the cost pass).
+        for f in 0..=n_frames {
+            for _ in 0..120 {
+                let mb = rnd(n_mb);
+                let kind = if rnd(2) == 0 { BinKind::Sign } else { BinKind::SuffixLsb };
+                let (path, dom) = match rnd(if f == 2 { 2 } else { 4 }) {
+                    0 | 1 => (
+                        SyntaxPath::Luma4x4 {
+                            block_idx: rnd(16) as u8,
+                            coeff_idx: rnd(16) as u8,
+                            kind,
+                        },
+                        rnd(2),
+                    ),
+                    2 => (
+                        SyntaxPath::ChromaAc {
+                            plane: rnd(2) as u8,
+                            block_idx: rnd(4) as u8,
+                            coeff_idx: rnd(16) as u8,
+                            kind,
+                        },
+                        rnd(2),
+                    ),
+                    _ => (SyntaxPath::ChromaDc { plane: rnd(2) as u8, coeff_idx: rnd(4) as u8, kind }, 0),
+                };
+                let target = if dom == 0 { &mut csb } else { &mut csl };
+                let domain = if dom == 0 { EmbedDomain::CoeffSignBypass } else { EmbedDomain::CoeffSuffixLsb };
+                target.positions.push(PositionKey::new(f, mb, domain, path));
+                target.bits.push(rnd(2) as u8);
+                target.magnitudes.push(rnd(40) as u16);
+            }
+            for _ in 0..30 {
+                let (target, domain) = if rnd(2) == 0 {
+                    (&mut msb, EmbedDomain::MvdSignBypass)
+                } else {
+                    (&mut msl, EmbedDomain::MvdSuffixLsb)
+                };
+                target.positions.push(PositionKey::new(
+                    f, rnd(n_mb), domain,
+                    SyntaxPath::Mvd {
+                        list: 0,
+                        partition: rnd(16) as u8,
+                        axis: if rnd(2) == 0 { Axis::X } else { Axis::Y },
+                        kind: if domain == EmbedDomain::MvdSignBypass { BinKind::Sign } else { BinKind::SuffixLsb },
+                    },
+                ));
+                target.bits.push(rnd(2) as u8);
+                target.magnitudes.push(rnd(60) as u16);
+            }
+        }
+        let cover = DomainCover {
+            coeff_sign_bypass: csb,
+            coeff_suffix_lsb: csl,
+            mvd_sign_bypass: msb,
+            mvd_suffix_lsb: msl,
+        };
+        let bits = |c: &DomainCosts| -> Vec<Vec<u32>> {
+            [&c.coeff_sign_bypass, &c.coeff_suffix_lsb, &c.mvd_sign_bypass, &c.mvd_suffix_lsb]
+                .iter()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        let full = compute_content_costs_yuv_with_mode(
+            &yuv, w, h, n_frames, &cover, 26, WaveletDemandMode::Off,
+        )
+        .unwrap();
+        // Sanity: the fixture really exercises finite chroma + luma costs.
+        assert!(full.coeff_sign_bypass.iter().chain(&full.coeff_suffix_lsb).any(|c| c.is_finite()));
+        for mode in [WaveletDemandMode::Chroma, WaveletDemandMode::All] {
+            let got = compute_content_costs_yuv_with_mode(&yuv, w, h, n_frames, &cover, 26, mode)
+                .unwrap();
+            assert_eq!(bits(&got), bits(&full), "{mode:?} costs diverge from full wavelet");
+        }
+    }
+
+    /// Real-content A/B of the band-limited wavelet: one real GOP (decoded YUV
+    /// from `$PHASM_TMP`, as the capacity gates cache it), its real clean cover,
+    /// and `compute_content_costs_yuv` under each [`WaveletDemandMode`],
+    /// INTERLEAVED so host load hits every arm alike, with bit-identity of the
+    /// resulting costs asserted on every rep. `PHASM_WAVELET_AB_YUV` /
+    /// `_W` / `_H` / `_F` select the fixture (default: iphone7 1080p, 30 f).
+    ///
+    /// ```text
+    /// PHASM_TMP=/Volumes/EXTDISK/tmp/phasm cargo test --release --features h264-encoder \
+    ///   --lib band_limited_wavelet_real_gop_ab -- --ignored --nocapture --test-threads=1
+    /// ```
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    #[ignore = "perf observation on a real decoded GOP; needs the $PHASM_TMP YUV cache"]
+    fn band_limited_wavelet_real_gop_ab() {
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let tmp = env("PHASM_TMP", "/tmp");
+        let path = env(
+            "PHASM_WAVELET_AB_YUV",
+            &format!("{tmp}/phasm_cap810_iphone7_1080p_30fps_h264_high_mov_1920x1072_f30.yuv"),
+        );
+        let w: u32 = env("PHASM_WAVELET_AB_W", "1920").parse().unwrap();
+        let h: u32 = env("PHASM_WAVELET_AB_H", "1072").parse().unwrap();
+        let f: u32 = env("PHASM_WAVELET_AB_F", "30").parse().unwrap();
+        let reps: usize = env("PHASM_WAVELET_AB_REPS", "5").parse().unwrap();
+        let Ok(all) = std::fs::read(&path) else {
+            eprintln!("SKIP: {path} not present");
+            return;
+        };
+        let frame = (w * h * 3 / 2) as usize;
+        let yuv = &all[..frame * f as usize];
+        let opts = crate::codec::h264::openh264_stego::EncodeOpts { qp: 26, intra_period: f as i32 };
+        let cover = crate::codec::h264::openh264_stego::gop_clean_cover(yuv, w, h, f, 0, opts)
+            .expect("clean cover");
+        let n = cover.coeff_sign_bypass.len() + cover.coeff_suffix_lsb.len()
+            + cover.mvd_sign_bypass.len() + cover.mvd_suffix_lsb.len();
+        eprintln!("fixture {path} {w}x{h} f={f}: {n} cover positions");
+        let bits = |c: &DomainCosts| -> Vec<u32> {
+            c.coeff_sign_bypass.iter().chain(&c.coeff_suffix_lsb).chain(&c.mvd_sign_bypass)
+                .chain(&c.mvd_suffix_lsb).map(|x| x.to_bits()).collect()
+        };
+        let reference = bits(
+            &compute_content_costs_yuv_with_mode(yuv, w, h, f, &cover, 26, WaveletDemandMode::Off)
+                .unwrap(),
+        );
+        // Process CPU (user + sys) as well as wall: on a loaded host the wall
+        // clock measures the scheduler, CPU time measures the work. (Run with
+        // RAYON_NUM_THREADS=1 to exclude rayon's idle spinning from it.)
+        fn cpu_ms() -> f64 {
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            let tv = |t: libc::timeval| t.tv_sec as f64 * 1e3 + t.tv_usec as f64 / 1e3;
+            tv(ru.ru_utime) + tv(ru.ru_stime)
+        }
+        let modes = [WaveletDemandMode::Off, WaveletDemandMode::Chroma, WaveletDemandMode::All];
+        let mut wall: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        let mut cpu: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        for r in 0..reps {
+            // Rotate the order each rep so no arm always runs first / warm.
+            for k in 0..modes.len() {
+                let i = (k + r) % modes.len();
+                let m = modes[i];
+                let (t, c0) = (std::time::Instant::now(), cpu_ms());
+                let c = compute_content_costs_yuv_with_mode(yuv, w, h, f, &cover, 26, m).unwrap();
+                cpu[i].push(cpu_ms() - c0);
+                wall[i].push(t.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(bits(&c), reference, "{m:?} costs diverge from the full wavelet");
+            }
+        }
+        let stat = |v: &[f64]| {
+            let mut v = v.to_vec();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (v[0], v[v.len() / 2], v[v.len() - 1])
+        };
+        for (i, m) in modes.iter().enumerate() {
+            let (w0, w1, w2) = stat(&wall[i]);
+            let (c0, c1, c2) = stat(&cpu[i]);
+            eprintln!(
+                "AB {m:?}: wall min/med/max {w0:.0}/{w1:.0}/{w2:.0} ms   cpu min/med/max {c0:.0}/{c1:.0}/{c2:.0} ms  (n={reps})"
+            );
+        }
+    }
+
+    /// Item-D measurement: the on-disk footprint of one real GOP's shadow
+    /// prefix (`ShadowGopPrefix`, exactly what sweep A caches: clean cover +
+    /// post-safe-MSL costs), as flat-packed today and under LOSSLESS
+    /// encodings — generic brotli, and a structure-aware transform (cost ∞
+    /// bitmap + finite f32 bits, position keys delta-coded) before brotli —
+    /// with pack/unpack CPU time, and the recompute time it would replace.
+    /// Every encoding is round-tripped and compared bit-for-bit.
+    /// Same fixture env as `band_limited_wavelet_real_gop_ab`.
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    #[ignore = "measurement on a real decoded GOP; needs the $PHASM_TMP YUV cache"]
+    fn shadow_prefix_spill_footprint_real_gop() {
+        use crate::codec::h264::cabac::bin_decoder::slice::{
+            walk_annex_b_for_cover_with_options, WalkOptions,
+        };
+        use crate::codec::h264::stego::cascade_safety::{
+            analyze_safe_mvd_subset, derive_msl_safe_from_msb,
+        };
+        use crate::stego::gop_cache::GopCachePayload;
+        use std::io::{Read, Write};
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let tmp = env("PHASM_TMP", "/tmp");
+        let path = env(
+            "PHASM_WAVELET_AB_YUV",
+            &format!("{tmp}/phasm_cap810_iphone7_1080p_30fps_h264_high_mov_1920x1072_f30.yuv"),
+        );
+        let w: u32 = env("PHASM_WAVELET_AB_W", "1920").parse().unwrap();
+        let h: u32 = env("PHASM_WAVELET_AB_H", "1072").parse().unwrap();
+        let f: u32 = env("PHASM_WAVELET_AB_F", "30").parse().unwrap();
+        let Ok(all) = std::fs::read(&path) else {
+            eprintln!("SKIP: {path} not present");
+            return;
+        };
+        let yuv = &all[..(w * h * 3 / 2) as usize * f as usize];
+        let opts = crate::codec::h264::openh264_stego::EncodeOpts { qp: 26, intra_period: f as i32 };
+
+        // The sweep-A prefix, step for step (gop_provisional_step).
+        let t_recompute = std::time::Instant::now();
+        let bs = crate::codec::h264::openh264_stego::clean_encode_gop(yuv, w, h, f, opts).unwrap();
+        let walk = walk_annex_b_for_cover_with_options(
+            &bs,
+            WalkOptions { record_mvd: true, ..Default::default() },
+        )
+        .unwrap();
+        let t_encode_walk = t_recompute.elapsed();
+        let t_costs0 = std::time::Instant::now();
+        let mut costs = compute_content_costs_yuv(yuv, w, h, f, &walk.cover, 26).unwrap();
+        let safe_msb = analyze_safe_mvd_subset(&walk.mvd_meta, walk.mb_w, walk.mb_h);
+        let safe_msl = derive_msl_safe_from_msb(
+            &walk.cover.mvd_sign_bypass.positions, &safe_msb, &walk.cover.mvd_suffix_lsb.positions,
+        );
+        for (i, c) in costs.mvd_suffix_lsb.iter_mut().enumerate() {
+            if !safe_msl.get(i).copied().unwrap_or(false) {
+                *c = f32::INFINITY;
+            }
+        }
+        let t_costs = t_costs0.elapsed();
+        let prefix = ShadowGopPrefix { cover: walk.cover, costs };
+
+        let n_pos: [usize; 4] = [
+            prefix.cover.coeff_sign_bypass.len(), prefix.cover.coeff_suffix_lsb.len(),
+            prefix.cover.mvd_sign_bypass.len(), prefix.cover.mvd_suffix_lsb.len(),
+        ];
+        let all_costs: Vec<f32> = prefix.costs.coeff_sign_bypass.iter()
+            .chain(&prefix.costs.coeff_suffix_lsb).chain(&prefix.costs.mvd_sign_bypass)
+            .chain(&prefix.costs.mvd_suffix_lsb).copied().collect();
+        let n_inf = all_costs.iter().filter(|c| c.is_infinite()).count();
+        let flat = prefix.flat_pack();
+
+        let brotli = |data: &[u8], q: u32| -> (Vec<u8>, f64) {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            {
+                let mut c = brotli::CompressorWriter::new(&mut out, 1 << 16, q, 22);
+                c.write_all(data).unwrap();
+            }
+            (out, t.elapsed().as_secs_f64() * 1e3)
+        };
+        let unbrotli = |data: &[u8]| -> (Vec<u8>, f64) {
+            let t = std::time::Instant::now();
+            let mut out = Vec::new();
+            brotli::Decompressor::new(data, 1 << 16).read_to_end(&mut out).unwrap();
+            (out, t.elapsed().as_secs_f64() * 1e3)
+        };
+
+        // Structure-aware lossless transform: per domain, bits | Δ-coded
+        // position keys (zigzag varint) | magnitudes | cost ∞-bitmap | finite
+        // cost bit patterns. Decoded back below and compared.
+        fn varint(out: &mut Vec<u8>, mut v: u64) {
+            while v >= 0x80 {
+                out.push((v as u8) | 0x80);
+                v >>= 7;
+            }
+            out.push(v as u8);
+        }
+        let transform = |p: &ShadowGopPrefix| -> Vec<u8> {
+            let mut out = Vec::new();
+            for (d, c) in [
+                (&p.cover.coeff_sign_bypass, &p.costs.coeff_sign_bypass),
+                (&p.cover.coeff_suffix_lsb, &p.costs.coeff_suffix_lsb),
+                (&p.cover.mvd_sign_bypass, &p.costs.mvd_sign_bypass),
+                (&p.cover.mvd_suffix_lsb, &p.costs.mvd_suffix_lsb),
+            ] {
+                varint(&mut out, d.len() as u64);
+                out.extend_from_slice(&d.bits);
+                let mut prev = 0u64;
+                for k in &d.positions {
+                    let delta = k.raw().wrapping_sub(prev) as i64;
+                    varint(&mut out, ((delta << 1) ^ (delta >> 63)) as u64);
+                    prev = k.raw();
+                }
+                for m in &d.magnitudes {
+                    varint(&mut out, *m as u64);
+                }
+                let mut bitmap = vec![0u8; c.len().div_ceil(8)];
+                for (i, v) in c.iter().enumerate() {
+                    if v.is_infinite() {
+                        bitmap[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                out.extend_from_slice(&bitmap);
+                for v in c.iter().filter(|v| !v.is_infinite()) {
+                    out.extend_from_slice(&v.to_bits().to_le_bytes());
+                }
+            }
+            out
+        };
+        let tr = transform(&prefix);
+        let decode = |b: &[u8]| -> ShadowGopPrefix {
+            let mut at = 0usize;
+            fn rd(b: &[u8], at: &mut usize) -> u64 {
+                let (mut v, mut sh) = (0u64, 0);
+                loop {
+                    let x = b[*at];
+                    *at += 1;
+                    v |= ((x & 0x7f) as u64) << sh;
+                    if x < 0x80 {
+                        return v;
+                    }
+                    sh += 7;
+                }
+            }
+            let mut out_d: Vec<crate::codec::h264::stego::inject::DomainBits> = Vec::new();
+            let mut out_c: Vec<Vec<f32>> = Vec::new();
+            for _ in 0..4 {
+                let n = rd(b, &mut at) as usize;
+                let bits = b[at..at + n].to_vec();
+                at += n;
+                let mut prev = 0u64;
+                let mut positions = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let z = rd(b, &mut at);
+                    let delta = ((z >> 1) as i64) ^ -((z & 1) as i64);
+                    prev = prev.wrapping_add(delta as u64);
+                    positions.push(PositionKey::from_raw(prev));
+                }
+                let magnitudes = (0..n).map(|_| rd(b, &mut at) as u16).collect();
+                let bm = &b[at..at + n.div_ceil(8)];
+                at += n.div_ceil(8);
+                let mut costs = Vec::with_capacity(n);
+                for i in 0..n {
+                    if bm[i / 8] >> (i % 8) & 1 == 1 {
+                        costs.push(f32::INFINITY);
+                    } else {
+                        let v = u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+                        at += 4;
+                        costs.push(f32::from_bits(v));
+                    }
+                }
+                out_d.push(crate::codec::h264::stego::inject::DomainBits { bits, positions, magnitudes });
+                out_c.push(costs);
+            }
+            assert_eq!(at, b.len());
+            let mut d = out_d.into_iter();
+            let mut c = out_c.into_iter();
+            ShadowGopPrefix {
+                cover: DomainCover {
+                    coeff_sign_bypass: d.next().unwrap(),
+                    coeff_suffix_lsb: d.next().unwrap(),
+                    mvd_sign_bypass: d.next().unwrap(),
+                    mvd_suffix_lsb: d.next().unwrap(),
+                },
+                costs: DomainCosts {
+                    coeff_sign_bypass: c.next().unwrap(),
+                    coeff_suffix_lsb: c.next().unwrap(),
+                    mvd_sign_bypass: c.next().unwrap(),
+                    mvd_suffix_lsb: c.next().unwrap(),
+                },
+            }
+        };
+        let same = |a: &ShadowGopPrefix, b: &ShadowGopPrefix| a.flat_pack() == b.flat_pack();
+        assert!(same(&decode(&tr), &prefix), "transform must be lossless");
+
+        let mb = |b: usize| b as f64 / 1048576.0;
+        eprintln!(
+            "fixture {path} {w}x{h} f={f}: positions csb {} csl {} msb {} msl {} ({} total, {:.1}% ∞-cost)",
+            n_pos[0], n_pos[1], n_pos[2], n_pos[3], all_costs.len(),
+            100.0 * n_inf as f64 / all_costs.len().max(1) as f64
+        );
+        eprintln!(
+            "recompute (this host): clean encode+walk {:.0} ms, costs+safe-MSL {:.0} ms",
+            t_encode_walk.as_secs_f64() * 1e3, t_costs.as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "FOOT cached_size {:.2} MB | flat_pack {:.2} MB (costs alone {:.2} MB)",
+            mb(prefix.cached_size()), mb(flat.len()), mb(all_costs.len() * 4)
+        );
+        for (label, data) in [("flat", &flat), ("transform", &tr)] {
+            for q in [1u32, 5, 9] {
+                let (z, t_c) = brotli(data, q);
+                let (back, t_d) = unbrotli(&z);
+                assert_eq!(&back, data, "brotli round trip");
+                eprintln!(
+                    "FOOT {label:<9} + brotli q{q}: {:.2} MB ({:.1}% of flat)  pack {t_c:.0} ms  unpack {t_d:.0} ms",
+                    mb(z.len()), 100.0 * z.len() as f64 / flat.len() as f64
+                );
+            }
+        }
+        eprintln!("FOOT transform raw: {:.2} MB", mb(tr.len()));
     }
 
     /// Textured region should have LOWER cost than smooth region.

@@ -30,15 +30,19 @@
 //!   (decoupled from `slot.value` so MC + median predictor see the
 //!   encoder's natural MV — no cascade).
 //!
-//! **MvdSuffixLsb is NOT injectable** (magnitude-LSB flip changes
-//! |MVD| → cascades through the median MV predictor). Pass 1 logs
-//! MvdSuffixLsb positions in the cover but Pass 3 never overrides
-//! them in the bitstream. Stamping shadow bits at MvdSuffixLsb
-//! positions would put non-injectable slots in the shadow's RS frame
-//! — the decoder reads the natural value, not the shadow bit, so
-//! ~50% of those slots become noise → RS exhausts every parity tier.
-//! That is why `priority_slots_all4` is restricted to the 3
-//! injectable domains.
+//! **MvdSuffixLsb is injectable only where cascade-safe.** A magnitude-LSB
+//! flip changes |MVD|, which cascades through the median MV predictor, so
+//! an arbitrary MSL position is NOT injectable: a shadow bit stamped there
+//! would never reach the bitstream, the decoder would read the natural
+//! value, and ~50% of such slots would be noise in the RS frame. Phase
+//! 6E-A5(d) proved a subset safe — `cascade_safety::derive_msl_safe_from_msb`
+//! — and only that subset is eligible: [`for_each_eligible_position`] takes
+//! it as `safe_msl`, sweep A selects with the same mask it hands sweep B,
+//! and sweep B overrides MSL only inside it, so every selected MSL slot is
+//! actually written. The safe set is invariant under the sign and safe-set
+//! magnitude flips an encode makes, which is what lets the decoder and the
+//! capacity probe re-derive it independently. (Before 6E-A5(d) this domain
+//! was excluded outright; this paragraph used to say so.)
 //!
 //! Selection is by hash priority alone —
 //! `ChaCha20(shadow_perm_seed, position_key)`. No locally-adaptive
@@ -75,6 +79,7 @@ use crate::stego::crypto::{self};
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
+use crate::stego::progress;
 // 2026-05-21 — Video shadow now uses the unified v1/v2 dispatch
 // shadow frame (see `crate::stego::shadow_layer` and the
 // `frame.rs` primary-frame pattern). v1 (46-byte overhead, u16
@@ -219,6 +224,7 @@ pub(crate) fn decode_shadow_from_priority_lsbs(
     let all_rs_bytes = frame::bits_to_bytes(&all_lsbs[..max_rs_bytes * 8]);
 
     for &parity_len in &SHADOW_PARITY_TIERS {
+        progress::check_cancelled()?;
         let k = 255usize.saturating_sub(parity_len);
         // Need ≥4 bytes recovered from first RS block to read the
         // u32 BE plaintext_len prefix. With k<4 the peek can't function;
@@ -253,6 +259,9 @@ pub(crate) fn decode_shadow_from_priority_lsbs(
             if Some(fdl) == peeked {
                 continue;
             }
+            // Up to ~250 RS decodes per tier: the last stretch of a video
+            // decode, all inside one blocking call.
+            progress::check_cancelled()?;
             if let Some(result) = try_single_fdl(&all_rs_bytes, fdl, parity_len, passphrase) {
                 return result;
             }

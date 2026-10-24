@@ -64,7 +64,7 @@ use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from
 use super::stego::shadow::{decode_shadow_from_priority_lsbs, for_each_eligible_position};
 use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
 use crate::stego::stc::hhat::generate_hhat;
-use crate::stego::{crypto, frame, payload};
+use crate::stego::{crypto, frame, payload, progress};
 
 /// STC constraint length — mirrors `openh264_stego::STC_H`. Both
 /// encode and decode sides MUST agree on this value.
@@ -824,6 +824,8 @@ pub(crate) fn consume_gop_roundtrip_safe(
 ) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
     let mut want = payload.len();
     loop {
+        // Each retry re-encodes the GOP; a cancel must stop the shrinking.
+        progress::check_cancelled()?;
         let chunk = &payload[..want];
         // chunk_frame v3.1 §4: GOP 0 carries u32 total_bytes + u32 m_total;
         // GOP ≥ 1 carries u32 m_total + payload_len (#888).
@@ -1200,8 +1202,8 @@ pub struct CapacityProbeResult {
     /// callback; the PRIMARY capacity now uses the per-tier STC-trial
     /// budget below (CAP2.1).
     pub cover_bits: usize,
-    /// #809 — total injectable bits across the 3 shadow domains
-    /// (CoeffSign + CoeffSuffixLsb + MvdSign), summed across GOPs. The
+    /// #809 — total shadow-eligible bits (CoeffSign + CoeffSuffixLsb +
+    /// MvdSign + cascade-safe MvdSuffixLsb), summed across GOPs. The
     /// shadow-capacity formula reads THIS (not `cover_bits`, which is
     /// CoeffSign-only) so the streaming HUD matches the one-shot
     /// `h264_video_capacity` shadow number.
@@ -1260,7 +1262,7 @@ impl CapacityProbeResult {
     /// the raw cover budget minus parity + per-shadow envelope.
     pub fn shadow_max_message_bytes(&self, n_shadows: u32) -> usize {
         // #809 — single source of truth for the collision-limited shadow
-        // formula, shared with the one-shot OH264 path. Uses the 3-domain
+        // formula, shared with the one-shot OH264 path. Uses the shadow-eligible
         // injectable pool (`shadow_pool_bits`), NOT CoeffSign-only
         // (`cover_bits`) — the streaming HUD matches the one-shot number.
         crate::codec::h264::stego::shadow_capacity::shadow_max_message_bytes_from_cover_bits(
@@ -1285,8 +1287,8 @@ pub struct StreamingProbeSession {
     params: EncodeSessionParams,
     inner: ProbeImpl,
     cover_bits: usize,
-    /// #809 — total injectable bits across the 3 shadow domains
-    /// (CoeffSign + CoeffSuffixLsb + MvdSign), accumulated per GOP. This
+    /// #809 — total shadow-eligible bits (CoeffSign + CoeffSuffixLsb +
+    /// MvdSign + cascade-safe MvdSuffixLsb), accumulated per GOP. This
     /// is the shadow-pool basis, distinct from `cover_bits` (CoeffSign-only,
     /// kept for the #475 progress estimate). Unifies the streaming HUD's
     /// shadow number with the one-shot `h264_video_capacity`.
@@ -1877,6 +1879,9 @@ impl StreamingDecodeSession {
         // primary anymore.
         match self.try_primary_decode(&slabs) {
             Ok(result) => Ok(result),
+            // A cancel is not a miss: don't go on to the shadow scope, and
+            // don't report it as a wrong passphrase.
+            Err(StegoError::Cancelled) => Err(StegoError::Cancelled),
             // Per-GOP primary missed under this passphrase → try the whole-video
             // SHADOW scope (bounded: parity tiers × fdl).
             Err(primary_err) => self
@@ -1887,9 +1892,10 @@ impl StreamingDecodeSession {
                 // chunk")`, which the mobile UI mislabels as "video format
                 // isn't supported" (#851). A genuine non-`InvalidVideo`
                 // primary error (e.g. a mid-stream truncation) is preserved.
-                .map_err(|_| match primary_err {
-                    StegoError::InvalidVideo(_) => StegoError::DecryptionFailed,
-                    other => other,
+                .map_err(|shadow_err| match (shadow_err, primary_err) {
+                    (StegoError::Cancelled, _) => StegoError::Cancelled,
+                    (_, StegoError::InvalidVideo(_)) => StegoError::DecryptionFailed,
+                    (_, other) => other,
                 }),
         }
     }
@@ -1908,32 +1914,38 @@ impl StreamingDecodeSession {
         // subsequent GOPs carry only `payload_len`. Stop at
         // `accumulated == total_bytes` and never walk the plain tail (W is
         // implicit, not on the wire — decode cost ∝ W, not n_gops).
+        //
+        // Every GOP is a walk plus an m_total search, the whole decode one
+        // blocking call: check for a cancel per GOP, and after a miss (the
+        // search gives up early when cancelled) before calling it one.
+        progress::check_cancelled()?;
         let cover0 = h264_gop_cover_bits(slabs[0], &self.cost_weights).ok_or_else(|| {
             StegoError::InvalidVideo("decode session: GOP 0 cover walk failed".into())
         })?;
-        let (total_bytes, payload0) =
-            extract_first_chunk_frame_match(&cover0, &hhat_seed, MAX_TOTAL_PAYLOAD_BYTES)
-                .ok_or_else(|| {
-                    StegoError::InvalidVideo(
-                        "decode session: no v3 first chunk found in GOP 0".into(),
-                    )
-                })?;
+        progress::check_cancelled()?;
+        let first = extract_first_chunk_frame_match(&cover0, &hhat_seed, MAX_TOTAL_PAYLOAD_BYTES);
+        progress::check_cancelled()?;
+        let (total_bytes, payload0) = first.ok_or_else(|| {
+            StegoError::InvalidVideo("decode session: no v3 first chunk found in GOP 0".into())
+        })?;
         let total_bytes = total_bytes as usize;
         self.emit_progress(DecodePhase::Walker { frame_idx: 1, total_frames: slabs.len() as u32 });
 
         let mut frame_bytes = payload0;
         let mut gop_idx = 1usize;
         while frame_bytes.len() < total_bytes && gop_idx < slabs.len() {
+            progress::check_cancelled()?;
             let cover = h264_gop_cover_bits(slabs[gop_idx], &self.cost_weights).ok_or_else(|| {
                 StegoError::InvalidVideo(format!("decode session: GOP {gop_idx} cover walk failed"))
             })?;
             let remaining = total_bytes - frame_bytes.len();
-            let payload =
-                extract_chunk_frame_match(&cover, &hhat_seed, remaining).ok_or_else(|| {
-                    StegoError::InvalidVideo(format!(
-                        "decode session: no v3 chunk in stego GOP {gop_idx} (need {remaining} more bytes)"
-                    ))
-                })?;
+            let found = extract_chunk_frame_match(&cover, &hhat_seed, remaining);
+            progress::check_cancelled()?;
+            let payload = found.ok_or_else(|| {
+                StegoError::InvalidVideo(format!(
+                    "decode session: no v3 chunk in stego GOP {gop_idx} (need {remaining} more bytes)"
+                ))
+            })?;
             frame_bytes.extend_from_slice(&payload);
             gop_idx += 1;
             self.emit_progress(DecodePhase::Walker {
@@ -2010,6 +2022,7 @@ impl StreamingDecodeSession {
         let mut frames_so_far: u32 = 0;
 
         for slab in split_annex_b_into_gops(&self.accumulator) {
+            progress::check_cancelled()?;
             let walk = walk_annex_b_for_cover_with_options(
                 slab,
                 WalkOptions { record_mvd: true, ..Default::default() },
@@ -2053,6 +2066,7 @@ impl StreamingDecodeSession {
 
         // priority_slots' total order: stable sort by priority with domain-grouped
         // insertion ⇒ (priority, domain_rank, intra_index) ascending.
+        progress::check_cancelled()?;
         slots.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         let all_lsbs: Vec<u8> = slots.iter().map(|s| s.3).collect();
 
@@ -2136,6 +2150,10 @@ fn h264_gop_cover_bits(slab: &[u8], weights: &CostWeights) -> Option<Vec<u8>> {
 /// LEN_SENTINEL-bypass and collapses the false-positive survivors to a single
 /// full STC extract per slab. See
 /// docs/design/video/h264/chunk-frame-v3.1-decode.md (#888).
+/// How many m_total candidates the chunk-frame searches try between cancel
+/// checks (each is an hhat build plus an 80- or 48-bit prefix extract).
+const CANCEL_CHECK_EVERY: usize = 256;
+
 fn extract_first_chunk_frame_match(
     cover_bits: &[u8],
     hhat_seed: &[u8; 32],
@@ -2151,6 +2169,11 @@ fn extract_first_chunk_frame_match(
     let mut m_total = min_m;
     while m_total <= n_cover {
         tries += 1;
+        // A miss walks every m_total up to n_cover — seconds on a long GOP.
+        // The caller tells a cancel from a miss.
+        if tries % CANCEL_CHECK_EVERY == 0 && progress::is_cancelled() {
+            return None;
+        }
         let w = n_cover / m_total;
         if w == 0 {
             break;
@@ -2214,7 +2237,12 @@ fn extract_chunk_frame_match(
         return None;
     }
     let mut m_total = min_m;
+    let mut tries = 0usize;
     while m_total <= n_cover {
+        tries += 1;
+        if tries % CANCEL_CHECK_EVERY == 0 && progress::is_cancelled() {
+            return None;
+        }
         let w = n_cover / m_total;
         if w == 0 {
             break;

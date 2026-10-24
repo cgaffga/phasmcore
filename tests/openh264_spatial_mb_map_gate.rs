@@ -44,20 +44,11 @@
 mod common;
 use common::oh264_stream;
 
+// Session guard, ffprobe dims and the cached scale-to-I420 are shared in
+// `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, probe_baseline_dims, session_guard, ScaleRecipe};
 use phasm_core::codec::h264::openh264::Encoder;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
-}
-
-fn corpus_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
 
 fn script_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -75,51 +66,14 @@ struct Fixture {
     intra_period: i32,
 }
 
-/// Same dim-rule as `regen_openh264_baseline.sh` — longest side =
-/// 1920, both axes 16-aligned. Matches the marginal-gate baseline.
-fn probe_baseline_dims(spec: &Fixture) -> (u32, u32) {
-    let src = corpus_root().join(spec.source_mp4);
-    assert!(src.exists(), "corpus fixture missing: {}", src.display());
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height",
-               "-of", "csv=p=0"])
-        .arg(&src)
-        .output()
-        .expect("ffprobe");
-    let s = String::from_utf8_lossy(&out.stdout);
-    let parts: Vec<&str> = s.trim().split(',').collect();
-    let iw: u32 = parts[0].parse().expect("source width");
-    let ih: u32 = parts[1].parse().expect("source height");
-    if iw >= ih {
-        (1920, ((1920 * ih) / iw / 16) * 16)
-    } else {
-        (((1920 * iw) / ih / 16) * 16, 1920)
-    }
-}
-
+/// Scale to the clean-baseline dims (`probe_baseline_dims`, the
+/// `regen_openh264_baseline.sh` rule) with that script's ffmpeg recipe. The
+/// cache is keyed on `spec.name`, not the script's tag.
 fn ensure_yuv(spec: &Fixture, w: u32, h: u32) -> Vec<u8> {
-    let yuv_path = format!(
-        "{}/openh264_baseline_{}_{}x{}_f{}.yuv", common::scratch_dir(),
-        spec.name, w, h, spec.n_frames
-    );
-    let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * spec.n_frames as usize;
-    if let Ok(data) = std::fs::read(&yuv_path) {
-        if data.len() >= need { return data; }
-    }
-    let src = corpus_root().join(spec.source_mp4);
-    let vf = format!("scale={w}:{h},format=yuv420p");
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &spec.n_frames.to_string(),
-               "-vf", &vf, "-f", "rawvideo"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {}", spec.source_mp4);
-    std::fs::read(&yuv_path).expect("read yuv")
+    ensure_scaled_yuv(
+        spec.source_mp4, "openh264_baseline", spec.name,
+        w, h, spec.n_frames, ScaleRecipe::FormatFilter,
+    )
 }
 
 /// Encode a YUV frame stream via the low-level `Encoder` API with no
@@ -150,8 +104,8 @@ fn encode_clean(yuv: &[u8], w: u32, h: u32, n_frames: u32, qp: i32, gop_size: i3
 
 /// Run `scripts/h264_mb_grid.py` on an Annex-B file → grid text.
 fn extract_mb_grid(annex_b: &[u8], tag: &str) -> String {
-    let h264_path = std::env::temp_dir().join(format!("oh264_spatial_{tag}.h264"));
-    let grid_path = std::env::temp_dir().join(format!("oh264_spatial_{tag}.grid.txt"));
+    let h264_path = common::scratch_path(&format!("oh264_spatial_{tag}.h264"));
+    let grid_path = common::scratch_path(&format!("oh264_spatial_{tag}.grid.txt"));
     std::fs::write(&h264_path, annex_b).expect("write annex-b");
     let status = std::process::Command::new("python3")
         .arg(script_path())
@@ -189,7 +143,7 @@ fn parse_grid(text: &str) -> Vec<Vec<String>> {
 fn run_spatial_gate(spec: &Fixture) {
     let _g = session_guard().lock().unwrap_or_else(|e| e.into_inner());
 
-    let (w, h) = probe_baseline_dims(spec);
+    let (w, h) = probe_baseline_dims(spec.source_mp4);
     let yuv = ensure_yuv(spec, w, h);
 
     // Stego encode (production 4-domain streaming session). Single GOP:

@@ -145,9 +145,13 @@ unsafe fn butterfly_chunk_4_neon(
     use core::arch::aarch64::*;
 
     // Pointer to start + k (u values, 4 Complex32 = 8 f32 = 2 × f32x4).
-    let u_ptr = data.as_mut_ptr().add(start + k) as *const f32;
+    // One base pointer for every access: each `data.as_mut_ptr()` call
+    // reborrows `data` mutably and invalidates the pointers taken
+    // before it (UB under Rust's aliasing rules; Miri flags it).
+    let base = data.as_mut_ptr();
+    let u_ptr = base.add(start + k) as *const f32;
     // Pointer to start + k + half (b values).
-    let b_ptr = data.as_mut_ptr().add(start + k + half) as *const f32;
+    let b_ptr = base.add(start + k + half) as *const f32;
     // Pointer to twiddles[0..4].
     let w_ptr = twiddles.as_ptr() as *const f32;
 
@@ -190,8 +194,8 @@ unsafe fn butterfly_chunk_4_neon(
     let new_b_lo = vzip1q_f32(new_b_re, new_b_im);
     let new_b_hi = vzip2q_f32(new_b_re, new_b_im);
 
-    let u_out = data.as_mut_ptr().add(start + k) as *mut f32;
-    let b_out = data.as_mut_ptr().add(start + k + half) as *mut f32;
+    let u_out = base.add(start + k) as *mut f32;
+    let b_out = base.add(start + k + half) as *mut f32;
     vst1q_f32(u_out, new_u_lo);
     vst1q_f32(u_out.add(4), new_u_hi);
     vst1q_f32(b_out, new_b_lo);
@@ -211,8 +215,12 @@ unsafe fn butterfly_chunk_4_sse(
 ) {
     use core::arch::x86_64::*;
 
-    let u_ptr = data.as_mut_ptr().add(start + k) as *const f32;
-    let b_ptr = data.as_mut_ptr().add(start + k + half) as *const f32;
+    // One base pointer for every access: each `data.as_mut_ptr()` call
+    // reborrows `data` mutably and invalidates the pointers taken
+    // before it (UB under Rust's aliasing rules; Miri flags it).
+    let base = data.as_mut_ptr();
+    let u_ptr = base.add(start + k) as *const f32;
+    let b_ptr = base.add(start + k + half) as *const f32;
     let w_ptr = twiddles.as_ptr() as *const f32;
 
     let u_lo = _mm_loadu_ps(u_ptr);
@@ -255,8 +263,8 @@ unsafe fn butterfly_chunk_4_sse(
     let new_b_lo = _mm_unpacklo_ps(new_b_re, new_b_im);
     let new_b_hi = _mm_unpackhi_ps(new_b_re, new_b_im);
 
-    let u_out = data.as_mut_ptr().add(start + k) as *mut f32;
-    let b_out = data.as_mut_ptr().add(start + k + half) as *mut f32;
+    let u_out = base.add(start + k) as *mut f32;
+    let b_out = base.add(start + k + half) as *mut f32;
     _mm_storeu_ps(u_out, new_u_lo);
     _mm_storeu_ps(u_out.add(4), new_u_hi);
     _mm_storeu_ps(b_out, new_b_lo);
@@ -276,8 +284,12 @@ unsafe fn butterfly_chunk_4_wasm(
 ) {
     use core::arch::wasm32::*;
 
-    let u_ptr = data.as_mut_ptr().add(start + k) as *mut v128;
-    let b_ptr = data.as_mut_ptr().add(start + k + half) as *mut v128;
+    // One base pointer for every access: each `data.as_mut_ptr()` call
+    // reborrows `data` mutably and invalidates the pointers taken
+    // before it (UB under Rust's aliasing rules; Miri flags it).
+    let base = data.as_mut_ptr();
+    let u_ptr = base.add(start + k) as *mut v128;
+    let b_ptr = base.add(start + k + half) as *mut v128;
     let w_ptr = twiddles.as_ptr() as *const v128;
 
     let u_lo = v128_load(u_ptr);

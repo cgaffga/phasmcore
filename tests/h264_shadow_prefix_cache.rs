@@ -113,7 +113,7 @@ fn encode_with(budget_env: Option<(&str, &str)>) -> Vec<u8> {
 
     let weights = CostWeights::default();
     h264_encode_with_shadows_streaming(
-        &mut src, W, H, N, opts, "primary message", &[], "primary-pass", &shadows, &weights, None,
+        &mut src, W, H, N, opts, "primary message", &[], "primary-pass", &shadows, &weights, None, None,
     )
     .expect("shadow encode")
 }

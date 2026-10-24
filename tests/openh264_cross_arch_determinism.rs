@@ -140,6 +140,7 @@ fn cross_arch_determinism_record_hash() {
     //   - 2026-05-23 post-V0.4.C:  c3a4d284e1b51741d0301ce469ffd9d0a886cae3885e1066c1f3049b555897b5 (47119 bytes, PRO_HIGH, set1=0)
     //   - 2026-06 Phase 6 (cf v2): 597e1db6e403e98454a9218bae3c8dc4178581c0302677668cb1a94dd618236d (47128 bytes, 4-domain streaming, chunk_frame v2)
     //   - 2026-06-11 (cf v3, #839): 54c11576e2dd28607e84a20303388aeef8c4d46b141b021168d3d864c6aea911 (47128 bytes, chunk_frame v3)
+    //   - 2026-10-18 (cf v3.1, #888): f20434ed2845e63caee017d107836d3cdf770289a54a6e4cc602d51fc7f7a1ca (47128 bytes, chunk_frame v3.1)
     //
     // If this assert ever fires:
     //   1. Print both hashes so the diff is captured in the log.
@@ -149,6 +150,18 @@ fn cross_arch_determinism_record_hash() {
     //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
+    // Re-baselined 2026-10-23 for the MVD cost model (c8b0ea18, 2026-10-20).
+    // That commit re-priced MVD flips by the damage they cause instead of
+    // 1/texture — a deliberate change to which positions the STC picks, so
+    // to the embedded bits — and never re-pinned; the gate sat red for three
+    // days. Bisected by the perf-backlog work: c8b0ea18~1 still produces the
+    // previous pin f20434ed…, c8b0ea18 produces ebdc000e…. Verified NOT
+    // non-determinism before re-pinning: two consecutive release runs on
+    // macOS aarch64 both produced ebdc000e… (47128 B, length unchanged), and
+    // the byte-identical perf changes merged since (28f46480) leave it there.
+    // Pinned from macOS aarch64 only; the Linux x86_64 + aarch64 confirmation
+    // is owed for this pin as for the two before it.
+    //
     // Re-baselined 2026-10-18 for chunk_frame WIRE FORMAT v3.1 (#888). Exactly
     // the same class of staleness as the v2→v3 case below: #888 added an
     // explicit `m_total: u32` to every chunk header (and `1be08ce5` deleted v3
@@ -169,7 +182,7 @@ fn cross_arch_determinism_record_hash() {
     // workflow_dispatch re-pin protocol documented above — that confirmation is
     // owed for BOTH this pin and the v3 one it replaces.
     const PINNED_SHA256: &str =
-        "f20434ed2845e63caee017d107836d3cdf770289a54a6e4cc602d51fc7f7a1ca";
+        "ebdc000e4966518842c84dda4527d90a2d005827ec1d0ba7d1d18ec5b2e0e9a0";
     const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,

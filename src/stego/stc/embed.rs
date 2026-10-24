@@ -646,6 +646,156 @@ pub fn stc_embed(
     }
 }
 
+/// `stc_embed(cover_bits, costs, message, hhat_matrix, h, w).is_some()`,
+/// computed without building the plan.
+///
+/// ## Why this is exact
+///
+/// `stc_embed` reports infeasible on exactly one data condition — the
+/// trellis's best terminal cost is `+∞` (both the inline and the segmented
+/// path: `best_cost == inf`). In the Viterbi recursion a state's cost is
+/// finite iff some path of all-finite-cost choices reaches it:
+///
+/// * `curr[s] = min(prev[s] + c₀, prev[s ^ col] + c₁)` is finite iff either
+///   operand is, and a sum of finite non-negative-or-negative f64 terms
+///   cannot overflow here (each term is an f32 widened to f64, ≤ 3.4e38, over
+///   at most 2³² positions — nowhere near f64::MAX);
+/// * the message-bit filter keeps finite states `s` with `s & 1 == bit` as
+///   state `s >> 1`.
+///
+/// So the set of finite states evolves as a 2ʰ-bit set `R` — with `x` the
+/// cover bit and `c` the flip cost at a position: `c` finite ⇒
+/// `R ∪ (R ⊕ col)`; `c = +∞`, `x = 0` ⇒ `R`; `c = +∞`, `x = 1` ⇒ `R ⊕ col`;
+/// message boundary ⇒ keep the bits with the required parity, halve the
+/// index. Feasible ⇔ `R ≠ ∅` at the end. That is the same predicate the f64
+/// trellis evaluates, as integer set operations: ~10× less work per
+/// position and no `n × 16 B` back-pointer table (16 MB at 1 M positions).
+///
+/// Cost magnitudes never enter it, which is the whole point for callers that
+/// only ask "does this payload fit?" (the H.264 capacity probe's bisection,
+/// `openh264_stego::cap2_stc_trial_max_payload`, ~25 full trellises per GOP).
+///
+/// Inputs outside that argument — a `NaN` or `-∞` cost — fall back to
+/// `stc_embed` itself, so the equality holds for every input.
+///
+/// **Cancellation and progress** follow the inline path's schedule: every
+/// `max(n / STC_PROGRESS_STEPS, 1)` positions it checks
+/// [`progress::is_cancelled`] (cancelled ⇒ `false`, as `stc_embed` returns
+/// `None`) and calls [`progress::advance`]. The segmented path (n > 1 M)
+/// checks at a different cadence, so under a concurrent cancel the two can
+/// stop at different positions — both still answer "infeasible".
+///
+/// Pinned against `stc_embed(...).is_some()` by
+/// `stc_is_feasible_matches_stc_embed_exhaustively`.
+pub fn stc_is_feasible(
+    cover_bits: &[u8],
+    costs: &[f32],
+    message: &[u8],
+    hhat_matrix: &[Vec<u32>],
+    h: usize,
+    w: usize,
+) -> bool {
+    if w == 0 || h > 7 {
+        return false;
+    }
+    let n = cover_bits.len();
+    let m = message.len();
+    if m == 0 {
+        return true;
+    }
+    if costs.iter().take(n).any(|c| c.is_nan() || *c == f32::NEG_INFINITY) {
+        return stc_embed(cover_bits, costs, message, hhat_matrix, h, w).is_some();
+    }
+    // The segmented path walks only the first m·w positions and rejects a
+    // shorter cover outright (`InMemoryCoverFetch::new` → None).
+    let n_walk = if n > SEGMENTED_THRESHOLD {
+        if n < m * w {
+            return false;
+        }
+        m * w
+    } else {
+        n
+    };
+
+    let columns: Vec<u128> = (0..w)
+        .map(|c| hhat::column_packed(hhat_matrix, c) as u128)
+        .collect();
+    let progress_interval = (n / STC_PROGRESS_STEPS as usize).max(1);
+
+    // Bit s of `reach` ⇔ trellis state s has finite cost.
+    let mut reach: u128 = 1; // state 0, cost 0.0
+    let mut msg_idx = 0usize;
+    for j in 0..n_walk {
+        let col_idx = j % w;
+        let col = columns[col_idx];
+        let finite = costs[j] != f32::INFINITY;
+        reach = if finite {
+            reach | xor_permute_states(reach, col)
+        } else if cover_bits[j] & 1 == 0 {
+            reach
+        } else {
+            xor_permute_states(reach, col)
+        };
+        if col_idx == w - 1 && msg_idx < m {
+            // `stc_embed` compares `s & 1` against the raw message byte, so a
+            // byte other than 0/1 matches no state at all.
+            let bit = message[msg_idx];
+            reach = if bit > 1 { 0 } else { keep_parity_and_halve(reach, bit as u32) };
+            msg_idx += 1;
+            if reach == 0 {
+                // No state survives, and an empty set stays empty (permuting or
+                // unioning ∅ gives ∅), so `stc_embed` would walk on and fail at
+                // the end — same answer, minus the remaining progress ticks.
+                return false;
+            }
+        }
+        if (j + 1) % progress_interval == 0 {
+            if progress::is_cancelled() {
+                return false;
+            }
+            progress::advance();
+        }
+    }
+    reach != 0
+}
+
+/// `{ s ⊕ col : s ∈ R }` for a 128-bit state set: one block swap per set bit
+/// of `col` (bit k swaps every pair of 2ᵏ-sized blocks), so bit `s` lands on
+/// bit `s ^ col`.
+#[inline]
+fn xor_permute_states(mut r: u128, col: u128) -> u128 {
+    const LOW: [u128; 7] = [
+        0x5555_5555_5555_5555_5555_5555_5555_5555,
+        0x3333_3333_3333_3333_3333_3333_3333_3333,
+        0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F,
+        0x00FF_00FF_00FF_00FF_00FF_00FF_00FF_00FF,
+        0x0000_FFFF_0000_FFFF_0000_FFFF_0000_FFFF,
+        0x0000_0000_FFFF_FFFF_0000_0000_FFFF_FFFF,
+        0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF,
+    ];
+    for (k, &low) in LOW.iter().enumerate() {
+        if (col >> k) & 1 == 1 {
+            let sh = 1u32 << k;
+            r = ((r & low) << sh) | ((r >> sh) & low);
+        }
+    }
+    r
+}
+
+/// The message-bit filter: keep states `s` with `s & 1 == bit`, renumbered
+/// `s >> 1` (bit `2t + bit` of `r` → bit `t`).
+#[inline]
+fn keep_parity_and_halve(r: u128, bit: u32) -> u128 {
+    let mut x = (r >> bit) & 0x5555_5555_5555_5555_5555_5555_5555_5555;
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333_3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F_0F0F;
+    x = (x | (x >> 4)) & 0x00FF_00FF_00FF_00FF_00FF_00FF_00FF_00FF;
+    x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF_0000_FFFF_0000_FFFF;
+    x = (x | (x >> 16)) & 0x0000_0000_FFFF_FFFF_0000_0000_FFFF_FFFF;
+    x = (x | (x >> 32)) & 0x0000_0000_0000_0000_FFFF_FFFF_FFFF_FFFF;
+    x
+}
+
 // ---------------------------------------------------------------------------
 // Inline path: single forward pass, stores all back pointers.
 // Best for small/medium images where O(n) memory is acceptable.
@@ -1011,6 +1161,117 @@ mod tests {
     use super::*;
     use super::super::hhat::generate_hhat;
     use super::super::extract::stc_extract;
+
+    fn lcg(s: &mut u64) -> u64 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *s >> 33
+    }
+
+    /// One random trial instance. `wet` is the per-mille ∞-cost probability;
+    /// the high settings are what make infeasible instances common.
+    fn random_instance(
+        s: &mut u64,
+        h: usize,
+        n: usize,
+        m: usize,
+        wet: u64,
+    ) -> (Vec<u8>, Vec<f32>, Vec<u8>, Vec<Vec<u32>>, usize) {
+        let w = (n / m).max(1);
+        let mut seed = [0u8; 32];
+        for b in seed.iter_mut() {
+            *b = lcg(s) as u8;
+        }
+        let hhat = generate_hhat(h, w, &seed);
+        let cover: Vec<u8> = (0..n).map(|_| (lcg(s) & 1) as u8).collect();
+        let costs: Vec<f32> = (0..n)
+            .map(|_| {
+                if lcg(s) % 1000 < wet {
+                    f32::INFINITY
+                } else {
+                    // Mix of magnitudes incl. zero and huge — magnitudes must
+                    // not matter to the answer.
+                    match lcg(s) % 4 {
+                        0 => 0.0,
+                        1 => 1.0,
+                        2 => (lcg(s) % 10_000) as f32 * 0.37,
+                        _ => 3.0e38,
+                    }
+                }
+            })
+            .collect();
+        let msg: Vec<u8> = (0..m).map(|_| (lcg(s) & 1) as u8).collect();
+        (cover, costs, msg, hhat, w)
+    }
+
+    /// `stc_is_feasible` must equal `stc_embed(..).is_some()` on EVERY input:
+    /// it replaces the full trellis in the H.264 capacity probe, whose answers
+    /// feed the per-GOP primary plan and therefore the stego bytes. Covers all
+    /// constraint lengths, exact and ragged `n` vs `m·w` (incl. a cover shorter
+    /// than `m·w`), wet fractions from 0 to 100 % (both outcomes must occur
+    /// often), a non-0/1 message byte, and the NaN fallback.
+    #[test]
+    fn stc_is_feasible_matches_stc_embed_exhaustively() {
+        let mut s = 0xFEA5_1B1E_u64;
+        let (mut yes, mut no) = (0usize, 0usize);
+        for h in 1..=7usize {
+            for &(n, m) in &[(64usize, 8usize), (200, 20), (203, 20), (512, 64), (1000, 37),
+                             (999, 333), (30, 40)] {
+                for &wet in &[0u64, 300, 600, 800, 900, 950, 980, 1000] {
+                    for _ in 0..3 {
+                        let (cover, costs, msg, hhat, w) = random_instance(&mut s, h, n, m, wet);
+                        let want = stc_embed(&cover, &costs, &msg, &hhat, h, w).is_some();
+                        let got = stc_is_feasible(&cover, &costs, &msg, &hhat, h, w);
+                        assert_eq!(got, want, "h={h} n={n} m={m} w={w} wet={wet}");
+                        if want { yes += 1 } else { no += 1 }
+                    }
+                }
+            }
+        }
+        assert!(yes > 200 && no > 200, "both outcomes must be well exercised: {yes} / {no}");
+
+        // Degenerate parameters.
+        let (cover, costs, msg, hhat, _) = random_instance(&mut s, 7, 100, 10, 0);
+        for (hh, ww) in [(7usize, 0usize), (8, 10)] {
+            assert_eq!(
+                stc_is_feasible(&cover, &costs, &msg, &hhat, hh, ww),
+                stc_embed(&cover, &costs, &msg, &hhat, hh, ww).is_some()
+            );
+        }
+        assert_eq!(stc_is_feasible(&cover, &costs, &[], &hhat, 7, 10), true);
+        // Non-0/1 message byte: matches no state in either.
+        let mut bad = msg.clone();
+        bad[3] = 2;
+        assert_eq!(
+            stc_is_feasible(&cover, &costs, &bad, &hhat, 7, 10),
+            stc_embed(&cover, &costs, &bad, &hhat, 7, 10).is_some()
+        );
+        // NaN cost → falls back to the full trellis.
+        let mut nan = costs.clone();
+        nan[5] = f32::NAN;
+        assert_eq!(
+            stc_is_feasible(&cover, &nan, &msg, &hhat, 7, 10),
+            stc_embed(&cover, &nan, &msg, &hhat, 7, 10).is_some()
+        );
+    }
+
+    /// Same equality on the segmented path (n > SEGMENTED_THRESHOLD), which
+    /// walks only the first m·w positions — one feasible and one infeasible
+    /// instance (the wet fraction straddles the capacity boundary).
+    #[test]
+    fn stc_is_feasible_matches_stc_embed_segmented() {
+        let mut s = 0x5E6_7E57_u64;
+        let n = SEGMENTED_THRESHOLD + 4_321;
+        let m = 1_200;
+        let mut seen = [false; 2];
+        for &wet in &[700u64, 1000] {
+            let (cover, costs, msg, hhat, w) = random_instance(&mut s, 7, n, m, wet);
+            assert!(n > SEGMENTED_THRESHOLD && m * w <= n);
+            let want = stc_embed(&cover, &costs, &msg, &hhat, 7, w).is_some();
+            assert_eq!(stc_is_feasible(&cover, &costs, &msg, &hhat, 7, w), want, "wet={wet}");
+            seen[want as usize] = true;
+        }
+        assert!(seen[0] && seen[1], "need one feasible and one infeasible instance: {seen:?}");
+    }
 
     #[test]
     fn embed_extract_roundtrip_tiny() {

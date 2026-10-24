@@ -42,19 +42,10 @@
 mod common;
 use common::oh264_stream;
 
+// Session guard, ffprobe dims and the cached scale-to-I420 are shared in
+// `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, probe_baseline_dims, session_guard, ScaleRecipe};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
-}
-
-fn corpus_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
 
 fn data_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -80,53 +71,15 @@ struct Fixture {
     intra_period: i32,
 }
 
-/// Mirror `regen_openh264_baseline.sh::get_target_dims` — fit longest
-/// side to 1920, round both axes down to 16. The baseline histograms
-/// were generated at these dims; the gate must match.
-fn probe_baseline_dims(spec: &Fixture) -> (u32, u32) {
-    let src = corpus_root().join(spec.source_mp4);
-    assert!(src.exists(), "corpus fixture missing: {}", src.display());
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height",
-               "-of", "csv=p=0"])
-        .arg(&src)
-        .output()
-        .expect("ffprobe");
-    let s = String::from_utf8_lossy(&out.stdout);
-    let parts: Vec<&str> = s.trim().split(',').collect();
-    let iw: u32 = parts[0].parse().expect("source width");
-    let ih: u32 = parts[1].parse().expect("source height");
-    let (tw, th) = if iw >= ih {
-        (1920, ((1920 * ih) / iw / 16) * 16)
-    } else {
-        (((1920 * iw) / ih / 16) * 16, 1920)
-    };
-    (tw, th)
-}
-
+/// Scale to the clean-baseline dims (`probe_baseline_dims`, the
+/// `regen_openh264_baseline.sh` rule) with that script's ffmpeg recipe. Keyed
+/// on `baseline_tag`, so this reads the very YUV the script encoded the
+/// committed baseline histogram from.
 fn ensure_yuv(spec: &Fixture, w: u32, h: u32) -> Vec<u8> {
-    let yuv_path = format!(
-        "{}/openh264_baseline_{}_{}x{}_f{}.yuv", common::scratch_dir(),
-        spec.baseline_tag, w, h, spec.n_frames
-    );
-    let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * spec.n_frames as usize;
-    if let Ok(data) = std::fs::read(&yuv_path) {
-        if data.len() >= need { return data; }
-    }
-    let src = corpus_root().join(spec.source_mp4);
-    let vf = format!("scale={w}:{h},format=yuv420p");
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &spec.n_frames.to_string(),
-               "-vf", &vf, "-f", "rawvideo"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {}", spec.source_mp4);
-    std::fs::read(&yuv_path).expect("read yuv")
+    ensure_scaled_yuv(
+        spec.source_mp4, "openh264_baseline", spec.baseline_tag,
+        w, h, spec.n_frames, ScaleRecipe::FormatFilter,
+    )
 }
 
 // ─────────────────────────── histogram parser ─────────────────────────
@@ -251,7 +204,7 @@ const EPS_INTRA_MIX: f64 = 10.0;
 fn run_gate(spec: &Fixture, msg: &str, pass: &str) {
     let _g = session_guard().lock().unwrap_or_else(|e| e.into_inner());
 
-    let (w, h) = probe_baseline_dims(spec);
+    let (w, h) = probe_baseline_dims(spec.source_mp4);
     let yuv = ensure_yuv(spec, w, h);
 
     let stego = oh264_stream::encode(
@@ -259,8 +212,8 @@ fn run_gate(spec: &Fixture, msg: &str, pass: &str) {
     ).expect("oh264 stego encode");
 
     // Write stego Annex-B + invoke histogram script.
-    let stego_h264 = std::env::temp_dir().join(format!("oh264_stealth_{}.h264", spec.name));
-    let stego_hist_path = std::env::temp_dir().join(format!("oh264_stealth_{}.hist.txt", spec.name));
+    let stego_h264 = common::scratch_path(&format!("oh264_stealth_{}.h264", spec.name));
+    let stego_hist_path = common::scratch_path(&format!("oh264_stealth_{}.hist.txt", spec.name));
     std::fs::write(&stego_h264, &stego).expect("write annex-b");
 
     let status = std::process::Command::new("python3")

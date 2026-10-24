@@ -24,6 +24,12 @@ pub enum CodecChoice {
 /// CLI can show "Cascade tier: High Quality (auto)" before encoding.
 /// Falls back silently if the resolve probe fails (encode will then
 /// resolve internally with the same logic).
+///
+/// `framed_bytes` is the exact framed (encrypted + headered) payload length
+/// from `StreamingEncodeSession::framed_message_len`, which counts `--attach`
+/// files as well as the text. It used to be estimated as `message.len() + 70`,
+/// which ignored attachments and so could announce a tier the real payload
+/// does not get.
 #[cfg(feature = "h264-encoder")]
 fn report_resolved_auto_tier(
     yuv: &[u8],
@@ -31,20 +37,18 @@ fn report_resolved_auto_tier(
     height: u32,
     n_frames: usize,
     gop_size: usize,
-    message_bytes: usize,
+    framed_bytes: usize,
     headroom: f32,
 ) {
     use phasm_core::{h264_resolve_auto_tier, CascadeTier};
     use phasm_core::codec::h264::openh264_stego::EncodeOpts;
     let opts = EncodeOpts { qp: 26, intra_period: gop_size as i32 };
-    // Framed message size ≈ message + ~64 (crypto envelope) + ~4 (chunk).
-    let estimated_framed_bytes = message_bytes.saturating_add(70);
     match h264_resolve_auto_tier(
-        yuv, width, height, n_frames, opts, estimated_framed_bytes, headroom,
+        yuv, width, height, n_frames, opts, framed_bytes, headroom,
     ) {
         Ok(tier) if tier != CascadeTier::Auto => {
-            eprintln!("Cascade tier: {} (auto, payload {} B)",
-                tier.ui_name(), message_bytes);
+            eprintln!("Cascade tier: {} (auto, framed payload {} B)",
+                tier.ui_name(), framed_bytes);
         }
         _ => {}
     }
@@ -445,30 +449,6 @@ fn run_oh264_encode(
             .unwrap_or(26);
         let gop_size: u32 = (cli_gop_size.max(1)) as u32;
 
-        // Report the resolved auto-tier (mirrors the mobile success-
-        // screen "Quality mode: High Quality (auto)" UX). The encoder
-        // resolves the same tier internally; this is purely the
-        // user-facing announcement before the (slower) encode runs.
-        //
-        // **`--verbose` only, because it is not cheap**: `h264_resolve_auto_tier`
-        // runs a full whole-clip OpenH264 encode plus a whole-clip CABAC walk
-        // to produce one line of text whose value nothing consumes. On 1080p ×
-        // 510 frames that measured ~11 s of a ~49 s run — and it was invisible,
-        // falling outside every `phase.*` bucket, which is how it went unnoticed
-        // for months. It is now recorded as its own phase so it can never hide
-        // again.
-        if verbose {
-            let _t_tier = std::time::Instant::now();
-            report_resolved_auto_tier(
-                &yuv_bytes, probe.width, probe.height, probe.n_frames,
-                gop_size as usize, message.len(),
-                phasm_core::CASCADE_DEFAULT_HEADROOM,
-            );
-            phasm_core::codec::h264::profile::record(
-                "phase.auto_tier_report", _t_tier.elapsed(),
-            );
-        }
-
         let params = EncodeSessionParams {
             width: probe.width,
             height: probe.height,
@@ -530,6 +510,40 @@ fn run_oh264_encode(
             params.clone(), message, primary_files, passphrase,
         )?;
         let framed_len = session.framed_message_len();
+
+        // Report the resolved auto-tier (mirrors the mobile success-
+        // screen "Quality mode: High Quality (auto)" UX). The encoder
+        // resolves the same tier internally; this is purely the
+        // user-facing announcement before the (slower) probe + encode run.
+        //
+        // It sits after the session exists because it sizes off the session's
+        // exact framed length, which includes `--attach` files; the earlier
+        // `message.len()` estimate ignored them. Moving it here does not touch
+        // the output: session creation only frames + encrypts the payload, and
+        // the OpenH264 work still runs in the same order (tier report, probe,
+        // encode). Verified with PHASM_DETERMINISTIC_SEED pinned: the stego
+        // file is byte-identical before and after the move.
+        //
+        // **`--verbose` only, because it is not cheap**: `h264_resolve_auto_tier`
+        // runs a full whole-clip OpenH264 encode plus a whole-clip CABAC walk
+        // to produce one line of text whose value nothing consumes. On 1080p ×
+        // 510 frames that measured ~11 s of a ~49 s run — and it was invisible,
+        // falling outside every `phase.*` bucket, which is how it went unnoticed
+        // for months. It is now recorded as its own phase so it can never hide
+        // again.
+        if verbose {
+            if let Some(framed) = framed_len {
+                let _t_tier = std::time::Instant::now();
+                report_resolved_auto_tier(
+                    &yuv_bytes, probe.width, probe.height, probe.n_frames,
+                    gop_size as usize, framed,
+                    phasm_core::CASCADE_DEFAULT_HEADROOM,
+                );
+                phasm_core::codec::h264::profile::record(
+                    "phase.auto_tier_report", _t_tier.elapsed(),
+                );
+            }
+        }
 
         let _t_probe = std::time::Instant::now();
         let per_gop_caps: Vec<usize> = {
@@ -684,6 +698,9 @@ fn run_oh264_shadow_encode(
     use phasm_core::codec::h264::openh264_stego::{
         h264_encode_with_shadows_streaming, EncodeOpts, FileYuvSource,
     };
+    use phasm_core::codec::h264::streaming_session::{
+        ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingProbeSession, YuvFrameRef,
+    };
     use phasm_core::stego::shadow_layer::ShadowLayer as VideoShadowLayer;
     use phasm_core::CostWeights;
 
@@ -752,6 +769,68 @@ fn run_oh264_shadow_encode(
             })
             .collect();
 
+        // ── D2: measure per-GOP capacity so the PRIMARY payload is planned
+        // PROPORTIONALLY, the same way the no-shadow path above plans it.
+        //
+        // Without this the core aims each GOP at an even share of what is
+        // left. Simulated on the measured corpus cap vectors (carry included)
+        // that stops at 39-49% of what `phasm capacity` reports, so a large
+        // primary plus shadows was refused for a size the capacity command
+        // said would fit. See `core/tests/d2_shadow_primary_plan.rs` and
+        // `docs/notes/2026-10-20-video-encode-ux-defects.md` D2.
+        //
+        // One extra forward pass on top of the shadow encode's ~4, read
+        // frame-by-frame off the decoded-YUV temp so RAM stays O(frame). The
+        // no-shadow path narrows its probe with `set_plan_target`; that is NOT
+        // done here on purpose — the target would have to be the SHADOW path's
+        // framed primary length, and guessing it low truncates the cap vector,
+        // which silently drops back to the even split. Measuring every GOP
+        // costs time and cannot be wrong. Narrowing it is a perf follow-on.
+        let _t_probe = std::time::Instant::now();
+        let per_gop_caps: Vec<usize> = {
+            let (fps_num, fps_den) = transcode::parse_frame_rate(&probe.frame_rate);
+            let params = EncodeSessionParams {
+                width: probe.width,
+                height: probe.height,
+                fps_num,
+                fps_den,
+                qp,
+                gop_size: GOP_SIZE,
+                total_frames_hint: n_frames,
+                color: ColorParams::default(),
+                engine: EncodeEngineChoice::Oh264,
+                cost_weights: CostWeights::default(),
+                progress_callback: None,
+            };
+            let mut probe_session = StreamingProbeSession::create(params)?;
+            let y_plane = (probe.width as usize) * (probe.height as usize);
+            let chroma_w = (probe.width as usize) / 2;
+            let chroma_plane = chroma_w * ((probe.height as usize) / 2);
+            let mut buf = vec![0u8; frame_size];
+            let mut reader = std::io::BufReader::new(std::fs::File::open(&yuv_temp)?);
+            for _ in 0..n_frames {
+                std::io::Read::read_exact(&mut reader, &mut buf)?;
+                let (y, rest) = buf.split_at(y_plane);
+                let (u, v) = rest.split_at(chroma_plane);
+                probe_session.push_frame(YuvFrameRef {
+                    y,
+                    y_stride: probe.width as usize,
+                    u,
+                    u_stride: chroma_w,
+                    v: &v[..chroma_plane],
+                    v_stride: chroma_w,
+                })?;
+            }
+            let (_probe_result, caps) = probe_session.finish_with_per_gop()?;
+            eprintln!(
+                "  probe: {} GOPs, Sigma {} B primary capacity",
+                caps.len(),
+                caps.iter().sum::<usize>(),
+            );
+            caps
+        };
+        phasm_core::codec::h264::profile::record("phase.probe_pass", _t_probe.elapsed());
+
         let mut source =
             FileYuvSource::open(&yuv_temp, probe.width, probe.height, n_frames, GOP_SIZE)?;
         // WV.6.g.progress — throttled determinate progress line. The streaming
@@ -770,6 +849,7 @@ fn run_oh264_shadow_encode(
         let annex_b = h264_encode_with_shadows_streaming(
             &mut source, probe.width, probe.height, n_frames, opts,
             message, primary_files, passphrase, &video_shadows, &weights,
+            Some(&per_gop_caps),
             Some(&mut progress_cb),
         )?;
         phasm_core::codec::h264::profile::record("phase.shadow_encode_total", _t_enc.elapsed());

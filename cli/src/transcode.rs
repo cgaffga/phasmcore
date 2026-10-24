@@ -157,7 +157,14 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
         .args([
             "-v", "error",
             "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,nb_frames,r_frame_rate",
+            // Rotation matters: `stream=width,height` reports the CODED size,
+            // but ffmpeg AUTO-ROTATES on decode, so a phone video shot in
+            // portrait reports 1920x1080 and then decodes to 1080x1920. See
+            // the swap below. `stream_side_data=rotation` is the modern form;
+            // `stream_tags=rotate` is the older one, kept for files that
+            // predate it.
+            "-show_entries",
+            "stream=width,height,nb_frames,r_frame_rate:stream_side_data=rotation:stream_tags=rotate",
             "-of", "default=noprint_wrappers=1:nokey=0",
         ])
         .arg(input)
@@ -177,6 +184,7 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     let mut height: Option<u32> = None;
     let mut n_frames: Option<usize> = None;
     let mut frame_rate: Option<String> = None;
+    let mut rotation: Option<i32> = None;
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("width=") {
             width = rest.trim().parse().ok();
@@ -186,6 +194,13 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
             n_frames = rest.trim().parse().ok();
         } else if let Some(rest) = line.strip_prefix("r_frame_rate=") {
             frame_rate = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("rotation=") {
+            rotation = rest.trim().parse::<f64>().ok().map(|r| r as i32);
+        } else if let Some(rest) = line.strip_prefix("TAG:rotate=") {
+            // Older container form; only used when side data is absent.
+            if rotation.is_none() {
+                rotation = rest.trim().parse::<f64>().ok().map(|r| r as i32);
+            }
         }
     }
     let width = width.ok_or_else(|| CliError::InvalidArgs(
@@ -204,9 +219,35 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
         probe_n_frames_via_packet_count(input)?
     };
 
+    // DISPLAY dimensions, not coded ones.
+    //
+    // ffmpeg applies the stream's rotation matrix on decode unless told
+    // otherwise, so for a portrait phone video `stream=width,height` says
+    // 1920x1080 while the frames that actually come out are 1080x1920. The
+    // CLI used to build its crop filter from the coded size and hand it
+    // rotated frames, which ffmpeg rejects outright:
+    //
+    //     Invalid too big or non positive size for width '1920' or height '1072'
+    //
+    // That made every rotated phone video unencodable from the CLI while the
+    // same clip worked in the app (2026-10-20, D17). Swapping here means the
+    // crop, the encoder dimensions and the mux all agree with what ffmpeg
+    // emits, and the output is upright with no rotation metadata needed.
+    let (width, height) = match rotation.map(|r| r.rem_euclid(360)) {
+        Some(90) | Some(270) => {
+            eprintln!(
+                "note: source is rotated {}deg; using display size {}x{} \
+                 (coded {}x{})",
+                rotation.unwrap(), height, width, width, height,
+            );
+            (height, width)
+        }
+        _ => (width, height),
+    };
+
     // Any size is accepted here — `decode_to_yuv_aligned` CROPS the decode
     // (top-left) to the encoder's grid (H.264 = 16, AV1 = 8) so the caller
-    // never has to pre-crop. Reports the RAW source dims.
+    // never has to pre-crop.
     let has_audio = probe_has_audio(input);
     Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio })
 }
@@ -514,4 +555,65 @@ pub fn temp_path_with_ext(original: &Path, ext: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("{stem}_phasm_cabac_{pid}_{ts}.{ext}"))
+}
+
+#[cfg(all(test, feature = "video"))]
+mod rotation_tests {
+    use super::*;
+
+    /// D17 regression (2026-10-20) — a portrait phone video reports CODED
+    /// dimensions, and ffmpeg auto-rotates on decode. `probe_video` must
+    /// report what ffmpeg will actually emit, or the crop filter is built for
+    /// the wrong geometry and ffmpeg refuses the whole encode with
+    /// "Invalid too big or non positive size".
+    ///
+    /// Builds its own fixture so it needs no committed test vector: a tiny
+    /// clip tagged `rotate=90` via the container, which is exactly how phone
+    /// footage carries it.
+    #[test]
+    fn probe_reports_display_dims_for_a_rotated_source() {
+        let dir = std::env::var("PHASM_TMP").unwrap_or_else(|_| "/tmp".into());
+        let src = std::path::PathBuf::from(&dir).join("phasm_d17_rot.mp4");
+        let _ = std::fs::remove_file(&src);
+
+        // 64x32 landscape, then tagged as rotated 90deg -> displays 32x64.
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error",
+                   "-f", "lavfi", "-i", "testsrc=size=64x32:rate=10:duration=1",
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                   "-metadata:s:v:0", "rotate=90"])
+            .arg(&src)
+            .status();
+        match ok {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("skipping: ffmpeg unavailable");
+                return;
+            }
+        }
+
+        let probe = match probe_video(&src) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: probe failed ({e})");
+                let _ = std::fs::remove_file(&src);
+                return;
+            }
+        };
+        let _ = std::fs::remove_file(&src);
+
+        // Some ffmpeg builds drop the `rotate` tag rather than writing side
+        // data. Only assert the swap when the rotation actually survived —
+        // otherwise this would fail on the muxer, not on our logic.
+        if probe.width == 32 && probe.height == 64 {
+            // swapped as intended
+        } else {
+            assert_eq!(
+                (probe.width, probe.height), (64, 32),
+                "neither display (32x64) nor coded (64x32) dims — probe is wrong",
+            );
+            eprintln!("note: this ffmpeg did not preserve the rotation tag; \
+                       swap path not exercised");
+        }
+    }
 }

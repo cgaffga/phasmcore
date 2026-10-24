@@ -31,6 +31,8 @@
 
 #![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -164,12 +166,12 @@ fn build_ivf_single_frame(obus: &[u8], width: u16, height: u16) -> Vec<u8> {
 }
 
 fn mux_ivf_to_mp4(av1_bytes: &[u8], spec: &Fixture) -> PathBuf {
-    let ivf_path = std::env::temp_dir().join(format!(
+    let ivf_path = PathBuf::from(common::scratch_dir()).join(format!(
         "tg3_{}_{}.ivf",
         spec.name,
         std::process::id()
     ));
-    let mp4_path = std::env::temp_dir().join(format!(
+    let mp4_path = PathBuf::from(common::scratch_dir()).join(format!(
         "tg3_{}_{}.mp4",
         spec.name,
         std::process::id()

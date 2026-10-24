@@ -342,6 +342,9 @@ pub struct AudioPassthrough<'a> {
     trak_raw: Vec<u8>,
     /// Source's media-timescale duration in `mdhd.time_scale` units.
     duration_media: u64,
+    /// The source file's `mvhd.time_scale`: the unit of `tkhd.duration` and
+    /// the edit list inside `trak_raw` (see `audio_iso`).
+    source_movie_timescale: u32,
     /// Audio sample-table chunk layout from the source. Each entry is
     /// `(first_sample_index_0based, samples_in_chunk)`.
     chunks: Vec<(usize, usize)>,
@@ -388,6 +391,8 @@ impl<'a> AudioPassthrough<'a> {
             samples,
             trak_raw: track.trak_raw.clone(),
             duration_media: track.duration,
+            source_movie_timescale: super::audio_iso::movie_timescale(source_mp4)
+                .unwrap_or(handbrake::MVHD_TIMESCALE),
             chunks,
         }))
     }
@@ -585,7 +590,11 @@ fn build_handbrake_x264(
     // stco/co64 in-place inside its trak_raw clone. tkhd.track_id is
     // also rewritten to 2 (video has 1).
     let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
-        let mut trak = a.trak_raw.clone();
+        let mut trak = super::audio_iso::passthrough_audio_trak(
+            &a.trak_raw,
+            a.source_movie_timescale,
+            handbrake::MVHD_TIMESCALE,
+        );
         let chunk_offsets: Vec<u64> = a
             .chunks
             .iter()
@@ -1248,7 +1257,11 @@ fn build_mp4_av1_inner(
     // Same mechanism the §Stealth.L4.5 H.264 audio passthrough uses
     // (see `build_handbrake_x264`).
     let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
-        let mut trak = a.trak_raw.clone();
+        let mut trak = super::audio_iso::passthrough_audio_trak(
+            &a.trak_raw,
+            a.source_movie_timescale,
+            handbrake::MVHD_TIMESCALE,
+        );
         let chunk_offsets: Vec<u64> = a
             .chunks
             .iter()

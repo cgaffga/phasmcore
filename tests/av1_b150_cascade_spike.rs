@@ -27,6 +27,8 @@
 
 #![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -183,7 +185,7 @@ fn build_ivf_single_frame(obus: &[u8], width: u16, height: u16) -> Vec<u8> {
 
 fn decode_av1_to_yuv(av1_bytes: &[u8], width: u32, height: u32, label: &str) -> Vec<u8> {
     let ivf = build_ivf_single_frame(av1_bytes, width as u16, height as u16);
-    let ivf_path = std::env::temp_dir().join(format!(
+    let ivf_path = PathBuf::from(common::scratch_dir()).join(format!(
         "b150_decode_{}_{}.ivf",
         label,
         std::process::id()

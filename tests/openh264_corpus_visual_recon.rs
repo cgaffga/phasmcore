@@ -9,7 +9,7 @@
 // empirical safety scan — C.8.3-11 cascade-break makes structural what
 // b10's scan validates empirically):
 //
-//   1. Load real iPhone/Artlist YUV (cached at /tmp via ffmpeg scale).
+//   1. Load real iPhone/Artlist YUV (cached under `$PHASM_TMP` via ffmpeg scale).
 //   2. Baseline encode + walk → canonical PositionKey + cover bits.
 //   3. STC plan over baseline_bits[0..STC_N].
 //   4. Override map keyed by PositionKey::raw().
@@ -33,7 +33,10 @@ use phasm_core::stego::stc::embed::stc_embed;
 use phasm_core::stego::stc::extract::stc_extract;
 use phasm_core::stego::stc::hhat::generate_hhat;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
+
+// Session guard + the cached scale-to-I420 are shared in `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, session_guard, ScaleRecipe};
 
 use core_openh264_sys::{
     encoder_pos_to_phasm_position_key, PhasmStegoDomain, PHASM_MB_TYPE_OTHER,
@@ -51,45 +54,13 @@ struct FixtureSpec {
     intra_period: i32,
 }
 
-fn corpus_root() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
-
-/// Scale source mp4 to raw YUV at the target encode dim, cache at /tmp.
+/// Scale source mp4 to raw YUV at the target encode dim, cached under
+/// `$PHASM_TMP`.
 fn ensure_yuv(spec: &FixtureSpec) -> Vec<u8> {
-    let yuv_path = format!(
-        "{}/phasm_c812_{}_{}x{}_f{}.yuv", common::scratch_dir(),
-        spec.name, spec.encode_w, spec.encode_h, spec.n_frames
-    );
-    let frame_size = (spec.encode_w * spec.encode_h * 3 / 2) as usize;
-    let need_bytes = frame_size * (spec.n_frames as usize);
-    if let Ok(data) = std::fs::read(&yuv_path) {
-        if data.len() >= need_bytes {
-            return data;
-        }
-    }
-    let src = corpus_root().join(spec.source_mp4);
-    if !src.exists() {
-        panic!(
-            "corpus fixture missing: {}\nexpected at {} (check test-vectors/video/h264/real-world/)",
-            spec.source_mp4,
-            src.display()
-        );
-    }
-    let vf = format!("scale={}:{}", spec.encode_w, spec.encode_h);
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &spec.n_frames.to_string()])
-        .args(["-an", "-vf", &vf])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale -> yuv failed for {}", spec.source_mp4);
-    std::fs::read(&yuv_path).expect("read yuv after regen")
+    ensure_scaled_yuv(
+        spec.source_mp4, "phasm_c812", spec.name,
+        spec.encode_w, spec.encode_h, spec.n_frames, ScaleRecipe::PixFmt,
+    )
 }
 
 /// Encode the YUV stream once. The hook reads `override_map` dynamically
@@ -336,11 +307,6 @@ fn run_visual_recon_roundtrip(spec: &FixtureSpec) {
         "fixture {}: observed {} wire flips, planned {} — overrides didn't land cleanly",
         spec.name, wire_flips_observed, planned_flips
     );
-}
-
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
 }
 
 // ============== Fixtures ==============

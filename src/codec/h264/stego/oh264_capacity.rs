@@ -21,14 +21,15 @@ use crate::stego::error::StegoError;
 
 /// Pure, stateless per-shadow capacity for the N-aware HUD bar.
 ///
-/// Given a cover pool of `pool_bits` injectable bits (the 3-domain
+/// Given a cover pool of `pool_bits` injectable bits (the shadow-eligible
 /// `shadow_pool_bits` reported by the capacity probe / one-shot
 /// capacity surface) and `n_shadows` total shadow messages sharing it,
 /// returns the maximum plaintext bytes available to EACH shadow. The
 /// per-shadow ceiling is symmetric (all N shadows share the same
-/// budget) and shrinks ~√N as messages are added, per the
-/// birthday-paradox collision bound in
-/// [`shadow_max_message_bytes_from_cover_bits`].
+/// budget) and shrinks as messages are added: the birthday-paradox
+/// bound in [`shadow_max_message_bytes_from_cover_bits`], capped since
+/// D19 (2026-10-23) at the largest size the per-block RS collision model
+/// lets all N shadows survive with ≥ 95% probability.
 ///
 /// This is the single source of truth the mobile bridges call to size
 /// each segment of the N-aware shadow capacity bar without re-probing:
@@ -48,11 +49,11 @@ pub fn h264_shadow_capacity_for_n(pool_bits: usize, n_shadows: usize) -> usize {
 #[derive(Debug, Clone, Copy)]
 pub struct H264StegoCapacityInfo {
     /// **CoeffSignBypass cover bits only**, summed over GOPs — NOT the
-    /// 3-domain injectable pool.
+    /// shadow-eligible injectable pool.
     ///
     /// Corrected 2026-10-19: this field was documented as
     /// `csb + csl + msb` but the accumulation below only ever added
-    /// `GopCapacity::coeff_sign_cover_bits` (CSB). The 3-domain pool is a
+    /// `GopCapacity::coeff_sign_cover_bits` (CSB). The shadow pool is a
     /// separate quantity (`GopCapacity::injectable_cover_bits`, surfaced as
     /// `CapacityProbeResult::shadow_pool_bits`) and is what the shadow
     /// formula consumes; on real 1080p content CSB is ~75-87% of it, so the
@@ -201,7 +202,7 @@ pub fn h264_video_capacity(
     let weights = super::cost_weights::CostWeights::default();
     let mut per_tier_sum = [0usize; 5];
     let mut cover_size_bits = 0usize;
-    // Accumulate the 3-domain shadow pool straight off the OH264
+    // Accumulate the shadow-eligible pool straight off the OH264
     // cover walk we're already doing per GOP, so the shadow number comes
     // from the SAME encoder the shadow encode uses — no separate pure-Rust
     // `pass1_count_4domain` whole-video pass (the ~45 s/clip bottleneck the
@@ -235,7 +236,7 @@ pub fn h264_video_capacity(
     for cap in caps {
         let cap = cap?;
         // CSB-only, by design — `H264StegoCapacityInfo::cover_size_bits` is a
-        // diagnostic cover count, not a capacity. The 3-domain shadow pool is
+        // diagnostic cover count, not a capacity. The shadow-eligible pool is
         // the separate `injectable_cover_bits` accumulation below.
         cover_size_bits += cap.coeff_sign_cover_bits;
         shadow_pool_bits += cap.injectable_cover_bits;

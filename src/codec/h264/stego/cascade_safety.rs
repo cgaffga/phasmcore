@@ -98,6 +98,7 @@ pub fn analyze_safe_mvd_subset(
     mb_w: u32,
     mb_h: u32,
 ) -> Vec<bool> {
+    let _prof = crate::codec::h264::profile::scope("cascade.safe_mvd");
     let n = meta.len();
     let mut safe = vec![false; n];
     if n == 0 || mb_w == 0 || mb_h == 0 {

@@ -62,41 +62,17 @@ mod common;
 
 use phasm_core::codec::h264::openh264_stego::{gop_clean_cover, EncodeOpts};
 use phasm_core::codec::h264::stego::content_costs::compute_content_costs_yuv;
-use std::path::PathBuf;
+// The cached scale-to-I420 is shared in `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, ScaleRecipe};
 
 /// Mirror of `MVD_COST_SIGMA` in `content_costs.rs`. Used to invert the old
 /// cost back to the texture it was derived from.
 const MVD_COST_SIGMA: f32 = 1e-3;
 
-fn corpus_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
-
 /// Decode `n_frames` of a corpus fixture to 16-aligned I420, cached under
 /// `$PHASM_TMP`.
 fn ensure_yuv(source_mp4: &str, tag: &str, w: u32, h: u32, n_frames: u32) -> Vec<u8> {
-    let path = common::scratch_path(&format!("phasm_mvdcost_{tag}_{w}x{h}_f{n_frames}.yuv"));
-    let need = (w * h * 3 / 2) as usize * n_frames as usize;
-    if let Ok(d) = std::fs::read(&path) {
-        if d.len() >= need {
-            return d;
-        }
-    }
-    let src = corpus_root().join(source_mp4);
-    assert!(src.exists(), "corpus fixture missing: {}", src.display());
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &n_frames.to_string()])
-        .args(["-an", "-vf", &format!("scale={w}:{h}")])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {source_mp4}");
-    std::fs::read(&path).expect("read yuv")
+    ensure_scaled_yuv(source_mp4, "phasm_mvdcost", tag, w, h, n_frames, ScaleRecipe::PixFmt)
 }
 
 /// Quantiles of the finite entries, plus how many were WET (∞).

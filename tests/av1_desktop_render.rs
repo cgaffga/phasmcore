@@ -18,6 +18,8 @@
 
 #![cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -132,7 +134,7 @@ fn render_carplane_stego_to_desktop() {
     // without a recognized container, but IVF is trivial to write
     // by hand and ffmpeg understands it natively.
     let desktop = PathBuf::from(env!("HOME")).join("Desktop");
-    let tmp_dir = std::env::temp_dir();
+    let tmp_dir = PathBuf::from(common::scratch_dir());
     for (packet, label) in [(&natural_packet, "natural"), (&stego_packet, "stego")] {
         let ivf_path = tmp_dir.join(format!("phasm_av1_carplane_{}.ivf", label));
         let mp4_path = desktop.join(format!("phasm_av1_carplane_{}.mp4", label));

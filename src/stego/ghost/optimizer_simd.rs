@@ -292,7 +292,10 @@ mod tests {
 
     #[test]
     fn blur_row_h_matches_scalar_random() {
-        for seed in 0..200u32 {
+        // Under Miri (the CI UB gate, `simd-parity.yml`) a few seeds still
+        // cover every width class; 200 would dominate the interpreted run.
+        let seeds: u32 = if cfg!(miri) { 4 } else { 200 };
+        for seed in 0..seeds {
             run_test(seed.wrapping_mul(2654435761), 32, 3);
             run_test(seed.wrapping_mul(2654435761), 33, 3);
             run_test(seed.wrapping_mul(2654435761), 64, 3);

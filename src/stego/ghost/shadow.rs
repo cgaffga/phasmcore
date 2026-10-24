@@ -493,7 +493,9 @@ pub fn shadow_extract(
         let mut emitted_steps: u32 = 0;
         let mut result: Option<Result<PayloadData, StegoError>> = None;
         for batch in combos.chunks(batch_size) {
-            progress::check_cancelled().ok();
+            // `?`, not `.ok()`: the result used to be discarded, so a
+            // cancelled decode brute-forced every remaining batch anyway.
+            progress::check_cancelled()?;
             let hit = batch.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
                 let lsbs = &fraction_lsbs[fi].1;
                 try_single_fdl(lsbs, fdl, parity_len, passphrase)

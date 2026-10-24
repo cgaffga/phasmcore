@@ -160,6 +160,7 @@ use super::pass2_cache::DecisionCache;
 use super::stego::hook::{BinKind, EmbedDomain, SyntaxPath};
 use super::stego::inject::{remap_cover_frame_idx, DomainCover};
 use crate::stego::error::StegoError;
+use crate::stego::progress;
 use crate::stego::stc::embed::stc_embed;
 use crate::stego::stc::extract::stc_extract;
 use crate::stego::stc::hhat::generate_hhat;
@@ -517,6 +518,19 @@ pub(crate) fn produce_gop_cover(
     })
 }
 
+/// What a failed STC search means. The search reads a set cancel flag as "no
+/// path", so on a cancelled encode it is a cancel, not a message that does not
+/// fit. Reported as `MessageTooLarge`, a cancel sent the encode down the
+/// shrink-and-retry loops — a full GOP re-encode per ~12% step — before it
+/// finally failed as too large: seconds of extra work, and the wrong error.
+fn stc_miss() -> StegoError {
+    if progress::is_cancelled() {
+        StegoError::Cancelled
+    } else {
+        StegoError::MessageTooLarge
+    }
+}
+
 /// 4b consumer (#894) — the payload-DEPENDENT half: tier resolution, combine,
 /// the STC plan over the message bits, the override-map build, the Pass-2
 /// wire-only stego emit, and the diagnostics. The cross-GOP cursor-carry lives
@@ -651,8 +665,11 @@ pub(crate) fn consume_gop_emit(
     let cover_slice: Vec<u8> = combined_cover[..used_cover].to_vec();
     let cost_slice: Vec<f32> = combined_costs[..used_cover].to_vec();
     let hhat = generate_hhat(STC_H, w, hhat_seed);
-    let plan = stc_embed(&cover_slice, &cost_slice, frame_bits, &hhat, STC_H, w)
-        .ok_or(StegoError::MessageTooLarge)?;
+    let plan = {
+        let _prof = crate::codec::h264::profile::scope("stc.emit_embed");
+        stc_embed(&cover_slice, &cost_slice, frame_bits, &hhat, STC_H, w)
+    }
+    .ok_or_else(stc_miss)?;
     if let Some(t) = t_before_stc {
         eprintln!(
             "[PHASM_PERF_TRACE]   └─ stc_embed(Viterbi)      {:>8.1} ms",
@@ -1234,8 +1251,8 @@ const CAP2_SAFETY_DEN: usize = 6;
 pub(crate) struct GopCapacity {
     pub per_tier_payload: [usize; 5],
     pub coeff_sign_cover_bits: usize,
-    /// #809 — total injectable cover bits in the 3 shadow domains
-    /// (CoeffSign + CoeffSuffixLsb + MvdSign) for THIS GOP, read straight
+    /// #809 — total shadow-eligible cover bits (CoeffSign + CoeffSuffixLsb
+    /// + MvdSign + cascade-safe MvdSuffixLsb) for THIS GOP, read straight
     /// off the OH264 cover walk. Lets `h264_video_capacity`
     /// compute the shadow capacity from the same encoder it will actually
     /// use — instead of a separate pure-Rust whole-video `pass1_count_4domain`
@@ -1248,16 +1265,26 @@ pub(crate) struct GopCapacity {
     /// [`super::stego::shadow_capacity::shadow_max_message_bytes_from_cover_bits`]
     /// — read that before changing this.
     ///
-    /// `MvdSuffixLsb` is excluded. Corrected 2026-10-19: the reason is
-    /// **conservatism, not ineligibility**. The old note here said MSL is
-    /// "not part of the shadow LSB pool", but production shadow selection
-    /// passes `Some(safe_msl)` and does include the cascade-safe MSL
-    /// positions (`openh264_stego.rs` sweep / `streaming_session`). Measured
-    /// at native 1080p those are 1.5-4.1% of the true pool (horse_flag
-    /// 21643/521619, iphone7 5301/282379, lumix_g9 2057/138454), so omitting
-    /// them under-reports shadow capacity slightly. Left as-is on purpose:
-    /// the safe fraction is content- and cascade-dependent, and erring low on
-    /// a user-visible capacity number is the safe direction.
+    /// Counts exactly the positions the shadow layer can use: every
+    /// CoeffSign, CoeffSuffixLsb and MvdSign position, plus the cascade-safe
+    /// `MvdSuffixLsb` positions — enumerated by
+    /// [`super::stego::shadow::for_each_eligible_position`] with the
+    /// production masks (`safe_csl = None`, `Some(safe_msl)`), i.e. by the
+    /// same call the shadow encoder and decoder iterate.
+    ///
+    /// History (D10, raised 2026-10-23): until then this summed only the
+    /// three always-eligible domains and left the safe MSL positions out —
+    /// 1.5-4.1% of the true pool at native 1080p (horse_flag 21643/521619,
+    /// iphone7 5301/282379, lumix_g9 2057/138454) — on the grounds that the
+    /// safe fraction is content-dependent and a low user-visible number is
+    /// the safe error. It is content-dependent, but it is not an estimate:
+    /// the safe set is derived per GOP by the same
+    /// `analyze_safe_mvd_subset` → `derive_msl_safe_from_msb` chain the
+    /// decoder re-runs, and that set is invariant under the sign and
+    /// safe-set magnitude flips an encode makes. So the probe sees the very
+    /// set the encode uses, and under-reporting it was simply wrong. The
+    /// shadow capacity scales with √pool, so the user-visible figure rose by
+    /// roughly half the pool change.
     pub injectable_cover_bits: usize,
 }
 
@@ -1265,6 +1292,15 @@ pub(crate) struct GopCapacity {
 /// embeds the encrypted (random-looking) frame, so a pseudo-random trial
 /// message reproduces the encode's syndrome reachability under the ∞-cost
 /// gate. A structured/all-zero payload would be unrepresentatively easy.
+/// A/B switch for timing: `PHASM_CAP2_FULL_TRELLIS=1` runs the capacity
+/// trials through the full `stc_embed` trellis (the pre-`stc_is_feasible`
+/// behaviour). The answer is the same either way — that equality is what
+/// `stc_is_feasible_matches_stc_embed_exhaustively` pins — so this only
+/// changes how long the probe takes.
+fn cap2_full_trellis_trials() -> bool {
+    std::env::var("PHASM_CAP2_FULL_TRELLIS").map(|v| v == "1").unwrap_or(false)
+}
+
 fn cap2_trial_payload(len: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(len);
     let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -1324,15 +1360,21 @@ fn cap2_stc_trial_max_payload(combined_cover: &[u8], combined_costs: &[f32]) -> 
         }
         let used = m_total * w;
         let hhat = generate_hhat(STC_H, w, &CAP2_TRIAL_SEED);
-        stc_embed(
-            &combined_cover[..used],
-            &combined_costs[..used],
-            &frame_bits,
-            &hhat,
-            STC_H,
-            w,
-        )
-        .is_some()
+        let _prof = crate::codec::h264::profile::scope("stc.cap_trial");
+        // Only feasibility is asked, so the set-reachability form of the
+        // trellis answers it exactly — `stc_is_feasible` is defined as
+        // `stc_embed(..).is_some()` — without the f64 Viterbi or its
+        // back-pointer table. ~25 of these run per GOP.
+        if cap2_full_trellis_trials() {
+            stc_embed(
+                &combined_cover[..used], &combined_costs[..used], &frame_bits, &hhat, STC_H, w,
+            )
+            .is_some()
+        } else {
+            crate::stego::stc::embed::stc_is_feasible(
+                &combined_cover[..used], &combined_costs[..used], &frame_bits, &hhat, STC_H, w,
+            )
+        }
     };
 
     if !embeddable(0) {
@@ -1611,12 +1653,6 @@ pub(crate) fn h264_gop_capacity_with(
     .map_err(|e| StegoError::InvalidVideo(format!("cap2 walk: {e}")))?;
 
     let coeff_sign_cover_bits = baseline_walk.cover.coeff_sign_bypass.bits.len();
-    // #809 — 3 shadow-injectable domains, same definition the shadow formula
-    // uses (CS + CSL + MvdSign; MvdSuffixLsb is excluded — it's the safe-MSL
-    // gated domain, not part of the shadow LSB pool).
-    let injectable_cover_bits = baseline_walk.cover.coeff_sign_bypass.bits.len()
-        + baseline_walk.cover.coeff_suffix_lsb.bits.len()
-        + baseline_walk.cover.mvd_sign_bypass.bits.len();
     lap!("encode+walk");
 
     // content costs + safe_msl gate — computed ONCE (tier-independent).
@@ -1647,7 +1683,7 @@ pub(crate) fn h264_gop_capacity_with(
         }
     };
     lap!("content_costs");
-    {
+    let injectable_cover_bits = {
         let safe_msb = super::stego::cascade_safety::analyze_safe_mvd_subset(
             &baseline_walk.mvd_meta, baseline_walk.mb_w, baseline_walk.mb_h,
         );
@@ -1655,6 +1691,19 @@ pub(crate) fn h264_gop_capacity_with(
             &baseline_walk.cover.mvd_sign_bypass.positions,
             &safe_msb,
             &baseline_walk.cover.mvd_suffix_lsb.positions,
+        );
+        // The shadow pool, counted by the SAME call — and the same masks —
+        // that the shadow encoder, the streaming verify and the decoder use to
+        // enumerate their slots (`safe_csl = None` ⇒ every CSL position;
+        // `Some(safe_msl)` ⇒ cascade-safe MSL only). Counting through it
+        // rather than re-deriving the rule here means the figure cannot drift
+        // from what an encode actually draws on. See `injectable_cover_bits`.
+        let mut pool = 0usize;
+        super::stego::shadow::for_each_eligible_position(
+            &baseline_walk.cover,
+            None,
+            Some(safe_msl.as_slice()),
+            |_, _, _| pool += 1,
         );
         let n_msl = base_costs.mvd_suffix_lsb.len();
         let safe_len = safe_msl.len().min(n_msl);
@@ -1666,7 +1715,8 @@ pub(crate) fn h264_gop_capacity_with(
         for i in safe_len..n_msl {
             base_costs.mvd_suffix_lsb[i] = f32::INFINITY;
         }
-    }
+        pool
+    };
     lap!("safe_msl");
 
     let csb_qp = vec![opts.qp; baseline_walk.cover.coeff_sign_bypass.len()];
@@ -1813,6 +1863,7 @@ pub(crate) fn clean_encode_gop(
     let mut out = vec![0u8; 4 * 1024 * 1024];
     let mut bitstream = Vec::with_capacity(2 * 1024 * 1024);
     for frame in 0..n_frames {
+        progress::check_cancelled()?;
         let base = (frame as usize) * frame_total;
         let y = &gop_yuv[base..base + frame_y];
         let u = &gop_yuv[base + frame_y..base + frame_y + frame_uv];
@@ -1915,6 +1966,15 @@ fn encode_once(
         PassMode::Replay => decision_cache.clone(),
         _ => None,
     };
+    // The #549 diagnostic dump switches, read ONCE per encode. `enc_pre_emit`
+    // fires for every coefficient / MVD bypass bin and `md_cost` for every MB
+    // — millions of calls per 1080p GOP — and `std::env::var` takes the
+    // process-wide env lock and scans `environ` each time: sampled at 7.4% of
+    // active CPU during a 1080p stego emit (`__findenv_locked` under this
+    // closure), more than OpenH264's whole deblocking filter. Output-neutral:
+    // both only gate `eprintln!`s.
+    let hook_dump = std::env::var("PHASM_549_HOOK_DUMP").as_deref() == Ok("1");
+    let md_dump = std::env::var("PHASM_549_MD_DUMP").as_deref() == Ok("1");
     let handlers = StegoHandlers {
         capture_mb_decision: capture_cache.map(|cache| {
             Box::new(move |d: &MbDecision| {
@@ -1932,7 +1992,7 @@ fn encode_once(
             // #549 Phase C — dump every emit-side hook fire when
             // PHASM_549_HOOK_DUMP=1, so the per-MB encoder-internal
             // emission sequence can be diff'd between Pass 1 and Pass 2.
-            if std::env::var("PHASM_549_HOOK_DUMP").as_deref() == Ok("1") {
+            if hook_dump {
                 eprintln!(
                     "[PHASM_549_HOOK pass={} frame={} mb=({},{}) dom={} bc={} sb={} ci={} part={} ref={} mvc={} orig={}]",
                     get_549_pass_idx(),
@@ -1989,7 +2049,7 @@ fn encode_once(
             // Tagged by thread-local pass index so a downstream diff
             // can find the first divergent MB between Pass 1 and Pass 2.
             // No-op when PHASM_549_MD_DUMP isn't "1".
-            if std::env::var("PHASM_549_MD_DUMP").as_deref() == Ok("1") {
+            if md_dump {
                 eprintln!(
                     "[PHASM_549_MD pass={} frame={} mb=({},{}) type={} cbp={}]",
                     get_549_pass_idx(),
@@ -2036,6 +2096,13 @@ fn encode_once(
     };
     let mut frame_err: Option<StegoError> = None;
     for frame in 0..n_frames {
+        // A GOP encode is one blocking call per pass; check per frame so a
+        // cancel stops it within a frame, not at the end of the GOP. Same exit
+        // as an encoder error, so the replay / pass modes are reset below.
+        if progress::is_cancelled() {
+            frame_err = Some(StegoError::Cancelled);
+            break;
+        }
         // WV.6.b.2: global frame_idx for the stego hooks (`frame_idx_base` is
         // `g*gop_size` for a per-GOP-standalone shadow call, `0` otherwise).
         // The encoder's INTERNAL frame_num / POC / `encode_frame` timestamp
@@ -2368,6 +2435,9 @@ fn embed_primary_per_gop_4domain(
             remaining.div_ceil(gops_remaining)
         };
         loop {
+            // Each step below re-runs an STC search; a cancel must stop the
+            // shrinking, not read as "smaller still".
+            progress::check_cancelled()?;
             let chunk = &frame_bytes[cursor..cursor + want];
             let framed = if is_first {
                 build_first_chunk_frame_v3_1(total_bytes, chunk)?
@@ -3516,6 +3586,7 @@ fn n_gops_for_cache(n_frames: u32, opts: EncodeOpts) -> usize {
     n_frames.div_ceil(gop_size).max(1) as usize
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn h264_encode_with_shadows_streaming<'a>(
     source: &mut dyn GopYuvSource,
     width: u32,
@@ -3527,6 +3598,14 @@ pub fn h264_encode_with_shadows_streaming<'a>(
     primary_passphrase: &str,
     shadows: &'a [crate::stego::shadow_layer::ShadowLayer<'a>],
     weights: &CostWeights,
+    // Per-GOP primary capacities in GOP order, when the caller already
+    // measured them (the mobile capacity probe does, for the HUD). Used to
+    // plan the PRIMARY payload proportionally instead of splitting it evenly
+    // — see `embed_primary_one_gop` for what the even split costs. A short,
+    // empty or over-long vector is safe: the planner only consumes a prefix
+    // matching this clip's GOP count, and anything it cannot use falls back
+    // to the even split.
+    per_gop_caps: Option<&[usize]>,
     // Optional fraction (0.0–1.0) progress sink, ticked per-GOP across the ~4
     // forward passes (see `ShadowProgress`). `None` = no reporting.
     progress: Option<&mut dyn FnMut(f32)>,
@@ -3577,20 +3656,53 @@ pub fn h264_encode_with_shadows_streaming<'a>(
     let (frame_bytes, hhat_seed) =
         prep_primary_payload(primary_message, primary_files, primary_passphrase)?;
 
+    // Plan the primary proportionally when the caller measured the caps.
+    // `MessageTooLarge` here is NOT fatal: the per-GOP shrink-and-carry loop
+    // in `embed_primary_one_gop` is still the real acceptance test, and it
+    // succeeds on payloads the planner's safety margin rejects. Falling back
+    // to the even split keeps today's behaviour rather than failing early on
+    // a message that would have fitted.
+    let gop_size_plan = opts.intra_period.max(1) as u32;
+    let n_gops_plan = n_frames.div_ceil(gop_size_plan).max(1) as usize;
+    let primary_plan: Option<Vec<usize>> = per_gop_caps.and_then(|caps| {
+        let samples: Vec<(usize, usize)> = caps
+            .iter()
+            .copied()
+            .take(n_gops_plan)
+            .enumerate()
+            .collect();
+        if samples.is_empty() {
+            return None;
+        }
+        use crate::stego::balanced_allocation::{plan_safe_balanced, PlanOutcome};
+        match plan_safe_balanced(
+            &samples,
+            n_gops_plan,
+            frame_bytes.len(),
+            gop_size_plan as usize,
+            &crate::stego::calibration::AllocationCalibration::H264_1080P_QP26,
+        ) {
+            PlanOutcome::Plan { plan, .. } => Some(plan),
+            _ => None,
+        }
+    });
+
     // WV.6.g.progress — meter the ~4 forward passes (3 source-pulling + verify).
     // Wrapping the source ticks per pulled GOP across tier pre-pass / Sweep A /
     // Sweep B emit; the verify pass ticks the same reporter directly. Total
     // units = 4 * n_gops (the happy single-tier path).
     let prog_gop_size = opts.intra_period.max(1) as u32;
     let prog_n_gops = n_frames.div_ceil(prog_gop_size).max(1) as usize;
-    let prog = ShadowProgress::new(prog_n_gops * 4, progress);
+    // Five forward passes: tier pre-pass, sweep A, primary dry run, sweep B
+    // emit, verify (the happy single-tier path).
+    let prog = ShadowProgress::new(prog_n_gops * 5, progress);
     let mut wrapped = ProgressYuvSource { inner: source, prog: &prog };
 
     // ── Tier (dep 3, O(GOP) pre-pass) + Sweep A. ──
-    let _t_tier = std::time::Instant::now();
-    let tier_idx =
-        streaming_tier_prepass(&mut wrapped, width, height, n_frames, opts, frame_bytes.len())?;
-    crate::codec::h264::profile::record("phase.1_tier_prepass", _t_tier.elapsed());
+    let tier_idx = {
+        let _p = crate::codec::h264::profile::scope("phase.1_tier_prepass");
+        streaming_tier_prepass(&mut wrapped, width, height, n_frames, opts, frame_bytes.len())?
+    };
     // Capacity = n_total at the largest parity tier (select once; prefix per tier).
     let capacities: Vec<usize> = shadows
         .iter()
@@ -3619,36 +3731,114 @@ pub fn h264_encode_with_shadows_streaming<'a>(
         crate::stego::gop_cache::ORPHAN_MAX_AGE,
     );
 
-    let _t_sa = std::time::Instant::now();
-    let sa = sweep_a(
-        &mut wrapped, width, height, n_frames, opts, &frame_bytes, &hhat_seed, shadows,
-        &capacities, tier_idx, weights, prefix_cache.as_mut(),
-    )?;
-    crate::codec::h264::profile::record("phase.2_sweep_a", _t_sa.elapsed());
+    let sa = {
+        let _p = crate::codec::h264::profile::scope("phase.2_sweep_a");
+        sweep_a(
+            &mut wrapped, width, height, n_frames, opts, &frame_bytes, &hhat_seed, shadows,
+            &capacities, tier_idx, weights, prefix_cache.as_mut(),
+        )?
+    };
+
+    // ── Every tier's shadow RS frames, built ONCE. ──
+    //
+    // Sweep B used to rebuild these inside its tier loop, re-encrypting each
+    // shadow under a fresh salt per attempt. The primary dry run below must
+    // stamp the very bits sweep B will, because STC feasibility depends on the
+    // fixed bits, so both now share one set. (Under `PHASM_DETERMINISTIC_SEED`
+    // every encrypt reseeds identically, so this is byte-identical there; in
+    // production each tier still gets its own random salt.)
+    let shadow_rs_by_tier: Vec<Vec<(Vec<u8>, usize)>> = SHADOW_PARITY_TIERS
+        .iter()
+        .map(|&parity_len| {
+            shadows
+                .iter()
+                .map(|s| build_shadow_rs_frame(s.passphrase, s.message, s.files, parity_len))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<_, _>>()?;
+
+    // ── Primary dry run: will sweep B place the WHOLE primary? ──
+    //
+    // The per-GOP caps the plan was built from were measured with no shadows
+    // in the cover; the shadows' ∞-fenced slots cost the primary ~9% on
+    // average and up to 38% in a GOP. `primary_dry_run` replays sweep B's
+    // drain exactly for one clean-encode pass, so an over-full primary is
+    // refused NOW — not after the full emit and verify.
+    //
+    // It replays ONE tier: the first sweep B will attempt (the lowest whose
+    // RS frames every shadow has positions for). That tier has the smallest
+    // shadow footprint, so it is where the primary has the most room, and it
+    // is the tier sweep B ends on whenever the shadows verify first time.
+    // Replaying all six cost about as much as sweep B itself (8.9 s vs 9.5 s
+    // on a 4-GOP 1080p clip) for a prediction the cursor check below
+    // provides anyway on the rare escalation.
+    let selections_suffice = |t: usize| {
+        shadow_rs_by_tier[t]
+            .iter()
+            .enumerate()
+            .all(|(s, (bits, _))| sa.selections[s].len() >= bits.len())
+    };
+    let Some(first_tier) = (0..SHADOW_PARITY_TIERS.len()).find(|&t| selections_suffice(t)) else {
+        // Not even the smallest RS frame has the positions it needs.
+        return Err(StegoError::MessageTooLarge);
+    };
+    let dry = {
+        let _p = crate::codec::h264::profile::scope("phase.2b_primary_dry_run");
+        let mut tick_unpulled = || prog.tick();
+        primary_dry_run(
+            &mut wrapped, width, height, n_frames, opts, &frame_bytes, primary_plan.as_deref(),
+            &hhat_seed, &sa, &shadow_rs_by_tier[first_tier..=first_tier],
+            &SHADOW_PARITY_TIERS[first_tier..=first_tier], tier_idx, weights,
+            prefix_cache.as_mut(), &mut tick_unpulled,
+        )?
+    };
+    if dry[0] != Some(frame_bytes.len()) {
+        // The most room the primary will ever get is not enough.
+        return Err(StegoError::MessageTooLarge);
+    }
 
     // ── Phase 4: parity-tier cascade (Sweep B emit + streaming verify). ──
     let gop_size = opts.intra_period.max(1) as u32;
-    for parity_len in SHADOW_PARITY_TIERS {
-        let shadow_rs: Vec<(Vec<u8>, usize)> = shadows
-            .iter()
-            .map(|s| build_shadow_rs_frame(s.passphrase, s.message, s.files, parity_len))
-            .collect::<Result<_, _>>()?;
+    let mut primary_placed_at_some_tier = false;
+    for (t, &parity_len) in SHADOW_PARITY_TIERS.iter().enumerate().skip(first_tier) {
         // Feasibility: this tier needs `n_total` selected positions per shadow.
         // (The whole-clip path's `MessageTooLarge` continue — eligible < n_total.)
-        if shadow_rs
-            .iter()
-            .enumerate()
-            .any(|(s, (bits, _))| sa.selections[s].len() < bits.len())
-        {
+        if !selections_suffice(t) {
             continue;
         }
+        let shadow_rs = &shadow_rs_by_tier[t];
 
-        let _t_sb = std::time::Instant::now();
-        let (bytes, gop_lens) = sweep_b_emit(
-            &mut wrapped, width, height, n_frames, opts, &frame_bytes, &hhat_seed, &sa, &shadow_rs,
-            parity_len, tier_idx, weights, prefix_cache.as_mut(),
-        )?;
-        crate::codec::h264::profile::record("phase.3_sweep_b_emit", _t_sb.elapsed());
+        let (bytes, gop_lens, primary_cursor) = {
+            let _p = crate::codec::h264::profile::scope("phase.3_sweep_b_emit");
+            sweep_b_emit_with_cursor(
+                &mut wrapped, width, height, n_frames, opts, &frame_bytes,
+                primary_plan.as_deref(), &hhat_seed, &sa, shadow_rs,
+                parity_len, tier_idx, weights, prefix_cache.as_mut(),
+            )?
+        };
+
+        // The ONLY evidence that the whole primary went in. The drain never
+        // errors when a GOP — the last one included — cannot take its share:
+        // it shrinks to what fits and carries the rest, and after the last GOP
+        // there is nothing to carry into. Until 2026-10-23 nothing checked, so
+        // an over-full primary was emitted truncated and the encode reported
+        // success: the first chunk announces `total_bytes`, fewer arrive, and
+        // the recipient can never decode it (regression gate:
+        // `oversized_primary_is_refused_not_emitted_truncated`). At
+        // `first_tier` the dry run predicts this cursor exactly, so a mismatch
+        // there means its equivalence with sweep B broke — loud in debug, a
+        // refusal in release. Above it (a shadow failed to verify and the
+        // tier escalated) this check is the only one, and the larger shadow
+        // footprint can legitimately leave the primary short.
+        debug_assert!(
+            t != first_tier || primary_cursor == frame_bytes.len(),
+            "primary dry run said tier {parity_len} fits, sweep B placed {primary_cursor} of {}",
+            frame_bytes.len(),
+        );
+        if primary_cursor != frame_bytes.len() {
+            continue;
+        }
+        primary_placed_at_some_tier = true;
 
         // WV.6.g.5 — streaming verify: re-decode the emitted clip ONE GOP at a
         // time (no O(clip) walk_final), faithfully mirroring the decoder's
@@ -3656,19 +3846,64 @@ pub fn h264_encode_with_shadows_streaming<'a>(
         // Ticks `prog` per GOP (pass 4 of 4) so the bar keeps moving through verify.
         let n_totals_tier: Vec<usize> = shadow_rs.iter().map(|(bits, _)| bits.len()).collect();
         let mut verify_tick = || prog.tick();
-        let _t_verify = std::time::Instant::now();
-        let verified = streaming_shadow_verify(
-            &bytes, &gop_lens, width, height, gop_size, shadows, &n_totals_tier,
-            Some(&mut verify_tick),
-        )?;
-        crate::codec::h264::profile::record("phase.4_shadow_verify", _t_verify.elapsed());
+        let verified = {
+            let _p = crate::codec::h264::profile::scope("phase.4_shadow_verify");
+            streaming_shadow_verify(
+                &bytes, &gop_lens, width, height, gop_size, shadows, &n_totals_tier,
+                Some(&mut verify_tick),
+            )?
+        };
         if verified {
             prog.finish();
+            log_prefix_cache_stats(prefix_cache.as_ref(), &cache_budget);
             return Ok(bytes);
         }
     }
 
-    Err(StegoError::ShadowEmbedFailed)
+    log_prefix_cache_stats(prefix_cache.as_ref(), &cache_budget);
+    // The shadows are the limit only if the primary was placed at some tier
+    // and the shadows still failed to verify there.
+    Err(if primary_placed_at_some_tier {
+        StegoError::ShadowEmbedFailed
+    } else {
+        StegoError::MessageTooLarge
+    })
+}
+
+/// `PHASM_PROFILE` diagnostic: what the per-GOP prefix cache did this encode
+/// (entries per tier, bytes held, hit / miss counts). Output-neutral.
+fn log_prefix_cache_stats(
+    cache: Option<
+        &crate::stego::gop_cache::BoundedGopCache<super::stego::content_costs::ShadowGopPrefix>,
+    >,
+    budget: &ShadowPrefixCacheBudget,
+) {
+    if std::env::var("PHASM_PROFILE").map(|v| v == "0" || v.eq_ignore_ascii_case("false")).unwrap_or(true) {
+        return;
+    }
+    match cache {
+        None => eprintln!("  [shadow-prefix-cache] disabled (budget 0 / 0)"),
+        Some(c) => {
+            let s = c.stats();
+            eprintln!(
+                "  [shadow-prefix-cache] budget ram {} MB disk {} MB | in_ram {} ({:.1} MB) \
+                 on_disk {} ({:.1} MB) overflowed {} | hits ram {} disk {} | misses {} \
+                 | spill_err {} unpack_err {}",
+                budget.ram_bytes >> 20, budget.disk_bytes >> 20,
+                s.cached_in_ram, s.ram_used as f64 / 1048576.0,
+                s.spilled_to_disk, s.disk_used as f64 / 1048576.0, s.overflowed,
+                s.ram_hits, s.disk_hits, s.misses, s.spill_errors, s.unpack_errors,
+            );
+        }
+    }
+}
+
+/// A/B switch for timing: `PHASM_SHADOW_B_REUSE_COVER=0` makes a sweep-B
+/// prefix-cache hit re-run the clean encode + walk instead of using the cached
+/// cover (the pre-change behaviour). Output-identical either way; gated by
+/// `h264_shadow_prefix_cache`.
+fn sweep_b_reuses_cached_cover() -> bool {
+    std::env::var("PHASM_SHADOW_B_REUSE_COVER").map(|v| v != "0").unwrap_or(true)
 }
 
 /// Read the `PHASM_USE_WIRE_ONLY` flag (production default: ON). Shared by the
@@ -4075,7 +4310,49 @@ fn embed_primary_one_gop(
     g: u32,
     n_gops: u32,
     hhat_seed: &[u8; 32],
+    // Per-GOP byte plan from `plan_safe_balanced`, sized to each GOP's
+    // MEASURED capacity. `None` keeps the legacy even split — see `want`.
+    plan: Option<&[usize]>,
 ) -> Result<(Vec<u8>, usize), StegoError> {
+    let (embedded, new_cursor) = drain_primary_one_gop(
+        gop_cover, gop_costs, frame_bytes, cursor, g, n_gops, hhat_seed, plan,
+        |cover, costs, bits, hhat, w| {
+            let _prof = crate::codec::h264::profile::scope("stc.primary_embed");
+            stc_embed(cover, costs, bits, hhat, STC_H, w)
+        },
+    )?;
+    let mut out = gop_cover.to_vec();
+    if let Some((plan, used)) = embedded {
+        for (k, slot) in out.iter_mut().enumerate().take(used) {
+            *slot = plan.stego_bits[k];
+        }
+    }
+    Ok((out, new_cursor))
+}
+
+/// The primary drain's per-GOP DECISION — how much of the payload this GOP
+/// takes — shared by sweep B (`embed_primary_one_gop`, which embeds) and the
+/// primary dry run (which only asks whether each candidate fits). One loop
+/// for both is what makes the dry run's prediction exact: the two cannot
+/// diverge on `want`, the shrink schedule or the chunk framing.
+///
+/// `try_embed(cover[..used], costs[..used], frame_bits, hhat, w)` returns
+/// `Some` iff a finite-cost STC path exists — `stc_embed` for sweep B,
+/// `stc_is_feasible` (pinned equal to `stc_embed(..).is_some()`) for the dry
+/// run. Returns the accepted attempt with its `used` prefix length, if any,
+/// and the advanced cursor.
+#[allow(clippy::too_many_arguments)]
+fn drain_primary_one_gop<T>(
+    gop_cover: &[u8],
+    gop_costs: &[f32],
+    frame_bytes: &[u8],
+    cursor: usize,
+    g: u32,
+    n_gops: u32,
+    hhat_seed: &[u8; 32],
+    plan: Option<&[usize]>,
+    mut try_embed: impl FnMut(&[u8], &[f32], &[u8], &[Vec<u32>], usize) -> Option<T>,
+) -> Result<(Option<(T, usize)>, usize), StegoError> {
     use crate::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_v3_1};
 
     let total_bytes =
@@ -4085,20 +4362,61 @@ fn embed_primary_one_gop(
     // (the decoder stops at `accumulated == total_bytes` and never STC-extracts
     // these). Matches the `continue` in the whole-clip loop.
     if !is_first && cursor >= frame_bytes.len() {
-        return Ok((gop_cover.to_vec(), cursor));
+        return Ok((None, cursor));
     }
 
     let n_cover = gop_cover.len();
     let gops_remaining = (n_gops - g) as usize; // ≥ 1, includes this GOP
     let remaining = frame_bytes.len() - cursor;
-    let mut want = if gops_remaining <= 1 {
-        remaining
-    } else {
-        remaining.div_ceil(gops_remaining)
+    // How much of the payload this GOP aims to carry.
+    //
+    // The even split below spreads the payload uniformly over the GOPs that
+    // are left, which ignores that GOP capacities vary by an order of
+    // magnitude on real footage. The shortfall of an infeasible GOP does carry
+    // forward (`remaining` shrinks, `gops_remaining` with it), but that is not
+    // enough: a capacity-RICH GOP is still held to the even share, so its
+    // headroom is wasted and a poorer GOP later inherits a share it cannot
+    // absorb. Simulated against the measured corpus cap vectors — carry
+    // included — against what `max_message_len` ADVERTISES to the capacity bar:
+    //
+    //     iphone7  Sigma 15215  advertised 13831  even split  5456   39%
+    //     img4138  Sigma 36227  advertised 32933  even split 16309   49%
+    //
+    // So the shadow path displayed the planner's ceiling and then embedded
+    // with the even split — a refusal after a multi-minute encode, for a
+    // message the bar promised would fit. Same defect the no-shadow path was
+    // fixed for (#841); gated by `tests/d2_shadow_primary_plan.rs`.
+    //
+    // (iphone7 bottoms out at `n * min(cap)` = 5440 because its poorest GOP is
+    // the LAST one, with nothing after it to spill into. img4138's poorest is
+    // early, so `n * min` = 520 is nowhere near its real even-split ceiling —
+    // the weakest GOP sets the clip ceiling only when it comes last.)
+    //
+    // With a plan, each GOP targets its own measured share instead.
+    //
+    // The target is CUMULATIVE: catch up to `sum(plan[..=g])`. If earlier
+    // GOPs under-filled (the shrink loop below), this GOP tries to make up
+    // the shortfall, bounded by its own feasibility.
+    //
+    // The LAST GOP always asks for everything left, plan or no plan. Taking
+    // the plan's cumulative target there would strand payload whenever the
+    // plan is LONGER than the clip's real GOP count (`Σ plan[..=last]` is then
+    // short of `message_len`), which the drain check reports as
+    // MessageTooLarge — a plan making things *worse* than the even split. The
+    // planner is built from a probe whose GOP count can differ from this
+    // encode's by a frame-count rounding, so this is reachable, and a wrong
+    // cap vector must never do worse than no cap vector.
+    let mut want = match plan {
+        _ if gops_remaining <= 1 => remaining,
+        Some(p) => {
+            let through_g: usize = p.iter().take(g as usize + 1).sum();
+            through_g.saturating_sub(cursor).min(remaining)
+        }
+        None => remaining.div_ceil(gops_remaining),
     };
-    let mut out = gop_cover.to_vec();
-    let mut new_cursor = cursor;
     loop {
+        // A cancel must stop the shrinking, not read as "smaller still".
+        progress::check_cancelled()?;
         let chunk = &frame_bytes[cursor..cursor + want];
         let framed = if is_first {
             build_first_chunk_frame_v3_1(total_bytes, chunk)?
@@ -4111,25 +4429,19 @@ fn embed_primary_one_gop(
         if w >= 1 {
             let used = m * w;
             let hhat = generate_hhat(STC_H, w, hhat_seed);
-            if let Some(plan) =
-                stc_embed(&gop_cover[..used], &gop_costs[..used], &frame_bits, &hhat, STC_H, w)
+            if let Some(t) = try_embed(&gop_cover[..used], &gop_costs[..used], &frame_bits, &hhat, w)
             {
-                for (k, slot) in out.iter_mut().enumerate().take(used) {
-                    *slot = plan.stego_bits[k];
-                }
-                new_cursor = cursor + want;
-                break;
+                return Ok((Some((t, used)), cursor + want));
             }
         }
         // Infeasible at `want`. want == 0 means even the header won't fit this
         // GOP's cover — leave the cover bits through (GOP 0 failing here surfaces
         // as MessageTooLarge via the caller's drain check).
         if want == 0 {
-            break;
+            return Ok((None, cursor));
         }
         want -= 1usize.max(want / 8); // ~12% step, always reaches 0
     }
-    Ok((out, new_cursor))
 }
 
 /// WV.6.g.4.1d — thin pub reference: the whole-clip primary plan exactly as the
@@ -4187,6 +4499,9 @@ pub fn streaming_provisional_plan(
             combine_cover_4domain(gc, costs_g, weights);
         let (gop_stego, new_cursor) = embed_primary_one_gop(
             &gop_combined, &gop_costs, frame_bytes, cursor, g as u32, n_gops, hhat_seed,
+            // Whole-clip path: no measured per-GOP caps here, so the even
+            // split stands. The streaming path is where the planner runs.
+            None,
         )?;
         cursor = new_cursor;
         let gop_plan = split_plan_4domain(&gop_stego, &boundaries);
@@ -4295,6 +4610,8 @@ pub fn gop_provisional_step(
         combine_cover_4domain(&cover_local, &content_costs, weights);
     let (gop_stego, new_cursor) = embed_primary_one_gop(
         &gop_combined, &gop_costs, frame_bytes, cursor, g, n_gops, hhat_seed,
+        // No measured caps on this path — even split, as before.
+        None,
     )?;
     let gop_plan = split_plan_4domain(&gop_stego, &boundaries);
     {
@@ -4423,13 +4740,16 @@ pub fn sweep_a(
 /// state; the emitted clip itself is O(clip) (streamed out, not the working set).
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-pub fn sweep_b_emit(
+pub fn sweep_b_emit_with_cursor(
     source: &mut dyn GopYuvSource,
     width: u32,
     height: u32,
     n_frames: u32,
     opts: EncodeOpts,
     primary_frame_bytes: &[u8],
+    // Per-GOP byte plan for the PRIMARY payload (`plan_safe_balanced`).
+    // `None` = legacy even split.
+    primary_plan: Option<&[usize]>,
     hhat_seed: &[u8; 32],
     sweep_a_result: &SweepAResult,
     shadow_rs: &[(Vec<u8>, usize)],
@@ -4440,11 +4760,9 @@ pub fn sweep_b_emit(
     // safe-MSL derivation for that GOP. `None` disables caching and is the
     // reference behaviour.
     mut prefix_cache: Option<&mut crate::stego::gop_cache::BoundedGopCache<super::stego::content_costs::ShadowGopPrefix>>,
-) -> Result<(Vec<u8>, Vec<usize>), StegoError> {
+) -> Result<(Vec<u8>, Vec<usize>, usize), StegoError> {
     use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
-    use super::stego::shadow::{
-        apply_shadow_to_plan, embed_shadow_lsb, overlay_infinity_costs, ShadowSlot, ShadowState,
-    };
+    use super::stego::shadow::{apply_shadow_to_plan, embed_shadow_lsb, overlay_infinity_costs};
 
     let n_shadows = sweep_a_result.selections.len();
     assert_eq!(n_shadows, shadow_rs.len(), "sweep_b_emit: one rs frame per shadow");
@@ -4453,8 +4771,6 @@ pub fn sweep_b_emit(
     let mb_width = width / 16;
     let mb_per_frame = ((width / 16) * (height / 16)) as usize;
     let wire_only = wire_only_enabled();
-    // n_total per shadow at this tier = the RS-frame bit count.
-    let n_totals: Vec<usize> = shadow_rs.iter().map(|(bits, _)| bits.len()).collect();
 
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
@@ -4470,44 +4786,56 @@ pub fn sweep_b_emit(
         let gop_yuv = source.gop_yuv(g)?;
         let fig = (n_frames - g * gop_size).min(gop_size);
 
-        // 1. clean encode → cover_local (LOCAL frame_idx) + mvd_meta.
-        override_map.lock().expect("lock").clear();
-        set_549_pass_idx(1);
-        let clean_bytes = shadow_encode_all_gops(
-            &gop_yuv, width, height, fig, opts, &override_map, &mb_type_table, &applied,
-            mb_width, mb_per_frame, false, PassMode::Passthrough, fig.max(1), 1, wire_only,
-        )?;
-        let clean_walk = walk_annex_b_for_cover_with_options(
-            &clean_bytes,
-            WalkOptions { record_mvd: true, ..Default::default() },
-        )
-        .map_err(|e| StegoError::InvalidVideo(format!("sweep_b clean walk: {e}")))?;
-        let cover_local = clean_walk.cover;
-
-        // 2. content_costs (local) + safe_msl_baseline + tier ∞-gates.
+        // 1+2. The per-GOP prefix: clean cover (LOCAL frame_idx) + content
+        //      costs with the safe_msl_baseline gate applied.
         //
         // Sweep A already computed this exact prefix for this GOP, and this
         // function runs once per parity tier, so without the cache it is
-        // recomputed up to 4x per GOP. A hit replaces the J-UNIWARD costs and
-        // the safe-MSL derivation; a miss recomputes and is byte-identical.
-        let mut content_costs = match prefix_cache
+        // recomputed up to 4x per GOP. A hit replaces ALL of it — the clean
+        // OpenH264 encode, the CABAC walk, the J-UNIWARD costs and the safe-MSL
+        // derivation — because the cached cover IS that clean walk: the
+        // standalone per-GOP clean encode is bit-deterministic (g.1) and each
+        // `encode_once` resets every piece of per-encode state (fork statics,
+        // `mb_type_table`, `applied`), so nothing the step-8 emit reads depends
+        // on a clean encode having run just before it. A miss recomputes, and is
+        // byte-identical either way (`h264_shadow_prefix_cache` gates on/off).
+        let (cover_local, mut content_costs) = match prefix_cache
             .as_deref_mut()
             .and_then(|c| c.fetch(g as usize))
         {
-            Some(hit) => hit.costs,
-            None => {
-                let mut cc = super::stego::content_costs::compute_content_costs_yuv(
-                    &gop_yuv, width, height, fig, &cover_local, opts.qp,
+            Some(hit) if sweep_b_reuses_cached_cover() => (hit.cover, hit.costs),
+            hit => {
+                override_map.lock().expect("lock").clear();
+                set_549_pass_idx(1);
+                let clean_bytes = shadow_encode_all_gops(
+                    &gop_yuv, width, height, fig, opts, &override_map, &mb_type_table,
+                    &applied, mb_width, mb_per_frame, false, PassMode::Passthrough,
+                    fig.max(1), 1, wire_only,
                 )?;
-                let safe_msb = analyze_safe_mvd_subset(
-                    &clean_walk.mvd_meta, clean_walk.mb_w, clean_walk.mb_h,
-                );
-                let safe_msl_baseline = derive_msl_safe_from_msb(
-                    &cover_local.mvd_sign_bypass.positions, &safe_msb,
-                    &cover_local.mvd_suffix_lsb.positions,
-                );
-                apply_safe_msl_gate(&mut cc, &safe_msl_baseline);
-                cc
+                let clean_walk = walk_annex_b_for_cover_with_options(
+                    &clean_bytes,
+                    WalkOptions { record_mvd: true, ..Default::default() },
+                )
+                .map_err(|e| StegoError::InvalidVideo(format!("sweep_b clean walk: {e}")))?;
+                let cover_local = clean_walk.cover;
+                let cc = match hit {
+                    Some(hit) => hit.costs,
+                    None => {
+                        let mut cc = super::stego::content_costs::compute_content_costs_yuv(
+                            &gop_yuv, width, height, fig, &cover_local, opts.qp,
+                        )?;
+                        let safe_msb = analyze_safe_mvd_subset(
+                            &clean_walk.mvd_meta, clean_walk.mb_w, clean_walk.mb_h,
+                        );
+                        let safe_msl_baseline = derive_msl_safe_from_msb(
+                            &cover_local.mvd_sign_bypass.positions, &safe_msb,
+                            &cover_local.mvd_suffix_lsb.positions,
+                        );
+                        apply_safe_msl_gate(&mut cc, &safe_msl_baseline);
+                        cc
+                    }
+                };
+                (cover_local, cc)
             }
         };
         apply_tier_gate(&cover_local, &mut content_costs, opts.qp, tier_idx);
@@ -4519,35 +4847,9 @@ pub fn sweep_b_emit(
             cover_local.mvd_suffix_lsb.len(),
         ];
 
-        // 3. per-GOP ShadowState_local for each shadow: the global selection's
-        //    positions that fall in THIS GOP's per-domain ranges, intra_index
-        //    relabelled local (global − offset). `rs_bits[i]` ↔ selection[i].
-        let mut states: Vec<ShadowState> = Vec::with_capacity(n_shadows);
-        for s in 0..n_shadows {
-            let sel = &sweep_a_result.selections[s];
-            let bits = &shadow_rs[s].0;
-            let mut st = ShadowState {
-                positions: Vec::new(),
-                bits: Vec::new(),
-                n_total: 0,
-                parity_len,
-                frame_data_len: shadow_rs[s].1,
-            };
-            for i in 0..n_totals[s].min(sel.len()) {
-                let slot = sel[i];
-                let d = slot.domain as usize;
-                if slot.intra_index >= offs[d] && slot.intra_index < offs[d] + sizes[d] {
-                    st.positions.push(ShadowSlot {
-                        domain: slot.domain,
-                        intra_index: slot.intra_index - offs[d],
-                        priority: slot.priority,
-                    });
-                    st.bits.push(bits[i]);
-                }
-            }
-            st.n_total = st.positions.len();
-            states.push(st);
-        }
+        // 3. per-GOP ShadowState_local for each shadow — see `gop_shadow_states`.
+        let states =
+            gop_shadow_states(&sweep_a_result.selections, shadow_rs, &offs, &sizes, parity_len);
 
         // 4. embed shadow LSBs into the cover bits + ∞-overlay the costs.
         let mut sb_csb = cover_local.coeff_sign_bypass.bits.clone();
@@ -4571,6 +4873,7 @@ pub fn sweep_b_emit(
         drop((sb_csb, sb_csl, sb_msb, sb_msl));
         let (gop_stego, nc) = embed_primary_one_gop(
             &combined, &combined_costs, primary_frame_bytes, cursor, g, n_gops, hhat_seed,
+            primary_plan,
         )?;
         cursor = nc;
         let mut domain_plan = split_plan_4domain(&gop_stego, &boundaries);
@@ -4632,7 +4935,412 @@ pub fn sweep_b_emit(
             offs[d] += sizes[d];
         }
     }
-    Ok((out, gop_lens))
+    Ok((out, gop_lens, cursor))
+}
+
+/// [`sweep_b_emit_with_cursor`] without the primary cursor — the signature the
+/// byte-identity gates call. Production must use the `_with_cursor` form: the
+/// cursor is the only evidence that the whole primary was placed (see
+/// `h264_encode_with_shadows_streaming`).
+#[allow(clippy::too_many_arguments)]
+pub fn sweep_b_emit(
+    source: &mut dyn GopYuvSource,
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    primary_frame_bytes: &[u8],
+    primary_plan: Option<&[usize]>,
+    hhat_seed: &[u8; 32],
+    sweep_a_result: &SweepAResult,
+    shadow_rs: &[(Vec<u8>, usize)],
+    parity_len: usize,
+    tier_idx: u8,
+    weights: &CostWeights,
+    prefix_cache: Option<&mut crate::stego::gop_cache::BoundedGopCache<super::stego::content_costs::ShadowGopPrefix>>,
+) -> Result<(Vec<u8>, Vec<usize>), StegoError> {
+    sweep_b_emit_with_cursor(
+        source, width, height, n_frames, opts, primary_frame_bytes, primary_plan, hhat_seed,
+        sweep_a_result, shadow_rs, parity_len, tier_idx, weights, prefix_cache,
+    )
+    .map(|(out, gop_lens, _)| (out, gop_lens))
+}
+
+/// One GOP's slice of sweep A's GLOBAL shadow selections at one parity tier.
+///
+/// For each shadow: the selected positions that fall inside this GOP's
+/// per-domain ranges (`offs[d]..offs[d] + sizes[d]`), relabelled to the local
+/// `intra_index` (global − offset), each paired with its RS bit
+/// (`shadow_rs[s].0[i]` ↔ `selections[s][i]`, first `n_total` only). Sweep B,
+/// the primary dry run and the loaded-capacity instrument all take their
+/// slots from here, so the three stamp and fence exactly the same positions.
+fn gop_shadow_states(
+    selections: &[Vec<super::stego::shadow::ShadowSlot>],
+    shadow_rs: &[(Vec<u8>, usize)],
+    offs: &[usize; 4],
+    sizes: &[usize; 4],
+    parity_len: usize,
+) -> Vec<super::stego::shadow::ShadowState> {
+    use super::stego::shadow::{ShadowSlot, ShadowState};
+    let mut states = Vec::with_capacity(shadow_rs.len());
+    for (s, (bits, frame_data_len)) in shadow_rs.iter().enumerate() {
+        let sel = &selections[s];
+        let mut st = ShadowState {
+            positions: Vec::new(),
+            bits: Vec::new(),
+            n_total: 0,
+            parity_len,
+            frame_data_len: *frame_data_len,
+        };
+        for i in 0..bits.len().min(sel.len()) {
+            let slot = sel[i];
+            let d = slot.domain as usize;
+            if slot.intra_index >= offs[d] && slot.intra_index < offs[d] + sizes[d] {
+                st.positions.push(ShadowSlot {
+                    domain: slot.domain,
+                    intra_index: slot.intra_index - offs[d],
+                    priority: slot.priority,
+                });
+                st.bits.push(bits[i]);
+            }
+        }
+        st.n_total = st.positions.len();
+        states.push(st);
+    }
+    states
+}
+
+/// Sweep B steps 1–2 on the STRUCTURAL cost mask: one GOP's clean cover and
+/// the ∞ pattern its primary costs will carry (safe-MSL and tier gates
+/// included). Exact for anything that only asks whether a payload fits —
+/// `stc_embed` fails iff no finite-cost path exists, so only the ∞ pattern
+/// matters (`content_costs::compute_cost_mask`; `cap2_mask_equivalence` pins
+/// it against the full J-UNIWARD costs sweep B uses).
+#[allow(clippy::too_many_arguments)]
+fn gop_clean_cover_and_mask(
+    gop_yuv: &[u8],
+    width: u32,
+    height: u32,
+    fig: u32,
+    opts: EncodeOpts,
+    tier_idx: u8,
+    override_map: &Arc<Mutex<HashMap<u64, u8>>>,
+    mb_type_table: &Arc<Mutex<Vec<u8>>>,
+    applied: &Arc<Mutex<u32>>,
+    mb_width: u32,
+    mb_per_frame: usize,
+    wire_only: bool,
+) -> Result<(super::stego::inject::DomainCover, DomainCosts), StegoError> {
+    use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
+    override_map.lock().expect("lock").clear();
+    set_549_pass_idx(1);
+    let clean_bytes = shadow_encode_all_gops(
+        gop_yuv, width, height, fig, opts, override_map, mb_type_table, applied, mb_width,
+        mb_per_frame, false, PassMode::Passthrough, fig.max(1), 1, wire_only,
+    )?;
+    let walk = walk_annex_b_for_cover_with_options(
+        &clean_bytes,
+        WalkOptions { record_mvd: true, ..Default::default() },
+    )
+    .map_err(|e| StegoError::InvalidVideo(format!("clean-cover walk: {e}")))?;
+    let cover = walk.cover;
+    let mut costs = super::stego::content_costs::compute_cost_mask(&cover, fig);
+    let safe_msb = analyze_safe_mvd_subset(&walk.mvd_meta, walk.mb_w, walk.mb_h);
+    let safe_msl = derive_msl_safe_from_msb(
+        &cover.mvd_sign_bypass.positions, &safe_msb, &cover.mvd_suffix_lsb.positions,
+    );
+    apply_safe_msl_gate(&mut costs, &safe_msl);
+    apply_tier_gate(&cover, &mut costs, opts.qp, tier_idx);
+    Ok((cover, costs))
+}
+
+/// D2 — **primary dry run**: will sweep B place the WHOLE primary, at each
+/// parity tier? Returns, per entry of `shadow_rs_by_tier`, the primary cursor
+/// sweep B's drain would end on (`Some`), or `None` for a tier sweep B skips
+/// because a shadow has fewer selected positions than its RS frame needs.
+///
+/// Exact, not an estimate. The drain (`embed_primary_one_gop`) decides how
+/// much each GOP takes purely by whether `stc_embed` finds a finite-cost path,
+/// and that depends only on the cover bits (with the shadow stamps), the ∞
+/// pattern, the chunk bits and `hhat` — all of which are reproduced here:
+/// the same clean cover (from sweep A's prefix cache when it hits, else a
+/// clean re-encode), the structural mask or the cached costs (identical ∞
+/// pattern), sweep A's selections, the very RS frames sweep B will stamp, the
+/// real primary frame, plan and seed — and the SAME drain loop
+/// (`drain_primary_one_gop`), asking `stc_is_feasible` instead of embedding.
+/// So the cursors match sweep B's bit for bit.
+///
+/// Why it exists: per-GOP capacity is measured with no shadows present, and
+/// the shadows cost the primary ~9% on average and up to 38% in one GOP
+/// (`d2_shadow_loading.rs`, 2026-10-23). Without this an over-full primary is
+/// found out only after the full encode — or, before 2026-10-23, not at all.
+#[allow(clippy::too_many_arguments)]
+fn primary_dry_run(
+    source: &mut dyn GopYuvSource,
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    primary_frame_bytes: &[u8],
+    primary_plan: Option<&[usize]>,
+    hhat_seed: &[u8; 32],
+    sweep_a_result: &SweepAResult,
+    shadow_rs_by_tier: &[Vec<(Vec<u8>, usize)>],
+    parity_tiers: &[usize],
+    tier_idx: u8,
+    weights: &CostWeights,
+    // Sweep A's per-GOP prefix cache. A hit carries the GOP's clean cover and
+    // its costs (same ∞ pattern as the structural mask), so the GOP needs no
+    // re-encode — and no source pull, so `tick_unpulled` keeps progress moving.
+    mut prefix_cache: Option<&mut crate::stego::gop_cache::BoundedGopCache<super::stego::content_costs::ShadowGopPrefix>>,
+    tick_unpulled: &mut dyn FnMut(),
+) -> Result<Vec<Option<usize>>, StegoError> {
+    use super::stego::cost_weights::combine_bits_4domain;
+    use super::stego::shadow::{embed_shadow_lsb, overlay_infinity_costs};
+    use crate::stego::stc::embed::stc_is_feasible;
+
+    let gop_size = opts.intra_period.max(1) as u32;
+    let n_gops = n_frames.div_ceil(gop_size).max(1);
+    let mb_width = width / 16;
+    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let wire_only = wire_only_enabled();
+    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    // A tier sweep B would skip is never attempted.
+    let attempted: Vec<bool> = shadow_rs_by_tier
+        .iter()
+        .map(|rs| {
+            rs.iter()
+                .enumerate()
+                .all(|(s, (bits, _))| sweep_a_result.selections[s].len() >= bits.len())
+        })
+        .collect();
+    let mut cursors = vec![0usize; parity_tiers.len()];
+    let mut offs = [0usize; 4];
+    source.rewind()?;
+    for g in 0..n_gops {
+        let fig = (n_frames - g * gop_size).min(gop_size);
+        let cached = prefix_cache.as_deref_mut().and_then(|c| c.fetch(g as usize));
+        let (cover, mask) = match cached {
+            Some(hit) => {
+                tick_unpulled();
+                let mut costs = hit.costs;
+                apply_tier_gate(&hit.cover, &mut costs, opts.qp, tier_idx);
+                (hit.cover, costs)
+            }
+            None => {
+                let gop_yuv = source.gop_yuv(g)?;
+                gop_clean_cover_and_mask(
+                    &gop_yuv, width, height, fig, opts, tier_idx, &override_map,
+                    &mb_type_table, &applied, mb_width, mb_per_frame, wire_only,
+                )?
+            }
+        };
+        let sizes = [
+            cover.coeff_sign_bypass.len(), cover.coeff_suffix_lsb.len(),
+            cover.mvd_sign_bypass.len(), cover.mvd_suffix_lsb.len(),
+        ];
+        for (t, &parity_len) in parity_tiers.iter().enumerate() {
+            if !attempted[t] {
+                continue;
+            }
+            let states = gop_shadow_states(
+                &sweep_a_result.selections, &shadow_rs_by_tier[t], &offs, &sizes, parity_len,
+            );
+            let mut costs = mask.clone();
+            let mut b_csb = cover.coeff_sign_bypass.bits.clone();
+            let mut b_csl = cover.coeff_suffix_lsb.bits.clone();
+            let mut b_msb = cover.mvd_sign_bypass.bits.clone();
+            let mut b_msl = cover.mvd_suffix_lsb.bits.clone();
+            for st in &states {
+                embed_shadow_lsb(&mut b_csb, &mut b_csl, &mut b_msb, &mut b_msl, st);
+                overlay_infinity_costs(
+                    &mut costs.coeff_sign_bypass, &mut costs.coeff_suffix_lsb,
+                    &mut costs.mvd_sign_bypass, &mut costs.mvd_suffix_lsb, st,
+                );
+            }
+            let (comb, comb_costs, _) =
+                combine_bits_4domain(&b_csb, &b_csl, &b_msb, &b_msl, &costs, weights);
+            let (_, nc) = drain_primary_one_gop(
+                &comb, &comb_costs, primary_frame_bytes, cursors[t], g, n_gops, hhat_seed,
+                primary_plan,
+                |cover, costs, bits, hhat, w| {
+                    stc_is_feasible(cover, costs, bits, hhat, STC_H, w).then_some(())
+                },
+            )?;
+            cursors[t] = nc;
+        }
+        for d in 0..4 {
+            offs[d] += sizes[d];
+        }
+    }
+    Ok(cursors
+        .into_iter()
+        .zip(attempted)
+        .map(|(c, a)| a.then_some(c))
+        .collect())
+}
+
+/// D2 residual — per-GOP primary capacity with and without the shadows in the
+/// cover, from ONE clean encode per GOP.
+///
+/// The capacity probe (`h264_gop_capacity`) measures each GOP with no shadows
+/// present, and both the HUD and the planner work from that figure. In a
+/// shadow encode, sweep B first stamps every shadow's bits into the cover and
+/// sets those positions to ∞ for the primary STC (`overlay_infinity_costs`),
+/// so the primary has fewer finite positions than the probe saw. This
+/// measures by how much, on exactly the cover and ∞ pattern sweep B builds:
+/// same clean encode, same safe-MSL and tier gates, same per-GOP slice of
+/// sweep A's global selections, at the given `parity_len`. Both columns use
+/// the probe's STC trial on the structural cost mask, which is exact for
+/// capacity — `stc_embed` fails iff no finite-cost path exists, so only the
+/// ∞ pattern matters (`content_costs::compute_cost_mask`; pinned against the
+/// full J-UNIWARD costs by `cap2_mask_equivalence`).
+///
+/// Instrument first (`d2_residual_*` in `oh264_video_shadow_roundtrip.rs`);
+/// it is also the building block for planning the primary against the
+/// loaded figure, if the measurements say that is worth a pass.
+#[derive(Debug, Clone)]
+pub struct ShadowLoadedCaps {
+    /// RS parity bytes per block the shadows were sized at.
+    pub parity_len: usize,
+    /// Tier from `streaming_tier_prepass`, as sweep B would use it.
+    pub tier_idx: u8,
+    /// Per GOP: primary STC-trial capacity (bytes) with no shadow in the cover.
+    pub unloaded: Vec<usize>,
+    /// Per GOP: the same trial with every shadow's slots stamped and ∞-fenced.
+    pub loaded: Vec<usize>,
+    /// Per GOP: primary-FINITE positions in the cover before the overlay.
+    pub finite_total: Vec<usize>,
+    /// Per GOP: how many of those the shadows took.
+    pub finite_taken: Vec<usize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn h264_shadow_loaded_gop_caps(
+    source: &mut dyn GopYuvSource,
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    opts: EncodeOpts,
+    primary_message: &str,
+    primary_passphrase: &str,
+    shadows: &[crate::stego::shadow_layer::ShadowLayer<'_>],
+    weights: &CostWeights,
+    parity_len: usize,
+) -> Result<ShadowLoadedCaps, StegoError> {
+    use super::stego::shadow::{build_shadow_rs_frame, embed_shadow_lsb, overlay_infinity_costs};
+    use super::stego::cost_weights::combine_bits_4domain;
+    use crate::stego::shadow_layer::SHADOW_PARITY_TIERS;
+
+    if shadows.is_empty() {
+        return Err(StegoError::InvalidVideo("h264_shadow_loaded_gop_caps: no shadows".into()));
+    }
+    let (frame_bytes, hhat_seed) = prep_primary_payload(primary_message, &[], primary_passphrase)?;
+    let tier_idx =
+        streaming_tier_prepass(source, width, height, n_frames, opts, frame_bytes.len())?;
+    let capacities: Vec<usize> = shadows
+        .iter()
+        .map(|s| {
+            build_shadow_rs_frame(s.passphrase, s.message, s.files, *SHADOW_PARITY_TIERS.last().unwrap())
+                .map(|(bits, _)| bits.len())
+        })
+        .collect::<Result<_, _>>()?;
+    let sa = sweep_a(
+        source, width, height, n_frames, opts, &frame_bytes, &hhat_seed, shadows, &capacities,
+        tier_idx, weights, None,
+    )?;
+    let shadow_rs: Vec<(Vec<u8>, usize)> = shadows
+        .iter()
+        .map(|s| build_shadow_rs_frame(s.passphrase, s.message, s.files, parity_len))
+        .collect::<Result<_, _>>()?;
+    if shadow_rs.iter().enumerate().any(|(s, (bits, _))| sa.selections[s].len() < bits.len()) {
+        return Err(StegoError::MessageTooLarge);
+    }
+
+    let gop_size = opts.intra_period.max(1) as u32;
+    let n_gops = n_frames.div_ceil(gop_size).max(1);
+    let mb_width = width / 16;
+    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let wire_only = wire_only_enabled();
+    let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
+    let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    let mut out = ShadowLoadedCaps {
+        parity_len,
+        tier_idx,
+        unloaded: Vec::with_capacity(n_gops as usize),
+        loaded: Vec::with_capacity(n_gops as usize),
+        finite_total: Vec::with_capacity(n_gops as usize),
+        finite_taken: Vec::with_capacity(n_gops as usize),
+    };
+    let mut offs = [0usize; 4];
+    source.rewind()?;
+    for g in 0..n_gops {
+        let gop_yuv = source.gop_yuv(g)?;
+        let fig = (n_frames - g * gop_size).min(gop_size);
+
+        let (cover, mut costs) = gop_clean_cover_and_mask(
+            &gop_yuv, width, height, fig, opts, tier_idx, &override_map, &mb_type_table,
+            &applied, mb_width, mb_per_frame, wire_only,
+        )?;
+
+        let finite_before = [
+            &costs.coeff_sign_bypass, &costs.coeff_suffix_lsb,
+            &costs.mvd_sign_bypass, &costs.mvd_suffix_lsb,
+        ]
+        .iter()
+        .map(|v| v.iter().filter(|c| c.is_finite()).count())
+        .sum::<usize>();
+
+        // Unloaded: the bare cover.
+        let (cb, cc, _) = combine_bits_4domain(
+            &cover.coeff_sign_bypass.bits, &cover.coeff_suffix_lsb.bits,
+            &cover.mvd_sign_bypass.bits, &cover.mvd_suffix_lsb.bits, &costs, weights,
+        );
+        out.unloaded.push(cap2_stc_trial_max_payload(&cb, &cc));
+
+        // Step 3: this GOP's slice of each shadow's global selection.
+        let sizes = [
+            cover.coeff_sign_bypass.len(), cover.coeff_suffix_lsb.len(),
+            cover.mvd_sign_bypass.len(), cover.mvd_suffix_lsb.len(),
+        ];
+        let states = gop_shadow_states(&sa.selections, &shadow_rs, &offs, &sizes, parity_len);
+
+        // Step 4: stamp + fence, exactly as sweep B does.
+        let mut b_csb = cover.coeff_sign_bypass.bits.clone();
+        let mut b_csl = cover.coeff_suffix_lsb.bits.clone();
+        let mut b_msb = cover.mvd_sign_bypass.bits.clone();
+        let mut b_msl = cover.mvd_suffix_lsb.bits.clone();
+        for st in &states {
+            embed_shadow_lsb(&mut b_csb, &mut b_csl, &mut b_msb, &mut b_msl, st);
+            overlay_infinity_costs(
+                &mut costs.coeff_sign_bypass, &mut costs.coeff_suffix_lsb,
+                &mut costs.mvd_sign_bypass, &mut costs.mvd_suffix_lsb, st,
+            );
+        }
+        let finite_after = [
+            &costs.coeff_sign_bypass, &costs.coeff_suffix_lsb,
+            &costs.mvd_sign_bypass, &costs.mvd_suffix_lsb,
+        ]
+        .iter()
+        .map(|v| v.iter().filter(|c| c.is_finite()).count())
+        .sum::<usize>();
+
+        // Loaded: what the primary STC actually gets.
+        let (lb, lc, _) = combine_bits_4domain(&b_csb, &b_csl, &b_msb, &b_msl, &costs, weights);
+        out.loaded.push(cap2_stc_trial_max_payload(&lb, &lc));
+        out.finite_total.push(finite_before);
+        out.finite_taken.push(finite_before - finite_after);
+
+        for d in 0..4 {
+            offs[d] += sizes[d];
+        }
+    }
+    Ok(out)
 }
 
 /// WV.6.g.5 — **streaming per-tier verify**: the O(GOP) replacement for the
@@ -4906,6 +5614,62 @@ mod tests {
             }
         }
         out
+    }
+
+    /// D10 (2026-10-23) — the probe's shadow pool is exactly the set the
+    /// shadow encoder and decoder enumerate: every CoeffSign, CoeffSuffixLsb
+    /// and MvdSign position plus the cascade-safe MvdSuffixLsb ones.
+    ///
+    /// Recomputed here from scratch — clean encode, walk, the decoder's own
+    /// mask chain, a domain-by-domain sum — rather than by calling
+    /// `for_each_eligible_position` again, so the test checks the rule and
+    /// not merely that the probe calls the same function twice. Also asserts
+    /// the clip really has safe MSL positions, otherwise the pre-D10 count
+    /// would pass too and the test would prove nothing.
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn d10_injectable_cover_bits_is_the_shadow_eligible_pool() {
+        let _g = SESSION_TEST_MUTEX.lock().unwrap();
+        const W: u32 = 176;
+        const H: u32 = 96;
+        const NF: u32 = 8;
+        let yuv = synth_yuv(W, H, NF);
+        let opts = EncodeOpts { qp: 26, intra_period: 30 };
+
+        let cap = h264_gop_capacity(&yuv, W, H, NF, opts, &CostWeights::default(), false)
+            .expect("probe");
+
+        let bitstream = clean_encode_gop(&yuv, W, H, NF, opts).expect("clean encode");
+        let walk = walk_annex_b_for_cover_with_options(
+            &bitstream,
+            WalkOptions { record_mvd: true, ..Default::default() },
+        )
+        .expect("walk");
+        let safe_msb = super::super::stego::cascade_safety::analyze_safe_mvd_subset(
+            &walk.mvd_meta, walk.mb_w, walk.mb_h,
+        );
+        let safe_msl = super::super::stego::cascade_safety::derive_msl_safe_from_msb(
+            &walk.cover.mvd_sign_bypass.positions,
+            &safe_msb,
+            &walk.cover.mvd_suffix_lsb.positions,
+        );
+        let n_msl = walk.cover.mvd_suffix_lsb.positions.len();
+        let safe_msl_count = safe_msl.iter().take(n_msl).filter(|&&b| b).count();
+        let three_domain = walk.cover.coeff_sign_bypass.bits.len()
+            + walk.cover.coeff_suffix_lsb.bits.len()
+            + walk.cover.mvd_sign_bypass.bits.len();
+
+        assert!(
+            safe_msl_count > 0,
+            "fixture has no cascade-safe MSL positions (of {n_msl}); it cannot \
+             distinguish the D10 count from the old three-domain one",
+        );
+        assert_eq!(
+            cap.injectable_cover_bits,
+            three_domain + safe_msl_count,
+            "probe pool {} != CS+CSL+MvdSign {three_domain} + safe MSL {safe_msl_count}",
+            cap.injectable_cover_bits,
+        );
     }
 
     /// B-lite.1 (#890) gate — the global-free `clean_encode_gop` producer is

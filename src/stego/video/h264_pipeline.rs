@@ -51,6 +51,9 @@ pub fn h264_ghost_decode(
             {
                 return Ok(payload);
             }
+            // The walker answers a cancel with a miss; don't report that as
+            // a wrong passphrase.
+            crate::stego::progress::check_cancelled()?;
             return Err(StegoError::DecryptionFailed);
         }
         #[cfg(not(feature = "h264-decoder"))]

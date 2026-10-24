@@ -1021,6 +1021,48 @@ mod tests {
         );
     }
 
+    /// The AVX2 IDCT against the scalar one, block by block: every single
+    /// coefficient position at three amplitudes, and random blocks in the
+    /// 8-bit JPEG range. The hash test above compares 12 fixed blocks; this
+    /// one says WHICH input breaks. Its register packing was wrong for every
+    /// block from the day it landed until 2026-10-24, unnoticed because no
+    /// test ever ran on AVX2 hardware — CI now runs it on x86 runners and
+    /// under Miri (`.github/workflows/simd-parity.yml`). Skips without AVX2.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_idct_matches_scalar_block_by_block() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let check = |q: &[i16; 64], qt: &[u16; 64], what: &str| {
+            let mut s = [0i32; 64];
+            idct_kernel_scalar(q, qt, &mut s);
+            let mut a = [0i32; 64];
+            unsafe { super::super::pixels_aan_simd::avx2::idct_kernel_avx2(q, qt, &mut a) };
+            assert_eq!(a, s, "AVX2 IDCT differs from scalar: {what}");
+        };
+        let ones = [1u16; 64];
+        for k in 0..64 {
+            for v in [256i16, -300, 1] {
+                let mut q = [0i16; 64];
+                q[k] = v;
+                check(&q, &ones, &format!("impulse at {k} = {v}"));
+            }
+        }
+        let mut x: u32 = 0x1234_5678;
+        for n in 0..200 {
+            let mut q = [0i16; 64];
+            for (i, c) in q.iter_mut().enumerate() {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                // Within 8-bit JPEG range (|q * qt| <= 1023), mostly small.
+                let lim = (1023 / AAN_TEST_QT_LUMA50[i] as i32).max(1);
+                let span = if (x >> 28) < 3 { lim } else { lim.min(8) };
+                *c = (((x >> 8) as i32 % (2 * span + 1)) - span) as i16;
+            }
+            check(&q, &AAN_TEST_QT_LUMA50, &format!("random block {n}"));
+        }
+    }
+
     #[test]
     fn determinism_across_runs() {
         // Sanity: the integer path is deterministic by construction.
@@ -1039,3 +1081,4 @@ mod tests {
         assert_eq!(p1, p2);
     }
 }
+

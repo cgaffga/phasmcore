@@ -6,7 +6,8 @@
 //
 // One #[test] per fixture so cargo's parallel runner spreads the
 // encode workload across cores. Each fixture:
-//   1. Scales corpus MP4 → YUV at largest 16-aligned dim (cached at /tmp).
+//   1. Scales corpus MP4 → YUV at largest 16-aligned dim (cached under
+//      `$PHASM_TMP`).
 //   2. Encodes via OH264 stego pipeline with a passphrase-driven message.
 //   3. Decodes back via openh264_stego_decode_yuv_string → assert recovery.
 //   4. Muxes the stego annex-B to mp4 via ffmpeg, writing to
@@ -24,19 +25,14 @@
 mod common;
 use common::oh264_stream;
 
+// Fixture/loader scaffolding (session guard, corpus root, ffprobe dims,
+// cached scale-to-I420) is shared in `common::video_fixture`. This suite keeps
+// its own `phasm_oh264_corpus_*` YUV cache via `ensure_scaled_yuv`.
+use common::video_fixture::{
+    ensure_scaled_yuv, probe_aligned_dims, session_guard, ScaleRecipe,
+    VideoFixture as Fixture,
+};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
-}
-
-fn corpus_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
 
 fn desktop_dir() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME env var");
@@ -45,84 +41,17 @@ fn desktop_dir() -> PathBuf {
     p
 }
 
-struct Fixture {
-    name: &'static str,
-    source_mp4: &'static str,
-    /// Optional cap on the longer side (pixels). Source aspect is
-    /// preserved; both axes are rounded down to the nearest multiple
-    /// of 16 (H.264 MB alignment). `None` = use source dims with only
-    /// the 16-align rounding.
-    long_side_cap: Option<u32>,
-    n_frames: u32,
-    qp: i32,
-}
-
-/// Probe source W×H via ffprobe, then return 16-aligned dims that
-/// preserve the source aspect ratio. If `long_side_cap` is set, the
-/// longer axis is bounded by it (uniformly scaling down).
-fn probe_aligned_dims(spec: &Fixture) -> (u32, u32) {
-    let src = corpus_root().join(spec.source_mp4);
-    assert!(src.exists(), "corpus fixture missing: {}", src.display());
-    let out = std::process::Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "v:0",
-               "-show_entries", "stream=width,height",
-               "-of", "csv=p=0"])
-        .arg(&src)
-        .output()
-        .expect("ffprobe");
-    let s = String::from_utf8_lossy(&out.stdout);
-    let trimmed = s.trim();
-    let parts: Vec<&str> = trimmed.split(',').collect();
-    let src_w: u32 = parts[0].parse().expect("source width");
-    let src_h: u32 = parts[1].parse().expect("source height");
-
-    let (mut tw, mut th) = (src_w, src_h);
-    if let Some(cap) = spec.long_side_cap {
-        let long = src_w.max(src_h) as f64;
-        if (long as u32) > cap {
-            let scale = cap as f64 / long;
-            tw = (src_w as f64 * scale) as u32;
-            th = (src_h as f64 * scale) as u32;
-        }
-    }
-    // Round DOWN to nearest multiple of 16 (H.264 MB align).
-    let aligned_w = (tw / 16) * 16;
-    let aligned_h = (th / 16) * 16;
-    (aligned_w.max(16), aligned_h.max(16))
-}
-
 fn ensure_yuv(spec: &Fixture, w: u32, h: u32) -> Vec<u8> {
-    let yuv_path = format!(
-        "{}/phasm_oh264_corpus_{}_{}x{}_f{}.yuv", common::scratch_dir(),
-        spec.name, w, h, spec.n_frames
-    );
-    let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * (spec.n_frames as usize);
-    if let Ok(data) = std::fs::read(&yuv_path) {
-        if data.len() >= need {
-            return data;
-        }
-    }
-    let src = corpus_root().join(spec.source_mp4);
-    assert!(src.exists(), "corpus fixture missing: {}", src.display());
-    let vf = format!("scale={}:{}", w, h);
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &spec.n_frames.to_string()])
-        .args(["-an", "-vf", &vf])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {}", spec.source_mp4);
-    std::fs::read(&yuv_path).expect("read yuv")
+    ensure_scaled_yuv(
+        spec.source_mp4, "phasm_oh264_corpus", spec.name,
+        w, h, spec.n_frames, ScaleRecipe::PixFmt,
+    )
 }
 
 /// Wrap a stego Annex-B stream into an mp4 via ffmpeg copy-mux.
 /// Writes to ~/Desktop/phasm_oh264_<name>_stego.mp4.
 fn mux_to_desktop(stego_bytes: &[u8], name: &str) -> PathBuf {
-    let h264_path = std::env::temp_dir().join(format!("phasm_oh264_demo_{}.h264", name));
+    let h264_path = common::scratch_path(&format!("phasm_oh264_demo_{}.h264", name));
     let mp4_path = desktop_dir().join(format!("phasm_oh264_{}_stego.mp4", name));
     std::fs::write(&h264_path, stego_bytes).expect("write annex-b");
     let status = std::process::Command::new("ffmpeg")

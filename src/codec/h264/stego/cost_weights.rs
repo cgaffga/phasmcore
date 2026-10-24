@@ -254,6 +254,7 @@ pub fn combine_bits_4domain(
     costs: &DomainCosts,
     weights: &CostWeights,
 ) -> (Vec<u8>, Vec<f32>, DomainBoundaries) {
+    let _prof = crate::codec::h264::profile::scope("cost.combine");
     let n_cs = coeff_sign_bits.len();
     let n_csl = coeff_suffix_bits.len();
     let n_mvds = mvd_sign_bits.len();

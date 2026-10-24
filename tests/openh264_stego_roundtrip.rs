@@ -28,44 +28,11 @@ mod common;
 use common::oh264_stream;
 
 use phasm_core::stego::payload::FileEntry;
-use std::sync::{Mutex, OnceLock};
-
-static SESSION_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-fn session_guard() -> &'static Mutex<()> {
-    SESSION_GUARD.get_or_init(|| Mutex::new(()))
-}
-
-fn corpus_root() -> std::path::PathBuf {
-    let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("test-vectors/video/h264/real-world/source");
-    p
-}
+// Session guard + the cached scale-to-I420 are shared in `common::video_fixture`.
+use common::video_fixture::{ensure_scaled_yuv, session_guard, ScaleRecipe};
 
 fn ensure_yuv(name: &str, source_mp4: &str, w: u32, h: u32, n_frames: u32) -> Vec<u8> {
-    let yuv_path = format!("{}/phasm_c813_{}_{}x{}_f{}.yuv", common::scratch_dir(), name, w, h, n_frames);
-    let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * (n_frames as usize);
-    if let Ok(data) = std::fs::read(&yuv_path) {
-        if data.len() >= need {
-            return data;
-        }
-    }
-    let src = corpus_root().join(source_mp4);
-    if !src.exists() {
-        panic!("corpus fixture missing: {}", src.display());
-    }
-    let vf = format!("scale={}:{}", w, h);
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
-        .arg(&src)
-        .args(["-frames:v", &n_frames.to_string()])
-        .args(["-an", "-vf", &vf])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg");
-    assert!(status.success(), "ffmpeg scale failed for {}", source_mp4);
-    std::fs::read(&yuv_path).expect("read yuv")
+    ensure_scaled_yuv(source_mp4, "phasm_c813", name, w, h, n_frames, ScaleRecipe::PixFmt)
 }
 
 /// v1.0 ship gate: the streaming capacity probe returns a non-trivial

@@ -13,6 +13,12 @@
 //! already live in one place (`common::visual_metrics`) for the same reason;
 //! this is the loader half.
 //!
+//! The other OH264 corpus tests (corpus validation, the stealth + spatial
+//! gates, visual_recon, the roundtrip + decode-perf suites, the MVD cost
+//! instrument) were migrated onto it on 2026-10-23. Each keeps its own YUV
+//! cache prefix and ffmpeg recipe ([`ensure_scaled_yuv`]) so caches already on
+//! disk keep hitting and a cache miss regenerates the same bytes as before.
+//!
 //! Scratch policy: every intermediate goes through `common::scratch_dir()`
 //! (i.e. `$PHASM_TMP`), never `std::env::temp_dir()`. The decoded-YUV caches
 //! here are hundreds of MB per fixture/resolution; see `common::scratch_dir`
@@ -47,15 +53,17 @@ pub fn corpus_root() -> PathBuf {
 pub struct VideoFixture {
     pub name: &'static str,
     pub source_mp4: &'static str,
+    /// Optional cap on the longer side (pixels). Source aspect is preserved;
+    /// both axes are rounded down to the nearest multiple of 16 (H.264 MB
+    /// alignment). `None` = source dims with only the 16-align rounding.
     pub long_side_cap: Option<u32>,
     pub n_frames: u32,
     pub qp: i32,
 }
 
-/// Probe source W×H via ffprobe and return aspect-preserving 16-aligned
-/// dims (H.264 macroblock alignment). Capped at `long_side_cap` if set.
-pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
-    let src = corpus_root().join(spec.source_mp4);
+/// Probe a corpus clip's native W×H via ffprobe.
+pub fn probe_source_dims(source_mp4: &str) -> (u32, u32) {
+    let src = corpus_root().join(source_mp4);
     assert!(src.exists(), "corpus fixture missing: {}", src.display());
     let out = std::process::Command::new("ffprobe")
         .args([
@@ -75,6 +83,13 @@ pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
     let parts: Vec<&str> = s.trim().split(',').collect();
     let src_w: u32 = parts[0].parse().expect("source width");
     let src_h: u32 = parts[1].parse().expect("source height");
+    (src_w, src_h)
+}
+
+/// Probe source W×H via ffprobe and return aspect-preserving 16-aligned
+/// dims (H.264 macroblock alignment). Capped at `long_side_cap` if set.
+pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
+    let (src_w, src_h) = probe_source_dims(spec.source_mp4);
 
     let (mut tw, mut th) = (src_w, src_h);
     if let Some(cap) = spec.long_side_cap {
@@ -90,6 +105,24 @@ pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
     (aw.max(16), ah.max(16))
 }
 
+/// The clean-OH264-baseline dim rule: fit the longest side to 1920, the other
+/// axis scaled and rounded down to a multiple of 16.
+///
+/// Mirrors `get_target_dims` in
+/// `test-vectors/video/h264/real-world/source/regen_openh264_baseline.sh`. The
+/// committed `tests/data/openh264_baseline_*_reference_mb_histogram.txt`
+/// histograms were generated at these dims, so the stealth + spatial gates
+/// must use exactly this rule — not [`probe_aligned_dims`], which only ever
+/// scales down.
+pub fn probe_baseline_dims(source_mp4: &str) -> (u32, u32) {
+    let (iw, ih) = probe_source_dims(source_mp4);
+    if iw >= ih {
+        (1920, ((1920 * ih) / iw / 16) * 16)
+    } else {
+        (((1920 * iw) / ih / 16) * 16, 1920)
+    }
+}
+
 /// Scale the corpus clip to a flat I420 buffer of `spec.n_frames` frames at
 /// `w`×`h`, caching the result under `$PHASM_TMP`.
 ///
@@ -97,29 +130,78 @@ pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
 /// original `openh264_visual_psnr_regression` implementation so existing
 /// caches on a developer machine keep being reused.
 pub fn ensure_yuv(spec: &VideoFixture, w: u32, h: u32) -> Vec<u8> {
+    ensure_scaled_yuv(
+        spec.source_mp4,
+        "phasm_oh264_psnr",
+        spec.name,
+        w,
+        h,
+        spec.n_frames,
+        ScaleRecipe::PixFmt,
+    )
+}
+
+/// The ffmpeg command that turns a corpus clip into raw I420.
+///
+/// Two recipes exist and are kept distinct on purpose. Each one fills YUV
+/// caches that are already on disk, and `FormatFilter` additionally shares its
+/// `openh264_baseline_*` cache files with `regen_openh264_baseline.sh`. A cache
+/// miss must regenerate the bytes the file's previous owner would have, so a
+/// caller keeps the recipe it had before the loaders were unified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScaleRecipe {
+    /// `-an -vf scale=W:H -f rawvideo -pix_fmt yuv420p`: the visual-gate recipe.
+    PixFmt,
+    /// `-vf scale=W:H,format=yuv420p -f rawvideo`: the
+    /// `regen_openh264_baseline.sh` recipe.
+    FormatFilter,
+}
+
+/// Scale `n_frames` of the corpus clip `source_mp4` to a flat I420 buffer at
+/// `w`×`h`, cached at `$PHASM_TMP/{cache_prefix}_{key}_{w}x{h}_f{n_frames}.yuv`.
+///
+/// A cache file at least `n_frames` frames long is returned whole; otherwise
+/// ffmpeg regenerates it with `recipe`. Every caller passes the prefix and
+/// recipe its pre-unification loader used, so the cache names and contents
+/// are unchanged.
+pub fn ensure_scaled_yuv(
+    source_mp4: &str,
+    cache_prefix: &str,
+    key: &str,
+    w: u32,
+    h: u32,
+    n_frames: u32,
+    recipe: ScaleRecipe,
+) -> Vec<u8> {
     let yuv_path = super::scratch_path(&format!(
-        "phasm_oh264_psnr_{}_{}x{}_f{}.yuv",
-        spec.name, w, h, spec.n_frames
+        "{cache_prefix}_{key}_{w}x{h}_f{n_frames}.yuv"
     ));
     let frame_size = (w * h * 3 / 2) as usize;
-    let need = frame_size * (spec.n_frames as usize);
+    let need = frame_size * (n_frames as usize);
     if let Ok(data) = std::fs::read(&yuv_path) {
         if data.len() >= need {
             return data;
         }
     }
-    let src = corpus_root().join(spec.source_mp4);
-    let vf = format!("scale={w}:{h}");
-    let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-i"])
+    let src = corpus_root().join(source_mp4);
+    assert!(src.exists(), "corpus fixture missing: {}", src.display());
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-i"])
         .arg(&src)
-        .args(["-frames:v", &spec.n_frames.to_string()])
-        .args(["-an", "-vf", &vf])
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
-        .arg(&yuv_path)
-        .status()
-        .expect("ffmpeg launch");
-    assert!(status.success(), "ffmpeg scale failed for {}", spec.source_mp4);
+        .args(["-frames:v", &n_frames.to_string()]);
+    match recipe {
+        ScaleRecipe::PixFmt => {
+            let vf = format!("scale={w}:{h}");
+            cmd.args(["-an", "-vf", &vf])
+                .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"]);
+        }
+        ScaleRecipe::FormatFilter => {
+            let vf = format!("scale={w}:{h},format=yuv420p");
+            cmd.args(["-vf", &vf, "-f", "rawvideo"]);
+        }
+    }
+    let status = cmd.arg(&yuv_path).status().expect("ffmpeg launch");
+    assert!(status.success(), "ffmpeg scale failed for {source_mp4}");
     std::fs::read(&yuv_path).expect("read yuv")
 }
 

@@ -18,6 +18,7 @@
 //! - Only handles single-fragment MP4 files (no fragmented MP4/fMP4)
 //! - Requires `mdat` box to be after `moov` for muxing (standard for camera output)
 
+pub(crate) mod audio_iso;
 pub mod av1_obu_split;
 pub mod build;
 pub mod demux;

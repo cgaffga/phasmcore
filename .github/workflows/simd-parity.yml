@@ -1,0 +1,89 @@
+# SIMD parity: every SIMD kernel against its scalar reference, on the ISAs
+# that actually run it, on every push and pull request.
+#
+# Why this exists. The AVX2 inverse DCT shipped broken twice — an
+# out-of-bounds store (fixed 2026-07-02) and wrong inter-pass register
+# packing (fixed 2026-10-24) — while the scalar-parity tests that catch both
+# sat in the lib test suite. Those tests only ever ran on the maintainer's
+# Apple Silicon machine (NEON) and under Rosetta (no AVX2), so on x86 with
+# AVX2 — Linux, Windows, Intel Macs, i.e. most CLI users — Armor produced
+# garbage pixels and the encoder corrupted its own quantization tables. Both
+# bugs were first found outside the project (denwong47/phasmcore, with a
+# parity check under Miri). See issue #4.
+#
+# Two complementary gates:
+#   * lib-tests  — the full lib suite natively, where the hardware has the
+#                  instructions. Catches any SIMD/scalar divergence.
+#   * miri-avx2  — the SIMD modules interpreted by Miri with AVX2 enabled.
+#                  Catches out-of-bounds and aliasing undefined behaviour
+#                  even when the output happens to come out right.
+
+name: simd-parity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lib-tests:
+    name: lib tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64 Linux, AVX2
+            os: ubuntu-latest
+            require_avx2: true
+          - name: x86_64 Windows, AVX2
+            os: windows-latest
+            require_avx2: false
+          - name: aarch64 Linux, NEON
+            os: ubuntu-24.04-arm
+            require_avx2: false
+          - name: aarch64 macOS, NEON
+            os: macos-latest
+            require_avx2: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The x86 gate is only worth anything if the AVX2 kernels actually run.
+      - name: Require AVX2
+        if: matrix.require_avx2
+        shell: bash
+        run: |
+          grep -m1 -o -w avx2 /proc/cpuinfo || {
+            echo "::error::runner has no AVX2 — the AVX2 kernels would not be tested"
+            exit 1
+          }
+
+      - name: Lib tests (release)
+        shell: bash
+        run: cargo test --release --lib
+
+  miri-avx2:
+    name: Miri, x86_64 + AVX2 (SIMD modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+
+      - name: Miri setup
+        run: cargo miri setup --target x86_64-unknown-linux-gnu
+
+      - name: SIMD modules under Miri
+        env:
+          RUSTFLAGS: -C target-feature=+avx2
+        run: >
+          cargo miri test --target x86_64-unknown-linux-gnu --lib --
+          pixels_aan uniward_simd fft2d_simd optimizer_simd embedding_simd
