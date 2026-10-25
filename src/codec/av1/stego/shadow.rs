@@ -32,6 +32,8 @@ use crate::stego::crypto::{self, derive_shadow_structural_key};
 use crate::stego::error::StegoError;
 use crate::stego::frame::{bits_to_bytes, bytes_to_bits};
 use crate::stego::payload::{self, PayloadData};
+#[cfg(feature = "av1-decoder")]
+use crate::stego::cost::av1_damage::{shadow_bucket, DamageInputs, DamageParams};
 
 // Re-export the shared shadow-frame infrastructure under AV1-
 // flavoured names. Mirror of H.264's pattern. The `_wide` suffix
@@ -86,6 +88,72 @@ pub struct Av1ShadowState {
     pub frame_data_len: usize,
 }
 
+/// v2 shadow eligibility and damage bucket (spec § 6) of every cover
+/// position of one GOP, in canonical order, from a dav1d recording of the
+/// GOP. Only decoder-visible syntax goes in, and no layer's flip changes
+/// it, so this equals the encoder's [`shadow_buckets_from_recordings`]
+/// (Pass 1) on any decode of the same GOP, natural or stego.
+///
+/// [`shadow_buckets_from_recordings`]: super::whole_video::shadow_buckets_from_recordings
+/// One GOP of a stego stream: its canonical cover bits and their v2
+/// shadow buckets, from a single dav1d decode.
+#[cfg(feature = "av1-decoder")]
+pub(crate) fn cover_and_buckets_from_stego(
+    gop_bytes: &[u8],
+) -> Result<(Vec<u8>, Vec<Option<u8>>), super::orchestrator::Av1StegoError> {
+    use core_dav1d_sys::{DAV1D_PHASM_TAG_AC_COEFF_SIGN, DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB};
+    let rec = super::decoder::decode_with_recording(gop_bytes)?;
+    let bits = rec
+        .iter()
+        .filter(|p| p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN || p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB)
+        .map(|p| p.decoded_value)
+        .collect();
+    Ok((bits, shadow_buckets_from_decode(&rec)))
+}
+
+#[cfg(feature = "av1-decoder")]
+pub fn shadow_buckets_from_decode(
+    rec: &super::decoder::DecodedCoverPositions,
+) -> Vec<Option<u8>> {
+    use core_dav1d_sys::{DAV1D_PHASM_TAG_AC_COEFF_SIGN, DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB};
+    let frames = rec.frames();
+    let params = DamageParams::from_env();
+    rec.iter()
+        .filter(|p| p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN || p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB)
+        .map(|p| {
+            let Some(f) = frames.get(p.frame as usize) else {
+                return None;
+            };
+            let (w, h) = if p.meta.plane == 0 {
+                (f.width, f.height)
+            } else {
+                (f.width.div_ceil(2), f.height.div_ceil(2))
+            };
+            shadow_bucket(
+                &DamageInputs {
+                    plane: p.meta.plane,
+                    px_x: p.meta.plane_px_x,
+                    px_y: p.meta.plane_px_y,
+                    plane_w: w,
+                    plane_h: h,
+                    tx_width_log2: p.meta.tx_width_log2,
+                    tx_height_log2: p.meta.tx_height_log2,
+                    tx_type: p.meta.tx_type,
+                    scan_pos: p.meta.scan_pos,
+                    abs_c: p.coeff_magnitude,
+                    qindex: f.qindex,
+                    frame_idx: p.frame,
+                    gop_len: frames.len() as u16,
+                    is_key_frame: p.frame == 0,
+                },
+                p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB,
+                &params,
+            )
+        })
+        .collect()
+}
+
+
 /// Build the per-cover-position priority list.
 ///
 /// For each index `i` in `0..cover_size`, computes a 32-bit
@@ -135,6 +203,8 @@ pub fn priority_slots(cover_size: usize, perm_seed: &[u8; 32]) -> Vec<Av1ShadowS
 /// cover_index since `priority_slots` iterates `0..cover_size`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Av1TopNEntry {
+    /// v2 damage bucket (spec § 6): low-damage buckets fill first.
+    bucket: u8,
     priority: u32,
     cover_index: usize,
 }
@@ -142,10 +212,11 @@ struct Av1TopNEntry {
 impl Ord for Av1TopNEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // `BinaryHeap` is a MAX-heap. We want it to pop the entry with
-        // the LARGEST `(priority, cover_index)` so a newly-pushed entry
-        // smaller than the current max can evict it.
-        self.priority
-            .cmp(&other.priority)
+        // the LARGEST `(bucket, priority, cover_index)` so a newly-pushed
+        // entry smaller than the current max can evict it.
+        self.bucket
+            .cmp(&other.bucket)
+            .then_with(|| self.priority.cmp(&other.priority))
             .then_with(|| self.cover_index.cmp(&other.cover_index))
     }
 }
@@ -212,12 +283,20 @@ impl Av1StreamingTopN {
     /// `capacity == 0` is a no-op (degenerate; caller usually short-
     /// circuits this case but the guard keeps the API total).
     pub fn push(&mut self, cover_index: usize) {
+        self.push_bucketed(cover_index, 0);
+    }
+
+    /// [`push`](Self::push) with the position's v2 damage bucket: the
+    /// order is `(bucket, priority, cover_index)`, so every low-damage
+    /// position is taken before any higher bucket (spec § 6).
+    pub fn push_bucketed(&mut self, cover_index: usize, bucket: u8) {
         if self.capacity == 0 {
             return;
         }
         self.rng
             .set_word_pos((cover_index as u128).wrapping_mul(2));
         let entry = Av1TopNEntry {
+            bucket,
             priority: self.rng.next_u32(),
             cover_index,
         };
@@ -359,6 +438,22 @@ impl Av1ShadowSelectionSweep {
         self.running_offset += cover_size;
     }
 
+    /// v2: stream one GOP's positions with their damage buckets
+    /// ([`shadow_buckets_from_decode`] / `shadow_buckets_from_recordings`).
+    /// Ineligible positions (`None`) are never shadow slots; they still
+    /// advance the union-cover offset.
+    pub fn push_gop_buckets(&mut self, buckets: &[Option<u8>]) {
+        let base = self.running_offset;
+        for sweeper in &mut self.sweepers {
+            for (i, b) in buckets.iter().enumerate() {
+                if let Some(b) = *b {
+                    sweeper.push_bucketed(base + i, b);
+                }
+            }
+        }
+        self.running_offset += buckets.len();
+    }
+
     /// Drain each sweeper into its sorted top-N. Returns one
     /// `Vec<Av1ShadowSlot>` per spec, in the same order specs were
     /// passed to [`new`](Self::new).
@@ -378,6 +473,14 @@ impl Av1ShadowSelectionSweep {
             result.push(sorted);
         }
         Ok(result)
+    }
+
+    /// Drain each sweeper into its sorted selection, however short. The
+    /// v2 encoder sweeps once at the largest tier's size and gives each
+    /// parity tier the prefix it needs: the order is tier-independent, so
+    /// a tier's top-`n` is the prefix of the largest tier's.
+    pub fn into_sorted_all(self) -> Vec<Vec<Av1ShadowSlot>> {
+        self.sweepers.into_iter().map(|s| s.into_sorted()).collect()
     }
 
     /// Total cover positions streamed so far (= sum of all push_gop
@@ -402,6 +505,7 @@ impl Av1ShadowSelectionSweep {
 /// `bit` rides each entry without affecting ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Av1ShadowBitTopNEntry {
+    bucket: u8,
     priority: u32,
     cover_index: usize,
     bit: u8,
@@ -409,8 +513,9 @@ struct Av1ShadowBitTopNEntry {
 
 impl Ord for Av1ShadowBitTopNEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.priority
-            .cmp(&other.priority)
+        self.bucket
+            .cmp(&other.bucket)
+            .then_with(|| self.priority.cmp(&other.priority))
             .then_with(|| self.cover_index.cmp(&other.cover_index))
     }
 }
@@ -455,12 +560,19 @@ impl Av1ShadowBitTopN {
     /// ranks within the current top-`capacity`. `capacity == 0` is a
     /// guarded no-op.
     pub fn push(&mut self, cover_index: usize, bit: u8) {
+        self.push_bucketed(cover_index, 0, bit);
+    }
+
+    /// [`push`](Self::push) with the position's v2 damage bucket (same
+    /// order as [`Av1StreamingTopN::push_bucketed`]).
+    pub fn push_bucketed(&mut self, cover_index: usize, bucket: u8, bit: u8) {
         if self.capacity == 0 {
             return;
         }
         self.rng
             .set_word_pos((cover_index as u128).wrapping_mul(2));
         let entry = Av1ShadowBitTopNEntry {
+            bucket,
             priority: self.rng.next_u32(),
             cover_index,
             bit,
@@ -589,11 +701,13 @@ impl Av1StreamingShadowVerify {
         &mut self,
         gop_bytes: &[u8],
     ) -> Result<(), super::orchestrator::Av1StegoError> {
-        let gop_cover = super::orchestrator::harvest_cover_bits_from_stego(gop_bytes)?;
+        let (gop_cover, buckets) = cover_and_buckets_from_stego(gop_bytes)?;
         let base = self.running_offset;
         for sweeper in &mut self.sweepers {
-            for (local_idx, &bit) in gop_cover.iter().enumerate() {
-                sweeper.push(base + local_idx, bit);
+            for (local_idx, (&bit, b)) in gop_cover.iter().zip(&buckets).enumerate() {
+                if let Some(b) = *b {
+                    sweeper.push_bucketed(base + local_idx, b, bit);
+                }
             }
         }
         self.running_offset += gop_cover.len();
@@ -987,9 +1101,10 @@ const SHADOW_DECODE_TOP_N_CAP: usize = 8 * 1024 * 1024;
 
 pub fn av1_shadow_extract(
     cover_bits: &[u8],
+    buckets: &[Option<u8>],
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
-    if cover_bits.is_empty() {
+    if cover_bits.is_empty() || buckets.len() != cover_bits.len() {
         return Err(StegoError::FrameCorrupted);
     }
     let perm_seed_zero = derive_shadow_structural_key(passphrase)?;
@@ -1003,8 +1118,10 @@ pub fn av1_shadow_extract(
     // realistic shadow message size, bounded in memory.
     let top_n_cap = cover_bits.len().min(SHADOW_DECODE_TOP_N_CAP);
     let mut top_n = Av1StreamingTopN::new(&perm_seed, top_n_cap);
-    for cover_index in 0..cover_bits.len() {
-        top_n.push(cover_index);
+    for (cover_index, b) in buckets.iter().enumerate() {
+        if let Some(b) = *b {
+            top_n.push_bucketed(cover_index, b);
+        }
     }
     let slots = top_n.into_sorted();
 
@@ -1063,6 +1180,42 @@ pub fn av1_shadow_extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sweep_of(n_total: usize, buckets: &[Option<u8>]) -> Vec<Av1ShadowSlot> {
+        let mut sweep = Av1ShadowSelectionSweep::new(&[Av1ShadowSelectionSpec { perm_seed: [7; 32], n_total }]);
+        sweep.push_gop_buckets(buckets);
+        sweep.into_sorted_all().remove(0)
+    }
+
+    /// v2: an ineligible position (golomb tail, reject band, DC, damage cap)
+    /// is never a shadow slot, even when the cover runs short.
+    #[test]
+    fn shadow_never_selects_ineligible_positions() {
+        let buckets: Vec<Option<u8>> = (0..1000).map(|i| (i % 3 != 0).then_some(0)).collect();
+        let sel = sweep_of(1000, &buckets);
+        assert_eq!(sel.len(), 666);
+        assert!(sel.iter().all(|s| s.cover_index % 3 != 0));
+    }
+
+    /// v2: every lower-damage bucket is used up before a higher one.
+    #[test]
+    fn shadow_prefers_low_damage_buckets() {
+        let buckets: Vec<Option<u8>> = (0..1000).map(|i| Some((i % 4) as u8)).collect();
+        let sel = sweep_of(300, &buckets);
+        assert_eq!(sel.len(), 300);
+        assert!(sel.iter().all(|s| s.cover_index % 4 <= 1), "took a bucket-2+ slot before bucket 1 ran out");
+        assert_eq!(sel.iter().filter(|s| s.cover_index % 4 == 0).count(), 250);
+    }
+
+    /// A tier's selection is a prefix of the largest tier's (the encoder
+    /// relies on it to sweep once).
+    #[test]
+    fn smaller_selection_is_a_prefix_of_a_larger_one() {
+        let buckets: Vec<Option<u8>> = (0..2000).map(|i| ((i * 7) % 5 != 0).then_some(((i * 13) % 4) as u8)).collect();
+        let small = sweep_of(100, &buckets);
+        let large = sweep_of(400, &buckets);
+        assert_eq!(small[..], large[..100]);
+    }
 
     #[test]
     fn priority_slots_are_deterministic_per_seed() {
@@ -1546,7 +1699,7 @@ mod tests {
 
         // Extract using the same passphrase.
         let recovered =
-            av1_shadow_extract(&cover, shadow_pass).expect("av1_shadow_extract");
+            av1_shadow_extract(&cover, &vec![Some(0); cover.len()], shadow_pass).expect("av1_shadow_extract");
         assert_eq!(recovered.text.as_bytes(), message);
     }
 
@@ -1566,14 +1719,14 @@ mod tests {
         // Wrong passphrase derives a different perm_seed → different
         // priority order → reads different LSB sequence → RS decode
         // fails OR AES-GCM-SIV tag fails. Either way, FrameCorrupted.
-        let err = av1_shadow_extract(&cover, "wrong")
+        let err = av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "wrong")
             .expect_err("wrong passphrase must fail");
         assert!(matches!(err, StegoError::FrameCorrupted | StegoError::DecryptionFailed));
     }
 
     #[test]
     fn f4_shadow_extract_empty_cover_rejects() {
-        let err = av1_shadow_extract(&[], "p").expect_err("empty cover must fail");
+        let err = av1_shadow_extract(&[], &[], "p").expect_err("empty cover must fail");
         assert!(matches!(err, StegoError::FrameCorrupted));
     }
 
@@ -1599,7 +1752,7 @@ mod tests {
             prepare_shadow_av1(cover_size, "peek-pass", &payload_bytes, 32).expect("prepare");
         let mut cover = vec![0u8; cover_size];
         embed_shadow_lsb_av1(&mut cover, &state);
-        let recovered = av1_shadow_extract(&cover, "peek-pass").expect("extract");
+        let recovered = av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "peek-pass").expect("extract");
         assert_eq!(recovered.text.as_bytes(), message_text.as_slice());
     }
 
@@ -1631,8 +1784,8 @@ mod tests {
         let mut cover = vec![0u8; cover_size];
         embed_shadows_all_av1(&mut cover, &states);
 
-        let recovered_a = av1_shadow_extract(&cover, "pass-A").expect("extract A");
-        let recovered_b = av1_shadow_extract(&cover, "pass-B").expect("extract B");
+        let recovered_a = av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "pass-A").expect("extract A");
+        let recovered_b = av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "pass-B").expect("extract B");
         assert_eq!(recovered_a.text.as_bytes(), msg_a);
         assert_eq!(recovered_b.text.as_bytes(), msg_b);
     }
@@ -1668,15 +1821,15 @@ mod tests {
         embed_shadows_all_av1(&mut cover, &states);
 
         assert_eq!(
-            av1_shadow_extract(&cover, "alpha").unwrap().text.as_bytes(),
+            av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "alpha").unwrap().text.as_bytes(),
             msg_a
         );
         assert_eq!(
-            av1_shadow_extract(&cover, "beta").unwrap().text.as_bytes(),
+            av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "beta").unwrap().text.as_bytes(),
             msg_b
         );
         assert_eq!(
-            av1_shadow_extract(&cover, "gamma").unwrap().text.as_bytes(),
+            av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "gamma").unwrap().text.as_bytes(),
             msg_c
         );
     }
@@ -1736,7 +1889,7 @@ mod tests {
         embed_shadow_lsb_av1(&mut cover, &state_b); // overwrites state_a
 
         // Extract with same-pass picks up state_b's payload.
-        let recovered = av1_shadow_extract(&cover, "same-pass").expect("extract");
+        let recovered = av1_shadow_extract(&cover, &vec![Some(0); cover.len()], "same-pass").expect("extract");
         assert_eq!(recovered.text, "later overwrites");
     }
 

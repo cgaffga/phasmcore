@@ -1260,6 +1260,25 @@ pub struct StegoWavelets {
 }
 
 impl StegoWavelets {
+    /// Exact stego wavelets: a full decomposition of the stego grid
+    /// through the same code as [`compute_cover_wavelets`], i.e. the
+    /// same per-sample arithmetic as [`compute_positions_streaming`]
+    /// (which the decoder runs). Every sample is bit-identical to the
+    /// decoder's, unlike [`apply_dct_modifications_to_wavelets`].
+    ///
+    /// Emits no progress steps (the shadow verify budgets
+    /// [`DIRTY_RECOST_PROGRESS_STEPS`] per verify, emitted by
+    /// [`compute_positions_with_dirty_recost`]).
+    pub fn compute_exact(stego_grid: &DctGrid, qt: &QuantTable) -> Self {
+        let bw = stego_grid.blocks_wide();
+        let bt = stego_grid.blocks_tall();
+        let img_w = bw * 8;
+        let img_h = bt * 8;
+        let pixels = decompress_to_pixels(stego_grid, qt, bw, bt);
+        let inner = compute_three_subbands(&pixels, img_w, img_h, &lpdf());
+        StegoWavelets { inner, img_w, img_h }
+    }
+
     /// Treat the stego wavelets as a CachedCoverWavelets view for
     /// passing into [`compute_positions_from_wavelets`]. (Field-equivalent
     /// struct; we keep them distinct in the type system to avoid mixing
@@ -1291,8 +1310,16 @@ impl StegoWavelets {
 /// (the delta from modification A + delta from modification B =
 /// delta_AB).
 ///
-/// Bit-exactness with `compute_cover_wavelets(modified_grid, qt)` is
-/// gated by `incremental_wavelet_matches_full_recompute` (lib test).
+/// **Not bit-exact** with `compute_cover_wavelets(modified_grid, qt)`:
+/// the full decomposition rounds the row-filter output to f32 before
+/// the column filter, the delta path does not, and overlapping deltas
+/// are summed in `HashSet` order. On a real 12 MP stego image the
+/// resulting costs differ from the decoder's at ~140 K positions (max
+/// relative error ~3e-4). The lib test
+/// `incremental_wavelet_matches_full_recompute` only bounds the error.
+/// Never feed this into anything that must agree with a decoder (the
+/// shadow verify uses [`StegoWavelets::compute_exact`]); it remains for
+/// benchmarks and tests.
 ///
 /// Memory: clones cover_wavelets once (~72 MB at 12 MP) and writes in
 /// place. The cover wavelets themselves are NOT mutated.
@@ -1731,6 +1758,14 @@ pub fn compute_positions_dual_from_wavelets(
 /// `compute_positions_from_wavelets(stego_grid, qt, &stego.as_cache(),
 /// si)`. Bit-exactness is gated by `dirty_recost_matches_full_recompute`.
 ///
+/// It equals the DECODER's `compute_positions_streaming(stego_grid, qt,
+/// None)` only when (a) `modifications` lists EVERY coefficient that
+/// differs between the cover and `grid` (not just the STC flips — the
+/// shadow LSB writes too), (b) `stego_wavelets` comes from
+/// [`StegoWavelets::compute_exact`], and (c) `cached_cover_positions`
+/// are the cover's no-SI positions. The Ghost shadow verify relies on
+/// that; it is gated by `tests/shadow_verify_decoder_parity.rs`.
+///
 /// Performance: at typical Ghost modification rates (~0.13%
 /// per-coefficient = ~1.6% per-block), the dirty fraction is ~30%.
 /// This path skips the ~70% clean-block per-coefficient cost
@@ -1837,8 +1872,15 @@ pub fn compute_positions_with_dirty_recost(
                         img_w,
                         img_h,
                         pad,
-                    ) as f32;
-                    if !cost.is_finite() || cost <= 0.0 {
+                    );
+                    // Same keep/drop predicate as the streaming path
+                    // (f64 `> 0 && finite`, then f32 finite) so a dirty
+                    // block yields exactly the decoder's position set.
+                    if !(cost > 0.0 && cost.is_finite()) {
+                        continue;
+                    }
+                    let cost = cost as f32;
+                    if !cost.is_finite() {
                         continue;
                     }
                     let flat_idx = ((br * bw + bc) * 64 + fi * 8 + fj) as u32;

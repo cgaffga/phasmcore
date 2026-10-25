@@ -231,6 +231,7 @@ Linux.
 | Code of Conduct reports | `conduct@phasm.app` |
 | Security disclosure | `security@phasm.app` |
 | Press / media | `press@phasm.app` |
+| Abuse reports (content shared via phasm.link) | `abuse@phasm.app` |
 
 For most contributor questions, prefer opening a GitHub issue
 tagged `question` (when issue templates are configured) so

@@ -299,17 +299,19 @@ pub(crate) fn symmetric_reflect(i: isize, len: isize) -> isize {
 }
 
 /// The subband outputs a cost pass will actually READ, as merged half-open
-/// x-spans per output row, in **absolute plane coordinates** (in-bounds pixels
-/// only — every reader skips out-of-plane taps, so the reflection padding is
-/// never read).
+/// x-spans per output row, in **padded-buffer coordinates** (plane `x + 15`,
+/// `y + 15` — the [`ThreeSubbands`] layout).
 ///
 /// Built by [`SubbandDemandBuilder`] from the two read footprints the H.264
 /// cost code has:
 ///
-/// * a 4×4 coefficient flip at block `(bx, by)` reads the 19×19 window
-///   `[bx-15, bx+3] × [by-15, by+3]` ([`accumulate_cost_from_field`]);
+/// * a 4×4 coefficient flip at block `(bx, by)` reads the whole 19×19 window
+///   `[bx-15, bx+3] × [by-15, by+3]` ([`accumulate_cost_from_field`]). Near
+///   the top or left edge that window reaches into the 15-sample reflection
+///   margin, so the demand spans plane `x ∈ [-15, width)`,
+///   `y ∈ [-15, height)`; the right and bottom margins are never read;
 /// * an MVD position reads its macroblock's 16×16 area
-///   (`content_costs::mb_y_texture`).
+///   (`content_costs::mb_y_texture`), in-plane only.
 ///
 /// [`compute_three_subbands_for`] evaluates the decomposition only there; see
 /// it for why the result is bit-identical where it is defined.
@@ -317,7 +319,9 @@ pub(crate) fn symmetric_reflect(i: isize, len: isize) -> isize {
 pub(crate) struct SubbandDemand {
     width: usize,
     height: usize,
-    /// `rows[y]` = sorted, disjoint, non-touching `[x0, x1)` spans.
+    /// `rows[oy]` for padded output row `oy = y + 15` (`oy < height + 15`) =
+    /// sorted, disjoint, non-touching `[x0, x1)` spans of padded columns,
+    /// within `[0, width + 15)`.
     rows: Vec<Vec<(usize, usize)>>,
 }
 
@@ -332,10 +336,16 @@ impl SubbandDemand {
         self.rows.iter().all(|r| r.is_empty())
     }
 
-    /// Whether output pixel `(x, y)` (absolute plane coordinates) is demanded.
+    /// Whether output sample `(x, y)` (plane coordinates; the reflection
+    /// margin is negative) is demanded.
     #[cfg(test)]
-    pub(crate) fn contains(&self, x: usize, y: usize) -> bool {
-        y < self.height && self.rows[y].iter().any(|&(a, b)| a <= x && x < b)
+    pub(crate) fn contains(&self, x: isize, y: isize) -> bool {
+        let pad = (FILT_LEN - 1) as isize;
+        let (px, py) = (x + pad, y + pad);
+        px >= 0
+            && py >= 0
+            && (py as usize) < self.rows.len()
+            && self.rows[py as usize].iter().any(|&(a, b)| a <= px as usize && (px as usize) < b)
     }
 }
 
@@ -368,11 +378,13 @@ impl SubbandDemandBuilder {
     }
 
     pub(crate) fn build(mut self) -> SubbandDemand {
-        let (w, h) = (self.width, self.height);
+        let pad = FILT_LEN - 1; // 15
+        // Padded extent that can be read: the top/left margin plus the plane.
+        let (w, h) = (self.width + pad, self.height + pad);
         let mut rows: Vec<Vec<(usize, usize)>> = vec![Vec::new(); h];
-        // A primitive at (py, px) covers x ∈ [px+lo, px+hi) and
-        // y ∈ [py+lo, py+hi), both clipped to the plane. Primitives sharing a
-        // row band are coalesced into spans BEFORE fanning out to the band's
+        // A primitive at plane (py, px) covers padded x ∈ [px+lo, px+hi) and
+        // y ∈ [py+lo, py+hi), both clipped to that extent. Primitives sharing
+        // a row band are coalesced into spans BEFORE fanning out to the band's
         // output rows, so the work scales with distinct bands, not with
         // positions × window height.
         let mut fan_out = |items: &mut Vec<(usize, usize)>, lo: isize, hi: isize| {
@@ -404,14 +416,15 @@ impl SubbandDemandBuilder {
                 }
             }
         };
-        // 19×19 impact window: offsets [-15, +4) on both axes.
-        fan_out(&mut self.blocks, -((FILT_LEN - 1) as isize), 4);
-        // 16×16 macroblock area: offsets [0, 16).
-        fan_out(&mut self.mb_areas, 0, 16);
+        // 19×19 impact window: plane offsets [-15, +4) on both axes, which is
+        // padded [0, 19) — margin included, as the accumulator reads it.
+        fan_out(&mut self.blocks, 0, IMPACT_SIZE as isize);
+        // 16×16 macroblock area: plane offsets [0, 16), padded [15, 31).
+        fan_out(&mut self.mb_areas, pad as isize, (pad + 16) as isize);
         for row in &mut rows {
             merge_spans(row);
         }
-        SubbandDemand { width: w, height: h, rows }
+        SubbandDemand { width: self.width, height: self.height, rows }
     }
 }
 
@@ -485,14 +498,16 @@ pub(crate) fn compute_three_subbands_for(
         return finish(lh, hl, hh);
     }
 
-    // Row-pass demand: output row y reads row-pass rows reflect(y + k).
+    // Row-pass demand: padded output row oy reads row-pass rows
+    // reflect(oy - pad + k), exactly the column pass's source rows.
     let mut row_need: Vec<Vec<(usize, usize)>> = vec![Vec::new(); height];
-    for (y, spans) in demand.rows.iter().enumerate() {
+    for (oy, spans) in demand.rows.iter().enumerate() {
         if spans.is_empty() {
             continue;
         }
         for k in 0..FILT_LEN {
-            let r = symmetric_reflect(y as isize + k as isize, height as isize) as usize;
+            let src_y = oy as isize - pad as isize + k as isize;
+            let r = symmetric_reflect(src_y, height as isize) as usize;
             row_need[r].extend_from_slice(spans);
         }
     }
@@ -503,14 +518,14 @@ pub(crate) fn compute_three_subbands_for(
     // ── Row pass over the demanded (row, x-span) pieces. ──
     //
     // Mirrors `compute_three_subbands`'s `fill_row`: interior output columns
-    // `out_x ∈ [pad, width)` — absolute `x ∈ [0, width - pad)` — read one
-    // contiguous source span per tap through `saxpy_inner`; every other column
-    // takes the scalar reflected loop. Same accumulator, same tap order, per
-    // element.
+    // `out_x ∈ [pad, width)` read one contiguous source span per tap through
+    // `saxpy_inner`; every other column — the left margin `[0, pad)` and the
+    // last `pad` plane columns — takes the scalar reflected loop. Same
+    // accumulator, same tap order, per element. Spans are padded columns.
     let mut row_low = vec![0.0f32; padded_w * height];
     let mut row_high = vec![0.0f32; padded_w * height];
     let interior = pad < width; // false only for a plane narrower than the filter
-    let interior_end = if interior { width - pad } else { 0 };
+    let (interior_lo, interior_hi) = if interior { (pad, width) } else { (0, 0) };
     let fill_row = |scratch_wide: &mut Vec<f32>,
                     scratch_acc: &mut Vec<f64>,
                     y: usize,
@@ -526,26 +541,29 @@ pub(crate) fn compute_three_subbands_for(
             scratch_wide.extend(src_row.iter().map(|&v| v as f32));
         }
         for &(a0, a1) in spans {
-            // Interior piece: absolute x in [a0, i1).
-            let i1 = a1.min(interior_end).max(a0);
-            if a0 < i1 {
-                let len = i1 - a0;
+            // Interior piece: padded columns [i0, i1), source column of tap 0
+            // at `i0 - pad`. Empty when the span misses the interior.
+            let i0 = a0.max(interior_lo).min(a1);
+            let i1 = a1.min(interior_hi).max(i0);
+            if i0 < i1 {
+                let len = i1 - i0;
+                let s0 = i0 - pad;
                 let (acc_low, acc_high) = scratch_acc.split_at_mut(padded_w);
                 acc_low[..len].fill(0.0);
                 acc_high[..len].fill(0.0);
                 for k in 0..FILT_LEN {
-                    let src = &scratch_wide[a0 + k..a0 + k + len];
+                    let src = &scratch_wide[s0 + k..s0 + k + len];
                     super::uniward_simd::saxpy_inner(&mut acc_low[..len], src, lp[k]);
                     super::uniward_simd::saxpy_inner(&mut acc_high[..len], src, HPDF[k]);
                 }
                 for i in 0..len {
-                    low_row[pad + a0 + i] = acc_low[i] as f32;
-                    high_row[pad + a0 + i] = acc_high[i] as f32;
+                    low_row[i0 + i] = acc_low[i] as f32;
+                    high_row[i0 + i] = acc_high[i] as f32;
                 }
             }
-            // Border piece (reflection): the original scalar arithmetic.
-            for ax in i1..a1 {
-                let out_x = ax + pad;
+            // Border pieces (reflection) on either side: the original scalar
+            // arithmetic.
+            for out_x in (a0..i0).chain(i1..a1) {
                 let mut sum_low = 0.0f64;
                 let mut sum_high = 0.0f64;
                 for k in 0..FILT_LEN {
@@ -591,18 +609,17 @@ pub(crate) fn compute_three_subbands_for(
                         lh_row: &mut [f32],
                         hl_row: &mut [f32],
                         hh_row: &mut [f32]| {
-        // Only in-plane output rows are ever demanded.
-        if out_y < pad || out_y >= pad + height {
+        // Only the top margin and the plane rows (`out_y < pad + height`) are
+        // ever demanded.
+        let Some(spans) = demand.rows.get(out_y) else {
             return;
-        }
-        let spans = &demand.rows[out_y - pad];
+        };
         if spans.is_empty() {
             return;
         }
         let (s_lh, rest) = scratch.split_at_mut(padded_w);
         let (s_hl, s_hh) = rest.split_at_mut(padded_w);
-        for &(a0, a1) in spans {
-            let (x0, x1) = (a0 + pad, a1 + pad);
+        for &(x0, x1) in spans {
             let len = x1 - x0;
             s_lh[..len].fill(0.0);
             s_hl[..len].fill(0.0);
@@ -836,7 +853,21 @@ pub(crate) fn compute_delta_field(
 /// Accumulate the J-UNIWARD cost of a flip whose pixel-domain impact is
 /// `field`, for a 4×4 block at top-left pixel `(block_px_x, block_px_y)`,
 /// against the cover `wavelets`. The position-dependent half:
-/// `Σ |Δ_band| / (|cover_band| + σ)` over the in-bounds 19×19 window.
+/// `Σ |Δ_band| / (|cover_band| + σ)` over the WHOLE 19×19 window.
+///
+/// The window starts 15 samples above and left of the block, so for a block
+/// in the first 15 rows or columns part of it lies in the subbands' reflection
+/// margin. Those samples count like any other, as in reference J-UNIWARD,
+/// which prices every block over its full window of the mirror-padded cover.
+/// (Until 2026-10 they were skipped: border blocks were priced at 19–92% of
+/// their cost, which steered flips into the top MB row and left MB column,
+/// where H.264 intra prediction spreads an edge offset across the frame —
+/// `docs/design/video/h264/intra-drift-diagnosis.md`.)
+///
+/// The block must lie inside the `img_w × img_h` plane. Its window then stays
+/// inside the padded buffer and never reaches the right or bottom margin.
+/// The summation order is unchanged, so an interior block's cost is
+/// bit-identical to the old in-bounds-only sum.
 pub(crate) fn accumulate_cost_from_field(
     field: &DeltaField,
     wavelets: &ThreeSubbands,
@@ -846,14 +877,17 @@ pub(crate) fn accumulate_cost_from_field(
     block_px_y: usize,
 ) -> f64 {
     let pad = FILT_LEN - 1; // 15
+    debug_assert!(
+        block_px_x + 4 <= img_w && block_px_y + 4 <= img_h,
+        "4x4 block ({block_px_x},{block_px_y}) outside the {img_w}x{img_h} plane"
+    );
+    debug_assert_eq!((wavelets.x_offset, wavelets.y_offset), (-(pad as isize), -(pad as isize)));
     let mut cost = 0.0f64;
     for out_r in 0..IMPACT_SIZE {
         for out_c in 0..IMPACT_SIZE {
+            // abs ≥ -pad = the buffer's offset: always inside the padded buffer.
             let abs_x = block_px_x as isize + out_c as isize - pad as isize;
             let abs_y = block_px_y as isize + out_r as isize - pad as isize;
-            if abs_x < 0 || abs_y < 0 || abs_x >= img_w as isize || abs_y >= img_h as isize {
-                continue;
-            }
 
             let wx = (abs_x - wavelets.x_offset) as usize;
             let wy = (abs_y - wavelets.y_offset) as usize;
@@ -1054,20 +1088,23 @@ mod tests {
         }
     }
 
-    /// Brute-force reference for [`SubbandDemandBuilder`]: a per-pixel bitmap
-    /// of exactly the samples `accumulate_cost_from_field` (19×19 window) and
-    /// `mb_y_texture` (16×16 MB area) read, in-bounds only.
+    /// Brute-force reference for [`SubbandDemandBuilder`]: a bitmap over the
+    /// whole padded buffer (`(w + 30) × (h + 30)`, plane `(x, y)` at
+    /// `(x + 15, y + 15)`) of exactly the samples `accumulate_cost_from_field`
+    /// (the full 19×19 window, reflection margin included) and `mb_y_texture`
+    /// (the in-plane 16×16 MB area) read.
     fn reference_demand_bitmap(
         w: usize,
         h: usize,
         blocks: &[(usize, usize)],
         mbs: &[(usize, usize)],
     ) -> Vec<bool> {
-        let mut m = vec![false; w * h];
+        let pw = w + 30;
+        let mut m = vec![false; pw * (h + 30)];
         let mut mark = |x0: isize, y0: isize, x1: isize, y1: isize| {
-            for y in y0.max(0)..y1.min(h as isize) {
-                for x in x0.max(0)..x1.min(w as isize) {
-                    m[y as usize * w + x as usize] = true;
+            for y in y0..y1.min(h as isize) {
+                for x in x0..x1.min(w as isize) {
+                    m[(y + 15) as usize * pw + (x + 15) as usize] = true;
                 }
             }
         };
@@ -1162,14 +1199,18 @@ mod tests {
                 assert_eq!((got.width, got.height), (full.width, full.height));
                 assert_eq!((got.x_offset, got.y_offset), (full.x_offset, full.y_offset));
                 assert_eq!(got.lh.len(), full.lh.len());
-                for y in 0..h {
-                    for x in 0..w {
-                        let need = reference[y * w + x];
+                // Every sample of the padded buffer: margins included, so a
+                // demanded margin sample must match and an undemanded one —
+                // the whole right / bottom margin — must stay 0.
+                for py in 0..full.height {
+                    for px in 0..pw {
+                        let (x, y) = (px as isize - 15, py as isize - 15);
+                        let i = py * pw + px;
+                        let need = reference[i];
                         assert_eq!(
                             demand.contains(x, y), need,
                             "{w}x{h} pattern {pattern}: demand at ({x},{y})"
                         );
-                        let i = (y + 15) * pw + (x + 15);
                         for (band, a, f) in [("LH", &got.lh, &full.lh), ("HL", &got.hl, &full.hl),
                                              ("HH", &got.hh, &full.hh)] {
                             if need {
@@ -1187,6 +1228,80 @@ mod tests {
                 assert_eq!(demand.demanded_px(), reference.iter().filter(|&&b| b).count());
             }
         }
+    }
+
+    /// A block on the top / left border is priced over its WHOLE 19×19
+    /// window, as reference J-UNIWARD prices it: the part of the window
+    /// outside the plane lies in the subbands' reflection margin and counts
+    /// like any other sample.
+    ///
+    /// Pinned by construction. Plane `b` is plane `a` mirrored into a 2×
+    /// canvas, `b[n + y][n + x] = a[reflect(y)][reflect(x)]`, so block
+    /// `(bx, by)` of `a`, reflection margin included, sees exactly the pixels
+    /// that block `(n + bx, n + by)` of `b` sees inside the plane. Every block
+    /// of `a`, border or not, must cost exactly what its twin in `b` costs,
+    /// from the full decomposition and from the band-limited one.
+    ///
+    /// The accumulator before 2026-10 skipped the margin, so this failed at
+    /// every block in the first 15 rows or columns (a border block summed only
+    /// part of its window).
+    #[test]
+    fn border_block_cost_equals_its_mirrored_interior_twin() {
+        let n = 64usize;
+        // `synth_plane` flipped left-right: noise along the left edge, flat
+        // along the right, all four textures along the top.
+        let s = synth_plane(n, n);
+        let a: Vec<u8> = (0..n * n).map(|i| s[(i / n) * n + (n - 1 - i % n)]).collect();
+        let m = 2 * n;
+        let mut b = vec![0u8; m * m];
+        for y in 0..m {
+            for x in 0..m {
+                let sy = symmetric_reflect(y as isize - n as isize, n as isize) as usize;
+                let sx = symmetric_reflect(x as isize - n as isize, n as isize) as usize;
+                b[y * m + x] = a[sy * n + sx];
+            }
+        }
+        let wa = compute_three_subbands(&a, n, n);
+        let wb = compute_three_subbands(&b, m, m);
+        // Band-limited `a`, demanded for the border blocks only, so the
+        // decomposition really is partial.
+        let mut builder = SubbandDemandBuilder::new(n, n);
+        for by in (0..n).step_by(4) {
+            for bx in (0..n).step_by(4) {
+                if bx < 16 || by < 16 {
+                    builder.add_coeff_block(bx, by);
+                }
+            }
+        }
+        let wa_band = compute_three_subbands_for(&a, n, n, &builder.build());
+        let unit_basis = precompute_unit_basis();
+        let mut checked_border = 0;
+        for scan_pos in [1u8, 4, 9, 15] {
+            for delta in [1.0, 2.0, 6.0] {
+                let field = compute_delta_field(&unit_basis, scan_pos, 26, delta);
+                for by in (0..n).step_by(4) {
+                    for bx in (0..n).step_by(4) {
+                        let ca = accumulate_cost_from_field(&field, &wa, n, n, bx, by);
+                        let cb = accumulate_cost_from_field(&field, &wb, m, m, n + bx, n + by);
+                        assert_eq!(
+                            ca.to_bits(), cb.to_bits(),
+                            "scan {scan_pos} δ {delta}: block ({bx},{by}) costs {ca} but its \
+                             interior twin costs {cb}"
+                        );
+                        if bx < 16 || by < 16 {
+                            let cband = accumulate_cost_from_field(&field, &wa_band, n, n, bx, by);
+                            assert_eq!(
+                                cband.to_bits(), ca.to_bits(),
+                                "scan {scan_pos} δ {delta}: band-limited cost of border block \
+                                 ({bx},{by}) is {cband}, full decomposition gives {ca}"
+                            );
+                            checked_border += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked_border, 4 * 3 * (16 * 16 - 12 * 12));
     }
 
     #[test]

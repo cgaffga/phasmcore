@@ -32,6 +32,11 @@ pub mod h264_uniward;
 #[cfg(feature = "av1-encoder")]
 pub mod av1_uniward;
 
+// AV1 v2 damage model (E·T·X from syntax). Decode-safe: needs no encoder,
+// so decode-only builds can rebuild shadow buckets.
+#[cfg(feature = "av1-decoder")]
+pub mod av1_damage;
+
 /// Cost assigned to coefficients that must never be modified (f32 version).
 /// Using infinity ensures the Viterbi STC never selects these positions for flipping.
 pub const WET_COST: f32 = f32::INFINITY;

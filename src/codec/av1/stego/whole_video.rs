@@ -17,6 +17,7 @@
 //! Design: see
 //! `docs/design/video/av1/phase-c-wv-whole-video-shadow.md` § 3.2.
 
+use crate::stego::cover_order::{gop_cover_order, gop_seeds, VideoCodec};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -199,7 +200,8 @@ pub(super) fn apply_phasm_av1_sequence(sequence: &mut Sequence) {
 use crate::codec::av1::stego::session::Av1StreamingEncodeParams;
 use crate::codec::av1::stego::shadow::{
     finalize_shadow_state_av1, prepare_shadow_pre_selection_av1,
-    Av1ShadowSelectionSweep, Av1ShadowState, Av1StreamingShadowVerify,
+    Av1ShadowSelectionSpec, Av1ShadowSelectionSweep, Av1ShadowSlot, Av1ShadowState,
+    Av1StreamingShadowVerify,
     AV1_SHADOW_PARITY_TIERS,
 };
 use crate::codec::av1::stego::writer::{replay_with_overrides, OverrideMap};
@@ -629,8 +631,44 @@ pub fn av1_encode_with_shadows_streaming(
     // only a GOP over both budgets of `pass1_cache_budget` (RAM, then a
     // scratch-dir spill) is re-encoded from the source. See the "Pass 1 →
     // Pass 2" section below.
-    let (mut pass1_cache, per_gop_cover_lens) =
-        run_pass1(source, n_frames, params, &pass1_cache_budget, &mut |_, _| {})?;
+    // v2 shadow selection runs during Pass 1, from each GOP's damage
+    // buckets, at the largest parity tier's size (spec § 6). The order
+    // `(bucket, priority, index)` is tier-independent, so each tier below
+    // takes a prefix.
+    let tier_pre_selections: Vec<(usize, Vec<_>)> = AV1_SHADOW_PARITY_TIERS
+        .iter()
+        .copied()
+        .filter(|&p| p >= shadow_parity_len_floor)
+        .filter_map(|p| {
+            shadows
+                .iter()
+                .map(|(pass, m)| prepare_shadow_pre_selection_av1(pass, m, p))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .map(|pre| (p, pre))
+        })
+        .collect();
+    let max_specs: Vec<Av1ShadowSelectionSpec> = (0..shadows.len())
+        .map(|s| {
+            let n_max = tier_pre_selections.iter().map(|(_, pre)| pre[s].to_selection_spec().n_total).max().unwrap_or(0);
+            let mut spec = tier_pre_selections
+                .first()
+                .map(|(_, pre)| pre[s].to_selection_spec())
+                .unwrap_or_else(|| Av1ShadowSelectionSpec { perm_seed: [0; 32], n_total: 0 });
+            spec.n_total = n_max;
+            spec
+        })
+        .collect();
+    let mut max_sweep = Av1ShadowSelectionSweep::new(&max_specs);
+    let (mut pass1_cache, per_gop_cover_lens) = run_pass1(
+        source,
+        n_frames,
+        params,
+        &pass1_cache_budget,
+        &mut |_, _| {},
+        Some(&mut |b: &[Option<u8>]| max_sweep.push_gop_buckets(b)),
+    )?;
+    let max_selection = max_sweep.into_sorted_all();
 
     // Per-GOP cover offsets into the union (= prefix sum of cover lens).
     let mut per_gop_cover_offsets: Vec<usize> = Vec::with_capacity(n_gops_usize);
@@ -656,11 +694,10 @@ pub fn av1_encode_with_shadows_streaming(
     }
     let total_message_bytes = primary_framed.len() as u32;
 
-    let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
+    // v2: the structural master; each GOP derives its own cover order and
+    // H-hat seed from it (`cover_order::gop_seeds`), as the decoder does.
+    let master = crate::stego::crypto::derive_structural_key(primary_passphrase)
         .map_err(Av1StegoError::Stego)?;
-    let hhat_seed: [u8; 32] = structural_key[32..]
-        .try_into()
-        .expect("derive_structural_key returns 64 bytes");
 
     // Parity-tier cascade. Each tier re-runs Pass 2 from the Pass-1
     // cache, with its own primary plan (the shadow positions it adds are
@@ -692,19 +729,17 @@ pub fn av1_encode_with_shadows_streaming(
             Err(_) => continue,
         };
 
-        // Drive the streaming sweep over cached per-GOP cover_lens.
-        // No encode work — heap operations only.
-        let specs: Vec<_> = pre_selections
+        // This tier's slots: the prefix of the Pass-1 selection.
+        let per_shadow_positions: Option<Vec<Vec<Av1ShadowSlot>>> = pre_selections
             .iter()
-            .map(|p| p.to_selection_spec())
+            .zip(&max_selection)
+            .map(|(pre, sel)| {
+                let n = pre.to_selection_spec().n_total;
+                (sel.len() >= n).then(|| sel[..n].to_vec())
+            })
             .collect();
-        let mut sweep = Av1ShadowSelectionSweep::new(&specs);
-        for &gop_n in &per_gop_cover_lens {
-            sweep.push_gop(gop_n);
-        }
-        let per_shadow_positions = match sweep.finish() {
-            Ok(v) => v,
-            Err(_) => continue, // capacity exhausted → try next parity tier
+        let Some(per_shadow_positions) = per_shadow_positions else {
+            continue; // too few eligible positions → try next parity tier
         };
 
         // Clone pre_selections for the streaming verifier before
@@ -797,7 +832,7 @@ pub fn av1_encode_with_shadows_streaming(
                     let shared = Av1CascadeGopShared {
                         total_message_bytes,
                         shadow_states: &shadow_states,
-                        hhat_seed: &hhat_seed,
+                        master: &master,
                     };
                     if let Some(bytes) = cascade_one_gop(inputs, shared)? {
                         break Some(bytes);
@@ -990,13 +1025,10 @@ pub fn av1_encode_streaming(
         )));
     }
 
-    // hhat seed from the primary passphrase — the same derive the decoder
-    // runs; one per encode, reused across GOPs.
-    let structural_key = crate::stego::crypto::derive_structural_key(primary_passphrase)
+    // v2: the structural master; each GOP derives its own cover order and
+    // H-hat seed from it (`cover_order::gop_seeds`), as the decoder does.
+    let master = crate::stego::crypto::derive_structural_key(primary_passphrase)
         .map_err(Av1StegoError::Stego)?;
-    let hhat_seed: [u8; 32] = structural_key[32..]
-        .try_into()
-        .expect("derive_structural_key returns 64 bytes");
 
     let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
     let t_total = std::time::Instant::now();
@@ -1033,6 +1065,7 @@ pub fn av1_encode_streaming(
             let fraction = progress.advance(gop_frames[g as usize] as f64);
             emit(fraction, Av1EncodePhase::Encode, g + 1);
         },
+        None,
     )?;
     // Exact from here on: which GOPs Pass 2 re-encodes is known.
     progress.set_total(all_frames + one_sweep + forecast.unstored_frames());
@@ -1061,7 +1094,7 @@ pub fn av1_encode_streaming(
             &mut caps,
             plan,
             primary_framed,
-            &hhat_seed,
+            &master,
             &mut shrinks,
             &mut |g, recomputed| {
                 let frames = gop_frames[g as usize] as f64;
@@ -1119,7 +1152,7 @@ fn embed_primary_pass(
     caps: &mut [super::primary_plan::GopPrimaryCap],
     mut plan: Vec<usize>,
     primary_framed: &[u8],
-    hhat_seed: &[u8; 32],
+    master: &[u8; 64],
     shrinks: &mut usize,
     on_gop_done: &mut dyn FnMut(u32, bool),
 ) -> Result<Option<Vec<u8>>, Av1StegoError> {
@@ -1163,7 +1196,7 @@ fn embed_primary_pass(
                 let shared = Av1CascadeGopShared {
                     total_message_bytes,
                     shadow_states: &[],
-                    hhat_seed,
+                    master,
                 };
                 if let Some(packet) = cascade_one_gop(inputs, shared)? {
                     break packet;
@@ -1249,8 +1282,9 @@ pub(super) struct Av1CascadeGopShared<'a> {
     /// filters each state's positions into this GOP's slice via
     /// `gop_offset`.
     pub shadow_states: &'a [Av1ShadowState],
-    /// hhat_seed for STC, derived from primary passphrase.
-    pub hhat_seed: &'a [u8; 32],
+    /// Structural master of the primary passphrase; each GOP derives its
+    /// cover order and H-hat seed from it (spec § 3).
+    pub master: &'a [u8; 64],
 }
 
 /// Run one GOP's body of the WV cascade: build chunk_frame v3 payload
@@ -1282,7 +1316,7 @@ pub(super) fn cascade_one_gop(
     let Av1CascadeGopShared {
         total_message_bytes,
         shadow_states,
-        hhat_seed,
+        master,
     } = shared;
 
     // Build chunk_frame v3 payload bits for this GOP. First GOP
@@ -1302,6 +1336,18 @@ pub(super) fn cascade_one_gop(
     let w = (gop_n / m_bits).max(1);
     let n_used = m_bits * w;
 
+    // v2 (spec § 3): the STC walks the whole GOP cover in one keyed order.
+    // STC input `i` is canonical position `order[i]`; `inv` maps back. The
+    // order spans all of `gop_n`, so the `n_used` cut drops a keyed random
+    // subset of positions, not the raster tail.
+    let seeds = gop_seeds(master, VideoCodec::Av1, gop_idx as u32);
+    let order = gop_cover_order(gop_n, &seeds.order);
+    let mut inv = vec![0u32; gop_n];
+    for (i, &c) in order.iter().enumerate() {
+        inv[c as usize] = i as u32;
+    }
+    let in_stc = |local: usize| (inv[local] as usize) < n_used;
+
     // Project per-GOP-local shadow slots (slot.cover_index -
     // gop_offset for the subset in [gop_offset, gop_offset + gop_n)).
     let mut gop_shadow_positions: Vec<Vec<(usize, u8)>> =
@@ -1315,37 +1361,28 @@ pub(super) fn cascade_one_gop(
         }
     }
 
-    // Stamp shadow LSBs into a clone of the GOP cover for STC's view.
-    // Track positions for ∞-cost overlay + post-STC defensive stamp
-    // + out-of-range overrides.
+    // Stamp shadow LSBs into a clone of the canonical GOP cover, then take
+    // the STC's view of it through the order, wet at every shadow slot.
     let mut combined_cover: Vec<u8> = harvest.cover_bits.clone();
-    let mut shadow_position_set: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
     for slots in &gop_shadow_positions {
         for &(local_idx, bit) in slots {
-            if local_idx < n_used {
-                combined_cover[local_idx] = bit;
+            combined_cover[local_idx] = bit;
+        }
+    }
+    let cover_used: Vec<u8> = order[..n_used].iter().map(|&c| combined_cover[c as usize]).collect();
+    let mut costs_for_stc: Vec<f32> =
+        order[..n_used].iter().map(|&c| harvest.costs[c as usize]).collect();
+    for slots in &gop_shadow_positions {
+        for &(local_idx, _) in slots {
+            if in_stc(local_idx) {
+                costs_for_stc[inv[local_idx] as usize] = f32::INFINITY;
             }
-            shadow_position_set.insert(local_idx);
-        }
-    }
-    // `harvest.cover_bits` is unchanged through this call (the shadow
-    // stamps mutate `combined_cover`, never the harvest), so we read
-    // the original cover directly off the borrowed harvest below —
-    // no need for an explicit clone.
-
-    // ∞-cost overlay.
-    let mut costs_for_stc: Vec<f32> = harvest.costs[..n_used].to_vec();
-    for &idx in &shadow_position_set {
-        if idx < n_used {
-            costs_for_stc[idx] = f32::INFINITY;
         }
     }
 
-    let cover_used = &combined_cover[..n_used];
-    let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
+    let hhat_matrix = hhat::generate_hhat(STC_H, w, &seeds.hhat);
     let mut embed = match stc_embed(
-        cover_used,
+        &cover_used,
         &costs_for_stc,
         &payload_bits,
         &hhat_matrix,
@@ -1359,27 +1396,30 @@ pub(super) fn cascade_one_gop(
     // Defensive shadow stamp on the STC plan.
     for slots in &gop_shadow_positions {
         for &(local_idx, bit) in slots {
-            if local_idx < n_used {
-                embed.stego_bits[local_idx] = bit;
+            if in_stc(local_idx) {
+                embed.stego_bits[inv[local_idx] as usize] = bit;
             }
         }
     }
 
-    // Split STC stego_bits into per-frame OverrideMaps.
+    // Map the STC plan back to canonical positions, split into per-frame
+    // OverrideMaps.
     let mut per_frame_plans: Vec<OverrideMap> =
         (0..harvest.frame_starts.len())
             .map(|_| OverrideMap::new())
             .collect();
-    for i in 0..n_used {
-        if embed.stego_bits[i] != harvest.cover_bits[i] {
-            let (frame_idx, cursor) = harvest.frame_cursor_at(i);
+    for (i, &c) in order[..n_used].iter().enumerate() {
+        let c = c as usize;
+        if embed.stego_bits[i] != harvest.cover_bits[c] {
+            let (frame_idx, cursor) = harvest.frame_cursor_at(c);
             per_frame_plans[frame_idx].set(cursor, embed.stego_bits[i] as u16);
         }
     }
-    // Out-of-range shadow override entries.
+    // Shadow slots the STC never sees (outside the first `n_used` of the
+    // order) are written directly.
     for slots in &gop_shadow_positions {
         for &(local_idx, bit) in slots {
-            if local_idx >= n_used && bit != harvest.cover_bits[local_idx] {
+            if !in_stc(local_idx) && bit != harvest.cover_bits[local_idx] {
                 let (frame_idx, cursor) = harvest.frame_cursor_at(local_idx);
                 per_frame_plans[frame_idx].set(cursor, bit as u16);
             }
@@ -1603,6 +1643,7 @@ fn run_pass1(
     params: Av1StreamingEncodeParams,
     budget: &Pass1CacheBudget,
     on_gop_done: &mut dyn FnMut(u32, &crate::stego::gop_cache::BoundedGopCache<Pass1Packets>),
+    mut on_gop_buckets: Option<&mut dyn FnMut(&[Option<u8>])>,
 ) -> Result<(crate::stego::gop_cache::BoundedGopCache<Pass1Packets>, Vec<usize>), Av1StegoError> {
     let prof = std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false);
     let gop_size = params.gop_size.max(1);
@@ -1651,6 +1692,11 @@ fn run_pass1(
         // Only the cover count is kept: Pass 2 harvests each GOP from its
         // rebuild, so a Pass-1 harvest would be thrown away.
         let cover = count_cover_bits(&frames);
+        // v2 shadows: each position's damage bucket, from the natural
+        // recording, while it is in hand (spec § 6).
+        if let Some(sink) = on_gop_buckets.as_mut() {
+            sink(&shadow_buckets_from_recordings(&frames, params.width, params.height));
+        }
         if prof {
             eprintln!(
                 "[AV1_PROF PASS1] gop {gop_idx}: pull={pull_dt:?}, encode={:?}, cover_bits={cover}",
@@ -1717,9 +1763,9 @@ fn pass1_entry_for(
         let window = harvest_window();
         let mut builder = GopHarvestBuilder::with_frames(packets.len());
         let mut pending: Vec<FrameHarvestJob> = Vec::with_capacity(window);
-        let frames = super::rebuild::rebuild_gop_streamed(packets, w, h, &mut |_, (_, recording)| {
+        let frames = super::rebuild::rebuild_gop_streamed(packets, w, h, &mut |k, (_, recording)| {
             // The job keeps the planes; the recording drops its reference.
-            pending.push(FrameHarvestJob::new(recording)?);
+            pending.push(FrameHarvestJob::new(recording, k, packets.len())?);
             recording.reconstructed_planes = dummy.clone();
             if pending.len() == window {
                 run_harvest_window(std::mem::take(&mut pending), w, h, &mut builder);
@@ -1806,6 +1852,30 @@ fn pass1_packets_for(
     Ok((frames.into_iter().map(|(packet, _)| packet).collect(), true))
 }
 
+/// The natural (no-stego) encode of `source` at `params`: the packets
+/// Pass 1 produces and the stego encode modifies. Quality gates measure a
+/// stego encode against this, not against the source, so the codec's own
+/// loss is not counted as stego damage.
+pub fn av1_encode_natural(
+    source: &mut dyn Av1GopYuvSource,
+    n_frames: u32,
+    params: Av1StreamingEncodeParams,
+) -> Result<Vec<u8>, Av1StegoError> {
+    let gop = params.gop_size.max(1);
+    let mut out = Vec::new();
+    let (mut done, mut gop_index) = (0u32, 0u32);
+    while done < n_frames {
+        let frames = gop.min(n_frames - done);
+        let yuv = source.gop_yuv(gop_index)?;
+        for (packet, _) in encode_gop_natural(&yuv, frames, params)? {
+            out.extend_from_slice(&packet);
+        }
+        done += frames;
+        gop_index += 1;
+    }
+    Ok(out)
+}
+
 /// Encode one GOP naturally: per frame the natural packet and the
 /// encoder's recording (replay storage, cover positions + meta,
 /// reconstructed planes, loop-filter state).
@@ -1884,6 +1954,11 @@ impl GopHarvest {
     fn frame_cursor_at(&self, idx: usize) -> (usize, u64) {
         self.combined_index[idx]
     }
+
+    /// Cover positions in the GOP.
+    pub(super) fn len(&self) -> usize {
+        self.cover_bits.len()
+    }
 }
 
 #[cfg(test)]
@@ -1941,7 +2016,11 @@ struct FrameHarvestJob {
 impl FrameHarvestJob {
     /// Walk `recording`'s 50/50 positions (a `planes` reference is taken,
     /// so the recording's own may be dropped right after).
-    fn new(recording: &PhasmFrameRecording<u8>) -> Result<Self, Av1StegoError> {
+    fn new(
+        recording: &PhasmFrameRecording<u8>,
+        frame_idx: usize,
+        gop_len: usize,
+    ) -> Result<Self, Av1StegoError> {
         let tile = recording.tiles.first().ok_or(Av1StegoError::EmptyRecording)?;
         let mut job = FrameHarvestJob {
             cursors: Vec::new(),
@@ -1970,6 +2049,11 @@ impl FrameHarvestJob {
                     tx_type: m.tx_type,
                     scan_pos: m.scan_pos,
                     coeff_magnitude: m.coeff_magnitude,
+                    is_golomb_tail: tag == PHASM_TAG_GOLOMB_TAIL_LSB,
+                    frame_idx: frame_idx as u16,
+                    gop_len: gop_len as u16,
+                    // Every GOP opens with its key frame.
+                    is_key_frame: frame_idx == 0,
                 });
             }
         }
@@ -2034,14 +2118,65 @@ pub(super) fn harvest_gop(
     // at a time ([`harvest_window`]), in parallel within the window, and
     // accumulated in frame order to keep the cover cursor monotonic.
     let mut builder = GopHarvestBuilder::with_frames(per_frame.len());
-    for window in per_frame.chunks(harvest_window()) {
+    for (w_idx, window) in per_frame.chunks(harvest_window()).enumerate() {
+        let first = w_idx * harvest_window();
         let jobs = window
             .iter()
-            .map(|(_, recording)| FrameHarvestJob::new(recording))
+            .enumerate()
+            .map(|(i, (_, recording))| FrameHarvestJob::new(recording, first + i, per_frame.len()))
             .collect::<Result<Vec<_>, _>>()?;
         run_harvest_window(jobs, width, height, &mut builder);
     }
     Ok(builder.finish())
+}
+
+/// v2 shadow eligibility and damage bucket of every cover position of one
+/// GOP, in canonical order, from its natural recordings (Pass 1). The
+/// encoder twin of [`super::shadow::shadow_buckets_from_decode`]: the same
+/// syntax in, so the same buckets out.
+pub(crate) fn shadow_buckets_from_recordings(
+    frames: &[(Vec<u8>, PhasmFrameRecording<u8>)],
+    width: u32,
+    height: u32,
+) -> Vec<Option<u8>> {
+    use crate::stego::cost::av1_damage::{shadow_bucket, DamageInputs, DamageParams};
+    let params = DamageParams::from_env();
+    let gop_len = frames.len() as u16;
+    let mut out = Vec::new();
+    for (f, (_, recording)) in frames.iter().enumerate() {
+        let Some(tile) = recording.tiles.first() else { continue };
+        for (&tag, m) in tile.bit_tags.iter().zip(tile.bit_meta.iter()) {
+            if tag != PHASM_TAG_AC_COEFF_SIGN && tag != PHASM_TAG_GOLOMB_TAIL_LSB {
+                continue;
+            }
+            let (w, h) = if m.plane == 0 {
+                (width, height)
+            } else {
+                (width.div_ceil(2), height.div_ceil(2))
+            };
+            out.push(shadow_bucket(
+                &DamageInputs {
+                    plane: m.plane,
+                    px_x: m.plane_px_x,
+                    px_y: m.plane_px_y,
+                    plane_w: w as u16,
+                    plane_h: h as u16,
+                    tx_width_log2: m.tx_width_log2,
+                    tx_height_log2: m.tx_height_log2,
+                    tx_type: m.tx_type,
+                    scan_pos: m.scan_pos,
+                    abs_c: m.coeff_magnitude,
+                    qindex: recording.frame_qindex,
+                    frame_idx: f as u16,
+                    gop_len,
+                    is_key_frame: f == 0,
+                },
+                tag == PHASM_TAG_GOLOMB_TAIL_LSB,
+                &params,
+            ));
+        }
+    }
+    out
 }
 
 /// Assembles a [`GopHarvest`] from per-frame [`FrameHarvestJob::run`]
@@ -2544,5 +2679,86 @@ mod tests {
             rss as f64 / (1 << 20) as f64,
             rss_before as f64 / (1 << 20) as f64
         );
+    }
+}
+
+#[cfg(all(test, feature = "av1-decoder"))]
+mod v2_shadow_tests {
+    use super::*;
+
+    fn noise_yuv(w: usize, h: usize, frames: usize) -> Vec<u8> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        (0..w * h * 3 / 2 * frames)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Smooth gradient plus noise, so the encoder codes a spread
+                // of |c| and transform sizes.
+                ((i % w) as u64 / 2 + (s >> 59)) as u8
+            })
+            .collect()
+    }
+
+    /// Spec § 6 invariance: the shadow buckets the encoder computes from its
+    /// Pass-1 recordings equal the ones a decoder computes from the STEGO
+    /// output (sign flips keep |c|; golomb tails are wet, so never flipped).
+    #[test]
+    fn shadow_buckets_match_between_encoder_and_decoder() {
+        let (w, h, n) = (256u32, 144u32, 3u32);
+        let yuv = noise_yuv(w as usize, h as usize, n as usize);
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n };
+        let natural = encode_gop_natural(&yuv, n, params).expect("natural");
+        let enc = shadow_buckets_from_recordings(&natural, w, h);
+        assert!(enc.iter().filter(|b| b.is_some()).count() > 100, "too few eligible positions");
+
+        let p = crate::stego::payload::encode_payload("bucket invariance", &[]).unwrap();
+        let (ct, nonce, salt) = crate::stego::crypto::encrypt(&p, "buckets").unwrap();
+        let framed = frame::build_frame(p.len(), &salt, &nonce, &ct);
+        let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, n);
+        let stego = av1_encode_streaming(&mut src, n, params, &framed, "buckets", Pass1CacheBudget::from_env_or_default(), None)
+            .expect("stego encode");
+        let dec = super::super::shadow::shadow_buckets_from_decode(
+            &super::super::decoder::decode_with_recording(&stego).expect("decode"),
+        );
+        assert_eq!(enc.len(), dec.len(), "cover sizes differ");
+        let diff = enc.iter().zip(&dec).filter(|(a, b)| a != b).count();
+        assert_eq!(diff, 0, "{diff} of {} buckets differ", enc.len());
+    }
+}
+
+#[cfg(all(test, feature = "av1-decoder"))]
+mod v2_shadow_decode_tests {
+    use super::*;
+
+    /// A wrong passphrase finds neither the primary nor a shadow, and fails
+    /// cleanly (no panic, no garbage text).
+    #[test]
+    fn shadow_decode_with_wrong_passphrase_fails_cleanly() {
+        let (w, h, n) = (256u32, 144u32, 3u32);
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        let yuv: Vec<u8> = (0..(w * h * 3 / 2 * n) as usize)
+            .map(|i| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((i % w as usize) as u64 / 2 + (s >> 59)) as u8
+            })
+            .collect();
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n };
+        let p = crate::stego::payload::encode_payload("primary", &[]).unwrap();
+        let (ct, nonce, salt) = crate::stego::crypto::encrypt(&p, "prim").unwrap();
+        let framed = frame::build_frame(p.len(), &salt, &nonce, &ct);
+        let shadow = crate::stego::payload::encode_payload("hidden", &[]).unwrap();
+        let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, n);
+        let stego = av1_encode_with_shadows_streaming(
+            &mut src, n, params, &framed, "prim", &[("shadow-pass", &shadow)], 4,
+            Pass1CacheBudget::from_env_or_default(),
+        )
+        .expect("encode with shadow");
+        let mut dec = super::super::session::Av1StreamingDecodeSession::create("prim");
+        dec.push_bytes(&stego);
+        assert_eq!(dec.finish_shadow_whole_video("shadow-pass").expect("shadow").text, "hidden");
+        assert!(dec.finish_shadow_whole_video("not-the-pass").is_err());
     }
 }

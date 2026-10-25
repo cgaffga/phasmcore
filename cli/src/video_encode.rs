@@ -113,6 +113,15 @@ pub struct VideoEncodeArgs {
     #[arg(long, default_value_t = 30)]
     pub gop_size: usize,
 
+    /// Output resolution: `original` keeps the source size; `sd`, `hd`
+    /// and `fhd` scale it to fit 848x480, 1280x720 or 1920x1080 (the box
+    /// turned to the video's orientation, aspect kept, never upscaled) —
+    /// the presets the mobile apps offer, with the same deterministic
+    /// scaler as the Android app. Check the fit with `phasm video-capacity
+    /// --resolution` at the same preset.
+    #[arg(long, value_enum, default_value_t = crate::transcode::Resolution::Original)]
+    pub resolution: crate::transcode::Resolution,
+
     /// AV1 rav1e quantizer (0..=255). Higher = more compression / smaller
     /// file / more distortion. Mobile bridges default to ~100; the AV1
     /// CLI path defaulted to `PHASM_AV1_QUANTIZER` env-var or 100. When
@@ -210,12 +219,12 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                 if shadows.is_empty() {
                     run_oh264_encode(
                         &args.video, &message, &primary_files, &passphrase, &output_path,
-                        args.gop_size, args.optimize, args.verbose,
+                        args.gop_size, args.optimize, args.verbose, args.resolution,
                     )?;
                 } else {
                     run_oh264_shadow_encode(
                         &args.video, &message, &primary_files, &passphrase,
-                        &shadows, &output_path,
+                        &shadows, &output_path, args.resolution,
                     )?;
                 }
             }
@@ -257,7 +266,7 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                     }
                     run_av1_encode(
                         &args.video, &message, &passphrase, &output_path,
-                        args.gop_size, args.optimize, args.verbose,
+                        args.gop_size, args.optimize, args.verbose, args.resolution,
                     )?;
                 } else {
                     // SAFETY: see above.
@@ -271,7 +280,7 @@ pub fn run(args: VideoEncodeArgs) -> Result<(), CliError> {
                     // set via Av1FileYuvSource over the ffmpeg temp.
                     run_av1_shadow_encode_streaming(
                         &args.video, &message, &primary_files, &passphrase,
-                        &shadows, &output_path, args.gop_size,
+                        &shadows, &output_path, args.gop_size, args.resolution,
                     )?;
                 }
             }
@@ -328,10 +337,11 @@ fn write_and_mux_oh264(
     std::fs::write(annex_b_temp, annex_b)?;
     let audio_source = probe.has_audio.then_some(input);
     let pattern = phasm_core::GopPattern::Ipppp { gop: gop_size as usize };
+    let lead_in_us = probe_lead_in_us(probe);
     let _dropped_audio = transcode::mux_annexb_to_mp4_with_profile(
         annex_b_temp, audio_source, &probe.frame_rate,
         probe.width, probe.height, n_frames, pattern,
-        transcode::MuxProfile::HandbrakeX264, output,
+        transcode::MuxProfile::HandbrakeX264, lead_in_us, output,
     )?;
     Ok(())
 }
@@ -365,6 +375,7 @@ fn write_and_mux_oh264(
 ///    (`MuxProfile::HandbrakeX264`); see the mux-site comment for why the
 ///    earlier ffmpeg `-c copy` shell-out was dropped (2026-05-24).
 #[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
 fn run_oh264_encode(
     input: &PathBuf,
     message: &str,
@@ -380,6 +391,7 @@ fn run_oh264_encode(
     // Gates the auto-tier announcement, which costs a whole-clip encode +
     // walk — see the call site.
     verbose: bool,
+    resolution: transcode::Resolution,
 ) -> Result<(), CliError> {
     let _ = optimize; // TODO: thread into EncodeSessionParams when video optimizer ships
     use phasm_core::{
@@ -408,17 +420,25 @@ fn run_oh264_encode(
         // index the whole clip, so this is the OOM-safe equivalent — true
         // O(GOP) here would need a streaming `h264_resolve_auto_tier`.)
         let _t_decode = std::time::Instant::now();
-        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 16)?;
+        // Exact size: any even source (1920×1080, 854×480, ...) is encoded
+        // as-is; the SPS crops the MB grid back to it.
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, transcode::H264_SIZE_ALIGN)?;
+        // `--resolution`: from here on `probe` is the scaled size.
+        transcode::scale_yuv_to_preset(&yuv_temp, &mut probe, resolution)?;
         phasm_core::codec::h264::profile::record("phase.decode_ffmpeg", _t_decode.elapsed());
         let yuv_file = std::fs::File::open(&yuv_temp)?;
         // SAFETY: `yuv_temp` is our own freshly-written temp file (above), not
         // modified concurrently for the lifetime of this map.
         let yuv_bytes = unsafe { memmap2::Mmap::map(&yuv_file)? };
-        // The container's `nb_frames` metadata is unreliable — e.g.
-        // Artlist_CarPlane.mp4 reports nb_frames=193 but the decoder yields
-        // 194. The decoded buffer is authoritative: derive the real frame
-        // count from it rather than trusting the probe, and only hard-error
-        // if the buffer isn't a whole number of frames (genuinely corrupt).
+        // The decoded buffer is authoritative for the frame count: derive it
+        // from the buffer rather than trusting the probe's `nb_frames` (absent
+        // or approximate in some containers), and only hard-error if the
+        // buffer isn't a whole number of frames (genuinely corrupt).
+        //
+        // (Artlist_CarPlane.mp4 once "reported 193 but decoded 194". The
+        // container was right: the 194th frame was a duplicate the decode
+        // used to insert in front of a late-starting video track. See
+        // `transcode::decode_to_yuv_command`.)
         let frame_size = (probe.width as usize) * (probe.height as usize) * 3 / 2;
         if frame_size == 0 || yuv_bytes.len() % frame_size != 0 {
             return Err(CliError::InvalidArgs(format!(
@@ -694,6 +714,7 @@ fn run_oh264_shadow_encode(
     passphrase: &str,
     shadows: &[phasm_core::ShadowLayer],
     output: &PathBuf,
+    resolution: transcode::Resolution,
 ) -> Result<(), CliError> {
     use phasm_core::codec::h264::openh264_stego::{
         h264_encode_with_shadows_streaming, EncodeOpts, FileYuvSource,
@@ -739,7 +760,13 @@ fn run_oh264_shadow_encode(
 
     let result = (|| -> Result<(), CliError> {
         let _t_decode = std::time::Instant::now();
-        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 16)?;
+        // Exact size: any even source (1920×1080, 854×480, ...) is encoded
+        // as-is; the SPS crops the MB grid back to it.
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, transcode::H264_SIZE_ALIGN)?;
+        // `--resolution`, scaled once up front (not per pull sweep): the
+        // probe, the per-GOP FileYuvSource and the mux all read the scaled
+        // temp at `probe`'s new size.
+        transcode::scale_yuv_to_preset(&yuv_temp, &mut probe, resolution)?;
         phasm_core::codec::h264::profile::record("phase.decode_ffmpeg", _t_decode.elapsed());
 
         // Exact frame count from the file SIZE — no whole-clip load (O(GOP) RAM).
@@ -882,7 +909,9 @@ fn run_oh264_shadow_encode(
 /// Shadow file attachments are still deferred (mirror of mobile + H.264
 /// CLI). `--attach` is honoured for the PRIMARY message only.
 #[cfg(feature = "av1-encoder")]
+#[allow(clippy::too_many_arguments)]
 fn run_av1_shadow_encode_streaming(
+
     input: &PathBuf,
     message: &str,
     primary_files: &[phasm_core::FileEntry],
@@ -890,6 +919,7 @@ fn run_av1_shadow_encode_streaming(
     shadows: &[phasm_core::ShadowLayer],
     output: &PathBuf,
     cli_gop_size: usize,
+    resolution: transcode::Resolution,
 ) -> Result<(), CliError> {
     use phasm_core::codec::av1::stego::whole_video::{
         av1_encode_with_shadows_streaming, Av1FileYuvSource, Pass1CacheBudget,
@@ -909,7 +939,7 @@ fn run_av1_shadow_encode_streaming(
         probe.width, probe.height, probe.n_frames, probe.frame_rate,
         if probe.has_audio { " (with audio)" } else { "" },
     );
-    // Non-8-aligned sources are CROPPED in `decode_to_yuv_aligned` below.
+    // Odd sources are CROPPED to even in `decode_to_yuv_aligned` below.
     if shadows.iter().any(|s| !s.files.is_empty()) {
         eprintln!(
             "note: shadow --attach flags are not yet supported on the AV1 CLI \
@@ -921,7 +951,9 @@ fn run_av1_shadow_encode_streaming(
     let mut cleanup_paths = vec![yuv_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
-        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 8)?;
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, transcode::AV1_SIZE_ALIGN)?;
+        // `--resolution`: scaled once; Av1FileYuvSource reads the scaled temp.
+        transcode::scale_yuv_to_preset(&yuv_temp, &mut probe, resolution)?;
 
         // Exact frame count from file SIZE — no whole-clip load.
         let frame_size = (probe.width as usize) * (probe.height as usize) * 3 / 2;
@@ -949,13 +981,7 @@ fn run_av1_shadow_encode_streaming(
             .map_err(CliError::from)?;
         let primary_framed = frame::build_frame(primary_payload.len(), &salt, &nonce, &ciphertext);
 
-        let mut quantizer: usize = std::env::var("PHASM_AV1_QUANTIZER")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        if quantizer == 0 {
-            quantizer = 100;
-        }
+        let quantizer = av1_quantizer();
         let encode_gop_size: u32 = cli_gop_size.max(1) as u32;
         let params = Av1StreamingEncodeParams {
             width: probe.width,
@@ -1011,7 +1037,7 @@ fn run_av1_shadow_encode_streaming(
         // best-effort via the in-tree muxer's source-MP4 path.
         let (fps_num, fps_den) = transcode::parse_frame_rate(&probe.frame_rate);
         let timing = FrameTiming { fps_num, fps_den };
-        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den);
+        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den, probe_lead_in_us(&probe));
         let source_bytes = if probe.has_audio {
             Some(std::fs::read(input).map_err(CliError::from)?)
         } else {
@@ -1052,6 +1078,20 @@ fn get_message(flag: &Option<String>) -> Result<String, CliError> {
     Err(CliError::NoMessage)
 }
 
+/// rav1e quantizer for CLI AV1 encodes and capacity probes:
+/// `PHASM_AV1_QUANTIZER` (which `--av1-quantizer` sets), else 100, the
+/// production default the mobile bridges ship. Capacity must be probed at
+/// the encode's quantizer: cover grows as it drops, so another value
+/// misreports what the encode can carry.
+#[cfg(feature = "av1-encoder")]
+pub(crate) fn av1_quantizer() -> usize {
+    std::env::var("PHASM_AV1_QUANTIZER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&q: &usize| q != 0)
+        .unwrap_or(100)
+}
+
 /// AV1 stego encode path. Mirrors `run_oh264_encode`'s shape:
 ///
 /// MP4 → ffmpeg → YUV → `Av1StreamingProbeSession` (per-GOP cap probe)
@@ -1067,6 +1107,7 @@ fn get_message(flag: &Option<String>) -> Result<String, CliError> {
 ///   - container always video-only / audio passthrough (no audio
 ///     drop flag).
 #[cfg(feature = "av1-encoder")]
+#[allow(clippy::too_many_arguments)]
 fn run_av1_encode(
     input: &PathBuf,
     message: &str,
@@ -1075,6 +1116,7 @@ fn run_av1_encode(
     cli_gop_size: usize,
     optimize: bool,
     verbose: bool,
+    resolution: transcode::Resolution,
 ) -> Result<(), CliError> {
     let _ = optimize; // matches the H.264 wiring-only TODO; video optimizer is a follow-on
     let _ = verbose; // added 2026-10-18 to match the H.264 call-site added in 49fe26700;
@@ -1098,20 +1140,21 @@ fn run_av1_encode(
         if probe.has_audio { " (with audio)" } else { "" },
     );
 
-    // AV1 requires 8-pixel alignment (vs H.264's 16). Non-8-aligned
-    // sources are CROPPED (top-left) to the nearest 8-grid in
-    // `decode_to_yuv_aligned` below (probe.width/height are updated to the
-    // encoded dims).
+    // AV1 takes any even size; an odd source is CROPPED (top-left) to even
+    // in `decode_to_yuv_aligned` below (probe.width/height are updated to
+    // the encoded dims).
 
     let yuv_temp = transcode::temp_path_with_ext(input, "yuv");
     let mut cleanup_paths = vec![yuv_temp.clone()];
 
     let result = (|| -> Result<(), CliError> {
-        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, 8)?;
+        transcode::decode_to_yuv_aligned(input, &yuv_temp, &mut probe, transcode::AV1_SIZE_ALIGN)?;
+        // `--resolution`: from here on `probe` is the scaled size.
+        transcode::scale_yuv_to_preset(&yuv_temp, &mut probe, resolution)?;
         let yuv_bytes = std::fs::read(&yuv_temp)?;
 
-        // Reconcile container nb_frames vs decoded buffer (same gotcha
-        // as the H.264 path — CarPlane reports 193 but decode yields 194).
+        // Reconcile container nb_frames vs decoded buffer, as the H.264 path
+        // does: the decoded buffer is authoritative.
         let frame_size = (probe.width as usize) * (probe.height as usize) * 3 / 2;
         if frame_size == 0 || yuv_bytes.len() % frame_size != 0 {
             return Err(CliError::InvalidArgs(format!(
@@ -1136,18 +1179,7 @@ fn run_av1_encode(
         // keeps legacy text-only streams parsing too.
         let primary_bytes = payload::encode_payload(message, &[]).map_err(CliError::from)?;
 
-        let mut quantizer: usize = std::env::var("PHASM_AV1_QUANTIZER")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
-        // The calibration is locked at QP=30 corpus measurements
-        // (`AllocationCalibration::AV1_1080P_QP30`); the production
-        // rav1e quantizer is on a separate 0..255 scale. The mobile
-        // bridges and this CLI ship quantizer=100 as the production
-        // default — keep them consistent.
-        if quantizer == 0 {
-            quantizer = 100;
-        }
+        let quantizer = av1_quantizer();
         let encode_gop_size: u32 = cli_gop_size.max(1) as u32;
         // T2.4: probe runs at the real encode_gop_size now (not
         // gop_size=1). Single Av1StreamingEncodeParams shared by the
@@ -1238,7 +1270,7 @@ fn run_av1_encode(
         // Audio passthrough via the in-tree muxer's source-MP4 path
         // (mirror of `phasm_av1_build_mp4` in ios-bridge). Read failure
         // falls back to video-only mux — never blocks on audio.
-        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den);
+        let frame_times = nominal_frame_times_us(n_frames, fps_num, fps_den, probe_lead_in_us(&probe));
         let source_bytes = if probe.has_audio {
             Some(std::fs::read(input).map_err(CliError::from)?)
         } else {
@@ -1279,14 +1311,24 @@ fn av1_err_to_cli(e: phasm_core::Av1StegoError) -> CliError {
 /// Nominal presentation times (µs) of `n` frames at `num/den` fps, for the
 /// AV1 muxer, which snaps them to an exact timing (29.97 → 60000 / 2002) that
 /// the untimed `fps × 512` timescale cannot represent (30000/1001 came out
-/// as 29.969 fps). The CLI decodes through ffmpeg, so a source lead-in is not
-/// visible here — the mobile apps pass the real frame times instead.
+/// as 29.969 fps). The CLI's raw decode carries no per-frame times, so these
+/// are nominal (the mobile apps pass the real ones); `lead_in_us` places the
+/// first one where the source presents its first video frame, which the
+/// muxer keeps by holding frame 0 (see `probe_lead_in_us`).
 #[cfg(feature = "av1-encoder")]
-fn nominal_frame_times_us(n: u32, num: u32, den: u32) -> Vec<i64> {
+fn nominal_frame_times_us(n: u32, num: u32, den: u32, lead_in_us: u64) -> Vec<i64> {
     if num == 0 {
         return Vec::new();
     }
     (0..n as i64)
-        .map(|i| (i * den as i64 * 1_000_000 + num as i64 / 2) / num as i64)
+        .map(|i| (i * den as i64 * 1_000_000 + num as i64 / 2) / num as i64 + lead_in_us as i64)
         .collect()
+}
+
+/// The source's video lead-in to keep in the output: when its first video
+/// frame is presented against the audio's time zero. Only meaningful when
+/// the audio is passed through; a video-only output starts at 0.
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
+fn probe_lead_in_us(probe: &transcode::VideoProbe) -> u64 {
+    if probe.has_audio { probe.video_start_us } else { 0 }
 }

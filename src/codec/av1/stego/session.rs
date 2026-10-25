@@ -116,6 +116,12 @@ impl Av1StreamingDecodeSession {
     /// chunk_frame per slab, assemble payload, decrypt, return
     /// plaintext.
     pub fn finish(self) -> Result<Vec<u8>, Av1StegoError> {
+        self.primary_plaintext()
+    }
+
+    /// [`finish`](Self::finish) without consuming the session, so
+    /// [`finish_payload`](Self::finish_payload) can go on to the shadows.
+    fn primary_plaintext(&self) -> Result<Vec<u8>, Av1StegoError> {
         if self.accumulator.is_empty() {
             return Err(Av1StegoError::ExtractionFailed);
         }
@@ -128,8 +134,9 @@ impl Av1StreamingDecodeSession {
             ));
         }
 
-        let structural_key = crypto::derive_structural_key(&self.passphrase)?;
-        let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
+        // v2: every GOP has its own keyed cover order and H-hat seed,
+        // derived from the structural master and the GOP index.
+        let master = crypto::derive_structural_key(&self.passphrase)?;
 
         // v3 wire: first GOP carries `total_bytes` (clip header);
         // subsequent GOPs carry only `payload_len`. Decoder concatenates
@@ -155,7 +162,8 @@ impl Av1StreamingDecodeSession {
             // A cancel (the bridges run decodes on the Decode channel) stops
             // at the next GOP instead of decoding the whole clip.
             crate::stego::progress::check_cancelled().map_err(Av1StegoError::Stego)?;
-            let cover_bits = harvest_cover_bits_from_stego(slab)?;
+            let (cover_bits, hhat_seed) =
+                gop_stc_input(&harvest_cover_bits_from_stego(slab)?, &master, gop_idx as u32);
             if gop_idx == 0 {
                 let (total_bytes, payload) = extract_first_chunk_frame_match(
                     &cover_bits,
@@ -230,7 +238,45 @@ impl Av1StreamingDecodeSession {
     pub fn finish_primary_payload(
         self,
     ) -> Result<crate::stego::payload::PayloadData, Av1StegoError> {
-        let plaintext = self.finish()?;
+        Self::primary_payload(self.primary_plaintext()?)
+    }
+
+    /// The message the session's passphrase opens, whichever layer it is:
+    /// the primary, else the whole-video shadow (what the encoders write
+    /// today), else a per-GOP shadow (older encodes). H.264's decode
+    /// session falls back to its shadows the same way. This is the entry
+    /// a decoder that is only given a passphrase should call —
+    /// [`finish_primary_payload`](Self::finish_primary_payload) alone can
+    /// never read a shadow back.
+    ///
+    /// A cancel stops at once; if no layer opens, the primary's error is
+    /// returned.
+    pub fn finish_payload(self) -> Result<crate::stego::payload::PayloadData, Av1StegoError> {
+        use crate::stego::error::StegoError;
+        let primary_err = match self.primary_plaintext() {
+            Ok(plaintext) => return Self::primary_payload(plaintext),
+            Err(Av1StegoError::Stego(StegoError::Cancelled)) => {
+                return Err(Av1StegoError::Stego(StegoError::Cancelled));
+            }
+            Err(e) => e,
+        };
+        for shadow in [Self::finish_shadow_whole_video] {
+            match shadow(&self, &self.passphrase) {
+                Ok(payload) => return Ok(payload),
+                Err(StegoError::Cancelled) => {
+                    return Err(Av1StegoError::Stego(StegoError::Cancelled));
+                }
+                Err(_) => {}
+            }
+        }
+        Err(primary_err)
+    }
+
+    /// Parse a decrypted primary as an `encode_payload` frame, falling
+    /// back to raw UTF-8 text for pre-FILE encoders.
+    fn primary_payload(
+        plaintext: Vec<u8>,
+    ) -> Result<crate::stego::payload::PayloadData, Av1StegoError> {
         match crate::stego::payload::decode_payload(&plaintext) {
             Ok(pd) => Ok(pd),
             Err(_) => {
@@ -244,51 +290,11 @@ impl Av1StreamingDecodeSession {
         }
     }
 
-    /// Extract a shadow message using a shadow-specific passphrase.
-    /// Walks per-GOP slabs (same OBU split as `finish`) and returns
-    /// the first GOP that successfully decodes the shadow under
-    /// `shadow_pass`. Each GOP carries the full shadow independently
-    /// (per-GOP scope); any one GOP recovers the message.
-    ///
-    /// Borrows `&self` since shadow extract doesn't consume session
-    /// state — caller can later call `finish()` for the primary, or
-    /// `finish_shadow_first_match` again with a different shadow
-    /// passphrase.
-    pub fn finish_shadow_first_match(
-        &self,
-        shadow_pass: &str,
-    ) -> Result<crate::stego::payload::PayloadData, crate::stego::error::StegoError> {
-        if self.accumulator.is_empty() {
-            return Err(crate::stego::error::StegoError::FrameCorrupted);
-        }
-        let gop_slabs = split_av1_into_gops(&self.accumulator);
-        if gop_slabs.is_empty() {
-            return Err(crate::stego::error::StegoError::InvalidVideo(
-                "session.finish_shadow: OBU walker found no sequence_header_obu in \
-                 accumulated bytes".into(),
-            ));
-        }
-        for slab in &gop_slabs {
-            crate::stego::progress::check_cancelled()?;
-            // For each slab, run the shadow-extract pipeline. The
-            // first GOP that yields a valid AES-authenticated shadow
-            // wins; subsequent slabs aren't explored to keep cost
-            // bounded.
-            if let Ok(payload) =
-                super::orchestrator::av1_stego_extract_shadow(slab, shadow_pass)
-            {
-                return Ok(payload);
-            }
-        }
-        Err(crate::stego::error::StegoError::FrameCorrupted)
-    }
 
     /// Extract a whole-video shadow message.
     ///
-    /// Unlike `finish_shadow_first_match` (which walks per-GOP slabs
-    /// and tries shadow extract on each individually — the per-GOP
-    /// shadow scope), this method harvests the UNION cover across all
-    /// GOPs and runs shadow extract once. Required for shadows
+    /// Harvests the UNION cover across all GOPs and runs shadow extract
+    /// once (the only shadow scope; the per-GOP one was v1 and is gone). Required for shadows
     /// produced by `Av1StreamingEncodeSession::create_whole_video_with_shadows`,
     /// whose shadow bits are spread top-N across the whole-video
     /// cover (no single GOP slab carries enough bits to RS-decode).
@@ -313,18 +319,67 @@ impl Av1StreamingDecodeSession {
             super::orchestrator::Av1StegoError::Stego(s) => s,
             _ => crate::stego::error::StegoError::FrameCorrupted,
         };
+        // v2: each position's damage bucket comes from the same decode, per
+        // GOP (frame index and GOP length are GOP-relative), spec § 6.
         let gop_slabs = split_av1_into_gops(&self.accumulator);
-        let cover = if gop_slabs.is_empty() {
-            crate::stego::progress::check_cancelled()?;
-            harvest_cover_bits_from_stego(&self.accumulator).map_err(to_stego)?
+        let slabs: Vec<&[u8]> = if gop_slabs.is_empty() {
+            vec![&self.accumulator]
         } else {
-            let mut cover = Vec::new();
-            for slab in &gop_slabs {
-                crate::stego::progress::check_cancelled()?;
-                cover.extend_from_slice(&harvest_cover_bits_from_stego(slab).map_err(to_stego)?);
-            }
-            cover
+            gop_slabs.iter().map(|s| s.as_slice()).collect()
         };
-        super::shadow::av1_shadow_extract(&cover, shadow_pass)
+        let (mut cover, mut buckets) = (Vec::new(), Vec::new());
+        for slab in slabs {
+            crate::stego::progress::check_cancelled()?;
+            let (c, b) = super::shadow::cover_and_buckets_from_stego(slab).map_err(to_stego)?;
+            cover.extend_from_slice(&c);
+            buckets.extend_from_slice(&b);
+        }
+        super::shadow::av1_shadow_extract(&cover, &buckets, shadow_pass)
+    }
+}
+
+/// v2 STC input for one GOP: the slab's canonical cover gathered through
+/// the GOP's keyed order (`stego::cover_order`, spec § 3), and the GOP's
+/// own H-hat seed. The order spans the whole GOP cover, as on the encode
+/// side.
+pub(crate) fn gop_stc_input(cover: &[u8], master: &[u8; 64], gop: u32) -> (Vec<u8>, [u8; 32]) {
+    use crate::stego::cover_order::{gop_cover_order, gop_seeds, VideoCodec};
+    let seeds = gop_seeds(master, VideoCodec::Av1, gop);
+    let order = gop_cover_order(cover.len(), &seeds.order);
+    (order.iter().map(|&i| cover[i as usize]).collect(), seeds.hhat)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stego::cover_order::{gop_cover_order, gop_seeds, VideoCodec};
+
+    fn master(fill: u8) -> [u8; 64] {
+        std::array::from_fn(|i| fill.wrapping_add(i as u8))
+    }
+
+    /// The decoder's STC input is the slab's canonical cover gathered
+    /// through the GOP's keyed order, with that GOP's own H-hat seed.
+    #[test]
+    fn gop_stc_input_is_the_keyed_gather() {
+        let cover: Vec<u8> = (0..500u32).map(|i| (i * 7 % 3 == 0) as u8).collect();
+        let m = master(5);
+        let (perm, hhat) = gop_stc_input(&cover, &m, 3);
+        let seeds = gop_seeds(&m, VideoCodec::Av1, 3);
+        let want: Vec<u8> =
+            gop_cover_order(cover.len(), &seeds.order).iter().map(|&i| cover[i as usize]).collect();
+        assert_eq!(perm, want);
+        assert_eq!(hhat, seeds.hhat);
+        assert_ne!(perm, cover, "the order must not be the identity");
+    }
+
+    #[test]
+    fn gop_stc_input_differs_per_gop() {
+        let cover: Vec<u8> = (0..500u32).map(|i| (i % 5 == 0) as u8).collect();
+        let m = master(9);
+        let (p0, h0) = gop_stc_input(&cover, &m, 0);
+        let (p1, h1) = gop_stc_input(&cover, &m, 1);
+        assert_ne!(h0, h1, "every GOP gets its own H-hat");
+        assert_ne!(p0, p1);
     }
 }

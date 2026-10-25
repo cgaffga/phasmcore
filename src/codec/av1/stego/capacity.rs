@@ -569,6 +569,21 @@ pub fn av1_probe_gops_at_with_progress(
     positions: &[u32],
     progress_fn: &mut dyn FnMut(u32, u32, u64),
 ) -> Result<Vec<(usize, usize)>, Av1StegoError> {
+    Ok(probe_gops(source, n_frames, params, positions, progress_fn)?
+        .into_iter()
+        .map(|(g, cover, _)| (g, cover))
+        .collect())
+}
+
+/// [`av1_probe_gops_at_with_progress`] plus each GOP's count of v2
+/// shadow-eligible positions (spec § 6: a shadow uses only those).
+fn probe_gops(
+    source: &mut dyn super::whole_video::Av1GopYuvSource,
+    n_frames: u32,
+    params: Av1StreamingEncodeParams,
+    positions: &[u32],
+    progress_fn: &mut dyn FnMut(u32, u32, u64),
+) -> Result<Vec<(usize, usize, usize)>, Av1StegoError> {
     if n_frames == 0 {
         return Err(Av1StegoError::InvalidPacket(
             "av1_probe_gops_at: n_frames == 0".into(),
@@ -605,7 +620,7 @@ pub fn av1_probe_gops_at_with_progress(
     let total = positions.len() as u32;
     let mut cover_bits_running: u64 = 0;
     let mut done: u32 = 0;
-    let mut samples: Vec<(usize, usize)> = Vec::with_capacity(positions.len());
+    let mut samples: Vec<(usize, usize, usize)> = Vec::with_capacity(positions.len());
     for &gop_idx in positions {
         let frames_in_this_gop = {
             let start = gop_idx * gop_size;
@@ -639,7 +654,15 @@ pub fn av1_probe_gops_at_with_progress(
                 }
             }
         }
-        samples.push((gop_idx as usize, cover_bits));
+        let eligible = super::whole_video::shadow_buckets_from_recordings(
+            &per_frame,
+            params.width,
+            params.height,
+        )
+        .iter()
+        .filter(|b| b.is_some())
+        .count();
+        samples.push((gop_idx as usize, cover_bits, eligible));
         cover_bits_running = cover_bits_running.saturating_add(cover_bits as u64);
         done = done.saturating_add(1);
         progress_fn(done, total, cover_bits_running);
@@ -726,9 +749,12 @@ pub fn av1_capacity_stratified_with_progress(
     let (positions, n_full, tail_gop) =
         stratified_probe_positions(n_frames, gop_size, calibration.k_min);
 
-    let samples = av1_probe_gops_at_with_progress(
-        source, n_frames, params, &positions, progress_fn,
-    )?;
+    let samples3 = probe_gops(source, n_frames, params, &positions, progress_fn)?;
+    // Share of the cover a v2 shadow may use, over the probed GOPs.
+    let (sum_cover, sum_eligible) = samples3
+        .iter()
+        .fold((0usize, 0usize), |(c, e), &(_, cb, el)| (c + cb, e + el));
+    let samples: Vec<(usize, usize)> = samples3.iter().map(|&(g, c, _)| (g, c)).collect();
     if samples.is_empty() {
         return Err(Av1StegoError::InvalidPacket(
             "av1_capacity_stratified: no samples collected".into(),
@@ -755,8 +781,14 @@ pub fn av1_capacity_stratified_with_progress(
         // Never advertise more than `encode_payload` accepts.
         .min(MAX_INNER_PAYLOAD_BYTES);
 
-    // Shadow (N=1) via collision formula.
-    let shadow_n1_bits = (extrapolated_cover_bits as f64).min(
+    // Shadow (N=1) via collision formula, capped by the v2 shadow-eligible
+    // positions (spec § 6), extrapolated by their share of the probed cover.
+    let eligible_bits = if sum_cover == 0 {
+        0
+    } else {
+        (extrapolated_cover_bits as u128 * sum_eligible as u128 / sum_cover as u128) as usize
+    };
+    let shadow_n1_bits = (eligible_bits as f64).min(
         (1024.0 * extrapolated_cover_bits as f64).sqrt(),
     ) as usize;
     let shadow_max_message_bytes_n1 = (shadow_n1_bits / 8)

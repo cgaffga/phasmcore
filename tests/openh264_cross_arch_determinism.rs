@@ -141,6 +141,7 @@ fn cross_arch_determinism_record_hash() {
     //   - 2026-06 Phase 6 (cf v2): 597e1db6e403e98454a9218bae3c8dc4178581c0302677668cb1a94dd618236d (47128 bytes, 4-domain streaming, chunk_frame v2)
     //   - 2026-06-11 (cf v3, #839): 54c11576e2dd28607e84a20303388aeef8c4d46b141b021168d3d864c6aea911 (47128 bytes, chunk_frame v3)
     //   - 2026-10-18 (cf v3.1, #888): f20434ed2845e63caee017d107836d3cdf770289a54a6e4cc602d51fc7f7a1ca (47128 bytes, chunk_frame v3.1)
+    //   - 2026-10-23 (MVD cost model, c8b0ea18): ebdc000e4966518842c84dda4527d90a2d005827ec1d0ba7d1d18ec5b2e0e9a0 (47128 bytes)
     //
     // If this assert ever fires:
     //   1. Print both hashes so the diff is captured in the log.
@@ -150,6 +151,22 @@ fn cross_arch_determinism_record_hash() {
     //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
+    // Re-baselined 2026-10-24 for the J-UNIWARD border window
+    // (`h264_uniward::accumulate_cost_from_field`). Blocks in the first 15
+    // pixel rows / columns used to be priced over only the in-plane part of
+    // their 19×19 window and are now priced over all of it, reflection margin
+    // included (docs/design/video/h264/intra-drift-diagnosis.md, fix 1). That
+    // re-prices every border coefficient position of this 480×272 fixture, so
+    // the STC picks different flips: a deliberate change to the embedded bits
+    // with the length unchanged (47128 B). Interior costs are bit-identical.
+    // Verified NOT non-determinism before re-pinning: on macOS aarch64, two
+    // consecutive release runs, `PHASM_H264_FULL_WAVELET=1` (full instead of
+    // band-limited decomposition), `PHASM_H264_DISABLE_SIMD=1` and
+    // `RAYON_NUM_THREADS=1` all produced 7aaaa39e…, and a one-off fingerprint
+    // of the H.264 content costs (border MBs included) matched between
+    // x86_64 under Rosetta and aarch64. The Linux x86_64 + aarch64 workflow
+    // confirmation is owed for this pin as for the ones before it.
+    //
     // Re-baselined 2026-10-23 for the MVD cost model (c8b0ea18, 2026-10-20).
     // That commit re-priced MVD flips by the damage they cause instead of
     // 1/texture — a deliberate change to which positions the STC picks, so
@@ -182,7 +199,7 @@ fn cross_arch_determinism_record_hash() {
     // workflow_dispatch re-pin protocol documented above — that confirmation is
     // owed for BOTH this pin and the v3 one it replaces.
     const PINNED_SHA256: &str =
-        "ebdc000e4966518842c84dda4527d90a2d005827ec1d0ba7d1d18ec5b2e0e9a0";
+        "7aaaa39e62e8e21d3cac901a4ba9a485e2f030be358f34c7b02fd669c27656a5";
     const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,

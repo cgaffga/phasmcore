@@ -70,8 +70,8 @@ jobs:
             label: linux-arm64
           - os: macos-latest
             label: macos-arm64
-          # AVX-512: GitHub's x86 runners have been AMD Zen 3 (no AVX-512),
-          # so this leg runs the same tests under Intel's Software
+          # AVX-512: GitHub's x86 runners vary (Zen 3 has no AVX-512, Zen 4
+          # lacks Ice Lake's extensions), so this leg runs the same tests under Intel's Software
           # Development Emulator as an Ice Lake server CPU (`-icx`, which
           # has everything rav1e's and dav1d's AVX512ICL level needs).
           - os: ubuntu-latest

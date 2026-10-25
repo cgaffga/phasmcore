@@ -239,7 +239,8 @@ pub fn compute_and_apply_deltas(
         return;
     }
 
-    let mb_width = (width / 16) as usize;
+    // Coded MB grid (ceil) — the grid cover positions are keyed on.
+    let mb_width = width.div_ceil(16) as usize;
     let pic_h = height as usize;
     let mut cache = IdctDeltaCache::new(qp);
 
@@ -452,7 +453,8 @@ pub fn compute_and_apply_deltas_for_row(
         return;
     }
 
-    let mb_width = (width / 16) as usize;
+    // Coded MB grid (ceil) — the grid cover positions are keyed on.
+    let mb_width = width.div_ceil(16) as usize;
     let pic_h = height as usize;
     let mut cache = IdctDeltaCache::new(qp);
 

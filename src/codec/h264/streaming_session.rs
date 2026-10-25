@@ -25,6 +25,7 @@
 //! - **D.0.7.11**: streaming decode session (shipped). See
 //!   [`StreamingDecodeSession`] below.
 
+use super::frame_geometry::FrameGeometry;
 use crate::stego::error::StegoError;
 
 // #474.1 — progress event types. Streaming sessions accept an optional
@@ -141,9 +142,13 @@ impl Default for ColorParams {
 /// formatted. The struct's `Debug` impl below skips the callback.
 #[derive(Clone)]
 pub struct EncodeSessionParams {
-    /// Encoded width. Must be 16-aligned (callers pad on the app side).
+    /// Display width in pixels: any even value >= 16. A width that is not a
+    /// multiple of 16 is coded on the MB grid and cropped back in the SPS
+    /// (`frame_crop_right_offset`), like a phone encoder — 1080 stays 1080.
     pub width: u32,
-    /// Encoded height. Same 16-aligned constraint.
+    /// Display height in pixels: any even value >= 16 (cropped via
+    /// `frame_crop_bottom_offset` when not a multiple of 16, e.g. 1080p is
+    /// coded 1088 lines with `crop_bottom = 4`).
     pub height: u32,
     /// Frame rate numerator (e.g. 30 for 30 fps, 30000 for 29.97).
     pub fps_num: u32,
@@ -301,7 +306,7 @@ impl StreamingEncodeSession {
     /// Create a new streaming encode session.
     ///
     /// # Errors
-    /// * [`StegoError::InvalidVideo`] if dimensions are zero/non-16-aligned,
+    /// * [`StegoError::InvalidVideo`] if dimensions are zero, odd or below 16,
     ///   fps is degenerate, gop_size is zero, total_frames_hint is zero,
     ///   or the message can't fit into the computed chunk schedule.
     pub fn create(
@@ -329,12 +334,9 @@ impl StreamingEncodeSession {
                 params.width, params.height
             )));
         }
-        if params.width % 16 != 0 || params.height % 16 != 0 {
-            return Err(StegoError::InvalidVideo(format!(
-                "dimensions must be 16-aligned, got {}x{} (app must pad)",
-                params.width, params.height
-            )));
-        }
+        // Exact even sizes are encoded as-is: OpenH264 codes the MB grid and
+        // emits the SPS crop (see `frame_geometry`).
+        FrameGeometry::new(params.width, params.height)?;
         if params.fps_den == 0 || params.fps_num == 0 {
             return Err(StegoError::InvalidVideo(
                 "fps_num and fps_den must be > 0".into(),
@@ -1363,12 +1365,7 @@ impl StreamingProbeSession {
                 params.width, params.height
             )));
         }
-        if params.width % 16 != 0 || params.height % 16 != 0 {
-            return Err(StegoError::InvalidVideo(format!(
-                "dimensions must be 16-aligned, got {}x{}",
-                params.width, params.height
-            )));
-        }
+        FrameGeometry::new(params.width, params.height)?;
         if params.gop_size == 0 {
             return Err(StegoError::InvalidVideo("gop_size must be > 0".into()));
         }
@@ -2353,10 +2350,29 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_non_16_aligned_dims() {
-        let mut bad = ok_params();
-        bad.width = 1234; // not 16-aligned
-        assert!(StreamingEncodeSession::create(bad, "hi", "pw").is_err());
+    fn create_rejects_odd_or_tiny_dims() {
+        // A 4:2:0 SPS crop is in 2-px units, so an odd size is not encodable
+        // exactly; below 16 OpenH264 refuses to initialise.
+        for (w, h) in [(1235, 1080), (1920, 1081), (14, 64)] {
+            let mut bad = ok_params();
+            bad.width = w;
+            bad.height = h;
+            assert!(StreamingEncodeSession::create(bad.clone(), "hi", "pw").is_err(), "{w}x{h}");
+            assert!(StreamingProbeSession::create(bad).is_err(), "{w}x{h} (probe)");
+        }
+    }
+
+    #[test]
+    fn create_accepts_exact_even_dims() {
+        // 1920x1080 (ok_params), and sizes that are not multiples of 16 on
+        // either axis: encoded on the MB grid and cropped in the SPS.
+        for (w, h) in [(1920, 1080), (1080, 1920), (1234, 1080), (848, 480), (200, 120)] {
+            let mut p = ok_params();
+            p.width = w;
+            p.height = h;
+            assert!(StreamingEncodeSession::create(p.clone(), "hi", "pw").is_ok(), "{w}x{h}");
+            assert!(StreamingProbeSession::create(p).is_ok(), "{w}x{h} (probe)");
+        }
     }
 
     #[test]

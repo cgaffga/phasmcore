@@ -70,6 +70,7 @@
 //! them on its own — frame-level concurrency would only add
 //! `cores × 32 MB` for no throughput gain).
 
+use crate::codec::h264::frame_geometry::FrameGeometry;
 use crate::codec::h264::tables::BLOCK_INDEX_TO_POS;
 use crate::codec::h264::stego::hook::{BinKind, EmbedDomain, PositionKey, SyntaxPath};
 use crate::codec::h264::stego::inject::{DomainBits, DomainCover};
@@ -164,7 +165,16 @@ fn mvd_position_cost(texture: f32, displacement_qpel: f32) -> f32 {
 ///
 /// `yuv` must be `width * height * 3 / 2 * n_frames` bytes in I420
 /// (YUV420p) layout, with all `n_frames` frames concatenated. `width`
-/// and `height` must be 16-aligned.
+/// and `height` are the display size: any even size ≥ 16×16.
+///
+/// **Coded-frame view.** For a size that is not a multiple of 16 the encoder
+/// codes the MB grid (`ceil(dim / 16)`) and crops back in the SPS, and the
+/// walker's cover includes the padded MB row / column. Each frame is
+/// therefore expanded to the coded size with the encoder's own padding fill
+/// ([`crate::codec::h264::frame_geometry::FrameGeometry::pad_frame_into`])
+/// before the wavelet decomposition, so every position — padded or near the
+/// edge — is priced from the pixels OpenH264 actually codes. 16-aligned
+/// sizes use the planes in place (no copy, identical arithmetic).
 ///
 /// `cover` carries the 4-domain positions emitted by the walker. The
 /// returned [`DomainCosts`] has the same per-domain lengths as
@@ -179,7 +189,7 @@ fn mvd_position_cost(texture: f32, displacement_qpel: f32) -> f32 {
 /// # Errors
 ///
 /// - [`StegoError::InvalidVideo`] if YUV length doesn't match
-///   `width × height × 3/2 × n_frames` or dims are not 16-aligned.
+///   `width × height × 3/2 × n_frames`, or the size is odd / below 16×16.
 pub fn compute_content_costs_yuv(
     yuv: &[u8],
     width: u32,
@@ -201,20 +211,24 @@ fn compute_content_costs_yuv_with_mode(
     demand_mode: WaveletDemandMode,
 ) -> Result<DomainCosts, StegoError> {
     let _prof = crate::codec::h264::profile::scope("cost.content_costs");
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(StegoError::InvalidVideo(format!(
-            "dimensions must be 16-aligned, got {width}x{height}"
-        )));
-    }
-    let frame_size = (width * height * 3 / 2) as usize;
+    let geom = FrameGeometry::new(width, height)?;
+    let frame_size = geom.frame_bytes();
     if yuv.len() != frame_size * n_frames as usize {
         return Err(StegoError::InvalidVideo(format!(
             "yuv len {} != expected {}", yuv.len(), frame_size * n_frames as usize,
         )));
     }
 
-    let mb_width = (width / 16) as usize;
-    let y_plane_size = (width * height) as usize;
+    // Everything below works on the CODED frame (the MB grid the encoder
+    // codes and the walker's cover addresses). For an aligned size that is
+    // the display frame itself; otherwise each frame is padded into
+    // `coded_frame` with the encoder's fill first.
+    let (coded_w, coded_h) = (geom.coded_width(), geom.coded_height());
+    let needs_pad = !geom.is_mb_aligned();
+    let mut coded_frame: Vec<u8> = Vec::new();
+
+    let mb_width = geom.mb_width() as usize;
+    let y_plane_size = (coded_w * coded_h) as usize;
     let chroma_plane_size = y_plane_size / 4;
 
     let unit_basis = precompute_unit_basis();
@@ -255,17 +269,22 @@ fn compute_content_costs_yuv_with_mode(
             continue;
         }
         let yuv_offset = (*frame_idx as usize) * frame_size;
-        let y_plane = &yuv[yuv_offset .. yuv_offset + y_plane_size];
-        let cb_offset = yuv_offset + y_plane_size;
-        let cb_plane = &yuv[cb_offset .. cb_offset + chroma_plane_size];
-        let cr_offset = cb_offset + chroma_plane_size;
-        let cr_plane = &yuv[cr_offset .. cr_offset + chroma_plane_size];
+        let frame: &[u8] = if needs_pad {
+            geom.pad_frame_into(&yuv[yuv_offset..yuv_offset + frame_size], &mut coded_frame);
+            &coded_frame
+        } else {
+            &yuv[yuv_offset..yuv_offset + frame_size]
+        };
+        let y_plane = &frame[..y_plane_size];
+        let cb_plane = &frame[y_plane_size..y_plane_size + chroma_plane_size];
+        let cr_offset = y_plane_size + chroma_plane_size;
+        let cr_plane = &frame[cr_offset..cr_offset + chroma_plane_size];
 
         // WV.6.b.3: the per-frame wavelet + cost work is shared with the spill
         // variant via `fill_frame_costs` (bit-identical — same arithmetic).
         let dt = fill_frame_costs(
             y_plane, cb_plane, cr_plane, bucket, cover, &field_table,
-            width as usize, height as usize, mb_width, &mut costs, demand_mode,
+            coded_w as usize, coded_h as usize, mb_width, &mut costs, demand_mode,
         );
         if trace_cc {
             t_wav += dt;
@@ -1113,12 +1132,157 @@ mod tests {
         assert!(matches!(res, Err(StegoError::InvalidVideo(_))));
     }
 
+    /// Odd sizes cannot be carried by a 4:2:0 SPS crop and are refused, as are
+    /// sizes below OpenH264's 16×16 minimum. Even non-16 sizes are accepted
+    /// (see `cropped_size_costs_equal_the_encoder_padded_frame`).
     #[test]
-    fn non_aligned_dims_rejected() {
+    fn odd_or_tiny_dims_rejected() {
         let yuv = vec![0u8; 100];
         let cover = empty_cover();
         let res = compute_content_costs_yuv(&yuv, 17, 16, 1, &cover, 26);
         assert!(matches!(res, Err(StegoError::InvalidVideo(_))));
+        let res = compute_content_costs_yuv(&yuv, 8, 8, 1, &cover, 26);
+        assert!(matches!(res, Err(StegoError::InvalidVideo(_))));
+    }
+
+    /// Exact-size (cropped) frames are priced over the CODED frame the encoder
+    /// codes: costs for a 150×90 clip must be bit-identical to costs computed
+    /// on the same clip explicitly padded to its 160×96 MB grid with the
+    /// encoder's fill, in every wavelet-demand mode. Positions in the padded
+    /// MB row / column (which the walker's cover contains) must be priced, not
+    /// dropped.
+    #[test]
+    fn cropped_size_costs_equal_the_encoder_padded_frame() {
+        use crate::codec::h264::frame_geometry::FrameGeometry;
+        let (w, h, n_frames) = (150u32, 90u32, 3u32);
+        let geom = FrameGeometry::new(w, h).unwrap();
+        let (cw, ch) = (geom.coded_width(), geom.coded_height());
+        assert_eq!((cw, ch), (160, 96));
+        let yuv = synth_yuv(w, h, n_frames);
+        let mut padded = Vec::new();
+        let mut one = Vec::new();
+        for f in 0..n_frames as usize {
+            let fb = geom.frame_bytes();
+            geom.pad_frame_into(&yuv[f * fb..(f + 1) * fb], &mut one);
+            padded.extend_from_slice(&one);
+        }
+        let cover = random_cover(geom.mb_per_frame() as u32, n_frames);
+        let bits = |c: &DomainCosts| -> Vec<Vec<u32>> {
+            [&c.coeff_sign_bypass, &c.coeff_suffix_lsb, &c.mvd_sign_bypass, &c.mvd_suffix_lsb]
+                .iter()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        for mode in [WaveletDemandMode::Off, WaveletDemandMode::Chroma, WaveletDemandMode::All] {
+            let exact = compute_content_costs_yuv_with_mode(&yuv, w, h, n_frames, &cover, 26, mode)
+                .unwrap();
+            let coded = compute_content_costs_yuv_with_mode(&padded, cw, ch, n_frames, &cover, 26, mode)
+                .unwrap();
+            assert_eq!(bits(&exact), bits(&coded), "{mode:?}: cropped costs != coded-frame costs");
+        }
+        // The last MB column and the last MB row are partly padding; their
+        // coefficient positions must carry finite costs like any other MB.
+        let exact = compute_content_costs_yuv(&yuv, w, h, n_frames, &cover, 26).unwrap();
+        let (mbw, mbh) = (geom.mb_width(), geom.mb_height());
+        let edge_finite = cover
+            .coeff_sign_bypass
+            .positions
+            .iter()
+            .zip(&exact.coeff_sign_bypass)
+            .filter(|(k, _)| k.frame_idx() < n_frames)
+            .filter(|(k, _)| k.mb_addr() % mbw == mbw - 1 || k.mb_addr() / mbw == mbh - 1)
+            .filter(|(_, c)| c.is_finite())
+            .count();
+        assert!(edge_finite > 0, "no finite cost in the padded MB row/column");
+    }
+
+    /// Border MBs are priced over their full J-UNIWARD window, through the
+    /// production cost pass in every wavelet-demand mode. Frame `b` is frame
+    /// `a` mirrored into a 2× canvas on every plane
+    /// (`b[n + y][n + x] = a[reflect(y)][reflect(x)]`), so a position in MB
+    /// `(mx, my)` of `a` sees, reflection margin included, exactly the pixels
+    /// the same position in MB `(mx + 4, my + 4)` of `b` sees inside the
+    /// plane, and must cost exactly the same: top MB row and left MB column
+    /// included, luma and chroma, both coefficient domains and both MVD
+    /// domains. End-to-end form of `h264_uniward`'s
+    /// `border_block_cost_equals_its_mirrored_interior_twin`. Before 2026-10
+    /// the margin was skipped and every position in the first 15 pixel rows or
+    /// columns came out cheaper than its twin.
+    #[test]
+    fn border_mb_costs_equal_their_mirrored_interior_twins() {
+        use crate::codec::h264::stego::hook::Axis;
+        use crate::stego::cost::h264_uniward::symmetric_reflect;
+        let n = 64usize; // a: 64×64 = 4×4 MBs; b: 128×128 = 8×8 MBs
+        let a = synth_yuv(n as u32, n as u32, 1);
+        let mirror = |plane: &[u8], side: usize| -> Vec<u8> {
+            let big = 2 * side;
+            (0..big * big)
+                .map(|i| {
+                    let r = |v: usize| symmetric_reflect(v as isize - side as isize, side as isize) as usize;
+                    plane[r(i / big) * side + r(i % big)]
+                })
+                .collect()
+        };
+        let (ys, cs) = (n * n, n * n / 4);
+        let mut b = mirror(&a[..ys], n);
+        b.extend(mirror(&a[ys..ys + cs], n / 2));
+        b.extend(mirror(&a[ys + cs..ys + 2 * cs], n / 2));
+
+        let cover_for = |mb_addr: &dyn Fn(u32, u32) -> u32| -> DomainCover {
+            let mut cover = DomainCover::default();
+            let push = |bits: &mut DomainBits, key: PositionKey, magnitude: u16| {
+                bits.bits.push(0);
+                bits.positions.push(key);
+                bits.magnitudes.push(magnitude);
+            };
+            for my in 0..4 {
+                for mx in 0..4 {
+                    let mb = mb_addr(mx, my);
+                    for coeff_idx in [1u8, 6, 15] {
+                        for block_idx in 0..16u8 {
+                            let csb = SyntaxPath::Luma4x4 { block_idx, coeff_idx, kind: BinKind::Sign };
+                            let csl = SyntaxPath::Luma4x4 { block_idx, coeff_idx, kind: BinKind::SuffixLsb };
+                            push(&mut cover.coeff_sign_bypass,
+                                 PositionKey::new(0, mb, EmbedDomain::CoeffSignBypass, csb), 3);
+                            push(&mut cover.coeff_suffix_lsb,
+                                 PositionKey::new(0, mb, EmbedDomain::CoeffSuffixLsb, csl), 2);
+                        }
+                        for (plane, block_idx) in (0..2u8).flat_map(|p| (0..4u8).map(move |b| (p, b))) {
+                            let path = SyntaxPath::ChromaAc { plane, block_idx, coeff_idx, kind: BinKind::Sign };
+                            push(&mut cover.coeff_sign_bypass,
+                                 PositionKey::new(0, mb, EmbedDomain::CoeffSignBypass, path), 1);
+                        }
+                    }
+                    for (domain, kind) in [(EmbedDomain::MvdSignBypass, BinKind::Sign),
+                                           (EmbedDomain::MvdSuffixLsb, BinKind::SuffixLsb)] {
+                        let path = SyntaxPath::Mvd { list: 0, partition: 0, axis: Axis::X, kind };
+                        let bits = if domain == EmbedDomain::MvdSignBypass {
+                            &mut cover.mvd_sign_bypass
+                        } else {
+                            &mut cover.mvd_suffix_lsb
+                        };
+                        push(bits, PositionKey::new(0, mb, domain, path), 5);
+                    }
+                }
+            }
+            cover
+        };
+        let cover_a = cover_for(&|mx, my| my * 4 + mx);
+        let cover_b = cover_for(&|mx, my| (my + 4) * 8 + (mx + 4));
+        let bits = |c: &DomainCosts| -> Vec<Vec<u32>> {
+            [&c.coeff_sign_bypass, &c.coeff_suffix_lsb, &c.mvd_sign_bypass, &c.mvd_suffix_lsb]
+                .iter()
+                .map(|v| v.iter().map(|x| x.to_bits()).collect())
+                .collect()
+        };
+        for mode in [WaveletDemandMode::Off, WaveletDemandMode::Chroma, WaveletDemandMode::All] {
+            let ca = compute_content_costs_yuv_with_mode(&a, n as u32, n as u32, 1, &cover_a, 26, mode)
+                .unwrap();
+            let cb = compute_content_costs_yuv_with_mode(&b, 2 * n as u32, 2 * n as u32, 1, &cover_b, 26, mode)
+                .unwrap();
+            assert!(ca.coeff_sign_bypass.iter().all(|c| c.is_finite()), "{mode:?}: wet AC position");
+            assert_eq!(bits(&ca), bits(&cb), "{mode:?}: border MB costs differ from their interior twins");
+        }
     }
 
     /// Construct a single Luma4x4 CSB position at (mb=0, block=0,
@@ -1225,18 +1389,12 @@ mod tests {
         assert_eq!(costs_a.coeff_sign_bypass, costs_b.coeff_sign_bypass);
     }
 
-    /// The band-limited wavelet (computed only where a priced position reads
-    /// it) must give BIT-identical costs to the full decomposition, in every
-    /// domain, for every kind of position — including chroma/luma blocks on
-    /// the plane borders, wet positions, MVD positions, positions of a frame
-    /// with no chroma AC at all, and out-of-range frames. A 1-ULP difference
-    /// here is a different STC plan, i.e. a different stego file.
-    #[test]
-    fn band_limited_wavelet_costs_are_bit_identical_to_full() {
+    /// Deterministic random 4-domain cover over an `n_mb`-MB frame grid for
+    /// `n_frames` frames (+ one out-of-range frame): luma / chroma AC /
+    /// chroma DC coefficient positions in both coefficient domains, MVD
+    /// positions in both MVD domains, and no chroma at all in frame 2.
+    fn random_cover(n_mb: u32, n_frames: u32) -> DomainCover {
         use crate::codec::h264::stego::hook::Axis;
-        let (w, h, n_frames) = (160u32, 96u32, 3u32);
-        let yuv = synth_yuv(w, h, n_frames);
-        let n_mb = (w / 16) * (h / 16);
         let mut s: u64 = 0x5EED_0F_C0575;
         let mut rnd = |m: u32| -> u32 {
             s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -1297,12 +1455,26 @@ mod tests {
                 target.magnitudes.push(rnd(60) as u16);
             }
         }
-        let cover = DomainCover {
+        DomainCover {
             coeff_sign_bypass: csb,
             coeff_suffix_lsb: csl,
             mvd_sign_bypass: msb,
             mvd_suffix_lsb: msl,
-        };
+        }
+    }
+
+    /// The band-limited wavelet (computed only where a priced position reads
+    /// it) must give BIT-identical costs to the full decomposition, in every
+    /// domain, for every kind of position — including chroma/luma blocks on
+    /// the plane borders, wet positions, MVD positions, positions of a frame
+    /// with no chroma AC at all, and out-of-range frames. A 1-ULP difference
+    /// here is a different STC plan, i.e. a different stego file.
+    #[test]
+    fn band_limited_wavelet_costs_are_bit_identical_to_full() {
+        let (w, h, n_frames) = (160u32, 96u32, 3u32);
+        let yuv = synth_yuv(w, h, n_frames);
+        let n_mb = (w / 16) * (h / 16);
+        let cover = random_cover(n_mb, n_frames);
         let bits = |c: &DomainCosts| -> Vec<Vec<u32>> {
             [&c.coeff_sign_bypass, &c.coeff_suffix_lsb, &c.mvd_sign_bypass, &c.mvd_suffix_lsb]
                 .iter()

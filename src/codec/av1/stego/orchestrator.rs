@@ -41,25 +41,14 @@
 //! would extract at different positions than the encoder hid at.
 
 #[cfg(feature = "av1-encoder")]
-use phasm_rav1e::ec::WriterEncoder;
+use phasm_rav1e::phasm_stego::PhasmFrameRecording;
 #[cfg(feature = "av1-encoder")]
-use phasm_rav1e::phasm_stego::{
-    AcSignMeta, PhasmFrameRecording, PHASM_TAG_AC_COEFF_SIGN,
-    PHASM_TAG_GOLOMB_TAIL_LSB,
-};
-#[cfg(feature = "av1-encoder")]
-use crate::stego::cost::av1_uniward::{
-    Av1FramePosition, FramePlanes,
-};
+use crate::stego::cost::av1_uniward::FramePlanes;
 
 #[cfg(feature = "av1-decoder")]
 use crate::codec::av1::stego::decoder::{decode_with_recording, Av1DecodeError};
-#[cfg(feature = "av1-encoder")]
-use crate::codec::av1::stego::writer::{replay_with_overrides, OverrideMap};
 
 use crate::stego::error::StegoError;
-#[cfg(feature = "av1-encoder")]
-use crate::stego::stc::embed::stc_embed;
 #[cfg(feature = "av1-decoder")]
 use crate::stego::stc::extract::stc_extract;
 use crate::stego::stc::hhat;
@@ -128,610 +117,40 @@ pub fn av1_stego_embed(
     message: &[u8],
     passphrase: &str,
 ) -> Result<Vec<u8>, Av1StegoError> {
-    // 1. Derive keys from passphrase.
-    let structural_key = crypto::derive_structural_key(passphrase)?;
-    let hhat_seed: [u8; 32] = structural_key[32..]
-        .try_into()
-        .expect("derive_structural_key returns 64 bytes");
-
-    // 2. Encrypt + frame the message into payload bits.
+    // v2: one frame is a one-frame GOP through the production cascade
+    // (keyed order, per-GOP H-hat, W·S·D costs), so tools built on this
+    // single-frame API measure what ships.
+    let master = crypto::derive_structural_key(passphrase)?;
     let (ciphertext, nonce, salt) = crypto::encrypt(message, passphrase)?;
-    let payload_bytes = frame::build_frame(message.len(), &salt, &nonce, &ciphertext);
-    let payload_bits = frame::bytes_to_bits(&payload_bytes);
-
-    // 3. Delegate to the bits-level inner. The streaming-session-v6
-    // path (`session.rs`) calls this directly with pre-framed
-    // chunk_frame bits to skip the per-GOP re-encrypt.
-    av1_stego_embed_payload_bits(natural_packet, recording, &payload_bits, &hhat_seed)
+    let framed = frame::build_frame(message.len(), &salt, &nonce, &ciphertext);
+    let (w, h) = av1_visible_frame_size(&natural_packet)?;
+    let frames = vec![(natural_packet, recording)];
+    let harvest = super::whole_video::harvest_gop(&frames, w as u32, h as u32)?;
+    let gop_n = harvest.len();
+    super::whole_video::cascade_one_gop(
+        super::whole_video::Av1CascadeGopInputs {
+            gop_idx: 0,
+            gop_offset: 0,
+            gop_n,
+            harvest: &harvest,
+            frames: &frames,
+            chunk: &framed,
+        },
+        super::whole_video::Av1CascadeGopShared {
+            total_message_bytes: framed.len() as u32,
+            shadow_states: &[],
+            master: &master,
+        },
+    )?
+    .ok_or(Av1StegoError::MessageTooLarge { needed_bits: framed.len() * 8, available_bits: gop_n })
 }
 
-/// Streaming entry point: embed pre-framed `payload_bits` into the
-/// cover without performing AES encryption or `frame::build_frame`
-/// wrapping. Caller is responsible for both (typically at
-/// session_create).
-///
-/// Used by [`session::Av1StreamingEncodeSession`] to embed chunk_frame
-/// bytes (the pre-encrypted + chunk-split payload) per GOP. The legacy
-/// `av1_stego_embed` is now a thin wrapper around this — passing the
-/// single-frame frame::build_frame output as payload bits and using the
-/// passphrase-derived hhat_seed.
-#[cfg(feature = "av1-encoder")]
-pub(crate) fn av1_stego_embed_payload_bits(
-    natural_packet: Vec<u8>,
-    recording: PhasmFrameRecording,
-    payload_bits: &[u8],
-    hhat_seed: &[u8; 32],
-) -> Result<Vec<u8>, Av1StegoError> {
-    av1_stego_embed_payload_bits_with_shadows(
-        natural_packet,
-        recording,
-        payload_bits,
-        hhat_seed,
-        &[],
-    )
-}
 
-/// Extract a shadow message from a stego AV1 packet.
-///
-/// Walks the bitstream via dav1d, harvests the joint Tier-1 cover
-/// (AC_COEFF_SIGN + GOLOMB_TAIL_LSB), then delegates to
-/// `av1_shadow_extract` which iterates the parity-tier brute-force.
-///
-/// Note: this operates on the FULL cover, NOT n_used. The embed
-/// path restricts shadows to [0, n_used), but the decoder doesn't
-/// know n_used. priority_slots with cover.len() == full n
-/// produces a SUPERSET of the embed-time top-N slots, sorted by the
-/// same priority function. The encode-time top-N positions (which
-/// are within [0, n_used)) appear at the SAME rank-positions in
-/// the decoder's sort. The decoder's bit-pack at those positions
-/// recovers the shadow bits.
-///
-/// Wrong-passphrase / corruption returns `StegoError::FrameCorrupted`.
-#[cfg(feature = "av1-decoder")]
-pub fn av1_stego_extract_shadow(
-    stego_av1_bytes: &[u8],
-    shadow_passphrase: &str,
-) -> Result<crate::stego::payload::PayloadData, crate::stego::error::StegoError> {
-    let cover_bits = harvest_cover_bits_from_stego(stego_av1_bytes).map_err(|e| match e {
-        Av1StegoError::Stego(s) => s,
-        Av1StegoError::Decode(_)
-        | Av1StegoError::EmptyRecording
-        | Av1StegoError::NoCoverPositions
-        | Av1StegoError::ExtractionFailed
-        | Av1StegoError::TileGroupSizeMismatch { .. }
-        | Av1StegoError::StcInfeasible
-        | Av1StegoError::MessageTooLarge { .. }
-        | Av1StegoError::InvalidPacket(_) => crate::stego::error::StegoError::FrameCorrupted,
-    })?;
-    super::shadow::av1_shadow_extract(&cover_bits, shadow_passphrase)
-}
 
-/// Legacy single-frame embed + N shadows. Wraps the primary encrypt
-/// + frame::build_frame for the main message, then delegates to
-/// `av1_stego_embed_payload_bits_with_shadows`. Mirror of
-/// `av1_stego_embed` plus a `shadows` parameter.
-///
-/// Each shadow is `(passphrase, payload_bytes)` — the payload bytes
-/// should already be `payload::encode_payload(text, files)` output
-/// when files are attached.
-#[cfg(feature = "av1-encoder")]
-pub fn av1_stego_embed_with_shadows(
-    natural_packet: Vec<u8>,
-    recording: PhasmFrameRecording,
-    message: &[u8],
-    passphrase: &str,
-    shadows: &[(&str, &[u8])],
-) -> Result<Vec<u8>, Av1StegoError> {
-    let structural_key = crypto::derive_structural_key(passphrase)?;
-    let hhat_seed: [u8; 32] = structural_key[32..]
-        .try_into()
-        .expect("derive_structural_key returns 64 bytes");
-    let (ciphertext, nonce, salt) = crypto::encrypt(message, passphrase)?;
-    let payload_bytes = frame::build_frame(message.len(), &salt, &nonce, &ciphertext);
-    let payload_bits = frame::bytes_to_bits(&payload_bytes);
-    av1_stego_embed_payload_bits_with_shadows(
-        natural_packet,
-        recording,
-        &payload_bits,
-        &hhat_seed,
-        shadows,
-    )
-}
 
-/// Embed payload bits + N shadows in one pass.
-///
-/// Shadow protocol (see `docs/design/video/av1/phase-c-shadows.md`):
-///
-/// 1. Snapshot the original Tier-1 cover BEFORE any shadow injection.
-/// 2. Inject shadow LSBs at ChaCha20-priority-sorted top-N positions
-///    over the (truncated to n_used) cover. Primary STC then sees
-///    shadow bits as natural cover bits.
-/// 3. Overlay `f32::INFINITY` cost at shadow positions so primary's
-///    Viterbi routes around them.
-/// 4. Run primary STC normally.
-/// 5. Defensive plan-stamp: apply_shadows_to_plan over stego_bits in
-///    case STC's path didn't perfectly avoid shadow positions (it
-///    should, but belt-and-suspenders).
-/// 6. Build the OverrideMap from the ORIGINAL (pre-shadow) cover vs
-///    the post-STC + post-shadow-stamp stego_bits. At shadow
-///    positions where the original cover bit happened to equal the
-///    shadow bit, no override is recorded; otherwise an override
-///    flips the natural OBU bit to the shadow bit.
-///
-/// Each shadow is `(passphrase: &str, payload_bytes: &[u8])`. Shadow
-/// payload bytes have already been bundled (text + files) by the
-/// caller via `crate::stego::payload::encode_payload` if applicable;
-/// `prepare_shadow_av1` encrypts + frames + RS-encodes internally.
-///
-/// `shadow_parity_len` applies uniformly to all shadows. Per-shadow
-/// parity selection is a follow-on.
-#[cfg(feature = "av1-encoder")]
-pub fn av1_stego_embed_payload_bits_with_shadows(
-    natural_packet: Vec<u8>,
-    recording: PhasmFrameRecording,
-    payload_bits: &[u8],
-    hhat_seed: &[u8; 32],
-    shadows: &[(&str, &[u8])],
-) -> Result<Vec<u8>, Av1StegoError> {
-    av1_stego_embed_payload_bits_with_shadows_parity(
-        natural_packet,
-        recording,
-        payload_bits,
-        hhat_seed,
-        shadows,
-        16, // default parity_len — middle of AV1_SHADOW_PARITY_TIERS
-    )
-}
 
-/// Same as `av1_stego_embed_payload_bits_with_shadows` with explicit
-/// shadow parity_len. Useful for tests + capacity tuning.
-#[cfg(feature = "av1-encoder")]
-pub fn av1_stego_embed_payload_bits_with_shadows_parity(
-    natural_packet: Vec<u8>,
-    recording: PhasmFrameRecording,
-    payload_bits: &[u8],
-    hhat_seed: &[u8; 32],
-    shadows: &[(&str, &[u8])],
-    shadow_parity_len: usize,
-) -> Result<Vec<u8>, Av1StegoError> {
-    if recording.tiles.is_empty() {
-        return Err(Av1StegoError::EmptyRecording);
-    }
 
-    let payload = payload_bits;
 
-    // 4. Filter recorder's bit_positions to the Tier-1 channel set.
-    //
-    // Both GOLOMB_TAIL_LSB and AC_COEFF_SIGN are enrolled. The
-    // phasm-rav1e + phasm-dav1d fork patches tag ONLY the literal
-    // LSB of each golomb code (leading zeros + non-LSB literals get
-    // OTHER), so every enrolled position is safe to flip ±1 without
-    // changing the bitstream length or cascading through culLevel.
-    let tile = &recording.tiles[0];
-    let mut ac_global_cursors: Vec<u64> = Vec::new();
-    let mut ac_cover_bits: Vec<u8> = Vec::new();
-    let mut ac_metas: Vec<AcSignMeta> = Vec::new();
-    for (cursor, ((&(_, value), &tag), &meta)) in tile
-        .bit_positions
-        .iter()
-        .zip(tile.bit_tags.iter())
-        .zip(tile.bit_meta.iter())
-        .enumerate()
-    {
-        if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
-            ac_global_cursors.push(cursor as u64);
-            ac_cover_bits.push(value as u8);
-            ac_metas.push(meta);
-        }
-    }
-
-    let n = ac_cover_bits.len();
-    // payload is now a bit array, so .len() IS the bit count.
-    let m_bits = payload.len();
-    if m_bits > n {
-        return Err(Av1StegoError::MessageTooLarge {
-            needed_bits: m_bits,
-            available_bits: n,
-        });
-    }
-
-    // 5. Compute STC params per phasm-core convention (Ghost
-    // `compute_stc_params`): w = floor(n / m_bits), n_used = m_bits
-    // * w. Each message bit gets `w` cover bits of slack. Truncate
-    // cover to n_used so STC's Viterbi is balanced.
-    let w = (n / m_bits.max(1)).max(1);
-    let n_used = m_bits * w;
-
-    // Prepare shadows over the FULL n cover (NOT n_used).
-    //
-    // Why FULL n: priority_slots's sort is over indices 0..N. If
-    // encoder uses N_enc=n_used and decoder uses N_dec=n (the
-    // post-harvest cover length), the two top-N sets diverge —
-    // decoder's top-N may include indices in [n_used, n) whose
-    // priorities sort BELOW some of encoder's top-N. With N_enc=n
-    // both sides agree on the priority ordering.
-    //
-    // Consequence: SOME shadow positions may land in [n_used, n).
-    // Primary STC operates only on [0, n_used) so these positions
-    // are outside its scope. We handle them with explicit override
-    // entries below (see "out-of-range shadow override" step).
-    let shadow_states = if shadows.is_empty() {
-        Vec::new()
-    } else {
-        super::shadow::prepare_shadows(n, shadows, shadow_parity_len)
-            .map_err(Av1StegoError::Stego)?
-    };
-
-    // Snapshot the ORIGINAL full cover BEFORE injecting shadow LSBs.
-    // The override map (below) compares against this; without it,
-    // shadow positions whose natural bit happened to equal the shadow
-    // bit would produce no override and the natural OBU bit would
-    // survive instead of the shadow bit.
-    let original_full_cover: Vec<u8> = ac_cover_bits.clone();
-
-    // Inject shadow LSBs into the in-range portion of the cover
-    // (`[0, n_used)`). Out-of-range positions are handled by the
-    // explicit override step below.
-    let mut shadow_position_set: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index < n_used {
-                ac_cover_bits[slot.cover_index] = state.bits[i];
-            }
-            shadow_position_set.insert(slot.cover_index);
-        }
-    }
-
-    let cover_used = &ac_cover_bits[..n_used];
-    let cursors_used = &ac_global_cursors[..n_used];
-    let metas_used = &ac_metas[..n_used];
-
-    // 6. Generate HHAT matrix from passphrase-derived seed.
-    let hhat_matrix = hhat::generate_hhat(STC_H, w, &hhat_seed);
-
-    // 7. STC embed with J-UNIWARD costs. Each AC sign's cost reflects
-    // how much its sign flip would perturb the Daubechies-8 wavelet
-    // decomposition of the post-LR reconstructed pixel plane the flip
-    // lives in. Positions with high-magnitude AC coefficients in
-    // textured regions get LOW cost (safe to flip — the perturbation
-    // hides in existing wavelet energy); positions in smooth regions
-    // get HIGH cost.
-    let (width, height) = av1_visible_frame_size(&natural_packet)?;
-    let mut costs = frame_costs(&recording, metas_used, width, height);
-
-    // Overlay INF cost at IN-RANGE shadow positions so primary STC's
-    // Viterbi routes around them. With shadow bits already injected
-    // into cover[..n_used] + INF cost here, primary's plan preserves
-    // shadow bits at shadow positions in [0, n_used).
-    for &idx in &shadow_position_set {
-        if idx < n_used {
-            costs[idx] = f32::INFINITY;
-        }
-    }
-
-    let mut embed_result = stc_embed(cover_used, &costs, &payload, &hhat_matrix, STC_H, w)
-        .ok_or(Av1StegoError::StcInfeasible)?;
-
-    // Defensive plan-stamp — re-apply shadow bits to
-    // stego_bits[..n_used] at IN-RANGE shadow positions in case STC's
-    // path didn't perfectly respect INF (it should, but
-    // belt-and-suspenders).
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index < n_used {
-                embed_result.stego_bits[slot.cover_index] = state.bits[i];
-            }
-        }
-    }
-
-    // 8. Build OverrideMap from ORIGINAL_full_cover → stego
-    // differences. Using the snapshot of the cover BEFORE shadow
-    // injection ensures override entries fire at every shadow
-    // position where the original natural bit differs from the
-    // shadow's required bit. Without this, shadow positions where
-    // the natural bit happened to equal the shadow bit would produce
-    // no override and the natural OBU bit (not the shadow) would
-    // survive.
-    let mut plan = OverrideMap::new();
-    for (i, &stego_bit) in embed_result.stego_bits.iter().enumerate() {
-        // i is in [0, n_used)
-        if stego_bit != original_full_cover[i] {
-            plan.set(cursors_used[i], stego_bit as u16);
-        }
-    }
-
-    // Out-of-range shadow override.
-    // Shadow positions with cover_index in [n_used, n) are outside
-    // primary STC's window. The replay path will pass them through
-    // unchanged unless we add explicit override entries here.
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index >= n_used {
-                let want = state.bits[i];
-                if want != original_full_cover[slot.cover_index] {
-                    plan.set(ac_global_cursors[slot.cover_index], want as u16);
-                }
-            }
-        }
-    }
-    let _ = cover_used; // silence unused-var hint; primary STC consumed it
-
-    // 9. Replay through a fresh WriterEncoder with the override plan.
-    // Produces the stego tile_group bytes.
-    let mut sink = WriterEncoder::new();
-    replay_with_overrides(&tile.storage, &tile.bit_positions, &plan, &mut sink);
-    let stego_tile_bytes = sink.done();
-
-    // 10. Splice stego tile bytes into the natural OBU output.
-    // Fast path: same length → in-place byte-overwrite.
-    // Slow path: length differs by ±1 byte (rare range-coder
-    // trailing-carry edge case) → rebuild the frame_obu with a
-    // recomputed ULEB128 size field.
-    let final_packet = if stego_tile_bytes.len() == recording.tile_group_len {
-        let mut packet = natural_packet;
-        let dst = &mut packet[recording.tile_group_offset
-            ..recording.tile_group_offset + recording.tile_group_len];
-        dst.copy_from_slice(&stego_tile_bytes);
-        packet
-    } else {
-        rebuild_obu_with_stego_tile_group(&natural_packet, &recording, &stego_tile_bytes)
-    };
-    Ok(final_packet)
-}
-
-/// Multi-frame-per-GOP stego encode primitive.
-///
-/// Takes the result of [`phasm_rav1e::phasm_stego::encode_gop_with_phasm_tee`]
-/// (N per-frame `(natural_packet, recording)` pairs from a single GOP)
-/// plus the GOP's payload bits, and produces the concatenated stego
-/// OBU bytes for the whole GOP.
-///
-/// The combined cover for the GOP is the per-frame Tier-1 covers
-/// (AC_COEFF_SIGN + GOLOMB_TAIL_LSB) concatenated in submission order.
-/// A single STC plan runs over that combined cover; the resulting
-/// stego_bits are split back into per-frame `OverrideMap`s and applied
-/// per-frame via [`replay_with_overrides`].
-///
-/// Mirrors `av1_stego_embed_payload_bits_with_shadows_parity` for the
-/// single-frame case (v=1 GOP). Differences:
-///
-/// - Per-frame cost vectors are computed independently (each frame
-///   has its own `frame_qindex` + `loop_filter_state` +
-///   `reconstructed_planes`) then concatenated.
-/// - The override map is split per-frame so each frame's replay sees
-///   only its own overrides; per-frame `tile_group_offset` /
-///   `tile_group_len` / `frame_obu_start` are used for the per-frame
-///   splice.
-/// - Shadows are computed over the COMBINED cover (per-GOP scope), not
-///   per-frame. The shadow priority sort over indices 0..n_combined
-///   places shadow positions at consistent ranks regardless of which
-///   frame each lives in. The override map split routes each shadow
-///   override entry to the correct frame.
-///
-/// `shadow_parity_len` applies uniformly to all shadows. Per-shadow
-/// parity selection lives at the wrapper layer.
-#[cfg(feature = "av1-encoder")]
-pub(crate) fn av1_stego_encode_one_gop(
-    per_frame: Vec<(Vec<u8>, PhasmFrameRecording)>,
-    payload_bits: &[u8],
-    hhat_seed: &[u8; 32],
-) -> Result<Vec<u8>, Av1StegoError> {
-    av1_stego_encode_one_gop_with_shadows_parity(
-        per_frame,
-        payload_bits,
-        hhat_seed,
-        &[],
-        0,
-    )
-}
-
-/// Multi-frame GOP primitive + shadow embedding.
-///
-/// See [`av1_stego_encode_one_gop`] for the no-shadow flavor.
-#[cfg(feature = "av1-encoder")]
-pub(crate) fn av1_stego_encode_one_gop_with_shadows_parity(
-    per_frame: Vec<(Vec<u8>, PhasmFrameRecording)>,
-    payload_bits: &[u8],
-    hhat_seed: &[u8; 32],
-    shadows: &[(&str, &[u8])],
-    shadow_parity_len: usize,
-) -> Result<Vec<u8>, Av1StegoError> {
-    if per_frame.is_empty() {
-        return Err(Av1StegoError::EmptyRecording);
-    }
-    let n_frames = per_frame.len();
-    // Every frame of the GOP has the size its keyframe's sequence header
-    // declares.
-    let (width, height) = av1_visible_frame_size(&per_frame[0].0)?;
-
-    // Per-frame harvest: Tier-1 cover bits + meta + global cursors +
-    // per-position J-UNIWARD cost.
-    struct FrameHarvest {
-        global_cursors: Vec<u64>,
-        cover_bits: Vec<u8>,
-        costs: Vec<f32>,
-    }
-    let mut frames_harvest: Vec<FrameHarvest> = Vec::with_capacity(n_frames);
-
-    for (_, recording) in per_frame.iter() {
-        if recording.tiles.is_empty() {
-            return Err(Av1StegoError::EmptyRecording);
-        }
-        let tile = &recording.tiles[0];
-
-        let mut global_cursors: Vec<u64> = Vec::new();
-        let mut cover_bits: Vec<u8> = Vec::new();
-        let mut metas: Vec<AcSignMeta> = Vec::new();
-
-        for (cursor, ((&(_, value), &tag), &meta)) in tile
-            .bit_positions
-            .iter()
-            .zip(tile.bit_tags.iter())
-            .zip(tile.bit_meta.iter())
-            .enumerate()
-        {
-            if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
-                global_cursors.push(cursor as u64);
-                cover_bits.push(value as u8);
-                metas.push(meta);
-            }
-        }
-
-        // Per-frame J-UNIWARD cost vector. Each position uses THIS
-        // frame's reconstructed planes + frame_qindex +
-        // loop_filter_state — frames have independent quality
-        // characteristics.
-        let costs = frame_costs(recording, &metas, width, height);
-
-        frames_harvest.push(FrameHarvest {
-            global_cursors,
-            cover_bits,
-            costs,
-        });
-    }
-
-    // Build combined cover + costs + per-bit (frame_idx, frame_cursor)
-    // back-reference index. The index is what lets us route a
-    // combined-cover position back to the right frame's override map.
-    let mut combined_cover: Vec<u8> = Vec::new();
-    let mut combined_costs: Vec<f32> = Vec::new();
-    let mut combined_index: Vec<(usize, u64)> = Vec::new();
-    for (frame_idx, fh) in frames_harvest.iter().enumerate() {
-        combined_cover.extend_from_slice(&fh.cover_bits);
-        combined_costs.extend_from_slice(&fh.costs);
-        for &c in &fh.global_cursors {
-            combined_index.push((frame_idx, c));
-        }
-    }
-    let n = combined_cover.len();
-
-    let m_bits = payload_bits.len();
-    if m_bits == 0 {
-        return Err(Av1StegoError::InvalidPacket(
-            "av1_stego_encode_one_gop: empty payload_bits".into(),
-        ));
-    }
-    if m_bits > n {
-        return Err(Av1StegoError::MessageTooLarge {
-            needed_bits: m_bits,
-            available_bits: n,
-        });
-    }
-
-    let w = (n / m_bits).max(1);
-    let n_used = m_bits * w;
-
-    // Shadows over the FULL combined cover. Same protocol as
-    // single-frame: priority-sort over indices 0..n, top-N positions
-    // carry shadow LSBs.
-    let shadow_states = if shadows.is_empty() {
-        Vec::new()
-    } else {
-        super::shadow::prepare_shadows(n, shadows, shadow_parity_len)
-            .map_err(Av1StegoError::Stego)?
-    };
-
-    // Snapshot ORIGINAL combined cover before shadow injection. Used
-    // for OverrideMap diff so shadow positions whose natural bit
-    // matches the shadow bit still produce no spurious override
-    // entries.
-    let original_full_cover: Vec<u8> = combined_cover.clone();
-
-    let mut shadow_position_set: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index < n_used {
-                combined_cover[slot.cover_index] = state.bits[i];
-            }
-            shadow_position_set.insert(slot.cover_index);
-        }
-    }
-
-    let cover_used = &combined_cover[..n_used];
-
-    let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
-
-    // Overlay INF cost at IN-RANGE shadow positions so primary STC's
-    // Viterbi routes around them.
-    let mut costs_for_stc: Vec<f32> = combined_costs[..n_used].to_vec();
-    for &idx in &shadow_position_set {
-        if idx < n_used {
-            costs_for_stc[idx] = f32::INFINITY;
-        }
-    }
-
-    let mut embed_result = stc_embed(cover_used, &costs_for_stc, payload_bits, &hhat_matrix, STC_H, w)
-        .ok_or(Av1StegoError::StcInfeasible)?;
-
-    // Defensive plan-stamp: re-apply shadow bits to stego_bits in
-    // case STC's path didn't perfectly respect INF cost.
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index < n_used {
-                embed_result.stego_bits[slot.cover_index] = state.bits[i];
-            }
-        }
-    }
-
-    // Split STC stego_bits → per-frame OverrideMaps.
-    let mut per_frame_plans: Vec<OverrideMap> =
-        (0..n_frames).map(|_| OverrideMap::new()).collect();
-    for i in 0..n_used {
-        if embed_result.stego_bits[i] != original_full_cover[i] {
-            let (frame_idx, cursor) = combined_index[i];
-            per_frame_plans[frame_idx].set(cursor, embed_result.stego_bits[i] as u16);
-        }
-    }
-
-    // Out-of-range shadow override: shadow positions with cover_index
-    // in [n_used, n) are outside primary STC's window. Add explicit
-    // override entries; replay path passes them through unchanged
-    // otherwise.
-    for state in &shadow_states {
-        for (i, slot) in state.positions.iter().enumerate().take(state.n_total) {
-            if slot.cover_index >= n_used {
-                let want = state.bits[i];
-                if want != original_full_cover[slot.cover_index] {
-                    let (frame_idx, cursor) = combined_index[slot.cover_index];
-                    per_frame_plans[frame_idx].set(cursor, want as u16);
-                }
-            }
-        }
-    }
-
-    // Per-frame replay + splice. Each frame's overrides land in that
-    // frame's WriterRecorder storage; the resulting stego tile_group
-    // bytes splice into the frame's natural OBU output via the same
-    // path the single-frame primitive uses.
-    let mut output = Vec::new();
-    for (frame_idx, (natural_packet, recording)) in per_frame.into_iter().enumerate() {
-        let tile = &recording.tiles[0];
-        let mut sink = WriterEncoder::new();
-        replay_with_overrides(
-            &tile.storage,
-            &tile.bit_positions,
-            &per_frame_plans[frame_idx],
-            &mut sink,
-        );
-        let stego_tile_bytes = sink.done();
-
-        let final_packet = if stego_tile_bytes.len() == recording.tile_group_len {
-            let mut packet = natural_packet;
-            let dst = &mut packet[recording.tile_group_offset
-                ..recording.tile_group_offset + recording.tile_group_len];
-            dst.copy_from_slice(&stego_tile_bytes);
-            packet
-        } else {
-            rebuild_obu_with_stego_tile_group(&natural_packet, &recording, &stego_tile_bytes)
-        };
-
-        output.extend_from_slice(&final_packet);
-    }
-
-    Ok(output)
-}
 
 /// Rebuild the frame_obu portion of the natural packet with the new
 /// stego tile_group bytes, recomputing the ULEB128 size field so the
@@ -969,47 +388,6 @@ fn sequence_header_frame_size(payload: &[u8]) -> Option<(usize, usize)> {
     Some((width, height))
 }
 
-/// J-UNIWARD cost of flipping each of a frame's enrolled positions
-/// (`metas`, in cover order), for the research embed paths. Each cost
-/// reflects how much the flip would perturb the Daubechies-8 wavelet
-/// decomposition of the post-LR reconstructed plane it lives in: positions
-/// in textured regions get LOW cost (the perturbation hides in existing
-/// wavelet energy), smooth regions HIGH cost. The frame's loop-filter state
-/// activates cascade-safety v2's three-tier dispatch (|coeff|-based
-/// safe/reject bands + forward model for the middle), and
-/// `coeff_magnitude` feeds its pre-filter, upper bound and cache key.
-///
-/// `width`×`height` is the visible frame size: the cost input repeats its
-/// edge into rav1e's 8-alignment padding ([`pack_cost_planes`]), whose
-/// pixels are cropped on output.
-#[cfg(feature = "av1-encoder")]
-fn frame_costs(
-    recording: &PhasmFrameRecording,
-    metas: &[AcSignMeta],
-    width: usize,
-    height: usize,
-) -> Vec<f32> {
-    let frame_planes = pack_cost_planes(&recording.reconstructed_planes, width, height);
-    let av1_positions: Vec<Av1FramePosition> = metas
-        .iter()
-        .map(|m| Av1FramePosition {
-            plane: m.plane,
-            plane_px_x: m.plane_px_x,
-            plane_px_y: m.plane_px_y,
-            tx_width_log2: m.tx_width_log2,
-            tx_height_log2: m.tx_height_log2,
-            tx_type: m.tx_type,
-            scan_pos: m.scan_pos,
-            coeff_magnitude: m.coeff_magnitude,
-        })
-        .collect();
-    crate::stego::cost::av1_uniward::compute_av1_uniward_costs_with_state(
-        &frame_planes,
-        &av1_positions,
-        recording.frame_qindex,
-        Some(recording.loop_filter_state),
-    )
-}
 
 /// Encode a u64 as an AV1 ULEB128 byte sequence (LSB-first 7-bit
 /// groups, continuation bit set on all but the last byte).
@@ -1138,38 +516,6 @@ pub(crate) fn split_av1_into_gops(bytes: &[u8]) -> Vec<Vec<u8>> {
     slabs
 }
 
-/// Extract a hidden encrypted message from stego AV1 bytes.
-///
-/// Inverse of [`av1_stego_embed`]. Decodes the AV1 stream with the
-/// recording hook, filters to AC_COEFF_SIGN positions, runs STC extract
-/// with brute-force `w` candidates, and decrypts the first valid frame.
-#[cfg(feature = "av1-decoder")]
-pub fn av1_stego_extract(
-    stego_av1_bytes: &[u8],
-    passphrase: &str,
-) -> Result<Vec<u8>, Av1StegoError> {
-    let structural_key = crypto::derive_structural_key(passphrase)?;
-    let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
-    let cover_bits = harvest_cover_bits_from_stego(stego_av1_bytes)?;
-    let mut seen_decrypt_fail = false;
-    let extracted = extract_first_valid_w(
-        &cover_bits,
-        &hhat_seed,
-        |frame_bytes| match try_parse_and_decrypt(frame_bytes, passphrase) {
-            Ok(plaintext) => Some(plaintext),
-            Err(StegoError::DecryptionFailed) => {
-                seen_decrypt_fail = true;
-                None
-            }
-            Err(_) => None,
-        },
-    );
-    match extracted {
-        Some(plaintext) => Ok(plaintext),
-        None if seen_decrypt_fail => Err(Av1StegoError::Stego(StegoError::DecryptionFailed)),
-        None => Err(Av1StegoError::ExtractionFailed),
-    }
-}
 
 /// Decode stego AV1 bytes via dav1d's recording hook and harvest the
 /// Tier-1 cover bits (AC_COEFF_SIGN ∪ GOLOMB_TAIL_LSB) in walker order.
@@ -1343,87 +689,44 @@ pub(crate) fn extract_chunk_frame_match(
     None
 }
 
-/// Brute-force the STC `w` parameter against `cover_bits`, calling
-/// `validator(frame_bytes)` for each candidate. Returns the first
-/// `Some(T)` the validator yields, or `None` after exhausting the
-/// search range.
-///
-/// Mirrors phasm-core's Ghost decode pattern (`pipeline.rs:1108`).
-/// The validator is what makes this generic — for legacy decode it
-/// runs `try_parse_and_decrypt`; for streaming decode it runs
-/// `parse_chunk_frame_v3_1` + expected_chunk_idx match. Each STC extract
-/// is cheap; the validator gates wrong-w results from passing
-/// through.
-#[cfg(feature = "av1-decoder")]
-pub(crate) fn extract_first_valid_w<T, F>(
-    cover_bits: &[u8],
-    hhat_seed: &[u8; 32],
-    mut validator: F,
-) -> Option<T>
-where
-    F: FnMut(&[u8]) -> Option<T>,
-{
-    let n = cover_bits.len();
-    // Encoder picks `w = floor(n / m_bits)`. The smallest m_bits any
-    // primary message can produce is `FRAME_OVERHEAD * 8 = 400 bits`
-    // (an empty plaintext still incurs 2-byte length + 16-byte salt +
-    // 12-byte nonce + 16-byte AES-GCM tag + 4-byte CRC = 50 bytes =
-    // 400 bits). So `w_max = n / 400` covers every valid encoder
-    // choice. At 256×144 this is ~30; at 1080p it climbs to ~2500.
-    //
-    // Previously this was capped at `min(n, 1000)`, which broke
-    // 1080p decode because encoders at ~1M-bit covers with short
-    // messages pick w in [1500, 2500] (well above the old 1000 cap).
-    // All AV1 corpus tests passed because they were small-resolution
-    // (256×144 / 144×256), so the cap was never exercised on
-    // production-sized covers.
-    let max_w = n / (crate::stego::frame::FRAME_OVERHEAD * 8);
-    let max_w = max_w.max(1);
-    for w in 1..=max_w {
-        if w > n {
-            break;
-        }
-        let m_max = n / w;
-        if m_max == 0 {
-            continue;
-        }
-        let n_used = m_max * w;
-        let stego_bits = &cover_bits[..n_used];
-        let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
-        let extracted_bits = stc_extract(stego_bits, &hhat_matrix, w);
-        let frame_bytes = frame::bits_to_bytes(&extracted_bits[..m_max]);
-        if let Some(out) = validator(&frame_bytes) {
-            return Some(out);
-        }
-    }
-    None
-}
 
-/// Parse a payload frame + decrypt with the passphrase. Returns
-/// plaintext on success. Mirror of Ghost's `try_parse_and_decrypt`
-/// at `core/src/stego/ghost/pipeline.rs:1204`.
-#[cfg(feature = "av1-decoder")]
-fn try_parse_and_decrypt(
-    frame_bytes: &[u8],
-    passphrase: &str,
-) -> Result<Vec<u8>, StegoError> {
-    let parsed = frame::parse_frame(frame_bytes)?;
-    let plaintext = crypto::decrypt(
-        &parsed.ciphertext,
-        passphrase,
-        &parsed.salt,
-        &parsed.nonce,
-    )?;
-    let len = parsed.plaintext_len as usize;
-    if len > plaintext.len() {
-        return Err(StegoError::FrameCorrupted);
-    }
-    Ok(plaintext[..len].to_vec())
-}
 
 #[cfg(all(test, feature = "av1-encoder", feature = "av1-decoder"))]
 mod tests {
     use super::*;
+
+    /// The single-frame API is the production v2 cascade on a one-frame
+    /// GOP, so its output decodes with the v2 session (the stealth tools
+    /// built on it measure v2).
+    #[test]
+    fn single_frame_embed_decodes_under_v2() {
+        let (w, h) = (256usize, 144usize);
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let yuv: Vec<u8> = (0..w * h * 3 / 2)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 56) as u8
+            })
+            .collect();
+        let params = crate::Av1StreamingEncodeParams {
+            width: w as u32,
+            height: h as u32,
+            quantizer: 30,
+            gop_size: 1,
+            total_frames_hint: 1,
+        };
+        let (packet, recording) = super::super::whole_video::encode_gop_natural(&yuv, 1, params)
+            .expect("natural encode")
+            .pop()
+            .unwrap();
+        let message = b"single frame, v2 wire";
+        let stego = av1_stego_embed(packet, recording, message, "v2-frame").expect("embed");
+        let mut dec = super::super::session::Av1StreamingDecodeSession::create("v2-frame");
+        dec.push_bytes(&stego);
+        assert_eq!(dec.finish().expect("decode"), message);
+    }
     use phasm_rav1e::color::ChromaSampling;
     use phasm_rav1e::phasm_stego::{
         encode_frame_with_phasm_tee, make_frame, make_inter_config,
@@ -1481,74 +784,7 @@ mod tests {
         encode_frame_with_phasm_tee(&fi, &mut fs, &inter_cfg)
     }
 
-    /// End-to-end round-trip test — the initial AV1 ship gate.
-    ///
-    /// Encode + decode a short encrypted message end-to-end:
-    ///   1. Build natural encode (Pass 1 via WriterTee)
-    ///   2. av1_stego_embed("hi from av1 stego", "secret pass") → stego AV1
-    ///   3. av1_stego_extract(stego AV1, "secret pass") → "hi from av1 stego"
-    ///
-    /// If this passes, the entire writer-trait architecture is
-    /// functional end-to-end — a real message survives the full
-    /// encrypt → STC plan → replay → byte-splice → decode →
-    /// STC extract → decrypt round-trip.
-    #[test]
-    fn w3105_round_trip_real_message() {
-        let plaintext = b"hi from av1 stego";
-        let passphrase = "v0.3-secret-pass";
 
-        // Pass 1: natural encode.
-        let (natural_packet, recording) = build_natural_encode();
-        assert!(!natural_packet.is_empty());
-        assert_eq!(recording.tiles.len(), 1);
-
-        // Embed.
-        let stego_packet = av1_stego_embed(
-            natural_packet.clone(),
-            recording.clone(),
-            plaintext,
-            passphrase,
-        )
-        .expect("av1_stego_embed should succeed");
-        assert_eq!(
-            stego_packet.len(),
-            natural_packet.len(),
-            "stego packet must have same length as natural"
-        );
-
-        // Extract.
-        let extracted = av1_stego_extract(&stego_packet, passphrase)
-            .expect("av1_stego_extract should succeed");
-        assert_eq!(
-            extracted.as_slice(),
-            plaintext,
-            "extracted plaintext must match original"
-        );
-    }
-
-    /// Wrong passphrase should fail decryption (not return garbage).
-    #[test]
-    fn w3105_wrong_passphrase_fails() {
-        let plaintext = b"secret data";
-        let passphrase = "correct-pass";
-        let wrong_passphrase = "wrong-pass";
-
-        let (natural_packet, recording) = build_natural_encode();
-        let stego_packet = av1_stego_embed(
-            natural_packet,
-            recording,
-            plaintext,
-            passphrase,
-        )
-        .expect("embed");
-
-        let result = av1_stego_extract(&stego_packet, wrong_passphrase);
-        assert!(
-            result.is_err(),
-            "extract with wrong passphrase should error; got Ok({:?})",
-            result.as_ref().ok()
-        );
-    }
 
     /// Stego packet remains a valid AV1 bitstream (dav1d decodes
     /// without error).
@@ -1576,75 +812,6 @@ mod tests {
         );
     }
 
-    /// Overwrite every pixel of `rec`'s planes past the visible `w`×`h`
-    /// (luma; chroma at half, rounded up) with `v`.
-    fn fill_alignment_padding(rec: &mut PhasmFrameRecording, w: usize, h: usize, v: u8) {
-        let mut f = (*rec.reconstructed_planes).clone();
-        for (i, p) in f.planes.iter_mut().enumerate() {
-            let (vw, vh) = if i == 0 { (w, h) } else { (w.div_ceil(2), h.div_ceil(2)) };
-            let (stride, xo, yo) = (p.cfg.stride, p.cfg.xorigin, p.cfg.yorigin);
-            for y in 0..p.cfg.height {
-                for x in 0..p.cfg.width {
-                    if x >= vw || y >= vh {
-                        p.data[(yo + y) * stride + xo + x] = v;
-                    }
-                }
-            }
-        }
-        rec.reconstructed_planes = Arc::new(f);
-    }
 
-    /// Enrolled (AC sign / golomb tail LSB) meta of a frame, in cover order.
-    fn enrolled_metas(rec: &PhasmFrameRecording) -> Vec<AcSignMeta> {
-        let t = &rec.tiles[0];
-        t.bit_tags
-            .iter()
-            .zip(&t.bit_meta)
-            .filter(|(tag, _)| **tag == PHASM_TAG_AC_COEFF_SIGN || **tag == PHASM_TAG_GOLOMB_TAIL_LSB)
-            .map(|(_, m)| *m)
-            .collect()
-    }
 
-    /// The research embed paths cost the visible frame only, like the
-    /// production harvest: rav1e aligns planes to 8 and what it
-    /// reconstructs in that padding is cropped on output. At 250×142 no
-    /// cost may change when only the padding pixels do, and both research
-    /// paths still embed (reading the visible size from the stream).
-    #[test]
-    fn research_embed_ignores_alignment_padding() {
-        let (w, h) = (250usize, 142usize);
-        let (yuv, params) = crate::codec::av1::stego::whole_video::noise_gop_sized(w as u32, h as u32, 2);
-        let frames = crate::codec::av1::stego::whole_video::encode_gop_natural(&yuv, 2, params)
-            .expect("encode");
-        assert_eq!(frames[0].1.reconstructed_planes.planes[0].cfg.width, 256, "rav1e aligns to 8");
-        assert_eq!(av1_visible_frame_size(&frames[0].0).expect("sequence header"), (w, h));
-        assert!(av1_visible_frame_size(&frames[1].0).is_err(), "an inter frame has no sequence header");
-        let padded = |v: u8| {
-            let mut f = frames.clone();
-            for (_, rec) in &mut f {
-                fill_alignment_padding(rec, w, h, v);
-            }
-            f
-        };
-        let (zero, full) = (padded(0), padded(255));
-
-        for (i, ((_, a), (_, b))) in zero.iter().zip(&full).enumerate() {
-            let metas = enrolled_metas(a);
-            let (ca, cb) = (frame_costs(a, &metas, w, h), frame_costs(b, &metas, w, h));
-            let changed = ca.iter().zip(&cb).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
-            assert_eq!(changed, 0, "frame {i}: {changed} of {} costs read the padding", ca.len());
-        }
-
-        let cover: usize = frames.iter().map(|(_, r)| enrolled_metas(r).len()).sum();
-        let bits: Vec<u8> = (0..cover / 40).map(|i| ((i * 7 + 3) % 5 < 2) as u8).collect();
-        let seed = [3u8; 32];
-        let gop = |f: Vec<(Vec<u8>, PhasmFrameRecording)>| av1_stego_encode_one_gop(f, &bits, &seed);
-        assert!(gop(zero.clone()).expect("GOP embed") == gop(full.clone()).expect("GOP embed"));
-        let one = |f: &Vec<(Vec<u8>, PhasmFrameRecording)>| {
-            let (packet, rec) = f[0].clone();
-            let n = enrolled_metas(&rec).len();
-            av1_stego_embed_payload_bits(packet, rec, &bits[..n / 40], &seed).expect("frame embed")
-        };
-        assert!(one(&zero) == one(&full));
-    }
 }

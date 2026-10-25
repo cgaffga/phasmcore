@@ -13,9 +13,8 @@
 
 use crate::codec::jpeg::JpegImage;
 use crate::stego::cost::uniward::{
-    apply_dct_modifications_to_wavelets, compute_cover_wavelets,
-    compute_positions_dual_from_wavelets, compute_positions_streaming,
-    compute_positions_with_dirty_recost,
+    compute_cover_wavelets, compute_positions_dual_from_wavelets,
+    compute_positions_streaming, compute_positions_with_dirty_recost, StegoWavelets,
 };
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
@@ -660,15 +659,19 @@ fn shadows_encode_body(
         _rung,
         GhostShadowRung::StreamingNoCache | GhostShadowRung::MinimalClones,
     );
-    let (cover_wavelets, cover_verify_positions, mut positions) =
+    // The cover wavelets themselves are needed only for this dual pass:
+    // the shadow verify recomputes the stego wavelets exactly (see
+    // `decoder_view_positions_sorted`), so they are dropped right here.
+    let (cover_verify_positions, mut positions) =
         if eff_shadows.is_empty() || skip_wavelet_cache {
             let p = compute_positions_streaming(img.dct_grid(0), qt, si_ref)?;
-            (None, None, p)
+            (None, p)
         } else {
             let cw = compute_cover_wavelets(img.dct_grid(0), qt);
             let (primary, verify) =
                 compute_positions_dual_from_wavelets(img.dct_grid(0), qt, &cw, si_ref)?;
-            (Some(cw), Some(verify), primary)
+            drop(cw);
+            (Some(verify), primary)
         };
 
     // 2. Prepare shadow layers (Y-channel direct LSB + RS).
@@ -780,24 +783,17 @@ fn shadows_encode_body(
     let mut stc_total_cost: f64;
     let mut stc_num_modifications: usize;
 
-    // Holds the most recent STC pass's modified flat positions, fed to
-    // the dirty-block UNIWARD re-cost on the shadow-verify path. Stays
-    // empty on the no-shadow path (no verify recompute).
-    let mut _stc_modified_positions: Vec<u32> = Vec::new();
-
     if shadow_states.is_empty() {
         // No shadows → no verification UNIWARD pass needed.
         let r = run_stc_pass(&mut img, &original_y, &positions, &[],
                      &frame_bits, &hhat_matrix, w, &si, &None)?;
         stc_total_cost = r.total_cost;
         stc_num_modifications = r.num_modifications;
-        _stc_modified_positions = r.modified_positions;
     } else {
         let r = run_stc_pass(&mut img, &original_y, &positions, &shadow_states,
                      &frame_bits, &hhat_matrix, w, &si, &shadow_inf_costs)?;
         stc_total_cost = r.total_cost;
         stc_num_modifications = r.num_modifications;
-        _stc_modified_positions = r.modified_positions;
 
         // Skip verification when ALL shadows use fraction=1 (100% pool).
         // With 100% pool there's no cost-pool boundary, so decoder always
@@ -810,34 +806,18 @@ fn shadows_encode_body(
         // using stego costs + same fraction/hash, and check RS decode + decrypt.
         // This catches cost-pool boundary disagreements between cover and stego.
         if !all_fraction_1 {
-            let qt_verify = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-            // Cached cover_wavelets enable dirty re-cost — much
-            // faster than the streaming recompute. Rung 2+ skips
-            // the cache to save ~760 MB at 60 MP and falls back to the
-            // streaming path. Both produce the SAME stego positions —
-            // dirty re-cost is a wall-clock optimization, not a
-            // behavior change. Both the first verify AND every
-            // cascade iteration below share the same gating.
-            let cover_wavelets = cover_wavelets.as_ref();
-            let cover_verify_positions = cover_verify_positions.as_ref();
-            let mut stego_y_positions = match (cover_wavelets, cover_verify_positions) {
-                (Some(cw), Some(cvp)) => {
-                    let stego_wavelets = apply_dct_modifications_to_wavelets(
-                        cw, &_stc_modified_positions, &original_y, img.dct_grid(0), qt_verify,
-                    );
-                    let p = compute_positions_with_dirty_recost(
-                        img.dct_grid(0), qt_verify, cvp, &_stc_modified_positions,
-                        &stego_wavelets, None,
-                    )?;
-                    drop(stego_wavelets);
-                    p
-                }
-                _ => {
-                    let si_ref_stego = si.as_ref().map(|s| (s, img.dct_grid(0)));
-                    compute_positions_streaming(img.dct_grid(0), qt_verify, si_ref_stego)?
-                }
-            };
-            stego_y_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+            // This verify AND every cascade iteration below go through
+            // `decoder_view_positions_sorted`, which returns exactly the
+            // positions a decoder computes from the emitted stego image,
+            // on every rung: rungs 0/1 via an exact dirty re-cost over
+            // the cached cover positions, rung 2+ via the decoder's own
+            // streaming recompute. Bit-identical either way, so the
+            // accept/reject decisions (and the output bytes) do not
+            // depend on the rung.
+            let cover_verify_positions = cover_verify_positions.as_deref();
+            let stego_y_positions = decoder_view_positions_sorted(
+                &img, qt_id, &original_y, cover_verify_positions,
+            )?;
 
             if !all_shadows_decode_ok(&img, &shadow_states, &eff_shadows, &stego_y_positions) {
                 // Escalate: try progressively larger fractions (more positions,
@@ -850,10 +830,9 @@ fn shadows_encode_body(
                 let mut cascade_positions = positions.clone();
                 cascade_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
-                // cover_wavelets + cover_verify_positions were
-                // materialized in the primary positions step — reuse
-                // them across every cascade iteration (parallel or
-                // serial). No additional upfront cost.
+                // cover_verify_positions was materialized in the
+                // primary positions step and is reused by every cascade
+                // iteration (parallel or serial).
 
                 let mut verified = false;
 
@@ -906,45 +885,14 @@ fn shadows_encode_body(
                             // Checkpoint before UNIWARD recomputation (expensive).
                             if best_fraction.load(Ordering::Relaxed) > fraction { return None; }
 
-                            let qt_re = match local_img.quant_table(qt_id) {
-                                Some(qt) => qt,
-                                None => return None,
+                            // Decoder-exact stego positions (same
+                            // helper as the first verify above).
+                            let local_stego_positions = match decoder_view_positions_sorted(
+                                &local_img, qt_id, &original_y, cover_verify_positions,
+                            ) {
+                                Ok(p) => p,
+                                Err(_) => return None,
                             };
-                            // Dirty re-cost when the cache is present
-                            // (rung 0/1) — per-iter clone of
-                            // cover_wavelets mutated by this iter's
-                            // modifications. At rung 2+ we use the
-                            // slower streaming recompute instead;
-                            // same stego positions, ~6× slower per
-                            // iter but ~760 MB lighter on the working
-                            // set at 60 MP.
-                            let mut local_stego_positions = match (cover_wavelets, cover_verify_positions) {
-                                (Some(cw), Some(cvp)) => {
-                                    let local_stego_wavelets = apply_dct_modifications_to_wavelets(
-                                        cw, &local_r.modified_positions, &original_y,
-                                        local_img.dct_grid(0), qt_re,
-                                    );
-                                    let p = match compute_positions_with_dirty_recost(
-                                        local_img.dct_grid(0), qt_re, cvp,
-                                        &local_r.modified_positions, &local_stego_wavelets, None,
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(_) => return None,
-                                    };
-                                    drop(local_stego_wavelets);
-                                    p
-                                }
-                                _ => {
-                                    let local_si_ref = si.as_ref().map(|s| (s, local_img.dct_grid(0)));
-                                    match compute_positions_streaming(
-                                        local_img.dct_grid(0), qt_re, local_si_ref,
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(_) => return None,
-                                    }
-                                }
-                            };
-                            local_stego_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
                             if all_shadows_decode_ok(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
                                 // Publish: this fraction verified successfully.
@@ -1028,37 +976,12 @@ fn shadows_encode_body(
 
                             if best_fraction > fraction { continue; }
 
-                            let qt_re = match local_img.quant_table(qt_id) {
-                                Some(qt) => qt,
-                                None => continue,
+                            let local_stego_positions = match decoder_view_positions_sorted(
+                                &local_img, qt_id, &original_y, cover_verify_positions,
+                            ) {
+                                Ok(p) => p,
+                                Err(_) => continue,
                             };
-                            let mut local_stego_positions = match (cover_wavelets, cover_verify_positions) {
-                                (Some(cw), Some(cvp)) => {
-                                    let local_stego_wavelets = apply_dct_modifications_to_wavelets(
-                                        cw, &local_r.modified_positions, &original_y,
-                                        local_img.dct_grid(0), qt_re,
-                                    );
-                                    let p = match compute_positions_with_dirty_recost(
-                                        local_img.dct_grid(0), qt_re, cvp,
-                                        &local_r.modified_positions, &local_stego_wavelets, None,
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
-                                    drop(local_stego_wavelets);
-                                    p
-                                }
-                                _ => {
-                                    let local_si_ref = si.as_ref().map(|s| (s, local_img.dct_grid(0)));
-                                    match compute_positions_streaming(
-                                        local_img.dct_grid(0), qt_re, local_si_ref,
-                                    ) {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    }
-                                }
-                            };
-                            local_stego_positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
                             if all_shadows_decode_ok(&local_img, &local_states, &eff_shadows, &local_stego_positions) {
                                 if fraction > best_fraction {
@@ -1122,22 +1045,85 @@ fn shadows_encode_body(
     Ok((stego_bytes, encode_quality))
 }
 
-/// Run a single STC pass: restore Y grid, embed shadows, then run STC with optional ∞-cost.
-///
-/// Returns `(total_cost, num_modifications)` from STC embedding.
 /// Result of a single STC embedding pass.
-///
-/// `modified_positions` carries the flat permute indices of
-/// coefficients whose LSB the STC pass actually flipped. Forward
-/// callers ignore it; the cascade-verify recompute path uses it to
-/// localize wavelet/cost re-computation to the dirty region
-/// (see docs/design/image/t3.2-dirty-block-recost.md).
 struct StcPassResult {
     total_cost: f64,
     num_modifications: usize,
-    modified_positions: Vec<u32>,
 }
 
+/// Y-channel positions of `stego`, sorted by cost, **bit-identical** to
+/// what a decoder computes from the emitted stego JPEG
+/// (`ghost_shadow_decode_from_image`: `compute_positions_streaming(grid,
+/// qt, None)` — no side information, the decoder has none — followed by
+/// the same stable `total_cmp` sort).
+///
+/// The shadow verify must run on exactly this view. A verify that sees
+/// a shadow's cost pool differently from the decoder can accept a
+/// shadow that then does not decode (the 2026-10 silent-shadow-loss
+/// bug; see docs/design/image/shadow-messages.md).
+///
+/// * `cover_verify_positions = Some(cvp)` (rungs 0/1): `cvp` holds the
+///   decoder-convention (no-SI) cover positions of `original_y`. The
+///   dirty set is the full coefficient diff `original_y` → stego (the
+///   shadow LSB writes AND the STC flips) and the stego wavelets are an
+///   exact decomposition of the stego grid. A clean block reads only
+///   unchanged wavelet samples, so its cached cover cost is what the
+///   decoder computes; a dirty block is recomputed with the decoder's
+///   own kernel on the decoder's own wavelets.
+/// * `None` (rung 2+, no cache): the decoder's streaming recompute.
+///
+/// Equivalence is gated by `tests/shadow_verify_decoder_parity.rs`.
+fn decoder_view_positions_sorted(
+    stego: &JpegImage,
+    qt_id: usize,
+    original_y: &crate::codec::jpeg::dct::DctGrid,
+    cover_verify_positions: Option<&[CoeffPos]>,
+) -> Result<Vec<CoeffPos>, StegoError> {
+    let qt = stego.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+    let grid = stego.dct_grid(0);
+    let mut positions = match cover_verify_positions {
+        Some(cvp) => {
+            let modifications = changed_coefficients(original_y, grid);
+            let stego_wavelets = StegoWavelets::compute_exact(grid, qt);
+            compute_positions_with_dirty_recost(
+                grid, qt, cvp, &modifications, &stego_wavelets, None,
+            )?
+        }
+        None => compute_positions_streaming(grid, qt, None)?,
+    };
+    positions.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+    Ok(positions)
+}
+
+/// Flat indices (`block_index * 64 + row * 8 + col`) of every
+/// coefficient that differs between `original` and `modified`.
+fn changed_coefficients(
+    original: &crate::codec::jpeg::dct::DctGrid,
+    modified: &crate::codec::jpeg::dct::DctGrid,
+) -> Vec<u32> {
+    let bw = original.blocks_wide();
+    let bt = original.blocks_tall();
+    debug_assert_eq!((bw, bt), (modified.blocks_wide(), modified.blocks_tall()));
+    let mut out = Vec::new();
+    for br in 0..bt {
+        for bc in 0..bw {
+            let a = original.block(br, bc);
+            let b = modified.block(br, bc);
+            if a == b {
+                continue;
+            }
+            let base = ((br * bw + bc) * 64) as u32;
+            for (k, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                if x != y {
+                    out.push(base + k as u32);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run a single STC pass: restore Y grid, embed shadows, then run STC with optional ∞-cost.
 fn run_stc_pass(
     img: &mut JpegImage,
     original_y: &crate::codec::jpeg::dct::DctGrid,
@@ -1181,9 +1167,9 @@ fn run_stc_pass(
     let total_cost = result.total_cost;
     let num_modifications = result.num_modifications;
 
-    let modified_positions = apply_stc_changes(img, positions, &cover_bits, &result.stego_bits, si);
+    apply_stc_changes(img, positions, &cover_bits, &result.stego_bits, si);
 
-    Ok(StcPassResult { total_cost, num_modifications, modified_positions })
+    Ok(StcPassResult { total_cost, num_modifications })
 }
 
 /// Apply STC LSB changes to the DctGrid.
@@ -1205,14 +1191,7 @@ fn apply_stc_changes(
     cover_bits: &[u8],
     stego_bits: &[u8],
     si: &Option<SideInfo>,
-) -> Vec<u32> {
-    // Emit the flat indices of actually-modified positions. The
-    // dirty-block UNIWARD re-cost needs these to identify which
-    // coefficients fall inside the 23×23 wavelet impact region of a
-    // modification. For the no-modification happy path (e.g. all
-    // `cover_bits == stego_bits`), this Vec stays empty. See
-    // `docs/design/image/t3.2-dirty-block-recost.md`.
-    let mut modified_positions = Vec::new();
+) {
     let grid_mut = img.dct_grid_mut(0);
     let n_modified = stego_bits.len();
     for (idx, pos) in positions.iter().take(n_modified).enumerate() {
@@ -1225,10 +1204,8 @@ fn apply_stc_changes(
                 side_info::nsf5_modify_coefficient(coeff)
             };
             flat_set(grid_mut, fi, modified);
-            modified_positions.push(pos.flat_idx);
         }
     }
-    modified_positions
 }
 
 /// Check if all shadow layers can be decoded from the decoder's perspective.
@@ -1798,4 +1775,75 @@ pub(super) fn flat_set(grid: &mut DctGrid, flat_idx: usize, val: i16) {
     let i = pos / 8;
     let j = pos % 8;
     grid.set(br, bc, i, j, val);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stego::cost::uniward::compute_positions_from_wavelets;
+
+    /// The cached-rung verify view (rungs 0/1) and the streaming view
+    /// (rung 2+) must both equal the decoder's sorted positions bit for
+    /// bit, after shadow-style AND STC-style modifications.
+    #[test]
+    fn decoder_view_is_rung_independent_and_decoder_exact() {
+        let bytes = std::fs::read("test-vectors/image/photo_640x480_q75_420.jpg").unwrap();
+        let cover = JpegImage::from_bytes(&bytes).unwrap();
+        let qt_id = cover.frame_info().components[0].quant_table_id as usize;
+        let qt = cover.quant_table(qt_id).unwrap();
+        let original_y = cover.dct_grid(0).clone();
+        let cw = compute_cover_wavelets(&original_y, qt);
+        let cvp = compute_positions_from_wavelets(&original_y, qt, &cw, None).unwrap();
+
+        let mut stego = cover.clone();
+        let bw = original_y.blocks_wide();
+        let bt = original_y.blocks_tall();
+        // Every 37th non-zero AC coefficient plus the four corner blocks.
+        let mut n = 0usize;
+        for br in 0..bt {
+            for bc in 0..bw {
+                let corner = (br == 0 || br == bt - 1) && (bc == 0 || bc == bw - 1);
+                for k in 1..64 {
+                    let c = stego.dct_grid(0).get(br, bc, k / 8, k % 8);
+                    if c == 0 {
+                        continue;
+                    }
+                    if corner || n % 37 == 0 {
+                        let m = side_info::nsf5_modify_coefficient(c);
+                        stego.dct_grid_mut(0).set(br, bc, k / 8, k % 8, m);
+                    }
+                    n += 1;
+                }
+            }
+        }
+        let mods = changed_coefficients(&original_y, stego.dct_grid(0));
+        assert!(mods.len() > 1000, "test must modify many coefficients");
+
+        let cached =
+            decoder_view_positions_sorted(&stego, qt_id, &original_y, Some(&cvp)).unwrap();
+        let streaming = decoder_view_positions_sorted(&stego, qt_id, &original_y, None).unwrap();
+        let mut decoder = compute_positions_streaming(stego.dct_grid(0), qt, None).unwrap();
+        decoder.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+        for (name, v) in [("cached", &cached), ("streaming", &streaming)] {
+            assert_eq!(v.len(), decoder.len(), "{name}: len");
+            for (x, y) in v.iter().zip(decoder.iter()) {
+                assert_eq!(x.flat_idx, y.flat_idx, "{name}: order");
+                assert_eq!(x.cost.to_bits(), y.cost.to_bits(), "{name}: cost at {}", x.flat_idx);
+            }
+        }
+    }
+
+    #[test]
+    fn changed_coefficients_lists_every_difference() {
+        let a = crate::codec::jpeg::dct::DctGrid::new(3, 2);
+        let mut b = a.clone();
+        assert!(changed_coefficients(&a, &b).is_empty());
+        b.set(0, 0, 0, 0, 9); // DC of the first block
+        b.set(0, 1, 2, 3, -1);
+        b.set(1, 2, 7, 7, 4); // last coefficient of the last block
+        assert_eq!(
+            changed_coefficients(&a, &b),
+            vec![0, 64 + 2 * 8 + 3, (3 + 2) * 64 + 63],
+        );
+    }
 }

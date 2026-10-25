@@ -200,10 +200,13 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, H264Error> {
         sub_height_c * if frame_mbs_only_flag { 1 } else { 2 }
     };
 
-    let width_in_pixels =
-        pic_width_in_mbs * 16 - crop_unit_x * (crop_left + crop_right);
-    let height_in_pixels =
-        frame_height_in_mbs * 16 - crop_unit_y * (crop_top + crop_bottom);
+    // Saturating: a malformed SPS whose crop exceeds the coded size must not
+    // overflow (debug panic) — it yields a 0 dimension instead. Phasm's own
+    // streams crop right/bottom only, by less than one MB.
+    let width_in_pixels = pic_width_in_mbs.saturating_mul(16)
+        .saturating_sub(crop_unit_x.saturating_mul(crop_left.saturating_add(crop_right)));
+    let height_in_pixels = frame_height_in_mbs.saturating_mul(16)
+        .saturating_sub(crop_unit_y.saturating_mul(crop_top.saturating_add(crop_bottom)));
     let pic_size_in_mbs = pic_width_in_mbs * frame_height_in_mbs;
 
     Ok(Sps {

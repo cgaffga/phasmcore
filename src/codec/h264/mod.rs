@@ -17,6 +17,9 @@ pub mod sps;
 pub mod slice;
 pub mod transform;
 pub mod b_partition_meta;
+/// Exact-size frame geometry: display size vs the coded MB grid, and the
+/// encoder's padding rule (SPS `frame_cropping`, 1920×1080 → 120×68 MBs).
+pub mod frame_geometry;
 
 // H.264 CABAC entropy coder: the bin-walker (decode) + shared tables.
 #[cfg(feature = "h264-decoder")]

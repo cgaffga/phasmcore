@@ -13,6 +13,8 @@ pub mod jpeg;
 pub mod h264;
 #[cfg(feature = "video")]
 pub mod mp4;
+#[cfg(any(feature = "video", feature = "av1-decoder"))]
+pub mod video_frame;
 
 // AV1 stego: skeleton landed 2026-05-20 (W3.2). Now (W3.D.4.2) gated
 // on EITHER av1-encoder (rav1e) OR av1-decoder (dav1d), since the

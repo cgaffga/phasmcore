@@ -43,6 +43,13 @@ pub struct VideoCapacityArgs {
     /// 30 fps = 1 IDR/sec). Applies to both H.264 and AV1.
     #[arg(long, default_value_t = 30)]
     pub gop_size: usize,
+
+    /// Output resolution preset of the encode to size for (`original`,
+    /// `sd`, `hd`, `fhd` — see `phasm video-encode --resolution`). Capacity
+    /// is measured on the scaled frames, so it only holds for an encode at
+    /// the same preset.
+    #[arg(long, value_enum, default_value_t = crate::transcode::Resolution::Original)]
+    pub resolution: crate::transcode::Resolution,
 }
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
@@ -107,8 +114,14 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
     let mut probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
-    // CROP any non-16-aligned source so capacity matches what encode accepts.
-    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, 16)?;
+    // Same size rule as encode (exact even size; an odd side loses one px),
+    // so capacity is measured on exactly the frames encode will embed into.
+    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, transcode::H264_SIZE_ALIGN)?;
+    // Same `--resolution` scaling as the encode.
+    if let Err(e) = transcode::scale_yuv_to_preset(&yuv_path, &mut probe, args.resolution) {
+        let _ = std::fs::remove_file(&yuv_path);
+        return Err(e);
+    }
     let yuv = std::fs::read(&yuv_path).map_err(|e| {
         CliError::InvalidArgs(format!("read decoded YUV {}: {e}", yuv_path.display()))
     })?;
@@ -193,8 +206,13 @@ fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
     let mut probe = transcode::probe_video(&args.video)?;
     let yuv_path = transcode::temp_path_with_ext(&args.video, "yuv");
-    // CROP any non-8-aligned source so capacity matches what encode accepts.
-    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, 8)?;
+    // CROP an odd source to even, exactly as the encode does.
+    transcode::decode_to_yuv_aligned(&args.video, &yuv_path, &mut probe, transcode::AV1_SIZE_ALIGN)?;
+    // Same `--resolution` scaling as the encode.
+    if let Err(e) = transcode::scale_yuv_to_preset(&yuv_path, &mut probe, args.resolution) {
+        let _ = std::fs::remove_file(&yuv_path);
+        return Err(e);
+    }
     let yuv = std::fs::read(&yuv_path).map_err(|e| {
         CliError::InvalidArgs(format!("read decoded YUV {}: {e}", yuv_path.display()))
     })?;
@@ -215,20 +233,16 @@ fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
 
     let info = {
         use phasm_core::{av1_capacity, Av1StreamingEncodeParams};
-        // The AV1 probe API requires gop_size=1 (D-phase contract:
-        // each frame is its own GOP for cover counting). The user-
-        // facing `--gop-size` is the encode GOP size; the closed-form
-        // capacity formula doesn't depend on the encode GOP — only on
-        // total cover bits — so we hand 1 to the params struct.
-        // `quantizer=80` is the rav1e default-quality target that
-        // `Av1StreamingEncodeParams::default()` documents (CLI uses
-        // the same default as mobile; matches the encode params
-        // selected by `run_av1_encode`).
+        // Probe the encode's shape: its GOP size (`--gop-size`) and its
+        // quantizer. A gop_size of 1 makes every frame a key frame, which
+        // carries about twice the cover of the P-frames the encode writes
+        // (see `Av1StreamingProbeSession::per_gop_cover_bits`), and a lower
+        // quantizer adds cover too; either over-reports what fits.
         let params = Av1StreamingEncodeParams {
             width: probe.width,
             height: probe.height,
-            quantizer: 80,
-            gop_size: 1,
+            quantizer: crate::video_encode::av1_quantizer(),
+            gop_size: gop_size as u32,
             total_frames_hint: probe.n_frames as u32,
         };
         av1_capacity(&yuv, params).map_err(|e| {

@@ -28,6 +28,7 @@ pub mod gop_cache;
 pub mod calibration;
 pub mod balanced_allocation;
 pub mod permute;
+pub mod cover_order;
 pub mod payload;
 pub mod progress;
 pub mod shadow_layer;

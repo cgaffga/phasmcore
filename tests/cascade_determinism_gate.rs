@@ -36,6 +36,17 @@ use rayon::ThreadPoolBuilder;
 
 const DETERMINISTIC_SEED: &str = "1";
 
+/// Every test here writes the process-global `PHASM_DETERMINISTIC_SEED`
+/// and/or memory budget, so they must not interleave: under the default
+/// parallel test runner, `without_seed_*` saw another test's seed and
+/// the rung tests saw each other's budgets (flaky on main as of
+/// 2026-10-24). Each test holds this lock for its whole body.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 fn load_shadow_test_image() -> Vec<u8> {
     std::fs::read("test-vectors/image/photo_640x480_q75_420.jpg").unwrap()
 }
@@ -77,6 +88,7 @@ fn encode_with_shadows_in_pool(threads: usize, cover: &[u8]) -> Vec<u8> {
 
 #[test]
 fn fanout_1_matches_fanout_default() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     let stego_serial = encode_with_shadows_in_pool(1, &cover);
     let stego_parallel = encode_with_shadows_in_pool(num_threads_default(), &cover);
@@ -95,6 +107,7 @@ fn fanout_1_matches_fanout_default() {
 
 #[test]
 fn fanout_1_matches_fanout_2() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     let s1 = encode_with_shadows_in_pool(1, &cover);
     let s2 = encode_with_shadows_in_pool(2, &cover);
@@ -107,6 +120,7 @@ fn fanout_1_matches_fanout_2() {
 
 #[test]
 fn fanout_default_matches_repeat() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     let n = num_threads_default();
     let a = encode_with_shadows_in_pool(n, &cover);
@@ -125,6 +139,7 @@ fn fanout_default_matches_repeat() {
 /// as the design promises.
 #[test]
 fn without_seed_encode_is_intentionally_nondeterministic() {
+    let _serial = serial();
     unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED"); }
     let cover = load_shadow_test_image();
     let pool = ThreadPoolBuilder::new()
@@ -183,6 +198,7 @@ fn without_seed_encode_is_intentionally_nondeterministic() {
 /// We pick budgets that cross each threshold.
 #[test]
 fn rung_2_matches_rung_0_byte_exact() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", DETERMINISTIC_SEED); }
 
@@ -211,6 +227,7 @@ fn rung_2_matches_rung_0_byte_exact() {
 
 #[test]
 fn rung_3_matches_rung_0_byte_exact() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", DETERMINISTIC_SEED); }
 
@@ -238,6 +255,7 @@ fn rung_3_matches_rung_0_byte_exact() {
 
 #[test]
 fn rung_1_matches_rung_0_byte_exact() {
+    let _serial = serial();
     let cover = load_shadow_test_image();
     let n = num_threads_default();
 

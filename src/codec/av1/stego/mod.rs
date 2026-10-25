@@ -36,12 +36,12 @@ pub mod writer;
 #[cfg(feature = "av1-decoder")]
 pub mod decoder;
 
-// Production av1_stego_embed + av1_stego_extract that wire rav1e
-// encode + dav1d decode + STC + crypto into the end-to-end
-// hide-a-message flow. Module compiles when EITHER feature is on;
+// Shared AV1 stego plumbing: per-GOP split, cover harvest from a stego
+// stream, chunk-frame extract, OBU rebuild, and the single-frame
+// `av1_stego_embed` (a one-frame GOP through the production v2 cascade,
+// for the stealth tools). Module compiles when EITHER feature is on;
 // individual functions are feature-gated so a decode-only build
-// (av1-decoder without av1-encoder, as shipped on the phasmcore
-// public mirror) exposes only av1_stego_extract.
+// (av1-decoder without av1-encoder) exposes only the decode side.
 #[cfg(any(feature = "av1-encoder", feature = "av1-decoder"))]
 pub mod orchestrator;
 

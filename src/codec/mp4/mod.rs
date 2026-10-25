@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! MP4/ISOBMFF container demux and mux.
+//! MP4/ISOBMFF container demux and stego-MP4 building.
 //!
 //! Zero-dependency MP4 parser and writer for extracting and replacing
 //! HEVC NAL units in video files. Handles the ISO Base Media File Format
@@ -11,18 +11,17 @@
 //! # Overview
 //!
 //! - [`demux`] — Parse MP4 file → [`Mp4File`] with tracks, samples, hvcC data
-//! - [`mux`] — Rebuild MP4 with modified video samples, corrected sample tables
+//! - [`build`] — Write the stego MP4 from scratch (video track plus an
+//!   optional passed-through audio track, scrubbed of source metadata)
 //!
 //! # Limitations
 //!
 //! - Only handles single-fragment MP4 files (no fragmented MP4/fMP4)
-//! - Requires `mdat` box to be after `moov` for muxing (standard for camera output)
 
 pub(crate) mod audio_iso;
 pub mod av1_obu_split;
 pub mod build;
 pub mod demux;
-pub mod mux;
 
 use std::fmt;
 
@@ -203,6 +202,20 @@ impl AvccData {
             sps_nalus: vec![sps],
             pps_nalus: vec![pps],
         })
+    }
+
+    /// Display size declared by the first SPS: the coded MB grid minus the
+    /// `frame_cropping` offsets (1920×1080 for a 120×68-MB stream with
+    /// `crop_bottom = 4`). This is the size a container must advertise.
+    /// `None` when there is no SPS or it does not parse.
+    pub fn sps_display_size(&self) -> Option<(u32, u32)> {
+        let sps = self.sps_nalus.first()?;
+        if sps.len() < 2 {
+            return None;
+        }
+        let rbsp = crate::codec::h264::bitstream::remove_emulation_prevention(&sps[1..]);
+        let parsed = crate::codec::h264::sps::parse_sps(&rbsp).ok()?;
+        Some((parsed.width_in_pixels, parsed.height_in_pixels))
     }
 
     /// Serialize this `AvccData` into the raw bytes of an MP4 `avcC`

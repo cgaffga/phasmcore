@@ -78,7 +78,6 @@ fn a_decode_cancel_stops_every_av1_decode_finish() {
 
     Channel::Decode.cancel();
     let primary = run_decode(|| session().finish());
-    let first_match = run_decode(|| session().finish_shadow_first_match(sp));
     let whole_video = run_decode(|| session().finish_shadow_whole_video(sp));
     Channel::Decode.clear_cancel();
 
@@ -87,7 +86,6 @@ fn a_decode_cancel_stops_every_av1_decode_finish() {
         "finish: {:?}",
         primary.map(|v| v.len())
     );
-    assert!(matches!(first_match, Err(StegoError::Cancelled)), "first_match: {first_match:?}");
     assert!(matches!(whole_video, Err(StegoError::Cancelled)), "whole_video: {whole_video:?}");
 
     // Uncancelled, the same streams decode.

@@ -34,8 +34,9 @@
 use core_dav1d_sys::{
     dav1d_close, dav1d_data_create, dav1d_data_unref, dav1d_default_settings,
     dav1d_err_again, dav1d_get_picture, dav1d_open, dav1d_picture_unref,
-    dav1d_send_data, Dav1dContext, Dav1dData, Dav1dPicture, Dav1dPhasmHooks,
-    Dav1dSettings,
+    dav1d_send_data, phasm_dav1d_frame_lf_state, Dav1dContext, Dav1dData, Dav1dPicture,
+    Dav1dPhasmHooks, Dav1dSettings, PhasmDav1dFrameLf, DAV1D_PHASM_TAG_AC_COEFF_SIGN,
+    DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB,
 };
 
 /// Errors returned by [`decode_with_recording`].
@@ -72,6 +73,22 @@ pub struct DecodedCoverPosition {
     /// J-UNIWARD cost compute to map decoded cover bit to a
     /// (plane, pixel-coord, TX-shape, scan-pos) tuple.
     pub meta: core_dav1d_sys::Dav1dPhasmAcSignMeta,
+    /// |c| of the coefficient this AC-sign / golomb-tail bit belongs to
+    /// (dav1d's `mag_hook`, after the golomb read); 0 for other tags.
+    pub coeff_magnitude: u16,
+    /// Index of the decoded frame (decode order) the bit belongs to.
+    pub frame: u16,
+}
+
+/// One decoded frame of a recording: where its bits end, its base qindex
+/// and its visible size. The v2 shadow buckets need all three (spec § 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedFrameInfo {
+    /// One past the frame's last position in [`DecodedCoverPositions`].
+    pub end: usize,
+    pub qindex: u8,
+    pub width: u16,
+    pub height: u16,
 }
 
 /// Visible-region YUV planes extracted from the last decoded picture.
@@ -105,9 +122,15 @@ pub struct DecodedCoverPositions {
     /// `decode_with_recording` leaves this `None` so existing tests
     /// don't pay the pixel-copy cost.
     pub planes: Option<DecodedFramePlanes>,
+    frames: Vec<DecodedFrameInfo>,
 }
 
 impl DecodedCoverPositions {
+    /// The decoded frames, in decode order.
+    pub fn frames(&self) -> &[DecodedFrameInfo] {
+        &self.frames
+    }
+
     /// Iterate all decoded positions in emission order.
     pub fn iter(&self) -> impl Iterator<Item = &DecodedCoverPosition> {
         self.all.iter()
@@ -139,6 +162,11 @@ struct RecorderState {
     current_meta: core_dav1d_sys::Dav1dPhasmAcSignMeta,
     /// Per-emission meta, parallel to `bits`.
     metas: Vec<core_dav1d_sys::Dav1dPhasmAcSignMeta>,
+    /// Per-emission |c|, parallel to `bits` (set by `mag_hook_cb`).
+    mags: Vec<u16>,
+    /// Cover bits of the current coefficient still waiting for its |c|.
+    pending_mag: Vec<usize>,
+    frames: Vec<DecodedFrameInfo>,
 }
 
 /// FFI callback wired into `Dav1dSettings.phasm_hooks.bit_hook`.
@@ -163,6 +191,25 @@ unsafe extern "C" fn bit_hook_cb(
     // `meta_hook_cb` at AC sign sites; stale for non-AC emissions
     // (acceptable — phasm-core only reads meta for AC).
     state.metas.push(state.current_meta);
+    state.mags.push(0);
+    if tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN || tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB {
+        state.pending_mag.push(state.bits.len() - 1);
+    }
+}
+
+/// FFI callback wired into `Dav1dSettings.phasm_hooks.mag_hook`: the
+/// coefficient's full |c| once it is known (after any golomb tail), for
+/// the cover bits of that coefficient recorded so far.
+///
+/// # Safety
+///
+/// Same as `bit_hook_cb`.
+unsafe extern "C" fn mag_hook_cb(cookie: *mut core::ffi::c_void, magnitude: core::ffi::c_uint) {
+    let state = unsafe { &mut *(cookie as *mut RecorderState) };
+    let m = magnitude.min(u16::MAX as u32) as u16;
+    for i in state.pending_mag.drain(..) {
+        state.mags[i] = m;
+    }
 }
 
 /// FFI callback wired into `Dav1dSettings.phasm_hooks.meta_hook`.
@@ -315,7 +362,7 @@ fn decode_with_recording_inner(
                               // av1_block_hist stealth-audit binary
                               // registers this
             sym_hook: None,
-            mag_hook: None,
+            mag_hook: Some(mag_hook_cb),
         };
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
@@ -359,6 +406,21 @@ fn decode_with_recording_inner(
             let mut pic = Dav1dPicture::default();
             let rc = dav1d_get_picture(ctx, &mut pic);
             if rc == 0 {
+                // Frame boundary: every bit recorded so far belongs to this
+                // or an earlier frame (single-thread, frame delay 1).
+                let view = &*(&pic as *const Dav1dPicture as *const Dav1dPictureView);
+                let mut lf = PhasmDav1dFrameLf::default();
+                let qindex = if phasm_dav1d_frame_lf_state(&pic as *const Dav1dPicture as *const _, &mut lf) == 0 {
+                    lf.base_q_idx
+                } else {
+                    0
+                };
+                recorder.frames.push(DecodedFrameInfo {
+                    end: recorder.bits.len(),
+                    qindex,
+                    width: view.p_w as u16,
+                    height: view.p_h as u16,
+                });
                 // If pixel capture is requested, read the visible YUV
                 // via the Dav1dPictureView layout mirror BEFORE unref.
                 // We keep the LAST picture we see — v0.3 is
@@ -441,20 +503,30 @@ fn decode_with_recording_inner(
         recorder.metas.len(),
         "decoder bit/meta length mismatch"
     );
+    let frames = recorder.frames;
+    let mut frame = 0usize;
     let positions = recorder
         .bits
         .into_iter()
-        .zip(recorder.metas.into_iter())
+        .zip(recorder.metas)
+        .zip(recorder.mags)
         .enumerate()
-        .map(|(i, ((value, tag), meta))| DecodedCoverPosition {
-            cursor: i as u64,
-            decoded_value: value,
-            tag,
-            meta,
+        .map(|(i, (((value, tag), meta), coeff_magnitude))| {
+            while frame + 1 < frames.len() && i >= frames[frame].end {
+                frame += 1;
+            }
+            DecodedCoverPosition {
+                cursor: i as u64,
+                decoded_value: value,
+                tag,
+                meta,
+                coeff_magnitude,
+                frame: frame as u16,
+            }
         })
         .collect();
 
-    Ok(DecodedCoverPositions { all: positions, planes: captured_planes })
+    Ok(DecodedCoverPositions { all: positions, planes: captured_planes, frames })
 }
 
 #[cfg(test)]

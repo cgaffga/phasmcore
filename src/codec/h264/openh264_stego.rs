@@ -156,6 +156,7 @@ use super::openh264::{
     set_frame_num, set_pass_mode, Encoder, EncoderError, MbDecision, PassMode, StegoHandlers,
     StegoSession,
 };
+use super::frame_geometry::{mb_grid, FrameGeometry};
 use super::pass2_cache::DecisionCache;
 use super::stego::hook::{BinKind, EmbedDomain, SyntaxPath};
 use super::stego::inject::{remap_cover_frame_idx, DomainCover};
@@ -350,10 +351,10 @@ pub(crate) fn produce_gop_cover(
     let trace = perf_trace();
     mem_trace("00 enter");
 
-    let mb_width = width / 16;
-    let mb_height = height / 16;
+    // Coded MB grid (ceil): matches the SPS the walker reads, also for
+    // cropped (non-16-aligned) sizes.
+    let (mb_width, mb_height) = mb_grid(width, height);
     let mb_per_frame = (mb_width * mb_height) as usize;
-    let _ = mb_height;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -561,8 +562,8 @@ pub(crate) fn consume_gop_emit(
     let trace = perf_trace();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
 
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -1178,8 +1179,8 @@ pub fn h264_walk_cover(
     opts: EncodeOpts,
 ) -> Result<super::stego::DomainCover, StegoError> {
     validate_dims(yuv, width, height, n_frames)?;
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -1766,12 +1767,11 @@ pub(crate) fn h264_gop_capacity_with(
 
 // ---------- internals ----------
 
+/// Validate a display size + tight-I420 YUV length. Any even size ≥ 16×16 is
+/// accepted: OpenH264 codes the MB grid and crops back to `width × height` in
+/// the SPS (see [`super::frame_geometry`]).
 fn validate_dims(yuv: &[u8], width: u32, height: u32, n_frames: u32) -> Result<(), StegoError> {
-    if width % 16 != 0 || height % 16 != 0 {
-        return Err(StegoError::InvalidVideo(format!(
-            "dimensions must be 16-aligned, got {width}x{height}"
-        )));
-    }
+    FrameGeometry::new(width, height)?;
     let frame_size = (width * height * 3 / 2) as usize;
     let expected = frame_size * n_frames as usize;
     if yuv.len() != expected {
@@ -1810,8 +1810,8 @@ pub(crate) fn oh264_plain_encode_gop(
     // fork, so a prior GOP's state would otherwise leak into this plain-tail
     // encode (see `produce_gop_cover`).
     unsafe { core_openh264_sys::phasm_reset_encoder_session_state() };
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let empty_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -2138,7 +2138,7 @@ fn encode_once(
                 for v in replay_buf.iter_mut() { *v = 0; }
                 // Place each captured MB's coefficients into the flat buffer
                 // at its raster-order slot.
-                let mb_height_u = height / 16;
+                let mb_height_u = mb_grid(width, height).1;
                 for &&(_, mx, my, ref coeffs) in frame_caps.iter() {
                     let mb_idx = (my as usize) * (mb_width as usize) + (mx as usize);
                     if mb_idx < mb_per_frame {
@@ -2680,10 +2680,10 @@ pub fn h264_encode_with_shadows<'a>(
     // WV.6.b.2: Pass 1 is now N standalone per-GOP encodes concatenated in GOP
     // order (`shadow_encode_all_gops`), not one whole-clip `encode_once`. The
     // fork-state reset is per-GOP inside the helper (#548).
-    let mb_width = width / 16;
-    let mb_height = height / 16;
+    // Coded MB grid (ceil): matches the SPS the walker reads, also for
+    // cropped (non-16-aligned) sizes.
+    let (mb_width, mb_height) = mb_grid(width, height);
     let mb_per_frame = (mb_width * mb_height) as usize;
-    let _ = mb_height;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -3257,8 +3257,8 @@ pub fn streaming_tier_prepass(
 
     let gop_size = opts.intra_period.max(1) as u32;
     let n_gops = n_frames.div_ceil(gop_size).max(1);
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let wire_only = wire_only_enabled();
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
@@ -3934,8 +3934,8 @@ pub fn gop_clean_cover(
     gop_global_start: u32,
     opts: EncodeOpts,
 ) -> Result<DomainCover, StegoError> {
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -3977,8 +3977,8 @@ pub fn whole_clip_baseline_cover(
     n_frames: u32,
     opts: EncodeOpts,
 ) -> Result<DomainCover, StegoError> {
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -4143,8 +4143,8 @@ pub fn whole_clip_provisional_cover(
         .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
         .hhat_seed;
 
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
     let applied: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
@@ -4553,8 +4553,8 @@ pub fn gop_provisional_step(
 ) -> Result<(DomainCover, Vec<bool>, usize), StegoError> {
     use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
 
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let wire_only = wire_only_enabled();
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
@@ -4768,8 +4768,8 @@ pub fn sweep_b_emit_with_cursor(
     assert_eq!(n_shadows, shadow_rs.len(), "sweep_b_emit: one rs frame per shadow");
     let gop_size = opts.intra_period.max(1) as u32;
     let n_gops = n_frames.div_ceil(gop_size).max(1);
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let wire_only = wire_only_enabled();
 
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -5101,8 +5101,8 @@ fn primary_dry_run(
 
     let gop_size = opts.intra_period.max(1) as u32;
     let n_gops = n_frames.div_ceil(gop_size).max(1);
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let wire_only = wire_only_enabled();
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));
@@ -5262,8 +5262,8 @@ pub fn h264_shadow_loaded_gop_caps(
 
     let gop_size = opts.intra_period.max(1) as u32;
     let n_gops = n_frames.div_ceil(gop_size).max(1);
-    let mb_width = width / 16;
-    let mb_per_frame = ((width / 16) * (height / 16)) as usize;
+    let (mb_width, mb_height) = mb_grid(width, height);
+    let mb_per_frame = (mb_width * mb_height) as usize;
     let wire_only = wire_only_enabled();
     let override_map: Arc<Mutex<HashMap<u64, u8>>> = Arc::new(Mutex::new(HashMap::new()));
     let mb_type_table: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![0xff; mb_per_frame]));

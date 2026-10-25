@@ -88,7 +88,10 @@ impl FrameTiming {
 /// Build an MP4 file from a phasm-encoded H.264 Annex-B byte stream and a
 /// target [`MuxerProfile`]. Returns the complete MP4 bytes.
 ///
-/// `width` / `height` are the encoded picture dimensions in pixels.
+/// `width` / `height` are the DISPLAY dimensions in pixels: for a stream
+/// whose SPS crops the MB grid (1920×1080 coded as 1088 lines) that is the
+/// cropped size, as in a phone MP4. A size that disagrees with the SPS is
+/// refused (`Mp4Error::InvalidBox`).
 ///
 /// The Annex-B stream must contain at least one SPS NAL and one PPS NAL —
 /// they are extracted into the `avcC` decoder configuration record and
@@ -139,6 +142,7 @@ pub fn build_mp4(
             timing,
             None,
             None,
+            0,
         ),
     }
 }
@@ -233,6 +237,7 @@ pub fn build_mp4_with_pattern(
             timing,
             composition_offsets.as_deref(),
             None,
+            0,
         ),
     }
 }
@@ -245,19 +250,23 @@ pub fn build_mp4_with_pattern(
 ///
 /// # Audio handling
 ///
-/// The source's first audio track is copied verbatim. The codec
-/// configuration record (mp4a/esds for AAC, dops for Opus, etc.)
-/// passes through unchanged inside the source's `stsd` box. Sample
-/// timing (`stts`/`stsc`/`stsz`) is preserved; only `stco`/`co64`
-/// chunk offsets are rewritten to point at the new MP4's mdat
-/// positions. Track IDs are renumbered so video stays at `track_id=1`
-/// and audio takes `track_id=2`.
+/// The source's first audio track is copied. The codec configuration
+/// record (mp4a/esds for AAC, dops for Opus, etc.) passes through
+/// unchanged inside the source's `stsd` box. Sample timing
+/// (`stts`/`stsc`/`stsz`) is preserved; only `stco`/`co64` chunk offsets
+/// are rewritten to point at the new MP4's mdat positions. Track IDs are
+/// renumbered so video stays at `track_id=1` and audio takes
+/// `track_id=2`. The track header fields that describe the source file
+/// rather than the audio — creation / modification times, the handler's
+/// name, data references, user data and metadata boxes — are cleared
+/// (`audio_iso`); a track that cannot be cleared fails the mux.
 ///
 /// `source_mp4` is the original MP4 byte stream (or any MP4 carrying
 /// the desired audio track — typically the same input the YUV came
 /// from). When the source has no audio track, the result is identical
 /// to [`build_mp4_with_pattern`].
 #[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_mp4_with_pattern_audio(
     profile: MuxerProfile,
     annex_b: &[u8],
@@ -267,6 +276,38 @@ pub fn build_mp4_with_pattern_audio(
     pattern: GopPattern,
     n_display_frames: usize,
     source_mp4: &[u8],
+) -> Result<Vec<u8>, Mp4Error> {
+    build_mp4_with_pattern_audio_lead_in(
+        profile, annex_b, width, height, timing, pattern, n_display_frames, source_mp4, 0,
+    )
+}
+
+/// [`build_mp4_with_pattern_audio`] for a source whose video starts
+/// `lead_in_us` after the start of its timeline, i.e. after the
+/// passed-through audio's time zero (a leading empty edit on the source's
+/// video track, as stock-footage exports carry).
+///
+/// The output video starts at 0 with no edit list (x264/HandBrake carry
+/// none), so without this every frame would play `lead_in_us` early against
+/// the audio, which keeps its own edit list. Instead frame 0 is held for the
+/// lead-in on top of its own duration: sample 0's `stts` delta grows by the
+/// lead-in, every later frame lands on its source time, and the frame count
+/// is unchanged. This is the same rule the AV1 muxer applies to a lead-in in
+/// its frame times (`VideoTimeline::from_frame_times`).
+///
+/// `lead_in_us == 0` is exactly [`build_mp4_with_pattern_audio`].
+#[cfg(feature = "h264-encoder")]
+#[allow(clippy::too_many_arguments)]
+pub fn build_mp4_with_pattern_audio_lead_in(
+    profile: MuxerProfile,
+    annex_b: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    pattern: GopPattern,
+    n_display_frames: usize,
+    source_mp4: &[u8],
+    lead_in_us: u64,
 ) -> Result<Vec<u8>, Mp4Error> {
     if width == 0 || height == 0 {
         return Err(Mp4Error::InvalidBox(format!(
@@ -326,6 +367,7 @@ pub fn build_mp4_with_pattern_audio(
             timing,
             composition_offsets.as_deref(),
             audio.as_ref(),
+            lead_in_us,
         ),
     }
 }
@@ -336,9 +378,10 @@ pub struct AudioPassthrough<'a> {
     /// Original audio samples in source order. Lifetime tied to the
     /// caller's source MP4 byte slice.
     samples: Vec<&'a [u8]>,
-    /// Source's `trak` box bytes — copied verbatim except for
-    /// `tkhd.track_id` (rewritten to 2) and `stco`/`co64` (rewritten
-    /// to point at our new mdat positions).
+    /// Source's `trak` box bytes, as the source has them. The output gets
+    /// `audio_iso::passthrough_audio_trak` of them (ISO shape, output
+    /// movie timescale, source identity cleared) with `tkhd.track_id`
+    /// rewritten to 2 and `stco`/`co64` to our new mdat positions.
     trak_raw: Vec<u8>,
     /// Source's media-timescale duration in `mdhd.time_scale` units.
     duration_media: u64,
@@ -490,14 +533,36 @@ fn build_handbrake_x264(
     timing: FrameTiming,
     composition_offsets: Option<&[i32]>,
     audio: Option<&AudioPassthrough<'_>>,
+    lead_in_us: u64,
 ) -> Result<Vec<u8>, Mp4Error> {
+    // `tkhd` and the `avc1` sample entry carry the DISPLAY size. For a cropped
+    // stream (1920×1080 coded as 120×68 MBs, `crop_bottom = 4`) that is the
+    // SPS size after frame cropping — what phone MP4s advertise. A caller
+    // passing the coded size (1088) or any other size would write a container
+    // that disagrees with its own bitstream, so refuse it here instead of
+    // shipping it. (An SPS that does not parse is left to the decoder.)
+    if let Some((sps_w, sps_h)) = avcc.sps_display_size()
+        && (sps_w, sps_h) != (width, height)
+    {
+        return Err(Mp4Error::InvalidBox(format!(
+            "track size {width}x{height} != SPS display size {sps_w}x{sps_h} \
+             (pass the cropped display size, not the coded MB-grid size)"
+        )));
+    }
     let mdhd_timescale = handbrake::mdhd_timescale(timing.fps_num, timing.fps_den);
     let frame_count = access_units.len() as u32;
+    // A source lead-in holds frame 0 longer (see
+    // `build_mp4_with_pattern_audio_lead_in`); 0 for every other caller,
+    // which keeps the single uniform `stts` run.
+    let lead_in_ticks: u64 =
+        (lead_in_us * mdhd_timescale as u64 + 500_000) / 1_000_000;
+    let lead_in_ticks = lead_in_ticks.min((u32::MAX - handbrake::STTS_DELTA_PER_FRAME) as u64);
     let track_duration_media: u64 =
-        (frame_count as u64) * (handbrake::STTS_DELTA_PER_FRAME as u64);
+        (frame_count as u64) * (handbrake::STTS_DELTA_PER_FRAME as u64) + lead_in_ticks;
     // Movie-header duration uses `MVHD_TIMESCALE` (1000 = ms).
     let movie_duration_ms: u64 = (frame_count as u64) * 1000 * (timing.fps_den as u64)
-        / (timing.fps_num as u64);
+        / (timing.fps_num as u64)
+        + lead_in_ticks * 1000 / mdhd_timescale as u64;
 
     // Pre-synthesise the x264 SEI NAL — prepended to the FIRST IDR
     // sample's NAL list. x264/HandBrake emits this exactly once per
@@ -590,11 +655,13 @@ fn build_handbrake_x264(
     // stco/co64 in-place inside its trak_raw clone. tkhd.track_id is
     // also rewritten to 2 (video has 1).
     let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
+        // ISO shape, output movie timescale, and none of the source file's
+        // timestamps / names / metadata (an error if it cannot be cleared).
         let mut trak = super::audio_iso::passthrough_audio_trak(
             &a.trak_raw,
             a.source_movie_timescale,
             handbrake::MVHD_TIMESCALE,
-        );
+        )?;
         let chunk_offsets: Vec<u64> = a
             .chunks
             .iter()
@@ -637,6 +704,7 @@ fn build_handbrake_x264(
         sync_samples: &sync_samples,
         avcc,
         composition_offsets,
+        lead_in_ticks: lead_in_ticks as u32,
         audio_trak: audio_trak_patched.as_deref(),
     });
 
@@ -690,6 +758,9 @@ struct MoovParams<'a> {
     /// `mdhd_timescale` units. `Some` when B-frames are present;
     /// `None` for IPPPP / I-only inputs.
     composition_offsets: Option<&'a [i32]>,
+    /// Extra `mdhd_timescale` ticks on sample 0's `stts` delta: the
+    /// source's video lead-in. 0 → one uniform `stts` run.
+    lead_in_ticks: u32,
     /// §Stealth.L4.5 — patched audio `trak` box bytes ready to
     /// splice. Already has track_id=2 + new stco/co64 offsets. None
     /// → video-only mux.
@@ -871,7 +942,13 @@ fn build_stbl_video_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
     let chunk_offsets = chunk_offsets_for_layout(&chunks, p.sample_offsets);
 
     let stsd = build_stsd_avc1(p.width, p.height, p.avcc);
-    let stts = build_stts_uniform(p.sample_sizes.len() as u32);
+    let stts = if p.lead_in_ticks == 0 {
+        build_stts_uniform(p.sample_sizes.len() as u32)
+    } else {
+        let mut deltas = vec![handbrake::STTS_DELTA_PER_FRAME; p.sample_sizes.len()];
+        deltas[0] += p.lead_in_ticks;
+        build_stts(&deltas)
+    };
     let ctts = p.composition_offsets.map(build_ctts);
     let stsc = build_stsc(&chunks);
     let stsz = build_stsz(p.sample_sizes);
@@ -1272,11 +1349,13 @@ pub fn build_mp4_av1(
 
 /// VP.M.4 — same as [`build_mp4_av1`] but also passes through the
 /// first audio track from `source_mp4`. The source's audio `trak` box
-/// is copied verbatim modulo `track_id` (renumbered to 2) and
-/// `stco`/`co64` (rewritten to point at the audio sample positions in
-/// the new mdat). Codec-agnostic — AAC, Opus, anything the source
-/// carries works the same way because we never touch the audio
-/// codec-config record (`mp4a`/`esds`, `Opus`/`dops`, etc.).
+/// is copied with `track_id` renumbered to 2, `stco`/`co64` rewritten to
+/// point at the audio sample positions in the new mdat, and the fields
+/// that identify the source file (creation / modification times, handler
+/// name, data references, user data and metadata) cleared, as on the
+/// H.264 path. Codec-agnostic — AAC, Opus, anything the source carries
+/// works the same way because we never touch the audio codec-config
+/// record (`mp4a`/`esds`, `Opus`/`dops`, etc.).
 ///
 /// When `source_mp4` has no audio track the result is identical to
 /// [`build_mp4_av1`].
@@ -1317,6 +1396,35 @@ pub fn build_mp4_av1_timed(
         None => None,
     };
     build_mp4_av1_inner(av1_obus, width, height, timing, audio.as_ref(), Some(frame_times_us))
+}
+
+/// [`build_mp4_av1_timed`] with the source given as a file path, mapped
+/// read-only, so a long clip never loads into the heap just to copy its
+/// audio. The source's audio track is copied as-is, edit list included —
+/// re-containerising it instead (Android's `MediaMuxer`) drops a leading
+/// empty edit, and the audio then plays early against the video.
+///
+/// `None` muxes video only. A source that cannot be opened or mapped is an
+/// error; the caller decides whether to retry without audio.
+#[cfg(feature = "video")]
+pub fn build_mp4_av1_timed_from_path(
+    av1_obus: &[u8],
+    width: u32,
+    height: u32,
+    timing: FrameTiming,
+    frame_times_us: &[i64],
+    source_path: Option<&std::path::Path>,
+) -> Result<Vec<u8>, Mp4Error> {
+    let Some(path) = source_path else {
+        return build_mp4_av1_timed(av1_obus, width, height, timing, frame_times_us, None);
+    };
+    let file = std::fs::File::open(path)
+        .map_err(|e| Mp4Error::InvalidBox(format!("cannot open source {}: {e}", path.display())))?;
+    // SAFETY: read-only map of a file the app owns for the length of this
+    // call; nothing writes it while the mux runs.
+    let source = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| Mp4Error::InvalidBox(format!("cannot map source {}: {e}", path.display())))?;
+    build_mp4_av1_timed(av1_obus, width, height, timing, frame_times_us, Some(&source))
 }
 
 fn build_mp4_av1_inner(
@@ -1402,11 +1510,13 @@ fn build_mp4_av1_inner(
     // Same mechanism the §Stealth.L4.5 H.264 audio passthrough uses
     // (see `build_handbrake_x264`).
     let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
+        // ISO shape, output movie timescale, and none of the source file's
+        // timestamps / names / metadata (an error if it cannot be cleared).
         let mut trak = super::audio_iso::passthrough_audio_trak(
             &a.trak_raw,
             a.source_movie_timescale,
             handbrake::MVHD_TIMESCALE,
-        );
+        )?;
         let chunk_offsets: Vec<u64> = a
             .chunks
             .iter()
@@ -2728,5 +2838,66 @@ mod tests {
             FrameTiming { fps_num: 0, fps_den: 1 },
         );
         assert!(r.is_err());
+    }
+
+    /// `build_minimal_annexb`'s IDR followed by `n - 1` AUD-delimited P
+    /// access units.
+    #[cfg(feature = "h264-encoder")]
+    fn build_annexb_frames(n: usize) -> Vec<u8> {
+        let mut bytes = build_minimal_annexb();
+        for _ in 1..n {
+            bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30]); // AUD
+            bytes.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x10]); // P slice (truncated)
+        }
+        bytes
+    }
+
+    /// The `stts` entries `(sample_count, delta)` of the first `stts` box.
+    #[cfg(feature = "h264-encoder")]
+    fn stts_entries(mp4: &[u8]) -> Vec<(u32, u32)> {
+        let at = mp4.windows(4).position(|w| w == b"stts").expect("stts box");
+        let rd = |o: usize| u32::from_be_bytes(mp4[o..o + 4].try_into().unwrap());
+        let n = rd(at + 8) as usize;
+        (0..n).map(|i| (rd(at + 12 + 8 * i), rd(at + 16 + 8 * i))).collect()
+    }
+
+    /// A source video lead-in holds frame 0: sample 0's `stts` delta grows by
+    /// the lead-in, the frame count does not, and no edit list appears.
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn lead_in_holds_frame_zero_without_adding_frames_or_edits() {
+        use crate::codec::h264::stego::gop_pattern::GopPattern;
+        let annex_b = build_annexb_frames(5);
+        // A source with no audio track: the lead-in still applies.
+        let source = build_mp4(MuxerProfile::HandbrakeX264, &build_minimal_annexb(), 1920, 1080, FrameTiming::FPS_30)
+            .unwrap();
+        let mux = |lead_in_us| {
+            build_mp4_with_pattern_audio_lead_in(
+                MuxerProfile::HandbrakeX264, &annex_b, 1920, 1080, FrameTiming::FPS_30,
+                GopPattern::Ipppp { gop: 30 }, 5, &source, lead_in_us,
+            )
+            .unwrap()
+        };
+
+        // 100 ms at 30 fps → 15360 ticks/s → 1536 ticks.
+        let held = mux(100_000);
+        assert_eq!(stts_entries(&held), vec![(1, 512 + 1536), (4, 512)]);
+        let parsed = super::super::demux::demux(&held).unwrap();
+        let v = parsed.tracks.iter().find(|t| &t.handler_type == b"vide").unwrap();
+        assert_eq!(v.samples.len(), 5, "no frame added");
+        assert_eq!(v.timescale, 15360);
+        assert_eq!(v.duration, 5 * 512 + 1536);
+        assert!(!held.windows(4).any(|w| w == b"edts"), "no edit list");
+
+        // No lead-in: the single uniform run, byte-identical to the
+        // plain audio-passthrough muxer.
+        let plain = mux(0);
+        assert_eq!(stts_entries(&plain), vec![(5, 512)]);
+        let reference = build_mp4_with_pattern_audio(
+            MuxerProfile::HandbrakeX264, &annex_b, 1920, 1080, FrameTiming::FPS_30,
+            GopPattern::Ipppp { gop: 30 }, 5, &source,
+        )
+        .unwrap();
+        assert_eq!(plain, reference);
     }
 }

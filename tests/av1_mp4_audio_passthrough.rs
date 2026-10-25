@@ -220,3 +220,51 @@ fn build_mp4_av1_with_audio_video_only_fallback_when_source_has_no_audio() {
         "no audio in source → no soun in output"
     );
 }
+
+/// The mobile muxers hand the core the source FILE, not its bytes: the bridge
+/// must not load a whole clip into memory to copy a few MB of audio, and
+/// re-containerising the audio on the platform side instead (Android's
+/// `MediaMuxer`) dropped the audio track's leading empty edit — the audio
+/// played ~120 ms early against the video. Muxing from the path must give
+/// exactly the bytes muxing from the source's bytes gives, edit list included.
+#[test]
+fn build_mp4_av1_timed_from_path_matches_the_byte_slice_mux() {
+    use phasm_core::codec::mp4::build::{build_mp4_av1_timed, build_mp4_av1_timed_from_path};
+    let source_path = aac_source_mp4_path();
+    let Ok(source) = std::fs::read(&source_path) else {
+        eprintln!("skipping: AAC source MP4 missing at {:?}", source_path);
+        return;
+    };
+    let stream = make_synthetic_av1_stream(4);
+    let timing = FrameTiming { fps_num: 24, fps_den: 1 };
+    let times = [83_008i64, 124_675, 166_342, 208_009];
+
+    let from_bytes = build_mp4_av1_timed(&stream, 1280, 720, timing, &times, Some(&source))
+        .expect("mux from bytes");
+    let from_path = build_mp4_av1_timed_from_path(&stream, 1280, 720, timing, &times, Some(&source_path))
+        .expect("mux from path");
+    assert_eq!(from_path, from_bytes, "path mux must equal the byte-slice mux");
+    // The source's audio lead-in (its leading empty edit) is carried over.
+    assert!(contains_fourcc(&from_path, b"elst"), "audio edit list must survive");
+}
+
+#[test]
+fn build_mp4_av1_timed_from_path_without_a_source_is_video_only() {
+    use phasm_core::codec::mp4::build::{build_mp4_av1_timed, build_mp4_av1_timed_from_path};
+    let stream = make_synthetic_av1_stream(3);
+    let timing = FrameTiming { fps_num: 30, fps_den: 1 };
+    let from_path = build_mp4_av1_timed_from_path(&stream, 640, 480, timing, &[], None)
+        .expect("video-only mux");
+    assert_eq!(from_path, build_mp4_av1(&stream, 640, 480, timing).expect("untimed mux"));
+}
+
+/// A source that cannot be opened is an error, not a silent video-only file:
+/// the caller decides whether to retry without audio.
+#[test]
+fn build_mp4_av1_timed_from_path_reports_a_missing_source() {
+    use phasm_core::codec::mp4::build::build_mp4_av1_timed_from_path;
+    let stream = make_synthetic_av1_stream(3);
+    let timing = FrameTiming { fps_num: 30, fps_den: 1 };
+    let missing = PathBuf::from("/nonexistent/phasm-av1-source.mp4");
+    assert!(build_mp4_av1_timed_from_path(&stream, 640, 480, timing, &[], Some(&missing)).is_err());
+}

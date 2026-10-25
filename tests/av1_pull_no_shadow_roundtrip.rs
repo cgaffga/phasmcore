@@ -381,8 +381,9 @@ fn pull_no_shadow_progress_tracks_work() {
 
 /// SHA-256 and length of the stego stream [`pull_no_shadow_aligned_output_is_unchanged`]
 /// encodes, captured 2026-10-24 before the Pass-2 rebuild (option 3) landed.
-const GOLDEN_256X144: &str = "33aa313f28d12504318e6fd7a58d38da92e5a0e4df50b7c5c049e523d36af3aa";
-const GOLDEN_256X144_LEN: usize = 95_837;
+// Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
+const GOLDEN_256X144: &str = "f4824c09a880ac89a2641e41b827252e0c69a02afde18af79a933f8e3cad7947";
+const GOLDEN_256X144_LEN: usize = 95_836;
 
 /// At a frame size whose width and height are multiples of 8, the encode's
 /// stego output stays byte-identical across the Pass-2 rebuild: rebuilding a

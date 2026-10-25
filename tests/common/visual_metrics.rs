@@ -31,22 +31,30 @@ pub fn psnr_y(a: &[u8], b: &[u8]) -> f64 {
 /// returns the minimum PSNR found at any MB position, plus its (mb_x,
 /// mb_y) location. Catches localized reconstruction failures that
 /// whole-frame PSNR averages out.
+///
+/// Covers the whole MB grid of the picture: for an exact (cropped) size
+/// the last MB column / row is only partly visible, and its visible part is
+/// measured too — those edge MBs are exactly where a cropping bug would show.
+/// For 16-aligned sizes this is the plain full-MB scan.
 pub fn worst_mb_psnr_y(src: &[u8], dec: &[u8], width: u32, height: u32) -> (f64, u32, u32) {
     let mut worst = f64::INFINITY;
     let mut wx = 0u32;
     let mut wy = 0u32;
     let w = width as usize;
-    for mb_y in 0..(height / 16) {
-        for mb_x in 0..(width / 16) {
+    let h = height as usize;
+    for mb_y in 0..height.div_ceil(16) {
+        for mb_x in 0..width.div_ceil(16) {
+            let rows = (h - mb_y as usize * 16).min(16);
+            let cols = (w - mb_x as usize * 16).min(16);
             let mut mse = 0.0_f64;
-            for dy in 0..16 {
-                for dx in 0..16 {
+            for dy in 0..rows {
+                for dx in 0..cols {
                     let off = (mb_y as usize * 16 + dy) * w + (mb_x as usize * 16 + dx);
                     let d = src[off] as f64 - dec[off] as f64;
                     mse += d * d;
                 }
             }
-            mse /= 256.0;
+            mse /= (rows * cols) as f64;
             let p = if mse == 0.0 { 99.0 } else { 10.0 * (255.0_f64 * 255.0 / mse).log10() };
             if p < worst {
                 worst = p;

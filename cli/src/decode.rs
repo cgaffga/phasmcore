@@ -218,9 +218,11 @@ fn decode_h264_cabac(
 /// Walks the MP4 via the in-tree `codec::mp4::demux` (no ffmpeg
 /// shell-out), pulls each AV1 sample's OBU bytes from the av01 video
 /// track, and streams them into `Av1StreamingDecodeSession`. Finalization
-/// goes through `finish_primary_payload`, which decodes both the
-/// `payload::encode_payload`-framed shape (CLI v1, mobile) AND legacy
-/// plain-text streams via its internal fallback.
+/// goes through `finish_payload`: whichever layer the passphrase opens —
+/// the primary, else a shadow (whole-video, then per-GOP) — framed by
+/// `payload::encode_payload` (CLI v1, mobile) or, for legacy streams,
+/// plain text. (Before 2026-10-24 this read only the primary, so an AV1
+/// `--shadow-message-N` could be written but never decoded.)
 ///
 /// Returns `text + files` as a `PayloadData` — the same shape as the
 /// H.264 dispatch with the file follow-on already wired through.
@@ -261,7 +263,7 @@ fn decode_av1_streaming(
     for sample in &track.samples {
         session.push_bytes(&sample.data);
     }
-    let payload = session.finish_primary_payload().map_err(|e| {
+    let payload = session.finish_payload().map_err(|e| {
         CliError::from(phasm_core::StegoError::InvalidVideo(format!(
             "AV1 decode failed: {e:?}"
         )))

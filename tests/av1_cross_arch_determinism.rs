@@ -76,7 +76,8 @@ const FIXTURES: &[Fixture] = &[
         h: 144,
         n_frames: 4,
         gop: 4,
-        pinned_sha256: "bad838c2898d764338defe15b629aa12ef8fefbe21e3cb92724a3ee710d92ae1",
+        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
+        pinned_sha256: "ef5e35c19ceddfc5de1aaef7d1c164251e9f8accc22ae25310a0db39bd5e6fc0",
         pinned_len: 81358,
     },
     // Two GOPs, frame size not a multiple of 8 (padded edge blocks).
@@ -86,7 +87,8 @@ const FIXTURES: &[Fixture] = &[
         h: 142,
         n_frames: 6,
         gop: 3,
-        pinned_sha256: "296d14cbeb8b3da6323b59bf78d5c3f317e14650658453ae5015e16e796feb1d",
+        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
+        pinned_sha256: "94f274477638744d3ef64f2764457df54572bd46d1049c75676b03737837a29a",
         pinned_len: 122462,
     },
     // 64x64 superblocks and the large transforms.
@@ -96,7 +98,8 @@ const FIXTURES: &[Fixture] = &[
         h: 360,
         n_frames: 4,
         gop: 4,
-        pinned_sha256: "0fbf65e8bf1c6165ac568c6a5f9e71d50076d8b2fcebd897bb5383d53dbef910",
+        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
+        pinned_sha256: "e04953f90ca4389df443d545199c4229900bcd69a9b2773265564c1160c23cf7",
         pinned_len: 407620,
     },
 ];

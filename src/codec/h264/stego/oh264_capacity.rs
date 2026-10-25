@@ -17,6 +17,7 @@
 //! OpenH264-only.
 
 use super::keys::CabacStegoMasterKeys;
+use crate::codec::h264::frame_geometry::FrameGeometry;
 use crate::stego::error::StegoError;
 
 /// Pure, stateless per-shadow capacity for the N-aware HUD bar.
@@ -129,11 +130,9 @@ pub fn h264_resolve_auto_tier(
     msg_bytes: usize,
     headroom: f32,
 ) -> Result<super::tier_filter::CascadeTier, StegoError> {
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(StegoError::InvalidVideo(format!(
-            "dimensions must be 16-aligned, got {width}x{height}"
-        )));
-    }
+    // Any even size >= 16x16: the encoder codes the MB grid and crops back
+    // to the exact size in the SPS (see `frame_geometry`).
+    FrameGeometry::new(width, height)?;
     let cover = super::super::openh264_stego::h264_walk_cover(
         yuv, width, height, n_frames as u32, opts,
     )?;
@@ -168,11 +167,9 @@ pub fn h264_video_capacity(
     full_tiers: bool,
 ) -> Result<H264StegoCapacityInfo, StegoError> {
     use crate::stego::frame::FRAME_OVERHEAD;
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(StegoError::InvalidVideo(format!(
-            "dimensions must be 16-aligned, got {width}x{height}"
-        )));
-    }
+    // Any even size >= 16x16: the encoder codes the MB grid and crops back
+    // to the exact size in the SPS (see `frame_geometry`).
+    FrameGeometry::new(width, height)?;
     let frame_size = (width * height * 3 / 2) as usize;
     if yuv.len() != frame_size * n_frames {
         return Err(StegoError::InvalidVideo(format!(
@@ -302,7 +299,7 @@ pub(crate) struct NShadowSetup {
 ///
 /// Performs the input checks that must succeed before any encode
 /// work starts:
-/// - 16-pixel dimension alignment
+/// - an even size of at least 16×16 (exact sizes are cropped in the SPS)
 /// - YUV byte length consistency with `n_frames`
 /// - `gop_size` in `1..=n_frames`
 /// - Unique passphrases across primary + every shadow
@@ -331,11 +328,9 @@ pub(crate) fn validate_n_shadow_inputs<'a>(
     let gop_size = pattern.gop_size();
     let b_count = pattern.legacy_b_count();
 
-    if !width.is_multiple_of(16) || !height.is_multiple_of(16) {
-        return Err(StegoError::InvalidVideo(format!(
-            "dimensions must be 16-aligned, got {width}x{height}"
-        )));
-    }
+    // Any even size >= 16x16: the encoder codes the MB grid and crops back
+    // to the exact size in the SPS (see `frame_geometry`).
+    FrameGeometry::new(width, height)?;
     let frame_size = (width * height * 3 / 2) as usize;
     if yuv_len != frame_size * n_frames {
         return Err(StegoError::InvalidVideo(format!(

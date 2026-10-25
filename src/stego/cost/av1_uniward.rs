@@ -59,6 +59,7 @@
 //! rav1e; `det_math::det_cos` is the project's existing primitive
 //! for exactly this case).
 
+use super::av1_damage::{damage, DamageInputs, DamageParams};
 use std::collections::HashMap;
 
 #[cfg(feature = "parallel")]
@@ -67,9 +68,7 @@ use rayon::prelude::*;
 use crate::det_math::det_cos;
 
 #[cfg(feature = "av1-encoder")]
-use crate::codec::av1::stego::cascade_kernel::{
-    scale_l3_to_cascade, L2Key, L3CascadeCache,
-};
+use crate::codec::av1::stego::cascade_kernel::L3CascadeCache;
 #[cfg(feature = "av1-encoder")]
 use phasm_rav1e::ec::PhasmFrameLoopFilterState;
 
@@ -93,21 +92,6 @@ fn coeff_to_cascade_factor() -> f64 {
     })
 }
 
-/// EE-D safe-band threshold: `|coeff| × factor < THRESHOLD_SAFE` →
-/// position accepted without forward modeling. Default 12.0
-/// (catches |coeff| ≤ 2 at factor=6, ~60% of cover positions).
-/// Env-overridable via `PHASM_AV1_THRESHOLD_SAFE`.
-#[cfg(feature = "av1-encoder")]
-fn threshold_safe() -> f64 {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<f64> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("PHASM_AV1_THRESHOLD_SAFE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(12.0)
-    })
-}
 
 /// EE-D reject-band threshold: `|coeff| × factor > THRESHOLD_REJECT`
 /// → position rejected (INF cost) without forward modeling. Default
@@ -190,22 +174,15 @@ pub(crate) fn phasm_av1_simd_enabled() -> bool {
 /// sizes so per-size σ tuning is v0.6+.
 const SIGMA: f64 = 0.015625; // 2^-6
 
-/// AV1 IDTX transform-type index. For 4×4: TX_TYPE=4 = IDTX. For
-/// other sizes the IDTX variants are at index 9 (V_DCT), 10 (H_DCT),
-/// etc. — we conservatively flag a small set; expand in v0.6+ when
-/// per-type bases land.
-///
-/// AV1 enum (per av1-spec § 6.4.2):
-///   0 = DCT_DCT       8 = V_DCT
-///   1 = ADST_DCT      9 = H_DCT
-///   2 = DCT_ADST     10 = V_ADST
-///   3 = ADST_ADST    11 = H_ADST
-///   4 = FLIPADST_DCT 12 = V_FLIPADST
-///   5 = DCT_FLIPADST 13 = H_FLIPADST
-///   6 = FLIPADST_FLIPADST
-///   7 = ADST_FLIPADST
-///   (IDTX = 15 in some encodings — variable across spec revisions)
-const AV1_TX_TYPE_IDTX: u8 = 15;
+/// AV1 IDTX transform type (identity both ways). rav1e's `TxType`
+/// (vendor/phasm-rav1e/src/transform/mod.rs), same numbering as dav1d:
+///   0 DCT_DCT  1 ADST_DCT  2 DCT_ADST  3 ADST_ADST  4 FLIPADST_DCT
+///   5 DCT_FLIPADST  6 FLIPADST_FLIPADST  7 ADST_FLIPADST  8 FLIPADST_ADST
+///   9 IDTX  10 V_DCT  11 H_DCT  12 V_ADST  13 H_ADST  14 V_FLIPADST
+///   15 H_FLIPADST  16 WHT_WHT
+/// (Was 15 before v2, which is H_FLIPADST: those blocks were costed as
+/// IDTX, and their golomb tails were not wet.)
+const AV1_TX_TYPE_IDTX: u8 = 9;
 
 /// One AC sign emission's spatial info needed for J-UNIWARD cost.
 /// Subset of `phasm_rav1e::AcSignMeta` — phasm-core projects encoder
@@ -231,6 +208,15 @@ pub struct Av1FramePosition {
     /// at zero. See `AcSignMeta::coeff_magnitude` in phasm-rav1e
     /// `src/ec.rs` for the fork-side definition.
     pub coeff_magnitude: u16,
+    /// A golomb-tail LSB (`PHASM_TAG_GOLOMB_TAIL_LSB`), not an AC sign.
+    /// Always wet in the primary.
+    pub is_golomb_tail: bool,
+    /// Frame index within the GOP (decode order) and the GOP's length, for
+    /// the damage model's temporal term; `is_key_frame` for its spatial
+    /// reach (v2).
+    pub frame_idx: u16,
+    pub gop_len: u16,
+    pub is_key_frame: bool,
 }
 
 /// Reconstructed-frame planes (per-plane visible-region packed YUV).
@@ -309,7 +295,10 @@ pub fn compute_av1_uniward_costs_with_state(
     // — same contract as the serial path.
     let t1 = std::time::Instant::now();
     let mut basis_cache = FrameBasisCache::new(delta_magnitude);
-    basis_cache.prefill(positions);
+    // Only the legacy wavelet path reads the basis cache.
+    if loop_filter_state.is_none() {
+        basis_cache.prefill(positions);
+    }
     let basis_cache = basis_cache; // freeze: subsequent reads are &-only
     let t_basis_prefill = t1.elapsed();
 
@@ -318,11 +307,9 @@ pub fn compute_av1_uniward_costs_with_state(
     // get O(1) closed-form cost; only middle needs forward modeling.
     let t2 = std::time::Instant::now();
     #[cfg(feature = "av1-encoder")]
-    let l3_cache = loop_filter_state.map(|state| {
-        let mut l3 = L3CascadeCache::new(state);
-        prefill_l3_middle_band(&mut l3, positions);
-        l3
-    });
+    // v2: the damage model replaced the L3 middle band, so the cache is no
+    // longer prefilled; its presence still selects the production branch.
+    let l3_cache = loop_filter_state.map(L3CascadeCache::new);
     #[cfg(not(feature = "av1-encoder"))]
     let l3_cache: Option<()> = None;
     let t_l3_prefill = t2.elapsed();
@@ -334,6 +321,7 @@ pub fn compute_av1_uniward_costs_with_state(
             &cb_wavelets,
             &cr_wavelets,
             planes,
+            qindex,
             &basis_cache,
             #[cfg(feature = "av1-encoder")]
             l3_cache.as_ref(),
@@ -373,61 +361,6 @@ fn phasm_av1_profile_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("PHASM_AV1_PROFILE").is_ok())
 }
 
-/// B.1.5.5: prefill L3 entries for cover positions whose `|coeff|`
-/// upper bound falls in the middle band. Skips safe + reject band
-/// positions (they get O(1) closed-form cost via three-tier dispatch).
-///
-/// B.3.2.4 audit fix (2026-06-06): pre-B.3.2.4 this function
-/// allocated `vec![0.0; tx_w * tx_h]` AND ran `dct_ii_basis` (up to
-/// 1024 `det_cos` calls for 32×32 TX) for EVERY middle-band
-/// position, then passed to `get_or_compute` which discarded the
-/// basis on cache HIT. Empirical hit rate ~99% per phase-b31
-/// numbers → ~99% of the work was discarded. PHASM_AV1_PROFILE
-/// measurement (2026-06-06, iphone5_1080p): l3_prefill = 1067-1238
-/// ms / frame, ~82% of cost-compute total.
-///
-/// Fix: probe the cache via the read-only `L3CascadeCache::get`
-/// FIRST. On hit (~99% of calls): skip the allocation + dct_ii_basis
-/// entirely. On miss (~1%): compute as before. Expected ~99%
-/// reduction in l3_prefill time → ~40-43% wall-clock embed_ms
-/// reduction on the production path.
-#[cfg(feature = "av1-encoder")]
-fn prefill_l3_middle_band(l3: &mut L3CascadeCache, positions: &[Av1FramePosition]) {
-    for pos in positions {
-        if pos.tx_type == AV1_TX_TYPE_IDTX {
-            continue;
-        }
-        let coeff_upper_bound = pos.coeff_magnitude as f64 * coeff_to_cascade_factor();
-        if coeff_upper_bound < threshold_safe() || coeff_upper_bound > threshold_reject() {
-            continue;
-        }
-        let tx_w = 1usize << pos.tx_width_log2;
-        let tx_h = 1usize << pos.tx_height_log2;
-        let scan_pos = pos.scan_pos as usize;
-        if scan_pos == 0 {
-            continue;
-        }
-        let freq_x = scan_pos % tx_w;
-        let freq_y = scan_pos / tx_w;
-        if freq_y >= tx_h {
-            continue;
-        }
-        let key = L2Key::new(tx_w, tx_h, freq_x, freq_y, pos.plane);
-
-        // B.3.2.4 cache-hit fast path: skip basis + dct_ii_basis when
-        // the key already exists. This is the load-bearing fix —
-        // ~99% of middle-band positions are duplicates of an earlier
-        // unique tuple.
-        if l3.get(&key).is_some() {
-            continue;
-        }
-
-        // Cold path: compute unit-magnitude basis + insert.
-        let mut basis = vec![0.0f64; tx_w * tx_h];
-        dct_ii_basis(tx_w, tx_h, freq_x, freq_y, &mut basis);
-        let _ = l3.get_or_compute(key, &basis);
-    }
-}
 
 /// AV1 quantizer step approximation for v1 MVP. Real AV1 uses two
 /// tables (DC + AC) indexed by qindex with non-linear scaling
@@ -437,6 +370,18 @@ fn prefill_l3_middle_band(l3: &mut L3CascadeCache, positions: &[Av1FramePosition
 #[inline]
 fn qindex_to_step(qindex: u8) -> f64 {
     (qindex as f64 / 4.0 + 1.0).max(1.0)
+}
+
+/// Chroma's per-plane weight W in the v2 cost (luma is 1.0). Calibrated
+/// 2026-10-25 to 0.5: with alpha_x 256 it gave the best worst frame (32.1
+/// dB) and worst block (20.1 dB) of the sweep. Env `PHASM_AV1_W_CHROMA`
+/// overrides it for calibration.
+#[cfg(feature = "av1-encoder")]
+fn w_chroma() -> f32 {
+    static W: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("PHASM_AV1_W_CHROMA").ok().and_then(|s| s.parse().ok()).unwrap_or(0.5)
+    })
 }
 
 /// Compute per-flip J-UNIWARD cost.
@@ -452,16 +397,15 @@ fn compute_position_cost(
     cb_wavelets: &ThreeSubbands,
     cr_wavelets: &ThreeSubbands,
     planes: &FramePlanes,
+    qindex: u8,
     basis_cache: &FrameBasisCache,
     #[cfg(feature = "av1-encoder")] l3_cache: Option<&L3CascadeCache>,
     #[cfg(not(feature = "av1-encoder"))] _l3_cache: Option<&()>,
 ) -> f32 {
-    // IDTX: no frequency basis — return uniform low cost. IDTX is
-    // identity (no transform), so flipping its sign in pixel space
-    // doesn't spread — cascade is small. Preferred by STC over
-    // |coeff|-band positions.
-    if pos.tx_type == AV1_TX_TYPE_IDTX {
-        return 1.0;
+    // Golomb tails are wet by tag, on every tx type (v2). Checked before
+    // anything else, the IDTX shortcut included.
+    if pos.is_golomb_tail {
+        return f32::INFINITY;
     }
 
     // B.1.5.5 three-tier dispatch (active iff `l3_cache` is Some, i.e.,
@@ -483,6 +427,12 @@ fn compute_position_cost(
         // EE-D reject band: above threshold → STC will never pick.
         // Checked FIRST so smoothness lookup doesn't run for these.
         if coeff_upper_bound > thresh_reject {
+            return f32::INFINITY;
+        }
+        if pos.plane > 2 {
+            return f32::INFINITY;
+        }
+        if pos.scan_pos == 0 {
             return f32::INFINITY;
         }
 
@@ -525,45 +475,43 @@ fn compute_position_cost(
             1.0
         };
 
-        // EE-D safe band: |coeff| × factor below threshold → low cost.
-        // Gradient: |coeff|=1 → cost 6, |coeff|=2 → cost 12, modulated
-        // by EE-E smoothness multiplier.
-        if coeff_upper_bound < threshold_safe() as f32 {
-            return coeff_upper_bound * smoothness_mult;
-        }
-
-        // Middle band: look up the predicted post-cascade magnitude
-        // from L3 (prefilled by `prefill_l3_middle_band` before this
-        // par_iter started).
-        let tx_w_local = 1usize << pos.tx_width_log2;
-        let tx_h_local = 1usize << pos.tx_height_log2;
-        let scan_pos_local = pos.scan_pos as usize;
-        if scan_pos_local == 0 {
-            return f32::INFINITY;
-        }
-        let freq_x_local = scan_pos_local % tx_w_local;
-        let freq_y_local = scan_pos_local / tx_w_local;
-        if freq_y_local >= tx_h_local {
-            return f32::INFINITY;
-        }
-        let key = L2Key::new(
-            tx_w_local,
-            tx_h_local,
-            freq_x_local,
-            freq_y_local,
-            pos.plane,
+        // v2 (spec § 4): cost = W_plane · S · D. S is the smoothness factor
+        // above; D = E·T·X (`av1_damage`), monotone in |c| — the old safe /
+        // middle bands priced |c| = 2..5 below |c| = 1.
+        let (plane_w, plane_h) = if pos.plane == 0 {
+            (planes.luma_width, planes.luma_height)
+        } else {
+            (planes.chroma_width, planes.chroma_height)
+        };
+        let d = damage(
+            &DamageInputs {
+                plane: pos.plane,
+                px_x: pos.plane_px_x,
+                px_y: pos.plane_px_y,
+                plane_w: plane_w as u16,
+                plane_h: plane_h as u16,
+                tx_width_log2: pos.tx_width_log2,
+                tx_height_log2: pos.tx_height_log2,
+                tx_type: pos.tx_type,
+                scan_pos: pos.scan_pos,
+                abs_c: pos.coeff_magnitude,
+                qindex,
+                frame_idx: pos.frame_idx,
+                gop_len: pos.gop_len,
+                is_key_frame: pos.is_key_frame,
+            },
+            &DamageParams::from_env(),
         );
-        // B.3.2.2: L3 cache still stores normalized_energy as f64 +
-        // scale_l3_to_cascade returns f64 (cold-side bookkeeping in
-        // core/src/codec/av1/stego/cascade_kernel.rs). Narrow at use
-        // site to compose with f32 smoothness_mult.
-        let normalized_energy = l3.get(&key).unwrap_or(0.0);
-        let cascade = scale_l3_to_cascade(normalized_energy, pos.coeff_magnitude) as f32;
-        return cascade * smoothness_mult;
+        let w_plane = if pos.plane == 0 { 1.0 } else { w_chroma() };
+        let _ = l3;
+        return w_plane * smoothness_mult * d;
     }
 
     // ---- Legacy J-UNIWARD path (B.1.3 magnitude proxy) follows ----
     // Active when l3_cache is None (unit tests, no-state callers).
+    if pos.tx_type == AV1_TX_TYPE_IDTX {
+        return 1.0;
+    }
     let _ = (y_wavelets, cb_wavelets, cr_wavelets); // legacy path uses these via match below
 
     // Pick wavelets + frame dims for the plane.
@@ -631,16 +579,24 @@ fn compute_position_cost(
     // byte-equivalence in CI.
     let sigma_f32 = SIGMA as f32;
     let mut cost = 0.0f32;
+    // The whole window counts, including the part in the subbands'
+    // reflection margin (`x_offset`/`y_offset` = -pad): a border block is
+    // priced like its mirrored interior twin. Only cells outside the padded
+    // subbands are skipped. (Before v2 the top/left margin was dropped, so
+    // border blocks came out cheap.)
+    let padded_h = (wavelets.lh.len() / wavelets.width.max(1)) as isize;
     for out_r in 0..impact_h {
         let abs_y = block_px_y as isize + out_r as isize - pad as isize;
-        if abs_y < 0 || abs_y >= img_h as isize {
+        let wy_signed = abs_y - wavelets.y_offset;
+        if wy_signed < 0 || wy_signed >= padded_h {
             continue;
         }
-        let wy = (abs_y - wavelets.y_offset) as usize;
-        // Valid out_c range so abs_x = block_px_x + out_c - pad ∈ [0, img_w).
-        let c_lo_signed = (pad as isize) - block_px_x as isize;
+        let wy = wy_signed as usize;
+        // Valid out_c range so abs_x - x_offset ∈ [0, wavelets.width).
+        let c_lo_signed = wavelets.x_offset + pad as isize - block_px_x as isize;
         let c_lo = c_lo_signed.max(0).min(impact_w as isize) as usize;
-        let c_hi_signed = (img_w as isize) + (pad as isize) - block_px_x as isize;
+        let c_hi_signed = wavelets.x_offset + wavelets.width as isize + pad as isize
+            - block_px_x as isize;
         let c_hi = c_hi_signed.max(0).min(impact_w as isize) as usize;
         if c_lo >= c_hi {
             continue;
@@ -1284,6 +1240,10 @@ mod tests {
                 tx_type: 0,
                 scan_pos: 1,
                 coeff_magnitude: 8,
+                is_golomb_tail: false,
+                frame_idx: 0,
+                gop_len: 1,
+                is_key_frame: true,
             },
             Av1FramePosition {
                 plane: 0,
@@ -1294,6 +1254,10 @@ mod tests {
                 tx_type: 0,
                 scan_pos: 5,
                 coeff_magnitude: 8,
+                is_golomb_tail: false,
+                frame_idx: 0,
+                gop_len: 1,
+                is_key_frame: true,
             },
             Av1FramePosition {
                 plane: 0,
@@ -1304,6 +1268,10 @@ mod tests {
                 tx_type: 0,
                 scan_pos: 7,
                 coeff_magnitude: 8,
+                is_golomb_tail: false,
+                frame_idx: 0,
+                gop_len: 1,
+                is_key_frame: true,
             },
         ];
         let costs = compute_av1_uniward_costs(&planes, &positions, 30);
@@ -1337,6 +1305,10 @@ mod tests {
             tx_type: 0,
             scan_pos: 5,
             coeff_magnitude: 8,
+            is_golomb_tail: false,
+            frame_idx: 0,
+            gop_len: 1,
+            is_key_frame: true,
         };
         let costs = compute_av1_uniward_costs(&planes, &[position], 30);
         // The cost should be > the J-UNIWARD-only value (i.e., the
@@ -1371,9 +1343,206 @@ mod tests {
             tx_type: AV1_TX_TYPE_IDTX,
             scan_pos: 5,
             coeff_magnitude: 8,
+            is_golomb_tail: false,
+            frame_idx: 0,
+            gop_len: 1,
+            is_key_frame: true,
         }];
         let costs = compute_av1_uniward_costs(&planes, &positions, 30);
         assert_eq!(costs, vec![1.0]);
+    }
+
+    /// A block on the top / left border is priced over its WHOLE window, as
+    /// reference J-UNIWARD prices it: the part of the window outside the
+    /// plane lies in the subbands' reflection margin and counts like any
+    /// other sample. Port of the H.264 test of the same name.
+    ///
+    /// Plane `b` is plane `a` mirrored into a 2× canvas,
+    /// `b[n + y][n + x] = a[reflect(y)][reflect(x)]`, so block `(bx, by)` of
+    /// `a`, reflection margin included, sees exactly the pixels block
+    /// `(n + bx, n + by)` of `b` sees. Every block of `a` must cost exactly
+    /// what its twin costs. Before v2 the accumulator dropped the top and
+    /// left margin samples, so border blocks came out cheaper.
+    #[test]
+    fn border_block_cost_equals_its_mirrored_interior_twin() {
+        let n = 64usize;
+        let s = synth_planes(n, n).y;
+        let a: Vec<u8> = (0..n * n).map(|i| s[(i / n) * n + (n - 1 - i % n)]).collect();
+        let m = 2 * n;
+        let mut b = vec![0u8; m * m];
+        for y in 0..m {
+            for x in 0..m {
+                let sy = symmetric_reflect(y as isize - n as isize, n as isize) as usize;
+                let sx = symmetric_reflect(x as isize - n as isize, n as isize) as usize;
+                b[y * m + x] = a[sy * n + sx];
+            }
+        }
+        let planes_of = |y: Vec<u8>, w: usize| FramePlanes {
+            y,
+            cb: vec![128; (w / 2) * (w / 2)],
+            cr: vec![128; (w / 2) * (w / 2)],
+            luma_width: w,
+            luma_height: w,
+            chroma_width: w / 2,
+            chroma_height: w / 2,
+        };
+        let pa = planes_of(a, n);
+        let pb = planes_of(b, m);
+        let mut checked_border = 0;
+        for log2 in [2u8, 3, 4] {
+            let tx = 1usize << log2;
+            for scan_pos in [1u16, 4, 9] {
+                for magnitude in [1u16, 3] {
+                    let mut at_a = Vec::new();
+                    let mut at_b = Vec::new();
+                    for by in (0..=n - tx).step_by(tx) {
+                        for bx in (0..=n - tx).step_by(tx) {
+                            let p = Av1FramePosition {
+                                plane_px_x: bx as u16,
+                                plane_px_y: by as u16,
+                                tx_width_log2: log2,
+                                tx_height_log2: log2,
+                                scan_pos,
+                                coeff_magnitude: magnitude,
+                                ..Default::default()
+                            };
+                            at_a.push(p);
+                            at_b.push(Av1FramePosition {
+                                plane_px_x: (n + bx) as u16,
+                                plane_px_y: (n + by) as u16,
+                                ..p
+                            });
+                            if bx < 16 || by < 16 {
+                                checked_border += 1;
+                            }
+                        }
+                    }
+                    let ca = compute_av1_uniward_costs(&pa, &at_a, 100);
+                    let cb = compute_av1_uniward_costs(&pb, &at_b, 100);
+                    for (i, (x, y)) in ca.iter().zip(&cb).enumerate() {
+                        assert_eq!(
+                            x.to_bits(), y.to_bits(),
+                            "tx {tx} scan {scan_pos} |c| {magnitude}: block ({},{}) costs {x}, \
+                             its interior twin {y}",
+                            at_a[i].plane_px_x, at_a[i].plane_px_y
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked_border > 0);
+    }
+
+    /// Flat planes, so the smoothness factor is the same everywhere and only
+    /// the damage term separates positions.
+    #[cfg(feature = "av1-encoder")]
+    fn flat_planes(w: usize, h: usize) -> FramePlanes {
+        FramePlanes {
+            y: vec![128; w * h],
+            cb: vec![128; (w / 2) * (h / 2)],
+            cr: vec![128; (w / 2) * (h / 2)],
+            luma_width: w,
+            luma_height: h,
+            chroma_width: w / 2,
+            chroma_height: h / 2,
+        }
+    }
+
+    #[cfg(feature = "av1-encoder")]
+    fn v2_position(abs_c: u16, x: u16, y: u16, frame_idx: u16) -> Av1FramePosition {
+        Av1FramePosition {
+            plane_px_x: x,
+            plane_px_y: y,
+            tx_width_log2: 3,
+            tx_height_log2: 3,
+            scan_pos: 1,
+            coeff_magnitude: abs_c,
+            frame_idx,
+            gop_len: 30,
+            is_key_frame: frame_idx == 0,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "av1-encoder")]
+    fn v2_cost(pos: Av1FramePosition) -> f32 {
+        compute_av1_uniward_costs_with_state(
+            &flat_planes(128, 128), &[pos], 100, Some(PhasmFrameLoopFilterState::default()),
+        )[0]
+    }
+
+    /// v2 fixes the inversion: a larger |c| always costs more.
+    #[cfg(feature = "av1-encoder")]
+    #[test]
+    fn primary_cost_is_monotone_in_abs_c() {
+        let c: Vec<f32> = (1..=5).map(|m| v2_cost(v2_position(m, 32, 32, 0))).collect();
+        assert!(c.windows(2).all(|w| w[0] < w[1]), "{c:?}");
+    }
+
+    #[cfg(feature = "av1-encoder")]
+    #[test]
+    fn key_frame_top_left_costs_more_than_bottom_right() {
+        let tl = v2_cost(v2_position(1, 0, 0, 0));
+        let br = v2_cost(v2_position(1, 120, 120, 0));
+        assert!(tl > br, "top-left {tl} vs bottom-right {br}");
+    }
+
+    #[cfg(feature = "av1-encoder")]
+    #[test]
+    fn last_frame_costs_less_than_first() {
+        let first = v2_cost(v2_position(1, 64, 64, 1));
+        let last = v2_cost(v2_position(1, 64, 64, 29));
+        assert!(first > last, "first {first} vs last {last}");
+    }
+
+    /// Golomb tails are wet in the primary because of their tag, not by the
+    /// accident of their |c| landing in the reject band — and on every tx
+    /// type, IDTX included.
+    #[cfg(feature = "av1-encoder")]
+    #[test]
+    fn golomb_tail_is_wet_for_every_tx_type() {
+        let planes = synth_planes(16, 16);
+        for tx_type in 0..=15u8 {
+            let positions = vec![Av1FramePosition {
+                tx_width_log2: 2,
+                tx_height_log2: 2,
+                tx_type,
+                scan_pos: 5,
+                coeff_magnitude: 16,
+                is_golomb_tail: true,
+                ..Default::default()
+            }];
+            let costs = compute_av1_uniward_costs_with_state(
+                &planes, &positions, 30, Some(PhasmFrameLoopFilterState::default()),
+            );
+            assert_eq!(costs, vec![f32::INFINITY], "tx_type {tx_type}");
+        }
+    }
+
+    /// rav1e's tx type 15 is H_FLIPADST, not IDTX: a reject-band |c| there
+    /// must stay wet.
+    #[cfg(feature = "av1-encoder")]
+    #[test]
+    fn h_flipadst_is_not_treated_as_idtx() {
+        let planes = synth_planes(16, 16);
+        let positions = vec![Av1FramePosition {
+            tx_width_log2: 2,
+            tx_height_log2: 2,
+            tx_type: 15,
+            scan_pos: 5,
+            coeff_magnitude: 7,
+            ..Default::default()
+        }];
+        let costs = compute_av1_uniward_costs_with_state(
+            &planes, &positions, 30, Some(PhasmFrameLoopFilterState::default()),
+        );
+        assert_eq!(costs, vec![f32::INFINITY]);
+    }
+
+    #[test]
+    fn idtx_constant_matches_rav1e() {
+        // vendor/phasm-rav1e/src/transform/mod.rs: TxType::IDTX = 9.
+        assert_eq!(AV1_TX_TYPE_IDTX, 9);
     }
 
     // ---- cost_accum_kernel: SIMD vs scalar parity ----

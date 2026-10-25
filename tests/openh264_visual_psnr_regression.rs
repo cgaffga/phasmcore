@@ -45,7 +45,7 @@ use common::oh264_stream;
 // copy is how two measurements of "the same thing" start disagreeing — the same
 // reason the metric kernels were centralised in `common::visual_metrics`.
 use common::video_fixture::{
-    ensure_yuv, ffmpeg_decode_annex_b, probe_aligned_dims, session_guard,
+    ensure_yuv, ffmpeg_decode_annex_b, probe_aligned_dims, probe_exact_dims, session_guard,
     VideoFixture as Fixture,
 };
 
@@ -97,11 +97,18 @@ const SSIM_FLOOR: f64 = 0.90;
 // ─────────────────────────── core harness ─────────────────────────────
 
 fn run_metrics(spec: &Fixture, msg: &str, pass: &str) {
+    run_metrics_at(spec, probe_aligned_dims(spec), msg, pass);
+}
+
+/// Same gate at an explicit size. Used with [`probe_exact_dims`] for the
+/// exact-size (SPS-cropped) cases: the decoder must return the exact size
+/// (the length check below) and the partly-visible edge MBs are inside the
+/// worst-MB scan.
+fn run_metrics_at(spec: &Fixture, (w, h): (u32, u32), msg: &str, pass: &str) {
     // Recover from poisoning so a single failing fixture doesn't
     // cascade-fail the rest of the corpus — failures are independent
     // measurements; we want to see all of them, not just the first.
     let _g = session_guard().lock().unwrap_or_else(|e| e.into_inner());
-    let (w, h) = probe_aligned_dims(spec);
     let yuv = ensure_yuv(spec, w, h);
 
     let t_enc = std::time::Instant::now();
@@ -218,6 +225,24 @@ fn visual_oh264_smoke_iphone7() {
     run_metrics(&spec, "phasm c2 smoke", "smoke-pass");
 }
 
+/// Exact-size smoke: the same fixture at its true 16:9 size, 640×360 — not
+/// the 16-floored 640×352. Coded 640×368 with `crop_bottom = 4`, so the last
+/// MB row is half padding; it must decode at exactly 640×360 and reconstruct
+/// as well as the aligned smoke.
+#[test]
+fn visual_oh264_smoke_iphone7_exact_size() {
+    let spec = Fixture {
+        name: "iphone7_smoke_exact",
+        source_mp4: "IMG_4138.MOV",
+        long_side_cap: Some(640),
+        n_frames: 8,
+        qp: 26,
+    };
+    let (w, h) = probe_exact_dims(&spec);
+    assert_eq!((w, h), (640, 360), "IMG_4138 is 16:9 1080p");
+    run_metrics_at(&spec, (w, h), "phasm exact-size smoke", "smoke-pass");
+}
+
 // ─────────────────────────── production ───────────────────────────────
 
 const PROD_LONG: u32 = 1920;
@@ -235,6 +260,35 @@ fn visual_oh264_iphone7_1080p() {
         },
         "C.2 visual gate — iPhone 7", "gate-pass",
     );
+}
+
+/// Production exact-size gate: genuine 1920×1080 (120×68 MBs,
+/// `crop_bottom = 4`), the size every 1080p phone video now encodes at.
+#[test]
+#[ignore]
+fn visual_oh264_iphone7_1080p_exact_size() {
+    let spec = Fixture {
+        name: "iphone7_1080p_exact",
+        source_mp4: "IMG_4138.MOV",
+        long_side_cap: Some(PROD_LONG), n_frames: PROD_N, qp: PROD_QP,
+    };
+    let (w, h) = probe_exact_dims(&spec);
+    assert_eq!((w, h), (1920, 1080));
+    run_metrics_at(&spec, (w, h), "C.2 visual gate — iPhone 7, exact 1080p", "gate-pass");
+}
+
+/// Portrait exact-size gate: 1080×1920 (68×120 MBs, `crop_right = 4`).
+#[test]
+#[ignore]
+fn visual_oh264_carplane_1080p_exact_size() {
+    let spec = Fixture {
+        name: "carplane_1080p_exact",
+        source_mp4: "Artlist_CarPlane.mp4",
+        long_side_cap: Some(PROD_LONG), n_frames: PROD_N, qp: PROD_QP,
+    };
+    let (w, h) = probe_exact_dims(&spec);
+    assert_eq!((w, h), (1080, 1920));
+    run_metrics_at(&spec, (w, h), "C.2 visual gate — CarPlane, exact portrait 1080p", "gate-pass");
 }
 
 #[test]

@@ -139,17 +139,23 @@ pub struct VideoProbe {
     /// True if the input has at least one audio stream we should
     /// preserve when muxing the stego Annex-B back to MP4.
     pub has_audio: bool,
+    /// When the first video frame is presented, in µs from the start of
+    /// the source's timeline (the time zero the passed-through audio is
+    /// placed against). Non-zero for a video track with a leading empty
+    /// edit, e.g. 166 016 µs on the Artlist stock clips, whose audio starts
+    /// at 120 ms. 0 when unknown or negative.
+    pub video_start_us: u64,
 }
 
 /// Run `ffprobe` to read width/height/frame-count/rate from `input`.
 ///
 /// Reports the RAW source dimensions (any size — no alignment enforced here).
-/// The encoder needs macroblock/transform alignment (H.264 = 16, AV1 = 8);
-/// callers pass the probe to [`decode_to_yuv_aligned`], which CROPS the
-/// decoded frames (top-left anchored) down to the nearest valid grid so any
-/// input size encodes without a manual pre-crop. Cropping (not scaling)
-/// matches the mobile floor-crop in `MediaPlaneExtractor`, and avoids the
-/// resample artifacts that would weaken stego stealth.
+/// Callers pass the probe to [`decode_to_yuv_aligned`] with the encoder's size
+/// granularity: H.264 encodes any EVEN size exactly ([`H264_SIZE_ALIGN`] = 2;
+/// the SPS crops the 16×16 MB grid back to the display size, like a phone
+/// encoder), AV1 needs 8. Only a source off that grid is CROPPED (top-left
+/// anchored, by at most `align − 1` px per axis). Cropping (not scaling)
+/// avoids the resample artifacts that would weaken stego stealth.
 #[cfg(feature = "video")]
 pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     use std::process::Command;
@@ -164,7 +170,7 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
             // `stream_tags=rotate` is the older one, kept for files that
             // predate it.
             "-show_entries",
-            "stream=width,height,nb_frames,r_frame_rate:stream_side_data=rotation:stream_tags=rotate",
+            "stream=width,height,nb_frames,r_frame_rate,start_time:stream_side_data=rotation:stream_tags=rotate",
             "-of", "default=noprint_wrappers=1:nokey=0",
         ])
         .arg(input)
@@ -185,6 +191,7 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     let mut n_frames: Option<usize> = None;
     let mut frame_rate: Option<String> = None;
     let mut rotation: Option<i32> = None;
+    let mut start_time: Option<f64> = None;
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("width=") {
             width = rest.trim().parse().ok();
@@ -194,6 +201,9 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
             n_frames = rest.trim().parse().ok();
         } else if let Some(rest) = line.strip_prefix("r_frame_rate=") {
             frame_rate = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("start_time=") {
+            // "N/A" when the stream has no start time.
+            start_time = rest.trim().parse().ok();
         } else if let Some(rest) = line.strip_prefix("rotation=") {
             rotation = rest.trim().parse::<f64>().ok().map(|r| r as i32);
         } else if let Some(rest) = line.strip_prefix("TAG:rotate=") {
@@ -246,10 +256,14 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
     };
 
     // Any size is accepted here — `decode_to_yuv_aligned` CROPS the decode
-    // (top-left) to the encoder's grid (H.264 = 16, AV1 = 8) so the caller
-    // never has to pre-crop.
+    // (top-left) to the encoder's grid (H.264 = 2, i.e. even; AV1 = 8) so the
+    // caller never has to pre-crop.
     let has_audio = probe_has_audio(input);
-    Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio })
+    let video_start_us = start_time
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map(|t| (t * 1_000_000.0).round() as u64)
+        .unwrap_or(0);
+    Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio, video_start_us })
 }
 
 #[cfg(feature = "video")]
@@ -295,9 +309,24 @@ fn probe_has_audio(input: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Largest multiple of `align` that is `<= d` (and `>= align`). The H.264
-/// encoder needs 16-aligned dimensions, AV1 8-aligned; [`decode_to_yuv_aligned`]
-/// CROPS the source to this grid so any input size encodes.
+/// Size granularity of the H.264 encoder: any even size is encoded exactly.
+/// The bitstream codes the 16×16 MB grid and the SPS `frame_cropping` brings
+/// it back to the display size (1920×1080 stays 1920×1080, coded as 1088
+/// lines with `crop_bottom = 4`, as on an iPhone). Odd sizes cannot be
+/// expressed in 4:2:0 crop units, so they lose their last row/column.
+#[cfg(feature = "video")]
+pub const H264_SIZE_ALIGN: u32 = 2;
+
+/// Size granularity for AV1: any even size. rav1e pads to its 8-px grid
+/// internally and signals the exact frame size, so nothing is cropped
+/// beyond an odd source's last row/column (as the apps do).
+#[cfg(feature = "video")]
+pub const AV1_SIZE_ALIGN: u32 = 2;
+
+/// Largest multiple of `align` that is `<= d` (and `>= align`). Both
+/// encoders take any even size ([`H264_SIZE_ALIGN`], [`AV1_SIZE_ALIGN`]);
+/// [`decode_to_yuv_aligned`] CROPS the source to this grid so any input size
+/// encodes.
 #[cfg(feature = "video")]
 pub fn aligned_dim(d: u32, align: u32) -> u32 {
     let a = align.max(1);
@@ -313,14 +342,14 @@ pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
     decode_to_yuv_cropped(input, output, None)
 }
 
-/// Decode + CROP to the encoder's macroblock/transform grid: drops the
-/// right/bottom edge strip (at most `align - 1` px per axis) down to the nearest
-/// `align`-multiple so ANY source size encodes without a manual pre-crop. This
-/// matches the iOS/Android decode path (which floor-crops the same way) — no
-/// resampling, no aspect change, no padding. Mutates `probe.width`/
-/// `probe.height` to the encoded dims — the caller MUST use these for the
-/// session + frame_size + mux. `align` is 16 for H.264, 8 for AV1. No-op (clean
-/// passthrough decode) when the source is already aligned.
+/// Decode + CROP to the encoder's size grid: drops the right/bottom edge strip
+/// (at most `align - 1` px per axis) down to the nearest `align`-multiple so
+/// ANY source size encodes without a manual pre-crop — no resampling, no
+/// aspect change, no padding. Mutates `probe.width`/`probe.height` to the
+/// encoded dims — the caller MUST use these for the session + frame_size +
+/// mux. `align` is [`H264_SIZE_ALIGN`] (2) for H.264, which keeps every even
+/// source at its exact size, and 8 for AV1. No-op (clean passthrough decode)
+/// when the source is already aligned.
 #[cfg(feature = "video")]
 pub fn decode_to_yuv_aligned(
     input: &Path,
@@ -343,14 +372,118 @@ pub fn decode_to_yuv_aligned(
     Ok(())
 }
 
-/// Inner ffmpeg decode with an optional top-left `-vf crop=W:H:0:0`.
+/// `--resolution` for `video-encode` / `video-capacity`: the output size
+/// preset the mobile apps offer (core `codec::video_frame::VideoPreset`).
 #[cfg(feature = "video")]
-fn decode_to_yuv_cropped(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
+pub enum Resolution {
+    /// The source's own size (default).
+    #[default]
+    Original,
+    /// Fits 848x480 (480p), turned to the source's orientation.
+    Sd,
+    /// Fits 1280x720 (720p).
+    Hd,
+    /// Fits 1920x1080 (1080p).
+    Fhd,
+}
+
+#[cfg(feature = "video")]
+impl Resolution {
+    fn preset(self) -> phasm_core::codec::video_frame::VideoPreset {
+        use phasm_core::codec::video_frame::VideoPreset;
+        match self {
+            Resolution::Original => VideoPreset::Original,
+            Resolution::Sd => VideoPreset::Sd,
+            Resolution::Hd => VideoPreset::Hd,
+            Resolution::Fhd => VideoPreset::Fhd,
+        }
+    }
+}
+
+/// Downscale the decoded YUV at `yuv` — tight I420 frames at
+/// `probe.width`×`probe.height`, already upright (ffmpeg autorotates) and
+/// even ([`decode_to_yuv_aligned`]) — to `resolution`, in place, and set
+/// `probe` to the new size. Call it right after the decode, before anything
+/// reads the frames, so the encode, its capacity probe and the mux all see
+/// the scaled size.
+///
+/// Sizes come from the core resolver (`video_target_resolve`, orientation 0
+/// since the frames are upright) and pixels from the core's deterministic
+/// area-average `I420Scaler` — the scaler the Android app runs, so the same
+/// clip at the same preset gives the same cover. Frame by frame, so RAM stays
+/// O(frame). No-op for `Original` or a source that already fits the preset.
+#[cfg(feature = "video")]
+pub fn scale_yuv_to_preset(yuv: &Path, probe: &mut VideoProbe, resolution: Resolution) -> Result<(), CliError> {
+    use phasm_core::codec::video_frame::{video_target_resolve, I420Scaler};
+    use std::io::{BufReader, BufWriter, Read, Write};
+
+    let target = video_target_resolve(probe.width, probe.height, 0, resolution.preset())
+        .ok_or_else(|| CliError::InvalidArgs(format!("cannot size a {}x{} video", probe.width, probe.height)))?;
+    let Some((dw, dh)) = target.scale_to.filter(|&s| s != (probe.width, probe.height)) else {
+        if resolution != Resolution::Original {
+            eprintln!(
+                "note: {}x{} already fits the {resolution:?} preset; keeping its size",
+                probe.width, probe.height,
+            );
+        }
+        return Ok(());
+    };
+    let frame_len = (probe.width as usize) * (probe.height as usize) * 3 / 2;
+    let file_len = std::fs::metadata(yuv)?.len() as usize;
+    if frame_len == 0 || !file_len.is_multiple_of(frame_len) {
+        return Err(CliError::InvalidArgs(format!(
+            "decoded YUV {file_len} bytes is not a whole number of {}x{} frames",
+            probe.width, probe.height,
+        )));
+    }
+    eprintln!("note: scaling {}x{} -> {dw}x{dh} ({resolution:?} preset)", probe.width, probe.height);
+
+    let mut scaled_path = yuv.as_os_str().to_owned();
+    scaled_path.push(".scaled");
+    let scaled_path = PathBuf::from(scaled_path);
+    let result = (|| -> Result<(), CliError> {
+        let mut reader = BufReader::new(std::fs::File::open(yuv)?);
+        let mut writer = BufWriter::new(std::fs::File::create(&scaled_path)?);
+        let mut scaler = I420Scaler::new(probe.width, probe.height, dw, dh);
+        let mut frame = vec![0u8; frame_len];
+        let mut out = Vec::new();
+        for _ in 0..file_len / frame_len {
+            reader.read_exact(&mut frame)?;
+            out.clear();
+            scaler.scale_into(&frame, &mut out);
+            writer.write_all(&out)?;
+        }
+        writer.flush()?;
+        drop(writer);
+        std::fs::rename(&scaled_path, yuv)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&scaled_path);
+    }
+    result?;
+    probe.width = dw;
+    probe.height = dh;
+    Ok(())
+}
+
+/// Option spellings that make the decode emit every decoded frame exactly
+/// once, in order: the current one first, then the older spelling that
+/// releases before 5.1 understand (and later ones still accept).
+#[cfg(feature = "video")]
+const PASSTHROUGH_FRAME_OPTS: [[&str; 2]; 2] =
+    [["-fps_mode", "passthrough"], ["-vsync", "passthrough"]];
+
+/// Build the raw-YUV decode command: one output frame per decoded source
+/// frame, optional top-left crop.
+#[cfg(feature = "video")]
+fn decode_to_yuv_command(
     input: &Path,
     output: &Path,
     crop: Option<(u32, u32)>,
-) -> Result<(), CliError> {
-    use std::process::Command;
+    frame_opt: [&str; 2],
+) -> Command {
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y").arg("-i").arg(input);
     if let Some((w, h)) = crop {
@@ -359,12 +492,50 @@ fn decode_to_yuv_cropped(
         // floor-crop exactly — no resampling, no aspect distortion, no padding.
         cmd.args(["-vf", &format!("crop={w}:{h}:0:0")]);
     }
+    // One output frame per decoded frame — no frame-rate conversion.
+    //
+    // Raw video carries no timestamps, so without this the decode falls back
+    // to constant-frame-rate output: it lays the frames on a fixed 1/fps grid
+    // that starts at the FILE's start time and duplicates or drops frames to
+    // fill it. When another track starts earlier than the video (an audio
+    // track at 0.120 s, video at 0.166 s: the Artlist stock clips, and any
+    // file with a leading empty edit on its video track), the gap in front of
+    // the first video frame is filled by repeating that frame. A 121-frame
+    // 24 fps clip came out as 122 frames, the first one doubled, and every
+    // later frame shifted a slot. The stego encode, the capacity probe and
+    // the muxed output all inherited the extra frame. A variable-rate source
+    // could equally lose or repeat frames mid-clip.
+    //
+    // The apps never had this: AVAssetReader and MediaCodec hand over each
+    // coded sample once.
+    cmd.args(frame_opt);
     cmd.args(["-f", "rawvideo", "-pix_fmt", "yuv420p"]).arg(output);
-    let result = cmd.output().map_err(|e| {
-        CliError::InvalidArgs(format!(
-            "failed to spawn ffmpeg (decode_to_yuv): {e}\n\nInstall ffmpeg or pre-extract YUV manually:\n  {TRANSCODE_SUGGESTION}"
-        ))
-    })?;
+    cmd
+}
+
+/// Inner raw-YUV decode with an optional top-left `-vf crop=W:H:0:0`.
+#[cfg(feature = "video")]
+fn decode_to_yuv_cropped(
+    input: &Path,
+    output: &Path,
+    crop: Option<(u32, u32)>,
+) -> Result<(), CliError> {
+    let spawn = |frame_opt: [&str; 2]| {
+        decode_to_yuv_command(input, output, crop, frame_opt).output().map_err(|e| {
+            CliError::InvalidArgs(format!(
+                "failed to spawn ffmpeg (decode_to_yuv): {e}\n\nInstall ffmpeg or pre-extract YUV manually:\n  {TRANSCODE_SUGGESTION}"
+            ))
+        })
+    };
+    let [current, legacy] = PASSTHROUGH_FRAME_OPTS;
+    let mut result = spawn(current)?;
+    if !result.status.success()
+        && String::from_utf8_lossy(&result.stderr).contains(&format!("option '{}'", &current[0][1..]))
+    {
+        // A release that predates the current option name rejects it as
+        // unrecognised; it takes the older spelling with the same meaning.
+        result = spawn(legacy)?;
+    }
     if !result.status.success() {
         let stderr = String::from_utf8_lossy(&result.stderr);
         let tail: String = stderr.lines().rev().take(15)
@@ -436,6 +607,7 @@ pub fn mux_annexb_to_mp4_with_profile(
     n_display_frames: usize,
     gop_pattern: phasm_core::GopPattern,
     profile: MuxProfile,
+    video_lead_in_us: u64,
     output: &Path,
 ) -> Result<bool, CliError> {
     let dropped_audio = match profile {
@@ -449,11 +621,14 @@ pub fn mux_annexb_to_mp4_with_profile(
                         "failed to read source MP4 for audio passthrough: {e}"
                     ))
                 })?;
-                phasm_core::codec::mp4::build::build_mp4_with_pattern_audio(
+                // The audio keeps the source's placement, so the video must
+                // too: frame 0 is held for the source's video lead-in.
+                phasm_core::codec::mp4::build::build_mp4_with_pattern_audio_lead_in(
                     phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
                     &annex_b,
                     width, height, timing, gop_pattern, n_display_frames,
                     &source_mp4,
+                    video_lead_in_us,
                 )
                 .map_err(|e| CliError::InvalidArgs(format!(
                     "HandBrake mux with audio failed: {e}"
@@ -555,6 +730,62 @@ pub fn temp_path_with_ext(original: &Path, ext: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("{stem}_phasm_cabac_{pid}_{ts}.{ext}"))
+}
+
+#[cfg(all(test, feature = "video"))]
+mod frame_count_tests {
+    use super::*;
+
+    /// Regression (2026-10-25): the raw-YUV decode must yield exactly the
+    /// source's frames. It used to resample to a constant rate anchored at
+    /// the file's start, so a video track starting after the audio got its
+    /// first frame repeated to fill the gap (Artlist_HorseFlag: 121 frames
+    /// decoded as 122). The fixture is built here: 24 frames at 24 fps whose
+    /// video track starts ~0.083 s after its audio track, which the old
+    /// decode turned into 26 frames.
+    #[test]
+    fn decode_yields_every_source_frame_once_when_video_starts_late() {
+        let dir = std::path::PathBuf::from(
+            std::env::var("PHASM_TMP").unwrap_or_else(|_| "/tmp".into()),
+        )
+        .join(format!("phasm_framecount_unit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("late_video.mp4");
+        let yuv = dir.join("late_video.yuv");
+
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error",
+                   "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=1.3",
+                   "-itsoffset", "0.1",
+                   "-f", "lavfi", "-i", "testsrc=size=64x48:rate=24:duration=1",
+                   "-map", "1:v", "-map", "0:a",
+                   "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"])
+            .arg(&src)
+            .status();
+        match ok {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!("skipping: fixture could not be built (decoder tool or libx264 unavailable)");
+                let _ = std::fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+
+        let mut probe = probe_video(&src).unwrap_or_else(|e| panic!("probe fixture: {e}"));
+        assert_eq!(probe.n_frames, 24, "fixture has 24 coded frames");
+        decode_to_yuv_aligned(&src, &yuv, &mut probe, H264_SIZE_ALIGN)
+            .unwrap_or_else(|e| panic!("decode: {e}"));
+        let len = std::fs::metadata(&yuv).unwrap().len() as usize;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let frame = (probe.width * probe.height * 3 / 2) as usize;
+        assert_eq!(len % frame, 0, "whole frames");
+        assert_eq!(
+            len / frame, 24,
+            "decode must emit each of the 24 source frames exactly once \
+             (26 = the late video track's lead-in was filled with copies of frame 0)",
+        );
+    }
 }
 
 #[cfg(all(test, feature = "video"))]

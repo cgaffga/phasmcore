@@ -606,7 +606,7 @@ mod tests {
             Av1CascadeGopShared {
                 total_message_bytes: chunk.len() as u32,
                 shadow_states: &[],
-                hhat_seed: &[9u8; 32],
+                master: &[9u8; 64],
             },
         )
         .expect("cascade")

@@ -105,6 +105,25 @@ pub fn probe_aligned_dims(spec: &VideoFixture) -> (u32, u32) {
     (aw.max(16), ah.max(16))
 }
 
+/// Probe source W×H and return the aspect-preserving EXACT size the encoder
+/// produces since SPS frame cropping: capped at `long_side_cap` like
+/// [`probe_aligned_dims`], but rounded down only to EVEN (4:2:0), not to 16.
+/// A 1920×1080 source stays 1920×1080; `long_side_cap = 640` on a 16:9 source
+/// gives 640×360 (coded 640×368, `crop_bottom = 4`).
+pub fn probe_exact_dims(spec: &VideoFixture) -> (u32, u32) {
+    let (src_w, src_h) = probe_source_dims(spec.source_mp4);
+    let (mut tw, mut th) = (src_w, src_h);
+    if let Some(cap) = spec.long_side_cap {
+        let long = src_w.max(src_h) as f64;
+        if (long as u32) > cap {
+            let scale = cap as f64 / long;
+            tw = (src_w as f64 * scale).round() as u32;
+            th = (src_h as f64 * scale).round() as u32;
+        }
+    }
+    ((tw & !1).max(16), (th & !1).max(16))
+}
+
 /// The clean-OH264-baseline dim rule: fit the longest side to 1920, the other
 /// axis scaled and rounded down to a multiple of 16.
 ///
