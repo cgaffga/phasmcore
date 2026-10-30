@@ -36,3 +36,8 @@ precise-builds = true
 # See docs/design/video/h264/video-steganography.md § "Patent licensing —
 # distribution plan".
 # ═════════════════════════════════════════════════════════════════════════════
+
+# macos-14 runners are gone on GitHub (the v0.5.0 aarch64-apple-darwin job got
+# no runner and was cancelled after 1 s); use the current Apple-silicon image.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
