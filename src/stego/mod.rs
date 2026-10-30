@@ -114,7 +114,7 @@ pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
 pub use capacity::{ghost_bands, ghost_bands_si, GhostBands};
 pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
-pub use payload::{PayloadData, FileEntry, compressed_payload_size};
+pub use payload::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
 
 #[cfg(test)]
 mod dimension_tests {

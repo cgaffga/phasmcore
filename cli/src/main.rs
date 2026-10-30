@@ -33,7 +33,8 @@ struct Cli {
 enum Commands {
     /// Encode a secret message into a cover image
     Encode(encode::EncodeArgs),
-    /// Decode a secret message from a stego image or video
+    #[cfg_attr(feature = "video", doc = "Decode a secret message from a stego image or video")]
+    #[cfg_attr(not(feature = "video"), doc = "Decode a secret message from a stego image")]
     Decode(decode::DecodeArgs),
     /// Show how much message data fits in an image
     Capacity(capacity::CapacityArgs),

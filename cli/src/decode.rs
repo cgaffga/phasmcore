@@ -31,7 +31,8 @@ use clap::Parser;
 
 #[derive(Parser)]
 pub struct DecodeArgs {
-    /// Stego image or video file
+    #[cfg_attr(feature = "video", doc = "Stego image or video file")]
+    #[cfg_attr(not(feature = "video"), doc = "Stego image file")]
     pub image: PathBuf,
 
     /// Passphrase (interactive prompt if omitted)
@@ -151,8 +152,7 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
         if !payload.files.is_empty() {
             std::fs::create_dir_all(dir)?;
             for f in &payload.files {
-                let out_path = dir.join(&f.filename);
-                std::fs::write(&out_path, &f.content)?;
+                write_attachment(dir, &f.filename, &f.content)?;
             }
         }
         Some(dir.to_string_lossy().to_string())
@@ -269,4 +269,38 @@ fn decode_av1_streaming(
         )))
     })?;
     Ok(payload)
+}
+
+/// Write one decoded attachment into `dir` without ever leaving it or
+/// replacing a file that is already there. Core hands out sanitized names
+/// (`phasm_core::safe_filename`); sanitizing again here keeps the CLI safe
+/// on its own, and a name that is taken gets a ` (1)`, ` (2)`, ... suffix.
+fn write_attachment(
+    dir: &std::path::Path,
+    name: &str,
+    content: &[u8],
+) -> Result<(), CliError> {
+    use std::io::Write;
+    let refuse = |msg: String| CliError::Io(std::io::Error::other(msg));
+    let name = phasm_core::safe_filename(name);
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name.as_str(), ""),
+    };
+    for n in 0..1000 {
+        let candidate = if n == 0 { name.clone() } else { format!("{stem} ({n}){ext}") };
+        let path = dir.join(&candidate);
+        if path.parent() != Some(dir) {
+            return Err(refuse(format!("refusing to write attachment {name:?} outside {}", dir.display())));
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(content).map_err(CliError::Io)?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CliError::Io(e)),
+        }
+    }
+    Err(refuse(format!("no free file name for attachment {name:?} in {}", dir.display())))
 }

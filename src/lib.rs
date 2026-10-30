@@ -47,7 +47,7 @@ pub use stego::EncodeQuality;
 pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET};
 pub use stego::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION, ARMOR_TARGET_DIMENSION};
-pub use stego::{PayloadData, FileEntry, compressed_payload_size};
+pub use stego::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
 pub use stego::progress;
 pub use stego::memory;
 pub use stego::{

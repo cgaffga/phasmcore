@@ -113,6 +113,40 @@ pub fn compressed_payload_size(text: &str, files: &[FileEntry]) -> usize {
     encode_payload(text, files).map_or_else(|_| text.len() + 1, |v| v.len())
 }
 
+/// Make an attachment name safe to use as a file name.
+///
+/// The name inside a payload is chosen by whoever made the image, and every
+/// frontend writes decoded attachments to disk under it, so it must never be
+/// able to leave the target directory or replace a hidden or device file:
+/// only the last path component survives (`/` and `\\` both count),
+/// control characters and `:` become `_`, a leading dot becomes `_` (no
+/// dotfiles such as `.bashrc` / `.profile`), trailing dots and spaces are
+/// dropped, Windows device names (`CON`, `NUL`, `COM1`, ...) get a `_`
+/// prefix, and an empty, `.` or `..` name becomes `attachment`.
+pub fn safe_filename(name: &str) -> String {
+    let last = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let mut out: String = last
+        .chars()
+        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
+        .collect();
+    out = out.trim_end_matches(['.', ' ']).trim_start().to_string();
+    if out.is_empty() {
+        return "attachment".to_string();
+    }
+    if out.starts_with('.') {
+        out.replace_range(..1, "_");
+    }
+    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        out.insert(0, '_');
+    }
+    out
+}
+
 /// Decode a payload from decrypted bytes.
 ///
 /// Input is `[flags byte][maybe_compressed_inner]` as produced by `encode_payload`.
@@ -185,9 +219,10 @@ fn parse_inner(data: &[u8]) -> Result<PayloadData, StegoError> {
                 }
 
                 // filename (UTF-8)
-                let filename = std::str::from_utf8(&data[cursor..cursor + name_len])
-                    .map_err(|_| StegoError::InvalidUtf8)?
-                    .to_string();
+                let filename = safe_filename(
+                    std::str::from_utf8(&data[cursor..cursor + name_len])
+                        .map_err(|_| StegoError::InvalidUtf8)?,
+                );
                 cursor += name_len;
 
                 // content_len (u32 BE)
@@ -454,6 +489,42 @@ mod tests {
         // Either way, roundtrip must work.
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.files[0].content, data);
+    }
+
+    #[test]
+    fn safe_filename_keeps_names_inside_the_directory() {
+        for (raw, safe) in [
+            ("report.pdf", "report.pdf"),
+            ("daten-übersicht.pdf", "daten-übersicht.pdf"),
+            ("../../.bashrc", "_bashrc"),
+            ("/Users/x/.ssh/authorized_keys", "authorized_keys"),
+            ("..\\..\\Windows\\win.ini", "win.ini"),
+            ("C:evil.exe", "C_evil.exe"),
+            ("a/b.txt", "b.txt"),
+            ("..", "attachment"),
+            (".", "attachment"),
+            ("dir/", "attachment"),
+            ("", "attachment"),
+            (".profile", "_profile"),
+            ("name\n\r\0.txt", "name___.txt"),
+            ("trailing. . ", "trailing"),
+            ("nul.txt", "_nul.txt"),
+            ("COM1", "_COM1"),
+            ("compute.txt", "compute.txt"),
+        ] {
+            assert_eq!(safe_filename(raw), safe, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn decoded_attachment_names_are_sanitized() {
+        let payload = encode_payload(
+            "hi",
+            &[FileEntry { filename: "../../.bashrc".to_string(), content: b"x".to_vec() }],
+        )
+        .unwrap();
+        let decoded = decode_payload(&payload).unwrap();
+        assert_eq!(decoded.files[0].filename, "_bashrc");
     }
 
     #[test]

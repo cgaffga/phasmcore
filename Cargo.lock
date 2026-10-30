@@ -772,9 +772,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "maybe-rayon"
@@ -979,7 +979,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "phasm-cli"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "image",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "phasm-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm-siv",
  "argon2",
