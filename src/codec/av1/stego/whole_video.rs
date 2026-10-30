@@ -2675,6 +2675,7 @@ mod tests {
     /// The sequence header carries the encode's colour: an HLG BT.2020
     /// source's tags pass through.
     #[test]
+    #[cfg(feature = "video")] // reads the stream with the MP4 module's splitter
     fn sequence_header_carries_the_source_colour() {
         use crate::codec::mp4::av1_obu_split::{parse_sequence_header_obu, split_av1_into_samples};
         let (yuv, mut params) = noise_gop_sized(64, 64, 2);
@@ -2691,6 +2692,7 @@ mod tests {
     /// librav1e wrapper the MP4 names always hands rav1e a colour
     /// description.
     #[test]
+    #[cfg(feature = "video")] // reads the stream with the MP4 module's splitter
     fn sequence_header_signals_bt709() {
         use crate::codec::mp4::av1_obu_split::{parse_sequence_header_obu, split_av1_into_samples};
         let (yuv, params) = noise_gop_sized(64, 64, 2);
