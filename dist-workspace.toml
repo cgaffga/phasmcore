@@ -16,6 +16,10 @@ hosting = "github"
 # Allow CI file to be in a different location (we keep it in core/.github/
 # so it survives the git subtree split to the phasmcore open-source repo)
 allow-dirty = ["ci"]
+# Build only the released package (phasm-cli, default features). Without this
+# dist runs `cargo build --workspace`, which also builds the codec -sys
+# members (OpenH264/dav1d need meson/nasm on the runner) and failed v0.5.0.
+precise-builds = true
 
 # ═════════════════════════════════════════════════════════════════════════════
 # DO NOT set `features = ["h264-encoder"]` here, and do NOT add the encoder to
