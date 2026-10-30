@@ -51,20 +51,20 @@ use super::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_
 use super::cabac::bin_decoder::slice::{
     walk_annex_b_for_cover_with_options, WalkOptions,
 };
-use super::stego::{combine_cover_4domain, CostWeights};
-use super::stego::orchestrate::DomainCosts;
+use super::stego::CostWeights;
+use super::stego::cost_weights::gop_stc_cover_bits;
 use super::stego::chunk_frame::{
     parse_chunk_frame_v3_1, parse_first_chunk_frame_v3_1,
     CHUNK_FRAME_FIRST_HEADER_LEN_V3_1, CHUNK_FRAME_NEXT_HEADER_LEN_V3_1,
 };
 use super::stego::hook::EmbedDomain;
-use super::stego::keys::CabacStegoMasterKeys;
+use super::stego::keys::H264StcKeys;
+use crate::stego::cover_order::GopSeeds;
 // #852 — whole-video SHADOW decode fallback. Decode-side / shared (not
 // behind `h264-encoder`), so the App Clip + decode-only WASM get it too.
-use super::stego::cascade_safety::{analyze_safe_mvd_subset, derive_msl_safe_from_msb};
+
 use super::stego::shadow::{decode_shadow_from_priority_lsbs, for_each_eligible_position};
 use crate::stego::stc::extract::{stc_extract, stc_extract_prefix};
-use crate::stego::stc::hhat::generate_hhat;
 use crate::stego::{crypto, frame, payload, progress};
 
 /// STC constraint length — mirrors `openh264_stego::STC_H`. Both
@@ -272,12 +272,11 @@ struct Oh264SessionState {
     gop_buffer: Vec<u8>,
     /// Frames currently buffered in `gop_buffer`.
     frames_buffered: u32,
-    /// STC h-hat seed for CoeffSign domain. Derived as
-    /// `per_gop_seeds(CoeffSignBypass, 0)` — the exact same derivation
-    /// the decode session ([`StreamingDecodeSession::finish`]) and the
-    /// OH264 stego primitive use, so encode and decode agree on the STC
-    /// h-hat without carrying the seed on the wire.
-    hhat_seed: [u8; 32],
+    /// v2 primary STC keys: GOP `g`'s cover order + H-hat seeds are
+    /// `keys.gop(g)` — the same derivation the decode session
+    /// ([`StreamingDecodeSession::finish`]) runs per slab, so encode and
+    /// decode agree without carrying anything on the wire.
+    keys: H264StcKeys,
     /// #798 — cascade tier the encoder resolved for the FIRST GOP
     /// (auto-tier is payload-driven; representative of the encode).
     /// `None` until the first GOP drains. Surfaced via
@@ -650,10 +649,7 @@ fn build_oh264_state(
     }
     let total_chunks = expected_n_gops as u16;
 
-    let keys = CabacStegoMasterKeys::derive(passphrase)?;
-    let hhat_seed = keys
-        .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
-        .hhat_seed;
+    let keys = H264StcKeys::derive(passphrase)?;
 
     let frame_bytes_size = (params.width as usize) * (params.height as usize) * 3 / 2;
     let gop_buffer = Vec::with_capacity(frame_bytes_size * params.gop_size as usize);
@@ -665,7 +661,7 @@ fn build_oh264_state(
         chunk_idx: 0,
         gop_buffer,
         frames_buffered: 0,
-        hhat_seed,
+        keys,
         resolved_tier: None,
         gop_alloc_plan: None,
         stego_window: None,
@@ -756,7 +752,7 @@ fn oh264_finish(
         return Err(StegoError::MessageTooLarge);
     }
     // #474.2 — Mux + Done. OH264 path doesn't currently run a separate
-    // HandBrake mux step (mp4 muxing is the bridge's responsibility),
+    // MP4 mux step (mp4 muxing is the bridge's responsibility),
     // but we still emit Mux for parity with the design doc so the
     // mobile-side smoothing engine sees a Mux→Done transition even
     // when the underlying mux is a no-op at this layer.
@@ -788,7 +784,7 @@ pub(crate) fn embed_gop_roundtrip_safe(
     payload: &[u8],
     chunk_idx: u16,
     total_bytes: u32,
-    hhat_seed: &[u8; 32],
+    seeds: &[GopSeeds],
     weights: &CostWeights,
 ) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
     // B-full.6b.1/.2 (#894): the payload-INDEPENDENT clean cover (Pass-1 + walk +
@@ -799,7 +795,7 @@ pub(crate) fn embed_gop_roundtrip_safe(
     let products = produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?;
     consume_gop_roundtrip_safe(
         &products, gop_yuv, width, height, frames_in_gop, opts, payload, chunk_idx,
-        total_bytes, hhat_seed, weights,
+        total_bytes, seeds, weights,
     )
 }
 
@@ -821,11 +817,16 @@ pub(crate) fn consume_gop_roundtrip_safe(
     payload: &[u8],
     chunk_idx: u16,
     total_bytes: u32,
-    hhat_seed: &[u8; 32],
+    seeds: &[GopSeeds],
     weights: &CostWeights,
 ) -> Result<(Vec<u8>, CascadeTier, usize), StegoError> {
+    // `seeds` = the GOP's seed variants in decoder order
+    // (`H264StcKeys::gop_variants`): one entry unless the Path B experiment
+    // knob `PHASM_H264_SEED_VARIANTS` is set. Each size is tried with every
+    // variant before the loop shrinks; the verify runs the decoder's own
+    // variant search, so the decoder finds exactly the variant embedded.
     let mut want = payload.len();
-    loop {
+    'shrink: loop {
         // Each retry re-encodes the GOP; a cancel must stop the shrinking.
         progress::check_cancelled()?;
         let chunk = &payload[..want];
@@ -837,36 +838,40 @@ pub(crate) fn consume_gop_roundtrip_safe(
             build_chunk_frame_v3_1(chunk)?
         };
         let frame_bits = bytes_to_bits_msb_first_pub(&framed);
-        match consume_gop_emit(
-            products, gop_yuv, width, height, frames_in_gop, opts, &frame_bits, hhat_seed,
-            weights, CascadeTier::Auto, DEFAULT_HEADROOM,
-        ) {
-            // Empty chunk round-trips trivially; non-empty must decode back to
-            // exactly the bytes embedded.
-            Ok((b, t))
-                if want == 0
-                    || verify_chunk_v3(&b, hhat_seed, chunk_idx, total_bytes, chunk, weights) =>
-            {
-                break Ok((b, t, want));
-            }
-            Ok(_) | Err(StegoError::MessageTooLarge) => {
-                // A GOP that cannot carry even an EMPTY chunk frame leaves the
-                // loop nothing to shrink. The `debug_assert` that used to
-                // stand here ("empty chunk must always succeed") is compiled
-                // OUT in release, so `want -= 1usize.max(0)` underflowed to
-                // usize::MAX and the next iteration panicked on
-                // `&payload[..usize::MAX]` — a release-mode crash, i.e. the app
-                // dying rather than reporting a full cover. Reproduced
-                // 2026-10-20 with reduced-domain cost weights; also reachable
-                // on a pathological low-capacity GOP under the production
-                // weights. Report it instead.
-                if want == 0 {
-                    break Err(StegoError::MessageTooLarge);
+        for (a, variant) in seeds.iter().enumerate() {
+            super::stego::v2_knobs::note_enc_try(a as u8);
+            match consume_gop_emit(
+                products, gop_yuv, width, height, frames_in_gop, opts, &frame_bits, variant,
+                weights, CascadeTier::Auto, DEFAULT_HEADROOM,
+            ) {
+                // Empty chunk round-trips trivially; non-empty must decode back
+                // to exactly the bytes embedded.
+                Ok((b, t))
+                    if want == 0
+                        || verify_chunk_v3_variants(&b, seeds, chunk_idx, total_bytes, chunk) =>
+                {
+                    super::stego::v2_knobs::note_enc_win(a as u8);
+                    break 'shrink Ok((b, t, want));
                 }
-                want -= 1usize.max(want / 8); // ~12% step, reaches 0
+                Ok(_) | Err(StegoError::MessageTooLarge) => {}
+                Err(other) => break 'shrink Err(other),
             }
-            Err(e) => break Err(e),
         }
+        // Every variant refused this size: shrink.
+        // A GOP that cannot carry even an EMPTY chunk frame leaves the
+        // loop nothing to shrink. The `debug_assert` that used to
+        // stand here ("empty chunk must always succeed") is compiled
+        // OUT in release, so `want -= 1usize.max(0)` underflowed to
+        // usize::MAX and the next iteration panicked on
+        // `&payload[..usize::MAX]` — a release-mode crash, i.e. the app
+        // dying rather than reporting a full cover. Reproduced
+        // 2026-10-20 with reduced-domain cost weights; also reachable
+        // on a pathological low-capacity GOP under the production
+        // weights. Report it instead.
+        if want == 0 {
+            break 'shrink Err(StegoError::MessageTooLarge);
+        }
+        want -= 1usize.max(want / 8); // ~12% step, reaches 0
     }
 }
 
@@ -886,12 +891,12 @@ pub(crate) fn consume_gop_roundtrip_safe(
 pub fn h264_diag_verified_gop_consumed(
     gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32,
     gop_size: u32, payload: &[u8], chunk_idx: u16, total_bytes: u32,
-    hhat_seed: &[u8; 32], weights: &CostWeights,
+    seeds: &GopSeeds, weights: &CostWeights,
 ) -> Result<usize, StegoError> {
     let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
     let (_bs, _tier, consumed) = embed_gop_roundtrip_safe(
         gop_yuv, width, height, frames_in_gop, opts, payload, chunk_idx,
-        total_bytes, hhat_seed, weights,
+        total_bytes, std::slice::from_ref(seeds), weights,
     )?;
     Ok(consumed)
 }
@@ -909,7 +914,7 @@ pub fn h264_diag_verified_gop_consumed(
 pub fn h264_diag_gop_emit_once(
     gop_yuv: &[u8], width: u32, height: u32, frames_in_gop: u32, qp: i32,
     gop_size: u32, payload: &[u8], chunk_idx: u16, total_bytes: u32,
-    hhat_seed: &[u8; 32], weights: &CostWeights,
+    seeds: &GopSeeds, weights: &CostWeights,
 ) -> Result<(Vec<u8>, bool), StegoError> {
     let opts = super::openh264_stego::EncodeOpts { qp, intra_period: gop_size as i32 };
     let products = produce_gop_cover(gop_yuv, width, height, frames_in_gop, opts)?;
@@ -921,10 +926,10 @@ pub fn h264_diag_gop_emit_once(
     let frame_bits = bytes_to_bits_msb_first_pub(&framed);
     match consume_gop_emit(
         &products, gop_yuv, width, height, frames_in_gop, opts, &frame_bits,
-        hhat_seed, weights, CascadeTier::Auto, DEFAULT_HEADROOM,
+        seeds, weights, CascadeTier::Auto, DEFAULT_HEADROOM,
     ) {
         Ok((b, _t)) => {
-            let ok = verify_chunk_v3(&b, hhat_seed, chunk_idx, total_bytes, payload, weights);
+            let ok = verify_chunk_v3(&b, seeds, chunk_idx, total_bytes, payload);
             Ok((b, ok))
         }
         Err(StegoError::MessageTooLarge) => Ok((Vec::new(), false)),
@@ -1066,7 +1071,7 @@ fn drain_one_gop(
             // ciphertext length; the decoder reads chunks until it has
             // accumulated this many bytes (W is implicit, not on the wire).
             state.msg_frame.len() as u32,
-            &state.hhat_seed,
+            &state.keys.gop_variants(state.chunk_idx as u32),
             &params.cost_weights,
         )?;
         state.cursor += consumed;
@@ -1228,7 +1233,50 @@ pub struct CapacityProbeResult {
     /// `primary_max_message_bytes_at_tier` remains the Σ-based upper bound, so
     /// the calibration binaries and the CLI JSON contract are unaffected.
     pub achievable_max_message_bytes: usize,
+    /// Wet-removal capacity policy (2026-10-25): Σ over GOPs of the
+    /// SYNTAX-DRY primary STC positions ([`super::stego::cost_weights::canonical_dry_mask`]).
+    /// `max_message_bytes` / `comfort_message_bytes` are change-rate α bands
+    /// over this count. 0 on a partial probe (early-exit). Since 2026-10-26
+    /// each GOP counts at its damage weight
+    /// (`quality_predict::quality_safe_cap`, 1 except for an intra-flooded
+    /// GOP), the same weight its planner cap carries: at a band's fill every
+    /// GOP then sits at the band's α times its weight.
+    pub dry_cover_bits: usize,
+    /// Adaptive red end (spec § 4a, 2026-10-26): the per-clip `α_max` in
+    /// 1/64ths, from the damage predictor
+    /// ([`super::stego::quality_predict::adaptive_max_alpha64`]): 8 (= the
+    /// fixed `CAP_ALPHA_MAX` 1/8) for clips the predictor rates hard, 12
+    /// (3/16) for the rest — two levels, see the module docs.
+    /// `max_message_bytes` reads it.
+    pub max_alpha_64: u32,
 }
+
+/// Capacity policy (maintainer decision, 2026-10-25 — "make the bar realistic
+/// and don't waste capacity"). With the syntax-wet positions removed the STC
+/// is "feasible" up to the whole dry cover, so the visual maximum is a
+/// deliberate change-rate α = primary payload BITS per syntax-dry STC
+/// position. The UI shows green below `comfort`, yellow from `comfort` to
+/// `max`, red (with a ⚠) at `max`.
+///
+/// Both are `(num, den)` fractions of α. Calibration + the PSNR/α curves and
+/// the v1-90%-fill comparison are in `docs/design/video/h264/intra-drift-diagnosis.md`
+/// (follow-up 3) and the shared spec § 4/§ 11.
+/// RED end — the explicit visual maximum: α = 1/8 (12.5 % of dry positions,
+/// change rate ≈ 6 %). Calibrated on the α sweep (follow-up 3): the heaviest
+/// fill where every corpus clip still holds clip-PSNR ≳ 27 dB and worst-MB
+/// ≳ 13 dB against the natural encode — degraded but the image is intact.
+/// Above it (α ≥ 15 %) the hardest clip (iphone5 1080p) collapses to 22 dB
+/// clip / 6.8 dB worst-MB.
+///
+/// Since 2026-10-26 this is the FLOOR of a per-clip red end: clips the damage
+/// predictor rates easy get 3/16 (`CapacityProbeResult::max_alpha_64`,
+/// `stego::quality_predict`).
+pub const CAP_ALPHA_MAX: (usize, usize) = (1, 8);
+/// YELLOW start — comfort: α = 1/25 (4 %, change rate ≈ 2 %), about the
+/// overall change rate v1 ran at its own 90 % fill (~2 %), via the measured
+/// rate ≈ α/2. At this α the corpus holds clip-PSNR ≳ 34 dB and worst-MB
+/// ≳ 16 dB — green.
+pub const CAP_ALPHA_COMFORT: (usize, usize) = (1, 25);
 
 impl CapacityProbeResult {
     /// Maximum primary-message bytes (UTF-8 text + attached files
@@ -1272,6 +1320,32 @@ impl CapacityProbeResult {
             n_shadows as usize,
         )
     }
+
+    /// Capacity policy (2026-10-25) — the RED end: the explicit visual maximum
+    /// primary-message bytes, `α_max` bits per syntax-dry STC position across
+    /// all GOPs, minus the crypto envelope. Clamped to the deliverable
+    /// [`Self::achievable_max_message_bytes`] (the planner can never place
+    /// more than that). A UI shows red + ⚠ as the fill approaches this.
+    /// `α_max` is per clip (2026-10-26): `max_alpha_64` / 64, never below
+    /// [`CAP_ALPHA_MAX`].
+    pub fn max_message_bytes(&self) -> usize {
+        let fixed = self.alpha_band_bytes(CAP_ALPHA_MAX);
+        let adaptive = self.alpha_band_bytes((self.max_alpha_64 as usize, 64));
+        fixed.max(adaptive).min(self.achievable_max_message_bytes)
+    }
+
+    /// Capacity policy (2026-10-25) — the YELLOW start: the comfort ceiling,
+    /// `α_comfort` bits per syntax-dry STC position (about the overall change
+    /// rate v1 ran at its own 90 % fill). Below this the UI is green.
+    pub fn comfort_message_bytes(&self) -> usize {
+        self.alpha_band_bytes(CAP_ALPHA_COMFORT).min(self.max_message_bytes())
+    }
+
+    fn alpha_band_bytes(&self, (num, den): (usize, usize)) -> usize {
+        // α × dry_bits = payload bits; / 8 = bytes; − the one-time envelope.
+        ((self.dry_cover_bits.saturating_mul(num) / den.max(1)) / 8)
+            .saturating_sub(frame::FRAME_OVERHEAD)
+    }
 }
 
 /// Streaming capacity probe — mirror of `StreamingEncodeSession` but
@@ -1295,11 +1369,21 @@ pub struct StreamingProbeSession {
     /// kept for the #475 progress estimate). Unifies the streaming HUD's
     /// shadow number with the one-shot `h264_video_capacity`.
     shadow_pool_bits: usize,
+    /// Wet-removal (2026-10-25): Σ syntax-dry primary STC positions, for the
+    /// capacity policy (`max_message_bytes` / `comfort_message_bytes`).
+    dry_cover_bits: usize,
+    /// Adaptive red end: each probed GOP's predicted damage curve, in GOP
+    /// order (`stego::quality_predict`). O(n_gops × 20) f64.
+    quality_curves: Vec<super::stego::quality_predict::GopQualityCurve>,
     n_gops: u32,
     /// CAP2.2 §12 — per-GOP tier-0 max-payload (bytes), pushed as each GOP
     /// drains. The full per-GOP VECTOR `allocate_chunks_proportional` needs
     /// to size a proportional plan. Surfaced via `finish_with_per_gop` only —
-    /// kept off the `Copy` `CapacityProbeResult`.
+    /// kept off the `Copy` `CapacityProbeResult`. Since 2026-10-26 each entry
+    /// is the QUALITY-SAFE cap (`quality_predict::quality_safe_cap`: the
+    /// deliverable cap, scaled down for a GOP intra-flooded at the red-end
+    /// floor), so every planner fed from it is damage-aware; Σ of the raw
+    /// caps stays in `per_tier_sum_payload`.
     per_gop_tier0_payload: Vec<usize>,
     /// CAP2.2 §12 (#824) — running SUM of per-GOP max-payload per tier (the
     /// carry/proportional message ceiling Σ). Feeds
@@ -1330,6 +1414,14 @@ struct ProbePlanTarget {
     /// computes `ceiled`.
     ceiled_sum: usize,
     satisfied: bool,
+    /// `Some` → the target is the BALANCED planner's
+    /// ([`set_balanced_plan_target`](StreamingProbeSession::set_balanced_plan_target)):
+    /// stop once `balanced_allocation::window_decided_by_prefix` holds over
+    /// the raw caps probed so far. `None` → the concentrate+tail rule above.
+    balanced: Option<crate::stego::calibration::AllocationCalibration>,
+    /// Balanced mode: Σ raw cap and count of the GOPs probed so far.
+    raw_sum: usize,
+    probed: usize,
 }
 
 enum ProbeImpl {
@@ -1398,6 +1490,8 @@ impl StreamingProbeSession {
             inner,
             cover_bits: 0,
             shadow_pool_bits: 0,
+            dry_cover_bits: 0,
+            quality_curves: Vec::new(),
             n_gops: 0,
             per_gop_tier0_payload: Vec::new(),
             per_tier_sum_payload: [0; 5],
@@ -1446,7 +1540,10 @@ impl StreamingProbeSession {
     /// is covered. The apps plan with `plan_safe_balanced` (#841) instead,
     /// whose t-stat lower bound genuinely depends on how many GOPs were
     /// sampled — truncating ITS sample set changes the plan and risks the
-    /// #850 false-`MessageTooLarge` class. Do not reuse this for that path.
+    /// #850 false-`MessageTooLarge` class. Do not reuse this for that path;
+    /// [`set_balanced_plan_target`](Self::set_balanced_plan_target) is the
+    /// balanced planner's early exit (every GOP passed as a sample, unprobed
+    /// ones as 0, so the imputation never runs).
     #[cfg(feature = "h264-encoder")]
     pub fn set_plan_target(&mut self, framed_len: usize, r_target: f64) {
         self.plan_target = Some(ProbePlanTarget {
@@ -1456,6 +1553,39 @@ impl StreamingProbeSession {
             // A zero-length message needs no GOP to carry it, so the prefix
             // condition holds vacuously from the start.
             satisfied: framed_len == 0,
+            balanced: None,
+            raw_sum: 0,
+            probed: 0,
+        });
+    }
+
+    /// Probe early-exit for a caller that plans with
+    /// [`StreamingEncodeSession::plan_safe_balanced`] over the per-GOP vector
+    /// from [`finish_with_per_gop`](Self::finish_with_per_gop) (the CLI).
+    ///
+    /// `balanced_allocation::select_window` picks the SHORTEST prefix
+    /// `W ≥ window_floor` with `target_utilization × Σ cap[..W] ≥ framed_len`.
+    /// Once the probed prefix satisfies that (the same predicate,
+    /// `window_decided_by_prefix`, with the same arithmetic), `W` lies inside
+    /// it; the window's hard check and proportional split read only window
+    /// GOPs, and with every GOP passed as a sample (unprobed ones as 0) the
+    /// imputation never runs. So reporting the unprobed GOPs as 0 yields a
+    /// bit-identical plan. Same partial-result caveat as
+    /// [`set_plan_target`](Self::set_plan_target): no capacity display.
+    #[cfg(feature = "h264-encoder")]
+    pub fn set_balanced_plan_target(
+        &mut self,
+        framed_len: usize,
+        calibration: &crate::stego::calibration::AllocationCalibration,
+    ) {
+        self.plan_target = Some(ProbePlanTarget {
+            framed_len,
+            r_target: 0.0,
+            ceiled_sum: 0,
+            satisfied: framed_len == 0,
+            balanced: Some(*calibration),
+            raw_sum: 0,
+            probed: 0,
         });
     }
 
@@ -1466,10 +1596,10 @@ impl StreamingProbeSession {
     }
 
     /// #475 — install a callback that fires after each GOP probe
-    /// completes, with `(gops_done, gops_total, cover_bits_so_far)`.
-    /// Caller computes the estimated total cover_bits as
-    /// `cover_bits_so_far * gops_total / gops_done`. `gops_total` is
-    /// derived from `params.total_frames_hint / gop_size`.
+    /// completes, with `(gops_done, gops_total, estimate_bytes)`.
+    /// `estimate_bytes` is the running policy maximum (see
+    /// `emit_estimate`); display it as is. `gops_total` is derived from
+    /// `params.total_frames_hint / gop_size`.
     pub fn set_progress_callback(
         &mut self,
         callback: Option<super::progress::CapacityProbeCallback>,
@@ -1535,7 +1665,43 @@ impl StreamingProbeSession {
         framed.saturating_sub(frame::FRAME_OVERHEAD)
     }
 
-    fn emit_estimate(&self) {
+    /// The probe result from the GOPs measured so far. With
+    /// `extrapolate_dry`, the dry cover is scaled from the GOPs probed to
+    /// `total_frames_hint / gop_size`, so the α bands of a partial probe
+    /// estimate the whole clip; `finish` passes `false`.
+    fn result_from_probed(&self, extrapolate_dry: bool, max_alpha_64: u32) -> CapacityProbeResult {
+        let total_gops = self.params.total_frames_hint.div_ceil(self.params.gop_size).max(1);
+        let dry_cover_bits = if extrapolate_dry && self.n_gops > 0 && self.n_gops < total_gops {
+            (self.dry_cover_bits as u128 * total_gops as u128 / self.n_gops as u128) as usize
+        } else {
+            self.dry_cover_bits
+        };
+        CapacityProbeResult {
+            cover_bits: self.cover_bits,
+            shadow_pool_bits: self.shadow_pool_bits,
+            n_gops: self.n_gops,
+            per_tier_sum_payload: self.per_tier_sum_payload,
+            achievable_max_message_bytes: self.achievable_bytes_from_probed(),
+            dry_cover_bits,
+            max_alpha_64,
+        }
+    }
+
+    /// The adaptive red end (spec § 4a) from the GOPs probed so far.
+    fn adaptive_max_alpha64(&self) -> u32 {
+        super::stego::quality_predict::adaptive_max_alpha64(
+            &self.quality_curves,
+            &self.per_gop_tier0_payload,
+            self.params.gop_size,
+            self.params.width,
+            self.params.height,
+        )
+    }
+
+    /// Report the running policy maximum (`max_message_bytes`), the figure
+    /// the UI shows once the probe is done. `extrapolate_dry` is `false`
+    /// only for the final event, which then equals the result exactly.
+    fn emit_estimate(&self, extrapolate_dry: bool) {
         if let Some(cb) = self.progress_callback.as_ref() {
             // Total GOPs target = ceil(total_frames_hint / gop_size).
             // The final partial GOP (if any) bumps `n_gops` past
@@ -1545,19 +1711,14 @@ impl StreamingProbeSession {
             let total_gops = self.params.total_frames_hint
                 .div_ceil(self.params.gop_size)
                 .max(1);
-            // Report what the PLANNER will accept, not Σ.
-            //
-            // This extrapolated `(Σ_probed / probed) × total_gops`, which
-            // converges on `primary_max_message_bytes` — a Σ-based UPPER bound
-            // the planner refuses well below. Now it converges on the
-            // achievable ceiling instead, so the number the user types against
-            // is the number the encode admits.
-            //
-            // Also changes the direction of travel: the Σ extrapolation
-            // started optimistic (GOP 0 is an IDR GOP and unusually roomy) and
-            // fell, while this starts conservative and CLIMBS, so a message
-            // that fits the figure on screen still fits a moment later.
-            cb(self.n_gops, total_gops, self.achievable_bytes_from_probed());
+            // Report what the UI will show once the probe is done: the
+            // α-band maximum, clamped to what the planner accepts
+            // (`achievable_bytes_from_probed`, which starts conservative and
+            // climbs). Reporting only the achievable ceiling overshot the
+            // final `max_message_bytes` several times over (a 4 s 720p clip
+            // showed ~8,800 while probing, 1,216 when done), so a message
+            // typed against the estimate overflowed.
+            cb(self.n_gops, total_gops, self.result_from_probed(extrapolate_dry, self.adaptive_max_alpha64()).max_message_bytes());
         }
     }
 
@@ -1592,8 +1753,8 @@ impl StreamingProbeSession {
                     let gop_n = state.frames_buffered;
                     state.pending.push((gop_n, std::mem::take(&mut state.gop_buffer)));
                     state.frames_buffered = 0;
-                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
-                    self.emit_estimate();
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.dry_cover_bits, &mut self.quality_curves, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
+                    self.emit_estimate(true);
                 }
                 Ok(())
             }
@@ -1619,13 +1780,25 @@ impl StreamingProbeSession {
 
     /// CAP2.2 §12 — like [`finish`](Self::finish) but ALSO returns the per-GOP
     /// tier-0 max-payload VECTOR (bytes), in GOP order (length == `n_gops`).
+    /// Each entry is the quality-safe cap (≤ the deliverable cap; see
+    /// `quality_predict::quality_safe_cap`) — hand it to the planner as is.
     /// This is the basis the CLI two-pass orchestrator feeds to
     /// [`allocate_chunks_proportional`](super::stego::chunk_frame::allocate_chunks_proportional)
     /// via [`StreamingEncodeSession::plan_proportional`]. `CapacityProbeResult`
     /// itself stays `Copy` and exposes the per-GOP Σ.
     pub fn finish_with_per_gop(
-        mut self,
+        self,
     ) -> Result<(CapacityProbeResult, Vec<usize>), StegoError> {
+        self.finish_with_quality_curves().map(|(r, per_gop, _)| (r, per_gop))
+    }
+
+    /// [`finish_with_per_gop`](Self::finish_with_per_gop) plus the per-GOP
+    /// predicted damage curves behind `max_alpha_64` — calibration surface
+    /// for the adaptive red end (`h264_v2_gates::adaptmax_calib`).
+    #[doc(hidden)]
+    pub fn finish_with_quality_curves(
+        mut self,
+    ) -> Result<(CapacityProbeResult, Vec<usize>, Vec<super::stego::quality_predict::GopQualityCurve>), StegoError> {
         match &mut self.inner {
             #[cfg(feature = "h264-encoder")]
             ProbeImpl::Oh264(state) => {
@@ -1638,15 +1811,11 @@ impl StreamingProbeSession {
                         self.n_gops = self.n_gops.saturating_add(1);
                         self.per_gop_tier0_payload.push(0);
                     }
-                    let result = CapacityProbeResult {
-                        cover_bits: self.cover_bits,
-                        shadow_pool_bits: self.shadow_pool_bits,
-                        n_gops: self.n_gops,
-                        per_tier_sum_payload: self.per_tier_sum_payload,
-                        achievable_max_message_bytes: self.achievable_bytes_from_probed(),
-                    };
+                    // Partial probe: no policy figures (dry_cover_bits is
+                    // partial too) — keep the fixed floor.
+                    let result = self.result_from_probed(false, super::stego::quality_predict::ALPHA64_FLOOR);
                     let per_gop = std::mem::take(&mut self.per_gop_tier0_payload);
-                    return Ok((result, per_gop));
+                    return Ok((result, per_gop, std::mem::take(&mut self.quality_curves)));
                 }
                 if state.frames_buffered > 0 {
                     let gop_n = state.frames_buffered;
@@ -1655,21 +1824,16 @@ impl StreamingProbeSession {
                 }
                 if !state.pending.is_empty() {
                     // Drain ALL remaining GOPs as the final parallel batch.
-                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
+                    drain_pending_gops_probe(&self.params, &mut state.pending, &mut self.cover_bits, &mut self.shadow_pool_bits, &mut self.dry_cover_bits, &mut self.quality_curves, &mut self.n_gops, &mut self.per_gop_tier0_payload, &mut self.per_tier_sum_payload, &mut self.plan_target)?;
                     // Emit one final per-GOP event before returning so
                     // listeners that race a final-state read can see
                     // the full count rather than the second-last one.
-                    self.emit_estimate();
+                    // It is the final value: no extrapolation.
+                    self.emit_estimate(false);
                 }
-                let result = CapacityProbeResult {
-                    cover_bits: self.cover_bits,
-                    shadow_pool_bits: self.shadow_pool_bits,
-                    n_gops: self.n_gops,
-                    per_tier_sum_payload: self.per_tier_sum_payload,
-                    achievable_max_message_bytes: self.achievable_bytes_from_probed(),
-                };
+                let result = self.result_from_probed(false, self.adaptive_max_alpha64());
                 let per_gop = std::mem::take(&mut self.per_gop_tier0_payload);
-                Ok((result, per_gop))
+                Ok((result, per_gop, std::mem::take(&mut self.quality_curves)))
             }
             ProbeImpl::EngineDisabled(c) => Err(StegoError::InvalidVideo(format!(
                 "engine {:?} is not compiled into this build",
@@ -1700,6 +1864,8 @@ fn drain_pending_gops_probe(
     pending: &mut Vec<(u32, Vec<u8>)>,
     cover_bits: &mut usize,
     shadow_pool_bits: &mut usize,
+    dry_cover_bits: &mut usize,
+    quality_curves: &mut Vec<super::stego::quality_predict::GopQualityCurve>,
     n_gops: &mut u32,
     per_gop_tier0: &mut Vec<usize>,
     per_tier_sum: &mut [usize; 5],
@@ -1733,22 +1899,47 @@ fn drain_pending_gops_probe(
         let cap = cap?;
         *cover_bits = cover_bits.saturating_add(cap.coeff_sign_cover_bits);
         *shadow_pool_bits = shadow_pool_bits.saturating_add(cap.injectable_cover_bits);
+        // Damage-aware planning (2026-10-26): the per-GOP vector the planner
+        // gets is the QUALITY-SAFE cap — the deliverable cap scaled by the
+        // GOP's damage weight, < 1 only for a GOP intra-flooded at the
+        // red-end floor (`quality_predict::quality_safe_cap`). Always ≤ the
+        // deliverable cap, so it stays a valid per-GOP ceiling for the
+        // encode; the per-tier Σ below keeps the raw (deliverable) figure.
+        // The α bands count the same GOP's dry cover at the same weight, so
+        // at the red end every other GOP sits at α_max, not above it.
+        let safe_cap = super::stego::quality_predict::quality_safe_cap(cap.per_tier_payload[0], &cap.quality);
+        *dry_cover_bits = dry_cover_bits
+            .saturating_add(super::stego::quality_predict::quality_safe_cap(cap.dry_cover_bits, &cap.quality));
+        quality_curves.push(cap.quality);
         *n_gops = n_gops.saturating_add(1);
         for t in 0..5 {
             // CAP2.2 §12 (#824) — Σ per tier = the true carry/proportional ceiling.
             per_tier_sum[t] = per_tier_sum[t].saturating_add(cap.per_tier_payload[t]);
         }
         // CAP2.2 §12 — record this GOP's tier-0 cap (bytes) for proportional
-        // allocation; GOP order matches the encode's chunk order.
-        per_gop_tier0.push(cap.per_tier_payload[0]);
+        // allocation; GOP order matches the encode's chunk order. The
+        // quality-safe value (see above): what every planner reads.
+        per_gop_tier0.push(safe_cap);
 
         // Probe early-exit bookkeeping. `ceiled` is computed exactly as
         // `allocate_chunks_concentrate_tail` computes it — any drift here
         // would make the prefix plan differ from the full plan, which is the
         // one thing `set_plan_target` promises cannot happen.
         if let Some(t) = plan_target.as_mut() {
-            if !t.satisfied {
-                let c = cap.per_tier_payload[0];
+            if !t.satisfied && t.balanced.is_some() {
+                let cal = t.balanced.unwrap();
+                // The same per-GOP value the plan will read (quality-safe).
+                t.raw_sum = t.raw_sum.saturating_add(safe_cap);
+                t.probed += 1;
+                // The encode session's GOP count (`build_oh264_state`).
+                let n_gops = params.total_frames_hint.div_ceil(params.gop_size).max(1) as usize;
+                if crate::stego::balanced_allocation::window_decided_by_prefix(
+                    t.probed, t.raw_sum, n_gops, t.framed_len, &cal,
+                ) {
+                    t.satisfied = true;
+                }
+            } else if !t.satisfied {
+                let c = safe_cap;
                 let r = t.r_target.clamp(0.0, 1.0);
                 let ceiled = ((r * c as f64) as usize).min(c);
                 t.ceiled_sum = t.ceiled_sum.saturating_add(ceiled);
@@ -1901,11 +2092,9 @@ impl StreamingDecodeSession {
     /// payload until GOP 0's declared `total_bytes` is reached, then parse
     /// + decrypt. `slabs` are the per-GOP Annex-B slices.
     fn try_primary_decode(&self, slabs: &[&[u8]]) -> Result<DecodeSessionResult, StegoError> {
-        // Derive the STC seed (same as encode side).
-        let keys = CabacStegoMasterKeys::derive(&self.passphrase)?;
-        let hhat_seed = keys
-            .per_gop_seeds(EmbedDomain::CoeffSignBypass, 0)
-            .hhat_seed;
+        // v2 per-GOP STC keys (same derivation as the encode side): slab `g`
+        // is walked in `keys.gop(g).order` and extracted with its own H-hat.
+        let keys = H264StcKeys::derive(&self.passphrase)?;
 
         // GOP 0 is always a stego GOP carrying the u32 `total_bytes`;
         // subsequent GOPs carry only `payload_len`. Stop at
@@ -1916,11 +2105,19 @@ impl StreamingDecodeSession {
         // blocking call: check for a cancel per GOP, and after a miss (the
         // search gives up early when cancelled) before calling it one.
         progress::check_cancelled()?;
-        let cover0 = h264_gop_cover_bits(slabs[0], &self.cost_weights).ok_or_else(|| {
-            StegoError::InvalidVideo("decode session: GOP 0 cover walk failed".into())
-        })?;
+        let walk_cover = |slab: &[u8], g: usize| {
+            walk_annex_b_for_cover_with_options(
+                slab,
+                WalkOptions { record_mvd: true, ..Default::default() },
+            )
+            .map(|w| w.cover)
+            .map_err(|_| StegoError::InvalidVideo(format!("decode session: GOP {g} cover walk failed")))
+        };
+        let cover0 = walk_cover(slabs[0], 0)?;
         progress::check_cancelled()?;
-        let first = extract_first_chunk_frame_match(&cover0, &hhat_seed, MAX_TOTAL_PAYLOAD_BYTES);
+        let first = first_variant_match(&cover0, &keys.gop_variants(0), true, |bits, hhat| {
+            extract_first_chunk_frame_match(bits, hhat, MAX_TOTAL_PAYLOAD_BYTES)
+        });
         progress::check_cancelled()?;
         let (total_bytes, payload0) = first.ok_or_else(|| {
             StegoError::InvalidVideo("decode session: no v3 first chunk found in GOP 0".into())
@@ -1932,11 +2129,12 @@ impl StreamingDecodeSession {
         let mut gop_idx = 1usize;
         while frame_bytes.len() < total_bytes && gop_idx < slabs.len() {
             progress::check_cancelled()?;
-            let cover = h264_gop_cover_bits(slabs[gop_idx], &self.cost_weights).ok_or_else(|| {
-                StegoError::InvalidVideo(format!("decode session: GOP {gop_idx} cover walk failed"))
-            })?;
+            let cover = walk_cover(slabs[gop_idx], gop_idx)?;
             let remaining = total_bytes - frame_bytes.len();
-            let found = extract_chunk_frame_match(&cover, &hhat_seed, remaining);
+            let found = first_variant_match(
+                &cover, &keys.gop_variants(gop_idx as u32), true,
+                |bits, hhat| extract_chunk_frame_match(bits, hhat, remaining),
+            );
             progress::check_cancelled()?;
             let payload = found.ok_or_else(|| {
                 StegoError::InvalidVideo(format!(
@@ -2011,8 +2209,9 @@ impl StreamingDecodeSession {
         let perm_seed = crate::stego::crypto::derive_shadow_structural_key(&self.passphrase)?;
         let mut rng = ChaCha20Rng::from_seed(*perm_seed);
 
-        // (priority, domain_rank, intra_index, bit) — the priority_slots order.
-        let mut slots: Vec<(u32, u8, usize, u8)> = Vec::new();
+        // (bucket, priority, domain_rank, intra_index, bit) — the
+        // priority_slots order (v2: damage bucket first, spec § 6).
+        let mut slots: Vec<(u8, u32, u8, usize, u8)> = Vec::new();
         let mut offs = [0usize; 4]; // running global per-domain offsets
         // Cumulative ACTUAL frames decoded so far — the global-remap base. The
         // encoder's `streaming_shadow_verify` uses g*gop_size for the SAME base;
@@ -2027,22 +2226,17 @@ impl StreamingDecodeSession {
                 WalkOptions { record_mvd: true, ..Default::default() },
             )
             .map_err(|_| StegoError::FrameCorrupted)?;
-            let safe_msb = analyze_safe_mvd_subset(&walk.mvd_meta, walk.mb_w, walk.mb_h);
             let mut cover = walk.cover;
-            let safe_msl = derive_msl_safe_from_msb(
-                &cover.mvd_sign_bypass.positions,
-                &safe_msb,
-                &cover.mvd_suffix_lsb.positions,
-            );
-            // GLOBAL-remap keys so priorities match the whole-clip priority_slots.
+            // GLOBAL-remap keys (and the MB syntax with them) so priorities
+            // match the whole-clip priority_slots.
             if frames_so_far > 0 {
                 remap_cover_frame_idx(&mut cover, frames_so_far);
             }
-            // Eligibility + domain order via the shared `for_each_eligible_position`
-            // (safe_csl = None ⇒ all CSL; cascade-safe MSL only) — the exact rule
-            // `priority_slots` + the streaming verify use, so the priority order
-            // here is bit-identical to the whole-clip `priority_slots`.
-            for_each_eligible_position(&cover, None, Some(safe_msl.as_slice()), |domain, i, key| {
+            // Eligibility, damage bucket and domain order via the shared
+            // `for_each_eligible_position` (v2, spec § 6) — the exact rule
+            // `priority_slots` + the streaming verify use, so the priority
+            // order here is bit-identical to the whole-clip `priority_slots`.
+            for_each_eligible_position(&cover, |domain, i, key, bucket| {
                 let bit = match domain {
                     EmbedDomain::CoeffSignBypass => cover.coeff_sign_bypass.bits[i],
                     EmbedDomain::CoeffSuffixLsb => cover.coeff_suffix_lsb.bits[i],
@@ -2050,7 +2244,7 @@ impl StreamingDecodeSession {
                     EmbedDomain::MvdSuffixLsb => cover.mvd_suffix_lsb.bits[i],
                 };
                 rng.set_word_pos((key.raw() as u128).wrapping_mul(2));
-                slots.push((rng.next_u32(), domain as u8, offs[domain as usize] + i, bit));
+                slots.push((bucket, rng.next_u32(), domain as u8, offs[domain as usize] + i, bit));
             });
             offs[0] += cover.coeff_sign_bypass.len();
             offs[1] += cover.coeff_suffix_lsb.len();
@@ -2063,11 +2257,12 @@ impl StreamingDecodeSession {
             // `cover` + `walk` (incl. mvd_meta) drop here — O(GOP) peak.
         }
 
-        // priority_slots' total order: stable sort by priority with domain-grouped
-        // insertion ⇒ (priority, domain_rank, intra_index) ascending.
+        // priority_slots' total order: stable sort by (bucket, priority) with
+        // domain-grouped insertion ⇒ (bucket, priority, domain_rank,
+        // intra_index) ascending.
         progress::check_cancelled()?;
-        slots.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
-        let all_lsbs: Vec<u8> = slots.iter().map(|s| s.3).collect();
+        slots.sort_by(|a, b| (a.0, a.1, a.2, a.3).cmp(&(b.0, b.1, b.2, b.3)));
+        let all_lsbs: Vec<u8> = slots.iter().map(|s| s.4).collect();
 
         let payload = decode_shadow_from_priority_lsbs(&all_lsbs, &self.passphrase)?;
         self.emit_progress(DecodePhase::Done);
@@ -2122,21 +2317,19 @@ fn split_annex_b_into_gops(annex_b: &[u8]) -> Vec<&[u8]> {
     slabs
 }
 
-/// chunk_frame v3 §4 — walk a GOP slab and combine the 4-domain cover
-/// (CS → CSL → MVDs → MVDsl, matching the encoder). Returns the combined
-/// cover bit vector the v3 STC extract operates on. Shared by both v3
-/// extract variants + the encode-time round-trip verify.
-fn h264_gop_cover_bits(slab: &[u8], weights: &CostWeights) -> Option<Vec<u8>> {
+/// chunk_frame v3 §4 — walk a GOP slab, combine the 4-domain cover
+/// (CS → CSL → MVDs → MVDsl, matching the encoder) and put it in the GOP's
+/// v2 STC order (`GopSeeds::order`, spec § 3). Returns the cover bit vector
+/// the v3 STC extract operates on. Shared by both v3 extract variants + the
+/// encode-time round-trip verify.
+fn h264_gop_cover_bits(slab: &[u8], order_seed: &[u8; 32]) -> Option<Vec<u8>> {
     // #493.5 Phase 4 — walk with MVD recording so the 4-domain combine
     // sees all 4 cover vectors (default walker leaves MVD cover empty).
     let walk = walk_annex_b_for_cover_with_options(
         slab,
         WalkOptions { record_mvd: true, ..Default::default() },
     ).ok()?;
-    let dummy_costs = DomainCosts::default();
-    let (cover_bits, _, _boundaries) =
-        combine_cover_4domain(&walk.cover, &dummy_costs, weights);
-    Some(cover_bits)
+    Some(gop_stc_cover_bits(&walk.cover, order_seed))
 }
 
 /// chunk_frame v3.1 first-chunk extract (GOP 0). Returns `(total_bytes,
@@ -2178,7 +2371,7 @@ fn extract_first_chunk_frame_match(
             break;
         }
         let used = m_total * w;
-        let hhat = generate_hhat(STC_H, w, hhat_seed);
+        let hhat = super::stego::v2_knobs::h264_hhat(STC_H, w, hhat_seed);
 
         // 80-bit prefix: u32 total_bytes + u32 m_total + u16 payload_len.
         let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 80);
@@ -2247,7 +2440,7 @@ fn extract_chunk_frame_match(
             break;
         }
         let used = m_total * w;
-        let hhat = generate_hhat(STC_H, w, hhat_seed);
+        let hhat = super::stego::v2_knobs::h264_hhat(STC_H, w, hhat_seed);
 
         // 48-bit prefix: u32 m_total + u16 payload_len. Exact m_total reject.
         let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat, w, 48);
@@ -2283,21 +2476,74 @@ fn extract_chunk_frame_match(
 /// GOP 0 verifies as a first chunk; GOP ≥ 1 as a subsequent chunk.
 fn verify_chunk_v3(
     gop: &[u8],
-    hhat_seed: &[u8; 32],
+    seeds: &GopSeeds,
     chunk_idx: u16,
     total_bytes: u32,
     expected: &[u8],
-    weights: &CostWeights,
 ) -> bool {
-    let Some(cover) = h264_gop_cover_bits(gop, weights) else {
+    let Some(cover) = h264_gop_cover_bits(gop, &seeds.order) else {
         return false;
     };
     if chunk_idx == 0 {
-        extract_first_chunk_frame_match(&cover, hhat_seed, MAX_TOTAL_PAYLOAD_BYTES)
+        extract_first_chunk_frame_match(&cover, &seeds.hhat, MAX_TOTAL_PAYLOAD_BYTES)
             .is_some_and(|(_t, p)| p == expected)
     } else {
-        extract_chunk_frame_match(&cover, hhat_seed, total_bytes as usize)
+        extract_chunk_frame_match(&cover, &seeds.hhat, total_bytes as usize)
             .is_some_and(|p| p == expected)
+    }
+}
+
+/// The decoder's seed-variant search over one walked GOP: try each variant
+/// (`H264StcKeys::gop_variants` order) — permute the cover in its order and
+/// run `extract(cover_bits, hhat_seed)` — and return the first hit. With one
+/// variant (the default) this is exactly the v2 single-seed extract.
+fn first_variant_match<T>(
+    cover: &super::stego::inject::DomainCover,
+    variants: &[GopSeeds],
+    count: bool,
+    extract: impl Fn(&[u8], &[u8; 32]) -> Option<T>,
+) -> Option<T> {
+    for (a, v) in variants.iter().enumerate() {
+        if count {
+            super::stego::v2_knobs::note_dec_try(a as u8);
+        }
+        let bits = gop_stc_cover_bits(cover, &v.order);
+        if let Some(x) = extract(&bits, &v.hhat) {
+            return Some(x);
+        }
+        if progress::is_cancelled() {
+            return None;
+        }
+    }
+    None
+}
+
+/// [`verify_chunk_v3`] through the decoder's variant search: the GOP must
+/// extract back to `expected` under the FIRST variant that yields a chunk,
+/// which is the one the decoder will take.
+fn verify_chunk_v3_variants(
+    gop: &[u8],
+    variants: &[GopSeeds],
+    chunk_idx: u16,
+    total_bytes: u32,
+    expected: &[u8],
+) -> bool {
+    let Ok(walk) = walk_annex_b_for_cover_with_options(
+        gop,
+        WalkOptions { record_mvd: true, ..Default::default() },
+    ) else {
+        return false;
+    };
+    if chunk_idx == 0 {
+        first_variant_match(&walk.cover, variants, false, |bits, hhat| {
+            extract_first_chunk_frame_match(bits, hhat, MAX_TOTAL_PAYLOAD_BYTES)
+        })
+        .is_some_and(|(_t, p)| p == expected)
+    } else {
+        first_variant_match(&walk.cover, variants, false, |bits, hhat| {
+            extract_chunk_frame_match(bits, hhat, total_bytes as usize)
+        })
+        .is_some_and(|p| p == expected)
     }
 }
 
@@ -2820,15 +3066,13 @@ mod tests {
             let slabs = split_annex_b_into_gops(&annex_b);
             assert_eq!(slabs.len(), 4, "all 4 GOPs (incl. plain tail) must emit + be SPS-separable");
 
-            let keys = CabacStegoMasterKeys::derive(PASS).expect("keys");
-            let hhat_seed = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0).hhat_seed;
-            let weights = CostWeights::default();
+            let keys = H264StcKeys::derive(PASS).expect("keys");
 
             // (2) GOP 0 carries the whole tiny message in its v3 first chunk:
             // `total_bytes == GOP 0's payload` (W = 1, no subsequent chunks).
-            let cover0 = h264_gop_cover_bits(slabs[0], &weights).expect("GOP 0 cover walk");
+            let cover0 = h264_gop_cover_bits(slabs[0], &keys.gop(0).order).expect("GOP 0 cover walk");
             let (total_bytes, payload0) =
-                extract_first_chunk_frame_match(&cover0, &hhat_seed, MAX_TOTAL_PAYLOAD_BYTES)
+                extract_first_chunk_frame_match(&cover0, &keys.gop(0).hhat, MAX_TOTAL_PAYLOAD_BYTES)
                     .expect("GOP 0 must carry the v3 first chunk");
             assert_eq!(
                 total_bytes as usize,
@@ -2843,9 +3087,10 @@ mod tests {
                 ).unwrap_or_else(|e| panic!("GOP {i} failed to walk (corrupt plain tail?): {e}"));
             }
             for i in 1..4usize {
-                let cover_i = h264_gop_cover_bits(slabs[i], &weights).expect("tail GOP cover walk");
+                let seeds_i = keys.gop(i as u32);
+                let cover_i = h264_gop_cover_bits(slabs[i], &seeds_i.order).expect("tail GOP cover walk");
                 assert!(
-                    extract_chunk_frame_match(&cover_i, &hhat_seed, total_bytes as usize).is_none(),
+                    extract_chunk_frame_match(&cover_i, &seeds_i.hhat, total_bytes as usize).is_none(),
                     "plain tail GOP {i} must NOT carry a v3 chunk"
                 );
             }
@@ -2889,17 +3134,20 @@ mod tests {
             let (result, per_gop_caps) = probe.finish_with_per_gop().expect("finish");
             assert_eq!(per_gop_caps.len(), result.n_gops as usize);
 
+            // The per-GOP vector is the quality-safe cap (damage-aware
+            // planning): never above the deliverable cap, whose Σ is the
+            // per-tier figure. Equal unless a GOP is intra-flooded.
             let sigma: usize = per_gop_caps.iter().sum();
-            // The accumulated Σ equals the sum of the per-GOP vector.
-            assert_eq!(
-                result.per_tier_sum_payload[0], sigma,
-                "per_tier_sum[0] must == Σ per-GOP caps"
+            assert!(
+                sigma <= result.per_tier_sum_payload[0],
+                "Σ quality-safe caps ({sigma}) must be ≤ per_tier_sum[0] ({})",
+                result.per_tier_sum_payload[0]
             );
             // Capacity is Σ − overhead (the new formula), not n_gops × min − overhead.
             let overhead = crate::stego::frame::FRAME_OVERHEAD;
             assert_eq!(
                 result.primary_max_message_bytes(),
-                sigma.saturating_sub(overhead),
+                result.per_tier_sum_payload[0].saturating_sub(overhead),
                 "primary capacity must be Σ − FRAME_OVERHEAD"
             );
             // Σ is always ≥ the old even-split n_gops × min (the under-report it replaces).
@@ -2910,6 +3158,58 @@ mod tests {
                 sigma, result.n_gops, min_cap
             );
         }
+        #[test]
+        fn probe_adaptive_max_is_bounded_and_deterministic() {
+            // Adaptive red end (spec § 4a): `max_alpha_64` ∈ {8, 12}, the same
+            // cover gives the same curves and figure, and `max_message_bytes`
+            // is the α band it names, never below the fixed 1/8 band, clamped
+            // to the deliverable figure.
+            let _g = SESSION_TEST_MUTEX.lock().unwrap();
+            const W: u32 = 320;
+            const H: u32 = 240;
+            const GOP: u32 = 3;
+            const N: u32 = 6;
+            let run = || {
+                let params = EncodeSessionParams {
+                    width: W, height: H, fps_num: 30, fps_den: 1, qp: 26,
+                    gop_size: GOP, total_frames_hint: N,
+                    color: ColorParams::default(),
+                    engine: EncodeEngineChoice::Oh264,
+                    cost_weights: CostWeights::default(),
+                    progress_callback: None,
+                };
+                let mut probe = StreamingProbeSession::create(params).expect("probe create");
+                for f in 0..N {
+                    let (y, u, v) = synth_yuv_frame(W, H, f);
+                    probe.push_frame(YuvFrameRef {
+                        y: &y, y_stride: W as usize,
+                        u: &u, u_stride: (W / 2) as usize,
+                        v: &v, v_stride: (W / 2) as usize,
+                    }).expect("probe push");
+                }
+                probe.finish_with_quality_curves().expect("finish")
+            };
+            let (a, caps_a, curves_a) = run();
+            let (b, _, curves_b) = run();
+            assert_eq!(curves_a, curves_b, "curves must be deterministic");
+            assert_eq!(a.max_alpha_64, b.max_alpha_64);
+            assert!(a.max_alpha_64 == 8 || a.max_alpha_64 == 12, "max_alpha_64 {}", a.max_alpha_64);
+            assert_eq!(curves_a.len(), caps_a.len());
+            assert_eq!(curves_a.iter().map(|c| c.n_dry).sum::<usize>(), a.dry_cover_bits);
+            for c in &curves_a {
+                assert!(c.energy.windows(2).all(|w| w[1] >= w[0]), "E(α) must not fall: {:?}", c.energy);
+            }
+            let overhead = crate::stego::frame::FRAME_OVERHEAD;
+            let band = |num: usize, den: usize| ((a.dry_cover_bits * num / den) / 8).saturating_sub(overhead);
+            let fixed = band(1, 8).min(a.achievable_max_message_bytes);
+            assert!(a.max_message_bytes() >= fixed);
+            assert_eq!(
+                a.max_message_bytes(),
+                band(1, 8).max(band(a.max_alpha_64 as usize, 64)).min(a.achievable_max_message_bytes)
+            );
+            assert!(a.comfort_message_bytes() <= a.max_message_bytes());
+        }
+
         #[test]
         fn streaming_session_emits_progress_events_round_trip() {
             // #474.2 — end-to-end: install encode + decode progress

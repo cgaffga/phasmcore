@@ -180,6 +180,7 @@ fn av1_capacity_probe() {
         quantizer: QUANTIZER,
         gop_size: GOP_SIZE,
         total_frames_hint: n_frames,
+        colour: Default::default(),
     };
 
     // HUD number, exactly as the mobile probe computes it. The probe is

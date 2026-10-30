@@ -1,135 +1,90 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
-//
-// Per-domain ChaCha20 seed derivation for encode-time CABAC stego.
-//
-// Architecture decision (see
-// docs/design/video/_archive/h264/encoder-algorithms/cabac-bypass-bin-stego.md):
-// the four
-// stego target domains (CoeffSignBypass, CoeffSuffixLsb,
-// MvdSignBypass, MvdSuffixLsb) MUST use uncorrelated per-domain
-// seeds for the STC permutation + H-hat matrices. Otherwise an
-// attacker breaking one domain's syndrome could attack the others
-// using the same matrix.
-//
-// This module:
-//   1. Wraps the existing Argon2-expensive master derivations
-//      (`derive_structural_key` for coefficient domains,
-//      `derive_h264_mvd_structural_key` for MVD domains) so the
-//      caller pays Argon2 once per encode/decode.
-//   2. Mixes the masters with a domain-specific label via the
-//      existing `derive_per_gop_seed` SHA-256 helper to
-//      produce per-(domain, GOP) seeds — cheap, deterministic,
-//      cross-platform identical (same `det_math` discipline as the
-//      rest of the encoder).
-//
-// Same structure the retired CAVLC pipeline used; just extended to
-// the four CABAC domains.
+
+//! Primary-STC keys for H.264 video stego, wire v2.
+//!
+//! Spec: `docs/design/video/stego-cover-order-and-damage-costs.md` § 3, § 8.
+//!
+//! The primary runs ONE STC per GOP over the whole combined 4-domain cover
+//! (CS | CSL | MVDs | MVDsl), walked in one keyed order. Each GOP gets its
+//! own order seed and its own H-hat seed, both from the passphrase's
+//! structural master (`crypto::derive_structural_key`, one Argon2 run per
+//! encode / decode) through the shared [`crate::stego::cover_order::gop_seeds`]
+//! with `VideoCodec::H264`. The v2 seed labels are the wire version.
+//!
+//! v1 (until 2026-10) derived per-domain seeds from two Argon2 masters
+//! (`CabacStegoMasterKeys`) and used GOP 0's CoeffSign H-hat seed for every
+//! GOP and no order. There is no v1 decoder (spec § 9).
 
 use zeroize::Zeroizing;
 
-use crate::stego::crypto::{
-    derive_h264_mvd_structural_key, derive_per_gop_seed,
-    derive_structural_key,
-};
+use crate::stego::cover_order::{gop_seeds, GopSeeds, VideoCodec};
+use crate::stego::crypto::derive_structural_key;
 use crate::stego::error::StegoError;
 
-use super::EmbedDomain;
-
-/// Master keys for the four CABAC stego domains. Computed once per
-/// encode/decode (Argon2 cost), then used to derive per-GOP per-
-/// domain seeds via cheap SHA-256 mixing.
-///
-/// **Two distinct masters**, one for the coefficient domains and
-/// one for the MVD domains, mirroring the retired CAVLC pipeline's
-/// `coeff_master` + `mvd_master` split. This guarantees that the
-/// four per-domain seeds derived below are uncorrelated even at
-/// the same GOP index.
-pub struct CabacStegoMasterKeys {
-    /// 64-byte master for `CoeffSignBypass` + `CoeffSuffixLsb`.
-    /// Layout: first 32 = perm_seed source, last 32 = hhat_seed source.
-    coeff_master: Zeroizing<[u8; 64]>,
-    /// 64-byte master for `MvdSignBypass` + `MvdSuffixLsb`. Same
-    /// layout as `coeff_master`.
-    mvd_master: Zeroizing<[u8; 64]>,
+/// The primary's per-GOP STC keys for one passphrase.
+#[derive(Clone)]
+pub struct H264StcKeys {
+    master: Zeroizing<[u8; 64]>,
 }
 
-/// Per-GOP STC seed pair for one domain. STC requires two seeds:
-/// one for the cover-position permutation, one for the H-hat
-/// matrix generation.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct DomainSeeds {
-    pub perm_seed: [u8; 32],
-    pub hhat_seed: [u8; 32],
+impl std::fmt::Debug for H264StcKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("H264StcKeys(..)")
+    }
 }
 
-impl CabacStegoMasterKeys {
-    /// Derive both Argon2 masters from a passphrase. ~Hundreds of
-    /// milliseconds; called once per encode or decode.
+impl H264StcKeys {
+    /// Derive from a passphrase (one Argon2 run, cached process-wide).
     pub fn derive(passphrase: &str) -> Result<Self, StegoError> {
-        let coeff_master = derive_structural_key(passphrase)?;
-        let mvd_master = derive_h264_mvd_structural_key(passphrase)?;
-        Ok(Self { coeff_master, mvd_master })
+        Ok(Self { master: derive_structural_key(passphrase)? })
     }
 
-    /// Derive `(perm_seed, hhat_seed)` for the given domain at the
-    /// given GOP index. Cheap (two SHA-256 calls).
-    pub fn per_gop_seeds(&self, domain: EmbedDomain, gop_idx: u32) -> DomainSeeds {
-        let (master_perm_src, master_hhat_src, perm_label, hhat_label) = match domain {
-            EmbedDomain::CoeffSignBypass => (
-                self.coeff_master_perm(),
-                self.coeff_master_hhat(),
-                b"cabac-coeff-sign-perm" as &[u8],
-                b"cabac-coeff-sign-hhat" as &[u8],
-            ),
-            EmbedDomain::CoeffSuffixLsb => (
-                self.coeff_master_perm(),
-                self.coeff_master_hhat(),
-                b"cabac-coeff-suffix-perm" as &[u8],
-                b"cabac-coeff-suffix-hhat" as &[u8],
-            ),
-            EmbedDomain::MvdSignBypass => (
-                self.mvd_master_perm(),
-                self.mvd_master_hhat(),
-                b"cabac-mvd-sign-perm" as &[u8],
-                b"cabac-mvd-sign-hhat" as &[u8],
-            ),
-            EmbedDomain::MvdSuffixLsb => (
-                self.mvd_master_perm(),
-                self.mvd_master_hhat(),
-                b"cabac-mvd-suffix-perm" as &[u8],
-                b"cabac-mvd-suffix-hhat" as &[u8],
-            ),
-        };
-        DomainSeeds {
-            perm_seed: derive_per_gop_seed(master_perm_src, gop_idx, perm_label),
-            hhat_seed: derive_per_gop_seed(master_hhat_src, gop_idx, hhat_label),
+    /// Keys from an explicit 64-byte master (tests and pinned fixtures).
+    pub fn from_master(master: [u8; 64]) -> Self {
+        Self { master: Zeroizing::new(master) }
+    }
+
+    /// Order + H-hat seeds of GOP `gop` (the GOP's index in the stream, i.e.
+    /// its slab index for the decoder).
+    pub fn gop(&self, gop: u32) -> GopSeeds {
+        gop_seeds(&self.master, VideoCodec::H264, gop)
+    }
+
+    /// EXPERIMENTAL (Path B, `v2_knobs::seed_variants`): seed variant `a` of
+    /// GOP `gop`. Variant 0 is [`Self::gop`]; variant `a > 0` uses the same
+    /// SHA-256 construction as `cover_order::gop_seeds` with the roles
+    /// `order-v2/a{a}` and `hhat-v2/a{a}`, so every variant is an
+    /// independent keyed (order, H-hat) pair.
+    pub fn gop_variant(&self, gop: u32, a: u8) -> GopSeeds {
+        if a == 0 {
+            return self.gop(gop);
+        }
+        fn derive(master_half: &[u8], role: &[u8], gop: u32) -> [u8; 32] {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"phasm-video-gop-v2");
+            for field in [master_half, &b"h264"[..], role] {
+                h.update((field.len() as u32).to_le_bytes());
+                h.update(field);
+            }
+            h.update(gop.to_le_bytes());
+            h.finalize().into()
+        }
+        let order_role = format!("order-v2/a{a}");
+        let hhat_role = format!("hhat-v2/a{a}");
+        GopSeeds {
+            order: derive(&self.master[..32], order_role.as_bytes(), gop),
+            hhat: derive(&self.master[32..], hhat_role.as_bytes(), gop),
         }
     }
 
-    fn coeff_master_perm(&self) -> &[u8; 32] {
-        Self::first_half(&self.coeff_master)
-    }
-    fn coeff_master_hhat(&self) -> &[u8; 32] {
-        Self::second_half(&self.coeff_master)
-    }
-    fn mvd_master_perm(&self) -> &[u8; 32] {
-        Self::first_half(&self.mvd_master)
-    }
-    fn mvd_master_hhat(&self) -> &[u8; 32] {
-        Self::second_half(&self.mvd_master)
-    }
-
-    fn first_half(buf: &[u8; 64]) -> &[u8; 32] {
-        // SAFETY: u8 slice → &[u8; 32] cast for the first 32 bytes.
-        // Length-checked at compile time (input is &[u8; 64]).
-        let first: &[u8] = &buf[..32];
-        first.try_into().expect("32-byte slice")
-    }
-    fn second_half(buf: &[u8; 64]) -> &[u8; 32] {
-        let second: &[u8] = &buf[32..];
-        second.try_into().expect("32-byte slice")
+    /// The seed variants the encoder may choose from and the decoder tries,
+    /// in order: `gop_variant(gop, 0..v2_knobs::seed_variants())`. One entry
+    /// (= [`Self::gop`]) unless the experiment knob is set.
+    pub fn gop_variants(&self, gop: u32) -> Vec<GopSeeds> {
+        (0..super::v2_knobs::seed_variants()).map(|a| self.gop_variant(gop, a)).collect()
     }
 }
 
@@ -138,86 +93,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derive_succeeds_with_any_nonempty_passphrase() {
-        let keys = CabacStegoMasterKeys::derive("test-passphrase").unwrap();
-        let _ = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
+    fn seed_variants_are_independent_and_variant_0_is_the_v2_seed() {
+        let k = H264StcKeys::derive("variants").unwrap();
+        for g in [0u32, 3] {
+            assert_eq!(k.gop_variant(g, 0), k.gop(g));
+            let v: Vec<GopSeeds> = (0..4).map(|a| k.gop_variant(g, a)).collect();
+            for i in 0..4 {
+                for j in i + 1..4 {
+                    assert_ne!(v[i].order, v[j].order);
+                    assert_ne!(v[i].hhat, v[j].hhat);
+                }
+            }
+            assert_eq!(k.gop_variant(g, 2), H264StcKeys::derive("variants").unwrap().gop_variant(g, 2));
+        }
+        // Default knob: one variant, the v2 seed.
+        assert_eq!(k.gop_variants(5), vec![k.gop(5)]);
     }
 
     #[test]
-    fn same_passphrase_produces_same_seeds() {
-        let a = CabacStegoMasterKeys::derive("same").unwrap();
-        let b = CabacStegoMasterKeys::derive("same").unwrap();
-        for &domain in &[
-            EmbedDomain::CoeffSignBypass,
-            EmbedDomain::CoeffSuffixLsb,
-            EmbedDomain::MvdSignBypass,
-            EmbedDomain::MvdSuffixLsb,
-        ] {
-            for gop in [0u32, 1, 5, 100] {
-                assert_eq!(
-                    a.per_gop_seeds(domain, gop),
-                    b.per_gop_seeds(domain, gop),
-                    "determinism: {domain:?} gop={gop}",
-                );
-            }
+    fn deterministic_and_keyed() {
+        let a = H264StcKeys::derive("same").unwrap();
+        let b = H264StcKeys::derive("same").unwrap();
+        let c = H264StcKeys::derive("other").unwrap();
+        for g in [0u32, 1, 7, 100] {
+            assert_eq!(a.gop(g), b.gop(g));
+            assert_ne!(a.gop(g), c.gop(g));
         }
     }
 
+    /// Every GOP has its own order and H-hat (v1 reused GOP 0's H-hat).
     #[test]
-    fn different_passphrase_produces_different_seeds() {
-        let a = CabacStegoMasterKeys::derive("alpha").unwrap();
-        let b = CabacStegoMasterKeys::derive("beta").unwrap();
-        let sa = a.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        let sb = b.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        assert_ne!(sa, sb);
+    fn per_gop_seeds_differ() {
+        let k = H264StcKeys::derive("gops").unwrap();
+        let (s0, s1) = (k.gop(0), k.gop(1));
+        assert_ne!(s0.order, s1.order);
+        assert_ne!(s0.hhat, s1.hhat);
+        assert_ne!(s0.order, s0.hhat);
     }
 
+    /// The H.264 seeds are the shared primitive's, with the H.264 codec tag.
     #[test]
-    fn four_domains_produce_distinct_seeds_at_same_gop() {
-        let keys = CabacStegoMasterKeys::derive("isolation").unwrap();
-        let cs = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        let cl = keys.per_gop_seeds(EmbedDomain::CoeffSuffixLsb, 0);
-        let ms = keys.per_gop_seeds(EmbedDomain::MvdSignBypass, 0);
-        let ml = keys.per_gop_seeds(EmbedDomain::MvdSuffixLsb, 0);
-        // All four must be pairwise distinct — this is the cross-
-        // domain isolation property.
-        let all = [cs, cl, ms, ml];
-        for i in 0..all.len() {
-            for j in (i + 1)..all.len() {
-                assert_ne!(all[i], all[j], "domain seeds {i} and {j} collided");
-            }
+    fn matches_the_shared_primitive() {
+        let mut m = [0u8; 64];
+        for (i, b) in m.iter_mut().enumerate() {
+            *b = i as u8;
         }
-    }
-
-    #[test]
-    fn perm_and_hhat_seeds_are_distinct() {
-        let keys = CabacStegoMasterKeys::derive("perm-vs-hhat").unwrap();
-        let s = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        assert_ne!(
-            s.perm_seed, s.hhat_seed,
-            "perm and hhat seeds must be uncorrelated within one domain",
-        );
-    }
-
-    #[test]
-    fn different_gops_produce_different_seeds() {
-        let keys = CabacStegoMasterKeys::derive("gop-isolation").unwrap();
-        let s0 = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        let s1 = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 1);
-        assert_ne!(s0, s1);
-    }
-
-    #[test]
-    fn coeff_and_mvd_masters_are_uncorrelated() {
-        // The coeff_master and mvd_master come from different Argon2
-        // salts. Their first-32-byte slices must differ.
-        let keys = CabacStegoMasterKeys::derive("master-split").unwrap();
-        // Indirect check: at gop=0 the coeff-domain seeds must
-        // differ from the MVD-domain seeds even with the same
-        // label structure.
-        let coeff = keys.per_gop_seeds(EmbedDomain::CoeffSignBypass, 0);
-        let mvd = keys.per_gop_seeds(EmbedDomain::MvdSignBypass, 0);
-        assert_ne!(coeff.perm_seed, mvd.perm_seed);
-        assert_ne!(coeff.hhat_seed, mvd.hhat_seed);
+        let k = H264StcKeys::from_master(m);
+        assert_eq!(k.gop(7), gop_seeds(&m, VideoCodec::H264, 7));
     }
 }

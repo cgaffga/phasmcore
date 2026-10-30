@@ -96,6 +96,13 @@ pub mod shadow;
 // `docs/design/video/av1/phase-c-wv-whole-video-shadow.md`. Needs
 // both features because the encode path self-verifies via the
 // decoder hook (`harvest_cover_bits_from_stego`).
+// Flood detection for decode-and-replan (spec § 7).
+#[cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
+pub mod flood;
+// Damage-aware per-GOP caps: dense GOPs carry less.
+#[cfg(feature = "av1-encoder")]
+pub mod density_cap;
+
 #[cfg(all(feature = "av1-encoder", feature = "av1-decoder"))]
 pub mod whole_video;
 

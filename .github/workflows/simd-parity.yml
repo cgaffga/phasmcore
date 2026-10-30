@@ -56,6 +56,8 @@ jobs:
             require_avx2: false
     runs-on: ${{ matrix.os }}
     steps:
+      # No submodules: image-only builds resolve rav1e from the crates.io
+      # index and need none of vendor/ (BUILDING.md).
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +88,8 @@ jobs:
             features: -C target-feature=+sse2
     runs-on: ubuntu-latest
     steps:
+      # No submodules: image-only builds resolve rav1e from the crates.io
+      # index and need none of vendor/ (BUILDING.md).
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@nightly

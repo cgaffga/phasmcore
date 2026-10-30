@@ -5,7 +5,7 @@
 //! Memory budget prediction + telemetry.
 //!
 //! Provides peak-RSS prediction (`predict_peak_memory()`, the `ModeId` /
-//! `GhostShadowRung` enums) and the public API every bridge calls at
+//! `GhostRung` enums, [`ghost_lane_plan`]) and the public API every bridge calls at
 //! startup:
 //!
 //! - `set_memory_budget(Some(bytes))` — bridge tells core the
@@ -43,20 +43,87 @@ pub enum ModeId {
     Av1WholeVideoShadow = 7,
 }
 
-/// Ladder rung selection for Ghost shadow encode. Rung 0 = default
-/// behavior (fast, parallel); higher rungs trade wall-clock for peak
-/// memory. The rung selection logic lives in `shadows_encode`.
+/// Ladder rung of a Ghost encode (`docs/design/image/ghost-embedding-v3.md`,
+/// "Memory"): how many embedding lanes are planned at once and whether a lane
+/// keeps its trellis back pointers in memory. Every rung writes the same
+/// bytes; higher rungs trade wall-clock for peak memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhostShadowRung {
-    /// Rung 0: full parallel, cover_wavelets cache on. Default.
+pub enum GhostRung {
+    /// Rung 0: one lane per worker (all lanes at once if fewer), inline
+    /// trellis. Default (no budget: CLI, crate, tests).
     FullParallel,
-    /// Rung 1: cap rayon workers to 1, cover_wavelets cache on.
+    /// Rung 1: as many lanes at once as the budget allows (≥ 2), inline.
     CappedParallel,
-    /// Rung 2: cap rayon workers to 1, drop cover_wavelets cache
-    /// (re-stream positions per cascade iter; ~6× slower per iter).
-    StreamingNoCache,
-    /// Rung 3: rung 2 + drop early original_y/cascade_positions clones.
-    MinimalClones,
+    /// Rung 2: one lane at a time, inline trellis.
+    SingleLane,
+    /// Rung 3: one lane at a time, segmented trellis (back pointers
+    /// recomputed per segment: `O(√n)` memory, twice the trellis work).
+    Segmented,
+}
+
+impl GhostRung {
+    /// Telemetry code (0..=3).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            GhostRung::FullParallel => 0,
+            GhostRung::CappedParallel => 1,
+            GhostRung::SingleLane => 2,
+            GhostRung::Segmented => 3,
+        }
+    }
+}
+
+/// How a Ghost encode plans its lanes ([`ghost_lane_plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhostLanePlan {
+    pub rung: GhostRung,
+    /// Lanes planned at the same time.
+    pub parallel_lanes: usize,
+    /// Back-pointer bytes one lane may keep (above: segmented trellis).
+    pub lane_inline_bytes: usize,
+    /// Most positions whose costs are held at once (`v3::EncodeOpts::group_positions`).
+    pub group_positions: usize,
+}
+
+/// Ceiling of the Ghost encoder's own allocations when a budget is set (the
+/// apps, WASM): with the app's own ~0.1–0.2 GB this keeps an encode under
+/// 1 GB up to ~100 MP (4:2:0). Larger covers need more: the parsed JPEG and
+/// the keyed order alone are ~7.2 B per pixel.
+pub const GHOST_TARGET_BYTES: usize = 800 << 20;
+
+/// Bytes of a Ghost encode that grow with the pixel count, excluding lanes
+/// and cost groups: the parsed JPEG (Y i16 + 4:2:0 chroma, 3 B/px), the keyed
+/// order (u32 per AC, ~4 B/px), the output JPEG (~0.25 B/px); side
+/// information adds 1 B/px (+ the caller's RGB, 3 B/px), shadows ~2 B/px
+/// (wet mask, region orders).
+pub fn ghost_fixed_bytes(mode: ModeId, pixels: usize) -> usize {
+    let quarter_bytes = match mode {
+        ModeId::GhostNoShadow => 29,
+        ModeId::GhostSi => 29 + 16,
+        ModeId::GhostShadow => 29 + 8,
+        ModeId::GhostSiShadow => 29 + 16 + 8,
+        _ => 29,
+    };
+    pixels.saturating_mul(quarter_bytes) / 4 + FIXED_OVERHEAD_BYTES
+}
+
+/// Back-pointer table one lane may keep in memory (in-memory Viterbi), on
+/// top of the share of the cover's in-flight working set
+/// (`v3::lane_inline_share`): a full-length lane (< 2²¹ positions, 64 B each
+/// at the wire's h = 9) always fits; longer lanes (short frames) keep what
+/// their share allows and recompute the rest.
+pub const LANE_INLINE_BYTES: usize = 128 << 20;
+
+/// Rayon workers an encode can use (1 without the `parallel` feature).
+pub fn encode_workers() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        rayon::current_num_threads().max(1)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        1
+    }
 }
 
 /// Static safety multiplier applied on top of the per-component sum.
@@ -83,42 +150,53 @@ pub fn predict_peak_memory(
     mode: ModeId,
     width: u32,
     height: u32,
-    rung: GhostShadowRung,
+    rung: GhostRung,
     n_workers: usize,
 ) -> usize {
     let pixels = (width as usize).saturating_mul(height as usize);
-    let bpp_base = bytes_per_pixel(mode, rung, n_workers);
-    let raw = pixels.saturating_mul(bpp_base).saturating_add(FIXED_OVERHEAD_BYTES);
+    let mut raw = if is_ghost_encode(mode) {
+        ghost_fixed_bytes(mode, pixels)
+    } else {
+        pixels.saturating_mul(bytes_per_pixel(mode)).saturating_add(FIXED_OVERHEAD_BYTES)
+    };
+    if is_ghost_encode(mode) {
+        // Lanes: a typical heavy payload (frame ≈ AC/16) on this cover.
+        let n_ac = pixels / 64 * 63;
+        let m = n_ac / 16;
+        let l = crate::stego::ghost::v3::lanes(n_ac, m);
+        let nk = n_ac.div_ceil(l);
+        let (k, inline) = match rung {
+            GhostRung::FullParallel => (n_workers.max(1).min(l), LANE_INLINE_BYTES),
+            GhostRung::CappedParallel => (2.min(l), LANE_INLINE_BYTES),
+            GhostRung::SingleLane => (1, LANE_INLINE_BYTES),
+            GhostRung::Segmented => (1, 0),
+        };
+        let h = crate::stego::ghost::v3::V3_STC_H;
+        let inline = inline.min(crate::stego::ghost::v3::lane_inline_share(n_ac, nk, k, h, n_workers));
+        let threads = crate::stego::ghost::v3::lane_threads(k, n_workers);
+        raw = raw.saturating_add(k.saturating_mul(crate::stego::ghost::v3::lane_bytes(nk, m.div_ceil(l), h, inline, threads)));
+        // One cost group of the lanes in flight (8 B per position).
+        raw = raw.saturating_add(k.saturating_mul(nk).saturating_mul(8));
+    }
     raw.saturating_mul(SAFETY_FACTOR_NUM) / SAFETY_FACTOR_DEN
 }
 
-/// Per-pixel byte budget for the dominant working buffers, indexed by
-/// mode and (where applicable) shadow ladder rung. See cost table at
-/// `docs/design/image/memory-budget-2026-05.md` § 1.
-fn bytes_per_pixel(mode: ModeId, rung: GhostShadowRung, n_workers: usize) -> usize {
-    let n = n_workers.max(1);
+fn is_ghost_encode(mode: ModeId) -> bool {
+    matches!(mode, ModeId::GhostNoShadow | ModeId::GhostShadow | ModeId::GhostSi | ModeId::GhostSiShadow)
+}
+
+/// Per-pixel byte budget for the dominant working buffers (Ghost encodes:
+/// without the lanes, which [`predict_peak_memory`] adds). See
+/// `docs/design/image/memory-budget-2026-05.md` § 1 and, for Ghost v3,
+/// `docs/design/image/ghost-embedding-v3.md` "Memory".
+fn bytes_per_pixel(mode: ModeId) -> usize {
     match mode {
-        ModeId::GhostNoShadow | ModeId::GhostSi => {
-            // luma f64 buffer + cost vec + positions Vec at peak.
-            // ~13 bytes/pixel observed at 12 MP in pre-shadow tests.
-            13
-        }
-        ModeId::GhostShadow | ModeId::GhostSiShadow => match rung {
-            // Rung 0: 12 (cover_wavelets) + 6 (cover_verify_positions)
-            //         + (12 + 6) × n_workers (per-worker stego_wavelets + img clones).
-            GhostShadowRung::FullParallel => 18 + 18 * n,
-            // Rung 1: same caches, single worker (no per-worker fanout).
-            GhostShadowRung::CappedParallel => 18 + 18,
-            // Rung 2: drop cover_wavelets + cover_verify_positions caches.
-            // Verify + cascade re-stream positions per iter (~6× slower).
-            GhostShadowRung::StreamingNoCache => 18,
-            // Rung 3: same as rung 2 for now. Future: skip
-            // cascade_positions clone (~4 bpp saved at 60 MP) by
-            // switching shadow::rebuild_shadow to indices. Predict
-            // matches rung 2 so the ladder doesn't promise headroom
-            // we haven't shipped yet.
-            GhostShadowRung::MinimalClones => 18,
-        },
+        // Ghost v3: see `ghost_fixed_bytes` (rounded up); costs are gathered
+        // per lane group, not held for the whole image.
+        ModeId::GhostNoShadow => 8,
+        ModeId::GhostSi => 12,
+        ModeId::GhostShadow => 10,
+        ModeId::GhostSiShadow => 14,
         ModeId::Armor => {
             // jpeg_to_luma_f64 (8 bytes/pixel) + Spectrum2D f64 complex
             // (16 bytes/pixel during FFT) + SectorLut (~0.3 bytes/pixel).
@@ -128,7 +206,12 @@ fn bytes_per_pixel(mode: ModeId, rung: GhostShadowRung, n_workers: usize) -> usi
         }
         ModeId::Decode => {
             // Lighter than encode: no cost surface, no STC embed buffers.
-            // luma f64 + positions Vec + small scratch.
+            // The parsed JPEG (~3 B/px) + the largest mode attempt: Ghost
+            // v1's nzAC order (~4 B/nzAC), the v1 cost-pool costs, or Armor
+            // (u32 order + LLR cache; its geometry stage streams the
+            // spectrum and the corrected image with a bounded working set).
+            // Measured 6.8-8.1 B/px at 48-110 MP (wrong passphrase, every
+            // mode tried).
             10
         }
         ModeId::Av1WholeVideoShadow => {
@@ -226,6 +309,56 @@ pub fn get_memory_budget() -> Option<usize> {
     *budget_cell().lock().unwrap()
 }
 
+/// Heap two `smart_decode` stages may hold at once, beyond the parsed
+/// image, when the `parallel` build runs them side by side (lowered to a
+/// quarter of the memory budget if one is set): on inputs above
+/// `ARMOR_TARGET_DIMENSION`, the v1 cost pass + pools next to Armor.
+/// Stages whose estimated peaks ([`DecodeStageHeap`]) add up to more run
+/// one after another, so overlap never raises the decode's peak above
+/// parse + this cap: typical photos up to ~16–18 MP overlap, a 48 MP cover
+/// keeps its serial peak.
+pub const DECODE_OVERLAP_BYTES: usize = 192 << 20;
+
+/// Estimated peak heap (beyond the parsed image) of the `smart_decode`
+/// stages that may overlap, for one cover. Upper bounds from the counting
+/// allocator (`examples/mem_probe`, 12 and 48 MP, Mac, 2026-10-29); `n` =
+/// Y coefficients (≈ pixels), `nz` = Y non-zero AC coefficients:
+///
+/// - the v1 cost order (`legacy_v1_cost_order`): 8 B per position kept
+///   + the stable sort's half-length scratch + strip buffers → 20 `nz`;
+/// - the v1 cost pools: the held order (8 B) + one-pass priorities of the
+///   largest pool (8 B + 4 B per member, half the order) + bitmaps
+///   → 14 `nz` + `n` / 4;
+/// - Armor (Fortress, STDM, geometric): ≤ 3.9 B per coefficient + one
+///   Argon2 (19 MiB) → 4 `n` + 20 MiB.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeStageHeap {
+    /// The v1 cost order (cost pass + sort).
+    pub legacy_order: usize,
+    /// The v1 cost pools (order held).
+    pub legacy_pools: usize,
+    /// Fortress, Armor STDM and geometric recovery.
+    pub armor: usize,
+}
+
+impl DecodeStageHeap {
+    /// Estimates for a cover of `n` Y coefficients, `nz` of them non-zero AC.
+    pub fn for_cover(n: usize, nz: usize) -> Self {
+        Self {
+            legacy_order: nz.saturating_mul(20),
+            legacy_pools: nz.saturating_mul(14).saturating_add(n / 4),
+            armor: n.saturating_mul(4).saturating_add(20 << 20),
+        }
+    }
+}
+
+/// Whether stages of estimated peaks `a` and `b` may run at once
+/// ([`DECODE_OVERLAP_BYTES`], or a quarter of the budget if lower).
+pub fn decode_overlap_ok(a: usize, b: usize) -> bool {
+    let cap = get_memory_budget().map_or(DECODE_OVERLAP_BYTES, |m| (m / 4).min(DECODE_OVERLAP_BYTES));
+    a.saturating_add(b) <= cap
+}
+
 /// Telemetry events emitted at key points in the encode/decode
 /// lifecycle. Hook in your analytics via `set_telemetry_hook`.
 ///
@@ -315,34 +448,80 @@ pub(crate) fn emit(event: TelemetryEvent) {
     }
 }
 
-/// Helper: select a Ghost shadow ladder rung given image dimensions
-/// and the current budget. Returns `FullParallel` when budget is
-/// `None` (no limit), else descends until predicted ≤ budget. Worst
-/// case (predicted > budget at every rung) returns `MinimalClones`.
+/// Plan a Ghost encode's lanes for a cover of `width × height` with `n_ac`
+/// Y AC coefficients, a frame of `m_bits` and STC height `h`.
 ///
-/// Called once per encode. Kept in this module so the
-/// prediction coefficients and the selection logic live together.
-pub fn select_ghost_shadow_rung(
-    mode: ModeId,
-    width: u32,
-    height: u32,
-    n_workers: usize,
-) -> GhostShadowRung {
-    let budget = match get_memory_budget() {
-        Some(b) => b,
-        None => return GhostShadowRung::FullParallel,
+/// No budget (CLI, crate, tests) → [`GhostRung::FullParallel`], one cost
+/// group, lanes in memory as far as the cover's in-flight working set
+/// allows (`v3::lane_inline_share`, applied by the planner). With a budget,
+/// the encoder's own allocations stay within
+/// `min(budget / 1.5, GHOST_TARGET_BYTES)`: the fastest of — in-memory lanes
+/// on every worker with one cost pass; the same with more cost passes
+/// (smaller groups); checkpointed lanes; fewer lanes at once. Every choice
+/// writes the same bytes.
+pub fn ghost_lane_plan(mode: ModeId, width: u32, height: u32, n_ac: usize, m_bits: usize, h: usize) -> GhostLanePlan {
+    use crate::stego::ghost::v3;
+    let workers = encode_workers();
+    let l = v3::lanes(n_ac, m_bits.max(1));
+    let k_max = workers.min(l).max(1);
+    let full = GhostLanePlan {
+        rung: GhostRung::FullParallel,
+        parallel_lanes: k_max,
+        lane_inline_bytes: LANE_INLINE_BYTES,
+        group_positions: usize::MAX,
     };
-    for rung in [
-        GhostShadowRung::FullParallel,
-        GhostShadowRung::CappedParallel,
-        GhostShadowRung::StreamingNoCache,
-        GhostShadowRung::MinimalClones,
-    ] {
-        if predict_peak_memory(mode, width, height, rung, n_workers) <= budget {
-            return rung;
+    let Some(budget) = get_memory_budget() else {
+        return full;
+    };
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let limit = (budget.saturating_mul(SAFETY_FACTOR_DEN) / SAFETY_FACTOR_NUM).min(GHOST_TARGET_BYTES);
+    let avail = limit.saturating_sub(ghost_fixed_bytes(mode, pixels));
+    let nk = n_ac.div_ceil(l);
+    let bits = m_bits.div_ceil(l);
+    // One lane's working set with `k` lanes at once: its table as far as its
+    // share allows (`inline(k)`, the plan's `lane_inline_bytes`), or
+    // checkpointed; idle workers help recompute.
+    let inline = |k: usize| LANE_INLINE_BYTES.min(v3::lane_inline_share(n_ac, nk, k, h, workers));
+    let lane_in = |k: usize| v3::lane_bytes(nk, bits, h, inline(k), v3::lane_threads(k, workers));
+    let lane_seg = |k: usize| v3::lane_bytes(nk, bits, h, 0, v3::lane_threads(k, workers));
+    // Cost-group positions that fit, at least one lane's worth. A group is
+    // gathered (8 B per position: sort index + costs, plus one cost strip),
+    // then its lanes run `k` at a time next to its costs (4 B per position).
+    let strip = crate::stego::cost::uniward::COST_STRIP_WORKING_BYTES;
+    let group = |k: usize, lane: usize| -> Option<usize> {
+        let lanes_rest = avail.checked_sub(k.saturating_mul(lane))?;
+        let gather_rest = avail.checked_sub(strip)?;
+        let g = (gather_rest / 8).min(lanes_rest / 4);
+        (g >= nk).then_some(g.min(n_ac))
+    };
+    if let Some(g) = group(k_max, lane_in(k_max)) {
+        let lane_inline_bytes = inline(k_max);
+        if g >= n_ac {
+            return GhostLanePlan { lane_inline_bytes, group_positions: usize::MAX, ..full };
+        }
+        // Prefer checkpointed lanes on every worker in one or two cost
+        // passes over in-memory lanes with many more passes.
+        if let Some(gs) = group(k_max, lane_seg(k_max))
+            && n_ac.div_ceil(gs) + 1 < n_ac.div_ceil(g)
+        {
+            return GhostLanePlan { rung: GhostRung::Segmented, parallel_lanes: k_max, lane_inline_bytes: 0, group_positions: gs };
+        }
+        return GhostLanePlan { rung: GhostRung::FullParallel, parallel_lanes: k_max, lane_inline_bytes, group_positions: g };
+    }
+    if let Some(g) = group(k_max, lane_seg(k_max)) {
+        return GhostLanePlan { rung: GhostRung::Segmented, parallel_lanes: k_max, lane_inline_bytes: 0, group_positions: g };
+    }
+    for k in (1..k_max).rev() {
+        if let Some(g) = group(k, lane_in(k)) {
+            let rung = if k > 1 { GhostRung::CappedParallel } else { GhostRung::SingleLane };
+            return GhostLanePlan { rung, parallel_lanes: k, lane_inline_bytes: inline(k), group_positions: g };
+        }
+        if let Some(g) = group(k, lane_seg(k)) {
+            return GhostLanePlan { rung: GhostRung::Segmented, parallel_lanes: k, lane_inline_bytes: 0, group_positions: g };
         }
     }
-    GhostShadowRung::MinimalClones
+    // Over the target whatever we do (very large covers): the leanest plan.
+    GhostLanePlan { rung: GhostRung::Segmented, parallel_lanes: 1, lane_inline_bytes: 0, group_positions: nk }
 }
 
 #[cfg(test)]
@@ -351,53 +530,35 @@ mod tests {
 
     #[test]
     fn predict_grows_linearly_with_pixels() {
-        let p1 = predict_peak_memory(
-            ModeId::GhostShadow, 4000, 3000,
-            GhostShadowRung::FullParallel, 6,
-        );
-        let p2 = predict_peak_memory(
-            ModeId::GhostShadow, 8000, 6000,
-            GhostShadowRung::FullParallel, 6,
-        );
-        // 4× pixels → between 3× and 5× memory (linear plus fixed overhead).
-        assert!(p2 > p1 * 3, "p2={} should be > 3×p1={}", p2, p1 * 3);
+        let p1 = predict_peak_memory(ModeId::GhostShadow, 4000, 3000, GhostRung::SingleLane, 6);
+        let p2 = predict_peak_memory(ModeId::GhostShadow, 8000, 6000, GhostRung::SingleLane, 6);
+        // 4× pixels → between 2× and 5× memory (linear plus lanes, which do
+        // not grow with the cover).
+        assert!(p2 > p1 * 2, "p2={} should be > 2×p1={}", p2, p1 * 2);
         assert!(p2 < p1 * 5, "p2={} should be < 5×p1={}", p2, p1 * 5);
     }
 
     #[test]
     fn rung_ordering_monotone() {
-        let w = 8000u32;
-        let h = 6000u32;
-        let r0 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostShadowRung::FullParallel, 6);
-        let r1 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostShadowRung::CappedParallel, 6);
-        let r2 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostShadowRung::StreamingNoCache, 6);
-        let r3 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostShadowRung::MinimalClones, 6);
-        assert!(r0 > r1, "rung 0 ({}) > rung 1 ({})", r0, r1);
-        assert!(r1 > r2, "rung 1 ({}) > rung 2 ({})", r1, r2);
-        // Rung 3 currently predicts same as rung 2 — the
-        // cascade_positions skip is a planned follow-on. Track via the
-        // explicit follow-up task #669 (filed in M4).
-        assert!(r2 >= r3, "rung 2 ({}) >= rung 3 ({})", r2, r3);
+        let (w, h) = (8000u32, 6000u32);
+        let r0 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::FullParallel, 6);
+        let r1 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::CappedParallel, 6);
+        let r2 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::SingleLane, 6);
+        let r3 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::Segmented, 6);
+        assert!(r0 > r1, "rung 0 ({r0}) > rung 1 ({r1})");
+        assert!(r1 > r2, "rung 1 ({r1}) > rung 2 ({r2})");
+        assert!(r2 > r3, "rung 2 ({r2}) > rung 3 ({r3})");
     }
 
+    /// 12 MP: ~0.1 GB of fixed buffers (parsed JPEG, keyed order); each
+    /// in-memory lane adds ~80 MB at h = 9 (64 B of back pointers + 8 B of
+    /// vectors per position), plus its cost group.
     #[test]
-    fn predict_60mp_shadow_in_expected_range() {
-        // 60 MP (60_000_000 pixels) Ghost shadow at rung 0 with 6 workers.
-        // Cost table: 18 + 18×6 = 126 bytes/pixel × 60 MP = 7.56 GB raw.
-        // ×1.5 safety = 11.3 GB. This is the predicted peak the ladder
-        // tries to avoid by stepping down rungs.
-        let peak = predict_peak_memory(
-            ModeId::GhostShadow, 10000, 6000,
-            GhostShadowRung::FullParallel, 6,
-        );
-        // 60 MP, 126 bpp, ×1.5 ≈ 11.3 GB. Allow ±10% for fixed overhead.
-        let expected_mb = (60_000_000usize * 126 * 3 / 2) / (1024 * 1024);
-        let actual_mb = peak / (1024 * 1024);
-        assert!(
-            actual_mb >= (expected_mb * 9 / 10) && actual_mb <= (expected_mb * 11 / 10),
-            "60 MP rung-0 peak {} MB, expected ~{} MB",
-            actual_mb, expected_mb,
-        );
+    fn predict_12mp_in_expected_range() {
+        let base = predict_peak_memory(ModeId::GhostNoShadow, 4032, 3024, GhostRung::Segmented, 6) / (1 << 20);
+        let full = predict_peak_memory(ModeId::GhostNoShadow, 4032, 3024, GhostRung::FullParallel, 6) / (1 << 20);
+        assert!((120..=250).contains(&base), "12 MP segmented {base} MB");
+        assert!(full > base + 6 * 60 && full < base + 6 * 160, "12 MP 6 lanes {full} MB (base {base})");
     }
 
     // ===== M2 API tests =====
@@ -423,32 +584,70 @@ mod tests {
         assert_eq!(get_memory_budget(), None);
     }
 
+    const N12: usize = 4032 / 8 * (3024 / 8) * 63;
+
     #[test]
-    fn select_rung_no_budget_returns_full_parallel() {
+    fn lane_plan_no_budget_is_full_parallel() {
         let _g = api_lock();
         set_memory_budget(None);
-        let r = select_ghost_shadow_rung(ModeId::GhostShadow, 10000, 6000, 6);
-        assert_eq!(r, GhostShadowRung::FullParallel);
+        let p = ghost_lane_plan(ModeId::GhostShadow, 4032, 3024, N12, 700_000, 9);
+        assert_eq!(p.rung, GhostRung::FullParallel);
+        assert_eq!(p.lane_inline_bytes, LANE_INLINE_BYTES);
+        assert_eq!(p.group_positions, usize::MAX);
+    }
+
+    /// Under a budget the plan fits `min(budget / 1.5, GHOST_TARGET_BYTES)`
+    /// (fixed buffers + lanes + one cost group), for any cover size the
+    /// target can hold; tiny budgets fall back to one checkpointed lane.
+    #[test]
+    fn lane_plan_fits_the_budget() {
+        use crate::stego::ghost::v3;
+        let _g = api_lock();
+        for budget in [400usize << 20, 1200 << 20, 1674 << 20, 3 << 30] {
+            set_memory_budget(Some(budget));
+            let limit = (budget * 2 / 3).min(GHOST_TARGET_BYTES);
+            for (w, hgt) in [(4032u32, 3024u32), (8064, 6048), (11_552, 8_672)] {
+                let n = (w as usize / 8) * (hgt as usize / 8) * 63;
+                for m in [25_000usize, n / 40, n / 6] {
+                    let p = ghost_lane_plan(ModeId::GhostNoShadow, w, hgt, n, m, 9);
+                    let l = v3::lanes(n, m);
+                    let nk = n.div_ceil(l);
+                    // As the planner runs a batch of `parallel_lanes` lanes.
+                    let workers = encode_workers();
+                    let k = p.parallel_lanes.min(workers).min(l);
+                    let inline = p.lane_inline_bytes.min(v3::lane_inline_share(n, nk, k, 9, workers));
+                    let lane = v3::lane_bytes(nk, m.div_ceil(l), 9, inline, v3::lane_threads(k, workers));
+                    // Gather phase (8 B per group position + a cost strip),
+                    // then lanes next to the group's costs (4 B per position).
+                    let g = p.group_positions.min(n);
+                    let used = ghost_fixed_bytes(ModeId::GhostNoShadow, w as usize * hgt as usize)
+                        + (g * 8 + crate::stego::cost::uniward::COST_STRIP_WORKING_BYTES)
+                            .max(g * 4 + k * lane);
+                    let fixed = ghost_fixed_bytes(ModeId::GhostNoShadow, w as usize * hgt as usize);
+                    if fixed + lane_bytes_min(nk) < limit {
+                        assert!(used <= limit, "budget {budget} {w}x{hgt} m={m}: {p:?} uses {used} > {limit}");
+                    }
+                    assert!(p.parallel_lanes >= 1 && p.group_positions >= nk.min(n), "{p:?}");
+                }
+            }
+        }
+        set_memory_budget(Some(1 << 20));
+        let p = ghost_lane_plan(ModeId::GhostNoShadow, 4032, 3024, N12, 700_000, 9);
+        assert_eq!((p.rung, p.parallel_lanes), (GhostRung::Segmented, 1));
+        set_memory_budget(None);
+    }
+
+    /// A checkpointed lane plus a one-lane cost group (test helper bound).
+    fn lane_bytes_min(nk: usize) -> usize {
+        crate::stego::ghost::v3::lane_bytes(nk, nk / 8, 9, 0, 1) + nk * 8
     }
 
     #[test]
-    fn select_rung_tight_budget_descends() {
+    fn lane_plan_generous_budget_keeps_full() {
         let _g = api_lock();
-        // 60 MP rung 0 needs ~11 GB; rung 3 needs ~0.85 GB.
-        // Pass a 1 GB budget — must pick rung 3.
-        set_memory_budget(Some(1_073_741_824));
-        let r = select_ghost_shadow_rung(ModeId::GhostShadow, 10000, 6000, 6);
-        assert_eq!(r, GhostShadowRung::MinimalClones);
-        set_memory_budget(None);
-    }
-
-    #[test]
-    fn select_rung_generous_budget_keeps_full() {
-        let _g = api_lock();
-        // 12 MP rung 0 needs ~2.3 GB at 6 workers. Pass 8 GB.
-        set_memory_budget(Some(8 * 1024 * 1024 * 1024));
-        let r = select_ghost_shadow_rung(ModeId::GhostShadow, 4000, 3000, 6);
-        assert_eq!(r, GhostShadowRung::FullParallel);
+        set_memory_budget(Some(8 << 30));
+        let p = ghost_lane_plan(ModeId::GhostShadow, 4032, 3024, N12, 700_000, 9);
+        assert_eq!(p.rung, GhostRung::FullParallel);
         set_memory_budget(None);
     }
 

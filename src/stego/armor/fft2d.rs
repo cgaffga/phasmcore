@@ -511,6 +511,224 @@ pub fn fft2d_test_hash_hex() -> String {
     hash.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Read access + bounded partial spectrum (decoder)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Read access to the bins of a `width × height` forward spectrum by flat
+/// row-major index (`v * width + u`). Template detection and DFT-ring
+/// extraction read through this, so they work on a full `Spectrum2D` and on a
+/// `PartialSpectrum` alike.
+pub trait SpectrumView {
+    fn width(&self) -> usize;
+    fn height(&self) -> usize;
+    fn bin(&self, idx: usize) -> Complex32;
+}
+
+impl SpectrumView for Spectrum2D {
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
+    #[inline]
+    fn bin(&self, idx: usize) -> Complex32 {
+        self.data[idx]
+    }
+}
+
+/// A half-open rectangle of spectrum bins: columns `c0..c1`, rows `r0..r1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BinRect {
+    pub c0: usize,
+    pub c1: usize,
+    pub r0: usize,
+    pub r1: usize,
+}
+
+impl BinRect {
+    /// Columns `cu - ru ..= cu + ru` and rows `cv - rv ..= cv + rv`, clipped to
+    /// a `w × h` spectrum; `None` if nothing is left.
+    pub fn around(cu: isize, cv: isize, ru: isize, rv: isize, w: usize, h: usize) -> Option<Self> {
+        let c0 = (cu - ru).max(0);
+        let c1 = (cu + ru + 1).min(w as isize);
+        let r0 = (cv - rv).max(0);
+        let r1 = (cv + rv + 1).min(h as isize);
+        (c0 < c1 && r0 < r1).then(|| BinRect {
+            c0: c0 as usize,
+            c1: c1 as usize,
+            r0: r0 as usize,
+            r1: r1 as usize,
+        })
+    }
+
+    #[inline]
+    fn contains(&self, u: usize, v: usize) -> bool {
+        u >= self.c0 && u < self.c1 && v >= self.r0 && v < self.r1
+    }
+}
+
+/// The bins of `fft2d(pixels)` inside a few rectangles, bit for bit, computed
+/// without the image or the full spectrum in memory (see `partial_spectrum`).
+pub struct PartialSpectrum {
+    width: usize,
+    height: usize,
+    rects: Vec<BinRect>,
+    data: Vec<Vec<Complex32>>,
+}
+
+impl SpectrumView for PartialSpectrum {
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
+    /// Panics on a bin outside every rectangle: the caller asked for the
+    /// wrong rectangles, which is a bug, not an input condition.
+    #[inline]
+    fn bin(&self, idx: usize) -> Complex32 {
+        let (u, v) = (idx % self.width, idx / self.width);
+        for (r, d) in self.rects.iter().zip(&self.data) {
+            if r.contains(u, v) {
+                return d[(v - r.r0) * (r.c1 - r.c0) + (u - r.c0)];
+            }
+        }
+        panic!("PartialSpectrum: bin ({u}, {v}) was not computed");
+    }
+}
+
+/// Row-FFT output one pass of `partial_spectrum` may hold: the needed columns
+/// over the full height. More columns than fit take further passes, each
+/// re-running the row FFTs (time, not memory).
+pub const PARTIAL_SPECTRUM_PASS_BYTES: usize = 160 << 20;
+
+/// Block rows produced and row-transformed together.
+const ROW_GROUP_BLOCKS: usize = 8;
+
+/// `fft2d` restricted to the bins inside `rects`, with a bounded working set.
+///
+/// `produce(br, strip)` writes pixel rows `8 br .. 8 br + 8` (row-major,
+/// `8 * width` values) of the real image; `height` must be a multiple of 8.
+/// It is called in order `br = 0, 1, …` once per pass.
+///
+/// Bit-identical to `fft2d`: each row goes through the same
+/// `fft1d_f32_with_plan` with the same row plan, and each needed column of
+/// the row output through the same call with the same column plan. Only the
+/// columns some rectangle needs are kept, at most `pass_bytes` of them at a
+/// time, and only the rectangles are kept after the column FFT. Peak memory
+/// is `pass_bytes` + the rectangles + one row group, independent of the
+/// image beyond that.
+pub fn partial_spectrum<P>(
+    width: usize,
+    height: usize,
+    rects: &[BinRect],
+    mut produce: P,
+    pass_bytes: usize,
+) -> PartialSpectrum
+where
+    P: FnMut(usize, &mut [f64]),
+{
+    assert!(height % 8 == 0 && width > 0);
+    let bh = height / 8;
+    let zero = Complex32::new(0.0, 0.0);
+
+    let mut need = vec![false; width];
+    for r in rects {
+        assert!(r.c1 <= width && r.r1 <= height);
+        need[r.c0..r.c1].iter_mut().for_each(|n| *n = true);
+    }
+    let cols: Vec<usize> = (0..width).filter(|&c| need[c]).collect();
+    drop(need);
+
+    let mut data: Vec<Vec<Complex32>> = rects
+        .iter()
+        .map(|r| vec![zero; (r.c1 - r.c0) * (r.r1 - r.r0)])
+        .collect();
+
+    // Same plans as fft2d.
+    let row_plan = if !width.is_power_of_two() && width > 1 {
+        Some(BluesteinPlan::new(width, -1.0))
+    } else {
+        None
+    };
+    let col_plan = if !height.is_power_of_two() && height > 1 {
+        Some(BluesteinPlan::new(height, -1.0))
+    } else {
+        None
+    };
+
+    let per_pass = (pass_bytes / (height * std::mem::size_of::<Complex32>())).max(1);
+    let mut strip = vec![0.0f64; ROW_GROUP_BLOCKS * 8 * width];
+
+    for batch in cols.chunks(per_pass) {
+        // Row-FFT output of the batch's columns, column-major.
+        let mut buf = vec![zero; batch.len() * height];
+        let buf_addr = buf.as_mut_ptr() as usize;
+
+        let mut br = 0;
+        while br < bh {
+            let g = ROW_GROUP_BLOCKS.min(bh - br);
+            for k in 0..g {
+                produce(br + k, &mut strip[k * 8 * width..(k + 1) * 8 * width]);
+            }
+            let y0 = br * 8;
+            let strip_ref = &strip;
+            // Safety: row `r` writes only buf[k * height + y0 + r]; distinct
+            // rows never alias, and `buf` outlives the loop.
+            let do_row = |r: usize| {
+                let row: Vec<Complex32> = strip_ref[r * width..(r + 1) * width]
+                    .iter()
+                    .map(|&v| Complex32::new(v as f32, 0.0))
+                    .collect();
+                let t = fft1d_f32_with_plan(&row, -1.0, row_plan.as_ref());
+                let dp = buf_addr as *mut Complex32;
+                for (k, &c) in batch.iter().enumerate() {
+                    unsafe {
+                        *dp.add(k * height + y0 + r) = t[c];
+                    }
+                }
+            };
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                (0..g * 8).into_par_iter().for_each(do_row);
+            }
+            #[cfg(not(feature = "parallel"))]
+            (0..g * 8).for_each(do_row);
+            br += g;
+        }
+
+        let do_col = |col: &mut [Complex32]| {
+            let t = fft1d_f32_with_plan(col, -1.0, col_plan.as_ref());
+            col.copy_from_slice(&t);
+        };
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            buf.par_chunks_mut(height).for_each(do_col);
+        }
+        #[cfg(not(feature = "parallel"))]
+        buf.chunks_mut(height).for_each(do_col);
+
+        for (r, d) in rects.iter().zip(data.iter_mut()) {
+            let rw = r.c1 - r.c0;
+            for (k, &c) in batch.iter().enumerate() {
+                if c < r.c0 || c >= r.c1 {
+                    continue;
+                }
+                let col = &buf[k * height..(k + 1) * height];
+                for v in r.r0..r.r1 {
+                    d[(v - r.r0) * rw + (c - r.c0)] = col[v];
+                }
+            }
+        }
+    }
+
+    PartialSpectrum { width, height, rects: rects.to_vec(), data }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,6 +749,41 @@ mod tests {
                 pixels[i],
                 recovered[i]
             );
+        }
+    }
+
+    #[test]
+    fn partial_spectrum_is_bit_identical_to_fft2d() {
+        // Power-of-two and Bluestein sizes, one and several passes.
+        for &(w, h) in &[(64usize, 48usize), (40, 64), (24, 16), (72, 56)] {
+            let pixels: Vec<f64> = (0..w * h)
+                .map(|i| ((i * 7919) % 251) as f64 * 0.73 - 40.0 + (i % w) as f64 * 0.1)
+                .collect();
+            let full = fft2d(&pixels, w, h);
+            let rects = [
+                BinRect::around(w as isize / 2, h as isize / 2, 9, 7, w, h).unwrap(),
+                BinRect::around(3, h as isize - 2, 5, 5, w, h).unwrap(),
+                BinRect::around(w as isize - 1, 0, 2, 3, w, h).unwrap(),
+            ];
+            for &pass in &[usize::MAX / 2, h * 8 * 3, 1] {
+                let part = partial_spectrum(
+                    w, h, &rects,
+                    |br, strip| strip.copy_from_slice(&pixels[br * 8 * w..(br + 1) * 8 * w]),
+                    pass,
+                );
+                for r in &rects {
+                    for v in r.r0..r.r1 {
+                        for u in r.c0..r.c1 {
+                            let (a, b) = (part.bin(v * w + u), full.data[v * w + u]);
+                            assert_eq!(
+                                (a.re.to_bits(), a.im.to_bits()),
+                                (b.re.to_bits(), b.im.to_bits()),
+                                "{w}x{h} pass {pass} bin ({u},{v})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

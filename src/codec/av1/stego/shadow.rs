@@ -105,7 +105,7 @@ pub(crate) fn cover_and_buckets_from_stego(
     let rec = super::decoder::decode_with_recording(gop_bytes)?;
     let bits = rec
         .iter()
-        .filter(|p| p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN || p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB)
+        .filter(|p| crate::stego::cost::av1_damage::av1_in_cover(p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN, p.coeff_magnitude))
         .map(|p| p.decoded_value)
         .collect();
     Ok((bits, shadow_buckets_from_decode(&rec)))
@@ -119,7 +119,7 @@ pub fn shadow_buckets_from_decode(
     let frames = rec.frames();
     let params = DamageParams::from_env();
     rec.iter()
-        .filter(|p| p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN || p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB)
+        .filter(|p| crate::stego::cost::av1_damage::av1_in_cover(p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN, p.coeff_magnitude))
         .map(|p| {
             let Some(f) = frames.get(p.frame as usize) else {
                 return None;

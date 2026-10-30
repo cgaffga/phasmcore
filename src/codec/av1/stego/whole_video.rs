@@ -155,6 +155,76 @@ pub(super) fn apply_phasm_av1_speed(config: &mut EncoderConfig) {
     }
 }
 
+/// Phasm AV1 colour signalling: the sequence header's colour description,
+/// from the encode's [`Av1Colour`] (the source's tags; see its doc).
+///
+/// The librav1e wrapper the MP4 names always passes rav1e a colour
+/// description, so the stream always sets `color_description_present_flag`,
+/// unspecified values included. Codes rav1e has no name for, and the
+/// identity matrix (which rav1e accepts only for 4:4:4), are signalled as
+/// unspecified. Bitstream only: the pixels, the cover and the decoder are
+/// unaffected.
+///
+/// Called by every production encoder construction site, with
+/// [`apply_phasm_av1_speed`].
+pub(super) fn apply_phasm_av1_colour(config: &mut EncoderConfig, colour: Av1Colour) {
+    use phasm_rav1e::color::{ColorDescription, ColorPrimaries as P, MatrixCoefficients as M, PixelRange, TransferCharacteristics as T};
+    let primaries = match colour.primaries {
+        1 => P::BT709,
+        4 => P::BT470M,
+        5 => P::BT470BG,
+        6 => P::BT601,
+        7 => P::SMPTE240,
+        8 => P::GenericFilm,
+        9 => P::BT2020,
+        10 => P::XYZ,
+        11 => P::SMPTE431,
+        12 => P::SMPTE432,
+        22 => P::EBU3213,
+        _ => P::Unspecified,
+    };
+    let transfer = match colour.transfer {
+        1 => T::BT709,
+        4 => T::BT470M,
+        5 => T::BT470BG,
+        6 => T::BT601,
+        7 => T::SMPTE240,
+        8 => T::Linear,
+        9 => T::Log100,
+        10 => T::Log100Sqrt10,
+        11 => T::IEC61966,
+        12 => T::BT1361,
+        13 => T::SRGB,
+        14 => T::BT2020_10Bit,
+        15 => T::BT2020_12Bit,
+        16 => T::SMPTE2084,
+        17 => T::SMPTE428,
+        18 => T::HLG,
+        _ => T::Unspecified,
+    };
+    let matrix = match colour.matrix {
+        1 => M::BT709,
+        4 => M::FCC,
+        5 => M::BT470BG,
+        6 => M::BT601,
+        7 => M::SMPTE240,
+        8 => M::YCgCo,
+        9 => M::BT2020NCL,
+        10 => M::BT2020CL,
+        11 => M::SMPTE2085,
+        12 => M::ChromatNCL,
+        13 => M::ChromatCL,
+        14 => M::ICtCp,
+        _ => M::Unspecified,
+    };
+    config.color_description = Some(ColorDescription {
+        color_primaries: primaries,
+        transfer_characteristics: transfer,
+        matrix_coefficients: matrix,
+    });
+    config.pixel_range = if colour.full_range { PixelRange::Full } else { PixelRange::Limited };
+}
+
 /// Phasm AV1 production sequence-level settings.
 ///
 /// `enable_large_lru` default: **true** — matches rav1e's `Sequence`
@@ -197,7 +267,7 @@ pub(super) fn apply_phasm_av1_sequence(sequence: &mut Sequence) {
     sequence.enable_large_lru = enable;
 }
 
-use crate::codec::av1::stego::session::Av1StreamingEncodeParams;
+use crate::codec::av1::stego::session::{Av1Colour, Av1StreamingEncodeParams};
 use crate::codec::av1::stego::shadow::{
     finalize_shadow_state_av1, prepare_shadow_pre_selection_av1,
     Av1ShadowSelectionSpec, Av1ShadowSelectionSweep, Av1ShadowSlot, Av1ShadowState,
@@ -762,7 +832,7 @@ pub fn av1_encode_with_shadows_streaming(
         // here fits no later tier either — `plan_primary`'s
         // `MessageTooLarge` ends the encode.
         let wet = shadow_wet_bits_per_gop(&shadow_states, &per_gop_cover_offsets, &per_gop_cover_lens);
-        let mut caps = super::primary_plan::gop_primary_caps(&per_gop_cover_lens, &wet);
+        let mut caps = super::primary_plan::damage_aware_caps(&per_gop_cover_lens, &wet, params.width, params.height);
         let mut attempts = 0usize;
         let tier_output = loop {
             let mut plan = super::primary_plan::plan_primary(&caps, primary_framed.len())?;
@@ -834,7 +904,7 @@ pub fn av1_encode_with_shadows_streaming(
                         shadow_states: &shadow_states,
                         master: &master,
                     };
-                    if let Some(bytes) = cascade_one_gop(inputs, shared)? {
+                    if let Some(bytes) = cascade_with_replan(inputs, shared)? {
                         break Some(bytes);
                     }
                     // `stc_embed` also returns `None` when the user cancelled;
@@ -1070,13 +1140,18 @@ pub fn av1_encode_streaming(
     // Exact from here on: which GOPs Pass 2 re-encodes is known.
     progress.set_total(all_frames + one_sweep + forecast.unstored_frames());
 
-    // ── Plan + Pass 2: per-GOP chunk sizes from the measured cover, then
+    // ── Plan + Pass 2: per-GOP chunk sizes from the measured cover (dense
+    // GOPs carry less, `density_cap`), then
     // embed each GOP from its Pass-1 entry. Over capacity is refused by
     // the plan, before any embed. A sweep that learns a GOP carries less
     // than planned and cannot carry the shortfall forward re-plans with
     // what it learned and sweeps again (from the cache — no re-encode).
-    let mut caps =
-        super::primary_plan::gop_primary_caps(&cover_lens, &vec![0; cover_lens.len()]);
+    let mut caps = super::primary_plan::damage_aware_caps(
+        &cover_lens,
+        &vec![0; cover_lens.len()],
+        params.width,
+        params.height,
+    );
     let mut shrinks = 0usize;
     let mut output = None;
     for sweep in 0..MAX_PRIMARY_PASSES {
@@ -1198,7 +1273,7 @@ fn embed_primary_pass(
                     shadow_states: &[],
                     master,
                 };
-                if let Some(packet) = cascade_one_gop(inputs, shared)? {
+                if let Some(packet) = cascade_with_replan(inputs, shared)? {
                     break packet;
                 }
                 // `stc_embed` also returns `None` when the user cancelled;
@@ -1255,6 +1330,7 @@ pub(super) fn process_one_gop_pass1(
 /// [`Pass1Entry`] (rebuilt from its cached packets, or re-encoded, by
 /// `pass1_entry_for`) plus the
 /// chunk the primary plan assigned it.
+#[derive(Clone, Copy)]
 pub(super) struct Av1CascadeGopInputs<'a> {
     pub gop_idx: usize,
     /// This GOP's first cover bit's offset into the union cover.
@@ -1274,6 +1350,7 @@ pub(super) struct Av1CascadeGopInputs<'a> {
 /// Whole-clip-scope inputs shared across every GOP within one parity
 /// tier of the cascade loop. Borrowed for the duration of one
 /// [`cascade_one_gop`] call.
+#[derive(Clone, Copy)]
 pub(super) struct Av1CascadeGopShared<'a> {
     /// Whole-clip total framed message length, for the chunk_frame
     /// v3 first-chunk header.
@@ -1301,9 +1378,73 @@ pub(super) struct Av1CascadeGopShared<'a> {
 /// of the `per_gop_natural[]` accumulator that previously dominated
 /// the O(clip) memory term at long clips (~75-100 KB/frame at 1080p).
 /// Pre-WV.7 whole-clip entry point was removed CR#5 (2026-10-18).
+/// Most re-embeds per GOP after a flood. Spec § 7 suggested two; at 50–90 %
+/// fill two left an occasional flooded GOP, so a third round, with the
+/// wet box doubling each time, catches a source the first box missed.
+const MAX_REPLANS: usize = 3;
+
+/// [`cascade_one_gop`] with decode-and-replan (spec § 7): decode the
+/// embedded GOP, and if a frame carries a flood ([`flood_region`]), keep the
+/// cover positions around the flood's source wet and embed again, at most
+/// [`MAX_REPLANS`] times. A replan the STC cannot satisfy ends the loop.
+/// When every round floods, the least damaged embed is kept
+/// ([`flood_severity`]): a re-embed moves flips, and can flood worse
+/// elsewhere than the round before.
+///
+/// [`flood_region`]: super::flood::flood_region
+/// [`flood_severity`]: super::flood::flood_severity
+pub(super) fn cascade_with_replan(
+    inputs: Av1CascadeGopInputs<'_>,
+    shared: Av1CascadeGopShared<'_>,
+) -> Result<Option<Vec<u8>>, Av1StegoError> {
+    let harvest = inputs.harvest;
+    let mut wet: Vec<u32> = Vec::new();
+    let mut best: Option<((usize, i64), Vec<u8>)> = None;
+    for round in 0..=MAX_REPLANS {
+        let Some(out) = cascade_one_gop(inputs, shared, &wet)? else {
+            // None on the first round; else the least damaged embed so far.
+            return Ok(best.map(|(_, b)| b));
+        };
+        let grids = super::decoder::decode_luma_block_grids(&out)?;
+        let Some(flood) = super::flood::flood_region(&harvest.natural_luma, &grids) else {
+            return Ok(Some(out));
+        };
+        let severity = super::flood::flood_severity(&harvest.natural_luma, &grids);
+        if std::env::var("PHASM_AV1_PROFILE").map(|v| v == "1").unwrap_or(false) {
+            eprintln!(
+                "[AV1_REPLAN] gop {} round {round}: flood in frame {} at ({},{})-({},{})",
+                inputs.gop_idx, flood.frame, flood.x0, flood.y0, flood.x1, flood.y1
+            );
+        }
+        if best.as_ref().is_none_or(|(b, _)| severity < *b) {
+            best = Some((severity, out));
+        }
+        if round == MAX_REPLANS {
+            break;
+        }
+        // The flood spreads right, down and down-left from its source, so
+        // the source lies around its first shifted block in raster order:
+        // wet that box (wider on each replan: ±64, ±128, ±256 px), in the
+        // flooded frame and every earlier one.
+        let r = 64 << round;
+        let (x0, y0) = (flood.sx.saturating_sub(r), flood.sy.saturating_sub(r));
+        let (x1, y1) = (flood.sx + r, flood.sy + r);
+        for (i, &(plane, px, py)) in harvest.locs.iter().enumerate() {
+            let (f, _) = harvest.combined_index[i];
+            let s = if plane == 0 { 1 } else { 2 }; // 4:2:0 chroma → luma coordinates
+            let (x, y) = (px as usize * s, py as usize * s);
+            if f <= flood.frame && (x0..x1).contains(&x) && (y0..y1).contains(&y) {
+                wet.push(i as u32);
+            }
+        }
+    }
+    Ok(best.map(|(_, b)| b))
+}
+
 pub(super) fn cascade_one_gop(
     inputs: Av1CascadeGopInputs<'_>,
     shared: Av1CascadeGopShared<'_>,
+    extra_wet: &[u32],
 ) -> Result<Option<Vec<u8>>, Av1StegoError> {
     let Av1CascadeGopInputs {
         gop_idx,
@@ -1379,8 +1520,16 @@ pub(super) fn cascade_one_gop(
             }
         }
     }
+    // Decode-and-replan: positions around an earlier embed's flood source.
+    for &c in extra_wet {
+        if in_stc(c as usize) {
+            costs_for_stc[inv[c as usize] as usize] = f32::INFINITY;
+        }
+    }
 
-    let hhat_matrix = hhat::generate_hhat(STC_H, w, &seeds.hhat);
+    // v2: the end-set H-hat (first and last row set in every column), the
+    // standard construction both codecs use (spec § 3 amendment).
+    let hhat_matrix = hhat::generate_hhat_end_set(STC_H, w, &seeds.hhat);
     let mut embed = match stc_embed(
         &cover_used,
         &costs_for_stc,
@@ -1904,6 +2053,7 @@ pub(super) fn encode_gop_natural(
     };
     config.low_latency = true;
     apply_phasm_av1_speed(&mut config);
+    apply_phasm_av1_colour(&mut config, params.colour);
     let config = Arc::new(config);
     let mut sequence = Sequence::new(&config);
     apply_phasm_av1_sequence(&mut sequence);
@@ -1948,6 +2098,21 @@ pub(super) struct GopHarvest {
     /// stash on big resolutions; currently keeps the full
     /// per-bit vector for simplicity).
     frame_starts: Vec<usize>,
+    /// Per-bit (plane, plane_px_x, plane_px_y): where decode-and-replan
+    /// (spec § 7) finds the positions feeding a flooded region.
+    locs: Vec<(u8, u16, u16)>,
+    /// Per-frame 16×16 luma block sums of the natural reconstruction: what
+    /// decode-and-replan compares a decode of the stego GOP with.
+    natural_luma: Vec<super::flood::LumaBlockGrid>,
+}
+
+/// One frame's harvest ([`FrameHarvestJob::run`]).
+struct FrameHarvest {
+    cursors: Vec<u64>,
+    bits: Vec<u8>,
+    costs: Vec<f32>,
+    locs: Vec<(u8, u16, u16)>,
+    luma: super::flood::LumaBlockGrid,
 }
 
 impl GopHarvest {
@@ -1992,8 +2157,11 @@ fn count_cover_bits(per_frame: &[(Vec<u8>, PhasmFrameRecording<u8>)]) -> usize {
                 .iter()
                 .zip(&tile.bit_tags)
                 .zip(&tile.bit_meta)
-                .filter(|((_, tag), _)| {
-                    **tag == PHASM_TAG_AC_COEFF_SIGN || **tag == PHASM_TAG_GOLOMB_TAIL_LSB
+                .filter(|((_, tag), m)| {
+                    crate::stego::cost::av1_damage::av1_in_cover(
+                        **tag == PHASM_TAG_AC_COEFF_SIGN,
+                        m.coeff_magnitude,
+                    )
                 })
                 .count()
         })
@@ -2037,7 +2205,7 @@ impl FrameHarvestJob {
             .zip(tile.bit_meta.iter())
             .enumerate()
         {
-            if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
+            if crate::stego::cost::av1_damage::av1_in_cover(tag == PHASM_TAG_AC_COEFF_SIGN, m.coeff_magnitude) {
                 job.cursors.push(cursor as u64);
                 job.bits.push(value as u8);
                 job.positions.push(Av1FramePosition {
@@ -2060,17 +2228,25 @@ impl FrameHarvestJob {
         Ok(job)
     }
 
-    /// The frame's `(cursors, cover bits, costs)`; the planes are released.
-    fn run(self, width: u32, height: u32) -> (Vec<u64>, Vec<u8>, Vec<f32>) {
+    /// The frame's cursors, cover bits, costs, locations and natural luma
+    /// block sums; the planes are released.
+    fn run(self, width: u32, height: u32) -> FrameHarvest {
         let frame_planes = pack_cost_planes(&self.planes, width as usize, height as usize);
         drop(self.planes);
+        let luma = super::flood::LumaBlockGrid::from_plane(
+            &frame_planes.y,
+            width as usize,
+            height as usize,
+            frame_planes.luma_width,
+        );
+        let locs = self.positions.iter().map(|p| (p.plane, p.plane_px_x, p.plane_px_y)).collect();
         let costs = compute_av1_uniward_costs_with_state(
             &frame_planes,
             &self.positions,
             self.qindex,
             Some(self.loop_filter),
         );
-        (self.cursors, self.bits, costs)
+        FrameHarvest { cursors: self.cursors, bits: self.bits, costs, locs, luma }
     }
 }
 
@@ -2146,7 +2322,7 @@ pub(crate) fn shadow_buckets_from_recordings(
     for (f, (_, recording)) in frames.iter().enumerate() {
         let Some(tile) = recording.tiles.first() else { continue };
         for (&tag, m) in tile.bit_tags.iter().zip(tile.bit_meta.iter()) {
-            if tag != PHASM_TAG_AC_COEFF_SIGN && tag != PHASM_TAG_GOLOMB_TAIL_LSB {
+            if !crate::stego::cost::av1_damage::av1_in_cover(tag == PHASM_TAG_AC_COEFF_SIGN, m.coeff_magnitude) {
                 continue;
             }
             let (w, h) = if m.plane == 0 {
@@ -2195,18 +2371,22 @@ impl GopHarvestBuilder {
                 costs: Vec::new(),
                 combined_index: Vec::new(),
                 frame_starts: Vec::with_capacity(n_frames),
+                locs: Vec::new(),
+                natural_luma: Vec::with_capacity(n_frames),
             },
         }
     }
 
-    /// The next frame's `(cursors, cover bits, costs)`.
-    fn push(&mut self, (frame_cursors, frame_bits, frame_costs): (Vec<u64>, Vec<u8>, Vec<f32>)) {
+    /// The next frame's harvest.
+    fn push(&mut self, f: FrameHarvest) {
         let h = &mut self.harvest;
         let frame_idx = h.frame_starts.len();
         h.frame_starts.push(h.cover_bits.len());
-        h.combined_index.extend(frame_cursors.iter().map(|&c| (frame_idx, c)));
-        h.cover_bits.extend_from_slice(&frame_bits);
-        h.costs.extend_from_slice(&frame_costs);
+        h.combined_index.extend(f.cursors.iter().map(|&c| (frame_idx, c)));
+        h.cover_bits.extend_from_slice(&f.bits);
+        h.costs.extend_from_slice(&f.costs);
+        h.locs.extend_from_slice(&f.locs);
+        h.natural_luma.push(f.luma);
     }
 
     fn finish(self) -> GopHarvest {
@@ -2247,6 +2427,7 @@ pub(super) fn noise_gop_sized(
         quantizer: 60,
         gop_size: n,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     (yuv, params)
 }
@@ -2467,6 +2648,60 @@ mod tests {
         rec.reconstructed_planes = Arc::new(f);
     }
 
+    /// Every H.273 code rav1e names maps to its own enum value; others are
+    /// unspecified.
+    #[test]
+    fn colour_codes_map_to_rav1e_values() {
+        for code in 0..=255u8 {
+            let mut config = EncoderConfig::default();
+            apply_phasm_av1_colour(&mut config, Av1Colour { primaries: code, transfer: code, matrix: code, full_range: false });
+            let d = config.color_description.expect("always signalled");
+            let (p, t, m) = (d.color_primaries as u8, d.transfer_characteristics as u8, d.matrix_coefficients as u8);
+            assert!(p == code || p == 2, "primaries {code} -> {p}");
+            assert!(t == code || t == 2, "transfer {code} -> {t}");
+            assert!(m == code || m == 2, "matrix {code} -> {m}");
+            if matches!(code, 1 | 4..=12 | 22) {
+                assert_eq!(p, code, "primaries {code}");
+            }
+            if matches!(code, 1 | 4..=18) {
+                assert_eq!(t, code, "transfer {code}");
+            }
+            if matches!(code, 1 | 4..=14) {
+                assert_eq!(m, code, "matrix {code}");
+            }
+        }
+    }
+
+    /// The sequence header carries the encode's colour: an HLG BT.2020
+    /// source's tags pass through.
+    #[test]
+    fn sequence_header_carries_the_source_colour() {
+        use crate::codec::mp4::av1_obu_split::{parse_sequence_header_obu, split_av1_into_samples};
+        let (yuv, mut params) = noise_gop_sized(64, 64, 2);
+        params.colour = Av1Colour { primaries: 9, transfer: 18, matrix: 9, full_range: true };
+        let frames = encode_gop_natural(&yuv, 2, params).expect("encode");
+        let stream: Vec<u8> = frames.iter().flat_map(|(p, _)| p.iter().copied()).collect();
+        let split = split_av1_into_samples(&stream).expect("split");
+        let sh = parse_sequence_header_obu(&split.sequence_header_obu).expect("sequence header");
+        assert_eq!(sh.color_description, Some((9, 18, 9)));
+        assert!(sh.full_range);
+    }
+
+    /// By default the sequence header signals BT.709, studio range: the
+    /// librav1e wrapper the MP4 names always hands rav1e a colour
+    /// description.
+    #[test]
+    fn sequence_header_signals_bt709() {
+        use crate::codec::mp4::av1_obu_split::{parse_sequence_header_obu, split_av1_into_samples};
+        let (yuv, params) = noise_gop_sized(64, 64, 2);
+        let frames = encode_gop_natural(&yuv, 2, params).expect("encode");
+        let stream: Vec<u8> = frames.iter().flat_map(|(p, _)| p.iter().copied()).collect();
+        let split = split_av1_into_samples(&stream).expect("split");
+        let sh = parse_sequence_header_obu(&split.sequence_header_obu).expect("sequence header");
+        assert_eq!(sh.color_description, Some((1, 1, 1)));
+        assert!(!sh.full_range);
+    }
+
     /// J-UNIWARD costs depend only on pixels a viewer sees: rav1e aligns
     /// plane width and height to 8, and what it reconstructs in that
     /// padding is cropped on output and not reproduced by a decoder.
@@ -2617,7 +2852,7 @@ mod tests {
             .output()
             .expect("ffmpeg");
         assert!(out.status.success(), "ffmpeg failed on {clip}");
-        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n };
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n, colour: Default::default() };
         let frames = encode_gop_natural(&out.stdout, n, params).expect("encode");
         let cover = count_cover_bits(&frames);
         let packets = Pass1Packets(frames.into_iter().map(|(p, _)| p).collect());
@@ -2643,7 +2878,7 @@ mod tests {
         let (w, h, n, q) = (u32_at(0), u32_at(4), u32_at(8), u32_at(12) as usize);
         let cover = u64::from_le_bytes(blob[16..24].try_into().unwrap()) as usize;
         let packets = Pass1Packets::flat_unpack(&blob[24..]).expect("packets");
-        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n };
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: q, gop_size: n, total_frames_hint: n, colour: Default::default() };
         let mut cache = crate::stego::gop_cache::BoundedGopCache::<Pass1Packets>::new(
             1, 1 << 30, 0, std::env::temp_dir(), AV1_PASS1_CACHE_TAG,
         );
@@ -2700,6 +2935,63 @@ mod v2_shadow_tests {
             .collect()
     }
 
+    /// Syntax-wet positions are not in the cover (amended spec § 3): golomb
+    /// tails and |c| >= 6 signs, which the decoder can tell apart. Encoder
+    /// and decoder covers agree in length on the stego output.
+    #[test]
+    fn cover_holds_no_syntax_wet_positions() {
+        let (w, h, n) = (256u32, 144u32, 3u32);
+        let yuv = noise_yuv(w as usize, h as usize, n as usize);
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n, colour: Default::default() };
+        let natural = encode_gop_natural(&yuv, n, params).expect("natural");
+        let want: usize = natural
+            .iter()
+            .map(|(_, r)| {
+                let t = &r.tiles[0];
+                t.bit_tags
+                    .iter()
+                    .zip(&t.bit_meta)
+                    .filter(|(tag, m)| **tag == PHASM_TAG_AC_COEFF_SIGN && (1..=5).contains(&m.coeff_magnitude))
+                    .count()
+            })
+            .sum();
+        let golomb: usize = natural
+            .iter()
+            .map(|(_, r)| r.tiles[0].bit_tags.iter().filter(|&&t| t == PHASM_TAG_GOLOMB_TAIL_LSB).count())
+            .sum();
+        assert!(golomb > 0, "fixture must contain golomb tails");
+        let harvest = harvest_gop(&natural, w, h).expect("harvest");
+        assert_eq!(harvest.len(), want);
+        assert_eq!(count_cover_bits(&natural), want);
+        assert_eq!(shadow_buckets_from_recordings(&natural, w, h).len(), want);
+
+        let p = crate::stego::payload::encode_payload("cover", &[]).unwrap();
+        let (ct, nonce, salt) = crate::stego::crypto::encrypt(&p, "cover").unwrap();
+        let framed = frame::build_frame(p.len(), &salt, &nonce, &ct);
+        let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, n);
+        let stego = av1_encode_streaming(&mut src, n, params, &framed, "cover", Pass1CacheBudget::from_env_or_default(), None)
+            .expect("encode");
+        let decoded = super::super::orchestrator::harvest_cover_bits_from_stego(&stego).expect("harvest stego");
+        assert_eq!(decoded.len(), want);
+    }
+
+    /// Decode-and-replan compares a dav1d decode with the encoder's natural
+    /// reconstruction, so the two grids must agree exactly on a natural GOP,
+    /// unaligned size included.
+    #[test]
+    fn luma_block_sums_match_between_encoder_and_decoder() {
+        let (w, h, n) = (250u32, 142u32, 3u32);
+        let yuv = noise_yuv(w as usize, h as usize, n as usize);
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n, colour: Default::default() };
+        let natural = encode_gop_natural(&yuv, n, params).expect("natural");
+        let harvest = harvest_gop(&natural, w, h).expect("harvest");
+        let stream: Vec<u8> = natural.iter().flat_map(|(p, _)| p.iter().copied()).collect();
+        let decoded = super::super::decoder::decode_luma_block_grids(&stream).expect("decode");
+        assert_eq!(decoded.len(), n as usize);
+        assert_eq!(harvest.natural_luma, decoded);
+        assert_eq!(super::super::flood::flood_region(&harvest.natural_luma, &decoded), None);
+    }
+
     /// Spec § 6 invariance: the shadow buckets the encoder computes from its
     /// Pass-1 recordings equal the ones a decoder computes from the STEGO
     /// output (sign flips keep |c|; golomb tails are wet, so never flipped).
@@ -2707,7 +2999,7 @@ mod v2_shadow_tests {
     fn shadow_buckets_match_between_encoder_and_decoder() {
         let (w, h, n) = (256u32, 144u32, 3u32);
         let yuv = noise_yuv(w as usize, h as usize, n as usize);
-        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n };
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n, colour: Default::default() };
         let natural = encode_gop_natural(&yuv, n, params).expect("natural");
         let enc = shadow_buckets_from_recordings(&natural, w, h);
         assert!(enc.iter().filter(|b| b.is_some()).count() > 100, "too few eligible positions");
@@ -2745,7 +3037,7 @@ mod v2_shadow_decode_tests {
                 ((i % w as usize) as u64 / 2 + (s >> 59)) as u8
             })
             .collect();
-        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n };
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 60, gop_size: n, total_frames_hint: n, colour: Default::default() };
         let p = crate::stego::payload::encode_payload("primary", &[]).unwrap();
         let (ct, nonce, salt) = crate::stego::crypto::encrypt(&p, "prim").unwrap();
         let framed = frame::build_frame(p.len(), &salt, &nonce, &ct);

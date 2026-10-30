@@ -976,6 +976,7 @@ mod prefix_cache_tests {
                 coeff_suffix_lsb: dom(5, 2),
                 mvd_sign_bypass: dom(11, 3),
                 mvd_suffix_lsb: dom(0, 4), // empty domain must round-trip too
+                ..Default::default()
             },
             costs: DomainCosts {
                 coeff_sign_bypass: costs(37, true),
@@ -1460,6 +1461,7 @@ mod tests {
             coeff_suffix_lsb: csl,
             mvd_sign_bypass: msb,
             mvd_suffix_lsb: msl,
+            ..Default::default()
         }
     }
 
@@ -1758,6 +1760,7 @@ mod tests {
                     coeff_suffix_lsb: d.next().unwrap(),
                     mvd_sign_bypass: d.next().unwrap(),
                     mvd_suffix_lsb: d.next().unwrap(),
+                    ..Default::default()
                 },
                 costs: DomainCosts {
                     coeff_sign_bypass: c.next().unwrap(),
@@ -2014,6 +2017,7 @@ impl crate::stego::gop_cache::GopCachePayload for ShadowGopPrefix {
             coeff_suffix_lsb: unpack_domain(bytes, &mut at)?,
             mvd_sign_bypass: unpack_domain(bytes, &mut at)?,
             mvd_suffix_lsb: unpack_domain(bytes, &mut at)?,
+            ..Default::default()
         };
         let costs = DomainCosts {
             coeff_sign_bypass: unpack_costs(bytes, &mut at)?,

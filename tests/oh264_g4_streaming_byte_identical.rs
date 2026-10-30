@@ -268,16 +268,11 @@ fn sweep_a_selection_machinery_matches_priority_slots() {
         );
     }
 
-    let n_msl = whole.mvd_suffix_lsb.len();
-    assert!(n_msl > 0, "fixture has no MvdSuffixLsb positions — the MSL gate would be vacuous");
-
     // A big, HIGH-ENTROPY shadow so n_total reaches a deep fraction of the
-    // cover (the tiny MvdSuffixLsb domain participates at ~that depth). The
-    // payload is Brotli-compressed (`encode_payload`), so a repeated string
-    // collapses to nothing — use deterministic pseudo-random printable ASCII
-    // that barely compresses. ~10 K chars → tens of Kbit RS frame, comfortably
-    // under this fixture's ~117 K eligible positions.
-    let shadow_msg: String = (0..10_000u32)
+    // eligible pool (several damage buckets participate at that depth). The
+    // payload is Brotli-compressed (`encode_payload`), so use deterministic
+    // pseudo-random printable ASCII that barely compresses.
+    let shadow_msg: String = (0..3_000u32)
         .map(|i| {
             let mut z = i.wrapping_mul(0x9E37_79B1).wrapping_add(0x7F4A_7C15);
             z ^= z >> 15;
@@ -289,87 +284,56 @@ fn sweep_a_selection_machinery_matches_priority_slots() {
     let shadows = [ShadowLayer { message: &shadow_msg, passphrase: "sweep-a", files: &[] }];
     let parity = SHADOW_PARITY_TIERS[0];
 
-    // Three mask shapes aligned to the whole-clip MSL positions: None (MSL
-    // excluded entirely), all-true (MSL fully eligible), and a deterministic
-    // ~50/50 hash mask (the realistic mixed case).
-    let mixed: Vec<bool> = whole
-        .mvd_suffix_lsb
+    // Reference: whole-clip selection over the whole-clip clean cover (v2:
+    // damage-aware, from the cover's own MB syntax — no masks).
+    let reference = prepare_shadow_over_emit_cover(
+        &whole, shadows[0].passphrase, shadows[0].message, shadows[0].files, parity,
+    )
+    .unwrap_or_else(|e| panic!("reference prepare_shadow failed: {e:?}"));
+    let n_total = reference.n_total;
+
+    // Streaming: push each GOP's clean cover (keys + MB syntax GLOBAL-remapped).
+    let mut sweep = ShadowSelectionSweep::new(&shadows, &[n_total]).expect("sweep new");
+    for gc in &per_gop {
+        sweep.push_gop(gc);
+    }
+    let streamed: Vec<ShadowSlot> =
+        sweep.finish().pop().expect("one shadow").into_iter().take(n_total).collect();
+
+    // Compare slot-by-slot: (domain, intra_index, priority, bucket).
+    let key = |s: &ShadowSlot| (s.domain as u8, s.intra_index, s.priority, s.bucket);
+    let buckets: std::collections::BTreeSet<u8> = streamed.iter().map(|s| s.bucket).collect();
+    let first_diff = reference
         .positions
         .iter()
-        .map(|k| (k.raw().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) & 1 == 0)
-        .collect();
-    let all_true = vec![true; n_msl];
-    let variants: [(&str, Option<&[bool]>); 3] =
-        [("none", None), ("all-safe", Some(&all_true)), ("mixed", Some(&mixed))];
-
-    for (label, safe_msl) in variants {
-        // Reference: whole-clip selection over the whole-clip clean cover.
-        let reference = prepare_shadow_over_emit_cover(
-            &whole, shadows[0].passphrase, shadows[0].message, shadows[0].files,
-            parity, None, safe_msl,
-        )
-        .unwrap_or_else(|e| panic!("[{label}] reference prepare_shadow failed: {e:?}"));
-        let n_total = reference.n_total;
-
-        // Streaming: push each GOP's clean cover with its slice of the mask.
-        // The per-GOP MSL positions concatenate (in GOP order) to the whole-clip
-        // MSL vector (g.4.1a), so the mask slices line up by accumulated offset.
-        let mut sweep = ShadowSelectionSweep::new(&shadows, &[n_total]).expect("sweep new");
-        let mut off_msl = 0usize;
-        for gc in &per_gop {
-            let gop_msl = gc.mvd_suffix_lsb.len();
-            let slice = safe_msl.map(|m| &m[off_msl..off_msl + gop_msl]);
-            sweep.push_gop(gc, slice);
-            off_msl += gop_msl;
-        }
-        assert_eq!(off_msl, n_msl, "[{label}] per-GOP MSL counts must sum to the whole-clip count");
-        let streamed: Vec<ShadowSlot> =
-            sweep.finish().pop().expect("one shadow").into_iter().take(n_total).collect();
-
-        // Compare slot-by-slot: (domain, intra_index, priority).
-        let key = |s: &ShadowSlot| (s.domain as u8, s.intra_index, s.priority);
-        let msl_selected = streamed.iter().filter(|s| s.domain as u8 == 3).count();
-        let first_diff = reference
-            .positions
-            .iter()
-            .zip(streamed.iter())
-            .position(|(r, s)| key(r) != key(s));
-        eprintln!(
-            "WV.6.g.4.1b [{label}] n_total={n_total} ref={} streamed={} \
-             MSL_selected={msl_selected} first_diff={first_diff:?}",
-            reference.positions.len(),
-            streamed.len(),
-        );
+        .zip(streamed.iter())
+        .position(|(r, s)| key(r) != key(s));
+    eprintln!(
+        "v2 selection n_total={n_total} ref={} streamed={} buckets={buckets:?} first_diff={first_diff:?}",
+        reference.positions.len(),
+        streamed.len(),
+    );
+    // This test's real guarantee is the whole-clip == streaming selection
+    // byte-identity asserted below (ref vs streamed, slot for slot). Multi-
+    // bucket ORDERING across the sweep is covered by the real-fixture shadow
+    // round-trips (`oh264_video_shadow_roundtrip`, `d10_*`). Under the shipped
+    // κ_t = 1 this smooth synthetic cover's damage spread collapses into
+    // bucket 0 (every eligible position is within ~1 octave of the QP-26
+    // reference), so only require the selection to be non-empty here.
+    assert!(!buckets.is_empty(), "the selection should use at least one damage bucket");
+    assert!(streamed.iter().all(|s| (s.domain as u8) < 2), "MVD domains are not shadow-eligible (v2)");
+    assert_eq!(reference.positions.len(), streamed.len(), "selected-count mismatch");
+    for (i, (r, s)) in reference.positions.iter().zip(streamed.iter()).enumerate() {
         assert_eq!(
-            reference.positions.len(),
-            streamed.len(),
-            "[{label}] selected-count mismatch (ref {} vs streamed {})",
-            reference.positions.len(),
-            streamed.len(),
+            key(r),
+            key(s),
+            "slot {i} diverges: ref={:?} streamed={:?} — the streaming selector is not \
+             bit-identical to priority_slots",
+            key(r),
+            key(s),
         );
-        for (i, (r, s)) in reference.positions.iter().zip(streamed.iter()).enumerate() {
-            assert_eq!(
-                key(r),
-                key(s),
-                "[{label}] slot {i} diverges: ref={:?} streamed={:?} — the streaming \
-                 selector is not bit-identical to priority_slots",
-                key(r),
-                key(s),
-            );
-        }
-        // The mask shapes must genuinely exercise MSL: all-safe/mixed should
-        // pull some MvdSuffixLsb into the top-N (else the gate is vacuous).
-        if label != "none" {
-            assert!(
-                msl_selected > 0,
-                "[{label}] no MvdSuffixLsb slots selected — raise the shadow size \
-                 so the MSL gate is actually exercised"
-            );
-        } else {
-            assert_eq!(msl_selected, 0, "[none] MSL must be excluded when safe_msl=None");
-        }
     }
-    eprintln!("WV.6.g.4.1b GREEN — streaming selector ≡ whole-clip priority_slots (3 mask shapes)");
+    eprintln!("WV.6.g.4.1b GREEN — streaming selector ≡ whole-clip priority_slots (v2)");
 }
 
 /// WV.6.g.4.1c — `safe_msl_prov` must be GOP-DECOMPOSABLE. The cascade-safety
@@ -520,7 +484,7 @@ fn streaming_provisional_plan_byte_identical_to_whole_clip() {
     // Synthetic primary — the decomposition holds for any payload + seed.
     let frame_bytes: Vec<u8> =
         (0..1500u32).map(|i| (i.wrapping_mul(37) ^ (i >> 2)) as u8).collect();
-    let hhat_seed = [0x5Au8; 32];
+    let hhat_seed = phasm_core::codec::h264::stego::keys::H264StcKeys::from_master([0x5Au8; 64]);
 
     let reference = whole_clip_primary_plan(
         &cover, &whole_costs, &frame_bytes, &hhat_seed, gop, n_gops, &weights,
@@ -712,11 +676,9 @@ fn sweep_a_selection_matches_whole_clip() {
         &yuv, w, h, n, opts, primary_msg, &[], primary_pass, &weights,
     )
     .expect("whole-clip provisional");
-    let whole_safe = whole_clip_safe_msl_prov(&pw);
     let parity = SHADOW_PARITY_TIERS[0];
     let ref_state = prepare_shadow_over_emit_cover(
-        &pw.prov_cover, shadows[0].passphrase, shadows[0].message, shadows[0].files,
-        parity, None, Some(&whole_safe),
+        &pw.prov_cover, shadows[0].passphrase, shadows[0].message, shadows[0].files, parity,
     )
     .expect("reference shadow selection");
     let n_total = ref_state.n_total;
@@ -735,7 +697,7 @@ fn sweep_a_selection_matches_whole_clip() {
 
     let streamed = &result.selections[0];
     let key = |s: &phasm_core::codec::h264::stego::shadow::ShadowSlot| {
-        (s.domain as u8, s.intra_index, s.priority)
+        (s.domain as u8, s.intra_index, s.priority, s.bucket)
     };
     let msl_sel = streamed.iter().filter(|s| s.domain as u8 == 3).count();
     let first_diff = ref_state

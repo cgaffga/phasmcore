@@ -235,6 +235,135 @@ pub fn encode_with_files_reported(
     })
 }
 
+/// Multi-GOP `encode_with_files_reported`, planned the way production plans:
+/// when `gop_caps` (the probe's per-GOP vector) is given, the session gets
+/// `plan_proportional(gop_caps, CAP2_DEFAULT_R_TARGET)` before the first
+/// frame, exactly as the CLI two-pass encode does; `None` leaves the online
+/// uniform spread. The tier is read before `finish()` (see above), i.e. after
+/// the first GOP drained.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_files_planned(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+    gop_caps: Option<&[usize]>,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<EncodeReport, StegoError> {
+    let mut enc = StreamingEncodeSession::create_with_files(
+        params(width, height, n_frames, qp, gop_size, CostWeights::default()),
+        message,
+        files,
+        passphrase,
+    )?;
+    if let Some(caps) = gop_caps {
+        enc.plan_proportional(caps, phasm_core::stego::chunk_frame::CAP2_DEFAULT_R_TARGET)?;
+    }
+    let framed_len = enc.framed_message_len().unwrap_or(0);
+    let mut out = Vec::new();
+    for f in 0..n_frames as usize {
+        enc.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)), &mut out)?;
+    }
+    let resolved_tier = enc.resolved_tier();
+    enc.finish(&mut out)?;
+    Ok(EncodeReport {
+        annex_b: out,
+        framed_len,
+        resolved_tier,
+    })
+}
+
+/// `probe_capacity` plus the per-GOP predicted damage curves behind the
+/// adaptive red end (`CapacityProbeResult::max_alpha_64`).
+#[allow(clippy::type_complexity)]
+pub fn probe_capacity_curves(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+) -> Result<
+    (CapacityProbeResult, Vec<usize>, Vec<phasm_core::codec::h264::stego::quality_predict::GopQualityCurve>),
+    StegoError,
+> {
+    let mut probe = StreamingProbeSession::create(params(width, height, n_frames, qp, gop_size, CostWeights::default()))?;
+    for f in 0..n_frames as usize {
+        probe.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)))?;
+    }
+    probe.finish_with_quality_curves()
+}
+
+/// Multi-GOP encode planned the way the **apps** plan (iOS / Android
+/// `PhasmStegoTranscoder`): `plan_safe_balanced` over the probe's full per-GOP
+/// vector with the H.264 calibration both bridges pass. With every GOP sampled
+/// the window is `max(⌈msg / (½·½·μ)⌉, 8)` GOPs, split proportionally to the
+/// caps inside it — so a clip of ≤ 8 GOPs carries the same α in every GOP.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_files_balanced(
+    yuv: &[u8],
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+    gop_caps: &[usize],
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<EncodeReport, StegoError> {
+    use phasm_core::codec::h264::streaming_session::H264PlanOutcome;
+    let mut enc = StreamingEncodeSession::create_with_files(
+        params(width, height, n_frames, qp, gop_size, CostWeights::default()),
+        message,
+        files,
+        passphrase,
+    )?;
+    let samples: Vec<(usize, usize)> = gop_caps.iter().copied().enumerate().collect();
+    let cal = phasm_core::stego::calibration::AllocationCalibration::H264_1080P_QP26;
+    match enc.plan_safe_balanced(&samples, gop_size as usize, &cal)? {
+        H264PlanOutcome::Installed { .. } => {}
+        H264PlanOutcome::MessageTooLarge => return Err(StegoError::MessageTooLarge),
+        H264PlanOutcome::NeedMoreSamples { .. } => {
+            return Err(StegoError::InvalidVideo("balanced plan wants more samples at full coverage".into()))
+        }
+    }
+    let framed_len = enc.framed_message_len().unwrap_or(0);
+    let mut out = Vec::new();
+    for f in 0..n_frames as usize {
+        enc.push_frame(frame_ref(width, frame_planes(yuv, width, height, f)), &mut out)?;
+    }
+    let resolved_tier = enc.resolved_tier();
+    enc.finish(&mut out)?;
+    Ok(EncodeReport { annex_b: out, framed_len, resolved_tier })
+}
+
+/// The framed message length (`framed_message_len`) a session would embed
+/// for `message` + `files` (Argon2 + payload framing only, no encode).
+#[allow(clippy::too_many_arguments)]
+pub fn framed_len_files(
+    width: u32,
+    height: u32,
+    n_frames: u32,
+    qp: i32,
+    gop_size: u32,
+    message: &str,
+    files: &[FileEntry],
+    passphrase: &str,
+) -> Result<usize, StegoError> {
+    let enc = StreamingEncodeSession::create_with_files(
+        params(width, height, n_frames, qp, gop_size, CostWeights::default()),
+        message,
+        files,
+        passphrase,
+    )?;
+    Ok(enc.framed_message_len().unwrap_or(0))
+}
+
 /// Encode a flat I420 clip with **no stego at all** — the low-level
 /// `Encoder` API with no stego handlers registered (mirrors
 /// `examples/openh264_clean_encode.rs`).

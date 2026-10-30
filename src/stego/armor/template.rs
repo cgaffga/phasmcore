@@ -13,7 +13,7 @@ use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
 
-use crate::stego::armor::fft2d::Spectrum2D;
+use crate::stego::armor::fft2d::{BinRect, Spectrum2D, SpectrumView};
 use crate::stego::crypto::derive_template_key;
 use crate::stego::error::StegoError;
 
@@ -161,13 +161,11 @@ pub fn embed_template(spectrum: &mut Spectrum2D, peaks: &[TemplatePeak]) {
 /// for the maximum magnitude. Computes confidence as (peak - noise_mean) / noise_std.
 ///
 /// P1b: Works with f32 magnitude spectrum, computes stats in f64 for precision.
-pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<DetectedPeak> {
-    let w = spectrum.width;
-    let h = spectrum.height;
+pub fn detect_template<S: SpectrumView + ?Sized>(spectrum: &S, peaks: &[TemplatePeak]) -> Vec<DetectedPeak> {
+    let w = spectrum.width();
+    let h = spectrum.height();
     let cx = w as f64 / 2.0;
     let cy = h as f64 / 2.0;
-
-    let magnitudes = super::fft2d::magnitude_spectrum(spectrum);
 
     let mut detected = Vec::new();
 
@@ -194,7 +192,10 @@ pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<Det
                 if nu < 0 || nu >= w as isize || nv < 0 || nv >= h as isize {
                     continue;
                 }
-                let mag = magnitudes[nv as usize * w + nu as usize] as f64;
+                // The magnitude `magnitude_spectrum` would hold for this bin
+                // (f64 det_hypot rounded to f32), computed on the fly.
+                let c = spectrum.bin(nv as usize * w + nu as usize);
+                let mag = crate::det_math::det_hypot(c.re as f64, c.im as f64) as f32 as f64;
 
                 if mag > best_mag {
                     best_mag = mag;
@@ -234,6 +235,25 @@ pub fn detect_template(spectrum: &Spectrum2D, peaks: &[TemplatePeak]) -> Vec<Det
     }
 
     detected
+}
+
+/// The spectrum bins `detect_template` reads for these peaks: the
+/// `SEARCH_RADIUS` neighbourhood of every expected peak inside the spectrum.
+pub fn template_search_rects(peaks: &[TemplatePeak], w: usize, h: usize) -> Vec<BinRect> {
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let r = SEARCH_RADIUS as isize;
+    peaks
+        .iter()
+        .filter_map(|peak| {
+            let su = (cx + peak.u).round() as isize;
+            let sv = (cy + peak.v).round() as isize;
+            if su < 0 || su >= w as isize || sv < 0 || sv >= h as isize {
+                return None;
+            }
+            BinRect::around(su, sv, r, r, w, h)
+        })
+        .collect()
 }
 
 /// Least-squares rotation+scale estimation from peak displacement.

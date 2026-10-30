@@ -62,7 +62,7 @@ pub enum EncodePhase {
         frame_idx: u32,
         total_frames: u32,
     },
-    /// HandBrake-style mp4 muxing + final file write. One event.
+    /// MP4 muxing + final file write. One event.
     Mux,
     /// Encode finished; bytes are in the caller's buffer. One event.
     Done,

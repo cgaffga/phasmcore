@@ -73,6 +73,7 @@ fn params(w: u32, h: u32, gop: u32, n: u32, quantizer: usize) -> Av1StreamingEnc
         quantizer,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     }
 }
 
@@ -381,8 +382,8 @@ fn pull_no_shadow_progress_tracks_work() {
 
 /// SHA-256 and length of the stego stream [`pull_no_shadow_aligned_output_is_unchanged`]
 /// encodes, captured 2026-10-24 before the Pass-2 rebuild (option 3) landed.
-// Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
-const GOLDEN_256X144: &str = "f4824c09a880ac89a2641e41b827252e0c69a02afde18af79a933f8e3cad7947";
+// Re-recorded 2026-10-26, AV1 v2: end-set H-hat (stc::hhat::generate_hhat_end_set).
+const GOLDEN_256X144: &str = "4088dec9ea2708ec47da8e16292da6f76be0970e032dd046f0643b79db8ac8e9";
 const GOLDEN_256X144_LEN: usize = 95_836;
 
 /// At a frame size whose width and height are multiples of 8, the encode's

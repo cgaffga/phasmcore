@@ -51,8 +51,11 @@ pub struct AllocationCalibration {
     /// within-clip p1/p50 ratio (≈ 0.24 on IMG_4138).
     pub pessimism_factor: f64,
 
-    /// Target per-GOP utilization rate. Drives `W_util` upward toward
-    /// balanced spread. **Locked 2026-06-08** against the W6
+    /// Target per-GOP utilization rate: the largest share of its own
+    /// basis a stego GOP is loaded to before the planner widens the stego
+    /// window (`balanced_allocation::select_window`; above
+    /// `target_utilization × Σ basis` every GOP carries the clip's own rate).
+    /// Must stay `≤ 1 / safety_margin` (then every selected window fits). **Locked 2026-06-08** against the W6
     /// self-steganalyzer at 1080p QP30: W6 AUC = 0.55 crossover at
     /// u ≈ 0.018; 0.05 is the balanced choice (point-estimate AUC
     /// 0.573, within ~0.4σ of the 0.55 design gate).
@@ -105,7 +108,14 @@ impl AllocationCalibration {
         // ≈ 11_878 payload bits/frame`, rounded to the corpus floor
         // `12_000` for conservative over-deduct.
         payload_bits_per_frame_floor: 12_000,
-        pessimism_factor: 0.5,
+        // 2026-10-26: 0.5 → 0.95. Deliverability measured on the v2 wire
+        // (decode-and-replan): 4 clips × 360p/720p × 6 passphrases, every
+        // encode at 100 % and at 95 % of the full-probe primary delivered
+        // (48/48 at each fill). 0.5 had clamped the red end to α ≈ 7.5 % of the
+        // dry cover, under the 1/8 band, so the bar never reached red.
+        // 0.95 keeps a 5 % margin over the measured edge
+        // (`docs/design/video/av1/v2-gate-results.md`, "Pessimism").
+        pessimism_factor: 0.95,
         target_utilization: 0.05,
         k_min: 8,
         w_floor_abs: 8,
@@ -130,14 +140,23 @@ impl AllocationCalibration {
     /// - Tier 2 (W6 AUC vs utilization): 4-clip × 8-seek, 1080p/GOP30/QP26.
     ///   AUC FLAT at ~0.51 across u ∈ {5..100}% — no 0.55 crossover (the
     ///   adaptive cost preserves the marginals W6 measures, so detectability
-    ///   is rate-insensitive). `target_utilization=0.50` is the user's
-    ///   posture choice (aggressive — max capacity, banking on the flat
-    ///   curve; `w_floor_*` still guarantees minimum spread). See
+    ///   is rate-insensitive). See
     ///   `docs/design/video/calibration-h264-tier2-2026-06.md`.
+    /// - `target_utilization` (2026-10-26, was 0.50): set by VISUAL damage,
+    ///   not W6 — 0.042 = the comfort α 1/25 (`CAP_ALPHA_COMFORT`) over the
+    ///   probe cap's α ≈ 0.95 (cap = 0.95 × syntax-dry bits / 8, the
+    ///   `CAP2_SAFETY` derate). A message below the comfort figure goes to
+    ///   the shortest prefix whose GOPs stay at α ≤ 1/25 (plain tail after);
+    ///   anything larger spreads over every GOP at the clip's own α. 0.50 had
+    ///   loaded the window GOPs of a > 8-GOP clip to α ≈ 0.24 (½ × the old
+    ///   pessimism ½ of the mean cap) — 2× the 1/8 red end — and broke the
+    ///   27 / 13 dB floor (`intra-drift-diagnosis.md` follow-up 5). Capacity
+    ///   is unaffected: the accept ceiling is `Σ caps / safety_margin` either
+    ///   way.
     pub const H264_1080P_QP26: Self = Self {
         payload_bits_per_frame_floor: 23,
         pessimism_factor: 0.5,
-        target_utilization: 0.50,
+        target_utilization: 0.042,
         k_min: 8,
         w_floor_abs: 8,
         w_floor_frac: 0.05,
@@ -161,7 +180,8 @@ mod tests {
         // Any change requires a fresh calibration spike + design doc update.
         let c = AllocationCalibration::AV1_1080P_QP30;
         assert_eq!(c.payload_bits_per_frame_floor, 12_000);
-        assert!((c.pessimism_factor - 0.5).abs() < 1e-9);
+        // 2026-10-26: 0.5 → 0.95 (v2 deliverability, see the constant).
+        assert!((c.pessimism_factor - 0.95).abs() < 1e-9);
         assert!((c.target_utilization - 0.05).abs() < 1e-9);
         assert_eq!(c.k_min, 8);
         assert_eq!(c.w_floor_abs, 8);
@@ -177,7 +197,8 @@ mod tests {
         let c = AllocationCalibration::H264_1080P_QP26;
         assert_eq!(c.payload_bits_per_frame_floor, 23);
         assert!((c.pessimism_factor - 0.5).abs() < 1e-9);
-        assert!((c.target_utilization - 0.50).abs() < 1e-9);
+        // 2026-10-26: 0.50 → 0.042 (visual window bound, see the constant).
+        assert!((c.target_utilization - 0.042).abs() < 1e-9);
         assert_eq!(c.k_min, 8);
         assert_eq!(c.w_floor_abs, 8);
         assert!((c.w_floor_frac - 0.05).abs() < 1e-9);

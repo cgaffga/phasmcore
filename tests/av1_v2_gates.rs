@@ -37,6 +37,12 @@ enum Fill {
     Kb1,
     Half,
     NinetyPct,
+    /// α in thousandths: payload bits per cover position (spec § 4a).
+    AlphaMilli(u32),
+    /// Thousandths of the primary capacity (deliverability margin).
+    PctMilli(u32),
+    /// The production red end: the stratified probe's `max_message_bytes`.
+    ProbeMax,
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +60,9 @@ struct GateReport {
     decode_ms: u128,
     primary_capacity: usize,
     framed_len: usize,
+    /// Cover positions over the clip (the probe's count): α and the change
+    /// rate are per cover position.
+    cover_positions: usize,
 }
 
 fn psnr(mse: f64) -> f64 {
@@ -137,8 +146,8 @@ fn text_for_framed_len(target: usize) -> String {
     pool[..lo].to_string()
 }
 
-fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Option<GateReport> {
-    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: QUANTIZER, gop_size: GOP, total_frames_hint: n };
+fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str, pass: &str) -> Option<GateReport> {
+    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: QUANTIZER, gop_size: GOP, total_frames_hint: n, colour: Default::default() };
     let n_gops = n.div_ceil(GOP);
     let mut src = Av1SliceYuvSource::new(yuv, w, h, n, GOP);
     src.rewind().unwrap();
@@ -153,17 +162,33 @@ fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Optio
         Fill::Kb1 => 1024,
         Fill::Half => capacity / 2,
         Fill::NinetyPct => capacity * 9 / 10,
+        Fill::AlphaMilli(a) => (cover.iter().sum::<usize>() as u64 * a as u64 / 1000 / 8) as usize,
+        Fill::PctMilli(m) => capacity * m as usize / 1000,
+        Fill::ProbeMax => {
+            src.rewind().unwrap();
+            let cal = phasm_core::stego::calibration::AllocationCalibration::AV1_1080P_QP30;
+            let est = phasm_core::codec::av1::stego::capacity::av1_capacity_stratified(&mut src, n, p, &cal).expect("stratified probe");
+            est.max_message_bytes() + frame::FRAME_OVERHEAD
+        }
     };
-    if target > capacity || target < 32 {
+    if (target > capacity && !matches!(fill, Fill::AlphaMilli(_) | Fill::PctMilli(_) | Fill::ProbeMax)) || target < 32 {
         eprintln!("{tag}: skip {fill:?} (capacity {capacity} B)");
         return None;
     }
-    let text = text_for_framed_len(target);
-    let pass = "gate";
-    let framed = framed_primary(&text, pass);
+    // The length estimate can overshoot the real frame by a few bytes on
+    // long texts; trim until the frame fits the target.
+    let mut text = text_for_framed_len(target);
+    let mut framed = framed_primary(&text, pass);
+    while framed.len() > target && !text.is_empty() {
+        text.truncate(text.len().saturating_sub(framed.len() - target));
+        framed = framed_primary(&text, pass);
+    }
+    // PHASM_GATE_DELIVERY_ONLY=1: encode + round trip only, one row per
+    // case, failures reported instead of asserted (deliverability runs).
+    let delivery_only = std::env::var("PHASM_GATE_DELIVERY_ONLY").is_ok_and(|v| v == "1");
 
     src.rewind().unwrap();
-    let natural = av1_encode_natural(&mut src, n, p).expect("natural encode");
+    let natural = if delivery_only { Vec::new() } else { av1_encode_natural(&mut src, n, p).expect("natural encode") };
     src.rewind().unwrap();
     let t0 = Instant::now();
     // PHASM_GATE_SHADOW=<bytes> adds one shadow of that size (spec § 11:
@@ -182,11 +207,22 @@ fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Optio
         Err(e) => {
             // The probe promised more than the encode can embed: a finding,
             // not a harness failure.
-            println!("| {tag} | | {fill:?} | {} | {capacity} | ENCODE FAILED: {e:?} |", framed.len());
+            println!("| {tag} | {pass} | {fill:?} | {} | {capacity} | ENCODE FAILED: {e:?} |", framed.len());
             return None;
         }
     };
     let encode_ms = t0.elapsed().as_millis();
+    if delivery_only {
+        let mut dec = Av1StreamingDecodeSession::create(pass);
+        dec.push_bytes(&stego);
+        let outcome = match dec.finish_primary_payload() {
+            Ok(got) if got.text == text => "DELIVERED".to_string(),
+            Ok(_) => "WRONG TEXT".to_string(),
+            Err(e) => format!("DECODE FAILED: {e:?}"),
+        };
+        println!("| {tag} | {pass} | {fill:?} | {} | {capacity} | {outcome} | {encode_ms} |", framed.len());
+        return None;
+    }
     let t1 = Instant::now();
     let mut dec = Av1StreamingDecodeSession::create(pass);
     dec.push_bytes(&stego);
@@ -198,7 +234,14 @@ fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Optio
     let nat_pos = decode_with_recording(&natural).expect("record natural");
     let st_pos = decode_with_recording(&stego).expect("record stego");
     assert_eq!(nat_pos.len(), st_pos.len(), "{tag}: position lists differ");
-    let mut r = GateReport { encode_ms, decode_ms, primary_capacity: capacity, framed_len: framed.len(), ..Default::default() };
+    let mut r = GateReport {
+        encode_ms,
+        decode_ms,
+        primary_capacity: capacity,
+        framed_len: framed.len(),
+        cover_positions: cover.iter().sum(),
+        ..Default::default()
+    };
     for (a, b) in nat_pos.iter().zip(st_pos.iter()) {
         let plane = (b.meta.plane as usize).min(2);
         r.positions_by_plane[plane] += 1;
@@ -215,6 +258,10 @@ fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Optio
     assert_eq!(nat_px.len(), st_px.len());
     let frames = nat_px.len() / fsz;
     let (mut mse_sum, mut worst_y, mut worst_u, mut worst_v, mut worst_block) = (0f64, 99f64, 99f64, 99f64, 99f64);
+    // PHASM_GATE_PER_GOP=1: worst 16x16 luma block per GOP (display order),
+    // to find GOPs the plan overloads (damage-aware allocation, spec § 4a).
+    let per_gop = std::env::var("PHASM_GATE_PER_GOP").is_ok_and(|v| v == "1");
+    let mut gop_worst = vec![99f64; frames.div_ceil(GOP as usize)];
     let mse = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len().max(1) as f64;
     for f in 0..frames {
         let (a, b) = (&st_px[f * fsz..(f + 1) * fsz], &nat_px[f * fsz..(f + 1) * fsz]);
@@ -237,8 +284,21 @@ fn gate_case(yuv: &[u8], w: u32, h: u32, n: u32, fill: Fill, tag: &str) -> Optio
                     }
                 }
                 worst_block = worst_block.min(psnr(s / c as f64));
+                let g = f / GOP as usize;
+                gop_worst[g] = gop_worst[g].min(psnr(s / c as f64));
             }
         }
+    }
+    if per_gop {
+        let mut gop_flips = vec![0usize; gop_worst.len()];
+        let frame_gop = |fr: u16| (fr as usize / GOP as usize).min(gop_worst.len() - 1);
+        for (a, b) in nat_pos.iter().zip(st_pos.iter()) {
+            if a.decoded_value != b.decoded_value {
+                gop_flips[frame_gop(b.frame)] += 1;
+            }
+        }
+        let cells: Vec<String> = gop_worst.iter().zip(&gop_flips).map(|(w, f)| format!("{w:.1}/{f}")).collect();
+        println!("PER_GOP {tag} {pass} {fill:?} worst-block-Y/flips (flips by decode frame): {}", cells.join(" "));
     }
     r.mean_psnr_y = psnr(mse_sum / frames.max(1) as f64);
     r.worst_frame_psnr_y = worst_y;
@@ -266,9 +326,10 @@ fn corpus() -> Vec<PathBuf> {
 #[test]
 #[ignore = "AV1 encodes over the corpus, minutes; --ignored --nocapture --test-threads=1"]
 fn v2_gate_corpus() {
-    let n = 2 * GOP;
-    println!("| clip | size | fill | framed B | cap B | flips | Y/U/V flips | mean Y | worst frame Y | worst block Y | worst U | worst V | flooded | enc ms | dec ms |");
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    // PHASM_GATE_GOPS=N sets the clip length (default 2 GOPs).
+    let n = GOP * std::env::var("PHASM_GATE_GOPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    println!("| clip | size | fill | framed B | cap B | flips | Y/U/V flips | mean Y | worst frame Y | worst block Y | worst U | worst V | flooded | enc ms | dec ms | cover |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     for clip in corpus() {
         if !clip.exists() {
             eprintln!("skip missing clip {}", clip.display());
@@ -287,19 +348,31 @@ fn v2_gate_corpus() {
                 continue;
             };
             // PHASM_GATE_FILLS="Kb1,Half" narrows the fills (calibration).
-            let fills: Vec<Fill> = [Fill::Bytes32, Fill::Kb1, Fill::Half, Fill::NinetyPct]
-                .into_iter()
-                .filter(|f| std::env::var("PHASM_GATE_FILLS").map_or(true, |v| v.split(',').any(|x| x == format!("{f:?}"))))
-                .collect();
-            for fill in fills {
+            // PHASM_GATE_ALPHAS="20,40,80" (thousandths) sweeps α instead (§ 4a).
+            // PHASM_GATE_PCTS="1000,950" (thousandths of capacity) measures
+            // deliverability; PHASM_GATE_REPS=N repeats each case with
+            // passphrases gate-0..gate-N.
+            let fills: Vec<Fill> = match (std::env::var("PHASM_GATE_ALPHAS"), std::env::var("PHASM_GATE_PCTS")) {
+                (Ok(v), _) => v.split(',').filter_map(|a| a.trim().parse().ok()).map(Fill::AlphaMilli).collect(),
+                (_, Ok(v)) => v.split(',').filter_map(|a| a.trim().parse().ok()).map(Fill::PctMilli).collect(),
+                _ if std::env::var("PHASM_GATE_FILLS").is_ok_and(|v| v == "ProbeMax") => vec![Fill::ProbeMax],
+                _ => [Fill::Bytes32, Fill::Kb1, Fill::Half, Fill::NinetyPct]
+                    .into_iter()
+                    .filter(|f| std::env::var("PHASM_GATE_FILLS").map_or(true, |v| v.split(',').any(|x| x == format!("{f:?}"))))
+                    .collect(),
+            };
+            let reps: usize = std::env::var("PHASM_GATE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            for (fill, rep) in fills.into_iter().flat_map(|f| (0..reps).map(move |r| (f, r))) {
                 let tag = format!("{name}-{h}p");
-                let Some(r) = gate_case(&yuv, w, h, n, fill, &tag) else { continue };
+                let pass = if reps > 1 { format!("gate-{rep}") } else { "gate".to_string() };
+                let Some(r) = gate_case(&yuv, w, h, n, fill, &tag, &pass) else { continue };
                 println!(
-                    "| {name} | {h}p | {fill:?} | {} | {} | {} | {}/{}/{} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} |",
+                    "| {name} | {h}p | {fill:?} | {} | {} | {} | {}/{}/{} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {} |",
                     r.framed_len, r.primary_capacity, r.flips,
                     r.flips_by_plane[0], r.flips_by_plane[1], r.flips_by_plane[2],
                     r.mean_psnr_y, r.worst_frame_psnr_y, r.worst_block_psnr_y,
-                    r.worst_frame_psnr_u, r.worst_frame_psnr_v, r.flooded_frames, r.encode_ms, r.decode_ms
+                    r.worst_frame_psnr_u, r.worst_frame_psnr_v, r.flooded_frames, r.encode_ms, r.decode_ms,
+                    r.cover_positions
                 );
             }
         }
@@ -333,7 +406,7 @@ fn write_v1_fixture() {
     let clip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-vectors/video/h264/real-world/source/IMG_4138.MOV");
     let (w, h, gop, n) = (256u32, 144u32, 8u32, 16u32);
     let yuv = clip_yuv(&clip, w, h, n).expect("corpus");
-    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: 30, gop_size: gop, total_frames_hint: n };
+    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: 30, gop_size: gop, total_frames_hint: n, colour: Default::default() };
     let framed = framed_primary(&text_for_framed_len(32), "v1-fixture");
     let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, gop);
     let stego = av1_encode_streaming(&mut src, n, p, &framed, "v1-fixture", Pass1CacheBudget::from_env_or_default(), None)
@@ -364,7 +437,7 @@ fn probe_capacity_encodes_on_the_corpus() {
         let name = clip.file_stem().unwrap().to_string_lossy().to_string();
         for (w, h) in [(640u32, 360u32), (1280, 720)] {
             let Some(yuv) = clip_yuv(&clip, w, h, n) else { continue };
-            let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: QUANTIZER, gop_size: GOP, total_frames_hint: n };
+            let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: QUANTIZER, gop_size: GOP, total_frames_hint: n, colour: Default::default() };
             let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, GOP);
             src.rewind().unwrap();
             let cap = av1_capacity_stratified(&mut src, n, p, &AllocationCalibration::AV1_1080P_QP30).expect("probe");
@@ -438,5 +511,30 @@ fn diag_flips_in_frame() {
             "D {d:>12.0} tag {tag} plane {} px ({},{}) tx {}x{} type {} scan {} |c| {c}",
             m.plane, m.plane_px_x, m.plane_px_y, 1 << m.tx_width_log2, 1 << m.tx_height_log2, m.tx_type, m.scan_pos
         );
+    }
+}
+
+/// The stratified probe alone (the production capacity figure) on
+/// `PHASM_GATE_CLIPS` at `PHASM_GATE_SIZES`, `PHASM_GATE_GOPS` GOPs.
+#[test]
+#[ignore = "AV1 probe encodes, minutes; --ignored --nocapture"]
+fn v2_probe_report() {
+    let n = GOP * std::env::var("PHASM_GATE_GOPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let sizes: Vec<(u32, u32)> = std::env::var("PHASM_GATE_SIZES")
+        .unwrap_or_else(|_| "1280x720".into())
+        .split(',')
+        .filter_map(|s| s.split_once('x'))
+        .map(|(a, b)| (a.parse().unwrap(), b.parse().unwrap()))
+        .collect();
+    for clip in corpus() {
+        for &(w, h) in &sizes {
+            let Some(yuv) = clip_yuv(&clip, w, h, n) else { continue };
+            let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: QUANTIZER, gop_size: GOP, total_frames_hint: n, colour: Default::default() };
+            let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, GOP);
+            src.rewind().unwrap();
+            let cal = phasm_core::stego::calibration::AllocationCalibration::AV1_1080P_QP30;
+            let est = phasm_core::codec::av1::stego::capacity::av1_capacity_stratified(&mut src, n, p, &cal).expect("probe");
+            println!("PROBE {} {h}p max {} comfort {} {est:?}", clip.display(), est.max_message_bytes(), est.comfort_message_bytes());
+        }
     }
 }

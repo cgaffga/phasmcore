@@ -338,6 +338,8 @@ pub fn walk_nalus_for_cover_parallel(
     acc_cover.mvd_suffix_lsb.reserve(total_mvd_lsb);
     acc_mvd_meta.reserve(total_mvd_meta);
 
+    acc_cover.mb_syntax.mb_w = prepared.mb_w as u32;
+    acc_cover.mb_syntax.mb_h = prepared.mb_h as u32;
     for r in slice_results {
         acc_cover.extend_from(r.cover);
         acc_mvd_meta.extend(r.mvd_meta);
@@ -566,7 +568,7 @@ where
                 // VCL NAL in the current GOP closes the prior GOP.
                 if t.is_idr() && had_vcl_in_current_gop {
                     let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
-                    let cover = recorder.take_cover();
+                    let mut cover = recorder.take_cover();
                     let mvd_meta = recorder.take_mvd_meta();
                     if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
                     let (closing_mb_w, closing_mb_h) = active_sps
@@ -577,6 +579,8 @@ where
                                 * if s.frame_mbs_only_flag { 1 } else { 2 },
                         ))
                         .unwrap_or((0, 0));
+                    cover.mb_syntax.mb_w = closing_mb_w;
+                    cover.mb_syntax.mb_h = closing_mb_h;
                     let action = on_gop(GopContext {
                         gop_idx: current_gop_idx,
                         cover,
@@ -656,7 +660,7 @@ where
     // End-of-stream: emit the final GOP if any VCL was processed.
     if had_vcl_in_current_gop {
         let t_gop = if trace { Some(std::time::Instant::now()) } else { None };
-        let cover = recorder.take_cover();
+        let mut cover = recorder.take_cover();
         let mvd_meta = recorder.take_mvd_meta();
         if let Some(t) = t_gop { t_gop_extract_total += t.elapsed(); }
         let (closing_mb_w, closing_mb_h) = active_sps
@@ -667,6 +671,8 @@ where
                     * if s.frame_mbs_only_flag { 1 } else { 2 },
             ))
             .unwrap_or((0, 0));
+        cover.mb_syntax.mb_w = closing_mb_w;
+        cover.mb_syntax.mb_h = closing_mb_h;
         on_gop(GopContext {
             gop_idx: current_gop_idx,
             cover,
@@ -804,6 +810,21 @@ fn walk_slice_mbs(
             )?
         };
 
+        // v2 damage-model input: this MB's intra flag + QP (decoder-visible
+        // syntax; untouched by every stego layer's wire-only flips).
+        {
+            use crate::codec::h264::stego::damage::{MbSyntax, MB_INTRA, MB_KEY};
+            let intra = dec.neighbors.prev_mb().map(|m| m.mb_type.is_intra()).unwrap_or(false);
+            let qp_y = prev_mb_qp.clamp(0, 51);
+            let qp_c = crate::codec::h264::transform::derive_chroma_qp(qp_y, pps.chroma_qp_index_offset);
+            recorder.on_mb(MbSyntax {
+                frame_idx,
+                mb_addr: mb_addr as u32,
+                qp_y: qp_y as u8,
+                qp_c: qp_c as u8,
+                flags: if intra { MB_INTRA } else { 0 } | if is_intra_slice { MB_KEY } else { 0 },
+            });
+        }
         mbs_walked += 1;
         mb_addr += 1;
         if is_last {

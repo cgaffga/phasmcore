@@ -2,62 +2,49 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Shadow messages: Y-channel direct LSB embedding + RS ECC (headerless brute-force).
+//! Shadow messages: Y-channel keyed-region STC + RS framing (headerless).
 //!
 //! Shadow messages provide plausible deniability for Ghost mode steganography.
 //! Multiple messages can be hidden in a single image, each with a different
-//! passphrase. They are embedded as absolute-value LSBs into Y-channel nzAC
-//! positions (the same domain as primary STC), using nsf5 modification.
+//! passphrase. The system auto-sorts messages by size: the largest becomes
+//! the primary, smaller messages become shadow layers.
 //!
-//! The system auto-sorts messages by size: the largest becomes the primary
-//! (embedded via STC for full stealth), smaller messages become shadow channels
-//! (embedded via direct LSB with Reed-Solomon error correction).
+//! ## Layout (Ghost v3, core 0.5)
 //!
-//! ## Headerless design
+//! Every shadow reads along a **keyed hash order** of the Y AC coefficients
+//! (zeros included): position `fi` has priority `ChaCha20(seed)` word pair
+//! `2·fi` and the order sorts by priority. The set of AC positions never
+//! changes, so the decoder rebuilds the order exactly — no costs on the
+//! decoder side.
 //!
-//! No magic byte, no frame_data_len in the bitstream. The decoder brute-forces
-//! all (parity, fdl) combinations. AES-256-GCM-SIV authentication is the only
-//! validator — successful decryption proves correct parameters.
+//! A shadow of `n` RS-coded bits owns the *region* = the first `n·w`
+//! positions of its hash order and embeds with a syndrome-trellis code of
+//! width `w` into the coefficient parity (end-set H-hat, the v3 height). The
+//! encoder's Viterbi minimises the J-UNIWARD (or SI-UNIWARD) cost of the
+//! flips; each flip is a ±1 change in the v3 direction (toward the precover
+//! with side information, else a keyed coin). Layers never touch each
+//! other: a later shadow treats every earlier shadow's region as wet, and
+//! the primary treats all regions as wet, so the bits arrive error-free; RS
+//! parity 4 is kept only as an integrity gate (the decoder requires zero
+//! corrections). Widths come from the v3 ladder.
 //!
-//! ## Short STC + Dynamic w
+//! ## Decode-only: shadows of core ≤ 0.4.x / apps ≤ 1.8 (layout v1)
 //!
-//! Since shadows and primary STC share the same Y-channel LSBs, the primary
-//! STC uses "short" message mode: only the actual `m` message bits are passed
-//! (not zero-padded to `m_max`). With dynamic `w = min(floor(n/m), 10)`, small
-//! messages get high w, meaning 2,500x fewer modifications. When w >= 2, shadow
-//! positions get `f32::INFINITY` cost in STC, so Viterbi routes around them,
-//! achieving BER ~ 0% on shadows.
-//!
-//! ## Cost-pool position selection
-//!
-//! Shadow positions are selected in two tiers for stealth:
-//! 1. **Tier 1 (cost pool):** Filter all Y nzAC positions to the cheapest
-//!    fraction (5%, 10%, 20%, 50%, or 100%) by UNIWARD cost. Cheap positions
-//!    are in textured regions — modifications there are least detectable.
-//! 2. **Tier 2 (hash permutation):** Within the cost pool, select positions
-//!    by keyed hash `ChaCha20(seed, flat_idx)` priority.
-//!
-//! Encoder uses cover-image costs; decoder uses stego-image costs. The cost
-//! pools differ slightly at the boundary (~2-5% positions), but RS error
-//! correction handles the resulting BER. Primary Ghost proves this works:
-//! encoder and decoder already use cover vs stego costs for STC positions.
-//! The decoder brute-forces the fraction alongside parity and fdl.
+//! - **Legacy tier**: direct LSB on the first `n` positions of a keyed hash
+//!   order of the Y *non-zero* AC set, RS parity 4…128, brute-forced (the
+//!   "100 % pool" where every v1 shadow ended up in practice);
+//! - **cost pools**: the cheapest 5–50 % of the nzAC set under the v1
+//!   J-UNIWARD costs, read only after everything else failed
+//!   ([`shadow_extract_cost_pools`]).
 //!
 //! ## Frame format (inside RS-encoded data, no header)
 //!
 //! ```text
-//! RS-encoded frame (all positions):
-//!     Inner: [plaintext_len: 2B] [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
+//!     [plaintext_len: 2B] [salt: 16B] [nonce: 12B] [ciphertext: N+16B]
 //! ```
-//!
-//! ## nzAC invariance
-//!
-//! The nsf5 anti-shrinkage rule (`|coeff|==1 -> away from zero`) ensures no
-//! coefficient ever becomes zero. Since both shadow embedding and primary STC
-//! use nsf5, the Y nzAC set is identical at encoder and decoder, guaranteeing
-//! position agreement.
 
 use crate::codec::jpeg::JpegImage;
+use crate::codec::jpeg::dct::DctGrid;
 use crate::stego::armor::ecc;
 use crate::stego::crypto;
 #[cfg(test)]
@@ -67,31 +54,38 @@ use crate::stego::frame;
 use crate::stego::payload::{self, FileEntry, PayloadData};
 use crate::stego::permute::CoeffPos;
 use crate::stego::progress;
-use super::pipeline::{flat_get, flat_set};
+use crate::stego::stc::{extract as stc_extract, hhat, trellis};
+use super::side_info::SideInfo;
+use super::v3;
 use crate::stego::shadow_layer::{
     build_shadow_frame, parse_shadow_frame, peek_shadow_fdl, SHADOW_FRAME_OVERHEAD_V1,
 };
-use crate::stego::side_info::nsf5_modify_coefficient;
 
-/// Frame overhead lower bound (= v1 overhead, 46 bytes). The
-/// brute-force decoder scans `[SHADOW_FRAME_OVERHEAD..=k-1]` which
-/// always lives in v1 territory — v2 frames are inherently large
-/// (≥65586 bytes) and reach the decoder via the peek path, not
-/// brute-force. Image-side encoder picks v1 for plaintexts
-/// ≤ u16::MAX (matches `shadow_layer::build_shadow_frame`).
+/// Frame overhead lower bound (= v1 overhead, 46 bytes). The image encoder
+/// picks the v1 frame for plaintexts ≤ u16::MAX.
 const SHADOW_FRAME_OVERHEAD: usize = SHADOW_FRAME_OVERHEAD_V1;
 
-/// RS parity tiers. Brute-forced at decode.
-const SHADOW_PARITY_TIERS: [usize; 6] = [4, 8, 16, 32, 64, 128];
+/// RS parity of a shadow layer. Its bits arrive error-free (no other layer
+/// writes into its region), so the parity is an integrity gate: the decoder
+/// requires zero corrections.
+pub const SHADOW_STC_PARITY: usize = 4;
 
-/// Cost pool fractions (denominators). Encoder picks smallest that fits.
-/// 20 = cheapest 5%, 10 = 10%, 5 = 20%, 2 = 50%, 1 = 100%.
-/// Smaller fractions give better stealth (positions in most textured regions).
-/// Decoder brute-forces all fractions.
-const COST_FRACTIONS: [usize; 5] = [20, 10, 5, 2, 1];
+/// Smallest shadow region payload the decoder accepts (bits).
+pub const SHADOW_MIN_STC_BITS: usize = (SHADOW_FRAME_OVERHEAD + SHADOW_STC_PARITY) * 8;
 
-/// Maximum RS-encoded frame bytes to prevent unreasonable allocations.
-const MAX_SHADOW_FRAME_BYTES: usize = 256 * 1024;
+/// RS parity tiers of the layout-v1 legacy tier (decode-only). Brute-forced.
+pub const SHADOW_PARITY_TIERS: [usize; 6] = [4, 8, 16, 32, 64, 128];
+
+/// Shadow layout v1's cost-pool fractions (denominators): 20 = cheapest 5 %,
+/// 10 = 10 %, 5 = 20 %, 2 = 50 %. Decode-only; v1's 100 % pool is the
+/// legacy tier.
+pub const COST_DEPENDENT_FRACTIONS: [usize; 4] = [20, 10, 5, 2];
+
+/// Largest shadow frame the layout-v1 brute force considers (decoder sanity
+/// bound, not wire). The released v1 encoder never capped shadow frames at
+/// the 256 KB its decoder used, so the bound is the shadow format's own.
+const MAX_SHADOW_FRAME_BYTES: usize = crate::stego::shadow_layer::MAX_SHADOW_FRAME_BYTES;
+
 
 // Thread-local scratch buffer for the brute-force loop's
 // bits_to_bytes step. The no-match path can call try_single_fdl
@@ -136,18 +130,18 @@ fn try_single_fdl_with_rs_bytes(
         Err(_) => return None,
     };
 
-    // O(1) format-aware consistency gate (mirrors the video shadow
-    // path). peek_shadow_fdl reads the first 2-6 bytes, dispatches
-    // v1 vs v2, returns the producer's total frame length. If that
-    // doesn't equal the brute-force fdl candidate, reject without
-    // parse + AES. Skips ~99% of bad candidates' Argon2 +
-    // AES-GCM-SIV work.
+    // O(1) format-aware consistency gate: the frame's own length field must
+    // agree with the brute-force candidate, or skip the Argon2 + AES work.
     let expected_total = peek_shadow_fdl(&decoded)?;
     if expected_total != fdl {
         return None;
     }
+    decrypt_frame(&decoded, passphrase)
+}
 
-    let fr = match parse_shadow_frame(&decoded) {
+/// Parse a decoded shadow frame and decrypt it.
+fn decrypt_frame(decoded: &[u8], passphrase: &str) -> Option<Result<PayloadData, StegoError>> {
+    let fr = match parse_shadow_frame(decoded) {
         Ok(f) => f,
         Err(_) => return None,
     };
@@ -167,9 +161,6 @@ fn try_single_fdl_with_rs_bytes(
 /// Peek at the first RS block to read `plaintext_len` and derive the exact fdl.
 /// Returns the candidate fdl if the first block decodes and the resulting fdl
 /// is plausible (>= k, within pool capacity).
-///
-/// Delegates v1/v2 dispatch to the shared [`peek_shadow_fdl`] helper
-/// in `shadow_layer`. Same dispatch logic for image + video shadow.
 fn peek_fdl_from_first_block(
     lsbs: &[u8],
     parity_len: usize,
@@ -195,259 +186,747 @@ fn peek_fdl_from_first_block(
     }
 }
 
-/// State for a single shadow layer during encoding.
+// ---------------------------------------------------------------------------
+// Selection: keyed hash orders
+// ---------------------------------------------------------------------------
+
+/// The first `k` Y AC flat indices (`block · 64 + 1..63`) of `grid` in the
+/// keyed hash order of `seed`: sorted by the priority `ChaCha20(seed)` word
+/// pair `2·fi` (the 64-bit word [`select_shadow_positions`] reads for
+/// position `fi`). Equal priorities keep raster order. Memory: the result
+/// plus a bounded working set (see [`ac_hash_order_visit`]).
+pub fn ac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u32> {
+    let mut out = Vec::with_capacity(k.min(v3::ac_count(grid)));
+    ac_hash_order_visit(grid, seed, k, ORDER_GROUP_CANDIDATES, |fi| out.push(fi));
+    out
+}
+
+/// Coefficient parities along the first `k` positions of the hash order
+/// (`parity_along(ac_hash_order_prefix(..))` without holding the order).
+fn ac_hash_order_parities(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u8> {
+    let c = grid.coeffs();
+    let mut out = Vec::with_capacity(k.min(v3::ac_count(grid)));
+    ac_hash_order_visit(grid, seed, k, ORDER_GROUP_CANDIDATES, |fi| out.push((c[fi as usize] & 1) as u8));
+    out
+}
+
+/// Candidates (priority, position) one pass of [`ac_hash_order_visit`]
+/// collects and sorts: 16 bytes each (128 MB transient at most). A full order
+/// of a 100 MP cover takes ~14 keystream passes.
+const ORDER_GROUP_CANDIDATES: usize = 8 << 20;
+
+/// Top priority bits the histogram of [`ac_hash_order_visit`] buckets by.
+const ORDER_BUCKET_BITS: u32 = 16;
+
+/// Blocks per keystream chunk (the unit of parallelism).
+const ORDER_CHUNK_BLOCKS: usize = 4096;
+
+/// Run `step(acc, priority, fi)` over every AC position, chunk by chunk of
+/// blocks (in parallel with `parallel`); the chunk accumulators come back in
+/// block order. Block `b`'s 64 priorities are keystream bytes
+/// `512 b .. 512 b + 512` (words `128 b ..`), so a chunk seeks to its first
+/// block and reads on, exactly the stream a sequential pass reads.
+fn scan_ac_priorities<T: Send>(
+    seed: &[u8; 32],
+    blocks: usize,
+    chunks: std::ops::Range<usize>,
+    init: impl Fn() -> T + Sync,
+    step: impl Fn(&mut T, u64, u32) + Sync,
+) -> Vec<T> {
+    use rand::{RngCore, SeedableRng};
+    let run = |c: usize| -> T {
+        let mut acc = init();
+        let b0 = c * ORDER_CHUNK_BLOCKS;
+        let b1 = (b0 + ORDER_CHUNK_BLOCKS).min(blocks);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
+        rng.set_word_pos(b0 as u128 * 128);
+        let mut buf = [0u8; 512];
+        for b in b0 as u32..b1 as u32 {
+            rng.fill_bytes(&mut buf);
+            // DC (k = 0) is not an AC position; its word pair is skipped.
+            for kk in 1..64u32 {
+                let o = kk as usize * 8;
+                step(&mut acc, u64::from_le_bytes(buf[o..o + 8].try_into().unwrap()), b * 64 + kk);
+            }
+        }
+        acc
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        chunks.into_par_iter().map(run).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    chunks.map(run).collect()
+}
+
+/// Visit the first `k` AC positions of the hash order, in order.
+///
+/// A histogram pass over the top `ORDER_BUCKET_BITS` priority bits finds the
+/// buckets that hold the `k` smallest priorities; then each group of buckets
+/// holding at most `group_cap` positions (or one bucket) takes one more pass
+/// that collects exactly its positions, sorts them by priority (stable, so
+/// equal priorities stay in raster order) and visits them. That is the
+/// order of a full sort by (priority, position), so every prefix is exact,
+/// while the working set is the histogram plus one group — independent of
+/// `k` and of the cover (the cost: one keystream pass per group).
+fn ac_hash_order_visit(grid: &DctGrid, seed: &[u8; 32], k: usize, group_cap: usize, mut visit: impl FnMut(u32)) {
+    let blocks = grid.blocks_wide() * grid.blocks_tall();
+    let k = k.min(blocks * 63);
+    if k == 0 {
+        return;
+    }
+    let shift = 64 - ORDER_BUCKET_BITS;
+    let n_buckets = 1usize << ORDER_BUCKET_BITS;
+    let chunks = blocks.div_ceil(ORDER_CHUNK_BLOCKS);
+    let mut hist = vec![0u64; n_buckets];
+    // Per-chunk histograms (256 KB each) are summed a round at a time, never
+    // all held at once.
+    const HIST_ROUND_CHUNKS: usize = 32;
+    for c0 in (0..chunks).step_by(HIST_ROUND_CHUNKS) {
+        let parts = scan_ac_priorities(
+            seed,
+            blocks,
+            c0..(c0 + HIST_ROUND_CHUNKS).min(chunks),
+            || vec![0u32; n_buckets],
+            |h: &mut Vec<u32>, prio, _| h[(prio >> shift) as usize] += 1,
+        );
+        for part in &parts {
+            for (t, &c) in hist.iter_mut().zip(part) {
+                *t += c as u64;
+            }
+        }
+    }
+
+    let mut done = 0usize;
+    let mut g0 = 0usize;
+    while done < k && g0 < n_buckets {
+        // Grow the group while it stays within the cap (at least one bucket).
+        let mut g1 = g0;
+        let mut count = 0u64;
+        while g1 < n_buckets && (g1 == g0 || count + hist[g1] <= group_cap as u64) && done as u64 + count < k as u64 {
+            count += hist[g1];
+            g1 += 1;
+        }
+        if count > 0 {
+            let (lo, hi) = (g0 as u64, g1 as u64);
+            let mut parts = scan_ac_priorities(
+                seed,
+                blocks,
+                0..chunks,
+                Vec::new,
+                |v: &mut Vec<(u64, u32)>, prio, fi| {
+                    let b = prio >> shift;
+                    if b >= lo && b < hi {
+                        v.push((prio, fi));
+                    }
+                },
+            );
+            // Sort each chunk's part (stable: raster order on ties), then
+            // merge the parts in place of one concatenated sort: a tie between
+            // parts goes to the earlier part, i.e. the earlier position, so
+            // the result is the stable sort of the concatenation without its
+            // copy or the sort's scratch.
+            let sort = |p: &mut Vec<(u64, u32)>| radsort::sort_by_key(p, |(prio, _)| *prio);
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                parts.par_iter_mut().for_each(sort);
+            }
+            #[cfg(not(feature = "parallel"))]
+            parts.iter_mut().for_each(sort);
+            let mut heads = vec![0usize; parts.len()];
+            let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>> = parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(i, p)| std::cmp::Reverse((p[0].0, i)))
+                .collect();
+            let take = (k - done).min(count as usize);
+            for _ in 0..take {
+                let std::cmp::Reverse((_, i)) = heap.pop().expect("histogram counted these");
+                visit(parts[i][heads[i]].1);
+                heads[i] += 1;
+                if let Some(&(prio, _)) = parts[i].get(heads[i]) {
+                    heap.push(std::cmp::Reverse((prio, i)));
+                }
+            }
+            done += take;
+        }
+        g0 = g1;
+    }
+}
+
+/// Every position of `positions` (any order) sorted by its keyed priority
+/// `ChaCha20(seed, flat_idx)` — the layout-v1 order of the nzAC set.
+pub fn hash_order(positions: &[CoeffPos], seed: &[u8; 32]) -> Vec<CoeffPos> {
+    select_shadow_positions(positions, 1, positions.len(), seed)
+}
+
+/// The H-hat seed of a shadow's STC: 32 bytes of ChaCha20 stream 1 under the
+/// shadow's structural key (the hash priorities use stream 0).
+fn stc_hhat_seed(perm_seed: &[u8; 32]) -> [u8; 32] {
+    use rand::{RngCore, SeedableRng};
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed(*perm_seed);
+    rng.set_stream(1);
+    let mut out = [0u8; 32];
+    rng.fill_bytes(&mut out);
+    out
+}
+
+/// A shadow region's H-hat (end-set construction, the v3 height).
+fn shadow_hhat(w: usize, perm_seed: &[u8; 32], h: usize) -> Vec<Vec<u32>> {
+    hhat::generate_hhat_end_set(h, w, &stc_hhat_seed(perm_seed))
+}
+
+/// Coefficient parities along `order` (flat indices).
+fn parity_along(grid: &DctGrid, order: &[u32]) -> Vec<u8> {
+    let c = grid.coeffs();
+    order.iter().map(|&fi| (c[fi as usize] & 1) as u8).collect()
+}
+
+
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+/// A shadow's encrypted frame, built once per encode (one salt + nonce).
+#[derive(Clone)]
+pub struct ShadowFrame {
+    /// Raw frame bytes (before RS).
+    pub frame_bytes: Vec<u8>,
+    /// Shadow structural key (seed of the hash order and the H-hat).
+    pub perm_seed: [u8; 32],
+    /// Seed of the direction coin of this layer's changes.
+    pub dir_seed: u64,
+}
+
+impl ShadowFrame {
+    /// Build the payload, encrypt it and frame it.
+    pub fn new(shadow_pass: &str, message: &str, files: &[FileEntry]) -> Result<Self, StegoError> {
+        let payload_bytes = payload::encode_payload(message, files)?;
+        let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
+        let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
+        let perm_seed = crypto::derive_shadow_structural_key(shadow_pass)?;
+        Ok(Self { frame_bytes, perm_seed: *perm_seed, dir_seed: v3::dir_seed_from_salt(&salt) })
+    }
+
+    /// RS-coded bit count (parity [`SHADOW_STC_PARITY`]).
+    pub fn rs_bits(&self) -> usize {
+        ecc::rs_encoded_len_with_parity(self.frame_bytes.len(), SHADOW_STC_PARITY) * 8
+    }
+}
+
+/// One shadow layer planned for embedding.
 #[derive(Clone)]
 pub struct ShadowState {
-    /// Cost-filtered + hash-permuted embedding positions (Y channel nzAC).
-    pub positions: Vec<CoeffPos>,
-    /// The desired LSB bits (RS-encoded frame, no header).
-    pub bits: Vec<u8>,
-    /// Total bits = RS-encoded data.
+    /// The region this layer owns (flat indices, hash order): `n_total · w`
+    /// positions. The primary and every later shadow treat them as wet.
+    pub positions: Vec<u32>,
+    /// The parity each of `positions` holds once embedded.
+    pub embed_bits: Vec<u8>,
+    /// RS-encoded frame bits, as the decoder extracts them.
     pub n_total: usize,
-    /// Current RS parity length.
-    pub parity_len: usize,
-    /// Unencoded frame byte count (before RS).
-    pub frame_data_len: usize,
-    /// Raw frame bytes (before RS), needed for parity bump rebuild.
-    pub frame_bytes: Vec<u8>,
-    /// Cached shadow structural key (ChaCha20 seed for position permutation).
+    /// Shadow structural key.
     pub perm_seed: [u8; 32],
-    /// Cost pool fraction denominator (20=5%, 10=10%, 5=20%, 2=50%, 1=100%).
-    pub cost_fraction: usize,
+    /// STC width.
+    pub stc_w: usize,
+    /// STC height.
+    pub h: usize,
+    /// Direction coin seed.
+    pub dir_seed: u64,
 }
 
-/// Prepare a shadow layer for embedding.
-///
-/// Builds the payload, encrypts, frames, RS-encodes, then selects positions
-/// using cost-pool filtering (Tier 1) + hash permutation (Tier 2).
-/// Tries fractions from smallest (best stealth) to largest (most capacity).
-///
-/// `all_y_positions_sorted` must be sorted by cost (cheapest first).
-pub fn prepare_shadow(
-    all_y_positions_sorted: &[CoeffPos],
-    shadow_pass: &str,
-    message: &str,
-    files: &[FileEntry],
-    parity_len: usize,
-) -> Result<ShadowState, StegoError> {
-    // 1. Build payload (text + files + compression).
-    let payload_bytes = payload::encode_payload(message, files)?;
-
-    // 2. Encrypt payload.
-    let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
-
-    // 3. Build inner frame (no header, no CRC — RS + GCM provide integrity).
-    let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
-    let frame_data_len = frame_bytes.len();
-
-    // 4. RS encode.
-    let rs_bytes = ecc::rs_encode_blocks_with_parity(&frame_bytes, parity_len);
-    let rs_bits = frame::bytes_to_bits(&rs_bytes);
-    let n_total = rs_bits.len();
-
-    // 5. Select positions: try fractions from smallest (best stealth) to largest.
-    let perm_seed = crypto::derive_shadow_structural_key(shadow_pass)?;
-    for &fraction in &COST_FRACTIONS {
-        let positions = select_shadow_positions(all_y_positions_sorted, fraction, n_total, &perm_seed);
-        if positions.len() >= n_total {
-            return Ok(ShadowState {
-                positions,
-                bits: rs_bits,
-                n_total,
-                parity_len,
-                frame_data_len,
-                frame_bytes,
-                perm_seed: *perm_seed,
-                cost_fraction: fraction,
-            });
-        }
+impl ShadowState {
+    /// RS-coded bits of this layer and the region length at width `w`.
+    pub fn region_len(frame: &ShadowFrame, w: usize) -> usize {
+        frame.rs_bits() * w
     }
 
-    Err(StegoError::MessageTooLarge)
-}
-
-/// Rebuild a shadow state with new parity and/or fraction.
-///
-/// Called during encoder escalation when decoder-side verification fails.
-/// Re-RS-encodes the same frame data with the new parity, selects positions
-/// from the specified cost fraction.
-///
-/// `all_y_positions_sorted` must be sorted by cost (cheapest first).
-pub fn rebuild_shadow(
-    state: &mut ShadowState,
-    all_y_positions_sorted: &[CoeffPos],
-    new_parity: usize,
-    new_fraction: usize,
-) -> Result<(), StegoError> {
-    let rs_bytes = ecc::rs_encode_blocks_with_parity(&state.frame_bytes, new_parity);
-    let rs_bits = frame::bytes_to_bits(&rs_bytes);
-    let n_total = rs_bits.len();
-
-    let positions = select_shadow_positions(
-        all_y_positions_sorted, new_fraction, n_total, &state.perm_seed,
-    );
-    if positions.len() < n_total {
-        return Err(StegoError::MessageTooLarge);
-    }
-
-    state.positions = positions;
-    state.bits = rs_bits;
-    state.n_total = n_total;
-    state.parity_len = new_parity;
-    state.cost_fraction = new_fraction;
-
-    Ok(())
-}
-
-/// Embed shadow intended bits as absolute-value LSBs into the Y DctGrid.
-///
-/// Uses nsf5 modification: toward zero for |coeff|>1, away from zero for
-/// |coeff|==1 (anti-shrinkage preserves the nzAC set).
-pub fn embed_shadow_lsb(img: &mut JpegImage, state: &ShadowState) {
-    for (i, pos) in state.positions.iter().enumerate() {
-        if i >= state.n_total {
-            break;
+    /// Plan a region of width `w` along `order` (the shadow's hash-order
+    /// prefix, at least `n_total · w` long) against the cover `img` plus the
+    /// values of earlier layers (`overlay`). `cost(i)` is the flip cost of
+    /// `order[i]` (∞ for earlier shadows' regions). `inline_limit`: the
+    /// trellis back-pointer table kept in memory (above: checkpointed).
+    ///
+    /// `Ok(None)` when the region does not fit or the trellis is infeasible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan(
+        frame: &ShadowFrame,
+        order: &[u32],
+        w: usize,
+        img: &JpegImage,
+        overlay: &v3::Overlay,
+        cost: impl Fn(usize) -> f32,
+        h: usize,
+        inline_limit: usize,
+        tick: &(dyn Fn(usize) + Sync),
+    ) -> Result<Option<Self>, StegoError> {
+        let rs_bytes = ecc::rs_encode_blocks_with_parity(&frame.frame_bytes, SHADOW_STC_PARITY);
+        let bits = frame::bytes_to_bits(&rs_bytes);
+        let n_total = bits.len();
+        let region_len = n_total * w;
+        if order.len() < region_len {
+            return Ok(None);
         }
-        let fi = pos.flat_idx as usize;
-        let coeff = flat_get(img.dct_grid(0), fi);
-        let current_lsb = (coeff.unsigned_abs() & 1) as u8;
-        if current_lsb != state.bits[i] {
-            let modified = nsf5_modify_coefficient(coeff);
-            flat_set(img.dct_grid_mut(0), fi, modified);
-        }
+        let region = &order[..region_len];
+        let grid = img.dct_grid(0);
+        let cover_bits: Vec<u8> = region.iter().map(|&fi| (v3::value(grid, Some(overlay), fi) & 1) as u8).collect();
+        let costs: Vec<f32> = (0..region_len).map(&cost).collect();
+        let cols = v3::packed_cols(&shadow_hhat(w, &frame.perm_seed, h), w);
+        let threads = crate::stego::memory::encode_workers();
+        let Some(planned) = trellis::embed(&cover_bits, &costs, &bits, &cols, h, inline_limit, threads, tick)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            positions: region.to_vec(),
+            embed_bits: planned.stego_bits,
+            n_total,
+            perm_seed: frame.perm_seed,
+            stc_w: w,
+            h,
+            dir_seed: frame.dir_seed,
+        }))
     }
 }
 
-/// Verify a shadow layer can be correctly decoded from the current image state.
-///
-/// Extracts LSBs, RS-decodes, parses frame, and decrypts.
-pub fn verify_shadow(
-    img: &JpegImage,
-    state: &ShadowState,
-    passphrase: &str,
-) -> Result<(), StegoError> {
+/// Embed a shadow layer into the overlay: give every position its planned
+/// parity by a ±1 change in the v3 direction (toward the precover with side
+/// information, else a keyed coin). Returns the number of coefficients
+/// changed.
+pub fn embed_shadow(img: &JpegImage, overlay: &mut v3::Overlay, state: &ShadowState, si: Option<&SideInfo>) -> usize {
+    let mut changed = 0;
     let grid = img.dct_grid(0);
-
-    // Extract all LSBs for this shadow's positions.
-    let lsbs: Vec<u8> = state.positions[..state.n_total].iter().map(|pos| {
-        let coeff = flat_get(grid, pos.flat_idx as usize);
-        (coeff.unsigned_abs() & 1) as u8
-    }).collect();
-    let rs_bytes = frame::bits_to_bytes(&lsbs);
-
-    // RS decode with known parameters.
-    let (decoded, _stats) = ecc::rs_decode_blocks_with_parity(
-        &rs_bytes, state.frame_data_len, state.parity_len,
-    ).map_err(|_| StegoError::FrameCorrupted)?;
-
-    // Parse frame and decrypt to verify integrity.
-    let fr = parse_shadow_frame(&decoded)?;
-    crypto::decrypt(
-        &fr.ciphertext,
-        passphrase,
-        &fr.salt,
-        &fr.nonce,
-    )?;
-
-    Ok(())
+    for (&fi, &bit) in state.positions.iter().zip(&state.embed_bits) {
+        let c = v3::value(grid, Some(overlay), fi);
+        if (c & 1) as u8 != bit {
+            overlay.set(fi, v3::modify_pm1(c, si.map(|s| s.error_at(fi as usize)), state.dir_seed, fi as u64));
+            changed += 1;
+        }
+    }
+    changed
 }
 
-/// Verify a shadow can be decoded from the decoder's perspective.
-///
-/// Uses stego-image UNIWARD costs (not encoder's cover costs) to select
-/// positions, then checks RS decode + AES-GCM. This catches cost-pool
-/// boundary disagreements that the encoder-side verify misses.
-///
-/// `stego_y_positions_sorted` must be sorted by cost from the STEGO image.
-pub fn verify_shadow_decoder_side(
-    img: &JpegImage,
-    state: &ShadowState,
+/// Verify a shadow layer from the current image exactly as the decoder
+/// reads it: the STC syndrome along the region, RS-decode with zero
+/// corrections, decrypt.
+pub fn verify_shadow(img: &JpegImage, state: &ShadowState, passphrase: &str) -> Result<(), StegoError> {
+    let lsbs = parity_along(img.dct_grid(0), &state.positions);
+    let hh = shadow_hhat(state.stc_w, &state.perm_seed, state.h);
+    match try_stc_tier(&lsbs, &hh, state.stc_w, passphrase, lsbs.len() / state.stc_w) {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(e)) => Err(e),
+        None => Err(StegoError::FrameCorrupted),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder (v3)
+// ---------------------------------------------------------------------------
+
+/// A tier's frame data length from its 48-bit syndrome header (v1 header =
+/// 2 bytes, v2 = 6 bytes, both at the start of the first RS block), if the
+/// RS-coded frame fits `max_bits`.
+fn tier_fdl(header_bits: &[u8], max_bits: usize) -> Option<(usize, usize)> {
+    if max_bits < SHADOW_MIN_STC_BITS || header_bits.len() < 48 {
+        return None;
+    }
+    let fdl = peek_shadow_fdl(&frame::bits_to_bytes(header_bits))?;
+    let rs_len = ecc::rs_encoded_len_with_parity(fdl, SHADOW_STC_PARITY);
+    if rs_len.checked_mul(8)? > max_bits {
+        return None;
+    }
+    Some((fdl, rs_len))
+}
+
+/// Decode one STC tier from parities along the hash order. Exact: reads the
+/// frame length from the first syndrome bits, extracts exactly the frame's
+/// bits, and requires the RS decode to correct nothing (a random word passes
+/// that with probability 2⁻³² per block), so a wrong passphrase or tier
+/// almost never reaches the Argon2 + AES step. `max_bits`: the most bits the
+/// region may hold at this width (`n / w`).
+fn try_stc_tier(
+    lsbs: &[u8],
+    hh: &[Vec<u32>],
+    w: usize,
     passphrase: &str,
-    stego_y_positions_sorted: &[CoeffPos],
-) -> Result<(), StegoError> {
-    let positions = select_shadow_positions(
-        stego_y_positions_sorted, state.cost_fraction, state.n_total, &state.perm_seed,
-    );
-    if positions.len() < state.n_total {
+    max_bits: usize,
+) -> Option<Result<PayloadData, StegoError>> {
+    let head = stc_extract::stc_extract_prefix(lsbs, hh, w, 48);
+    let (fdl, rs_len) = tier_fdl(&head, max_bits)?;
+    if lsbs.len() < rs_len * 8 * w {
+        return None;
+    }
+    let bits = stc_extract::stc_extract_prefix(lsbs, hh, w, rs_len * 8);
+    let rs_bytes = frame::bits_to_bytes(&bits);
+    let (decoded, stats) = ecc::rs_decode_blocks_with_parity(&rs_bytes, fdl, SHADOW_STC_PARITY).ok()?;
+    if stats.total_errors != 0 {
+        return None;
+    }
+    decrypt_frame(&decoded, passphrase)
+}
+
+/// Whether the first RS block of a tier's frame decodes with zero
+/// corrections (a random word passes with probability 2⁻³²).
+fn first_block_clean(lsbs: &[u8], hh: &[Vec<u32>], w: usize, fdl: usize, rs_len: usize) -> bool {
+    let k = 255 - SHADOW_STC_PARITY;
+    let (blk_bytes, blk_data) = if fdl <= k { (rs_len, fdl) } else { (255, k) };
+    if lsbs.len() < blk_bytes * 8 * w {
+        return false;
+    }
+    let bits = stc_extract::stc_extract_prefix(lsbs, hh, w, blk_bytes * 8);
+    matches!(
+        ecc::rs_decode_blocks_with_parity(&frame::bits_to_bytes(&bits), blk_data, SHADOW_STC_PARITY),
+        Ok((_, s)) if s.total_errors == 0
+    )
+}
+
+/// Ghost v3 shadow decode: STC regions along the passphrase's hash order of
+/// the Y AC set, every width of the v3 ladder.
+///
+/// Memory is `O(region)`, not `O(cover)`: the hash order is built only as
+/// far as the reads need — every width's 48-bit header first, then the first
+/// RS block of the widths whose header is plausible, then the full region
+/// of the widths whose first block decodes cleanly.
+pub fn shadow_extract_v3(img: &JpegImage, passphrase: &str) -> Result<PayloadData, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let grid = img.dct_grid(0);
+    let n = v3::ac_count(grid);
+    let widths = v3::shadow_widths(n, SHADOW_MIN_STC_BITS);
+    if widths.is_empty() {
         return Err(StegoError::FrameCorrupted);
     }
+    let h = v3::V3_STC_H;
+    let t = v3::tstart();
+    let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
+    v3::tlog("shadow key", t);
+    progress::check_cancelled()?;
 
-    let grid = img.dct_grid(0);
-    let lsbs: Vec<u8> = positions[..state.n_total].iter().map(|pos| {
-        let coeff = flat_get(grid, pos.flat_idx as usize);
-        (coeff.unsigned_abs() & 1) as u8
-    }).collect();
-    let rs_bytes = frame::bits_to_bytes(&lsbs);
+    // Stage 1: every width's header.
+    let mut lsbs = ac_hash_order_parities(grid, &perm_seed, 48 * widths[widths.len() - 1]);
+    v3::tlog("shadow order", t);
+    let mut cand: Vec<(usize, Vec<Vec<u32>>, usize, usize)> = Vec::new(); // (w, hh, fdl, rs_len)
+    for &w in &widths {
+        let hh = shadow_hhat(w, &perm_seed, h);
+        let head = stc_extract::stc_extract_prefix(&lsbs[..48 * w], &hh, w, 48);
+        if let Some((fdl, rs_len)) = tier_fdl(&head, n / w) {
+            cand.push((w, hh, fdl, rs_len));
+        }
+    }
+    v3::tlog("shadow headers", t);
+    progress::check_cancelled()?;
 
-    let (decoded, _stats) = ecc::rs_decode_blocks_with_parity(
-        &rs_bytes, state.frame_data_len, state.parity_len,
-    ).map_err(|_| StegoError::FrameCorrupted)?;
+    // Stage 2: first RS block of the plausible widths.
+    let blk = |&(w, _, fdl, rs_len): &(usize, Vec<Vec<u32>>, usize, usize)| {
+        let k = 255 - SHADOW_STC_PARITY;
+        (if fdl <= k { rs_len } else { 255 }) * 8 * w
+    };
+    let need2 = cand.iter().map(blk).max().unwrap_or(0);
+    if need2 > lsbs.len() {
+        lsbs = ac_hash_order_parities(grid, &perm_seed, need2);
+    }
+    cand.retain(|(w, hh, fdl, rs_len)| first_block_clean(&lsbs, hh, *w, *fdl, *rs_len));
+    progress::check_cancelled()?;
 
-    let fr = parse_shadow_frame(&decoded)?;
-    crypto::decrypt(
-        &fr.ciphertext,
-        passphrase,
-        &fr.salt,
-        &fr.nonce,
-    )?;
-
-    Ok(())
+    // Stage 3: full regions of the surviving widths.
+    let need3 = cand.iter().map(|(w, _, _, rs_len)| rs_len * 8 * w).max().unwrap_or(0);
+    if need3 > lsbs.len() {
+        lsbs = ac_hash_order_parities(grid, &perm_seed, need3);
+    }
+    for (w, hh, _, _) in &cand {
+        if let Some(r) = try_stc_tier(&lsbs, hh, *w, passphrase, n / w) {
+            return r;
+        }
+    }
+    Err(StegoError::FrameCorrupted)
 }
 
-/// Full shadow decode pipeline (headerless brute-force).
+// ---------------------------------------------------------------------------
+// Decoder (layout v1, core ≤ 0.4.x)
+// ---------------------------------------------------------------------------
+
+/// The first `k` Y non-zero AC positions (flat indices) in layout v1's
+/// keyed hash order (the order `hash_order` gives the nzAC set): one
+/// sequential keystream pass, `O(k)` memory.
+pub fn nzac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u32> {
+    use rand::{RngCore, SeedableRng};
+    let coeffs = grid.coeffs();
+    let nb = grid.blocks_wide() * grid.blocks_tall();
+    let n = coeffs.chunks_exact(64).map(|b| b[1..].iter().filter(|&&c| c != 0).count()).sum::<usize>();
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut want = (k as u128) * 5 / 4 + 64;
+    loop {
+        let thr = if want >= n as u128 { u64::MAX } else { ((want << 64) / n as u128) as u64 };
+        let mut cand: Vec<(u64, u32)> = Vec::with_capacity((want as usize).min(n) + (want as usize).min(n) / 8);
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
+        let mut buf = [0u8; 512];
+        for b in 0..nb {
+            rng.fill_bytes(&mut buf);
+            let blk = &coeffs[b * 64..b * 64 + 64];
+            for kk in 1..64usize {
+                if blk[kk] == 0 {
+                    continue;
+                }
+                let prio = u64::from_le_bytes(buf[kk * 8..kk * 8 + 8].try_into().unwrap());
+                if prio <= thr {
+                    cand.push((prio, (b * 64 + kk) as u32));
+                }
+            }
+        }
+        if cand.len() >= k || thr == u64::MAX {
+            radsort::sort_by_key(&mut cand, |(prio, _)| *prio);
+            return cand.into_iter().take(k).map(|(_, fi)| fi).collect();
+        }
+        want *= 2;
+    }
+}
+
+/// The first `k` positions of `pool` (any order) in the keyed hash order:
+/// threshold selection, `O(k)` memory (as `select_shadow_positions`, which
+/// sorts the whole pool).
+fn pool_hash_order_prefix(pool: &[CoeffPos], seed: &[u8; 32], k: usize) -> Vec<u32> {
+    use rand::{RngCore, SeedableRng};
+    let n = pool.len();
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
+    let mut want = (k as u128) * 5 / 4 + 64;
+    loop {
+        let thr = if want >= n as u128 { u64::MAX } else { ((want << 64) / n as u128) as u64 };
+        let mut cand: Vec<(u64, u32)> = Vec::with_capacity((want as usize).min(n) + (want as usize).min(n) / 8);
+        for p in pool {
+            rng.set_word_pos(p.flat_idx as u128 * 2);
+            let prio = rng.next_u64();
+            if prio <= thr {
+                cand.push((prio, p.flat_idx));
+            }
+        }
+        if cand.len() >= k || thr == u64::MAX {
+            radsort::sort_by_key(&mut cand, |(prio, _)| *prio);
+            return cand.into_iter().take(k).map(|(_, fi)| fi).collect();
+        }
+        want *= 2;
+    }
+}
+
+/// The keyed priorities of the cheapest `len` entries of `cost_sorted`,
+/// indexed by cost rank: `prio[r]` = the word pair `2·flat_idx` of
+/// `ChaCha20(seed)` for `cost_sorted[r]` — what [`pool_hash_order_prefix`]
+/// reads with one `set_word_pos` per position (each refilling a 256-byte
+/// block buffer), here from ONE sequential keystream pass over the blocks
+/// that hold a pool member (as [`nzac_hash_order_prefix`] reads it).
 ///
-/// Brute-forces (fraction, parity, fdl) combinations. For each cost fraction,
-/// selects positions from the cheapest pool, then tries all parity/fdl combos.
-/// AES-256-GCM-SIV authentication validates correct parameters.
+/// The cost pools are nested (each is a prefix of `cost_sorted`), so the
+/// priorities of the largest pool serve every smaller one
+/// ([`ranked_hash_order_prefix`]).
 ///
-/// `all_y_positions_sorted` must be sorted by cost (cheapest first).
-pub fn shadow_extract(
+/// Working memory, on top of the result (8 B per member): a membership
+/// bitmap (1 bit per Y coefficient), per-block member counts (4 B per
+/// block) and the flat-order → rank map (4 B per member), freed on return.
+/// `None` if a flat index repeats or lies outside the grid (no real cost
+/// list does): the caller then reads per position, as before.
+fn pool_priorities(grid: &DctGrid, cost_sorted: &[CoeffPos], len: usize, seed: &[u8; 32]) -> Option<Vec<u64>> {
+    use rand::{RngCore, SeedableRng};
+    let len = len.min(cost_sorted.len());
+    let nb = grid.coeffs().len() / 64;
+    // One bitmap word per 8×8 block (bit k = coefficient k of the block).
+    let mut members = vec![0u64; nb];
+    for p in &cost_sorted[..len] {
+        let fi = p.flat_idx as usize;
+        let (b, bit) = (fi / 64, 1u64 << (fi % 64));
+        if b >= nb || members[b] & bit != 0 {
+            return None;
+        }
+        members[b] |= bit;
+    }
+    // Members in blocks before b; then each rank's slot in flat order.
+    let mut before = vec![0u32; nb];
+    let mut acc = 0u32;
+    for (b, m) in members.iter().enumerate() {
+        before[b] = acc;
+        acc += m.count_ones();
+    }
+    let mut rank_at = vec![0u32; len];
+    for (r, p) in cost_sorted[..len].iter().enumerate() {
+        let fi = p.flat_idx as usize;
+        let (b, k) = (fi / 64, fi % 64);
+        let j = before[b] + (members[b] & ((1u64 << k) - 1)).count_ones();
+        rank_at[j as usize] = r as u32;
+    }
+    let mut prio = vec![0u64; len];
+    let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
+    let mut buf = [0u8; 512];
+    let mut next_block = 0usize;
+    for (b, &m) in members.iter().enumerate() {
+        if m == 0 {
+            continue;
+        }
+        if b != next_block {
+            // 128 keystream words per block (a word pair per coefficient).
+            rng.set_word_pos(b as u128 * 128);
+        }
+        rng.fill_bytes(&mut buf);
+        next_block = b + 1;
+        let mut rest = m;
+        let mut j = before[b] as usize;
+        while rest != 0 {
+            let k = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            prio[rank_at[j] as usize] = u64::from_le_bytes(buf[k * 8..k * 8 + 8].try_into().unwrap());
+            j += 1;
+        }
+    }
+    Some(prio)
+}
+
+/// The first `k` positions of the pool `cost_sorted[..n]` in the keyed hash
+/// order, from the rank-indexed priorities of a pool at least as large
+/// ([`pool_priorities`]). The same threshold selection as
+/// [`pool_hash_order_prefix`], over the same candidates in the same order
+/// (pool order) with the same stable sort — so the same output, ties
+/// included.
+fn ranked_hash_order_prefix(prio: &[u64], cost_sorted: &[CoeffPos], n: usize, k: usize) -> Vec<u32> {
+    let k = k.min(n);
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut want = (k as u128) * 5 / 4 + 64;
+    loop {
+        let thr = if want >= n as u128 { u64::MAX } else { ((want << 64) / n as u128) as u64 };
+        let mut cand: Vec<(u64, u32)> = Vec::with_capacity((want as usize).min(n) + (want as usize).min(n) / 8);
+        for (p, pos) in prio[..n].iter().zip(&cost_sorted[..n]) {
+            if *p <= thr {
+                cand.push((*p, pos.flat_idx));
+            }
+        }
+        if cand.len() >= k || thr == u64::MAX {
+            radsort::sort_by_key(&mut cand, |(prio, _)| *prio);
+            return cand.into_iter().take(k).map(|(_, fi)| fi).collect();
+        }
+        want *= 2;
+    }
+}
+
+/// Coefficient |LSBs| along flat indices.
+fn abs_lsbs(grid: &DctGrid, order: &[u32]) -> Vec<u8> {
+    let c = grid.coeffs();
+    order.iter().map(|&fi| (c[fi as usize].unsigned_abs() & 1) as u8).collect()
+}
+
+/// The layout-v1 brute force (parity × fdl) over an order of `total`
+/// positions whose LSB prefix of any length `prefix(k)` returns. Reads only
+/// what it needs: the first RS block (255 × 8 positions) for the peek and the
+/// small-frame scan, then the whole frame of the (at most six) peeked
+/// candidates — the same candidates, bounds and checks as a brute force over
+/// all `total` LSBs.
+fn legacy_brute_force(total: usize, prefix: impl Fn(usize) -> Vec<u8>, passphrase: &str) -> Result<PayloadData, StegoError> {
+    let base = prefix(total.min(255 * 8));
+    progress::check_cancelled()?;
+    // Peek: the first block announces the frame length (fdl >= k).
+    let mut cands: Vec<(usize, usize)> = Vec::new();
+    let mut need = 0;
+    for &parity_len in &SHADOW_PARITY_TIERS {
+        let max_fdl = compute_max_fdl(total / 8, parity_len).min(MAX_SHADOW_FRAME_BYTES);
+        if SHADOW_FRAME_OVERHEAD > max_fdl {
+            continue;
+        }
+        if let Some(fdl) = peek_fdl_from_first_block(&base, parity_len, max_fdl) {
+            need = need.max(ecc::rs_encoded_len_with_parity(fdl, parity_len) * 8);
+            cands.push((parity_len, fdl));
+        }
+    }
+    if !cands.is_empty() {
+        let long = if need > base.len() { prefix(need.min(total)) } else { base.clone() };
+        for &(parity_len, fdl) in &cands {
+            if let Some(r) = try_single_fdl(&long, fdl, parity_len, passphrase) {
+                return r;
+            }
+        }
+    }
+    // Small frames (fdl < k): all within the first block.
+    brute_force_lsb_pools(std::slice::from_ref(&base), passphrase)
+}
+
+/// Layout v1's legacy tier: direct LSBs along the passphrase's hash order of
+/// the Y nzAC set, brute-force (parity, fdl). AES-256-GCM-SIV validates.
+/// Memory is bounded by the frame read, not the cover.
+pub fn shadow_extract_legacy(img: &JpegImage, passphrase: &str) -> Result<PayloadData, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let grid = img.dct_grid(0);
+    let total = super::capacity::count_nonzero_ac(grid);
+    if total == 0 {
+        return Err(StegoError::FrameCorrupted);
+    }
+    let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
+    legacy_brute_force(total, |k| abs_lsbs(grid, &nzac_hash_order_prefix(grid, &perm_seed, k)), passphrase)
+}
+
+/// Shadow layout v1's cost pools (decode-only): the cheapest `1/fraction` of
+/// `cost_sorted` (sorted by cost, cheapest first), hash-ordered, then the
+/// legacy brute force. For shadows of core ≤ 0.4.x that landed in a tight
+/// pool, read under the costs that encoder used.
+pub fn shadow_extract_cost_pools(
     img: &JpegImage,
-    all_y_positions_sorted: &[CoeffPos],
+    cost_sorted: &[CoeffPos],
+    passphrase: &str,
+    fractions: &[usize],
+) -> Result<PayloadData, StegoError> {
+    let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
+    if cost_sorted.is_empty() {
+        return Err(StegoError::FrameCorrupted);
+    }
+    let grid = img.dct_grid(0);
+    // The pools are nested prefixes of `cost_sorted`: one keystream pass
+    // gives the priorities of the largest, and every pool reads its
+    // prefix of them.
+    let largest = fractions.iter().map(|&f| cost_sorted.len() / f.max(1)).max().unwrap_or(0);
+    progress::check_cancelled()?;
+    let prio = pool_priorities(grid, cost_sorted, largest, &perm_seed);
+    let mut last = StegoError::FrameCorrupted;
+    for &fraction in fractions {
+        let pool = &cost_sorted[..cost_sorted.len() / fraction.max(1)];
+        if pool.is_empty() {
+            continue;
+        }
+        let prefix = |k: usize| match &prio {
+            Some(prio) => ranked_hash_order_prefix(prio, cost_sorted, pool.len(), k),
+            None => pool_hash_order_prefix(pool, &perm_seed, k),
+        };
+        match legacy_brute_force(pool.len(), |k| abs_lsbs(grid, &prefix(k)), passphrase) {
+            Ok(p) => return Ok(p),
+            Err(StegoError::Cancelled) => return Err(StegoError::Cancelled),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Brute-force (pool, parity, fdl) over LSB streams: first-block peek
+/// (fdl ≥ k), then the small-fdl scan (fdl < k). AES-256-GCM-SIV validates.
+fn brute_force_lsb_pools(
+    fraction_lsbs: &[Vec<u8>],
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
-    // 1. Derive shadow structural key for position permutation.
-    let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
-
-    let grid = img.dct_grid(0);
-
-    if all_y_positions_sorted.is_empty() {
-        return Err(StegoError::FrameCorrupted);
-    }
-
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
 
-        // Phase 1: Pre-extract LSBs for all fractions in parallel.
-        let fraction_lsbs: Vec<(usize, Vec<u8>)> = COST_FRACTIONS.par_iter().filter_map(|&fraction| {
-            let pool_size = all_y_positions_sorted.len() / fraction;
-            if pool_size == 0 {
-                return None;
-            }
-            let positions = select_shadow_positions(
-                all_y_positions_sorted, fraction, pool_size, &perm_seed,
-            );
-            if positions.is_empty() {
-                return None;
-            }
-            let lsbs: Vec<u8> = positions.iter().map(|pos| {
-                let coeff = flat_get(grid, pos.flat_idx as usize);
-                (coeff.unsigned_abs() & 1) as u8
-            }).collect();
-            Some((fraction, lsbs))
-        }).collect();
-
         // Phase 2a: First-block peek — decode first RS block to read plaintext_len
         // and derive the exact fdl. Handles messages where fdl >= k (most cases).
-        // This is O(30) RS block decodes — very fast.
-        // Parallelized across (fraction, parity) combos with
-        // find_map_first short-circuit on first hit.
         let combos_2a: Vec<(usize, usize)> = (0..fraction_lsbs.len())
             .flat_map(|fi| SHADOW_PARITY_TIERS.iter().map(move |&p| (fi, p)))
             .collect();
         if let Some(result) = combos_2a.par_iter().find_map_first(|&(fi, parity_len)| {
-            let lsbs = &fraction_lsbs[fi].1;
+            let lsbs = &fraction_lsbs[fi];
             let k = 255usize.saturating_sub(parity_len);
             if k == 0 { return None; }
             let max_rs_bytes = lsbs.len() / 8;
@@ -462,9 +941,8 @@ pub fn shadow_extract(
 
         // Phase 2b: Small-fdl fallback — for tiny messages where fdl < k (single
         // partial RS block). Scan fdl from SHADOW_FRAME_OVERHEAD to min(k-1, max_fdl).
-        // Typically ~200 values per (fraction, parity) → ~6K combos total.
         let mut combos: Vec<(usize, usize, usize)> = Vec::new();
-        for (fi, (_, lsbs)) in fraction_lsbs.iter().enumerate() {
+        for (fi, lsbs) in fraction_lsbs.iter().enumerate() {
             for &parity_len in &SHADOW_PARITY_TIERS {
                 let k = 255usize.saturating_sub(parity_len);
                 if k < 2 { continue; }
@@ -480,24 +958,16 @@ pub fn shadow_extract(
             }
         }
 
-        // Progress instrumentation: split the worst-case ~3000-
-        // 6000 combo brute-force into batches and emit one progress
-        // step per batch. Each batch still uses par_iter.find_map_first
-        // so first-hit short-circuit is preserved within a batch;
-        // between batches we check for cancellation and emit a
-        // visible progress tick. Eliminates the 1-3 s dark stretch
-        // that the user saw at the end of a wrong-pass smart_decode.
+        // Progress: one step per batch (cancellation checked between batches).
         const SHADOW_BRUTE_BATCHES: usize = 32;
         let total_combos = combos.len();
         let batch_size = total_combos.div_ceil(SHADOW_BRUTE_BATCHES).max(1);
         let mut emitted_steps: u32 = 0;
         let mut result: Option<Result<PayloadData, StegoError>> = None;
         for batch in combos.chunks(batch_size) {
-            // `?`, not `.ok()`: the result used to be discarded, so a
-            // cancelled decode brute-forced every remaining batch anyway.
             progress::check_cancelled()?;
             let hit = batch.par_iter().find_map_first(|&(fi, parity_len, fdl)| {
-                let lsbs = &fraction_lsbs[fi].1;
+                let lsbs = &fraction_lsbs[fi];
                 try_single_fdl(lsbs, fdl, parity_len, passphrase)
             });
             progress::advance();
@@ -507,9 +977,6 @@ pub fn shadow_extract(
                 break;
             }
         }
-        // Drain any remaining steps if we short-circuited early so
-        // the bar reaches its budgeted ceiling (advance() is capped
-        // at total-1 anyway, but make the intent explicit).
         while emitted_steps < SHADOW_BRUTE_BATCHES as u32 {
             progress::advance();
             emitted_steps += 1;
@@ -523,51 +990,19 @@ pub fn shadow_extract(
 
     #[cfg(not(feature = "parallel"))]
     {
-        let mut last_err = StegoError::FrameCorrupted;
-
-        // 2. Brute-force: fraction × parity × fdl.
-        // For each fraction, select pool positions and extract LSBs once.
-        for &fraction in &COST_FRACTIONS {
-            let pool_size = all_y_positions_sorted.len() / fraction;
-            if pool_size == 0 {
-                continue;
-            }
-
-            // Hash-select all pool positions (sorted by hash priority).
-            let positions = select_shadow_positions(
-                all_y_positions_sorted, fraction, pool_size, &perm_seed,
-            );
-            if positions.is_empty() {
-                continue;
-            }
-
-            // Extract LSBs once for this fraction (reused across parity/fdl).
-            let all_lsbs: Vec<u8> = positions.iter().map(|pos| {
-                let coeff = flat_get(grid, pos.flat_idx as usize);
-                (coeff.unsigned_abs() & 1) as u8
-            }).collect();
-
-            // Inner brute-force: parity × fdl.
-            if let Some(result) = try_extract_with_lsbs(
-                &all_lsbs, passphrase, &mut last_err,
-            ) {
+        for all_lsbs in fraction_lsbs {
+            if let Some(result) = try_extract_with_lsbs(all_lsbs, passphrase) {
                 return result;
             }
         }
-
-        Err(last_err)
+        Err(StegoError::FrameCorrupted)
     }
 }
 
 /// Try all (parity, fdl) combinations on a given LSB vector using
 /// first-block peek + small-fdl fallback.
-/// Returns `Some(Ok(...))` on success or `None` to continue to next fraction.
 #[cfg(not(feature = "parallel"))]
-fn try_extract_with_lsbs(
-    all_lsbs: &[u8],
-    passphrase: &str,
-    _last_err: &mut StegoError,
-) -> Option<Result<PayloadData, StegoError>> {
+fn try_extract_with_lsbs(all_lsbs: &[u8], passphrase: &str) -> Option<Result<PayloadData, StegoError>> {
     for &parity_len in &SHADOW_PARITY_TIERS {
         let k = 255usize.saturating_sub(parity_len);
         if k < 2 { continue; }
@@ -577,13 +1012,11 @@ fn try_extract_with_lsbs(
             .min(MAX_SHADOW_FRAME_BYTES);
         if SHADOW_FRAME_OVERHEAD > max_fdl { continue; }
 
-        // First-block peek: derive exact fdl from first RS block.
         if let Some(fdl) = peek_fdl_from_first_block(all_lsbs, parity_len, max_fdl)
             && let Some(result) = try_single_fdl(all_lsbs, fdl, parity_len, passphrase) {
                 return Some(result);
             }
 
-        // Small-fdl fallback: scan partial-block range (fdl < k).
         let small_max = (k - 1).min(max_fdl);
         if SHADOW_FRAME_OVERHEAD > small_max { continue; }
         for fdl in SHADOW_FRAME_OVERHEAD..=small_max {
@@ -592,56 +1025,35 @@ fn try_extract_with_lsbs(
             }
         }
     }
-
     None
 }
 
-/// Compute shadow capacity in plaintext bytes from Y nzAC count.
-///
-/// Uses the full nzAC pool and smallest parity tier for maximum capacity.
+/// Largest single shadow message (plaintext bytes) for a cover with `y_nzac`
+/// non-zero Y AC coefficients, JPEG input: an RS-coded frame of half the
+/// Ghost maximum (`capacity::band_frame_bits`), so the primary — the largest
+/// message, by the auto-sort — still fits next to it. Technically a shadow
+/// region can hold far more; this is the stealth policy. A Deep Cover cover
+/// with exact side information: `capacity::estimate_shadow_capacity_si`.
 pub fn shadow_capacity(y_nzac: usize) -> usize {
-    if y_nzac == 0 {
-        return 0;
-    }
-
-    let parity_len = SHADOW_PARITY_TIERS[0]; // smallest parity for max capacity
-    let available_rs_bytes = y_nzac / 8;
-
-    let k = 255 - parity_len;
-    if k == 0 || available_rs_bytes == 0 {
-        return 0;
-    }
-
-    let full_blocks = available_rs_bytes / 255;
-    let remainder_bytes = available_rs_bytes % 255;
-
-    let mut max_frame_bytes = full_blocks * k;
-    if remainder_bytes > parity_len {
-        max_frame_bytes += remainder_bytes - parity_len;
-    }
-
-    max_frame_bytes.saturating_sub(SHADOW_FRAME_OVERHEAD)
+    super::capacity::shadow_capacity_for(y_nzac, super::capacity::MAX_RATE_DIV)
 }
 
-// --- Internal helpers ---
-//
-// `build_shadow_frame`, `parse_shadow_frame`, and `ParsedShadowFrame`
-// now live in `crate::stego::shadow_layer` (unified v1/v2 dispatch
-// for image + video). Imported at the top of this file.
+/// Largest shadow plaintext (bytes) whose RS-coded frame fits `bits`.
+pub fn shadow_plaintext_for_bits(bits: usize) -> usize {
+    let max_fdl = compute_max_fdl(bits / 8, SHADOW_STC_PARITY);
+    max_fdl.saturating_sub(SHADOW_FRAME_OVERHEAD)
+}
 
-/// Two-tier position selection for shadow channels.
-///
-/// **Tier 1 (cost pool):** Takes the cheapest `1/fraction` of positions from
-/// `cost_sorted_positions` (which must be sorted by cost, cheapest first).
-/// This ensures shadow modifications land in textured/cheap regions.
-///
-/// **Tier 2 (hash permutation):** Within the cost pool, assigns each position
-/// a deterministic priority from `ChaCha20(seed, flat_idx)`. Sorts by
-/// priority, takes first `n_total`.
-///
-/// Encoder and decoder may disagree on a few positions near the cost-pool
-/// boundary (cover vs stego costs differ slightly). RS handles the BER.
-fn select_shadow_positions(
+/// RS-coded bits of a shadow frame carrying `plaintext_bytes`.
+pub fn shadow_bits_for_plaintext(plaintext_bytes: usize) -> usize {
+    ecc::rs_encoded_len_with_parity(plaintext_bytes + SHADOW_FRAME_OVERHEAD, SHADOW_STC_PARITY) * 8
+}
+
+/// Hash-priority selection: the cheapest `1/fraction` of
+/// `cost_sorted_positions` (sorted by cost, cheapest first — irrelevant for
+/// `fraction = 1`), sorted by the keyed priority `ChaCha20(seed, flat_idx)`,
+/// first `n_total` taken. Layout v1, decode-only.
+pub(crate) fn select_shadow_positions(
     cost_sorted_positions: &[CoeffPos],
     fraction: usize,
     n_total: usize,
@@ -664,14 +1076,8 @@ fn select_shadow_positions(
         let priority = rng.next_u64();
         (priority, p.clone())
     }).collect();
-    // LSD radix sort on the u64 priorities is ~2-3x faster than
-    // comparison sort for large pools (the 100% fraction on a
-    // 12 MP photo sorts ~766 K elements; std sort_unstable_by_key
-    // there runs ~80-100 ms, radsort runs ~30-40 ms). On unique
-    // u64 keys (collision probability ~2^-26 at this scale) any
-    // sort algorithm produces the same logical order, so the swap
-    // is byte-identical to the previous unstable-sort output in
-    // practice (wire-safe — does not change embedded positions).
+    // LSD radix sort on the u64 priorities (unique in practice, so any sort
+    // gives the same order).
     radsort::sort_by_key(&mut candidates, |(priority, _)| *priority);
 
     candidates.into_iter().map(|(_, p)| p).take(n_total).collect()
@@ -710,32 +1116,139 @@ mod tests {
     }
 
     #[test]
-    fn shadow_capacity_basic() {
-        // 100% pool = 100K positions. Capacity should be substantial.
-        let cap = shadow_capacity(100_000);
-        assert!(cap > 10_000, "capacity {cap} should be > 10KB for 100K positions");
-        // Large image: 3M positions -> ~370KB capacity.
-        let large_cap = shadow_capacity(3_000_000);
-        assert!(large_cap > 300_000, "capacity {large_cap} should be > 300KB for 3M positions");
-    }
-
-    #[test]
-    fn shadow_capacity_small() {
+    fn shadow_capacity_is_half_the_maximum() {
         assert_eq!(shadow_capacity(0), 0);
-        // Very small pool -> 0 capacity.
         assert_eq!(shadow_capacity(7), 0);
+        let cap = shadow_capacity(3_833_089);
+        assert!(shadow_bits_for_plaintext(cap) <= 3_833_089 / 5 / 2);
+        assert!(shadow_bits_for_plaintext(cap + 1) > 3_833_089 / 5 / 2);
     }
 
     #[test]
-    fn shadow_capacity_larger_than_chroma_repetition() {
-        // Use a realistically large position count (1M ~ 5MP image).
-        let positions = 1_000_000usize;
-        // Old chroma R=7 repetition: ~positions/7/8 bytes minus overhead.
-        let old_chroma_cap = (positions / 7 / 8).saturating_sub(50);
-        let cap = shadow_capacity(positions);
-        assert!(
-            cap > old_chroma_cap,
-            "shadow ({cap}) should be larger than old chroma R=7 ({old_chroma_cap})"
-        );
+    fn plaintext_bits_conversions_are_inverse() {
+        for pt in [0usize, 1, 64, 204, 205, 251, 1000, 70_000] {
+            let bits = shadow_bits_for_plaintext(pt);
+            assert_eq!(shadow_plaintext_for_bits(bits), pt, "pt {pt}");
+            assert!(shadow_plaintext_for_bits(bits - 8) < pt || pt == 0);
+        }
+        assert_eq!(shadow_plaintext_for_bits(0), 0);
     }
+
+    /// The hash order depends on the set only — not on the input order or
+    /// the costs — and is a permutation of it.
+    #[test]
+    fn hash_order_ignores_input_order_and_costs() {
+        let seed = [7u8; 32];
+        let a: Vec<CoeffPos> = (0..5000u32).map(|i| CoeffPos { flat_idx: i * 3 + 1, cost: i as f32 }).collect();
+        let mut b = a.clone();
+        b.reverse();
+        for p in b.iter_mut() {
+            p.cost = -(p.flat_idx as f32);
+        }
+        let oa: Vec<u32> = hash_order(&a, &seed).iter().map(|p| p.flat_idx).collect();
+        let ob: Vec<u32> = hash_order(&b, &seed).iter().map(|p| p.flat_idx).collect();
+        assert_eq!(oa, ob);
+        let mut sorted = oa.clone();
+        sorted.sort_unstable();
+        let mut want: Vec<u32> = a.iter().map(|p| p.flat_idx).collect();
+        want.sort_unstable();
+        assert_eq!(sorted, want, "a permutation of the set");
+        assert_ne!(oa[..100], want[..100], "and not the raster order");
+    }
+
+    /// The streamed all-AC prefix equals the per-position (`set_word_pos`)
+    /// hash order of the AC set, at every prefix length.
+    #[test]
+    fn ac_hash_order_prefix_equals_the_hash_order() {
+        let img = JpegImage::from_bytes(&std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap()).unwrap();
+        let grid = img.dct_grid(0);
+        let seed = [9u8; 32];
+        let all: Vec<CoeffPos> =
+            v3::ac_flat_indices(grid).into_iter().map(|fi| CoeffPos { flat_idx: fi, cost: 0.0 }).collect();
+        let full: Vec<u32> = hash_order(&all, &seed).iter().map(|p| p.flat_idx).collect();
+        for k in [0usize, 1, 7, 100, 999, 5_000, 37_000, 75_599, 75_600, 80_000] {
+            let pre = ac_hash_order_prefix(grid, &seed, k);
+            assert_eq!(pre, full[..k.min(full.len())], "k = {k}");
+            // Many small groups (one keystream pass each) give the same order.
+            for cap in [300usize, 7777] {
+                let mut small = Vec::new();
+                ac_hash_order_visit(grid, &seed, k, cap, |fi| small.push(fi));
+                assert_eq!(small, pre, "k = {k}, cap = {cap}");
+            }
+            let par = ac_hash_order_parities(grid, &seed, k);
+            assert_eq!(par, parity_along(grid, &pre), "parities, k = {k}");
+        }
+    }
+
+    /// The cost pools' one-pass priorities give exactly the per-position
+    /// (`set_word_pos`) prefixes, for every nested pool and prefix length.
+    /// (Ties between priorities cannot be forced through the keystream;
+    /// their order is the same by construction: same candidates in the
+    /// same order, same stable sort.)
+    #[test]
+    fn pool_priorities_match_the_per_position_prefix() {
+        let img = JpegImage::from_bytes(&std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap()).unwrap();
+        let grid = img.dct_grid(0);
+        let qt = img.quant_table(img.frame_info().components[0].quant_table_id as usize).unwrap();
+        let mut sorted = crate::stego::cost::uniward::compute_positions_streaming_legacy_v1(grid, qt, None).unwrap();
+        sorted.sort_by(|a, b| a.cost.total_cmp(&b.cost));
+        assert!(sorted.len() > 10_000);
+        for seed in [[3u8; 32], [0xa5; 32]] {
+            let largest = sorted.len() / 2;
+            let prio = pool_priorities(grid, &sorted, largest, &seed).unwrap();
+            for frac in [20usize, 10, 5, 2] {
+                let n = sorted.len() / frac;
+                for k in [0usize, 1, 17, 255 * 8, n / 3, n - 1, n, n + 5] {
+                    assert_eq!(
+                        ranked_hash_order_prefix(&prio, &sorted, n, k),
+                        pool_hash_order_prefix(&sorted[..n], &seed, k),
+                        "frac {frac} k {k}"
+                    );
+                }
+            }
+        }
+        // A repeated flat index falls back to the per-position read.
+        let mut dup = sorted[..100].to_vec();
+        dup[50] = dup[10].clone();
+        assert!(pool_priorities(grid, &dup, 100, &[1u8; 32]).is_none());
+    }
+
+    /// Timing probe: keystream vs the prefix order at 12 MP.
+    /// `cargo test --release --lib ac_order_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn ac_order_timing() {
+        use rand::{RngCore, SeedableRng};
+        let Ok(b) = std::fs::read("test-vectors/image/photo_original_3557.jpg") else { return };
+        let img = JpegImage::from_bytes(&b).unwrap();
+        let grid = img.dct_grid(0);
+        let nb = grid.blocks_wide() * grid.blocks_tall();
+        let t = std::time::Instant::now();
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([3u8; 32]);
+        let mut buf = [0u8; 512];
+        let mut x = 0u64;
+        for _ in 0..nb {
+            rng.fill_bytes(&mut buf);
+            x ^= buf[7] as u64;
+        }
+        eprintln!("keystream {:?} ({x})", t.elapsed());
+        for k in [1_000usize, 100_000, 1_450_000, 6_000_000] {
+            let t = std::time::Instant::now();
+            let o = ac_hash_order_prefix(grid, &[3u8; 32], k);
+            eprintln!("prefix k={k}: {:?} ({})", t.elapsed(), o.len());
+        }
+    }
+
+    /// The H-hat seed is a fixed function of the structural key (pinned:
+    /// a change here would make every shadow unreadable).
+    #[test]
+    fn stc_hhat_seed_is_pinned() {
+        let s = stc_hhat_seed(&[0u8; 32]);
+        let hex: String = s.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, PINNED_HHAT_SEED_ZERO_KEY);
+        assert_ne!(stc_hhat_seed(&[1u8; 32]), s);
+    }
+
+    /// `rand_chacha` ChaCha20, key = 0, stream 1, first 32 bytes.
+    const PINNED_HHAT_SEED_ZERO_KEY: &str = "ef3fdfd6c61578fbf5cf35bd3dd33b8009631634d21e42ac33960bd138e50d32";
 }

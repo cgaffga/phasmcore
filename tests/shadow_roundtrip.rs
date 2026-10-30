@@ -174,12 +174,13 @@ fn shadow_too_large() {
     // Use the smaller 320x240 image.
     let cover = load_test_image("photo_320x240_q75_420.jpg");
 
-    let img = JpegImage::from_bytes(&cover).unwrap();
-    let cap = estimate_shadow_capacity(&img).unwrap();
+    // Shadow capacity is a stealth policy (the apps enforce it); the encoder
+    // rejects what cannot technically fit: more frame bits than the cover
+    // has AC coefficients (75 600 here, ~9.4 KB).
+    let _ = JpegImage::from_bytes(&cover).unwrap();
     // Generate incompressible data using a simple LCG to defeat Brotli compression.
-    // Compressed size ≈ raw size, so this will exceed shadow capacity.
     let mut rng_state = 0x12345678u64;
-    let oversized_msg: String = (0..(cap + 100))
+    let oversized_msg: String = (0..10_000)
         .map(|_| {
             rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
             char::from(b'!' + ((rng_state >> 33) % 94) as u8)
@@ -290,9 +291,11 @@ fn shadow_capacity_estimate() {
     let img = JpegImage::from_bytes(&cover).unwrap();
     let cap = estimate_shadow_capacity(&img).unwrap();
 
-    // With 100% pool: capacity should be large.
-    // 640x480 has ~300K nzAC positions, 100% pool -> many KB.
-    assert!(cap > 1000, "shadow capacity should be > 1KB, got {cap}");
+    // Stealth policy: a shadow frame of half the Ghost maximum (nzAC / 10
+    // bits), so the primary (the largest message) still fits next to it.
+    let nzac = phasm_core::stego::capacity::count_nonzero_ac(img.dct_grid(0));
+    assert_eq!(cap, phasm_core::shadow_capacity(nzac));
+    assert!(cap > 200, "shadow capacity should be > 200 B, got {cap}");
 
     // Grayscale: still has Y channel, so V2 should have capacity.
     let gray = load_test_image("gray_64x64_q75.jpg");

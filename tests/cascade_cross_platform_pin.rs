@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! M6 phase gate: parallel and no-parallel feature builds produce the
-//! same Ghost shadow encode bytes for the same input.
+//! Cross-platform encode pins: parallel and no-parallel feature builds (and
+//! aarch64 / x86_64 / WASM) produce the same Ghost encode bytes for the
+//! same input — a Ghost v3 primary, and a primary with two shadows.
 //!
 //! Pre-M6 the serial cascade (`#[cfg(not(feature = "parallel"))]`)
 //! used a greedy "first success in CASCADE order" algorithm, while the
@@ -20,7 +21,7 @@
 //! If either run produces a hash that doesn't match
 //! `EXPECTED_SHADOW_ENCODE_HASH` below, the two paths have diverged.
 
-use phasm_core::{ghost_encode_with_shadows, ShadowLayer};
+use phasm_core::{ghost_encode, ghost_encode_with_shadows, ShadowLayer};
 use sha2::{Digest, Sha256};
 
 const DETERMINISTIC_SEED: &str = "42";
@@ -72,8 +73,41 @@ fn encode_and_hash() -> String {
 /// commit, the hash needs to be re-pinned to whatever the test
 /// produces. After re-pinning, the test must be GREEN under both
 /// `cargo test` (no parallel) and `cargo test --features parallel`.
+///
+/// History:
+/// - `4a149432465e390e…` — v1 J-UNIWARD costs (phasm-core ≤ 0.4.x).
+/// - `fc67d9eec489ce2a…` (2026-10-25) — v2 costs (whole-window border
+///   pricing, window aligned with the impact; `docs/design/image/
+///   juniward-cost.md`). Every primary-STC cost changed, so the flips —
+///   and the bytes — did. Same hash with and without `parallel`.
+/// - `d9451b982931a4ee…` (2026-10-25) — shadow layout v2 (keyed-region
+///   STC, `docs/design/image/shadow-messages.md`): the two shadows now
+///   embed by STC (width 10) instead of direct LSB, and the primary's wet
+///   set is their regions. Identical serial / `parallel`, and on aarch64
+///   (NEON) and x86_64 (Rosetta, SSE2). (Never released.)
+/// - `0f2802224f275acc…` (2026-10-27) — Ghost v3
+///   (`docs/design/image/ghost-embedding-v3.md`): ternary STC over all Y AC
+///   coefficients (STC height 9), shadows on keyed regions of the all-AC set.
 const EXPECTED_SHADOW_ENCODE_HASH: &str =
-    "4a149432465e390e9a23e343e4be7d9cf66ed354c793a4a5df142dc96262691f";
+    "0f2802224f275accb98f7b4edec35d66c31ecfdf617b8f20dde8d60d3b98cc20";
+
+/// Ghost v3 primary, no shadows (same seed, cover and passphrase as the
+/// shadow pin's primary).
+const EXPECTED_PRIMARY_ENCODE_HASH: &str =
+    "0efed1f4b986dae6be0ae280cfda49b15dd6c8434d275f62a819068892076832";
+
+fn hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[test]
+fn primary_encode_hash_matches_cross_platform_pin() {
+    unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", DETERMINISTIC_SEED); }
+    let stego = ghost_encode(&load_cover(), &"primary message, pinned ".repeat(20), "primary-pass-m6")
+        .expect("ghost_encode");
+    unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED"); }
+    assert_eq!(hex(&stego), EXPECTED_PRIMARY_ENCODE_HASH, "Ghost v3 primary encode changed; re-pin only if intended");
+}
 
 #[test]
 fn shadow_encode_hash_matches_cross_platform_pin() {

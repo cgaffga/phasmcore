@@ -608,6 +608,7 @@ mod tests {
                 shadow_states: &[],
                 master: &[9u8; 64],
             },
+            &[],
         )
         .expect("cascade")
     }
@@ -779,6 +780,7 @@ mod tests {
             quantizer: q,
             gop_size: n,
             total_frames_hint: n,
+            colour: Default::default(),
         };
 
         let t = std::time::Instant::now();

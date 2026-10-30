@@ -12,9 +12,11 @@ mod passphrase;
 mod progress;
 #[cfg(feature = "video")]
 mod transcode;
-#[cfg(feature = "video")]
+// Encode-side video subcommands exist only when a video encoder is compiled in;
+// a decode-only build (`h264-decoder`) decodes videos via `phasm decode`.
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 mod video_capacity;
-#[cfg(feature = "video")]
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 mod video_encode;
 
 use clap::{Parser, Subcommand};
@@ -35,11 +37,11 @@ enum Commands {
     Decode(decode::DecodeArgs),
     /// Show how much message data fits in an image
     Capacity(capacity::CapacityArgs),
-    /// Encode a secret message into an MP4 video (H.264 Baseline CAVLC)
-    #[cfg(feature = "video")]
+    /// Encode a secret message into an MP4 video (H.264, or AV1 with --codec av1)
+    #[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
     VideoEncode(video_encode::VideoEncodeArgs),
     /// Show video embedding capacity
-    #[cfg(feature = "video")]
+    #[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
     VideoCapacity(video_capacity::VideoCapacityArgs),
 }
 
@@ -49,9 +51,9 @@ fn main() {
         Commands::Encode(args) => encode::run(args),
         Commands::Decode(args) => decode::run(args),
         Commands::Capacity(args) => capacity::run(args),
-        #[cfg(feature = "video")]
+        #[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
         Commands::VideoEncode(args) => video_encode::run(args),
-        #[cfg(feature = "video")]
+        #[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
         Commands::VideoCapacity(args) => video_capacity::run(args),
     };
 

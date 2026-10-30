@@ -155,6 +155,7 @@ fn wv_streaming_pull_peak_rss_720p_1shadow() {
         quantizer: 30,
         gop_size: GOP_SIZE,
         total_frames_hint: N_FRAMES,
+        colour: Default::default(),
     };
 
     let primary_text = "pull-API WV memory regression gate";
@@ -258,6 +259,7 @@ fn wv_streaming_pull_smoke_small_fixture() {
         quantizer: 30,
         gop_size: GOP_SIZE,
         total_frames_hint: N_FRAMES,
+        colour: Default::default(),
     };
 
     let primary_text = "WV-shadow smoke — primary payload";

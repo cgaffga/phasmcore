@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 use crate::stego::armor::ecc;
-use crate::stego::armor::fft2d::Spectrum2D;
+use crate::stego::armor::fft2d::{BinRect, Spectrum2D, SpectrumView};
 use crate::stego::crypto;
 use crate::stego::frame;
 
@@ -45,9 +45,6 @@ const RING_RS_PARITY: usize = 192;
 /// Maximum data bytes in ring payload.
 const RING_RS_K: usize = 255 - RING_RS_PARITY; // 63
 
-/// Fixed salt for ring key derivation (independent from STDM).
-const RING_SALT: &[u8; 16] = b"phasm-ring-v1\0\0\0";
-
 /// Compute the maximum payload bytes the DFT ring can carry.
 pub fn ring_capacity(_width: usize, _height: usize) -> usize {
     // NUM_SECTORS / SPREAD_SECTORS = 64 effective bits
@@ -60,18 +57,9 @@ pub fn ring_capacity(_width: usize, _height: usize) -> usize {
     data_bytes.min(RING_RS_K) - frame::FRAME_OVERHEAD
 }
 
-/// Derive the ring encryption key from the passphrase.
-fn derive_ring_key(passphrase: &str) -> Result<[u8; 32], crate::stego::error::StegoError> {
-    let mut output = [0u8; 32];
-    argon2::Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), RING_SALT, &mut output)
-        .map_err(|_| crate::stego::error::StegoError::KeyDerivationFailed)?;
-    Ok(output)
-}
-
 /// Derive the ring PRNG seed for sector assignment.
 fn derive_ring_seed(passphrase: &str) -> Result<[u8; 32], crate::stego::error::StegoError> {
-    let ring_key = derive_ring_key(passphrase)?;
+    let ring_key = crate::stego::crypto::derive_ring_key(passphrase)?;
     // Use HMAC-SHA256 for proper domain separation (replaces XOR with fixed string)
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -253,6 +241,28 @@ pub fn lut_test_deterministic_bytes() -> Vec<u8> {
         }
     }
     bytes
+}
+
+/// The spectrum bins `extract_ring_payload` reads: every bin the sector LUT
+/// can hold lies in this rectangle (the LUT scans `dx, dy` in
+/// `-r_max_int..=r_max_int` around the integer centre, wrapping modulo the
+/// size; a side that would wrap becomes the full range).
+pub fn ring_rect(w: usize, h: usize) -> BinRect {
+    let min_dim = w.min(h) as f64;
+    let r_outer = RING_R_OUTER * min_dim;
+    let r_max_int = r_outer.ceil() as i32 + 1;
+    let cx = (w as f64 / 2.0) as i32;
+    let cy = (h as f64 / 2.0) as i32;
+    let span = |c: i32, n: usize| -> (usize, usize) {
+        if c - r_max_int < 0 || c + r_max_int >= n as i32 {
+            (0, n)
+        } else {
+            ((c - r_max_int) as usize, (c + r_max_int + 1) as usize)
+        }
+    };
+    let (c0, c1) = span(cx, w);
+    let (r0, r1) = span(cy, h);
+    BinRect { c0, c1, r0, r1 }
 }
 
 /// Perf-test helper: LUT-backed `compute_sector_magnitude_lut` exposed
@@ -440,20 +450,20 @@ fn set_sector_magnitude(
 /// magnitudes, returns mean. Bit-identical to the legacy ring-scan
 /// path on the same fixture (same iteration order, same f64
 /// arithmetic — only the bin classification is hoisted to LUT build).
-fn compute_sector_magnitude_lut(spectrum: &Spectrum2D, sector_idx: usize, lut: &SectorLut) -> f64 {
+fn compute_sector_magnitude_lut<S: SpectrumView + ?Sized>(spectrum: &S, sector_idx: usize, lut: &SectorLut) -> f64 {
     let bins = &lut.sectors[sector_idx];
     if bins.is_empty() {
         return 0.0;
     }
     let mut sum = 0.0f64;
-    let spectrum_len = spectrum.data.len();
+    let spectrum_len = spectrum.width() * spectrum.height();
     let mut count = 0usize;
     for bin in bins {
         let idx = bin.idx as usize;
         if idx >= spectrum_len {
             continue;
         }
-        let c = spectrum.data[idx];
+        let c = spectrum.bin(idx);
         sum += det_hypot(c.re as f64, c.im as f64);
         count += 1;
     }
@@ -640,12 +650,12 @@ pub fn embed_ring_payload(
 /// Extract a ring payload from the DFT spectrum.
 ///
 /// Returns `Some(plaintext_bytes)` if successful, `None` if decode fails.
-pub fn extract_ring_payload(
-    spectrum: &Spectrum2D,
+pub fn extract_ring_payload<S: SpectrumView + ?Sized>(
+    spectrum: &S,
     passphrase: &str,
 ) -> Option<Vec<u8>> {
-    let w = spectrum.width;
-    let h = spectrum.height;
+    let w = spectrum.width();
+    let h = spectrum.height();
     // Same LUT-once optimization on the decode side.
     let lut = SectorLut::build(w, h);
 
@@ -716,6 +726,20 @@ mod tests {
             *val = Complex32::new(mag, 0.0);
         }
         Spectrum2D { data, width: w, height: h }
+    }
+
+    #[test]
+    fn ring_rect_covers_every_lut_bin() {
+        for &(w, h) in &[(64usize, 48usize), (40, 40), (800, 600), (96, 1024), (8, 8)] {
+            let lut = SectorLut::build(w, h);
+            let r = ring_rect(w, h);
+            for sector in &lut.sectors {
+                for bin in sector {
+                    let (u, v) = (bin.idx as usize % w, bin.idx as usize / w);
+                    assert!(u >= r.c0 && u < r.c1 && v >= r.r0 && v < r.r1, "{w}x{h} ({u},{v}) {r:?}");
+                }
+            }
+        }
     }
 
     /// T3.4.A — the LUT-backed compute_sector_magnitude MUST agree

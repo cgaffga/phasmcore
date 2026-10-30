@@ -7,6 +7,34 @@ This directory was scaffolded on **2026-05-10** as Phase 0 of the plan documente
 
 The eventual goal is the empirical evaluation chapter of an arXiv paper on Phasm Ghost mode. The immediate goal is engineering hygiene — Phasm has shipped without a single number quantifying its actual stealth against modern detectors. That gap closes here.
 
+> **Correction (2026-10-25): the May "% of capacity" rows did not measure what
+> they say.** Their inline generator used a message of `"PhasmEval"`
+> (`"PhasmAlaska"` for ALASKA-2) repeated to the target length. Brotli
+> compresses that to about 20 bytes, so 25 / 50 / 75 / 100 % all embedded the
+> same ~70-byte frame: **≈ 0.02 bpnzAC, not "~0.19 bpnzAC eq"**.
+>
+> Invalid as full-capacity results:
+> - Path 1a / 1b / 1c "Phasm Ghost @ N % capacity", including the curriculum
+>   pf010/pf020 runs and the "**10.2× less detectable**" headline;
+> - Phase 2 (ALASKA, Wikimedia);
+> - `figures/01`, `figures/02`, `figures/SUMMARY.md`;
+> - the E12 forward Phasm cell.
+>
+> Runs made at fixed bpnzAC with `prep/generate_phasm_ghost.py` (E9, gap3, the
+> 2026-06 matched SRNet) are unaffected. The shadow-curve N=0 rows use 31–64-byte
+> primaries, so they describe that payload, not max capacity.
+>
+> At the real maximum (frame = 0.20 bpnzAC), a Phasm-matched hand-crafted
+> detector reaches P_E ≈ 0.08 (v1) / 0.11 (v2) on BOSSbase. See
+> `runs/2026-10-25-ghost-regress-026-043/RESULTS.md`.
+>
+> Current Ghost (v3, ternary STC over all AC coefficients) is measured in
+> `runs/2026-10-26-ghost-structural/RESULTS.md`, Deep Cover with exact side
+> information in `runs/2026-10-27-deep-cover-exact-si/RESULTS.md`. The
+> shadow and capacity rows below (Phases 3–5) measure the v1 shadow design
+> (cost pools); v3 shadows are keyed-region STCs of at most half the Ghost
+> maximum each.
+
 ## Scope (what's in / out)
 
 | In scope | Out of scope (for now) |
@@ -319,26 +347,27 @@ eval/
 ├── NEXT_STEPS.md        ← exact commands to start Phase 1
 ├── pyproject.toml       ← Python 3.12 deps, pinned via uv
 ├── .gitignore           ← excludes data/, runs/*/data/, .venv/, third_party/
-├── prep/                ← data prep scripts
-│   ├── download_bossbase.py
-│   ├── encode_jpeg.py
-│   └── generate_juniward.py
-├── detectors/           ← detector wrappers (Phase 1+)
+├── REPRO_DATASETS.md    ← dataset download + hash manifest
+├── prep/                ← data prep + stego generation (download_bossbase.py,
+│                          encode_jpeg.py, generate_juniward.py, generate_phasm_ghost.py, …)
+├── detectors/           ← detector training + evaluation (SRNet, EfficientNet, hand-crafted)
+├── scripts/             ← experiment drivers and queues
+├── figures/             ← generated charts
+├── bin/                 ← phasm binaries used by runs (MANIFEST.md)
 ├── third_party/         ← cloned external repos (gitignored)
 │   └── README.md        ← what to clone, with pinned commits
 ├── data/                ← gitignored
 │   ├── bossbase/        ← raw PGM + re-encoded JPEG covers
 │   └── stego/           ← generated stego images
-├── runs/                ← experiment outputs
-│   └── README.md        ← result format + naming convention
-└── notebooks/           ← exploratory analysis
+└── runs/                ← experiment outputs
+    └── README.md        ← result format + naming convention
 ```
 
 ## Common commands (when Phase 1 is live)
 
 ```bash
 # Initial setup (run once)
-cd ~/Development/phasm/eval
+cd eval
 uv sync                                  # creates .venv with pinned deps
 
 # Get Deep-Steganalysis (the only third-party clone now)
@@ -350,10 +379,9 @@ cd ..
 uv run python prep/download_bossbase.py
 uv run python prep/encode_jpeg.py --quality 75
 uv run python prep/generate_juniward.py --payload 0.1 0.4
-uv run python detectors/train_srnet.py --payload 0.1 0.4 --seeds 3
+uv run python detectors/train_srnet.py --payload 0.4 --seed 42   # one run per payload / seed
 
-# Inspect result
-uv run jupyter lab notebooks/01_juniward_baseline.ipynb
+# Inspect result: runs/<datestamp>-<slug>/RESULTS.md
 ```
 
 The actual command surface will firm up during Phase 1 implementation. Start at `NEXT_STEPS.md`.

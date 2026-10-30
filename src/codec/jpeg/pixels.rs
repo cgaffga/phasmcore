@@ -12,6 +12,7 @@
 use std::sync::OnceLock;
 
 use crate::codec::jpeg::JpegImage;
+use crate::codec::jpeg::dct::DctGrid;
 
 // Bulk pixel-domain helpers (`jpeg_to_luma_f64` /
 // `luma_f64_to_jpeg`) call the integer LL&M kernels directly.
@@ -183,6 +184,35 @@ pub fn dct_block_unquantized(pixels: &[f64; 64], qt: &[u16; 64]) -> [f64; 64] {
     unquantized
 }
 
+/// Pixel rows `8 br .. 8 br + 8` of what `jpeg_to_luma_f64` returns for this
+/// grid and quantization table, row-major (`strip.len() == 64 * blocks_wide`).
+/// `jpeg_to_luma_f64` is built on it, so a strip-wise consumer sees the same
+/// values bit for bit.
+pub fn luma_block_row_f64(grid: &DctGrid, qt: &[u16; 64], br: usize, strip: &mut [f64]) {
+    let width = grid.blocks_wide() * 8;
+    for bc in 0..grid.blocks_wide() {
+        let block_pixels = idct_block_f64(grid.block(br, bc).try_into().unwrap(), qt);
+        for row in 0..8 {
+            for col in 0..8 {
+                strip[row * width + bc * 8 + col] = block_pixels[row * 8 + col];
+            }
+        }
+    }
+}
+
+/// The block IDCT `jpeg_to_luma_f64` uses (quantized coefficients → pixels).
+#[inline]
+pub fn idct_block_f64(quantized: &[i16; 64], qt: &[u16; 64]) -> [f64; 64] {
+    idct_block_active(quantized, qt)
+}
+
+/// The block DCT + quantization `luma_f64_to_jpeg` uses (pixels → quantized
+/// coefficients).
+#[inline]
+pub fn dct_block_f64(block_pixels: &[f64; 64], qt: &[u16; 64]) -> [i16; 64] {
+    dct_block_active(block_pixels, qt)
+}
+
 /// Convert entire Y-channel DctGrid → row-major f64 pixel array.
 ///
 /// Returns (pixels, width_in_pixels, height_in_pixels) where dimensions
@@ -205,19 +235,7 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
     // Each block-row writes a disjoint 8-row strip of `pixels`,
     // and reads `grid.block(br, bc)` (immutable). Parallelize across br
     // via par_chunks_mut over the 8*width pixel strips.
-    let process_strip = |br: usize, strip: &mut [f64]| {
-        for bc in 0..bw {
-            let block = grid.block(br, bc);
-            let quantized: [i16; 64] = block.try_into().unwrap();
-            let block_pixels = idct_block_active(&quantized, &qt_values);
-            for row in 0..8 {
-                for col in 0..8 {
-                    let px = bc * 8 + col;
-                    strip[row * width + px] = block_pixels[row * 8 + col];
-                }
-            }
-        }
-    };
+    let process_strip = |br: usize, strip: &mut [f64]| luma_block_row_f64(grid, &qt_values, br, strip);
 
     #[cfg(feature = "parallel")]
     {
@@ -325,7 +343,7 @@ pub fn luma_f64_to_jpeg(pixels: &[f64], width: usize, height: usize, img: &mut J
                 block_pixels[row * 8 + col] = pixels[py * width + px];
             }
         }
-        let quantized = dct_block_active(&block_pixels, &qt_values);
+        let quantized = dct_block_f64(&block_pixels, &qt_values);
         block_coeffs.copy_from_slice(&quantized);
     };
 

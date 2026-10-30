@@ -7,8 +7,8 @@ B-frame stealth-distribution work (#123 / #126 / #127 — Phase
 `.gitignore`); keep a personal copy here locally so the regen
 scripts below can find them.
 
-The derived `.yuv` files go to `/tmp/` on demand — never committed,
-wiped on reboot, regenerate cheaply.
+The derived `.yuv` files go to `$PHASM_TMP` (falls back to `/tmp`) on
+demand — never committed, regenerate cheaply.
 
 ## Contents (gitignored)
 
@@ -51,7 +51,7 @@ None of these clips are redistributed; all stay gitignored.
 For the ytnews clip (1280×720 news broadcast), regen pulls the
 already-compressed `.h264` elementary stream in `/tmp/ytnews.h264`
 (also gitignored). If that's missing you need to re-save from the
-upstream source; see `docs/design/video/h264/encoder-quality-plan.md`
+upstream source; see `docs/design/video/_archive/h264/encoder-quality-plan.md`
 § D.2-stealth for the original download path. Single-vendor and
 not in active use post-§6E-A6 reference-distribution work.
 
@@ -63,10 +63,16 @@ Run from repo root:
 core/test-vectors/video/h264/real-world/source/regen.sh
 ```
 
-Produces `/tmp/img4138_1080p_f10.yuv` and `/tmp/img4273_1080p_f10.yuv`
-(30 MB each, 10 frames @ 1920×1072 yuv420p) — the dimensions expected
-by the calibration harnesses. Re-run after a reboot or if you've
-cleared `/tmp/`.
+Produces `$PHASM_TMP/img4138_1080p_f10.yuv` and
+`$PHASM_TMP/img4273_1080p_f10.yuv` (30 MB each, 10 frames @ 1920×1072
+yuv420p) — the dimensions expected by the calibration harnesses. Re-run
+after clearing the scratch dir.
+
+The other `regen_*.sh` scripts in this directory build the reference
+Annex-B clips and histograms (`regen_x264_reference.sh`,
+`regen_iphone_vt_reference.sh`, `regen_openh264_baseline.sh`,
+`regen_real_world_histograms.sh`); the committed histogram tables live
+in `core/tests/data/`.
 
 Exits non-zero with a clear message if a source `.MOV` is missing —
 put the file back here, or update the script's source path.
@@ -74,5 +80,5 @@ put the file back here, or update the script's source path.
 ## Cleanup
 
 When a calibration sweep is done for a given phase, delete the
-`/tmp/img*.yuv` files manually; they compress poorly and eat /tmp
-space fast. A reboot will clean them up automatically.
+`$PHASM_TMP/img*.yuv` files manually; they compress poorly and eat
+scratch space fast.

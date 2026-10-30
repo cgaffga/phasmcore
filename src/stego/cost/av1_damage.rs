@@ -211,6 +211,19 @@ pub fn damage(inp: &DamageInputs, p: &DamageParams) -> f32 {
     e * t * x
 }
 
+/// Largest |c| whose sign is in the AV1 cover.
+pub const AV1_COVER_MAX_ABS_C: u16 = 5;
+
+/// Whether a 50/50 position is in the AV1 stego cover (amended spec § 3):
+/// AC signs with 1 ≤ |c| ≤ [`AV1_COVER_MAX_ABS_C`]. Golomb-tail LSBs and
+/// larger |c| are wet by syntax, which the decoder can tell too (no layer's
+/// flip changes |c|), so they are left out of the cover rather than kept in
+/// it as wet positions, where they only cost STC capacity. Encoder, decoder,
+/// probe and shadows all build the cover with this.
+pub fn av1_in_cover(is_ac_sign: bool, abs_c: u16) -> bool {
+    is_ac_sign && (1..=AV1_COVER_MAX_ABS_C).contains(&abs_c)
+}
+
 /// Number of shadow damage buckets.
 pub const SHADOW_BUCKETS: u8 = 4;
 

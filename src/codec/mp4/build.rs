@@ -2,70 +2,47 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Phasm-owned MP4 builder for H.264 Annex-B output.
+//! Phasm-owned MP4 builder.
 //!
-//! Wraps a phasm-encoded H.264 Annex-B bitstream in an MP4 container whose
-//! top-level atom signature matches a chosen [`MuxerProfile`]. The default
-//! `HandbrakeX264` profile lands phasm output inside the HandBrake/x264
-//! converter-pipeline metaclass — the largest single container metaclass on
-//! the open internet (Agent B 2026-05-02 + strategy doc
-//! `docs/design/video/h264/stealth-strategy.md`).
+//! **H.264.** Wraps a phasm-encoded Annex-B bitstream in an MP4 container
+//! whose atom signature matches a [`MuxerProfile`]. The one profile is
+//! [`MuxerProfile::LavfOpenH264`] (module [`lavf`]): the container a
+//! libavformat transcoder writes around a libopenh264 encode, consistent
+//! with the OpenH264 bitstream inside it (see
+//! `docs/design/video/h264/openh264-stealth-report.md`, "Container layer").
+//! A HandBrake/x264 profile that put an x264 SEI banner and a HandBrake
+//! `©too` around that bitstream (every claim of which the SPS / PPS /
+//! slices contradict) was removed on 2026-10-29.
+//!
+//! **AV1.** [`build_mp4_av1`] and its variants write the `av01` container
+//! with the box helpers in this file (`ftyp → mdat → moov`, one chunk per
+//! GOP, `mvhd` timescale 1000, `fps × 512` media timescale).
 //!
 //! Distinct from [`super::mux`], which patches an existing source MP4 by
 //! copying its `moov` and substituting modified samples — that path makes
 //! sense when the source file is also H.264 (HEVC sources can't be
-//! shadow-patched). The builder here writes a fresh MP4 from scratch given
-//! the target profile and an Annex-B byte stream.
-//!
-//! # Scope
-//!
-//! Shipped (§Stealth.L4.1):
-//! - HandBrake/x264 container signature: `ftyp` major+compatibles,
-//!   `mvhd.time_scale=1000`, `hdlr.name="VideoHandler"`, `udta/©too`
-//!   plaintext "HandBrake X.X.X yyyymmddhhss".
-//! - Top-level atom order `ftyp → mdat → moov` (HandBrake without
-//!   `+faststart`).
-//! - `avcC` from extracted SPS+PPS NAL units; lengthSizeMinusOne=3.
-//! - One sample per access unit; AUD NALs are stripped from `mdat`
-//!   (HandBrake/x264 convention — Apple/Android keep AUDs).
-//! - One chunk per GOP (run-length compressed `stsc`, per-GOP `stco`).
-//! - IPPPP timing (uniform `stts`, no `ctts`).
-//!
-//! Shipped (§Stealth.L4.2):
-//! - x264 SEI `user_data_unregistered` NAL with the canonical UUID +
-//!   plaintext "x264 - core 164 …" banner injected into the leading IDR
-//!   sample. Strongest single L4 plaintext fingerprint per Agent B
-//!   survey §Tier B.
-//! - B-frame timing — [`build_mp4_with_pattern`] emits a per-sample
-//!   `ctts` box (version=1 with signed offsets) and an `edts/elst`
-//!   pre-roll edit when the input GOP pattern carries B-frames. Plain
-//!   `build_mp4` keeps the IPPPP / I-only path (no `ctts`, no `edts`).
-//!
-//! Shipped (§Stealth.L3.1):
-//! - VUI emission on every CABAC SPS path (encoder side, see
-//!   `core/src/codec/h264/encoder/bitstream_writer.rs`). The new
-//!   builder reads SPS+PPS straight from the input Annex-B and stores
-//!   them verbatim in `avcC`, so VUI presence flows through end-to-end.
-//!
-//! Deferred (held for follow-on sessions):
-//! - Byte-exact `avcC` byte equality vs reference x264 SPS+PPS —
-//!   currently blocked on stego encoder still emitting Main profile
-//!   (§Stealth.L3.1 follow-on / I_8x8 walker support).
-//! - Audio track passthrough — separate task.
+//! shadow-patched). The builders here write a fresh MP4 from scratch given
+//! the target profile and an Annex-B (or OBU) byte stream.
 
-use super::{write_u32, write_u64, Av1cData, AvccData, Mp4Error};
+use super::{AvccData, Mp4Error};
 use crate::codec::h264::NalType;
 #[cfg(feature = "h264-encoder")]
 use crate::codec::h264::stego::gop_pattern::{iter_encode_order, FrameType, GopPattern};
 
-/// Container target profile. Each variant carries the byte-exact atom
-/// signature of one converter-pipeline metaclass.
+// A child of this module (it uses the builder's private helpers), kept
+// outside a `build/` directory, which the repository ignores.
+#[path = "build_lavf.rs"]
+mod lavf;
+
+/// Container target profile: the byte-exact atom signature of one
+/// converter-pipeline metaclass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxerProfile {
-    /// HandBrake / FFmpeg + libx264 (the v1.0 default — largest single
-    /// internet container metaclass, smallest engineering gap from phasm
-    /// encoder defaults).
-    HandbrakeX264,
+    /// The container a libavformat-based transcoder writes around a
+    /// libopenh264 encode: consistent with the OpenH264 bitstream inside it.
+    /// The CLI default since 2026-10-29. See [`lavf`] for the field-by-field
+    /// rationale.
+    LavfOpenH264,
 }
 
 /// Per-frame timing info supplied by the caller. One entry per access unit
@@ -95,8 +72,7 @@ impl FrameTiming {
 ///
 /// The Annex-B stream must contain at least one SPS NAL and one PPS NAL —
 /// they are extracted into the `avcC` decoder configuration record and
-/// then dropped from the per-frame mdat samples (HandBrake/x264
-/// convention).
+/// then dropped from the per-frame mdat samples.
 pub fn build_mp4(
     profile: MuxerProfile,
     annex_b: &[u8],
@@ -133,17 +109,9 @@ pub fn build_mp4(
     }
 
     match profile {
-        MuxerProfile::HandbrakeX264 => build_handbrake_x264(
-            annex_b,
-            &access_units,
-            &avcc,
-            width,
-            height,
-            timing,
-            None,
-            None,
-            0,
-        ),
+        MuxerProfile::LavfOpenH264 => {
+            lavf::build(annex_b, &access_units, &avcc, width, height, timing, None, None, 0)
+        }
     }
 }
 
@@ -153,8 +121,6 @@ pub fn build_mp4(
 /// B-frames), access units appear in encode order — but the decoder must
 /// display frames in display order. The standard MP4 mechanism is the
 /// `ctts` (composition time-to-sample) box: per-sample CTS-DTS offset.
-/// Real HandBrake/x264 output also emits an `edts/elst` leading empty
-/// edit so the first displayed frame's PTS lands at zero.
 ///
 /// `pattern` describes the encode-order pattern (e.g.
 /// `GopPattern::iphone_default()` = `Ibpbp{ gop: 30, b_count: 1 }`) and
@@ -208,9 +174,7 @@ pub fn build_mp4_with_pattern(
     }
 
     // Per-sample composition-time offset = display_idx - encode_idx, in
-    // STTS_DELTA_PER_FRAME units. Same for IPPPP (always 0) — but we
-    // still emit ctts when any B-frame is present to match HandBrake/
-    // x264 convention.
+    // STTS_DELTA_PER_FRAME units. Same for IPPPP (always 0).
     let any_b_frame = encode_order.iter().any(|f| f.frame_type == FrameType::B);
     let composition_offsets: Option<Vec<i32>> = if any_b_frame {
         Some(
@@ -219,7 +183,7 @@ pub fn build_mp4_with_pattern(
                 .map(|f| {
                     let display = f.display_idx as i32;
                     let encode = f.encode_idx as i32;
-                    (display - encode) * (handbrake::STTS_DELTA_PER_FRAME as i32)
+                    (display - encode) * (shared::STTS_DELTA_PER_FRAME as i32)
                 })
                 .collect(),
         )
@@ -228,7 +192,7 @@ pub fn build_mp4_with_pattern(
     };
 
     match profile {
-        MuxerProfile::HandbrakeX264 => build_handbrake_x264(
+        MuxerProfile::LavfOpenH264 => lavf::build(
             annex_b,
             &access_units,
             &avcc,
@@ -243,10 +207,9 @@ pub fn build_mp4_with_pattern(
 }
 
 /// §Stealth.L4.5 — variant of [`build_mp4_with_pattern`] that also
-/// passes through an audio track from the source MP4. The HandBrake-
-/// class video container shape is unchanged; the audio is added as a
-/// second track inside `moov` with its samples appended to `mdat`
-/// after the video samples.
+/// passes through an audio track from the source MP4. The video container
+/// shape is unchanged; the audio is added as a second track inside `moov`
+/// with its samples appended to `mdat` after the video samples.
 ///
 /// # Audio handling
 ///
@@ -287,13 +250,11 @@ pub fn build_mp4_with_pattern_audio(
 /// passed-through audio's time zero (a leading empty edit on the source's
 /// video track, as stock-footage exports carry).
 ///
-/// The output video starts at 0 with no edit list (x264/HandBrake carry
-/// none), so without this every frame would play `lead_in_us` early against
-/// the audio, which keeps its own edit list. Instead frame 0 is held for the
-/// lead-in on top of its own duration: sample 0's `stts` delta grows by the
-/// lead-in, every later frame lands on its source time, and the frame count
-/// is unchanged. This is the same rule the AV1 muxer applies to a lead-in in
-/// its frame times (`VideoTimeline::from_frame_times`).
+/// [`MuxerProfile::LavfOpenH264`] carries the lead-in as a leading empty
+/// edit, rounded to whole frames — what a libavformat transcode of such a
+/// source writes. The frames keep a uniform `stts`. Every frame lands on its
+/// source time against the audio, which keeps its own edit list, and the
+/// frame count is unchanged.
 ///
 /// `lead_in_us == 0` is exactly [`build_mp4_with_pattern_audio`].
 #[cfg(feature = "h264-encoder")]
@@ -347,7 +308,7 @@ pub fn build_mp4_with_pattern_audio_lead_in(
                 .map(|f| {
                     let display = f.display_idx as i32;
                     let encode = f.encode_idx as i32;
-                    (display - encode) * (handbrake::STTS_DELTA_PER_FRAME as i32)
+                    (display - encode) * (shared::STTS_DELTA_PER_FRAME as i32)
                 })
                 .collect(),
         )
@@ -358,7 +319,7 @@ pub fn build_mp4_with_pattern_audio_lead_in(
     let audio = AudioPassthrough::extract_first(source_mp4)?;
 
     match profile {
-        MuxerProfile::HandbrakeX264 => build_handbrake_x264(
+        MuxerProfile::LavfOpenH264 => lavf::build(
             annex_b,
             &access_units,
             &avcc,
@@ -373,7 +334,7 @@ pub fn build_mp4_with_pattern_audio_lead_in(
 }
 
 /// Extracted audio track from a source MP4, ready to splice into a
-/// new HandBrake-class mux. `None` when the source has no audio.
+/// new mux. `None` when the source has no audio.
 pub struct AudioPassthrough<'a> {
     /// Original audio samples in source order. Lifetime tied to the
     /// caller's source MP4 byte slice.
@@ -383,14 +344,9 @@ pub struct AudioPassthrough<'a> {
     /// movie timescale, source identity cleared) with `tkhd.track_id`
     /// rewritten to 2 and `stco`/`co64` to our new mdat positions.
     trak_raw: Vec<u8>,
-    /// Source's media-timescale duration in `mdhd.time_scale` units.
-    duration_media: u64,
     /// The source file's `mvhd.time_scale`: the unit of `tkhd.duration` and
     /// the edit list inside `trak_raw` (see `audio_iso`).
     source_movie_timescale: u32,
-    /// Audio sample-table chunk layout from the source. Each entry is
-    /// `(first_sample_index_0based, samples_in_chunk)`.
-    chunks: Vec<(usize, usize)>,
 }
 
 impl<'a> AudioPassthrough<'a> {
@@ -425,362 +381,29 @@ impl<'a> AudioPassthrough<'a> {
             samples.push(&source_mp4[start..end]);
         }
 
-        // Reconstruct chunk layout from stsc — same logic the patch
-        // path in mux.rs uses. We need this to recompute stco offsets
-        // when the audio samples land at fresh positions in our mdat.
-        let chunks = reconstruct_chunk_layout(&track.trak_raw, track.samples.len())?;
-
         Ok(Some(AudioPassthrough {
             samples,
             trak_raw: track.trak_raw.clone(),
-            duration_media: track.duration,
             source_movie_timescale: super::audio_iso::movie_timescale(source_mp4)
-                .unwrap_or(handbrake::MVHD_TIMESCALE),
-            chunks,
+                .unwrap_or(shared::MVHD_TIMESCALE),
         }))
     }
 }
 
-// ─── HandBrake/x264 profile ──────────────────────────────────────────
+// ─── Constants shared with the lavf profile ──────────────────────────
 
-/// HandBrake target signature constants. Pulled from
-/// `docs/research/mp4-container-forensics-survey.md` §Q2 + Gloe 2014
-/// Tab. 2-4 + Altinisik 2022 §IV.
-mod handbrake {
-    /// `ftyp` major brand.
-    pub const FTYP_MAJOR: &[u8; 4] = b"isom";
-    /// `ftyp` minor version.
-    pub const FTYP_MINOR: u32 = 0x0000_0200;
-    /// `ftyp` compatible brands, in order.
-    pub const FTYP_COMPATIBLE: &[&[u8; 4]] =
-        &[b"isom", b"iso2", b"avc1", b"mp41"];
-
-    /// `mvhd.time_scale` — HandBrake convention.
+/// Container constants the `lavf` profile's movie/track header builders
+/// share with this module.
+mod shared {
+    /// `mvhd.time_scale` (1000 = ms).
     pub const MVHD_TIMESCALE: u32 = 1000;
 
-    /// Per-track media `time_scale`, parametrised by frame rate. HandBrake
-    /// emits 12800 @ 25 fps, 15360 @ 30 fps, 60000 @ 29.97. The general
-    /// rule is "fps × 512" so a single-frame `stts` delta of 512 ticks
-    /// gives a clean per-frame duration. (Per-fps caps documented in
-    /// Agent B survey §Q2 "FFmpeg + libx264".)
-    pub fn mdhd_timescale(fps_num: u32, fps_den: u32) -> u32 {
-        // Frame rate × 512 → integer ticks per frame.
-        // 30 fps → 15360 ticks; 25 → 12800; 29.97 (30000/1001) →
-        // 30000 × 512 / 1001 = 15344. Round-half-to-even.
-        let num = (fps_num as u64) * 512;
-        let den = fps_den as u64;
-        ((num + den / 2) / den) as u32
-    }
-
-    /// Per-frame media-timescale duration in `mdhd_timescale` units.
+    /// Ticks per frame the composition offsets are computed in.
+    #[cfg(feature = "h264-encoder")]
     pub const STTS_DELTA_PER_FRAME: u32 = 512;
-
-    /// Plaintext `udta/©too` — version + build date marker. Matches the
-    /// structure HandBrake emits ("HandBrake N.N.N (yyyymmddhhss)") but
-    /// uses a stable phasm-side version pin so the same phasm build
-    /// produces the same string. HandBrake's own version pool is wide
-    /// enough that any pinned version lands inside the metaclass.
-    pub const UDTA_TOO: &str = "HandBrake 1.7.3 2024010100";
 
     /// Video handler name.
     pub const HDLR_VIDE_NAME: &str = "VideoHandler";
-
-    /// x264 SEI `user_data_unregistered` UUID — appears in every
-    /// libx264-generated H.264 bitstream. The 16-byte UUID identifies the
-    /// payload as the x264 settings/version blob; analysts (and most
-    /// detectors) match on the UUID + the leading "x264 - core" prefix.
-    /// See Agent B survey §Q2 + x264 source `encoder/encoder.c`
-    /// (`x264_sei_version_write`).
-    pub const X264_SEI_UUID: [u8; 16] = [
-        0xDC, 0x45, 0xE9, 0xBD, 0xE6, 0xD9, 0x48, 0xB7,
-        0x96, 0x2C, 0xD8, 0x20, 0xD9, 0x23, 0xEE, 0xEF,
-    ];
-
-    /// x264 SEI plaintext core string — the well-known "x264 - core …"
-    /// banner. The exact suffix (build hash + options) is wide-pool in
-    /// the wild; pinning it to a believable libx264 release leaves
-    /// phasm output indistinguishable from any other libx264 transcode
-    /// at the SEI plaintext level. Includes a NUL terminator (x264
-    /// emits the C string null-terminated).
-    pub const X264_SEI_PLAINTEXT: &str = concat!(
-        "x264 - core 164 r3107 a8b68eb",
-        " - H.264/MPEG-4 AVC codec",
-        " - Copyleft 2003-2024",
-        " - http://www.videolan.org/x264.html",
-        " - options: cabac=1 ref=3 deblock=1:0:0 analyse=0x3:0x113",
-        " me=hex subme=7 psy=1 psy_rd=1.00:0.00 mixed_ref=1",
-        " me_range=16 chroma_me=1 trellis=1 8x8dct=1 cqm=0",
-        " deadzone=21,11 fast_pskip=1 chroma_qp_offset=-2",
-        " threads=6 lookahead_threads=1 sliced_threads=0 nr=0",
-        " decimate=1 interlaced=0 bluray_compat=0",
-        " constrained_intra=0 bframes=3 b_pyramid=2",
-        " b_adapt=1 b_bias=0 direct=1 weightb=1 open_gop=0",
-        " weightp=2 keyint=250 keyint_min=25 scenecut=40",
-        " intra_refresh=0 rc_lookahead=40 rc=crf mbtree=1",
-        " crf=23.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4",
-        " ip_ratio=1.40 aq=1:1.00",
-        "\0",
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_handbrake_x264(
-    annex_b: &[u8],
-    access_units: &[AccessUnit],
-    avcc: &AvccData,
-    width: u32,
-    height: u32,
-    timing: FrameTiming,
-    composition_offsets: Option<&[i32]>,
-    audio: Option<&AudioPassthrough<'_>>,
-    lead_in_us: u64,
-) -> Result<Vec<u8>, Mp4Error> {
-    // `tkhd` and the `avc1` sample entry carry the DISPLAY size. For a cropped
-    // stream (1920×1080 coded as 120×68 MBs, `crop_bottom = 4`) that is the
-    // SPS size after frame cropping — what phone MP4s advertise. A caller
-    // passing the coded size (1088) or any other size would write a container
-    // that disagrees with its own bitstream, so refuse it here instead of
-    // shipping it. (An SPS that does not parse is left to the decoder.)
-    if let Some((sps_w, sps_h)) = avcc.sps_display_size()
-        && (sps_w, sps_h) != (width, height)
-    {
-        return Err(Mp4Error::InvalidBox(format!(
-            "track size {width}x{height} != SPS display size {sps_w}x{sps_h} \
-             (pass the cropped display size, not the coded MB-grid size)"
-        )));
-    }
-    let mdhd_timescale = handbrake::mdhd_timescale(timing.fps_num, timing.fps_den);
-    let frame_count = access_units.len() as u32;
-    // A source lead-in holds frame 0 longer (see
-    // `build_mp4_with_pattern_audio_lead_in`); 0 for every other caller,
-    // which keeps the single uniform `stts` run.
-    let lead_in_ticks: u64 =
-        (lead_in_us * mdhd_timescale as u64 + 500_000) / 1_000_000;
-    let lead_in_ticks = lead_in_ticks.min((u32::MAX - handbrake::STTS_DELTA_PER_FRAME) as u64);
-    let track_duration_media: u64 =
-        (frame_count as u64) * (handbrake::STTS_DELTA_PER_FRAME as u64) + lead_in_ticks;
-    // Movie-header duration uses `MVHD_TIMESCALE` (1000 = ms).
-    let movie_duration_ms: u64 = (frame_count as u64) * 1000 * (timing.fps_den as u64)
-        / (timing.fps_num as u64)
-        + lead_in_ticks * 1000 / mdhd_timescale as u64;
-
-    // Pre-synthesise the x264 SEI NAL — prepended to the FIRST IDR
-    // sample's NAL list. x264/HandBrake emits this exactly once per
-    // bitstream (at the leading IDR), and the plaintext "x264 - core"
-    // suffix is the strongest single L4 fingerprint (Agent B survey
-    // §"Tier B"). The phasm encoder does NOT emit this NAL itself —
-    // injection is mux-time only.
-    let x264_sei_nal = build_x264_sei_user_data_unregistered();
-    let mut sei_consumed = false;
-
-    // Build mdat sample data: one sample per access unit, NAL-length-
-    // prefixed. AUD NALs are stripped (HandBrake convention). SPS/PPS
-    // NALs are stripped (they live in avcC). On the first IDR sample,
-    // prepend the synthesised x264 SEI before the slice NAL so analysts
-    // see the canonical libx264 banner at the start of the bitstream.
-    let mut sample_data: Vec<Vec<u8>> = Vec::with_capacity(access_units.len());
-    for au in access_units {
-        let mut buf = Vec::new();
-        if au.is_sync && !sei_consumed {
-            let len = x264_sei_nal.len() as u32;
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(&x264_sei_nal);
-            sei_consumed = true;
-        }
-        for &(nal_start, nal_end, nal_type) in &au.nals {
-            if nal_type == NalType::AUD {
-                continue; // HandBrake/x264 strips AUDs in the AVC1 mdat.
-            }
-            // For IDR samples: drop SPS/PPS too (they live in avcC).
-            if nal_type == NalType::SPS || nal_type == NalType::PPS {
-                continue;
-            }
-            let nal = &annex_b[nal_start..nal_end];
-            // 4-byte big-endian length prefix.
-            let len = nal.len() as u32;
-            buf.extend_from_slice(&len.to_be_bytes());
-            buf.extend_from_slice(nal);
-        }
-        sample_data.push(buf);
-    }
-
-    let sample_sizes: Vec<u32> = sample_data.iter().map(|s| s.len() as u32).collect();
-    let video_payload: u64 = sample_sizes.iter().map(|&s| s as u64).sum();
-    let audio_payload: u64 = audio
-        .map(|a| a.samples.iter().map(|s| s.len() as u64).sum::<u64>())
-        .unwrap_or(0);
-    let total_mdat_payload: u64 = video_payload + audio_payload;
-
-    // ─── Compute layout ─────────────────────────────────────────
-    //
-    // HandBrake (no +faststart) layout: ftyp → mdat → moov.
-    // mdat carries video samples first, then audio samples (when
-    // present) — matches what `ffmpeg -c:a copy` interleaves into a
-    // libx264 file at low frame counts.
-
-    let ftyp = build_ftyp_handbrake();
-    let ftyp_len = ftyp.len() as u64;
-
-    let mdat_header_len: u64 = if total_mdat_payload + 8 > u32::MAX as u64 { 16 } else { 8 };
-    let mdat_total_size = mdat_header_len + total_mdat_payload;
-    let first_sample_offset = ftyp_len + mdat_header_len;
-
-    // Per-video-sample absolute offsets in the output file.
-    let mut sample_offsets: Vec<u64> = Vec::with_capacity(sample_data.len());
-    let mut cursor = first_sample_offset;
-    for &size in &sample_sizes {
-        sample_offsets.push(cursor);
-        cursor += size as u64;
-    }
-    // Per-audio-sample absolute offsets — sit right after the video.
-    let mut audio_sample_offsets: Vec<u64> = Vec::new();
-    if let Some(a) = audio {
-        for s in &a.samples {
-            audio_sample_offsets.push(cursor);
-            cursor += s.len() as u64;
-        }
-    }
-
-    // Sync sample indices (1-based per spec): each access unit whose
-    // first VCL NAL is IDR.
-    let sync_samples: Vec<u32> = access_units
-        .iter()
-        .enumerate()
-        .filter_map(|(i, au)| if au.is_sync { Some(i as u32 + 1) } else { None })
-        .collect();
-
-    // ─── Patch the audio trak (when present) ────────────────────
-    // Compute new chunk-offset table from the audio sample layout +
-    // source's chunk grouping (stsc), then rewrite the source's
-    // stco/co64 in-place inside its trak_raw clone. tkhd.track_id is
-    // also rewritten to 2 (video has 1).
-    let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
-        // ISO shape, output movie timescale, and none of the source file's
-        // timestamps / names / metadata (an error if it cannot be cleared).
-        let mut trak = super::audio_iso::passthrough_audio_trak(
-            &a.trak_raw,
-            a.source_movie_timescale,
-            handbrake::MVHD_TIMESCALE,
-        )?;
-        let chunk_offsets: Vec<u64> = a
-            .chunks
-            .iter()
-            .map(|&(first_idx, _spc)| {
-                audio_sample_offsets
-                    .get(first_idx)
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .collect();
-        // Patch stco/co64. Failures are non-fatal — we just leave
-        // the source's offsets in place (they'd be wrong but the
-        // file would at least decode video). Caller's smoke test
-        // catches misshapen audio, then we'd return an error. For
-        // now, propagate the error.
-        patch_trak_stco(&mut trak, &chunk_offsets)?;
-        patch_trak_track_id(&mut trak, 2)?;
-        Ok::<Vec<u8>, Mp4Error>(trak)
-    }).transpose()?;
-
-    let audio_duration_movie: Option<u64> = audio.map(|a| {
-        // Convert audio's mdhd-timescale duration to movie-timescale
-        // (1000) so mvhd.duration covers the longest track.
-        let mdhd_ts = read_audio_mdhd_timescale(&a.trak_raw).unwrap_or(48000) as u64;
-        a.duration_media * (handbrake::MVHD_TIMESCALE as u64) / mdhd_ts
-    });
-
-    // ─── Build moov ─────────────────────────────────────────────
-    let movie_duration_final = audio_duration_movie
-        .map(|ad| ad.max(movie_duration_ms))
-        .unwrap_or(movie_duration_ms);
-    let moov = build_moov_handbrake(MoovParams {
-        width,
-        height,
-        movie_duration_ms: movie_duration_final,
-        track_duration_media,
-        mdhd_timescale,
-        sample_sizes: &sample_sizes,
-        sample_offsets: &sample_offsets,
-        sync_samples: &sync_samples,
-        avcc,
-        composition_offsets,
-        lead_in_ticks: lead_in_ticks as u32,
-        audio_trak: audio_trak_patched.as_deref(),
-    });
-
-    // ─── Assemble output ────────────────────────────────────────
-    let mut out = Vec::with_capacity(ftyp.len() + mdat_total_size as usize + moov.len());
-    out.extend_from_slice(&ftyp);
-
-    // mdat header
-    if mdat_header_len == 16 {
-        write_u32(&mut out, 1); // size = 1 → extended
-        out.extend_from_slice(b"mdat");
-        write_u64(&mut out, mdat_total_size);
-    } else {
-        write_u32(&mut out, mdat_total_size as u32);
-        out.extend_from_slice(b"mdat");
-    }
-    for sample in &sample_data {
-        out.extend_from_slice(sample);
-    }
-    if let Some(a) = audio {
-        for s in &a.samples {
-            out.extend_from_slice(s);
-        }
-    }
-    out.extend_from_slice(&moov);
-
-    Ok(out)
-}
-
-fn build_ftyp_handbrake() -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(handbrake::FTYP_MAJOR);
-    content.extend_from_slice(&handbrake::FTYP_MINOR.to_be_bytes());
-    for &brand in handbrake::FTYP_COMPATIBLE {
-        content.extend_from_slice(brand);
-    }
-    wrap_box(b"ftyp", &content)
-}
-
-struct MoovParams<'a> {
-    width: u32,
-    height: u32,
-    movie_duration_ms: u64,
-    track_duration_media: u64,
-    mdhd_timescale: u32,
-    sample_sizes: &'a [u32],
-    sample_offsets: &'a [u64],
-    sync_samples: &'a [u32],
-    avcc: &'a AvccData,
-    /// Per-sample composition-time offset (PTS - DTS) in
-    /// `mdhd_timescale` units. `Some` when B-frames are present;
-    /// `None` for IPPPP / I-only inputs.
-    composition_offsets: Option<&'a [i32]>,
-    /// Extra `mdhd_timescale` ticks on sample 0's `stts` delta: the
-    /// source's video lead-in. 0 → one uniform `stts` run.
-    lead_in_ticks: u32,
-    /// §Stealth.L4.5 — patched audio `trak` box bytes ready to
-    /// splice. Already has track_id=2 + new stco/co64 offsets. None
-    /// → video-only mux.
-    audio_trak: Option<&'a [u8]>,
-}
-
-fn build_moov_handbrake(p: MoovParams<'_>) -> Vec<u8> {
-    let next_track_id: u32 = if p.audio_trak.is_some() { 3 } else { 2 };
-    let mvhd = build_mvhd(p.movie_duration_ms, next_track_id);
-    let trak = build_video_trak_handbrake(&p);
-    let udta = build_udta_handbrake();
-
-    let mut moov = Vec::new();
-    moov.extend_from_slice(&mvhd);
-    moov.extend_from_slice(&trak);
-    if let Some(audio_trak) = p.audio_trak {
-        moov.extend_from_slice(audio_trak);
-    }
-    moov.extend_from_slice(&udta);
-    wrap_box(b"moov", &moov)
 }
 
 fn build_mvhd(duration_ms: u64, next_track_id: u32) -> Vec<u8> {
@@ -791,7 +414,7 @@ fn build_mvhd(duration_ms: u64, next_track_id: u32) -> Vec<u8> {
     content.extend_from_slice(&[0; 4]);
     content.extend_from_slice(&[0; 4]);
     // time_scale
-    content.extend_from_slice(&handbrake::MVHD_TIMESCALE.to_be_bytes());
+    content.extend_from_slice(&shared::MVHD_TIMESCALE.to_be_bytes());
     // duration (32-bit since version=0)
     content.extend_from_slice(&(duration_ms as u32).to_be_bytes());
     // rate = 1.0 (16.16 fixed)
@@ -815,105 +438,15 @@ const UNITY_MATRIX: [u8; 36] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
 ];
 
-fn build_video_trak_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
-    let tkhd = build_tkhd_video(p.movie_duration_ms, p.width, p.height);
-    let edts = build_edts_handbrake(p);
-    let mdia = build_mdia_video_handbrake(p);
-    let mut trak = Vec::new();
-    trak.extend_from_slice(&tkhd);
-    if let Some(edts) = edts {
-        trak.extend_from_slice(&edts);
-    }
-    trak.extend_from_slice(&mdia);
-    wrap_box(b"trak", &trak)
-}
-
-/// `edts/elst` for B-frame-aware streams.
-///
-/// **2026-05-05 fix**: real x264-medium output emits NO `edts/elst`
-/// box. The original §Stealth.L4.2 follow-on (#146) emitted one with
-/// `media_time = -min(ctts)` thinking it matched x264; in fact x264
-/// relies on `ctts` version=1 signed offsets alone to encode B-frame
-/// PTS reordering, with all DTS values non-negative and all PTS = DTS
-/// + ctts non-negative. The leading-empty-edit phasm was emitting
-/// instead instructed players to start playback past the IDR, dropping
-/// the IDR from display output and producing a 1-frame
-/// presentation-time shift that read as ~5–10 dB Y-PSNR vs source.
-///
-/// See `docs/design/video/_archive/h264/encoder-quality-perf-gap-2026-05-04.md`.
-///
-/// Kept around as `_unused` for diff readability — caller never invokes.
-#[allow(dead_code)]
-fn build_edts_handbrake(_p: &MoovParams<'_>) -> Option<Vec<u8>> {
-    // x264 doesn't emit edts/elst. We don't either.
-    None
-}
-
-fn build_tkhd_video(duration_ms: u64, width: u32, height: u32) -> Vec<u8> {
-    let mut content = Vec::new();
-    // version=0, flags=0x000007 (track_enabled | in_movie | in_preview)
-    content.extend_from_slice(&[0, 0x00, 0x00, 0x07]);
-    content.extend_from_slice(&[0; 4]); // creation_time
-    content.extend_from_slice(&[0; 4]); // modification_time
-    content.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-    content.extend_from_slice(&[0; 4]); // reserved
-    content.extend_from_slice(&(duration_ms as u32).to_be_bytes());
-    content.extend_from_slice(&[0; 8]); // reserved
-    content.extend_from_slice(&[0; 2]); // layer
-    content.extend_from_slice(&[0; 2]); // alternate_group
-    content.extend_from_slice(&[0; 2]); // volume
-    content.extend_from_slice(&[0; 2]); // reserved
-    content.extend_from_slice(&UNITY_MATRIX);
-    // width / height as 16.16 fixed-point
-    content.extend_from_slice(&(width << 16).to_be_bytes());
-    content.extend_from_slice(&(height << 16).to_be_bytes());
-    wrap_box(b"tkhd", &content)
-}
-
-fn build_mdia_video_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
-    let mdhd = build_mdhd(p.track_duration_media, p.mdhd_timescale);
-    let hdlr = build_hdlr_vide();
-    let minf = build_minf_video_handbrake(p);
-    let mut mdia = Vec::new();
-    mdia.extend_from_slice(&mdhd);
-    mdia.extend_from_slice(&hdlr);
-    mdia.extend_from_slice(&minf);
-    wrap_box(b"mdia", &mdia)
-}
-
-fn build_mdhd(duration: u64, timescale: u32) -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version=0, flags=0
-    content.extend_from_slice(&[0; 4]); // creation_time
-    content.extend_from_slice(&[0; 4]); // modification_time
-    content.extend_from_slice(&timescale.to_be_bytes());
-    content.extend_from_slice(&(duration as u32).to_be_bytes());
-    // language: ISO-639-2 packed; "und" = 0x55C4
-    content.extend_from_slice(&[0x55, 0xC4]);
-    content.extend_from_slice(&[0; 2]); // pre_defined
-    wrap_box(b"mdhd", &content)
-}
-
 fn build_hdlr_vide() -> Vec<u8> {
     let mut content = Vec::new();
     content.extend_from_slice(&[0, 0, 0, 0]); // version=0, flags=0
     content.extend_from_slice(&[0; 4]); // pre_defined
     content.extend_from_slice(b"vide");
     content.extend_from_slice(&[0; 12]); // reserved
-    content.extend_from_slice(handbrake::HDLR_VIDE_NAME.as_bytes());
+    content.extend_from_slice(shared::HDLR_VIDE_NAME.as_bytes());
     content.push(0); // null terminator
     wrap_box(b"hdlr", &content)
-}
-
-fn build_minf_video_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
-    let vmhd = build_vmhd();
-    let dinf = build_dinf();
-    let stbl = build_stbl_video_handbrake(p);
-    let mut minf = Vec::new();
-    minf.extend_from_slice(&vmhd);
-    minf.extend_from_slice(&dinf);
-    minf.extend_from_slice(&stbl);
-    wrap_box(b"minf", &minf)
 }
 
 fn build_vmhd() -> Vec<u8> {
@@ -937,186 +470,8 @@ fn build_dinf() -> Vec<u8> {
     wrap_box(b"dinf", &dref)
 }
 
-fn build_stbl_video_handbrake(p: &MoovParams<'_>) -> Vec<u8> {
-    let chunks = chunk_layout_per_gop(p.sample_sizes.len() as u32, p.sync_samples);
-    let chunk_offsets = chunk_offsets_for_layout(&chunks, p.sample_offsets);
-
-    let stsd = build_stsd_avc1(p.width, p.height, p.avcc);
-    let stts = if p.lead_in_ticks == 0 {
-        build_stts_uniform(p.sample_sizes.len() as u32)
-    } else {
-        let mut deltas = vec![handbrake::STTS_DELTA_PER_FRAME; p.sample_sizes.len()];
-        deltas[0] += p.lead_in_ticks;
-        build_stts(&deltas)
-    };
-    let ctts = p.composition_offsets.map(build_ctts);
-    let stsc = build_stsc(&chunks);
-    let stsz = build_stsz(p.sample_sizes);
-    let stco = build_stco(&chunk_offsets);
-    let stss = build_stss(p.sync_samples);
-
-    // §Stealth.L4.3 — stbl child order matches HandBrake/libavformat:
-    // stsd → stts → ctts (B-frames only) → stss → stsc → stsz → stco.
-    // Yang/EVA decision trees treat stbl `PathOrder` as a fingerprint
-    // input; the legacy `stss-after-stsz` order phasm shipped placed it
-    // outside the libx264 metaclass.
-    let mut stbl = Vec::new();
-    stbl.extend_from_slice(&stsd);
-    stbl.extend_from_slice(&stts);
-    if let Some(ctts) = ctts {
-        stbl.extend_from_slice(&ctts);
-    }
-    stbl.extend_from_slice(&stss);
-    stbl.extend_from_slice(&stsc);
-    stbl.extend_from_slice(&stsz);
-    stbl.extend_from_slice(&stco);
-    wrap_box(b"stbl", &stbl)
-}
-
-/// `ctts` (composition time-to-sample) box, version=1 with signed
-/// offsets. One entry per sample (no run-length compression here —
-/// HandBrake/x264 typically emits per-sample for IBPBP M=2 since
-/// adjacent samples don't share offsets). offsets are in
-/// `mdhd_timescale` units.
-fn build_ctts(offsets: &[i32]) -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(&[1, 0, 0, 0]); // version=1, flags=0
-    content.extend_from_slice(&(offsets.len() as u32).to_be_bytes());
-    for &off in offsets {
-        content.extend_from_slice(&1u32.to_be_bytes()); // sample_count = 1
-        content.extend_from_slice(&off.to_be_bytes()); // signed i32
-    }
-    wrap_box(b"ctts", &content)
-}
-
-/// One chunk == one GOP. Chunk i contains all samples whose 1-based index
-/// is in the half-open run `[sync_samples[i], sync_samples[i+1])` (with
-/// the last chunk extending to `sample_count`). Returns `(chunk_index_0
-/// → samples_in_chunk)` for every chunk in encode order. If
-/// `sync_samples` is empty (no IDRs — degenerate), falls back to one
-/// chunk holding all samples.
-fn chunk_layout_per_gop(sample_count: u32, sync_samples: &[u32]) -> Vec<u32> {
-    if sync_samples.is_empty() || sample_count == 0 {
-        return vec![sample_count];
-    }
-    let mut chunks = Vec::with_capacity(sync_samples.len());
-    for w in sync_samples.windows(2) {
-        chunks.push(w[1] - w[0]);
-    }
-    chunks.push(sample_count + 1 - sync_samples[sync_samples.len() - 1]);
-    chunks
-}
-
-/// First-sample file offset for each chunk, given per-sample offsets and
-/// the chunk-size layout. The first sample of chunk `c` is sample index
-/// `sum(chunks[0..c])` (0-based).
-fn chunk_offsets_for_layout(chunks: &[u32], sample_offsets: &[u64]) -> Vec<u64> {
-    let mut out = Vec::with_capacity(chunks.len());
-    let mut idx = 0usize;
-    for &spc in chunks {
-        if idx < sample_offsets.len() {
-            out.push(sample_offsets[idx]);
-        } else {
-            out.push(0);
-        }
-        idx += spc as usize;
-    }
-    out
-}
-
-fn build_stsd_avc1(width: u32, height: u32, avcc: &AvccData) -> Vec<u8> {
-    let avc1 = build_avc1(width, height, avcc);
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
-    content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    content.extend_from_slice(&avc1);
-    wrap_box(b"stsd", &content)
-}
-
-fn build_avc1(width: u32, height: u32, avcc: &AvccData) -> Vec<u8> {
-    // VisualSampleEntry layout per ISO/IEC 14496-12 §8.5.2.
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0; 6]); // reserved
-    content.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
-    content.extend_from_slice(&[0; 2]); // pre_defined
-    content.extend_from_slice(&[0; 2]); // reserved
-    content.extend_from_slice(&[0; 12]); // pre_defined[3]
-    content.extend_from_slice(&(width as u16).to_be_bytes());
-    content.extend_from_slice(&(height as u16).to_be_bytes());
-    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution = 72 dpi
-    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution = 72 dpi
-    content.extend_from_slice(&[0; 4]); // reserved
-    content.extend_from_slice(&1u16.to_be_bytes()); // frame_count
-    content.extend_from_slice(&[0; 32]); // compressorname (32-byte Pascal string, all zeros)
-    content.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
-    content.extend_from_slice(&[0xFF, 0xFF]); // pre_defined = -1
-
-    let avcc_box = wrap_box(b"avcC", &avcc.to_bytes());
-    content.extend_from_slice(&avcc_box);
-
-    wrap_box(b"avc1", &content)
-}
-
-/// VP.M.1 — stsd builder for AV1 video tracks. Mirror of
-/// [`build_stsd_avc1`] but emits an `av01` sample entry wrapping an
-/// `av1C` config box. Used by [`build_mp4_av1`] (VP.M.2+).
-#[allow(dead_code)] // Used by build_mp4_av1 once VP.M.2 lands.
-fn build_stsd_av01(width: u32, height: u32, av1c: &Av1cData) -> Vec<u8> {
-    let av01 = build_av01(width, height, av1c);
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
-    content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    content.extend_from_slice(&av01);
-    wrap_box(b"stsd", &content)
-}
-
-/// VP.M.1 — `av01` VisualSampleEntry builder. The ISO/IEC 14496-12
-/// VisualSampleEntry layout (§ 8.5.2) is codec-agnostic — same 78
-/// bytes as `avc1` — the only difference is the fourcc and the
-/// trailing codec-specific config box (`av1C` for AV1 vs `avcC` for
-/// H.264).
-///
-/// Per AV1-ISOBMFF § 2.2.1, the `av01` sample entry MAY also include
-/// optional `colr` / `pasp` boxes. VP.M.1 emits only `av1C` for the
-/// MVP; color VUI passthrough (VP.9) adds `colr` later.
-#[allow(dead_code)] // Used by build_mp4_av1 once VP.M.2 lands.
-fn build_av01(width: u32, height: u32, av1c: &Av1cData) -> Vec<u8> {
-    // VisualSampleEntry layout per ISO/IEC 14496-12 §8.5.2.
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0; 6]); // reserved
-    content.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
-    content.extend_from_slice(&[0; 2]); // pre_defined
-    content.extend_from_slice(&[0; 2]); // reserved
-    content.extend_from_slice(&[0; 12]); // pre_defined[3]
-    content.extend_from_slice(&(width as u16).to_be_bytes());
-    content.extend_from_slice(&(height as u16).to_be_bytes());
-    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution = 72 dpi
-    content.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution = 72 dpi
-    content.extend_from_slice(&[0; 4]); // reserved
-    content.extend_from_slice(&1u16.to_be_bytes()); // frame_count
-    content.extend_from_slice(&[0; 32]); // compressorname (32-byte Pascal string, all zeros)
-    content.extend_from_slice(&0x0018u16.to_be_bytes()); // depth = 24
-    content.extend_from_slice(&[0xFF, 0xFF]); // pre_defined = -1
-
-    let av1c_box = wrap_box(b"av1C", &av1c.to_bytes());
-    content.extend_from_slice(&av1c_box);
-
-    wrap_box(b"av01", &content)
-}
-
-fn build_stts_uniform(sample_count: u32) -> Vec<u8> {
-    // One run: sample_count samples each with delta = STTS_DELTA_PER_FRAME.
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
-    content.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-    content.extend_from_slice(&sample_count.to_be_bytes());
-    content.extend_from_slice(&handbrake::STTS_DELTA_PER_FRAME.to_be_bytes());
-    wrap_box(b"stts", &content)
-}
-
-/// Run-length `stts` over per-sample deltas. All-equal deltas give exactly
-/// the [`build_stts_uniform`] bytes when the delta is
-/// `STTS_DELTA_PER_FRAME`.
+/// Run-length `stts` over per-sample deltas: all-equal deltas give a single
+/// run.
 fn build_stts(deltas: &[u32]) -> Vec<u8> {
     let mut runs: Vec<(u32, u32)> = Vec::new(); // (sample_count, delta)
     for &d in deltas {
@@ -1135,105 +490,10 @@ fn build_stts(deltas: &[u32]) -> Vec<u8> {
     wrap_box(b"stts", &content)
 }
 
-/// AV1 video-track timing: `mdhd` timescale, one `stts` delta per sample,
-/// and the movie duration (ms) it implies.
-struct VideoTimeline {
-    timescale: u32,
-    deltas: Vec<u32>,
-    movie_duration_ms: u64,
-}
-
-impl VideoTimeline {
-    /// `n` frames at the nominal `timing` rate, 512 ticks each at
-    /// `fps × 512` — the untimed muxer's layout, byte for byte.
-    fn uniform(timing: FrameTiming, n: usize) -> Self {
-        Self {
-            timescale: handbrake::mdhd_timescale(timing.fps_num, timing.fps_den),
-            deltas: vec![handbrake::STTS_DELTA_PER_FRAME; n],
-            movie_duration_ms: (n as u64) * 1000 * (timing.fps_den as u64)
-                / (timing.fps_num as u64),
-        }
-    }
-
-    /// Timing from the source's frame presentation times (µs, one per
-    /// sample, presentation order). `None` for fewer than two frames.
-    ///
-    /// - **Constant rate** when the clip is one: the closer of an integer
-    ///   rate N and an NTSC rate M·1000/1001 to the mean frame period,
-    ///   accepted within 0.05 % with every frame within a quarter period of
-    ///   its slot. Integer → `N × 512` / delta 512 (the untimed layout);
-    ///   NTSC → `M × 2000` / delta 2002 (60000 @ 29.97, HandBrake's).
-    /// - **Otherwise** (variable rate) 90 kHz ticks from the real gaps.
-    /// - **Lead-in:** a first frame later than 0 (a leading empty edit in
-    ///   the source) extends sample 0's duration by it — frame 0 is held
-    ///   from 0 and every later frame lands on its source time against the
-    ///   passed-through audio. The muxer emits no edit list, like HandBrake.
-    ///
-    /// Integer and basic f64 arithmetic only (no transcendental functions),
-    /// so every platform derives the same timeline.
-    fn from_frame_times(frame_times_us: &[i64]) -> Option<Self> {
-        let n = frame_times_us.len();
-        if n < 2 {
-            return None;
-        }
-        let mut t = frame_times_us.to_vec();
-        for i in 1..n {
-            if t[i] <= t[i - 1] {
-                t[i] = t[i - 1] + 1;
-            }
-        }
-        let lead_us = t[0].max(0) as f64;
-        let rel: Vec<i64> = t.iter().map(|&x| x - t[0]).collect();
-        let period = rel[n - 1] as f64 / (n - 1) as f64;
-
-        // (timescale, delta, exact period in µs) for the two CFR families.
-        let mut candidates: Vec<(u32, u32, f64)> = Vec::new();
-        let int_fps = (1_000_000.0 / period).round();
-        if int_fps >= 1.0 && int_fps <= 1000.0 {
-            candidates.push((int_fps as u32 * 512, 512, 1_000_000.0 / int_fps));
-        }
-        let ntsc_m = (1_001_000.0 / period).round();
-        if ntsc_m >= 1.0 && ntsc_m <= 1000.0 {
-            candidates.push((ntsc_m as u32 * 2000, 2002, 1_001_000.0 / ntsc_m));
-        }
-        let cfr = candidates
-            .into_iter()
-            .min_by(|a, b| (period - a.2).abs().total_cmp(&(period - b.2).abs()))
-            .filter(|&(_, _, p)| {
-                (period - p).abs() <= p * 0.0005
-                    && rel.iter().enumerate().all(|(i, &r)| (r as f64 - i as f64 * p).abs() <= p / 4.0)
-            });
-
-        let (timescale, mut deltas) = match cfr {
-            Some((ts, delta, _)) => (ts, vec![delta; n]),
-            None => {
-                let mut ticks: Vec<u64> = rel.iter().map(|&r| (r as f64 * 0.09).round() as u64).collect();
-                for i in 1..n {
-                    if ticks[i] <= ticks[i - 1] {
-                        ticks[i] = ticks[i - 1] + 1;
-                    }
-                }
-                let mut d: Vec<u32> = ticks.windows(2).map(|w| (w[1] - w[0]) as u32).collect();
-                d.push(*d.last().expect("n >= 2"));
-                (90_000, d)
-            }
-        };
-        let lead_ticks = (lead_us * timescale as f64 / 1_000_000.0).round() as u64;
-        deltas[0] = (deltas[0] as u64 + lead_ticks).min(u32::MAX as u64) as u32;
-
-        let total: u64 = deltas.iter().map(|&d| d as u64).sum();
-        Some(Self {
-            timescale,
-            movie_duration_ms: total * (handbrake::MVHD_TIMESCALE as u64) / timescale as u64,
-            deltas,
-        })
-    }
-}
-
 fn build_stsc(chunk_sizes: &[u32]) -> Vec<u8> {
     // Compress runs of equal-sized chunks into a single stsc entry.
-    // HandBrake convention: one chunk per GOP, so equal-size GOPs
-    // collapse to a single entry — the most common shape.
+    // One chunk per GOP, so equal-size GOPs collapse to a single entry —
+    // the most common shape.
     let mut entries: Vec<(u32, u32)> = Vec::new(); // (first_chunk, spc)
     for (i, &spc) in chunk_sizes.iter().enumerate() {
         if entries.last().is_none_or(|&(_, prev_spc)| prev_spc != spc) {
@@ -1252,19 +512,8 @@ fn build_stsc(chunk_sizes: &[u32]) -> Vec<u8> {
     wrap_box(b"stsc", &content)
 }
 
-fn build_stsz(sample_sizes: &[u32]) -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(&[0, 0, 0, 0]); // version+flags
-    content.extend_from_slice(&0u32.to_be_bytes()); // sample_size = 0 → variable
-    content.extend_from_slice(&(sample_sizes.len() as u32).to_be_bytes());
-    for &s in sample_sizes {
-        content.extend_from_slice(&s.to_be_bytes());
-    }
-    wrap_box(b"stsz", &content)
-}
-
 fn build_stco(chunk_offsets: &[u64]) -> Vec<u8> {
-    // One offset per chunk (HandBrake: one chunk per GOP). Use stco when
+    // One offset per chunk (one chunk per GOP). Use stco when
     // all offsets fit in 32 bits; otherwise co64.
     let needs_co64 = chunk_offsets.iter().any(|&o| o > u32::MAX as u64);
     let mut content = Vec::new();
@@ -1293,47 +542,22 @@ fn build_stss(sync_samples: &[u32]) -> Vec<u8> {
     wrap_box(b"stss", &content)
 }
 
-fn build_udta_handbrake() -> Vec<u8> {
-    // udta/©too — QuickTime classic user-data string format
-    // (§ "User-Data Atoms"): length(u16 BE, NOT counting these 4
-    // header bytes) + language(u16 BE, 0 = unspecified) + UTF-8 string
-    // bytes. Real HandBrake matches this layout exactly.
-    let mut too_content = Vec::new();
-    let s = handbrake::UDTA_TOO.as_bytes();
-    too_content.extend_from_slice(&(s.len() as u16).to_be_bytes());
-    too_content.extend_from_slice(&0u16.to_be_bytes()); // language = unspecified
-    too_content.extend_from_slice(s);
-    let too_box = wrap_box(&[0xA9, b't', b'o', b'o'], &too_content);
-    wrap_box(b"udta", &too_box)
-}
-
 // ──────────────────────────────────────────────────────────────────────
 //  VP.M.3 — AV1-in-MP4 orchestrator
 // ──────────────────────────────────────────────────────────────────────
 
-/// VP.M.3 — top-level entry point: encode an AV1 OBU byte stream
-/// into a valid AV1-in-MP4 (av01) file ready for distribution. Used
-/// by [`crate::codec::av1`] consumers to wrap rav1e output.
+/// VP.M.3 — top-level entry point: wrap an AV1 OBU byte stream in the
+/// MP4 a libavformat transcode with the librav1e encoder writes (see
+/// `build_lavf.rs`, "AV1"), video only, at the nominal `timing` rate.
 ///
 /// **Per VP decision D2 (locked 2026-06-06)**: single cross-platform
 /// Rust muxer. No platform-specific paths (no AVAssetWriter, no
 /// MediaMuxer).
 ///
-/// **Scope**: video-only mux. Audio passthrough (when input video
-/// has audio tracks) is the iOS/Android app layer's responsibility
-/// (VP.3 / VP.6).
-///
-/// **Pipeline**:
-///
-/// 1. [`super::av1_obu_split::split_av1_into_samples`] partitions the
-///    OBU stream into a `sequence_header_obu` + per-frame samples +
-///    sync flags.
-/// 2. The SH OBU populates `av1C` via
-///    [`Av1cData::default_yuv420_8bit`] (assumes 4:2:0 8-bit BT.709 —
-///    VP.M's MVP; VP.8 will add proper SH parsing).
-/// 3. Sample byte sizes + offsets are computed assuming
-///    ftyp → mdat → moov layout (HandBrake convention).
-/// 4. The full mp4 byte stream is assembled and returned.
+/// [`super::av1_obu_split::split_av1_into_samples`] partitions the stream
+/// into temporal-unit samples (delimiters dropped, the sequence header in
+/// each sync sample) and sync flags; the sequence header gives the `av1C`
+/// fields and `colr`.
 ///
 /// **Errors**: `InvalidBox` if dimensions are zero, frame rate is
 /// zero, OBU stream contains no sequence_header_obu, or OBU stream
@@ -1374,12 +598,13 @@ pub fn build_mp4_av1_with_audio(
 /// timed from the source's frame presentation times (µs, one per frame, in
 /// presentation order — e.g. the decode pass's output times).
 ///
-/// The untimed muxers stamp every frame at the nominal integer rate from 0:
-/// 29.97 / 23.976 sources run 0.1 % fast against the passed-through audio
-/// (~120 ms after two minutes), a variable-rate clip loses its cadence, and
-/// a lead-in (a leading empty edit in the source) is lost. Here the exact
-/// rate, the real cadence and the lead-in are kept — see
-/// `VideoTimeline::from_frame_times`.
+/// The untimed muxers stamp every frame at the nominal rate from 0: a
+/// 29.97 / 23.976 source passed as an integer rate runs 0.1 % fast against
+/// the passed-through audio, a variable-rate clip loses its cadence, and a
+/// lead-in (a leading empty edit in the source) is lost. Here the clip's
+/// constant rate, its cadence in whole frame slots and the lead-in (an
+/// empty edit) are kept, as the libavformat transcode keeps them — see
+/// `lavf::av1_timeline`.
 ///
 /// When `frame_times_us` does not have one time per frame (or fewer than
 /// two), the result is exactly the untimed muxer's at `timing`.
@@ -1435,7 +660,7 @@ fn build_mp4_av1_inner(
     audio: Option<&AudioPassthrough<'_>>,
     frame_times_us: Option<&[i64]>,
 ) -> Result<Vec<u8>, Mp4Error> {
-    use super::av1_obu_split::split_av1_into_samples;
+    use super::av1_obu_split::{parse_sequence_header_obu, split_av1_into_samples};
 
     if width == 0 || height == 0 {
         return Err(Mp4Error::InvalidBox(format!(
@@ -1449,7 +674,6 @@ fn build_mp4_av1_inner(
         )));
     }
 
-    // 1. Split + extract SH.
     let split = split_av1_into_samples(av1_obus)?;
     if split.sequence_header_obu.is_empty() {
         return Err(Mp4Error::InvalidBox(
@@ -1461,333 +685,8 @@ fn build_mp4_av1_inner(
             "no frame samples in stream".into(),
         ));
     }
-    // VP.8: try the real parser first; fall back to default profile
-    // (4:2:0 8-bit BT.709, level 4.0) if the parser doesn't recognize
-    // the OBU syntax. Default is correct for phasm-rav1e's standard
-    // output; the parser improves accuracy for non-standard streams
-    // (different profile / bit depth / chroma config).
-    let av1c = Av1cData::from_sequence_header_obu(split.sequence_header_obu.clone())
-        .unwrap_or_else(|| Av1cData::default_yuv420_8bit(split.sequence_header_obu));
-
-    // 2. Sample layout — video first, then audio (when present).
-    let sample_sizes: Vec<u32> = split.samples.iter().map(|s| s.len() as u32).collect();
-    let video_payload: u64 = sample_sizes.iter().map(|&s| s as u64).sum();
-    let audio_payload: u64 = audio
-        .map(|a| a.samples.iter().map(|s| s.len() as u64).sum::<u64>())
-        .unwrap_or(0);
-    let total_mdat_payload: u64 = video_payload + audio_payload;
-
-    // 3. ftyp + mdat header sizing.
-    let ftyp = build_ftyp_av1();
-    let mdat_header_len: u64 = if total_mdat_payload + 8 > u32::MAX as u64 { 16 } else { 8 };
-    let first_sample_offset = ftyp.len() as u64 + mdat_header_len;
-
-    // 4. Per-video-sample absolute file offsets.
-    let mut sample_offsets: Vec<u64> = Vec::with_capacity(sample_sizes.len());
-    let mut cursor = first_sample_offset;
-    for &size in &sample_sizes {
-        sample_offsets.push(cursor);
-        cursor += size as u64;
-    }
-    // Per-audio-sample absolute offsets — sit right after the video.
-    let mut audio_sample_offsets: Vec<u64> = Vec::new();
-    if let Some(a) = audio {
-        for s in &a.samples {
-            audio_sample_offsets.push(cursor);
-            cursor += s.len() as u64;
-        }
-    }
-
-    // 5. Sync sample indices (1-based per ISO BMFF stss).
-    let sync_samples: Vec<u32> = split
-        .sync
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &s)| if s { Some(i as u32 + 1) } else { None })
-        .collect();
-
-    // 6. Patch the audio trak when present — rewrite stco/co64 + track_id.
-    // Same mechanism the §Stealth.L4.5 H.264 audio passthrough uses
-    // (see `build_handbrake_x264`).
-    let audio_trak_patched: Option<Vec<u8>> = audio.map(|a| {
-        // ISO shape, output movie timescale, and none of the source file's
-        // timestamps / names / metadata (an error if it cannot be cleared).
-        let mut trak = super::audio_iso::passthrough_audio_trak(
-            &a.trak_raw,
-            a.source_movie_timescale,
-            handbrake::MVHD_TIMESCALE,
-        )?;
-        let chunk_offsets: Vec<u64> = a
-            .chunks
-            .iter()
-            .map(|&(first_idx, _spc)| {
-                audio_sample_offsets
-                    .get(first_idx)
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .collect();
-        patch_trak_stco(&mut trak, &chunk_offsets)?;
-        patch_trak_track_id(&mut trak, 2)?;
-        Ok::<Vec<u8>, Mp4Error>(trak)
-    }).transpose()?;
-
-    // 7. moov. Video timing from the source's frame times when there is
-    // one per frame, else the nominal rate.
-    let timeline = frame_times_us
-        .filter(|t| t.len() == sample_sizes.len())
-        .and_then(VideoTimeline::from_frame_times)
-        .unwrap_or_else(|| VideoTimeline::uniform(timing, sample_sizes.len()));
-    let mdhd_timescale = timeline.timescale;
-    let track_duration_media: u64 = timeline.deltas.iter().map(|&d| d as u64).sum();
-    let movie_duration_ms_video: u64 = timeline.movie_duration_ms;
-    // mvhd.duration must cover the longest track. Convert the audio
-    // track's mdhd-timescale duration into movie-timescale (1000 ms/s)
-    // and take the max.
-    let movie_duration_ms = match audio {
-        Some(a) => {
-            let mdhd_ts = read_audio_mdhd_timescale(&a.trak_raw).unwrap_or(48000) as u64;
-            let audio_ms = a.duration_media * (handbrake::MVHD_TIMESCALE as u64) / mdhd_ts;
-            movie_duration_ms_video.max(audio_ms)
-        }
-        None => movie_duration_ms_video,
-    };
-
-    let moov = build_moov_av1(MoovParamsAv1 {
-        width,
-        height,
-        movie_duration_ms,
-        track_duration_media,
-        mdhd_timescale,
-        sample_sizes: &sample_sizes,
-        sample_offsets: &sample_offsets,
-        sync_samples: &sync_samples,
-        stts_deltas: &timeline.deltas,
-        av1c: &av1c,
-        audio_trak: audio_trak_patched.as_deref(),
-    });
-
-    // 8. Assemble.
-    let total_size = ftyp.len() as u64
-        + mdat_header_len
-        + total_mdat_payload
-        + moov.len() as u64;
-    let mut out = Vec::with_capacity(total_size as usize);
-    out.extend_from_slice(&ftyp);
-
-    // mdat header — 8-byte for ≤ ~4 GiB payload, 16-byte extended for larger.
-    if mdat_header_len == 8 {
-        out.extend_from_slice(&((total_mdat_payload + 8) as u32).to_be_bytes());
-        out.extend_from_slice(b"mdat");
-    } else {
-        out.extend_from_slice(&1u32.to_be_bytes()); // size=1 signals extended u64 length
-        out.extend_from_slice(b"mdat");
-        out.extend_from_slice(&(total_mdat_payload + 16).to_be_bytes());
-    }
-
-    // Video samples, then audio samples.
-    for s in &split.samples {
-        out.extend_from_slice(s);
-    }
-    if let Some(a) = audio {
-        for s in &a.samples {
-            out.extend_from_slice(s);
-        }
-    }
-
-    // moov.
-    out.extend_from_slice(&moov);
-
-    Ok(out)
-}
-
-/// `ftyp` for AV1-in-MP4. Major brand = `isom`; compatible brands
-/// include `av01` to advertise AV1 capability per
-/// AV1-ISOBMFF § 2.1. Modern decoders use the major brand for
-/// container compatibility checks; av01 in compatible_brands
-/// signals "this file contains AV1 video".
-fn build_ftyp_av1() -> Vec<u8> {
-    let mut content = Vec::new();
-    content.extend_from_slice(b"isom"); // major_brand
-    content.extend_from_slice(&0x0000_0200u32.to_be_bytes()); // minor_version
-    for brand in &[b"isom", b"iso6", b"av01", b"mp41"] {
-        content.extend_from_slice(*brand);
-    }
-    wrap_box(b"ftyp", &content)
-}
-
-/// Parallel of [`MoovParams`] for AV1 — carries an `av1C` config
-/// instead of `avcC`, drops `composition_offsets` (AV1 stego is IPPPP
-/// always; no B-frames). VP.M.4: gained `audio_trak` for source-MP4
-/// audio passthrough.
-struct MoovParamsAv1<'a> {
-    width: u32,
-    height: u32,
-    movie_duration_ms: u64,
-    track_duration_media: u64,
-    mdhd_timescale: u32,
-    sample_sizes: &'a [u32],
-    sample_offsets: &'a [u64],
-    sync_samples: &'a [u32],
-    /// One `stts` delta per sample, in `mdhd_timescale` units.
-    stts_deltas: &'a [u32],
-    av1c: &'a Av1cData,
-    /// VP.M.4 — pre-patched audio `trak` box bytes (track_id=2 +
-    /// rewritten stco/co64 offsets). None → video-only mux.
-    audio_trak: Option<&'a [u8]>,
-}
-
-fn build_moov_av1(p: MoovParamsAv1<'_>) -> Vec<u8> {
-    // next_track_ID: 2 video-only; 3 with audio (track 1 = video,
-    // track 2 = audio, next allocates 3).
-    let next_track_id: u32 = if p.audio_trak.is_some() { 3 } else { 2 };
-    let mvhd = build_mvhd(p.movie_duration_ms, next_track_id);
-    let trak = build_video_trak_av1(&p);
-    let udta = build_udta_handbrake(); // Reuse — UDTA is codec-agnostic.
-
-    let mut moov = Vec::new();
-    moov.extend_from_slice(&mvhd);
-    moov.extend_from_slice(&trak);
-    if let Some(audio_trak) = p.audio_trak {
-        moov.extend_from_slice(audio_trak);
-    }
-    moov.extend_from_slice(&udta);
-    wrap_box(b"moov", &moov)
-}
-
-fn build_video_trak_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
-    let tkhd = build_tkhd_video(p.movie_duration_ms, p.width, p.height);
-    let mdia = build_mdia_video_av1(p);
-    let mut trak = Vec::new();
-    trak.extend_from_slice(&tkhd);
-    trak.extend_from_slice(&mdia);
-    wrap_box(b"trak", &trak)
-}
-
-fn build_mdia_video_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
-    let mdhd = build_mdhd(p.track_duration_media, p.mdhd_timescale);
-    let hdlr = build_hdlr_vide();
-    let minf = build_minf_video_av1(p);
-    let mut mdia = Vec::new();
-    mdia.extend_from_slice(&mdhd);
-    mdia.extend_from_slice(&hdlr);
-    mdia.extend_from_slice(&minf);
-    wrap_box(b"mdia", &mdia)
-}
-
-fn build_minf_video_av1(p: &MoovParamsAv1<'_>) -> Vec<u8> {
-    let vmhd = build_vmhd();
-    let dinf = build_dinf();
-    let stbl = build_stbl_av01(p);
-    let mut minf = Vec::new();
-    minf.extend_from_slice(&vmhd);
-    minf.extend_from_slice(&dinf);
-    minf.extend_from_slice(&stbl);
-    wrap_box(b"minf", &minf)
-}
-
-/// AV1 stbl — same shape as [`build_stbl_video_handbrake`] but emits
-/// an `av01` sample entry, no `ctts` (AV1 stego is IPPPP / no
-/// B-frames), and uses [`chunk_layout_per_gop`] keyed off the AV1
-/// sync sample list.
-fn build_stbl_av01(p: &MoovParamsAv1<'_>) -> Vec<u8> {
-    let chunks = chunk_layout_per_gop(p.sample_sizes.len() as u32, p.sync_samples);
-    let chunk_offsets = chunk_offsets_for_layout(&chunks, p.sample_offsets);
-
-    let stsd = build_stsd_av01(p.width, p.height, p.av1c);
-    let stts = build_stts(p.stts_deltas);
-    let stsc = build_stsc(&chunks);
-    let stsz = build_stsz(p.sample_sizes);
-    let stco = build_stco(&chunk_offsets);
-    let stss = build_stss(p.sync_samples);
-
-    // stbl child order matches the H.264 path (HandBrake/libavformat
-    // convention): stsd → stts → stss → stsc → stsz → stco.
-    let mut stbl = Vec::new();
-    stbl.extend_from_slice(&stsd);
-    stbl.extend_from_slice(&stts);
-    stbl.extend_from_slice(&stss);
-    stbl.extend_from_slice(&stsc);
-    stbl.extend_from_slice(&stsz);
-    stbl.extend_from_slice(&stco);
-    wrap_box(b"stbl", &stbl)
-}
-
-// ─── SEI synthesis ────────────────────────────────────────────────────
-
-/// Synthesise an x264-class `user_data_unregistered` SEI NAL carrying the
-/// 16-byte UUID + plaintext core string. Returns the NAL bytes including
-/// the 1-byte NAL header (no Annex-B start code, no length prefix —
-/// caller adds whichever envelope it needs).
-///
-/// SEI NAL layout (ITU-T H.264 §7.3.2.3):
-///   nal_header (1 byte)               = 0x06   (type=6, ref_idc=0)
-///   ┌─ for each SEI message: ─────┐
-///   │  payload_type bytes          │   user_data_unregistered = 5
-///   │  payload_size bytes          │   length of the payload that follows
-///   │  payload (UUID + data)       │
-///   └─────────────────────────────┘
-///   rbsp_trailing_bits             (single 1 bit + zero-pad to byte)
-///
-/// The payload_type/payload_size encoding is "0xFF * (n / 0xFF) + (n %
-/// 0xFF)" — successive 0xFF bytes accumulate, then a final byte < 0xFF
-/// gives the remainder. Most short SEIs (≤ 0xFE bytes) emit one byte.
-///
-/// Emulation-prevention is needed but extremely rare in this payload:
-/// our plaintext has no `00 00 ≤01` runs, but to stay correct under any
-/// future plaintext, we apply EP after the NAL header. The output is the
-/// final NALU bytes.
-fn build_x264_sei_user_data_unregistered() -> Vec<u8> {
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&handbrake::X264_SEI_UUID);
-    payload.extend_from_slice(handbrake::X264_SEI_PLAINTEXT.as_bytes());
-
-    let mut rbsp = Vec::new();
-    rbsp.push(0x06); // NAL header: nal_ref_idc=0, nal_unit_type=6 (SEI)
-
-    // payload_type = 5 (user_data_unregistered) — fits in one byte.
-    rbsp.push(5);
-
-    // payload_size encoding (sect. 7.3.2.3.1):
-    let mut remaining = payload.len();
-    while remaining >= 0xFF {
-        rbsp.push(0xFF);
-        remaining -= 0xFF;
-    }
-    rbsp.push(remaining as u8);
-
-    rbsp.extend_from_slice(&payload);
-
-    // RBSP trailing bits: rbsp_stop_one_bit (1) + zero-pad to byte.
-    // Since the payload above is byte-aligned, this is a single 0x80.
-    rbsp.push(0x80);
-
-    add_emulation_prevention(&rbsp)
-}
-
-/// Insert emulation-prevention `0x03` bytes into RBSP per H.264 §7.4.1.1.
-/// Required for any byte stream that may contain `00 00 ≤02` patterns.
-/// Operates on the NAL payload (does NOT touch the leading header byte
-/// at index 0).
-fn add_emulation_prevention(rbsp: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rbsp.len());
-    if !rbsp.is_empty() {
-        out.push(rbsp[0]);
-    }
-    let mut zero_run = 0usize;
-    for &b in &rbsp[1..] {
-        if zero_run >= 2 && b <= 0x03 {
-            out.push(0x03);
-            zero_run = 0;
-        }
-        out.push(b);
-        if b == 0 {
-            zero_run += 1;
-        } else {
-            zero_run = 0;
-        }
-    }
-    out
+    let sh = parse_sequence_header_obu(&split.sequence_header_obu);
+    lavf::build_av1(split.samples, &split.sync, sh.as_ref(), width, height, timing, frame_times_us, audio)
 }
 
 // ─── Annex-B parsing ──────────────────────────────────────────────────
@@ -1912,179 +811,10 @@ fn wrap_box(box_type: &[u8; 4], content: &[u8]) -> Vec<u8> {
 // Same approach as `super::mux::patch_*_in_moov` — preserves opaque
 // fields (esds for AAC, dops for Opus, etc.) byte-exact.
 
-fn find_subbox_offset(buf: &[u8], target: &[u8; 4]) -> Option<usize> {
-    fn recurse(buf: &[u8], start: usize, end: usize, target: &[u8; 4]) -> Option<usize> {
-        let mut found = None;
-        let _ = super::iterate_boxes(buf, start, end, |h, content_start, _| {
-            if found.is_some() {
-                return Ok(());
-            }
-            let box_start = content_start - h.header_len as usize;
-            if h.box_type == *target {
-                found = Some(box_start);
-            } else if matches!(
-                &h.box_type,
-                b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts"
-            ) {
-                let inner_end = box_start + h.size as usize;
-                if let Some(inner) = recurse(buf, content_start, inner_end, target) {
-                    found = Some(inner);
-                }
-            }
-            Ok(())
-        });
-        found
-    }
-    recurse(buf, 0, buf.len(), target)
-}
-
-/// Reconstruct `(first_sample_idx_0based, samples_per_chunk)` for
-/// every chunk in an audio `trak`'s sample table. Mirrors the same
-/// derivation `super::mux::compute_chunk_first_samples` does, but
-/// reads from a standalone trak buffer instead of the moov.
-fn reconstruct_chunk_layout(
-    trak: &[u8],
-    n_samples: usize,
-) -> Result<Vec<(usize, usize)>, Mp4Error> {
-    if n_samples == 0 {
-        return Ok(Vec::new());
-    }
-    // Read num_chunks from stco or co64.
-    let (num_chunks, is_co64) = if let Some(off) = find_subbox_offset(trak, b"stco") {
-        let h = super::parse_box_header(trak, off)?;
-        let cs = off + h.header_len as usize;
-        (super::read_u32(trak, cs + 4)? as usize, false)
-    } else if let Some(off) = find_subbox_offset(trak, b"co64") {
-        let h = super::parse_box_header(trak, off)?;
-        let cs = off + h.header_len as usize;
-        (super::read_u32(trak, cs + 4)? as usize, true)
-    } else {
-        return Ok(Vec::new());
-    };
-    let _ = is_co64;
-
-    let stsc_entries = if let Some(off) = find_subbox_offset(trak, b"stsc") {
-        let h = super::parse_box_header(trak, off)?;
-        let cs = off + h.header_len as usize;
-        super::demux::parse_stsc(trak, cs)?
-    } else {
-        Vec::new()
-    };
-
-    let mut samples_per_chunk = vec![0u32; num_chunks];
-    if stsc_entries.is_empty() {
-        samples_per_chunk.fill(1);
-    } else {
-        for (i, entry) in stsc_entries.iter().enumerate() {
-            let first_chunk = entry.0 as usize;
-            let spc = entry.1;
-            let next_first = if i + 1 < stsc_entries.len() {
-                stsc_entries[i + 1].0 as usize
-            } else {
-                num_chunks + 1
-            };
-            for chunk_idx in first_chunk..next_first {
-                if (1..=num_chunks).contains(&chunk_idx) {
-                    samples_per_chunk[chunk_idx - 1] = spc;
-                }
-            }
-        }
-    }
-
-    let mut chunks = Vec::with_capacity(num_chunks);
-    let mut sample_idx = 0usize;
-    for &spc in &samples_per_chunk {
-        let count = spc as usize;
-        chunks.push((sample_idx, count));
-        sample_idx += count;
-    }
-    Ok(chunks)
-}
-
-/// Rewrite `stco` (32-bit) or `co64` (64-bit) chunk-offset entries
-/// inside a `trak` buffer in place. `new_chunk_offsets` must have
-/// exactly `count(stco/co64.entries)` entries — the source's chunk
-/// count is preserved.
-fn patch_trak_stco(trak: &mut [u8], new_chunk_offsets: &[u64]) -> Result<(), Mp4Error> {
-    if let Some(off) = find_subbox_offset(trak, b"stco") {
-        let h = super::parse_box_header(trak, off)?;
-        let cs = off + h.header_len as usize;
-        let count = super::read_u32(trak, cs + 4)? as usize;
-        if count != new_chunk_offsets.len() {
-            return Err(Mp4Error::InvalidBox(format!(
-                "stco entry count mismatch in audio trak: {} vs {}",
-                count,
-                new_chunk_offsets.len()
-            )));
-        }
-        if new_chunk_offsets.iter().any(|&o| o > u32::MAX as u64) {
-            return Err(Mp4Error::InvalidBox(
-                "audio trak stco offsets exceed 32-bit; co64 upgrade not supported".into(),
-            ));
-        }
-        for (i, &offset) in new_chunk_offsets.iter().enumerate() {
-            let pos = cs + 8 + i * 4;
-            trak[pos..pos + 4].copy_from_slice(&(offset as u32).to_be_bytes());
-        }
-        return Ok(());
-    }
-    if let Some(off) = find_subbox_offset(trak, b"co64") {
-        let h = super::parse_box_header(trak, off)?;
-        let cs = off + h.header_len as usize;
-        let count = super::read_u32(trak, cs + 4)? as usize;
-        if count != new_chunk_offsets.len() {
-            return Err(Mp4Error::InvalidBox(format!(
-                "co64 entry count mismatch in audio trak: {} vs {}",
-                count,
-                new_chunk_offsets.len()
-            )));
-        }
-        for (i, &offset) in new_chunk_offsets.iter().enumerate() {
-            let pos = cs + 8 + i * 8;
-            trak[pos..pos + 8].copy_from_slice(&offset.to_be_bytes());
-        }
-        return Ok(());
-    }
-    Err(Mp4Error::InvalidBox("audio trak missing stco/co64".into()))
-}
-
-/// Rewrite `tkhd.track_id` inside a `trak` buffer in place. Used to
-/// renumber the audio track to 2 (video stays at 1).
-fn patch_trak_track_id(trak: &mut [u8], new_track_id: u32) -> Result<(), Mp4Error> {
-    let off = find_subbox_offset(trak, b"tkhd")
-        .ok_or_else(|| Mp4Error::InvalidBox("audio trak missing tkhd".into()))?;
-    let h = super::parse_box_header(trak, off)?;
-    let cs = off + h.header_len as usize;
-    let version = trak[cs];
-    let track_id_pos = if version == 1 {
-        cs + 4 + 16 // ver+flags(4) + creation(8) + modification(8)
-    } else {
-        cs + 4 + 8 // ver+flags(4) + creation(4) + modification(4)
-    };
-    trak[track_id_pos..track_id_pos + 4].copy_from_slice(&new_track_id.to_be_bytes());
-    Ok(())
-}
-
-/// Read `mdhd.time_scale` from a `trak` buffer (used to convert the
-/// audio track's media-timescale duration to mvhd-timescale ms when
-/// computing the new movie duration).
-fn read_audio_mdhd_timescale(trak: &[u8]) -> Option<u32> {
-    let off = find_subbox_offset(trak, b"mdhd")?;
-    let h = super::parse_box_header(trak, off).ok()?;
-    let cs = off + h.header_len as usize;
-    let version = trak[cs];
-    let ts_pos = if version == 1 {
-        cs + 4 + 16 // ver+flags + creation(8) + modification(8)
-    } else {
-        cs + 4 + 8 // ver+flags + creation(4) + modification(4)
-    };
-    super::read_u32(trak, ts_pos).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::mp4::{is_mp4, parse_box_header};
+    use crate::codec::mp4::Av1cData;
 
     // ──────────────────────────────────────────────────────────────
     //  VP.M.1 — AV1 box builder unit tests
@@ -2148,58 +878,6 @@ mod tests {
         assert_eq!(bytes[3], 0x00);
     }
 
-    #[test]
-    fn build_av01_box_well_formed() {
-        let av1c = Av1cData::default_yuv420_8bit(fake_sh_obu());
-        let av01 = build_av01(1920, 1080, &av1c);
-
-        // First 4 bytes = box size (big-endian u32).
-        let box_size =
-            u32::from_be_bytes([av01[0], av01[1], av01[2], av01[3]]) as usize;
-        assert_eq!(box_size, av01.len(), "size field must match actual length");
-
-        // Next 4 bytes = "av01" fourcc.
-        assert_eq!(&av01[4..8], b"av01", "fourcc must be av01");
-
-        // VisualSampleEntry header is 78 bytes after fourcc (per § 8.5.2).
-        // At byte 8 we have: 6 reserved + 2 data_ref_idx + 2 pre_defined
-        // + 2 reserved + 12 pre_defined[3] = 24 codec-agnostic
-        // before width. Width is bytes 32-33 of the box. Big-endian u16.
-        let width =
-            u16::from_be_bytes([av01[32], av01[33]]) as u32;
-        let height =
-            u16::from_be_bytes([av01[34], av01[35]]) as u32;
-        assert_eq!(width, 1920, "width must be encoded at expected offset");
-        assert_eq!(height, 1080, "height must be encoded at expected offset");
-
-        // av1C box must appear after the 78-byte VisualSampleEntry
-        // header (which lives at bytes [8..86]).
-        assert_eq!(&av01[86 + 4..86 + 8], b"av1C", "av1C box must follow VisualSampleEntry header");
-    }
-
-    #[test]
-    fn build_stsd_av01_well_formed() {
-        let av1c = Av1cData::default_yuv420_8bit(fake_sh_obu());
-        let stsd = build_stsd_av01(1280, 720, &av1c);
-
-        // Box header: size + "stsd".
-        let box_size =
-            u32::from_be_bytes([stsd[0], stsd[1], stsd[2], stsd[3]]) as usize;
-        assert_eq!(box_size, stsd.len());
-        assert_eq!(&stsd[4..8], b"stsd", "fourcc must be stsd");
-
-        // Then version+flags (4 bytes of zero), then entry_count = 1.
-        assert_eq!(&stsd[8..12], &[0, 0, 0, 0], "version+flags");
-        assert_eq!(
-            u32::from_be_bytes([stsd[12], stsd[13], stsd[14], stsd[15]]),
-            1,
-            "entry_count must be 1"
-        );
-
-        // Then the av01 entry starts at byte 16.
-        assert_eq!(&stsd[16 + 4..16 + 8], b"av01", "av01 entry must follow stsd header");
-    }
-
 
     /// Build the minimum viable Annex-B stream: SPS + PPS + AUD + IDR.
     fn build_minimal_annexb() -> Vec<u8> {
@@ -2230,55 +908,11 @@ mod tests {
     }
 
     #[test]
-    fn ftyp_handbrake_is_byte_exact() {
-        let ftyp = build_ftyp_handbrake();
-        // 8-byte header + 8 content bytes (major + minor) + 16 compatibles
-        assert_eq!(ftyp.len(), 8 + 8 + 16);
-        // size + 'ftyp'
-        assert_eq!(&ftyp[0..4], &(ftyp.len() as u32).to_be_bytes());
-        assert_eq!(&ftyp[4..8], b"ftyp");
-        // major_brand
-        assert_eq!(&ftyp[8..12], b"isom");
-        // minor_version (HandBrake = 0x0000_0200)
-        assert_eq!(&ftyp[12..16], &[0x00, 0x00, 0x02, 0x00]);
-        // compatibles: isom, iso2, avc1, mp41
-        assert_eq!(&ftyp[16..20], b"isom");
-        assert_eq!(&ftyp[20..24], b"iso2");
-        assert_eq!(&ftyp[24..28], b"avc1");
-        assert_eq!(&ftyp[28..32], b"mp41");
-    }
-
-    #[test]
-    fn build_mp4_round_trips_minimal_annexb() {
-        let annex_b = build_minimal_annexb();
-        let mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
-            &annex_b,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-        )
-        .expect("build_mp4 succeeds");
-
-        assert!(is_mp4(&mp4), "output is recognized as MP4");
-
-        // Top-level layout: ftyp → mdat → moov.
-        let h0 = parse_box_header(&mp4, 0).unwrap();
-        assert_eq!(h0.box_type, *b"ftyp");
-        let h1 = parse_box_header(&mp4, h0.size as usize).unwrap();
-        assert_eq!(h1.box_type, *b"mdat");
-        let moov_off = h0.size as usize + h1.size as usize;
-        let h2 = parse_box_header(&mp4, moov_off).unwrap();
-        assert_eq!(h2.box_type, *b"moov");
-        assert_eq!(moov_off + h2.size as usize, mp4.len());
-    }
-
-    #[test]
     fn build_mp4_demuxes_back_to_one_video_track() {
         use crate::codec::mp4::demux::demux;
         let annex_b = build_minimal_annexb();
         let mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annex_b,
             1920,
             1080,
@@ -2296,222 +930,8 @@ mod tests {
         // One access unit (one IDR sample).
         assert_eq!(track.samples.len(), 1);
         assert!(track.samples[0].is_sync, "IDR sample is sync");
-        // mdhd timescale: 30 × 512 = 15360 (HandBrake @ 30 fps).
+        // mdhd timescale: 30 × 512 = 15360 @ 30 fps.
         assert_eq!(track.timescale, 15360);
-    }
-
-    #[test]
-    fn handbrake_mdhd_timescale_30fps() {
-        assert_eq!(handbrake::mdhd_timescale(30, 1), 15360);
-    }
-
-    #[test]
-    fn stbl_child_order_matches_handbrake() {
-        // §Stealth.L4.3 — stbl children must appear in
-        // stsd → stts → stss → stsc → stsz → stco order (no ctts on
-        // IPPPP). Yang/EVA decision trees fingerprint this ordering.
-        let annex_b = build_minimal_annexb();
-        let mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
-            &annex_b,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-        )
-        .unwrap();
-
-        // Walk into moov → trak → mdia → minf → stbl and collect child
-        // 4-CCs in order.
-        let order = collect_stbl_child_order(&mp4);
-        let expected: &[&[u8; 4]] = &[b"stsd", b"stts", b"stss", b"stsc", b"stsz", b"stco"];
-        assert_eq!(
-            order.iter().map(|s| *s).collect::<Vec<_>>(),
-            expected.iter().map(|s| **s).collect::<Vec<_>>(),
-        );
-    }
-
-        #[cfg(feature = "h264-encoder")]
-        #[test]
-    fn stbl_child_order_with_ctts_inserts_after_stts() {
-        // With B-frames present, stbl order is
-        // stsd → stts → ctts → stss → stsc → stsz → stco.
-        use crate::codec::h264::stego::gop_pattern::GopPattern;
-        // 5-frame Annex-B (encode order I P B P B). Synthesise NAL
-        // sequence by hand — content doesn't have to decode, just
-        // parse as 5 access units.
-        let mut bytes = Vec::new();
-        // AU 0 — IDR (with SPS+PPS prefix).
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x40, 0x40, 0x3C, 0x80]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xEB, 0xE3, 0xCB]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]);
-        // AUs 1-4 — non-IDR slices.
-        for _ in 0..4 {
-            bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30]);
-            bytes.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]);
-        }
-        let mp4 = build_mp4_with_pattern(
-            MuxerProfile::HandbrakeX264,
-            &bytes,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-            GopPattern::Ibpbp { gop: 5, b_count: 1 },
-            5,
-        )
-        .unwrap();
-        let order = collect_stbl_child_order(&mp4);
-        let expected: &[&[u8; 4]] =
-            &[b"stsd", b"stts", b"ctts", b"stss", b"stsc", b"stsz", b"stco"];
-        assert_eq!(
-            order.iter().map(|s| *s).collect::<Vec<_>>(),
-            expected.iter().map(|s| **s).collect::<Vec<_>>(),
-        );
-    }
-
-    /// §Stealth.L4.2.fix regression test (2026-05-05).
-    ///
-    /// Phasm MUST NOT emit `edts/elst` boxes — real x264-medium output
-    /// has none, and a leading-empty-edit shifts the IDR's presentation
-    /// time to a negative value (or past the start) that ffmpeg trims
-    /// from display, causing a 1-frame frame-pairing offset that read
-    /// as a 7+ dB Y-PSNR cliff in stego measurements. CTTS version=1
-    /// signed offsets handle B-frame PTS reordering without any edit
-    /// list. Lock this in: scan the entire MP4 byte stream for the
-    /// `elst` 4-CC and assert it never appears, even with B-frames in
-    /// the GOP pattern.
-    #[cfg(feature = "h264-encoder")]
-    #[test]
-    fn ibpbp_mp4_does_not_emit_edts_elst() {
-        use crate::codec::h264::stego::gop_pattern::GopPattern;
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x40, 0x40, 0x3C, 0x80]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xEB, 0xE3, 0xCB]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]);
-        for _ in 0..4 {
-            bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30]);
-            bytes.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x00]);
-        }
-        let mp4 = build_mp4_with_pattern(
-            MuxerProfile::HandbrakeX264,
-            &bytes,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-            GopPattern::Ibpbp { gop: 5, b_count: 1 },
-            5,
-        )
-        .unwrap();
-        // Search for 'edts' and 'elst' 4-CC anywhere in the byte
-        // stream. Both must be absent for a spec-correct B-frame
-        // container that doesn't trim the IDR.
-        for needle in [b"edts", b"elst"] {
-            let mut found = false;
-            for window in mp4.windows(4) {
-                if window == needle.as_slice() {
-                    found = true;
-                    break;
-                }
-            }
-            assert!(
-                !found,
-                "MP4 contains '{}' box — phasm must not emit edts/elst (see §Stealth.L4.2.fix)",
-                std::str::from_utf8(needle).unwrap(),
-            );
-        }
-    }
-
-    /// Walk the box tree to find moov/trak/mdia/minf/stbl and return its
-    /// children's 4-CCs in order. Helper for stbl-ordering tests.
-    fn collect_stbl_child_order(mp4: &[u8]) -> Vec<[u8; 4]> {
-        let mut order = Vec::new();
-        let _ = crate::codec::mp4::iterate_boxes(mp4, 0, mp4.len(), |h, content_start, _| {
-            if h.box_type == *b"moov" {
-                let _ = crate::codec::mp4::iterate_boxes(
-                    mp4,
-                    content_start,
-                    content_start + h.size as usize - h.header_len as usize,
-                    |h2, cs2, _| {
-                        if h2.box_type == *b"trak" {
-                            walk_trak_to_stbl(mp4, cs2, h2.size as usize, &mut order);
-                        }
-                        Ok(())
-                    },
-                );
-            }
-            Ok(())
-        });
-        order
-    }
-
-    fn walk_trak_to_stbl(mp4: &[u8], content_start: usize, size: usize, out: &mut Vec<[u8; 4]>) {
-        let end = content_start + size - 8;
-        let _ = crate::codec::mp4::iterate_boxes(mp4, content_start, end, |h, cs, _| {
-            if h.box_type == *b"mdia" {
-                let _ = crate::codec::mp4::iterate_boxes(
-                    mp4,
-                    cs,
-                    cs + h.size as usize - h.header_len as usize,
-                    |h2, cs2, _| {
-                        if h2.box_type == *b"minf" {
-                            let _ = crate::codec::mp4::iterate_boxes(
-                                mp4,
-                                cs2,
-                                cs2 + h2.size as usize - h2.header_len as usize,
-                                |h3, cs3, _| {
-                                    if h3.box_type == *b"stbl" {
-                                        let _ = crate::codec::mp4::iterate_boxes(
-                                            mp4,
-                                            cs3,
-                                            cs3 + h3.size as usize - h3.header_len as usize,
-                                            |h4, _, _| {
-                                                out.push(h4.box_type);
-                                                Ok(())
-                                            },
-                                        );
-                                    }
-                                    Ok(())
-                                },
-                            );
-                        }
-                        Ok(())
-                    },
-                );
-            }
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn udta_too_length_field_is_string_length_only() {
-        // §Stealth.L4.3 — QuickTime user-data string layout:
-        // length(u16, NOT counting itself or language) + language(u16) +
-        // string. Fixed a latent off-by-4 that shipped with L4.1.
-        let udta = build_udta_handbrake();
-        // Outer udta: header(8) + ©too child.
-        // ©too: header(8) + content (length(2) + lang(2) + string).
-        let s = handbrake::UDTA_TOO.as_bytes();
-        let too_content_len = 2 + 2 + s.len();
-        assert_eq!(udta.len(), 8 + 8 + too_content_len);
-        // Length field at udta[16..18] (after both 8-byte headers).
-        let len_field = u16::from_be_bytes([udta[16], udta[17]]);
-        assert_eq!(len_field as usize, s.len(), "length field = string length");
-    }
-
-    #[test]
-    fn handbrake_mdhd_timescale_25fps() {
-        assert_eq!(handbrake::mdhd_timescale(25, 1), 12800);
-    }
-
-    #[test]
-    fn handbrake_mdhd_timescale_29_97fps() {
-        // 29.97 → 30000/1001 → 30000×512 / 1001 = 15344.6… → round to 15345
-        // (round-half-to-even, but 15344.65 is closer to 15345).
-        let t = handbrake::mdhd_timescale(30000, 1001);
-        // Allow ±1 tolerance — the rounding rule is documented but not
-        // load-bearing at this precision.
-        assert!((t as i64 - 15345).abs() <= 1, "got {t}");
     }
 
     #[test]
@@ -2541,12 +961,12 @@ mod tests {
 
     #[test]
     fn build_mp4_strips_aud_and_parameter_sets_from_mdat() {
-        // After mux, the IDR sample contains: synthesised x264 SEI NAL +
-        // the IDR slice NAL. SPS, PPS, AUD are stripped. Walk the NAL
-        // list and verify NO type-7/8/9 NALs remain.
+        // After mux, the IDR sample contains the IDR slice NAL only (no SEI is
+        // injected). SPS, PPS, AUD are stripped. Walk the NAL list and verify
+        // NO type-6/7/8/9 NALs remain.
         let annex_b = build_minimal_annexb();
         let mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annex_b,
             1920,
             1080,
@@ -2554,14 +974,9 @@ mod tests {
         )
         .unwrap();
 
-        let h0 = parse_box_header(&mp4, 0).unwrap();
-        let h1 = parse_box_header(&mp4, h0.size as usize).unwrap();
-        assert_eq!(h1.box_type, *b"mdat");
-        let mdat_payload =
-            &mp4[h0.size as usize + 8..h0.size as usize + h1.size as usize];
+        let mdat_payload = find_box(&mp4, b"mdat");
 
         let mut pos = 0;
-        let mut saw_sei = false;
         let mut saw_idr = false;
         while pos + 4 <= mdat_payload.len() {
             let len = u32::from_be_bytes([
@@ -2576,16 +991,13 @@ mod tests {
             assert_ne!(nal_type, 7, "SPS must NOT appear in mdat");
             assert_ne!(nal_type, 8, "PPS must NOT appear in mdat");
             assert_ne!(nal_type, 9, "AUD must NOT appear in mdat");
-            if nal_type == 6 {
-                saw_sei = true;
-            }
+            assert_ne!(nal_type, 6, "no SEI is injected into mdat");
             if nal_type == 5 {
                 saw_idr = true;
             }
             pos += len;
         }
         assert_eq!(pos, mdat_payload.len(), "mdat parses exactly to end");
-        assert!(saw_sei, "x264 SEI NAL is present in mdat");
         assert!(saw_idr, "IDR slice NAL is present in mdat");
     }
 
@@ -2595,150 +1007,26 @@ mod tests {
         // error.
         let bytes = vec![0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
         let r = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &bytes,
             1920,
             1080,
             FrameTiming::FPS_30,
         );
         assert!(r.is_err());
-    }
-
-    #[test]
-    fn x264_sei_nal_starts_with_sei_header_and_carries_uuid() {
-        let nal = build_x264_sei_user_data_unregistered();
-        assert_eq!(nal[0], 0x06, "SEI NAL header byte");
-        assert_eq!(nal[1], 5, "payload_type = user_data_unregistered (5)");
-
-        // Skip past payload_size byte(s) — payload_size encoding is
-        // 0xFF * (n / 0xFF) + (n % 0xFF). For our string this is at
-        // most a couple of 0xFF bytes plus a remainder.
-        let mut pos = 2;
-        while nal[pos] == 0xFF {
-            pos += 1;
-        }
-        pos += 1; // remainder byte
-
-        // The UUID should follow immediately.
-        assert_eq!(
-            &nal[pos..pos + 16],
-            &handbrake::X264_SEI_UUID,
-            "x264 SEI UUID present at expected offset"
-        );
-    }
-
-    #[test]
-    fn x264_sei_plaintext_present_in_nal() {
-        let nal = build_x264_sei_user_data_unregistered();
-        // Search for the leading "x264 - core" plaintext anywhere in
-        // the NAL bytes — emulation-prevention can split runs but
-        // never inserts inside non-zero text, so the literal substring
-        // survives.
-        let banner = b"x264 - core";
-        let found = nal.windows(banner.len()).any(|w| w == banner);
-        assert!(found, "x264 banner is plaintext-readable inside SEI NAL");
-    }
-
-    #[test]
-    fn build_mp4_injects_exactly_one_sei_at_first_idr() {
-        // Two-IDR stream: SEI must appear in sample 0 only.
-        let mut bytes = Vec::new();
-        // Sample 0 (IDR)
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1E, 0xAC, 0xD9, 0x40, 0x40, 0x3C, 0x80]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xEB, 0xE3, 0xCB]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00]);
-        // Sample 1 (also IDR — second access unit)
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x10]);
-        bytes.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x01]);
-
-        let mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
-            &bytes,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-        )
-        .unwrap();
-
-        // Count occurrences of the x264 UUID across the entire file —
-        // expected: exactly 1 (in the leading IDR sample).
-        let mut count = 0;
-        for w in mp4.windows(handbrake::X264_SEI_UUID.len()) {
-            if w == handbrake::X264_SEI_UUID {
-                count += 1;
-            }
-        }
-        assert_eq!(count, 1, "x264 SEI UUID appears exactly once in mp4 file");
-
-        // And that one occurrence is in sample 0, not sample 1.
-        use crate::codec::mp4::demux::demux;
-        let parsed = demux(&mp4).unwrap();
-        let track = &parsed.tracks[parsed.video_track_idx.unwrap()];
-        let s0 = &track.samples[0].data;
-        let s1 = &track.samples[1].data;
-        let in_s0 = s0
-            .windows(handbrake::X264_SEI_UUID.len())
-            .any(|w| w == handbrake::X264_SEI_UUID);
-        let in_s1 = s1
-            .windows(handbrake::X264_SEI_UUID.len())
-            .any(|w| w == handbrake::X264_SEI_UUID);
-        assert!(in_s0, "SEI UUID is in sample 0");
-        assert!(!in_s1, "SEI UUID is NOT in sample 1");
-    }
-
-    #[test]
-    fn emulation_prevention_inserts_03_after_two_zeros() {
-        // Input with a 00 00 01 sequence in the body.
-        let rbsp = vec![0x42, 0x00, 0x00, 0x01, 0xAA];
-        let out = add_emulation_prevention(&rbsp);
-        // Expected: 0x42 0x00 0x00 0x03 0x01 0xAA
-        assert_eq!(out, vec![0x42, 0x00, 0x00, 0x03, 0x01, 0xAA]);
-    }
-
-    #[test]
-    fn emulation_prevention_does_not_touch_header_byte() {
-        // If the input header byte is 0x00, EP must NOT insert an 0x03
-        // before it (the header is exempt from EP).
-        let rbsp = vec![0x06, 0x00, 0x00, 0x00, 0xFF];
-        let out = add_emulation_prevention(&rbsp);
-        // After header: zero run of 3, but EP only inserts when value
-        // ≤ 0x03 follows two zeros, so position [1..3] = 00 00 then 00
-        // gets EP inserted because next byte (0x00) is ≤ 0x03.
-        assert_eq!(out, vec![0x06, 0x00, 0x00, 0x03, 0x00, 0xFF]);
     }
 
     #[test]
     fn build_mp4_rejects_zero_dimensions() {
         let annex_b = build_minimal_annexb();
         let r = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annex_b,
             0,
             1080,
             FrameTiming::FPS_30,
         );
         assert!(r.is_err());
-    }
-
-    #[test]
-    fn chunk_layout_per_gop_uniform_size() {
-        // 6 samples, sync at indices 1 and 4 → GOP sizes [3, 3]
-        let chunks = chunk_layout_per_gop(6, &[1, 4]);
-        assert_eq!(chunks, vec![3, 3]);
-    }
-
-    #[test]
-    fn chunk_layout_per_gop_mixed_size() {
-        // 10 samples, sync at indices 1, 4, 8 → GOP sizes [3, 4, 3]
-        let chunks = chunk_layout_per_gop(10, &[1, 4, 8]);
-        assert_eq!(chunks, vec![3, 4, 3]);
-    }
-
-    #[test]
-    fn chunk_layout_per_gop_no_sync_falls_back() {
-        let chunks = chunk_layout_per_gop(5, &[]);
-        assert_eq!(chunks, vec![5]);
     }
 
     #[test]
@@ -2770,45 +1058,6 @@ mod tests {
         assert_eq!(&stsc[44..48], &30u32.to_be_bytes()); // spc = 30
     }
 
-    #[test]
-    fn build_ctts_writes_per_sample_signed_offsets() {
-        // 5 samples, IBPBP M=2: ctts = [0, +1, -1, +1, -1] × ticks.
-        let offsets: Vec<i32> = vec![0, 512, -512, 512, -512];
-        let ctts = build_ctts(&offsets);
-        // Header (8) + version+flags (4) + entry_count (4) + 5 × 8 bytes
-        assert_eq!(ctts.len(), 8 + 4 + 4 + 5 * 8);
-        // Version byte = 1.
-        assert_eq!(ctts[8], 1);
-        // entry_count = 5.
-        assert_eq!(&ctts[12..16], &5u32.to_be_bytes());
-        // First entry: sample_count=1, offset=0.
-        assert_eq!(&ctts[16..20], &1u32.to_be_bytes());
-        assert_eq!(&ctts[20..24], &0i32.to_be_bytes());
-        // Third entry: sample_count=1, offset=-512.
-        assert_eq!(&ctts[32..36], &1u32.to_be_bytes());
-        assert_eq!(&ctts[36..40], &(-512i32).to_be_bytes());
-    }
-
-        #[cfg(feature = "h264-encoder")]
-        #[test]
-    fn build_mp4_with_ipppp_pattern_emits_no_ctts_no_edts() {
-        // IPPPP (no B-frames) → no ctts, no edts.
-        use crate::codec::h264::stego::gop_pattern::GopPattern;
-        let annex_b = build_minimal_annexb();
-        let mp4 = build_mp4_with_pattern(
-            MuxerProfile::HandbrakeX264,
-            &annex_b,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-            GopPattern::Ipppp { gop: 1 },
-            1,
-        )
-        .unwrap();
-        assert!(!mp4.windows(4).any(|w| w == b"ctts"), "no ctts box");
-        assert!(!mp4.windows(4).any(|w| w == b"edts"), "no edts box");
-    }
-
         #[cfg(feature = "h264-encoder")]
         #[test]
     fn build_mp4_with_pattern_rejects_au_count_mismatch() {
@@ -2816,7 +1065,7 @@ mod tests {
         use crate::codec::h264::stego::gop_pattern::GopPattern;
         let annex_b = build_minimal_annexb();
         let r = build_mp4_with_pattern(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annex_b,
             1920,
             1080,
@@ -2831,7 +1080,7 @@ mod tests {
     fn build_mp4_rejects_zero_fps() {
         let annex_b = build_minimal_annexb();
         let r = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annex_b,
             1920,
             1080,
@@ -2861,43 +1110,157 @@ mod tests {
         (0..n).map(|i| (rd(at + 12 + 8 * i), rd(at + 16 + 8 * i))).collect()
     }
 
-    /// A source video lead-in holds frame 0: sample 0's `stts` delta grows by
-    /// the lead-in, the frame count does not, and no edit list appears.
+    // ─── LavfOpenH264 profile ────────────────────────────────────────
+
+    /// Samples of the first track as NAL-unit lists (4-byte length prefixes).
+    fn sample_nals(mp4: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let parsed = super::super::demux::demux(mp4).unwrap();
+        let v = parsed.tracks.iter().find(|t| &t.handler_type == b"vide").unwrap();
+        v.samples
+            .iter()
+            .map(|s| {
+                let d = &mp4[s.offset as usize..(s.offset + s.size as u64) as usize];
+                let mut out = Vec::new();
+                let mut i = 0;
+                while i < d.len() {
+                    let n = u32::from_be_bytes(d[i..i + 4].try_into().unwrap()) as usize;
+                    out.push(d[i + 4..i + 4 + n].to_vec());
+                    i += 4 + n;
+                }
+                out
+            })
+            .collect()
+    }
+
+    fn find_box<'a>(mp4: &'a [u8], typ: &[u8; 4]) -> &'a [u8] {
+        let at = mp4.windows(4).position(|w| w == typ).unwrap_or_else(|| panic!("no {typ:?}"));
+        let size = u32::from_be_bytes(mp4[at - 4..at].try_into().unwrap()) as usize;
+        &mp4[at + 4..at - 4 + size]
+    }
+
+    /// The profile carries exactly the encoder's NAL units: every NAL of the
+    /// input but AUD / SPS / PPS, and nothing added (in particular no SEI).
     #[cfg(feature = "h264-encoder")]
     #[test]
-    fn lead_in_holds_frame_zero_without_adding_frames_or_edits() {
+    fn lavf_profile_keeps_every_nal_but_aud_and_parameter_sets() {
+        use crate::codec::h264::stego::gop_pattern::GopPattern;
+        let annex_b = build_annexb_frames(7);
+        let pat = GopPattern::Ipppp { gop: 30 };
+        let lavf = build_mp4_with_pattern(MuxerProfile::LavfOpenH264, &annex_b, 1920, 1080, FrameTiming::FPS_30, pat, 7).unwrap();
+        let want: Vec<Vec<Vec<u8>>> = group_access_units(&parse_annexb_nals(&annex_b))
+            .iter()
+            .map(|au| {
+                au.nals
+                    .iter()
+                    .filter(|&&(_, _, t)| t != NalType::AUD && t != NalType::SPS && t != NalType::PPS)
+                    .map(|&(a, b, _)| annex_b[a..b].to_vec())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(sample_nals(&lavf), want);
+    }
+
+    #[test]
+    fn lavf_profile_has_no_x264_or_handbrake_marker() {
+        // The 16-byte UUID of an x264 version SEI (`user_data_unregistered`).
+        const X264_SEI_UUID: [u8; 16] = [
+            0xDC, 0x45, 0xE9, 0xBD, 0xE6, 0xD9, 0x48, 0xB7,
+            0x96, 0x2C, 0xD8, 0x20, 0xD9, 0x23, 0xEE, 0xEF,
+        ];
+        let mp4 = build_mp4(MuxerProfile::LavfOpenH264, &build_minimal_annexb(), 1920, 1080, FrameTiming::FPS_30).unwrap();
+        let has = |n: &[u8]| mp4.windows(n.len()).any(|w| w == n);
+        assert!(!has(b"x264"), "x264 banner");
+        assert!(!has(&X264_SEI_UUID), "x264 SEI UUID");
+        assert!(!has(b"HandBrake"), "HandBrake tag");
+        assert!(has(lavf::LAVF_TOOL.as_bytes()), "muxer tag");
+        assert!(has(lavf::LAVC_COMPRESSOR.as_bytes()), "compressor name");
+        assert_eq!(&mp4[32..40], &[0, 0, 0, 8, b'f', b'r', b'e', b'e'], "free before mdat");
+        assert_eq!(&mp4[44..48], b"mdat");
+    }
+
+    #[test]
+    fn lavf_profile_headers() {
+        let mp4 = build_mp4(MuxerProfile::LavfOpenH264, &build_minimal_annexb(), 1920, 1080, FrameTiming::FPS_30).unwrap();
+        let tkhd = find_box(&mp4, b"tkhd");
+        assert_eq!(&tkhd[..4], &[0, 0, 0, 3], "tkhd flags enabled | in movie");
+        let elst = find_box(&mp4, b"elst");
+        // One frame at 30 fps: 512 / 15360 s → 34 ms (rounded up), media time 0.
+        assert_eq!(elst, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 34, 0, 0, 0, 0, 0, 1, 0, 0]);
+        let mdhd = find_box(&mp4, b"mdhd");
+        assert_eq!(&mdhd[12..16], &15360u32.to_be_bytes());
+        // avcC: High profile → the chroma-format / bit-depth extension.
+        let avcc = find_box(&mp4, b"avcC");
+        assert_eq!(&avcc[avcc.len() - 4..], &[0xFD, 0xF8, 0xF8, 0x00]);
+        // btrt: (bufferSizeDB 0, max = average, average 0).
+        let btrt = find_box(&mp4, b"btrt");
+        assert_eq!(&btrt[..4], &[0; 4]);
+        assert_ne!(&btrt[4..8], &[0; 4]);
+        assert_eq!(&btrt[8..12], &[0; 4]);
+        // A single IDR: every sample is a sync sample → no stss.
+        assert!(!mp4.windows(4).any(|w| w == b"stss"));
+    }
+
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn lavf_profile_fractional_rate_uses_the_rate_as_timescale() {
         use crate::codec::h264::stego::gop_pattern::GopPattern;
         let annex_b = build_annexb_frames(5);
-        // A source with no audio track: the lead-in still applies.
-        let source = build_mp4(MuxerProfile::HandbrakeX264, &build_minimal_annexb(), 1920, 1080, FrameTiming::FPS_30)
-            .unwrap();
-        let mux = |lead_in_us| {
-            build_mp4_with_pattern_audio_lead_in(
-                MuxerProfile::HandbrakeX264, &annex_b, 1920, 1080, FrameTiming::FPS_30,
-                GopPattern::Ipppp { gop: 30 }, 5, &source, lead_in_us,
-            )
-            .unwrap()
-        };
+        let t = FrameTiming { fps_num: 30000, fps_den: 1001 };
+        let mp4 = build_mp4_with_pattern(MuxerProfile::LavfOpenH264, &annex_b, 1920, 1080, t, GopPattern::Ipppp { gop: 30 }, 5).unwrap();
+        assert_eq!(&find_box(&mp4, b"mdhd")[12..16], &30000u32.to_be_bytes());
+        assert_eq!(stts_entries(&mp4), vec![(5, 1001)]);
+        assert!(mp4.windows(4).any(|w| w == b"stss"), "P frames → stss");
+    }
 
-        // 100 ms at 30 fps → 15360 ticks/s → 1536 ticks.
-        let held = mux(100_000);
-        assert_eq!(stts_entries(&held), vec![(1, 512 + 1536), (4, 512)]);
-        let parsed = super::super::demux::demux(&held).unwrap();
-        let v = parsed.tracks.iter().find(|t| &t.handler_type == b"vide").unwrap();
-        assert_eq!(v.samples.len(), 5, "no frame added");
-        assert_eq!(v.timescale, 15360);
-        assert_eq!(v.duration, 5 * 512 + 1536);
-        assert!(!held.windows(4).any(|w| w == b"edts"), "no edit list");
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn lavf_profile_rejects_b_frames() {
+        use crate::codec::h264::stego::gop_pattern::GopPattern;
+        let annex_b = build_annexb_frames(5);
+        let pat = GopPattern::Ibpbp { gop: 30, b_count: 1 };
+        let n = crate::codec::h264::stego::gop_pattern::iter_encode_order(5, pat).count();
+        let annex_b = if n == 5 { annex_b } else { build_annexb_frames(n) };
+        assert!(build_mp4_with_pattern(MuxerProfile::LavfOpenH264, &annex_b, 1920, 1080, FrameTiming::FPS_30, pat, 5).is_err());
+    }
 
-        // No lead-in: the single uniform run, byte-identical to the
-        // plain audio-passthrough muxer.
-        let plain = mux(0);
-        assert_eq!(stts_entries(&plain), vec![(5, 512)]);
-        let reference = build_mp4_with_pattern_audio(
-            MuxerProfile::HandbrakeX264, &annex_b, 1920, 1080, FrameTiming::FPS_30,
-            GopPattern::Ipppp { gop: 30 }, 5, &source,
+    /// Runs of contiguous samples are chunked below 1 MiB.
+    #[test]
+    fn lavf_profile_chunks_below_one_mebibyte() {
+        let mut annex_b = build_minimal_annexb();
+        for _ in 1..8 {
+            annex_b.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30]);
+            annex_b.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A]);
+            annex_b.extend(std::iter::repeat_n(0x55u8, 300_000));
+        }
+        let mp4 = build_mp4(MuxerProfile::LavfOpenH264, &annex_b, 1920, 1080, FrameTiming::FPS_30).unwrap();
+        let stsc = find_box(&mp4, b"stsc");
+        let rd = |o: usize| u32::from_be_bytes(stsc[o..o + 4].try_into().unwrap());
+        let entries: Vec<(u32, u32)> = (0..rd(4) as usize).map(|i| (rd(8 + 12 * i), rd(12 + 12 * i))).collect();
+        // IDR (tiny) + 3 × 300 kB = 0.9 MB; a 4th would reach 1.2 MB.
+        assert_eq!(entries, vec![(1, 4), (2, 3), (3, 1)]);
+    }
+
+    /// A source lead-in becomes a leading empty edit in whole frames; the
+    /// frames keep one uniform `stts` run.
+    #[cfg(feature = "h264-encoder")]
+    #[test]
+    fn lavf_lead_in_is_an_empty_edit() {
+        use crate::codec::h264::stego::gop_pattern::GopPattern;
+        let annex_b = build_annexb_frames(5);
+        let source = build_mp4(MuxerProfile::LavfOpenH264, &build_minimal_annexb(), 1920, 1080, FrameTiming::FPS_30).unwrap();
+        // 110 ms at 30 fps → 3.3 frames → 3 frames = 1536 ticks of 15360.
+        let mp4 = build_mp4_with_pattern_audio_lead_in(
+            MuxerProfile::LavfOpenH264, &annex_b, 1920, 1080, FrameTiming::FPS_30,
+            GopPattern::Ipppp { gop: 30 }, 5, &source, 110_000,
         )
         .unwrap();
-        assert_eq!(plain, reference);
+        assert_eq!(stts_entries(&mp4), vec![(5, 512)]);
+        let elst = find_box(&mp4, b"elst");
+        let rd = |o: usize| u32::from_be_bytes(elst[o..o + 4].try_into().unwrap());
+        assert_eq!(rd(4), 2);
+        assert_eq!((rd(8), rd(12) as i32), (100, -1), "empty edit, 1536 ticks → 100 ms");
+        assert_eq!((rd(20), rd(24)), (167, 0), "5 frames → 166.7 ms, rounded up");
+        let tkhd = find_box(&mp4, b"tkhd");
+        assert_eq!(u32::from_be_bytes(tkhd[20..24].try_into().unwrap()), 267, "(1536 + 2560) ticks → 266.7 ms");
     }
 }

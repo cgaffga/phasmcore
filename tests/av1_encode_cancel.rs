@@ -53,6 +53,7 @@ fn cancel_during_encode_is_reported_as_cancelled() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let p = payload::encode_payload("cancelled before the embed", &[]).unwrap();
     let (ct, nonce, salt) = crypto::encrypt(&p, "cancel-pass").unwrap();
@@ -122,6 +123,7 @@ fn cancel_after_pass1_stops_pass2() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let p = payload::encode_payload("cancelled between the passes", &[]).unwrap();
     let (ct, nonce, salt) = crypto::encrypt(&p, "cancel-pass").unwrap();

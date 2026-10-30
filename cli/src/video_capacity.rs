@@ -3,7 +3,6 @@
 // https://github.com/cgaffga/phasmcore
 
 use crate::error::CliError;
-#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 use crate::transcode;
 use std::path::PathBuf;
 
@@ -11,8 +10,20 @@ use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum CodecChoice {
+    #[cfg(feature = "h264-encoder")]
     H264,
+    #[cfg(feature = "av1-encoder")]
     Av1,
+}
+
+impl CodecChoice {
+    /// H.264 when compiled in (backwards-compatible default), else AV1.
+    const fn default_choice() -> Self {
+        #[cfg(feature = "h264-encoder")]
+        { Self::H264 }
+        #[cfg(not(feature = "h264-encoder"))]
+        { Self::Av1 }
+    }
 }
 
 #[derive(Parser)]
@@ -35,7 +46,7 @@ pub struct VideoCapacityArgs {
     /// Codec to estimate capacity for. Defaults to H.264 for
     /// backwards compatibility with `phasm video-capacity` invocations
     /// from before AV1 landed.
-    #[arg(long, value_enum, default_value_t = CodecChoice::H264)]
+    #[arg(long, value_enum, default_value_t = CodecChoice::default_choice())]
     pub codec: CodecChoice,
 
     /// GOP size used by the streaming-session capacity
@@ -54,51 +65,10 @@ pub struct VideoCapacityArgs {
 
 pub fn run(args: VideoCapacityArgs) -> Result<(), CliError> {
     match args.codec {
-        CodecChoice::H264 => run_h264(args),
-        CodecChoice::Av1 => run_av1(args),
-    }
-}
-
-fn run_h264(args: VideoCapacityArgs) -> Result<(), CliError> {
-    // H.264 video capacity is reported by the streaming-session 4-domain
-    // formula (the production OpenH264 encoder path). The legacy CAVLC
-    // capacity scan was retired with the CAVLC stego subsystem (it also
-    // reported wildly incorrect numbers — it counted Baseline-CAVLC
-    // positions, not what the OH264 streaming-session encoder accepts).
-    #[cfg(feature = "h264-encoder")]
-    {
-        return run_h264_video_capacity(args);
-    }
-
-    // Without the OpenH264 backend there is no video-encode capacity to
-    // report — the only H.264 surface in a decode-only build is the
-    // walker. Tell the user to rebuild with the encoder feature.
-    #[cfg(not(feature = "h264-encoder"))]
-    {
-        let _ = args;
-        Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-            "H.264 video capacity requires the OpenH264 backend. \
-             Rebuild from source: \
-             `cargo install phasm-cli --features h264-encoder`."
-                .into(),
-        )))
-    }
-}
-
-fn run_av1(args: VideoCapacityArgs) -> Result<(), CliError> {
-    #[cfg(feature = "av1-encoder")]
-    {
-        return run_av1_video_capacity(args);
-    }
-    #[cfg(not(feature = "av1-encoder"))]
-    {
-        let _ = args;
-        Err(CliError::from(phasm_core::StegoError::InvalidVideo(
-            "AV1 video capacity requires the AV1 backend. \
-             Rebuild from source: \
-             `cargo install phasm-cli --features av1-encoder`."
-                .into(),
-        )))
+        #[cfg(feature = "h264-encoder")]
+        CodecChoice::H264 => run_h264_video_capacity(args),
+        #[cfg(feature = "av1-encoder")]
+        CodecChoice::Av1 => run_av1_video_capacity(args),
     }
 }
 
@@ -153,10 +123,16 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     };
 
     if args.json {
+        // `primary_max_message_bytes` keeps its meaning (the STC ceiling) for
+        // compatibility; `max_message_bytes` / `comfort_message_bytes` are the
+        // apps' bands, `achievable_max_message_bytes` the planner's accept limit.
         println!(
-            r#"{{"engine":"video","codec":"h264","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{},"per_tier_primary_max_message_bytes":[{},{},{},{},{}]}}"#,
+            r#"{{"engine":"video","codec":"h264","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"comfort_message_bytes":{},"max_message_bytes":{},"achievable_max_message_bytes":{},"primary_max_message_bytes":{},"shadow_max_message_bytes":{},"per_tier_primary_max_message_bytes":[{},{},{},{},{}]}}"#,
             probe.width, probe.height, probe.n_frames, gop_size,
             info.cover_size_bits,
+            info.comfort_message_bytes,
+            info.max_message_bytes,
+            info.achievable_max_message_bytes,
             info.primary_max_message_bytes,
             info.shadow_max_message_bytes,
             info.per_tier_primary_max_message_bytes[0],
@@ -166,16 +142,23 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
             info.per_tier_primary_max_message_bytes[4],
         );
     } else {
-        println!("CABAC v2 capacity ({}x{}, {} frames, gop={}):",
+        println!("H.264 capacity ({}x{}, {} frames, gop={}):",
             probe.width, probe.height, probe.n_frames, gop_size);
-        // CSB-only, and a raw position count (∞-cost positions included) —
+        // The figures the apps show. The CLI does not enforce them: a larger
+        // payload still encodes (with a warning) at the cost of visible damage.
+        println!("  comfort message bytes:             {}", info.comfort_message_bytes);
+        println!("  max message bytes (red end):       {}", info.max_message_bytes);
+        println!("  technical ceiling (STC limit):     {}   (visible damage above the max)",
+            info.primary_max_message_bytes);
+        println!("  shadow max message bytes (n=1):    {}", info.shadow_max_message_bytes);
+        println!();
+        // CSB-only, and a raw position count (infinity-cost positions included) —
         // NOT a capacity and NOT the 3-domain shadow pool, which the old
         // label here wrongly claimed. See `H264StegoCapacityInfo`.
         println!("  cover bits (CoeffSign domain):     {}", info.cover_size_bits);
-        println!("  primary max message bytes:         {}", info.primary_max_message_bytes);
-        println!("  shadow max message bytes (n=1):    {}", info.shadow_max_message_bytes);
+        println!("  planner accept limit:              {}", info.achievable_max_message_bytes);
         println!();
-        println!("  D'.2 per-tier primary capacity (cascade-safety quality):");
+        println!("  D'.2 per-tier primary capacity (cascade-safety quality, technical ceiling):");
         let tier_names = ["Max Capacity", "Balanced", "Quality", "High Quality", "Best Quality"];
         for (tier, name) in tier_names.iter().enumerate() {
             println!("    Tier {} ({:14}): {:>10} bytes",
@@ -185,22 +168,13 @@ fn run_h264_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// AV1 streaming-session capacity branch (v0.6 closed-form).
-///
-/// Mirrors `run_h264_video_capacity`: ffmpeg → temp YUV →
-/// `Av1StreamingProbeSession`. The probe runs at `gop_size=1`
-/// (per session-API contract — each frame is its own GOP for
-/// cover counting), then closed-form math projects the conservative
-/// primary + shadow caps via the 0.15 STC ratio. There is no per-tier
-/// breakdown on AV1 v0.6 (single joint Tier 1
-/// `AC_COEFF_SIGN + GOLOMB_TAIL_LSB`); the `--max` flag has no effect
-/// here and is reported as such.
-///
-/// The `--gop-size` flag scales the per-GOP overhead deduction: the
-/// real encode uses `gop_size` (default 30, matching mobile), so
-/// the closed-form math reflects that GOP count. Capacity itself is
-/// per-frame-density × frame-count, independent of how those frames
-/// are grouped — the deduction is the chunk_frame v3 wire overhead.
+/// AV1 capacity branch: ffmpeg → temp YUV → `av1_capacity`, which probes
+/// every GOP of the clip at the encode's GOP size and quantizer and reports
+/// what the apps show: the v2 cover after the damage-aware per-GOP caps, the
+/// maximum (red end) and the comfort figure (start of the yellow band). The
+/// apps sample a few GOPs and show a conservative estimate of the same
+/// figures, so the CLI's can be a little higher. AV1 has no per-tier
+/// breakdown; `--max` has no effect here and is reported as such.
 #[cfg(feature = "av1-encoder")]
 fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
     transcode::ensure_ffmpeg_available()?;
@@ -235,15 +209,16 @@ fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
         use phasm_core::{av1_capacity, Av1StreamingEncodeParams};
         // Probe the encode's shape: its GOP size (`--gop-size`) and its
         // quantizer. A gop_size of 1 makes every frame a key frame, which
-        // carries about twice the cover of the P-frames the encode writes
-        // (see `Av1StreamingProbeSession::per_gop_cover_bits`), and a lower
-        // quantizer adds cover too; either over-reports what fits.
+        // carries about twice the cover of the P-frames the encode writes,
+        // and a lower quantizer adds cover too; either over-reports what
+        // fits.
         let params = Av1StreamingEncodeParams {
             width: probe.width,
             height: probe.height,
             quantizer: crate::video_encode::av1_quantizer(),
             gop_size: gop_size as u32,
             total_frames_hint: probe.n_frames as u32,
+            colour: Default::default(),
         };
         av1_capacity(&yuv, params).map_err(|e| {
             CliError::from(phasm_core::StegoError::InvalidVideo(format!(
@@ -258,21 +233,19 @@ fn run_av1_video_capacity(args: VideoCapacityArgs) -> Result<(), CliError> {
 
     if args.json {
         println!(
-            r#"{{"engine":"video","codec":"av1","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"shadow_max_message_bytes_n1":{},"ac_sign_bits":{},"golomb_tail_bits":{}}}"#,
+            r#"{{"engine":"video","codec":"av1","width":{},"height":{},"n_frames":{},"gop_size":{},"cover_size_bits":{},"primary_max_message_bytes":{},"comfort_message_bytes":{},"shadow_max_message_bytes_n1":{}}}"#,
             probe.width, probe.height, probe.n_frames, gop_size,
             info.cover_size_bits,
             info.primary_max_message_bytes,
+            info.comfort_message_bytes,
             info.shadow_max_message_bytes_n1,
-            info.per_domain_bits.ac_sign,
-            info.per_domain_bits.golomb_tail,
         );
     } else {
-        println!("AV1 streaming-session capacity ({}x{}, {} frames, encode gop={}):",
+        println!("AV1 capacity ({}x{}, {} frames, encode gop={}):",
             probe.width, probe.height, probe.n_frames, gop_size);
-        println!("  cover bits (Tier 1 joint domain): {}", info.cover_size_bits);
-        println!("    AC_COEFF_SIGN:    {} bits", info.per_domain_bits.ac_sign);
-        println!("    GOLOMB_TAIL_LSB:  {} bits", info.per_domain_bits.golomb_tail);
-        println!("  primary max message bytes:        {}", info.primary_max_message_bytes);
+        println!("  cover positions (damage-aware):   {}", info.cover_size_bits);
+        println!("  max message bytes:                {}", info.primary_max_message_bytes);
+        println!("  comfort message bytes:            {}", info.comfort_message_bytes);
         println!("  shadow max message bytes (n=1):   {}", info.shadow_max_message_bytes_n1);
     }
     Ok(())

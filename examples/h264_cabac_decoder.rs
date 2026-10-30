@@ -3,13 +3,13 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
-//! Minimal spec-direct CABAC decoder for encoder debugging.
+//! Minimal spec-direct CABAC decoder for debugging.
 //!
 //! Implements H.264 § 9.3.3.2 DecodeDecision / DecodeBypass /
 //! DecodeTerminate exactly as written in the spec. Uses the SAME
-//! `CabacContext` tables as our encoder (initialize_contexts, RANGE_TAB_LPS,
-//! TRANS_IDX_LPS, TRANS_IDX_MPS) so any encoder/decoder disagreement is
-//! a spec-interpretation bug, not a table mismatch.
+//! `CabacContext` tables as the stego walker (initialize_contexts,
+//! RANGE_TAB_LPS, TRANS_IDX_LPS, TRANS_IDX_MPS) so any disagreement with
+//! the walker is a spec-interpretation bug, not a table mismatch.
 //!
 //! Usage:
 //! ```

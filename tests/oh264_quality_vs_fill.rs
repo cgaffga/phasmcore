@@ -27,10 +27,24 @@
 // This file is an INSTRUMENT first and a gate second. Per fixture it:
 //
 //   1. Probes the offered capacity with the production `StreamingProbeSession`
-//      → `finish_with_per_gop()` → `achievable_max_message_bytes` — the exact
-//      number the mobile HUD shows. No local capacity formula; if the probe
-//      and the encoder disagree, that disagreement is a finding, not something
-//      to paper over.
+//      → `finish_with_per_gop()` → `max_message_bytes()` — the exact number
+//      the mobile HUD shows as the bar's 100 % (the red end; both apps refuse
+//      a message above it). No local capacity formula; if the probe and the
+//      encoder disagree, that disagreement is a finding, not something to
+//      paper over.
+//
+//      **Not `achievable_max_message_bytes`.** Until the H.264 v2 wet-removal
+//      (`8a200458`, 2026-10-25) that WAS the HUD figure. Since then the
+//      primary STC cover is the syntax-dry positions only, the STC is
+//      feasible almost up to the whole dry cover, and
+//      `achievable_max_message_bytes` is the deliverable ceiling at a change
+//      rate α ≈ 0.86 — about 5× the red end (smoke: 1495 B vs 287 B). The
+//      visual maximum became a deliberate α band (`CAP_ALPHA_MAX` 1/8, 3/16
+//      on clips the damage predictor rates easy), and the apps show
+//      `min(max_message_bytes, achievable)`. Filling to the ceiling measured
+//      payloads no user can submit: the smoke's 75 % row was 3.9× the red
+//      end at α ≈ 0.65 (stego-only 15.3 dB, SSIM 0.62) and failed the gate.
+//      The ceiling is still printed so the gap stays visible.
 //   2. Encodes a CLEAN REFERENCE: the same OH264 encoder at the same QP over
 //      the same pixels with **no stego handlers registered at all**
 //      (`oh264_stream::encode_clean`).
@@ -131,6 +145,26 @@ use phasm_core::stego::payload::{compressed_payload_size, FileEntry};
 // spread) below the worst value ever observed, so a different salt draw cannot
 // flip the gate red on its own. A tighter floor would be a flaky gate, not a
 // stricter one.
+//
+// ── Fill basis moved to the HUD red end, 2026-10-29 ─────────────────────
+//
+// The numbers above were taken with 100 % = `achievable_max_message_bytes`,
+// which on v1 was the HUD figure. After the v2 wet-removal (`8a200458`) that
+// field is the deliverable ceiling at α ≈ 0.86, ~5× what the apps offer, and
+// the smoke failed at 75 % of it (3.9× the red end): SSIM 0.62, 15.3 dB,
+// worst-MB 4.9 dB, damage set in the IDR and carried through the GOP. The
+// fill basis is now `max_message_bytes()` (see step 1 above). Re-measured on
+// that basis (commit `9033a2df` + this change):
+//
+//   smoke, K=8:          worst 32.74 dB  min 32.58  SSIM 0.982  wMB 20.15
+//                        spread 2.4-14.4 dB (the 14.4 is the 6 % row: one
+//                        draw at 17 B payload reads 39.1 dB)
+//   iphone7_1080p, K=1:  worst 40.07 dB  min 37.69  SSIM 0.995  wMB 18.04
+//                        (red end 5604 B, ceiling 25984 B)
+//
+// The floors below are deliberately NOT re-tightened in the same change:
+// rebasing and tightening stay two reviewable steps, and the other 1080p
+// fixtures have not been re-measured on the new basis.
 //
 // ── WHAT "VISUALLY INVISIBLE" WOULD BE ──────────────────────────────────
 //
@@ -245,7 +279,8 @@ const VISUALLY_INVISIBLE_SSIM_MEAN: f64 = 0.995;
 #[allow(dead_code)]
 const VISUALLY_INVISIBLE_WORST_MB_PSNR_DB: f64 = 35.0;
 
-/// Fill levels, as a percentage of the probe's offered capacity.
+/// Fill levels, as a percentage of the probe's offered capacity (the HUD's
+/// red end, `max_message_bytes()`).
 const FILL_PERCENTS: &[u32] = &[6, 25, 50, 75, 100];
 
 /// Default passphrase for every encode in this file. Fixed so runs are
@@ -514,13 +549,28 @@ fn run_fixture(spec: &VideoFixture) {
     let (probe, per_gop) = oh264_stream::probe_capacity(&src, w, h, spec.n_frames, spec.qp, spec.n_frames)
         .expect("capacity probe");
     let probe_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let capacity = probe.achievable_max_message_bytes;
-    // `achievable_max_message_bytes = framed_ceiling − FRAME_OVERHEAD`, so the
-    // framed length a session reports maps back to a payload-basis fill by
+    // The bar's 100 % exactly as both apps compute it (iOS
+    // `EncodeCoordinator`, Android `EncodeCoordinator`): the α-band red end,
+    // already capped at the deliverable ceiling by `max_message_bytes()`,
+    // falling back to the ceiling only when the probe reports no band.
+    let ceiling = probe.achievable_max_message_bytes;
+    let capacity = match probe.max_message_bytes() {
+        0 => ceiling,
+        max => max,
+    };
+    assert!(
+        capacity <= ceiling,
+        "[{}] red end {capacity} B above the deliverable ceiling {ceiling} B",
+        spec.name
+    );
+    // Both figures are `payload bits / 8 − FRAME_OVERHEAD`, so the framed
+    // length a session reports maps back to a payload-basis fill by
     // subtracting the same constant. Needed to turn `framed_message_len()`
     // into the delivered-fill column.
     let frame_overhead = frame_overhead();
-    let framed_ceiling = capacity + frame_overhead;
+    let framed_capacity = capacity + frame_overhead;
+    // Change rate α (payload bits per syntax-dry STC position) at 100 % fill.
+    let alpha_at_full = (framed_capacity * 8) as f64 / probe.dry_cover_bits.max(1) as f64;
 
     eprintln!();
     eprintln!(
@@ -534,12 +584,21 @@ fn run_fixture(spec: &VideoFixture) {
     );
     eprintln!(
         "│ probe: {probe_ms:.0}ms  offered capacity = {capacity} B \
-         (achievable_max_message_bytes; framed ceiling {framed_ceiling} B)"
+         (max_message_bytes, the HUD red end; framed {framed_capacity} B, \
+         α={alpha_at_full:.3} at 100%)"
     );
     eprintln!(
-        "│        cover_bits={cb}  shadow_pool_bits={sp}  n_gops={ng}  \
-         per_gop_tier0={pg:?}",
+        "│        max_alpha_64={ma}  comfort={cf} B  deliverable ceiling \
+         (achievable_max_message_bytes)={ceiling} B = {x:.1}× the red end, NOT filled",
+        ma = probe.max_alpha_64,
+        cf = probe.comfort_message_bytes(),
+        x = ceiling as f64 / capacity.max(1) as f64,
+    );
+    eprintln!(
+        "│        cover_bits={cb}  dry_cover_bits={dc}  shadow_pool_bits={sp}  \
+         n_gops={ng}  per_gop_tier0={pg:?}",
         cb = probe.cover_bits,
+        dc = probe.dry_cover_bits,
         sp = probe.shadow_pool_bits,
         ng = probe.n_gops,
         pg = per_gop,
@@ -1005,8 +1064,9 @@ fn run_fixture(spec: &VideoFixture) {
 
 /// The one-time crypto-frame envelope, read straight from phasm-core.
 ///
-/// `CapacityProbeResult::achievable_max_message_bytes` is defined as
-/// `framed_ceiling − FRAME_OVERHEAD`, so this is what converts a session's
+/// `CapacityProbeResult::max_message_bytes()` (like
+/// `achievable_max_message_bytes`) is a framed size minus `FRAME_OVERHEAD`,
+/// so this is what converts a session's
 /// reported `framed_message_len()` back onto the payload basis the fill
 /// percentages are expressed in. Imported rather than hardcoded as 50 so the
 /// delivered-fill column cannot silently shift if the envelope changes;
@@ -1029,7 +1089,7 @@ fn frame_overhead() -> usize {
 ///
 /// Production-resolution behaviour lives in the `#[ignore]`d cases — do NOT
 /// read the smoke's absolute dB as representative of 1080p. At this size the
-/// whole clip holds 282 payload bytes, so the per-flip damage is concentrated
+/// HUD offers 287 payload bytes for the whole clip, so the per-flip damage is concentrated
 /// into far fewer macroblocks than at 1080p and SSIM in particular reads
 /// ~0.09 lower for the same PSNR.
 #[test]

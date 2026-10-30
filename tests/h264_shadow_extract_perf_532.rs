@@ -28,14 +28,22 @@
 
 #![cfg(feature = "h264-decoder")]
 
+use phasm_core::codec::h264::stego::damage::{MbSyntax, MbSyntaxMap, MB_INTRA, MB_KEY};
 use phasm_core::codec::h264::stego::shadow as shadow_h264;
 use phasm_core::codec::h264::stego::{DomainCover, DomainBits, EmbedDomain, PositionKey,
-    SyntaxPath, Axis, BinKind};
+    SyntaxPath, BinKind};
 use std::time::Instant;
 
-/// Build a synthetic 4-domain cover with `n_per_domain` positions
-/// across all four bypass-bin domains. Bits + position keys derived
-/// from a linear-congruential PRNG for determinism.
+const FRAMES: u32 = 8;
+const MB_W: u32 = 32;
+const MB_H: u32 = 32;
+
+/// Build a synthetic 4-domain cover with `n_per_domain` positions per
+/// domain. Bits + position keys derived from a linear-congruential PRNG for
+/// determinism. v2 shadows read the damage model, so the coefficient
+/// positions are Luma4x4 AC positions and the cover carries MB syntax (a
+/// key frame, then P frames of inter MBs); MVD positions are present but
+/// not shadow-eligible.
 fn synth_cover(n_per_domain: usize) -> DomainCover {
     let mut cover = DomainCover::default();
     let mut s: u32 = 0xDEAD_BEEF;
@@ -47,30 +55,40 @@ fn synth_cover(n_per_domain: usize) -> DomainCover {
         for _ in 0..n_per_domain {
             let raw = next_key();
             let bit = (raw & 1) as u8;
-            let path = SyntaxPath::Mvd {
-                list: 0,
-                partition: 0,
-                axis: Axis::X,
-                kind: BinKind::Sign,
+            let kind = if domain == EmbedDomain::CoeffSuffixLsb { BinKind::SuffixLsb } else { BinKind::Sign };
+            let path = SyntaxPath::Luma4x4 {
+                block_idx: (raw & 15) as u8,
+                coeff_idx: 1 + ((raw >> 4) % 15) as u8,
+                kind,
             };
             let key = PositionKey::new(
-                (raw >> 16) & 0xFF,
-                (raw >> 8) & 0xFFFF,
+                1 + (raw >> 16) % (FRAMES - 1),
+                (raw >> 8) % (MB_W * MB_H),
                 domain,
                 path,
             );
             bits.bits.push(bit);
             bits.positions.push(key);
-            // DomainBits invariant: one magnitude per bit (the magnitudes
-            // carrier was added by CASCADE.P1 #750 after this test went
-            // dormant; value is irrelevant to the shadow extract path).
-            bits.magnitudes.push(1 + ((raw >> 12) & 0x1F) as u16);
+            bits.magnitudes.push(if kind == BinKind::SuffixLsb { 16 } else { 1 + ((raw >> 12) & 1) as u16 });
         }
     };
     push_bits(&mut cover.coeff_sign_bypass, EmbedDomain::CoeffSignBypass);
     push_bits(&mut cover.coeff_suffix_lsb, EmbedDomain::CoeffSuffixLsb);
     push_bits(&mut cover.mvd_sign_bypass, EmbedDomain::MvdSignBypass);
     push_bits(&mut cover.mvd_suffix_lsb, EmbedDomain::MvdSuffixLsb);
+    let mut mbs = Vec::new();
+    for f in 0..FRAMES {
+        for a in 0..MB_W * MB_H {
+            mbs.push(MbSyntax {
+                frame_idx: f,
+                mb_addr: a,
+                qp_y: 26,
+                qp_c: 26,
+                flags: if f == 0 { MB_INTRA | MB_KEY } else { 0 },
+            });
+        }
+    }
+    cover.mb_syntax = MbSyntaxMap { mb_w: MB_W, mb_h: MB_H, mbs };
     cover
 }
 
@@ -90,8 +108,6 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
         &msg,
         &[],
         4, // smallest parity tier — encoder's natural default
-        None,
-        None,
     )
     .expect("prepare_shadow");
 
@@ -106,7 +122,7 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
 
     // Extract — time only this.
     let t0 = Instant::now();
-    let recovered = shadow_h264::shadow_extract(&cover, "perf-test-pass", None, None)
+    let recovered = shadow_h264::shadow_extract(&cover, "perf-test-pass")
         .expect("shadow_extract_all4 must succeed (#532 correctness)");
     let elapsed = t0.elapsed().as_nanos();
 
@@ -119,7 +135,7 @@ fn run_one(payload_size_bytes: usize, cover_positions_per_domain: usize) -> u128
 fn run_no_shadow(cover_positions_per_domain: usize) -> u128 {
     let cover = synth_cover(cover_positions_per_domain);
     let t0 = Instant::now();
-    let r = shadow_h264::shadow_extract(&cover, "perf-test-pass", None, None);
+    let r = shadow_h264::shadow_extract(&cover, "perf-test-pass");
     let elapsed = t0.elapsed().as_nanos();
     assert!(r.is_err(), "no shadow → must fail to extract");
     elapsed

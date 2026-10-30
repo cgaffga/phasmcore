@@ -118,11 +118,160 @@ fn argon2_derive_cached(
         output.copy_from_slice(&cached);
         return Ok(());
     }
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, output)
-        .map_err(|_| StegoError::KeyDerivationFailed)?;
+    #[cfg(feature = "parallel")]
+    if let Some(shared) = key_scope::lookup(passphrase, salt, output.len()) {
+        output.copy_from_slice(&shared?);
+        cache_store(passphrase, salt, output);
+        return Ok(());
+    }
+    argon2_raw(passphrase, salt, output)?;
     cache_store(passphrase, salt, output);
     Ok(())
+}
+
+/// One uncached Argon2id run.
+fn argon2_raw(passphrase: &str, salt: &[u8; 16], output: &mut [u8]) -> Result<(), StegoError> {
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, output)
+        .map_err(|_| StegoError::KeyDerivationFailed)
+}
+
+/// The fixed-salt keys an image decode (`smart_decode`) can derive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) enum DecodeKey {
+    /// Ghost primary ([`derive_structural_key`]).
+    Ghost,
+    /// Ghost shadows ([`derive_shadow_structural_key`]).
+    Shadow,
+    /// Fortress ([`derive_fortress_structural_key`]).
+    Fortress,
+    /// Armor STDM ([`derive_armor_structural_key`]).
+    Armor,
+    /// Armor DFT template ([`derive_template_key`]).
+    Template,
+    /// Armor DFT ring payload ([`derive_ring_key`]).
+    Ring,
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl DecodeKey {
+    pub(crate) const ALL: [DecodeKey; 6] =
+        [DecodeKey::Ghost, DecodeKey::Shadow, DecodeKey::Fortress, DecodeKey::Armor, DecodeKey::Template, DecodeKey::Ring];
+
+    fn salt_and_len(self) -> (&'static [u8; 16], usize) {
+        match self {
+            DecodeKey::Ghost => (STRUCTURAL_SALT, 64),
+            DecodeKey::Shadow => (SHADOW_STRUCTURAL_SALT, 32),
+            DecodeKey::Fortress => (FORTRESS_STRUCTURAL_SALT, 32),
+            DecodeKey::Armor => (ARMOR_STRUCTURAL_SALT, 64),
+            DecodeKey::Template => (TEMPLATE_SALT, 32),
+            DecodeKey::Ring => (RING_SALT, 32),
+        }
+    }
+}
+
+/// Keys of one decode, shared across threads.
+///
+/// The thread-local cache above keeps a key on the thread that derived it;
+/// `smart_decode`'s attempts run on rayon workers, so a key one attempt
+/// derived could be derived again by a later attempt on another thread. A
+/// [`KeyScope`] registers the passphrase for the duration of one decode:
+/// every derivation of one of its keys, on any thread, goes through a
+/// shared once-cell (the first caller runs Argon2, concurrent callers wait
+/// for it, later ones copy), and [`KeyScope::prederive`] starts derivations
+/// on idle workers before they are asked for. Same keys, so the same
+/// results; an attempt never waits for a key it does not need.
+#[cfg(feature = "parallel")]
+pub(crate) use key_scope::KeyScope;
+
+#[cfg(feature = "parallel")]
+mod key_scope {
+    use super::{argon2_raw, cache_lookup, DecodeKey, StegoError, Zeroizing};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    /// `Err(())`: Argon2 refused (`KeyDerivationFailed`), deterministically.
+    type Slot = OnceLock<Result<Zeroizing<Vec<u8>>, ()>>;
+
+    struct Inner {
+        passphrase: Zeroizing<String>,
+        slots: [Slot; 6],
+        /// The decode returned: prederivations not yet started are skipped.
+        done: AtomicBool,
+    }
+
+    impl Inner {
+        fn get(&self, key: DecodeKey) -> Result<Zeroizing<Vec<u8>>, StegoError> {
+            let i = DecodeKey::ALL.iter().position(|&k| k == key).unwrap();
+            let (salt, len) = key.salt_and_len();
+            self.slots[i]
+                .get_or_init(|| {
+                    let pass = self.passphrase.as_str();
+                    if let Some(hit) = cache_lookup(pass, salt, len) {
+                        return Ok(Zeroizing::new(hit));
+                    }
+                    let mut out = Zeroizing::new(vec![0u8; len]);
+                    argon2_raw(pass, salt, &mut out).map(|()| out).map_err(|_| ())
+                })
+                .clone()
+                .map_err(|()| StegoError::KeyDerivationFailed)
+        }
+    }
+
+    static ACTIVE: Mutex<Vec<Arc<Inner>>> = Mutex::new(Vec::new());
+
+    /// The shared key for `(passphrase, salt, len)` if a live scope holds
+    /// that passphrase and the salt is one of its keys.
+    pub(super) fn lookup(passphrase: &str, salt: &[u8; 16], len: usize) -> Option<Result<Zeroizing<Vec<u8>>, StegoError>> {
+        let key = DecodeKey::ALL.into_iter().find(|k| k.salt_and_len() == (salt, len))?;
+        let scope = {
+            let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            active.iter().find(|s| s.passphrase.as_str() == passphrase)?.clone()
+        };
+        Some(scope.get(key))
+    }
+
+    /// See [`super::KeyScope`](crate::stego::crypto::KeyScope). Dropping it
+    /// unregisters the passphrase; the derived keys are zeroized when the
+    /// last reference (a prederivation still running) goes.
+    pub(crate) struct KeyScope(Arc<Inner>);
+
+    impl KeyScope {
+        pub(crate) fn new(passphrase: &str) -> Self {
+            let inner = Arc::new(Inner {
+                passphrase: Zeroizing::new(passphrase.to_string()),
+                slots: Default::default(),
+                done: AtomicBool::new(false),
+            });
+            ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(inner.clone());
+            Self(inner)
+        }
+
+        /// Start deriving `keys` on the current rayon pool, one task each,
+        /// without waiting. A stage that needs one of them before its task
+        /// ran derives it itself (or waits for the task already running
+        /// it); a task that starts after the decode returned does nothing.
+        /// Tasks are detached (`rayon::spawn`) so a decode that succeeds
+        /// early never waits for a key it did not need.
+        pub(crate) fn prederive(&self, keys: &[DecodeKey]) {
+            for &key in keys {
+                let inner = self.0.clone();
+                rayon::spawn(move || {
+                    if !inner.done.load(Ordering::Relaxed) {
+                        let _ = inner.get(key);
+                    }
+                });
+            }
+        }
+    }
+
+    impl Drop for KeyScope {
+        fn drop(&mut self) {
+            self.0.done.store(true, Ordering::Relaxed);
+            ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|s| !Arc::ptr_eq(s, &self.0));
+        }
+    }
 }
 
 /// Fixed salt for Ghost Tier-1 (structural) key derivation.
@@ -150,6 +299,9 @@ pub const SALT_LEN: usize = 16;
 /// Fixed salt for Shadow layer structural key derivation (repetition coding).
 /// Independent from all other keys so shadow permutations are uncorrelated.
 const SHADOW_STRUCTURAL_SALT: &[u8; 16] = b"phasm-shdw-v1\0\0\0";
+
+/// Fixed salt for the Armor DFT ring key (independent from STDM).
+const RING_SALT: &[u8; 16] = b"phasm-ring-v1\0\0\0";
 
 /// Fixed salt for the H.264 MVD-domain structural key. Independent from
 /// the Ghost structural salt so the MVD-domain permutation + STC matrix do
@@ -265,6 +417,13 @@ pub fn derive_shadow_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 3
     Ok(output)
 }
 
+/// Derive the Armor DFT ring key from a passphrase.
+pub fn derive_ring_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
+    let mut output = [0u8; 32];
+    argon2_derive_cached(passphrase, RING_SALT, &mut output)?;
+    Ok(output)
+}
+
 /// Derive the AES-256 encryption key (Tier 2) from passphrase + random salt.
 pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, StegoError> {
     let mut key = Zeroizing::new([0u8; 32]);
@@ -290,9 +449,10 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONC
     // any other non-determinism in the encoder). Diagnostic-only:
     // production paths leave the env var unset, falling back to
     // `rand::thread_rng` for cryptographic salt+nonce per spec.
-    if let Ok(seed_str) = std::env::var("PHASM_DETERMINISTIC_SEED")
-        && let Ok(seed) = seed_str.parse::<u64>()
-    {
+    let env_seed = std::env::var("PHASM_DETERMINISTIC_SEED").ok().and_then(|s| s.parse::<u64>().ok());
+    #[cfg(feature = "test-hooks")]
+    let env_seed = env_seed.or_else(test_hooks::deterministic_seed);
+    if let Some(seed) = env_seed {
         use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
         rng.fill_bytes(&mut salt);
@@ -310,6 +470,25 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONC
     let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
 
     Ok((ciphertext, nonce_bytes, salt))
+}
+
+/// The `PHASM_DETERMINISTIC_SEED` override for hosts without environment
+/// variables (WASM under Node): byte-identity tests of a WASM build against
+/// native. Only in builds with the `test-hooks` feature, never shipped.
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks {
+    use std::sync::Mutex;
+
+    static SEED: Mutex<Option<u64>> = Mutex::new(None);
+
+    /// Set (or clear) the deterministic salt/nonce seed.
+    pub fn set_deterministic_seed(seed: Option<u64>) {
+        *SEED.lock().unwrap_or_else(|p| p.into_inner()) = seed;
+    }
+
+    pub(super) fn deterministic_seed() -> Option<u64> {
+        *SEED.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Encrypt plaintext with AES-256-GCM-SIV using caller-provided salt and nonce.

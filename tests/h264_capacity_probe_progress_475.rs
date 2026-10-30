@@ -6,18 +6,17 @@
 //!
 //! Verifies that `StreamingProbeSession::set_progress_callback` fires
 //! once per drained GOP (push_frame flushes + final partial flush in
-//! finish()), with monotonically non-decreasing `gops_done` and
-//! cover_bits arguments, and that the final emit matches the value
-//! returned from `finish()`.
+//! finish()), with non-decreasing `gops_done`, and that the final
+//! emit is the policy maximum `finish()` returns (`max_message_bytes`):
+//! the figure the HUD shows while probing is the one it shows after.
+//!
+//! The running value is not monotonic: it is the smaller of the
+//! planner's achievable ceiling (climbs) and the α band of the dry cover
+//! extrapolated from the GOPs probed so far (neutral). The disabled
+//! version of this test asserted monotonic cover bits, but the callback
+//! has reported bytes since CAP2.5#821.
 
-// DISABLED — do not reactivate without the source fix. This test exposes a
-// real `StreamingProbeSession` cover_bits monotonicity inconsistency (probe
-// emits decreasing cover_bits across GOPs; #805-adjacent, deferred to
-// retirement Phase 6). It was previously dead-gated on the removed pure-Rust
-// `h264-encoder` feature; the openh264-backend→h264-encoder rename (Phase 5)
-// would have silently reactivated it, so it is now explicitly disabled via
-// `cfg(any())`.
-#![cfg(any())]
+#![cfg(feature = "h264-encoder")]
 
 use phasm_core::codec::h264::progress::CapacityProbeCallback;
 use phasm_core::codec::h264::stego::CostWeights;
@@ -86,9 +85,8 @@ fn capacity_probe_fires_progress_per_gop() {
         cost_weights: CostWeights::default(),
         progress_callback: None,
     };
-    let mut probe = StreamingProbeSession::create(params)
-        .expect("create probe")
-        .with_progress_callback(cb);
+    let mut probe = StreamingProbeSession::create(params).expect("create probe");
+    probe.set_progress_callback(Some(cb));
 
     for f in 0..N {
         let (y, u, v) = synth_yuv(W, H, f);
@@ -112,20 +110,18 @@ fn capacity_probe_fires_progress_per_gop() {
     assert_eq!(events.len(), 3, "expected 3 progress events, got {:?}", events);
 
     // gops_done monotonic non-decreasing, total_gops constant at 3,
-    // cover_bits monotonic non-decreasing, last event matches final
+    // last event matches the final
     // result.
     let mut prev_done = 0u32;
-    let mut prev_bits = 0usize;
-    for &(done, total, bits) in &events {
+    for &(done, total, _) in &events {
         assert!(done >= prev_done, "gops_done regressed: {events:?}");
-        assert!(bits >= prev_bits, "cover_bits regressed: {events:?}");
         assert_eq!(total, 3, "total_gops should be ceil(12/4)=3, got {total}");
         prev_done = done;
-        prev_bits = bits;
     }
     let last = events.last().expect("at least one event");
     assert_eq!(last.0, result.n_gops, "last event gops_done != result");
-    assert_eq!(last.2, result.cover_bits, "last event cover_bits != result");
+    assert!(result.max_message_bytes() > 0, "cover too small to test the estimate: {result:?}");
+    assert_eq!(last.2, result.max_message_bytes(), "last event != max_message_bytes()");
     assert_eq!(result.n_gops, 3);
 }
 
@@ -152,9 +148,8 @@ fn capacity_probe_partial_final_gop_emits_event() {
         cost_weights: CostWeights::default(),
         progress_callback: None,
     };
-    let mut probe = StreamingProbeSession::create(params)
-        .expect("create probe")
-        .with_progress_callback(cb);
+    let mut probe = StreamingProbeSession::create(params).expect("create probe");
+    probe.set_progress_callback(Some(cb));
 
     for f in 0..N {
         let (y, u, v) = synth_yuv(W, H, f);
@@ -171,6 +166,6 @@ fn capacity_probe_partial_final_gop_emits_event() {
     // 2 full GOPs from push_frame + 1 partial-GOP emit from finish()
     assert_eq!(events.len(), 3, "events: {:?}", events);
     assert_eq!(events.last().unwrap().0, result.n_gops);
-    assert_eq!(events.last().unwrap().2, result.cover_bits);
+    assert_eq!(events.last().unwrap().2, result.max_message_bytes());
     assert_eq!(result.n_gops, 3);
 }

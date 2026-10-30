@@ -13,47 +13,28 @@
 
 /// Collision-limited shadow-capacity formula.
 ///
-/// `cover_size_bits` = total shadow-eligible bits (CoeffSign +
-/// CoeffSuffixLsb + MvdSign + cascade-safe MvdSuffixLsb). Multiple shadows write LSBs
-/// into one shared priority-ordered pool; the birthday-paradox collision
-/// rate over `N` messages bounds the per-message ceiling at
-/// √(1024·pool/(N−1)), capped by the raw pool. Worst-case RS parity
-/// (128 B) is then subtracted, and the v1/v2 frame envelope is applied
-/// by `max_shadow_plaintext_bytes`.
+/// `cover_size_bits` = the shadow pool: the damage-aware shadow-eligible
+/// positions in the low-damage bucket 0 (`GopCapacity::injectable_cover_bits`,
+/// v2 — spec `docs/design/video/stego-cover-order-and-damage-costs.md` § 6).
+/// Multiple shadows write LSBs into one shared priority-ordered pool; the
+/// birthday-paradox collision rate over `N` messages bounds the per-message
+/// ceiling at √(1024·pool/(N−1)), capped by the raw pool. Worst-case RS
+/// parity (128 B) is then subtracted, and the v1/v2 frame envelope is
+/// applied by `max_shadow_plaintext_bytes`.
 ///
-/// ## The pool INTENTIONALLY counts primary-wet positions — do not "fix" this
+/// ## What the pool counts (v2, 2026-10)
 ///
-/// Verified 2026-10-19. A raw-cover-count capacity figure is usually a bug
-/// (the caller must exclude ∞-cost positions), and this one looks like one:
-/// `injectable_cover_bits` is a plain `bits.len()` sum, and 46-60% of those
-/// positions carry `f32::INFINITY` in the primary cost vector
-/// (`content_costs::compute_cost_mask`) on the real-world corpus. It is
-/// nevertheless **correct**, because ∞-cost is a statement about the PRIMARY
-/// embedder, not about the position:
-///
-/// - The primary uses STC, so its cost vector gates which positions the
-///   Viterbi may flip. ∞ ⇒ never flipped.
-/// - Shadows use **direct LSB writes**, not STC, and select positions by hash
-///   priority alone. `shadow::for_each_eligible_position` — the single source
-///   of truth for shadow eligibility — takes `(cover, safe_csl, safe_msl)` and
-///   **no cost vector at all**. A DC coefficient's sign bin is just as
-///   writable at the CABAC bypass-emit site as an AC one.
-/// - The ∞ overlay runs the OPPOSITE way round: `shadow::overlay_infinity_costs`
-///   marks the chosen SHADOW positions ∞ so the primary's STC leaves them
-///   alone.
-///
-/// Empirically: ~46-60% of the top-N slots a real shadow encode consumes are
-/// primary-wet, and `oh264_video_shadow_roundtrip` is green — impossible if
-/// those slots were unusable, since RS absorbs ~128 B of parity, not 50%
-/// symbol noise. Narrowing the pool to finite-cost positions would understate
-/// shadow capacity by ~√2 and surface a smaller number than the encoder can
-/// actually carry.
-///
-/// The pool also includes the cascade-safe `MvdSuffixLsb` positions, which
-/// production shadow selection draws on too (1.5-4.1% of the real pool).
-/// They were left out until 2026-10-23 as a deliberate under-report (D10);
-/// the pool is now counted by `for_each_eligible_position` itself. See
-/// `GopCapacity::injectable_cover_bits`.
+/// Shadows still use direct LSB writes, not STC, so the PRIMARY's ∞ costs
+/// say nothing about whether a shadow may use a position. What they may use
+/// is now decided by damage (`damage::DamageModel`, from decoder-visible
+/// syntax): CoeffSign + CoeffSuffixLsb AC positions whose `D` is below the
+/// shadow threshold. DC positions (a DC sign flip shifts a whole block or
+/// MB — they were 46–60 % of the slots a v1 shadow used), the MVD domains
+/// and the key-frame flood positions are out. The pool counts the
+/// low-damage bucket 0 only, because N shadows remain independent random
+/// subsets only within one bucket (`damage::shadow_bucket`). On the corpus
+/// this cut the pool to roughly half of the v1 figure (§ 11 capacity table
+/// in `docs/design/video/h264/intra-drift-diagnosis.md`).
 ///
 /// ## D19 (2026-10-23): capped by what N shadows actually survive
 ///

@@ -16,7 +16,7 @@
 //! pure-Rust encoder. Gated `h264-encoder`: video stego is
 //! OpenH264-only.
 
-use super::keys::CabacStegoMasterKeys;
+use super::keys::H264StcKeys;
 use crate::codec::h264::frame_geometry::FrameGeometry;
 use crate::stego::error::StegoError;
 
@@ -111,6 +111,17 @@ pub struct H264StegoCapacityInfo {
     /// calibration against its own doc), as do `h264_calibrate` and the CLI's
     /// JSON output contract.
     pub achievable_max_message_bytes: usize,
+    /// The apps' capacity-bar RED END (spec § 4a): the visual maximum, the
+    /// number a UI should call "max". Same figure `StreamingProbeSession`
+    /// reports (`CapacityProbeResult::max_message_bytes`: change-rate α bands
+    /// over the damage-weighted syntax-dry cover, α_max 1/8 or 3/16 by the
+    /// damage predictor, clamped to `achievable_max_message_bytes`). Above it
+    /// the video is visibly damaged; `primary_max_message_bytes` is only the
+    /// STC feasibility ceiling.
+    pub max_message_bytes: usize,
+    /// The apps' capacity-bar YELLOW START: comfort ceiling
+    /// (`CapacityProbeResult::comfort_message_bytes`, α = 1/25).
+    pub comfort_message_bytes: usize,
 }
 
 /// Resolve the auto-selected cascade tier for an OH264 encode.
@@ -205,6 +216,11 @@ pub fn h264_video_capacity(
     // `pass1_count_4domain` whole-video pass (the ~45 s/clip bottleneck the
     // probe profiling pinned).
     let mut shadow_pool_bits = 0usize;
+    // Capacity-policy inputs, accumulated exactly as the streaming probe does
+    // (`drain_pending_gops_probe`): the damage-weighted syntax-dry cover and
+    // each GOP's predicted damage curve.
+    let mut dry_cover_bits = 0usize;
+    let mut quality_curves: Vec<super::quality_predict::GopQualityCurve> = Vec::new();
     // The per-GOP capacity probes are independent and the accumulation below is
     // an order-independent sum. The GOPs are probed sequentially in GOP-index
     // order. (Previously run concurrently under the pressure controller; reverted
@@ -237,7 +253,13 @@ pub fn h264_video_capacity(
         // the separate `injectable_cover_bits` accumulation below.
         cover_size_bits += cap.coeff_sign_cover_bits;
         shadow_pool_bits += cap.injectable_cover_bits;
-        gop_caps_t0.push(cap.per_tier_payload[0]);
+        dry_cover_bits = dry_cover_bits.saturating_add(
+            super::quality_predict::quality_safe_cap(cap.dry_cover_bits, &cap.quality),
+        );
+        // The planner's per-GOP basis is the quality-safe cap (damage-aware
+        // planning, same as the streaming probe); Σ per tier stays raw.
+        gop_caps_t0.push(super::quality_predict::quality_safe_cap(cap.per_tier_payload[0], &cap.quality));
+        quality_curves.push(cap.quality);
         for t in 0..5 {
             per_tier_sum[t] += cap.per_tier_payload[t];
         }
@@ -277,12 +299,28 @@ pub fn h264_video_capacity(
         framed_ceiling.saturating_sub(FRAME_OVERHEAD)
     };
 
+    // The apps' bands (red end + comfort), from the SAME methods the streaming
+    // probe's result uses, so the CLI shows what the apps show.
+    let policy = crate::codec::h264::streaming_session::CapacityProbeResult {
+        cover_bits: cover_size_bits,
+        shadow_pool_bits,
+        n_gops: n_gops as u32,
+        per_tier_sum_payload: per_tier_sum,
+        achievable_max_message_bytes,
+        dry_cover_bits,
+        max_alpha_64: super::quality_predict::adaptive_max_alpha64(
+            &quality_curves, &gop_caps_t0, gop_size as u32, width, height,
+        ),
+    };
+
     Ok(H264StegoCapacityInfo {
         cover_size_bits,
         primary_max_message_bytes,
         shadow_max_message_bytes,
         per_tier_primary_max_message_bytes,
         achievable_max_message_bytes,
+        max_message_bytes: policy.max_message_bytes(),
+        comfort_message_bytes: policy.comfort_message_bytes(),
     })
 }
 
@@ -369,7 +407,7 @@ pub(crate) struct NShadowPrimary {
     /// MSB-first). WV.6.a chunks THESE into per-GOP `chunk_frame` v3
     /// payloads; `total_bytes == frame_bytes.len()`.
     pub(crate) frame_bytes: Vec<u8>,
-    pub(crate) keys: CabacStegoMasterKeys,
+    pub(crate) keys: H264StcKeys,
     pub(crate) m_total: usize,
 }
 
@@ -388,7 +426,7 @@ pub(crate) fn prep_n_shadow_primary_payload(
         .iter()
         .flat_map(|&byte| (0..8).rev().map(move |i| (byte >> i) & 1))
         .collect();
-    let keys = CabacStegoMasterKeys::derive(primary_passphrase)?;
+    let keys = H264StcKeys::derive(primary_passphrase)?;
     let m_total = frame_bits.len();
     Ok(NShadowPrimary { frame_bits, frame_bytes, keys, m_total })
 }

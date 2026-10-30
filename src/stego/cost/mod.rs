@@ -17,6 +17,9 @@
 #[cfg(test)]
 pub mod uerd;
 pub mod uniward;
+// The 0.4.x (v1) image cost function, kept verbatim for decoding the
+// shadows of older images; public entry points re-exported by `uniward`.
+mod uniward_legacy_v1;
 mod uniward_simd;
 
 // H.264 OH264 Tier-3 cost primitives (J-UNIWARD subband decomposition +

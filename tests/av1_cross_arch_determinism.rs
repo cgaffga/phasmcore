@@ -76,9 +76,11 @@ const FIXTURES: &[Fixture] = &[
         h: 144,
         n_frames: 4,
         gop: 4,
-        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
-        pinned_sha256: "ef5e35c19ceddfc5de1aaef7d1c164251e9f8accc22ae25310a0db39bd5e6fc0",
-        pinned_len: 81358,
+        // Re-recorded 2026-10-30: the sequence header signals BT.709
+        // (apply_phasm_av1_colour, for the librav1e-consistent MP4); 3 bytes
+        // per GOP, everything else identical.
+        pinned_sha256: "928ff1883b309e719596acc73408a8b6dc91274941fc56d8b6ebeac5239ef7f8",
+        pinned_len: 81361,
     },
     // Two GOPs, frame size not a multiple of 8 (padded edge blocks).
     Fixture {
@@ -87,9 +89,11 @@ const FIXTURES: &[Fixture] = &[
         h: 142,
         n_frames: 6,
         gop: 3,
-        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
-        pinned_sha256: "94f274477638744d3ef64f2764457df54572bd46d1049c75676b03737837a29a",
-        pinned_len: 122462,
+        // Re-recorded 2026-10-30: the sequence header signals BT.709
+        // (apply_phasm_av1_colour, for the librav1e-consistent MP4); 3 bytes
+        // per GOP, everything else identical.
+        pinned_sha256: "4e3ad0a4b1cf38dbfa2553c7f225ce60e1f39b1c3b2f67dfedf5d1642ec55975",
+        pinned_len: 122468,
     },
     // 64x64 superblocks and the large transforms.
     Fixture {
@@ -98,9 +102,11 @@ const FIXTURES: &[Fixture] = &[
         h: 360,
         n_frames: 4,
         gop: 4,
-        // Re-recorded 2026-10-25, AV1 v2: calibrated cost (X area in pixels, alpha_x 1, W_chroma 0.5).
-        pinned_sha256: "e04953f90ca4389df443d545199c4229900bcd69a9b2773265564c1160c23cf7",
-        pinned_len: 407620,
+        // Re-recorded 2026-10-30: the sequence header signals BT.709
+        // (apply_phasm_av1_colour, for the librav1e-consistent MP4); 3 bytes
+        // per GOP, everything else identical.
+        pinned_sha256: "0962f955303089659b03a9de645e3d440ef5c5e2ad8b34fe29af0fc21236ae05",
+        pinned_len: 407623,
     },
 ];
 
@@ -167,6 +173,7 @@ fn encode(fx: &Fixture, yuv: &[u8], framed: &[u8]) -> Vec<u8> {
         quantizer: 60,
         gop_size: fx.gop,
         total_frames_hint: fx.n_frames,
+        colour: Default::default(),
     };
     let mut src = Av1SliceYuvSource::new(yuv, fx.w, fx.h, fx.n_frames, fx.gop);
     av1_encode_streaming(

@@ -38,29 +38,49 @@
 //! unchanged. The hash here guards the STRONGER claim that the f64
 //! internals are also identical across SIMD ISAs.
 
-use phasm_core::stego::cost::uniward::cost_kernel_test_hash_hex;
+use phasm_core::stego::cost::uniward::{cost_kernel_test_hash_hex, cost_kernel_test_hash_hex_legacy_v1};
 
-/// Hash recorded on aarch64 NEON, 2026-05-22. Phases A+B+C+D active.
-const EXPECTED_HASH: &str =
+/// v2 cost function (phasm-core 0.5, 2026-10-25): whole-window pricing over
+/// symmetric-padded wavelets, window aligned with the impact
+/// (`docs/design/image/juniward-cost.md`). The fixture now also exercises
+/// the padded decomposition: the outer block ring's windows read margin
+/// samples.
+///
+/// History:
+/// - `059a4a4707b21fa1…` (2026-05-22, aarch64 NEON, T3.3 phases A–D): the
+///   v1 kernel. Still pinned below as `EXPECTED_HASH_LEGACY_V1` — the
+///   legacy path the shadow decoder falls back to must stay bit-identical
+///   to what 0.4.x shipped.
+/// - `52b3740787c356b97d664d896d037379e5c847293e64ec1b6141252c2fc974e9` (2026-10-25): v2. Moved because the cost definition
+///   changed (both flaws fixed); not a determinism regression. Verified
+///   identical on aarch64 NEON, x86_64 SSE2 (Rosetta) and wasm32 SIMD128.
+const EXPECTED_HASH: &str = "52b3740787c356b97d664d896d037379e5c847293e64ec1b6141252c2fc974e9";
+
+/// The 0.4.x (v1) kernel, kept verbatim in `uniward_legacy_v1` for
+/// decoding the shadows of older images. Must never move.
+const EXPECTED_HASH_LEGACY_V1: &str =
     "059a4a4707b21fa135e803a27c8bdad0dc01d9b1f39a030ec1ac4e923e62a8f2";
 
 #[test]
 fn cost_kernel_bytes_are_platform_invariant() {
     let actual = cost_kernel_test_hash_hex();
     eprintln!("Cost kernel cross-platform hash: {}", actual);
-    if EXPECTED_HASH == "REPLACE_ME_WITH_AARCH64_HASH" {
-        panic!(
-            "EXPECTED_HASH not yet pinned. \
-            Set EXPECTED_HASH = \"{}\" in \
-            core/tests/cost_kernel_cross_platform.rs.",
-            actual
-        );
-    }
     assert_eq!(
         actual, EXPECTED_HASH,
         "cost kernel f64 bytes diverged on this platform — \
         cross-platform determinism broken (the pair-wise sum order \
-        in compute_coefficient_cost_precomputed must produce \
-        identical output on every SIMD ISA)"
+        in uniward::cost_kernel and the padded decomposition must \
+        produce identical output on every SIMD ISA)"
+    );
+}
+
+#[test]
+fn legacy_v1_cost_kernel_is_unchanged() {
+    let actual = cost_kernel_test_hash_hex_legacy_v1();
+    eprintln!("Legacy v1 cost kernel hash: {}", actual);
+    assert_eq!(
+        actual, EXPECTED_HASH_LEGACY_V1,
+        "the legacy v1 cost kernel no longer reproduces phasm-core 0.4.x — \
+        shadows of images made by older releases would stop decoding"
     );
 }

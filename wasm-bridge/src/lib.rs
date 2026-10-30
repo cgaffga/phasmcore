@@ -24,10 +24,11 @@
 use wasm_bindgen::prelude::*;
 
 use phasm_core::{
-    armor_capacity, armor_capacity_info, armor_decode, armor_encode, ghost_capacity,
-    ghost_capacity_si, ghost_capacity_with_shadows, ghost_decode, ghost_shadow_decode,
+    armor_capacity, armor_capacity_info, armor_decode, armor_encode, estimate_shadow_capacity_si,
+    ghost_capacity, ghost_capacity_si, ghost_capacity_with_shadows, ghost_decode, ghost_shadow_decode,
     ghost_encode, ghost_encode_si, ghost_encode_si_with_files,
     ghost_encode_with_files, optimize_cover, OptimizerConfig, OptimizerMode,
+    deep_cover_jpeg as core_deep_cover_jpeg,
     smart_decode, DecodeQuality, FileEntry, JpegImage, PayloadData, StegoError,
     GHOST_DECODE_STEPS,
 };
@@ -451,6 +452,112 @@ pub fn encode_with_progress(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel Ghost encode (Web Workers)
+// ---------------------------------------------------------------------------
+
+/// The coordinator of a Ghost encode split over Web Workers
+/// (`phasm_core::GhostEncodeSession`): it hands out tasks for helper
+/// workers (`ghost_run_task`) and takes their results. Same output bytes as
+/// `encode_with_files` / `encode_si_with_files`. Every worker has its own
+/// WASM instance; tasks and results are self-contained byte arrays, so no
+/// `SharedArrayBuffer` (and no COOP/COEP headers) is needed.
+#[wasm_bindgen]
+pub struct GhostEncodeJob {
+    inner: Option<phasm_core::GhostEncodeSession>,
+}
+
+fn job_err(e: StegoError) -> JsError {
+    JsError::new(&stego_error_message(&e))
+}
+
+#[wasm_bindgen]
+impl GhostEncodeJob {
+    /// Start an encode. `raw_pixels_rgb` empty = JPEG cover; otherwise the
+    /// Deep Cover pixels (as for `encode_si_with_files`). `helpers`: number of
+    /// helper workers that will run the tasks.
+    #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        image_bytes: &[u8],
+        raw_pixels_rgb: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+        message: &str,
+        files_json: &str,
+        passphrase: &str,
+        helpers: u32,
+    ) -> Result<GhostEncodeJob, JsError> {
+        check_domain()?;
+        let files = parse_files_json(files_json)?;
+        let pixels = (!raw_pixels_rgb.is_empty()).then_some((raw_pixels_rgb, pixel_width, pixel_height));
+        let inner = phasm_core::GhostEncodeSession::new(image_bytes, message, &files, passphrase, pixels, helpers as usize)
+            .map_err(job_err)?;
+        Ok(GhostEncodeJob { inner: Some(inner) })
+    }
+
+    fn session(&mut self) -> Result<&mut phasm_core::GhostEncodeSession, JsError> {
+        self.inner.as_mut().ok_or_else(|| JsError::new("INVALID_INPUT:encode job already finished"))
+    }
+
+    /// Tasks ready for helpers: an array of `Uint8Array`. A task's int32
+    /// (little-endian) at `ghost_task_target_offset()` is the helper it must
+    /// run on, or −1 for any.
+    pub fn take_tasks(&mut self) -> Result<js_sys::Array, JsError> {
+        let tasks = self.session()?.take_tasks().map_err(job_err)?;
+        let arr = js_sys::Array::new();
+        for t in tasks {
+            arr.push(&js_sys::Uint8Array::from(&t[..]));
+        }
+        Ok(arr)
+    }
+
+    /// The coordinator's own work (the keyed order); call right after the
+    /// first `take_tasks`, while the helpers compute the costs.
+    pub fn run_local(&mut self) -> Result<(), JsError> {
+        self.session()?.run_local().map_err(job_err)
+    }
+
+    /// A helper's result; `helper` = index of the helper that ran it.
+    pub fn submit(&mut self, result: &[u8], helper: i32) -> Result<(), JsError> {
+        self.session()?.submit(result, helper).map_err(job_err)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.inner.as_ref().is_some_and(|s| s.is_done())
+    }
+
+    /// Fraction of the work done, 0..1.
+    pub fn progress(&self) -> f64 {
+        self.inner.as_ref().map_or(0.0, |s| s.progress())
+    }
+
+    /// The stego JPEG (after `is_done()`).
+    pub fn finish(&mut self) -> Result<Vec<u8>, JsError> {
+        let s = self.inner.take().ok_or_else(|| JsError::new("INVALID_INPUT:encode job already finished"))?;
+        s.finish().map(|(bytes, _)| bytes).map_err(job_err)
+    }
+}
+
+thread_local! {
+    static TASK_RUNNER: std::cell::RefCell<phasm_core::GhostTaskRunner> =
+        std::cell::RefCell::new(phasm_core::GhostTaskRunner::new());
+}
+
+/// Run one task of a `GhostEncodeJob` (helper workers). The helper keeps
+/// split-trellis back pointers between a segment task and its trace task.
+#[wasm_bindgen]
+pub fn ghost_run_task(task: Vec<u8>) -> Result<Vec<u8>, JsError> {
+    check_domain()?;
+    TASK_RUNNER.with(|r| r.borrow_mut().run(task)).map_err(job_err)
+}
+
+/// Byte offset of a task's target helper (int32 LE, −1 = any helper).
+#[wasm_bindgen]
+pub fn ghost_task_target_offset() -> u32 {
+    phasm_core::GHOST_TASK_TARGET_OFFSET as u32
+}
+
+// ---------------------------------------------------------------------------
 // Decode
 // ---------------------------------------------------------------------------
 
@@ -660,24 +767,76 @@ pub fn capacity(image_bytes: &[u8], mode: u8) -> Result<usize, JsError> {
     Ok(cap)
 }
 
-/// Estimate Ghost mode capacity with SI-UNIWARD ("Deep Cover").
-///
-/// Returns ~43% more capacity than standard Ghost mode, reflecting the
-/// lower per-bit distortion cost when raw pixels are available.
+/// Ghost capacity of a Deep Cover embed: the cover JPEG plus the raw RGB
+/// pixels that will be passed to `encode_si` / `encode_si_with_files`. With
+/// exact side information (the cover is [`deep_cover_jpeg`]'s output for
+/// these pixels, checked by core) the maximum is nzAC / 4 frame bits,
+/// otherwise the plain Ghost [`capacity`].
 ///
 /// # Parameters
 /// - `image_bytes`: Raw JPEG bytes of the cover image.
+/// - `raw_pixels`: RGB (3 bytes per pixel, row-major), at least
+///   `pixel_width * pixel_height * 3` bytes.
 ///
 /// # Returns
-/// The estimated SI capacity in bytes as `usize`.
+/// The capacity in bytes as `usize`.
 #[wasm_bindgen]
-pub fn capacity_si(image_bytes: &[u8]) -> Result<usize, JsError> {
+pub fn capacity_si(image_bytes: &[u8], raw_pixels: &[u8], pixel_width: u32, pixel_height: u32) -> Result<usize, JsError> {
     check_domain()?;
-    let img = JpegImage::from_bytes(image_bytes)
-        .map_err(|e| JsError::new(&format!("INVALID_JPEG:{e:?}")))?;
-    let cap = ghost_capacity_si(&img)
-        .map_err(|e| JsError::new(&stego_error_message(&e)))?;
-    Ok(cap)
+    let img = si_capacity_cover(image_bytes, raw_pixels)?;
+    ghost_capacity_si(&img, raw_pixels, pixel_width, pixel_height).map_err(|e| JsError::new(&stego_error_message(&e)))
+}
+
+/// Shadow message capacity of a Deep Cover embed (cover JPEG + its raw RGB
+/// pixels): with exact side information a shadow may hold half the Deep
+/// Cover maximum, otherwise half the plain Ghost maximum.
+#[wasm_bindgen]
+pub fn shadow_capacity_si(
+    image_bytes: &[u8],
+    raw_pixels: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+) -> Result<usize, JsError> {
+    check_domain()?;
+    let img = si_capacity_cover(image_bytes, raw_pixels)?;
+    estimate_shadow_capacity_si(&img, raw_pixels, pixel_width, pixel_height)
+        .map_err(|e| JsError::new(&stego_error_message(&e)))
+}
+
+/// Parse the cover of a pixel-aware (`*_si`) capacity call.
+fn si_capacity_cover(image_bytes: &[u8], raw_pixels: &[u8]) -> Result<JpegImage, JsError> {
+    if raw_pixels.is_empty() {
+        return Err(JsError::new("INTERNAL:No raw pixel data provided"));
+    }
+    JpegImage::from_bytes(image_bytes).map_err(|e| JsError::new(&format!("INVALID_JPEG:{e:?}")))
+}
+
+/// Write the Deep Cover cover JPEG for raw RGB pixels with phasm's cover
+/// writer (byte-identical to libjpeg-turbo `cjpeg -quality Q`).
+///
+/// Pass the result to `encode_si` / `encode_si_with_files` together with the
+/// SAME pixel buffer so the core uses exact side information
+/// (`docs/design/image/deep-cover-exact-si.md`); compute capacity / bands on
+/// these bytes too.
+///
+/// # Parameters
+/// - `pixels`: raw RGB (3 bytes per pixel, row-major), `width * height * 3` bytes.
+/// - `width`, `height`: dimensions in pixels.
+/// - `quality`: IJG quality 1..=100 (92 = the apps' Ghost quality).
+///
+/// # Returns
+/// The cover JPEG as `Uint8Array`.
+#[wasm_bindgen]
+pub fn deep_cover_jpeg(pixels: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, JsError> {
+    check_domain()?;
+    let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(3));
+    if expected != Some(pixels.len()) {
+        return Err(JsError::new("INTERNAL:Pixel buffer size mismatch"));
+    }
+    if !(1..=100).contains(&quality) {
+        return Err(JsError::new(&format!("INTERNAL:Quality must be 1..=100, got {quality}")));
+    }
+    core_deep_cover_jpeg(pixels, width, height, quality).map_err(|e| JsError::new(&stego_error_message(&e)))
 }
 
 /// Estimate Ghost primary capacity accounting for shadow position overhead.
@@ -689,7 +848,8 @@ pub fn capacity_si(image_bytes: &[u8]) -> Result<usize, JsError> {
 /// - `image_bytes`: Raw JPEG bytes of the cover image.
 /// - `shadow_count`: Number of shadow layers.
 /// - `shadow_total_bytes`: Total plaintext bytes across all shadow messages.
-/// - `is_si`: `true` for SI-UNIWARD (Deep Cover), `false` for standard J-UNIWARD.
+/// - `is_si`: ignored — no side information; the Deep Cover maximum needs the
+///   pixels ([`ghost_bands_si`]).
 ///
 /// # Returns
 /// The estimated primary capacity in bytes as `usize`.
@@ -722,6 +882,51 @@ pub fn capacity_info(image_bytes: &[u8]) -> Result<String, JsError> {
         info.fortress_capacity,
         info.stdm_capacity,
     ))
+}
+/// Ghost stealth bands of a cover (the capacity bar) as JSON
+/// `{"max":…,"comfort":…,"caution":…}`, in plaintext bytes of the primary
+/// payload next to `shadow_count` shadows of `shadow_total_bytes` together
+/// (0, 0 = no shadows), for an embed without side information (JPEG input);
+/// Deep Cover covers: [`ghost_bands_si`].
+#[wasm_bindgen]
+pub fn ghost_bands(image_bytes: &[u8], shadow_count: u32, shadow_total_bytes: u32) -> Result<String, JsError> {
+    check_domain()?;
+    let img = JpegImage::from_bytes(image_bytes)
+        .map_err(|e| JsError::new(&format!("INVALID_JPEG:{e:?}")))?;
+    let b = phasm_core::ghost_bands(&img, shadow_count as usize, shadow_total_bytes as usize)
+        .map_err(|e| JsError::new(&stego_error_message(&e)))?;
+    Ok(bands_json(&b))
+}
+
+/// [`ghost_bands`] for a Deep Cover embed: the cover JPEG plus the raw RGB
+/// pixels that will be passed to `encode_si*`. With exact side information
+/// (checked by core) every band derives from the Deep Cover maximum, nzAC /
+/// 4 frame bits; otherwise the same as [`ghost_bands`].
+#[wasm_bindgen]
+pub fn ghost_bands_si(
+    image_bytes: &[u8],
+    raw_pixels: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    shadow_count: u32,
+    shadow_total_bytes: u32,
+) -> Result<String, JsError> {
+    check_domain()?;
+    let img = si_capacity_cover(image_bytes, raw_pixels)?;
+    let b = phasm_core::ghost_bands_si(
+        &img,
+        raw_pixels,
+        pixel_width,
+        pixel_height,
+        shadow_count as usize,
+        shadow_total_bytes as usize,
+    )
+    .map_err(|e| JsError::new(&stego_error_message(&e)))?;
+    Ok(bands_json(&b))
+}
+
+fn bands_json(b: &phasm_core::GhostBands) -> String {
+    format!("{{\"max\":{},\"comfort\":{},\"caution\":{}}}", b.max_bytes, b.comfort_bytes, b.caution_bytes)
 }
 
 /// Compute the compressed payload size for the given message and optional files.
@@ -852,6 +1057,130 @@ pub fn __test_fft2d_hash() -> String {
 #[doc(hidden)]
 pub fn __test_aan_hash() -> String {
     phasm_core::codec::jpeg::pixels_aan::aan_test_hash_hex()
+}
+
+/// Test builds only: fixed salt/nonce seed (`PHASM_DETERMINISTIC_SEED`), so
+/// an encode can be compared byte for byte with a native one.
+#[cfg(feature = "test-hooks")]
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_set_deterministic_seed(seed: u64) {
+    phasm_core::stego::crypto::test_hooks::set_deterministic_seed(Some(seed));
+}
+
+/// Test builds only: one STC trellis (`m` message bits, width `w`, height
+/// `h`) on random input; returns the plan's total cost. For timing the
+/// kernel from JS.
+#[cfg(feature = "test-hooks")]
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __bench_trellis(m: usize, w: usize, h: usize, inline: bool) -> f64 {
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let n = m * w;
+    let cover: Vec<u8> = (0..n).map(|_| (next() & 1) as u8).collect();
+    let costs: Vec<f32> = (0..n).map(|_| (next() % 10_000) as f32 / 100.0).collect();
+    let msg: Vec<u8> = (0..m).map(|_| (next() & 1) as u8).collect();
+    let hh = phasm_core::stego::stc::hhat::generate_hhat_end_set(h, w, &[7u8; 32]);
+    let cols: Vec<u32> = (0..w).map(|c| phasm_core::stego::stc::hhat::column_packed(&hh, c)).collect();
+    let limit = if inline { usize::MAX } else { 0 };
+    phasm_core::stego::stc::trellis::embed(&cover, &costs, &msg, &cols, h, limit, 1, &|_| {})
+        .ok()
+        .flatten()
+        .map_or(-1.0, |p| p.total_cost)
+}
+
+/// Test builds only: time-able split-trellis pieces on random input
+/// (`which`: 0 = pass A over `m` blocks, 1 = one segment's back pointers of
+/// `m` blocks, 2 = `embed` inline).
+#[cfg(feature = "test-hooks")]
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __bench_split(m: usize, w: usize, h: usize, which: u8) -> f64 {
+    let mut x = 0x9e3779b97f4a7c15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let n = m * w;
+    let cover: Vec<u8> = (0..n).map(|_| (next() & 1) as u8).collect();
+    let costs: Vec<f32> = (0..n).map(|_| (next() % 10_000) as f32 / 100.0).collect();
+    let msg: Vec<u8> = (0..m).map(|_| (next() & 1) as u8).collect();
+    let hh = phasm_core::stego::stc::hhat::generate_hhat_end_set(h, w, &[7u8; 32]);
+    let cols: Vec<u32> = (0..w).map(|c| phasm_core::stego::stc::hhat::column_packed(&hh, c)).collect();
+    use phasm_core::stego::stc::trellis as t;
+    match which {
+        0 => t::pass_a(&cover, &costs, &msg, &cols, h, m, &|_| {}).ok().flatten().map_or(-1.0, |p| p.cost),
+        1 => {
+            let mut cp = vec![f64::INFINITY; 1 << h];
+            cp[0] = 0.0;
+            t::segment_rows(&cover, &costs, &msg, &cols, h, &cp).map_or(-1.0, |r| r[r.len() / 2] as f64)
+        }
+        _ => t::embed(&cover, &costs, &msg, &cols, h, usize::MAX, 1, &|_| {}).ok().flatten().map_or(-1.0, |p| p.total_cost),
+    }
+}
+
+/// Cross-platform STC trellis byte-equivalence hook: the SHA-256 pinned in
+/// `stc::trellis::tests::trellis_hash_pinned`. Verifies the WASM SIMD128
+/// trellis kernel plans exactly what the NEON / scalar kernels plan.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_trellis_hash() -> String {
+    phasm_core::stego::stc::trellis::trellis_test_hash_hex()
+}
+
+/// Cross-platform ChaCha20 stream hook: the WASM SIMD128 keystream used by
+/// the keyed shuffle must equal `rand_chacha::ChaCha20Rng`'s (pinned in
+/// `stego::chacha_stream::tests`).
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_chacha_hash() -> String {
+    phasm_core::stego::chacha_stream::chacha_stream_test_hash_hex()
+}
+
+/// Cross-platform J-UNIWARD cost-kernel byte-equivalence hook: the v2
+/// kernel hash pinned in `core/tests/cost_kernel_cross_platform.rs`
+/// (`52b37407…`) and the legacy v1 one (`059a4a47…`). Verifies WASM
+/// SIMD128 produces bit-identical costs to NEON / SSE2 / scalar.
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_cost_kernel_hashes() -> String {
+    format!(
+        "{} {}",
+        phasm_core::stego::cost::uniward::cost_kernel_test_hash_hex(),
+        phasm_core::stego::cost::uniward::cost_kernel_test_hash_hex_legacy_v1(),
+    )
+}
+
+/// SHA256 over `(flat_idx, cost bits)` of every Y AC coefficient of a JPEG
+/// under the Ghost encoder's costs (`compute_ac_costs_separable`), for comparing
+/// a whole real image's costs against a native build
+/// (`core/examples/cost_hash_check.rs <image>`).
+#[wasm_bindgen]
+#[doc(hidden)]
+pub fn __test_cost_positions_hash(image_bytes: &[u8]) -> Result<String, JsError> {
+    use sha2::{Digest, Sha256};
+    let img = phasm_core::JpegImage::from_bytes(image_bytes).map_err(|e| JsError::new(&format!("{e:?}")))?;
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or_else(|| JsError::new("no qt"))?;
+    let pos = phasm_core::stego::cost::uniward::compute_ac_costs_separable(img.dct_grid(0), qt)
+        .map_err(|e| JsError::new(&format!("{e:?}")))?;
+    let mut h = Sha256::new();
+    let mut n_pos = 0usize;
+    for (fi, c) in pos.iter().enumerate().filter(|(_, c)| c.is_finite()) {
+        h.update((fi as u32).to_le_bytes());
+        h.update(c.to_bits().to_le_bytes());
+        n_pos += 1;
+    }
+    let _ = n_pos;
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Returns the SHA256 of the SCALAR-explicit path (bypassing

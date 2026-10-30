@@ -9,10 +9,13 @@
 //! "Deep Cover" for non-JPEG input and shadow messages for plausible deniability.
 
 pub mod capacity;
+pub mod deep_cover;
 pub mod optimizer;
 pub(crate) mod optimizer_simd;
 pub mod permute;
 pub mod pipeline;
 pub mod quality;
+pub mod session;
 pub mod shadow;
 pub mod side_info;
+pub mod v3;

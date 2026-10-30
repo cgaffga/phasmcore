@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-use phasm_core::{DecodeQuality, EncodeQuality, PayloadData};
+use phasm_core::{DecodeQuality, EncodeQuality, GhostBands, PayloadData};
 
 /// Minimal CLI-side video capacity report (H.264 position counts). Replaces
 /// the old `phasm_core::VideoCapacity`, which was HEVC-specific and was
 /// removed with the HEVC pipeline (2026-06-04).
-#[cfg(feature = "video")]
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 #[derive(Debug, Clone)]
 pub struct CliVideoCapacityInfo {
     pub num_i_frames: usize,
@@ -197,9 +197,12 @@ fn print_attachments(files: &[phasm_core::FileEntry], extract_dir: Option<&str>)
 
 // ── Capacity output ──
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_capacity(
     ghost: usize,
     ghost_si: usize,
+    bands: &GhostBands,
+    deep_cover: bool,
     armor: usize,
     fortress: usize,
     shadow: usize,
@@ -209,31 +212,42 @@ pub fn print_capacity(
 ) {
     let (aw, ah) = armor_cover;
     if json {
+        // `ghost` / `ghostDeepCover` keep their meaning (the plain and the
+        // side-informed maximum of the Ghost cover). `ghostComfort`,
+        // `ghostCaution` and `ghostMax` are the apps' capacity bands of the
+        // embed `encode --mode ghost` does: the Deep Cover bands when
+        // `ghostDeepCoverBands` is true (non-JPEG input).
         println!(
-            "{{\"ghost\":{ghost},\"ghostDeepCover\":{ghost_si},\"armor\":{armor},\"fortress\":{fortress},\"shadow\":{shadow},\"armorWidth\":{aw},\"armorHeight\":{ah}}}"
+            "{{\"ghost\":{ghost},\"ghostDeepCover\":{ghost_si},\"ghostComfort\":{},\"ghostCaution\":{},\"ghostMax\":{},\"ghostDeepCoverBands\":{deep_cover},\"armor\":{armor},\"fortress\":{fortress},\"shadow\":{shadow},\"armorWidth\":{aw},\"armorHeight\":{ah}}}",
+            bands.comfort_bytes, bands.caution_bytes, bands.max_bytes,
         );
         return;
     }
     let armor_line = format!("Armor:   {armor} bytes (Fortress: {fortress} bytes) on the {aw}x{ah} cover");
+    // The figures the apps show; the CLI does not enforce them.
+    let kind = if deep_cover { "  (Deep Cover, exact side information)" } else { "" };
+    let ghost_line = format!(
+        "Ghost:   comfort {} bytes, caution {} bytes, max {} bytes{kind}",
+        bands.comfort_bytes, bands.caution_bytes, bands.max_bytes,
+    );
+    let shadow_line = format!("Shadows: {shadow} bytes per layer");
     match mode_filter {
         Some("ghost") => {
-            println!("Ghost:   {ghost} bytes (Deep Cover: {ghost_si} bytes)");
-            println!("Shadows: {shadow} bytes per layer");
+            println!("{ghost_line}");
+            println!("{shadow_line}");
         }
-        Some("armor") => {
-            println!("{armor_line}");
-        }
+        Some("armor") => println!("{armor_line}"),
         _ => {
-            println!("Ghost:   {ghost} bytes (Deep Cover: {ghost_si} bytes)");
+            println!("{ghost_line}");
             println!("{armor_line}");
-            println!("Shadows: {shadow} bytes per layer");
+            println!("{shadow_line}");
         }
     }
 }
 
 // ── Video encode output ──
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 pub fn print_video_encode_result(
     output_path: &str,
     elapsed: Duration,
@@ -261,7 +275,7 @@ pub fn print_video_encode_result(
 
 // ── Video capacity output ──
 
-#[cfg(feature = "video")]
+#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
 pub fn print_video_capacity(info: &CliVideoCapacityInfo, json: bool) {
     if json {
         let frames_json: Vec<String> = info

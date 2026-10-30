@@ -34,10 +34,13 @@
 //! 2. **Confidence-bounded escalation** — start at K_min; if
 //!    99.9%-confidence pessimistic estimate doesn't clear
 //!    `message × safety_margin`, double K and request more samples.
-//! 3. **Balanced spread** — once confident, plan W from
-//!    `ceil(msg / (target_utilization × cap_per_gop_safe))`, clamped
-//!    below by `max(w_floor_abs, n_gops × w_floor_frac)` and above
-//!    by `n_gops`.
+//! 3. **Balanced spread** — once confident, the stego window W is the
+//!    shortest prefix of GOPs whose per-GOP basis, loaded to
+//!    `target_utilization`, holds the message (clamped below by
+//!    `max(w_floor_abs, n_gops × w_floor_frac)`, above by `n_gops`), and
+//!    the message is split over it proportional to each GOP's basis. So no
+//!    stego GOP runs above `target_utilization` of its own capacity unless
+//!    the whole clip has to (W = n_gops: every GOP at the clip's rate).
 //! 4. **Pre-encode hard check** — `total_safe ≥ msg × safety_margin`;
 //!    only commits the plan if this holds.
 //!
@@ -143,9 +146,6 @@ pub fn plan_safe_balanced(
     // Statistical lower bound on per-GOP cap.
     let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt() * fpc).max(0.0);
 
-    // Apply pessimism factor (heavy-tail / outlier defense).
-    let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
-
     // Sanity-check sample mean against table. Warn but don't fail.
     //
     // Unit basis (fixed 2026-10-18, see
@@ -170,70 +170,6 @@ pub fn plan_safe_balanced(
         }
     }
 
-    // Compute balanced W. Unchanged: W is the *spread* knob (how many GOPs
-    // the payload is smeared over), driven by `target_utilization`, and it is
-    // what keeps a 100-byte message from being diced into 1-byte chunks across
-    // a 600-GOP clip — every chunk pays a `chunk_frame` header, so smearing
-    // past the payload makes overhead dominate. Only the split *within* the
-    // window changes below.
-    let target_cap_per_chunk =
-        (calibration.target_utilization * cap_per_gop_safe).max(1.0);
-    let w_util = (message_len as f64 / target_cap_per_chunk).ceil() as usize;
-    let w_floor = calibration
-        .w_floor_abs
-        .max(((n_gops as f64) * calibration.w_floor_frac).ceil() as usize);
-    let w = w_util.max(w_floor).min(n_gops);
-
-    // Per-GOP allocation basis — the fix for #841's core defect.
-    //
-    // The planner is handed a vector of measured per-GOP caps and used to
-    // reduce it to its MEAN, then hand every GOP in the window an equal
-    // share (`uniform_split`). Two failures, one cause:
-    //
-    // - a GOP measured at 26 B was still assigned `message_len / W`, which it
-    //   provably cannot hold — the information was in hand and discarded;
-    // - a GOP measured at 6300 B was never asked for more than the even
-    //   share, so its surplus was unreachable.
-    //
-    // Those are not two bugs. Σ caps == `n_gops × mean`, so reporting Σ as
-    // the capacity (which `h264_video_capacity` does, and the HUD shows)
-    // assumes every GOP carries *its own* amount. Fill uniformly and the
-    // binding limit collapses to `n_gops × min(cap)`; on this corpus that is
-    // a median ~2× and worst-case 70× below the displayed number
-    // (`cap_corpus_min_mu_census`). Σ-reporting and uniform filling are
-    // mutually exclusive by arithmetic — `balanced-allocation-v3.md` §17.1
-    // already required the coupling: "Reporting Σ requires the encoder to
-    // *achieve* Σ → couple with proportional GOP allocation".
-    //
-    // So: allocate against what is actually known per GOP. Measured GOPs
-    // contribute their exact cap; unmeasured GOPs contribute the
-    // pessimism-discounted statistical lower bound.
-    //
-    // **`pessimism_factor` applies only to the imputed entries.** It is
-    // documented as a multiplier on the statistical lower bound
-    // `μ − t·σ/√K` — i.e. defence against *sampling* error. A GOP we
-    // measured carries no sampling error, so discounting it was halving a
-    // known-exact number. At full coverage (`fpc == 0`, the #850 census fix)
-    // that discount alone put the accept ceiling at `0.4545 × Σ`.
-    //
-    // This converges on truth as coverage grows, but it is NOT monotonically
-    // increasing: the imputed value bounds the *mean*, not the *minimum*, so
-    // probing a GOP that turns out worse than the bound (IMG_4138 has a 26 B
-    // GOP against μ = 1811) correctly lowers Σ basis and can flip a
-    // borderline message from accept to reject. What IS guaranteed is the
-    // property that was missing: a **measured** GOP is never over-allocated.
-    //
-    // That is what makes it safe to start encoding before the probe has
-    // finished — the planner uses whatever is known, and the residual risk
-    // sits only on GOPs nobody has looked at yet, absorbed by `safety_margin`
-    // plus the drain's per-GOP verify + shrink-carry (graceful
-    // `MessageTooLarge`, never silent loss).
-    //
-    // Corollary for the UI: a displayed estimate derived from this can still
-    // fall as probing proceeds. A never-falling display would need a
-    // conservative floor per unmeasured GOP rather than a bound on the mean,
-    // which costs displayed capacity early — a UX trade, not a correctness
-    // one.
     let imputed = (cap_per_gop_lower * calibration.pessimism_factor).floor() as usize;
     let mut basis = vec![imputed; n_gops];
     for &(idx, cap) in samples {
@@ -241,6 +177,11 @@ pub fn plan_safe_balanced(
             basis[idx] = cap;
         }
     }
+
+    // The stego window W — the leading GOPs that carry chunks; the rest are a
+    // plain tail. See [`select_window`] for the rule and why it is a prefix
+    // sum of the basis, not a multiple of the mean.
+    let w = select_window(&basis, message_len, calibration);
 
     // Pre-encode hard check against the basis over the window, not against
     // `mean × W`. At full coverage this is the exact bound `Σ caps ≥
@@ -318,21 +259,23 @@ pub fn plan_safe_balanced(
 ///
 /// # Why this is a solve and not a bisection
 ///
-/// Acceptance is **not** provably monotone in `message_len`, because `W`
-/// is itself a function of `message_len` and the window is a *prefix* of
-/// the clip. With caps `[1, 1, 1000]` a short message takes `W = 2`
-/// (capacity 2) and is refused, while a longer one takes `W = 3`
-/// (capacity 1002) and is admitted. A bisection would silently return a
-/// wrong answer on such a vector. In practice `W` saturates at `n_gops`
-/// early enough that real corpus vectors are monotone, but "in practice"
-/// is not a sound basis for the number shown to the user.
+/// `W` is itself a function of `message_len` and the window is a *prefix*
+/// of the clip, so acceptance is monotone in `message_len` only when every
+/// selected window also fits — which holds when `target_utilization ≤
+/// 1 / safety_margin` (both shipped calibrations), since a selected
+/// `W < n_gops` then has `S(W) ≥ message / u ≥ message × safety_margin`.
+/// Under the pre-2026-10-26 mean-based window rule it did not hold (caps
+/// `[1, 1, 1000]`: a short message took `W = 2` and was refused, a longer one
+/// took `W = 3` and was admitted). Enumerating keeps the answer exact for any
+/// calibration rather than relying on that inequality.
 ///
 /// So this enumerates `W` instead. For a given `W` the planner admits
 /// exactly the messages that both *select* that `W` and *fit* in it:
 ///
 /// ```text
-///     select:  message ∈ ( (W−1)·T , W·T ]      where T = target_cap_per_chunk
-///              (or (0, W_floor·T] at the floor)
+///     select:  message ∈ ( u·S(W−1) , u·S(W) ]   where S(W) = Σ basis[..W],
+///              u = target_utilization            (or (0, u·S(W_floor)] at the
+///                                                floor, (u·S(n−1), ∞) at n)
 ///     fit:     message ≤ Σ basis[..W] / safety_margin
 /// ```
 ///
@@ -364,7 +307,6 @@ pub fn max_message_len(
         0.0
     };
     let cap_per_gop_lower = (mu - t * sigma / (k as f64).sqrt() * fpc).max(0.0);
-    let cap_per_gop_safe = cap_per_gop_lower * calibration.pessimism_factor;
 
     // Same basis the planner builds: measured caps where known, the
     // pessimism-discounted bound where not.
@@ -376,44 +318,113 @@ pub fn max_message_len(
         }
     }
 
-    let target_cap_per_chunk =
-        (calibration.target_utilization * cap_per_gop_safe).max(1.0);
-    let w_floor = calibration
-        .w_floor_abs
-        .max(((n_gops as f64) * calibration.w_floor_frac).ceil() as usize)
-        .min(n_gops)
-        .max(1);
+    let u = calibration.target_utilization;
+    let w_floor = window_floor(n_gops, calibration);
 
     let mut best = 0usize;
-    let mut running: usize = basis[..w_floor.min(n_gops)].iter().sum();
+    let mut prev: usize = basis[..w_floor - 1].iter().sum();
     for w in w_floor..=n_gops {
-        if w > w_floor {
-            running += basis[w - 1];
-        }
-        // Messages that select this W.
-        let window_lo = if w == w_floor {
-            0.0
-        } else {
-            (w - 1) as f64 * target_cap_per_chunk
-        };
-        // `plan_safe_balanced` CLAMPS `w` to `n_gops`, so the last window is
-        // open-ended: every message above `(n_gops−1)·T` also selects
-        // `w = n_gops`, and only the fit constraint binds there. Treating it
-        // as `w·T` understated iphone7's capacity by 3.6× (3803 vs 13831) —
-        // caught by `max_message_len_agrees_exactly_with_the_planner`.
-        let window_hi = if w == n_gops {
-            f64::INFINITY
-        } else {
-            w as f64 * target_cap_per_chunk
-        };
+        let running = prev + basis[w - 1];
+        // Messages that select this W ([`select_window`]: the smallest
+        // W ≥ w_floor with `u · S(W) ≥ message`).
+        let window_lo = if w == w_floor { 0.0 } else { u * prev as f64 };
+        // `select_window` falls back to `n_gops` when no prefix qualifies, so
+        // the last window is open-ended: every message above `u · S(n−1)`
+        // selects it, and only the fit constraint binds there.
+        let window_hi = if w == n_gops { f64::INFINITY } else { u * running as f64 };
         // Messages that fit in this W.
         let fit = running as f64 / calibration.safety_margin;
         let usable = window_hi.min(fit).floor();
         if usable > window_lo && usable >= 1.0 {
             best = best.max(usable as usize);
         }
+        prev = running;
     }
     best
+}
+
+/// The minimum stego window: `max(w_floor_abs, ⌈n_gops × w_floor_frac⌉)`,
+/// clamped to `[1, n_gops]`.
+pub fn window_floor(n_gops: usize, calibration: &AllocationCalibration) -> usize {
+    calibration
+        .w_floor_abs
+        .max(((n_gops as f64) * calibration.w_floor_frac).ceil() as usize)
+        .min(n_gops)
+        .max(1)
+}
+
+/// Whether the stego window is already decided by the first `k` GOPs, whose
+/// basis sums to `prefix_sum`: true once `k ≥` [`window_floor`] and the prefix
+/// holds the message at `target_utilization` — exactly the condition
+/// [`select_window`] stops on, evaluated with the same arithmetic. The probe's
+/// early exit ([`crate::codec::h264::streaming_session::StreamingProbeSession`]'s
+/// balanced plan target) uses it: past this point no unprobed GOP can change
+/// the plan.
+pub fn window_decided_by_prefix(
+    k: usize,
+    prefix_sum: usize,
+    n_gops: usize,
+    message_len: usize,
+    calibration: &AllocationCalibration,
+) -> bool {
+    message_len == 0
+        || (k >= window_floor(n_gops, calibration)
+            && calibration.target_utilization * prefix_sum as f64 >= message_len as f64)
+}
+
+/// The stego window W: the smallest `W ∈ [window_floor, n_gops]` with
+/// `target_utilization × Σ basis[..W] ≥ message_len`, else `n_gops`.
+///
+/// The message is then split over the window proportional to `basis`
+/// (`allocate_chunks_proportional`), so every stego GOP carries the same
+/// fraction `message / Σ basis[..W]` of its own capacity. The rule therefore
+/// bounds that fraction at `target_utilization` for any message that does
+/// not need the whole clip, and at the clip's own rate when it does
+/// (W = n_gops) — the payload is never packed into a prefix at a higher
+/// per-GOP rate than the clip as a whole would need.
+///
+/// The per-GOP basis is in payload bytes, and the H.264 probe's cap is a
+/// fixed fraction of the GOP's syntax-dry cover (≈ 0.95 × dry / 8), so a
+/// share of capacity IS a change-rate α (α ≈ 0.95 × share).
+///
+/// This replaced (2026-10-26) `W = ⌈message / (target_utilization ×
+/// pessimism × μ_lower)⌉`. That rule had two defects that compounded on
+/// clips longer than `window_floor` GOPs:
+///
+/// - it loaded each window GOP to `target_utilization × pessimism` of the
+///   MEAN cap (H.264: ½ × ½ → α ≈ 0.24, twice the policy red end 1/8, six
+///   times the comfort 1/25), however small the message;
+/// - it sized the window from the mean while the split is proportional to
+///   each GOP's own cap, so a prefix of weak GOPs (IMG_4138: 6309, 5462,
+///   2942 B against μ = 24199 B) ran hotter still.
+///
+/// Measured on a 10-GOP IMG_4138 720p clip at the fixed 1/8: worst-MB
+/// 11.4 dB and flood frames on 5 of 6 encodes, below the 13 dB floor
+/// (`docs/design/video/h264/intra-drift-diagnosis.md`, follow-up 5).
+///
+/// The window is still a prefix with a plain tail when the message is small
+/// (rather than always `n_gops`): every stego GOP pays a chunk header and the
+/// full stego GOP pipeline at encode, and the decoder must walk every stego
+/// GOP, so a 30-byte message on a 600-GOP clip should not touch all 600. A
+/// plain tail GOP costs one clean encode and is never walked.
+pub fn select_window(
+    basis: &[usize],
+    message_len: usize,
+    calibration: &AllocationCalibration,
+) -> usize {
+    let n_gops = basis.len();
+    if n_gops == 0 {
+        return 0;
+    }
+    let w_floor = window_floor(n_gops, calibration);
+    let mut sum: usize = basis[..w_floor - 1].iter().sum();
+    for w in w_floor..=n_gops {
+        sum += basis[w - 1];
+        if window_decided_by_prefix(w, sum, n_gops, message_len, calibration) {
+            return w;
+        }
+    }
+    n_gops
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────
@@ -1097,5 +1108,90 @@ mod tests {
             PlanOutcome::Plan { window, .. } => assert_eq!(window, 8),
             _ => panic!("expected Plan with W=W_floor"),
         }
+    }
+
+    /// Per-GOP share of its own cap (≈ α / 0.95 on H.264) for every stego GOP.
+    fn shares(plan: &[usize], caps: &[usize]) -> Vec<(usize, f64)> {
+        (0..plan.len()).filter(|&i| plan[i] > 0).map(|i| (i, plan[i] as f64 / caps[i] as f64)).collect()
+    }
+
+    /// The long-clip concentration bug (2026-10-26): a 10-GOP IMG_4138 720p
+    /// clip's per-GOP caps. At the policy red end (1/8 of the dry cover ≈
+    /// 0.95 × Σcaps / 8) the old mean-based window put the message into the
+    /// first 8 GOPs at a share ≈ 0.26 of each GOP's cap (α ≈ 0.25, 2× the
+    /// red end). Now: no stego GOP's share exceeds `target_utilization` unless
+    /// the window is the whole clip, and then every GOP carries the clip's
+    /// own share (± rounding).
+    #[test]
+    fn long_clip_payload_never_packed_above_clip_rate() {
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        let caps = [18877usize, 6309, 5462, 8465, 2942, 15455, 29831, 33112, 51674, 69862];
+        let sigma: usize = caps.iter().sum();
+        let samples = full_samples(&caps);
+        // comfort (α 1/25) .. red end 3/16 .. the accept ceiling.
+        let max_ok = max_message_len(&samples, caps.len(), &cal);
+        for msg in [10usize, 500, 2_000, 5_000, sigma / 25, sigma / 8, sigma * 3 / 16, sigma / 3, max_ok] {
+            let PlanOutcome::Plan { plan, window } = plan_safe_balanced(&samples, caps.len(), msg, 30, &cal) else {
+                panic!("msg {msg} must plan");
+            };
+            assert_respects_caps(&plan, &caps, msg);
+            let clip_share = msg as f64 / sigma as f64;
+            for (i, sh) in shares(&plan, &caps) {
+                if window < caps.len() {
+                    // Rounding: one byte over the proportional share at most.
+                    assert!(sh <= cal.target_utilization + 1.0 / caps[i] as f64, "msg {msg} W {window} GOP {i} share {sh}");
+                } else {
+                    // The split runs on ⌊u·cap⌋ targets when they hold the message, so
+                    // allow that flooring (≤ 1 %) plus a byte of rounding.
+                    assert!((sh - clip_share).abs() <= 2.0 / caps[i] as f64 + 0.01 * clip_share, "msg {msg} GOP {i} share {sh} vs clip {clip_share}");
+                }
+            }
+            if msg as f64 > cal.target_utilization * sigma as f64 {
+                assert_eq!(window, caps.len(), "msg {msg} above the window bound must use every GOP");
+            }
+        }
+        // The exact case the drift diagnosis measured: the red end 1/8 of a
+        // dry cover of 2_038_747 bits = 31_805 B (probe figure + envelope).
+        let PlanOutcome::Plan { plan, window } = plan_safe_balanced(&samples, caps.len(), 31_805 + 60, 30, &cal) else {
+            panic!()
+        };
+        assert_eq!(window, 10);
+        let max_share = shares(&plan, &caps).into_iter().map(|(_, s)| s).fold(0.0f64, f64::max);
+        assert!(max_share < 0.14, "max share {max_share} (was ≈ 0.26 under the mean-based window)");
+    }
+
+    /// The CLI probe stops measuring once `window_decided_by_prefix` holds;
+    /// unprobed GOPs then read 0. The plan must be bit-identical to the plan
+    /// over the full measured vector.
+    #[test]
+    fn prefix_decided_window_gives_identical_plan_with_unprobed_gops_zeroed() {
+        let cal = AllocationCalibration::H264_1080P_QP26;
+        let mut caps: Vec<usize> = Vec::new();
+        let mut x = 0x1234_5678u64;
+        for _ in 0..40 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            caps.push(200 + (x >> 40) as usize % 9000);
+        }
+        let n = caps.len();
+        let full = full_samples(&caps);
+        let mut checked = 0;
+        for msg in (1..=n * 400).step_by(97) {
+            // Where would the probe have stopped?
+            let mut sum = 0usize;
+            let stop = (0..n).find(|&i| {
+                sum += caps[i];
+                window_decided_by_prefix(i + 1, sum, n, msg, &cal)
+            });
+            let Some(stop) = stop else { continue };
+            let mut truncated = caps.clone();
+            for c in truncated.iter_mut().skip(stop + 1) {
+                *c = 0;
+            }
+            let a = plan_safe_balanced(&full, n, msg, 30, &cal);
+            let b = plan_safe_balanced(&full_samples(&truncated), n, msg, 30, &cal);
+            assert_eq!(a, b, "msg {msg} stop {stop}");
+            checked += 1;
+        }
+        assert!(checked > 10);
     }
 }

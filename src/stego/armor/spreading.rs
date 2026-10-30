@@ -17,11 +17,27 @@ pub const SPREAD_LEN: usize = 8;
 
 /// Generate `count` spreading vectors of length `SPREAD_LEN` from a seed.
 ///
-/// Each vector is drawn from a standard normal distribution (via Box-Muller)
-/// and then normalized to unit length. This ensures the projection operation
-/// in STDM is well-conditioned.
+/// Each vector is drawn uniformly from [-1, 1)^L and then normalized to unit
+/// length. This ensures the projection operation in STDM is well-conditioned.
 pub fn generate_spreading_vectors(seed: &[u8; 32], count: usize) -> Vec<[f64; SPREAD_LEN]> {
+    spreading_vectors_range(seed, 0, count)
+}
+
+/// ChaCha20 keystream words one vector consumes.
+///
+/// `gen_range(-1.0..1.0)` on f64 draws exactly one `u64` (two words) per
+/// value and never rejects: rand maps the draw to `v * 2.0 - 1.0` with
+/// `v` in `[0, 1 - 2^-52]`, which is exact and at most `1 - 2^-51 < 1`.
+/// So vector `i` is a pure function of keystream words `16 i .. 16 i + 16`
+/// (one ChaCha20 block), and any vector can be generated on its own.
+const WORDS_PER_VECTOR: u128 = 2 * SPREAD_LEN as u128;
+
+/// Vectors `start .. start + count` of the sequence `generate_spreading_vectors`
+/// produces, bit for bit, without generating the ones before them. Lets the
+/// decoder regenerate vectors chunk by chunk instead of holding all of them.
+pub fn spreading_vectors_range(seed: &[u8; 32], start: usize, count: usize) -> Vec<[f64; SPREAD_LEN]> {
     let mut rng = ChaCha20Rng::from_seed(*seed);
+    rng.set_word_pos(start as u128 * WORDS_PER_VECTOR);
     let mut vectors = Vec::with_capacity(count);
 
     for _ in 0..count {
@@ -86,6 +102,20 @@ mod tests {
             a.iter().map(|v| v[0].to_bits()).collect::<Vec<_>>(),
             b.iter().map(|v| v[0].to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn range_matches_the_sequence() {
+        let seed = [9u8; 32];
+        let all = generate_spreading_vectors(&seed, 3000);
+        for &(start, count) in &[(0usize, 1usize), (1, 5), (3, 64), (777, 100), (2999, 1), (1024, 1976)] {
+            let part = spreading_vectors_range(&seed, start, count);
+            for (k, v) in part.iter().enumerate() {
+                for (a, b) in v.iter().zip(all[start + k].iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "vector {}", start + k);
+                }
+            }
+        }
     }
 
     #[test]

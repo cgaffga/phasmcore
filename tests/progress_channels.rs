@@ -161,6 +161,80 @@ fn an_image_decode_follows_its_own_channel() {
     Channel::Decode.clear_cancel();
 }
 
+/// A procedural cover above `ARMOR_TARGET_DIMENSION` (2400 x 1800, Deep
+/// Cover writer): large enough for `smart_decode`'s deferred-Armor path,
+/// small enough that its stages overlap.
+fn large_cover() -> Vec<u8> {
+    let (w, h) = (2400u32, 1800u32);
+    let mut px = Vec::with_capacity((w * h * 3) as usize);
+    let mut s: u32 = 0x9e37_79b9;
+    for y in 0..h {
+        for x in 0..w {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            let n = (s % 21) as i32 - 10;
+            let v = |a: i32| (a + n).clamp(0, 255) as u8;
+            px.extend_from_slice(&[v((x * 255 / w) as i32 + ((x / 5 + y / 3) % 11) as i32 * 3), v((y * 255 / h) as i32), v(120 + ((x + y) / 9 % 30) as i32)]);
+        }
+    }
+    phasm_core::deep_cover_jpeg(&px, w, h, 92).unwrap()
+}
+
+/// A cancel during a large wrong-passphrase decode (stages running side by
+/// side) stops it with `Cancelled`, promptly, and leaves the progress
+/// counters consistent.
+#[test]
+fn a_large_decode_with_overlapping_stages_cancels() {
+    let _g = serial();
+    let cover = large_cover();
+    let t = std::time::Instant::now();
+    let full = run_decode(|| phasm_core::smart_decode(&cover, "nobody"));
+    let full_time = t.elapsed();
+    assert!(full.is_err());
+
+    let t = std::time::Instant::now();
+    let canceller = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        Channel::Decode.cancel();
+    });
+    let res = run_decode(|| phasm_core::smart_decode(&cover, "nobody"));
+    let cancelled_time = t.elapsed();
+    canceller.join().unwrap();
+    Channel::Decode.clear_cancel();
+    assert!(matches!(res, Err(StegoError::Cancelled)), "got {:?}", res.map(|r| r.0.text));
+    assert!(cancelled_time < full_time, "cancelled {cancelled_time:?} vs full {full_time:?}");
+    let (step, total) = Channel::Decode.get();
+    assert_eq!(step, total, "finish() completes the bar");
+}
+
+/// Full-resolution Armor and Fortress above `ARMOR_TARGET_DIMENSION` stay
+/// decodable (Armor is deferred, never skipped — here it runs next to the
+/// v1 cost pools), and so do a Ghost primary and its shadows there.
+#[test]
+fn large_inputs_decode_every_mode() {
+    let _g = serial();
+    let cover = large_cover();
+    let long = "full-resolution Armor, long enough to skip Fortress: ".repeat(3);
+    let armor = phasm_core::armor_encode(&cover, &long, "pa").unwrap();
+    let (p, q) = run_decode(|| phasm_core::smart_decode(&armor, "pa")).unwrap();
+    assert_eq!((p.text.as_str(), q.mode), (long.as_str(), 2));
+    let fortress = phasm_core::armor_encode(&cover, "short", "pf").unwrap();
+    let (p, q) = run_decode(|| phasm_core::smart_decode(&fortress, "pf")).unwrap();
+    assert_eq!((p.text.as_str(), q.mode), ("short", 2));
+
+    let shadows: Vec<phasm_core::ShadowLayer> = [("s1", "first shadow"), ("s2", "second shadow")]
+        .iter()
+        .map(|&(pw, m)| phasm_core::ShadowLayer { message: m.into(), passphrase: pw.into(), files: vec![] })
+        .collect();
+    let ghost = phasm_core::ghost_encode_with_shadows(&cover, "primary", &[], "pg", &shadows, None).unwrap();
+    for (pw, want) in [("pg", "primary"), ("s1", "first shadow"), ("s2", "second shadow")] {
+        let (p, q) = run_decode(|| phasm_core::smart_decode(&ghost, pw)).unwrap();
+        assert_eq!((p.text.as_str(), q.mode), (want, 1), "{pw}");
+    }
+    assert!(run_decode(|| phasm_core::smart_decode(&ghost, "nobody")).is_err());
+}
+
 #[cfg(feature = "h264-encoder")]
 mod video {
     use super::*;

@@ -58,11 +58,10 @@ fn single_keyframe_sequence_header_plus_frame() {
     stream.extend_from_slice(&frame);
 
     let result = split_av1_into_samples(&stream).unwrap();
-    assert_eq!(result.sequence_header_obu, sh, "av1C must carry the SH OBU");
+    assert_eq!(result.sequence_header_obu, sh, "the split keeps the first SH OBU");
     assert_eq!(result.samples.len(), 1, "one frame = one sample");
-    // muxer-sh-in-band-fix: sync samples now carry the SH bytes in-band
-    // (av1C is redundant — both are populated). The single keyframe
-    // sample = SH bytes followed by frame_obu bytes.
+    // muxer-sh-in-band-fix: sync samples carry the SH bytes in-band. The
+    // single keyframe sample = SH bytes followed by frame_obu bytes.
     let mut expected = Vec::new();
     expected.extend_from_slice(&sh);
     expected.extend_from_slice(&frame);
@@ -106,8 +105,8 @@ fn multi_frame_ipppp_gop_one_sh_one_keyframe() {
 fn multi_gop_each_starts_with_sh_marks_keyframe() {
     // SH + frame + SH + frame + frame → 3 samples, sync = [true, true, false].
     // muxer-sh-in-band-fix: BOTH sync samples carry their respective SH
-    // bytes in-band (every IDR re-emits the SH for seekability), but
-    // av1C still carries only the FIRST one.
+    // bytes in-band (every IDR re-emits the SH for seekability); the
+    // split's `sequence_header_obu` is the FIRST one.
     let mut stream = Vec::new();
     let sh1 = make_obu(OBU_SEQUENCE_HEADER, 8);
     let f1 = make_obu(OBU_FRAME, 30);
@@ -121,7 +120,6 @@ fn multi_gop_each_starts_with_sh_marks_keyframe() {
     stream.extend_from_slice(&f3);
 
     let result = split_av1_into_samples(&stream).unwrap();
-    // av1C carries only the FIRST sequence_header_obu.
     assert_eq!(result.sequence_header_obu, sh1);
     assert_eq!(result.samples.len(), 3);
     assert_eq!(result.sync, vec![true, true, false]);

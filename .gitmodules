@@ -1,0 +1,8 @@
+[submodule "vendor/phasm-openh264"]
+	path = vendor/phasm-openh264
+	url = https://github.com/cgaffga/phasm-openh264.git
+	branch = phasm-stego
+[submodule "vendor/phasm-dav1d"]
+	path = vendor/phasm-dav1d
+	url = https://github.com/cgaffga/phasm-dav1d.git
+	branch = phasm-stego

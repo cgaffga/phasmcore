@@ -2,12 +2,14 @@
 
 [![crates.io](https://img.shields.io/crates/v/phasm-core.svg)](https://crates.io/crates/phasm-core)
 [![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.93%2B-orange.svg)](https://www.rust-lang.org)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%20%7C%20Android%20%7C%20Web%20%7C%20CLI-green.svg)](https://phasm.app)
 
 Pure-Rust steganography engine for hiding encrypted text messages in JPEG photos.
 
 This is the core library behind [Phasm](https://phasm.app) — available on [iOS](https://apps.apple.com/app/phasm-steganography/id6759446274), Android, and the [web](https://phasm.app).
+
+> **Build from source, including H.264 and AV1 video stego: see [BUILDING.md](BUILDING.md).** Clone with `git clone --recursive` (the video codecs are git submodules), then `make check-deps && make cli-video`.
 
 > **Name**: original etymology = *phasmid* (stick-insect family — hide-in-plain-sight, hence the green mascot). Technical backronym: **PHASM = Plausibly-deniable Hidden Adaptive Shadow Messaging** — each word maps to a property of the engine in this crate.
 
@@ -19,31 +21,37 @@ Add the library to your Cargo.toml with default features (no H.264 encoder, per 
 cargo add phasm-core
 ```
 
-Or install the CLI binary:
+Or install the CLI (pre-built binaries: see [CLI](#cli) below), or build it from source:
 
 ```bash
-cargo install phasm-cli
+cargo install --git https://github.com/cgaffga/phasmcore phasm-cli
 ```
+
+**Building from source, with or without video: [BUILDING.md](BUILDING.md)** covers the prerequisites per OS (meson, ninja, nasm for the video codecs), every feature combination, the `make` targets, and using phasm-core as a git dependency.
 
 ### Optional Cargo features
 
 | Feature | Description |
 |---------|-------------|
 | `parallel` | [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD costs, STC embedding, Armor decode sweeps. Recommended for native builds. |
-| `video` | H.264 video stego pipeline (decoder + bitstream parsing). |
-| `simd` | Hand-tuned SIMD intrinsics (NEON / AVX2 / WASM SIMD128) for H.264 motion compensation and SATD. |
-| `h264-encoder` | Pure-Rust clean-room H.264 encoder. **EXPERIMENTAL — research-only**; production default is OpenH264 (`openh264-backend`). **OFF by default — only enable when distributing per local jurisdiction's [Via LA AVC](https://www.via-la.com/licensing-2/avc-h-264/) patent-pool terms.** Source-only consumption is royalty-free; binary distribution above the free tier (currently 100,000 units/year) is not. |
+| `h264-decoder` | H.264 video stego **decode** (pure-Rust CABAC walker, no C dependency). Implies `video`. |
+| `video` | MP4 demux/mux and H.264 bitstream parsing; the base of `h264-decoder`. |
+| `simd` | A NEON kernel for the H.264 stego walker (aarch64). The image-side SIMD kernels (NEON / AVX2 / WASM SIMD128) are always built. |
 
 ```bash
 cargo add phasm-core --features parallel
-cargo install phasm-cli --features h264-encoder   # H.264 video stego, source-build only
+cargo install --git https://github.com/cgaffga/phasmcore phasm-cli --features h264-decoder   # adds H.264 video decode
 ```
+
+The H.264 encoder (`h264-encoder`) and the AV1 features (`av1-encoder`, `av1-decoder`) are not part of the crates.io package. They build from a recursive clone of this repository or as a git dependency; see [BUILDING.md](BUILDING.md) and "Video steganography" below.
 
 ## Two Embedding Modes
 
 ### Ghost (Stealth)
 
-Optimizes for **undetectability**. Uses the [J-UNIWARD](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) cost function to assign distortion costs per DCT coefficient, then embeds via [Syndrome-Trellis Codes (STC)](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) to minimize total distortion. The result resists state-of-the-art steganalysis detectors (SRNet, XedroudjNet) at typical embedding rates.
+Optimizes for **undetectability**. Uses the [J-UNIWARD](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) cost function to assign distortion costs per DCT coefficient, then embeds via a ternary (double-layered) [Syndrome-Trellis Code (STC)](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) over **every** luminance AC coefficient, zeros included, to minimize total distortion (Ghost v3). Large photos are split into independent lanes that are embedded in parallel. Measured with SRNet (BOSSbase 1.01, QF75, 0.20 bpnzAC, trained from scratch), the detection error is 0.272, against 0.190 for the earlier design (0.5 = undetectable); the capacity bar's comfort band keeps typical messages far below that rate.
+
+Images written by core ≤ 0.4.3 (Ghost v1) still decode.
 
 Use Ghost when the stego image will be stored or transmitted without recompression — the embedding does not survive JPEG re-encoding.
 
@@ -53,22 +61,23 @@ Ghost mode also supports **file attachments** (Brotli-compressed, multi-file).
 
 Ghost mode supports **[shadow messages](https://phasm.app/blog/shadow-messages-plausible-deniability-steganography)** — multiple messages hidden in a single image, each with a different passphrase. If coerced into revealing a passphrase, you can give the shadow passphrase instead of the primary one. The adversary decodes a decoy message and has no way to detect whether additional messages exist.
 
-Shadows use **Y-channel direct LSB embedding** with Reed-Solomon error correction. Key design properties:
+Each shadow is a short **keyed-region STC** on the same luminance AC set as the primary. Key design properties:
 
-- **Cost-pool position selection** — shadow positions are drawn from the cheapest UNIWARD-cost regions via two-tier filtering (top-N% cost pool + keyed ChaCha20 permutation), ensuring modifications land in textured areas for maximum stealth
-- **∞-cost protection** — when the primary message uses dynamic w ≥ 2, shadow positions receive `f32::INFINITY` cost in the STC Viterbi trellis, routing the primary encoder around them with **BER ≈ 0%**
-- **Headerless brute-force decode** — no magic bytes or agreed-upon parameters. A "first-block peek" decodes just the first RS block for each (fraction, parity) combination to read `plaintext_len` and derive the exact frame data length — **~30 RS block decodes** instead of scanning thousands of FDL values. A small-FDL fallback handles tiny messages (single partial RS block). AES-256-GCM-SIV authentication is the only validator
-- **Stego-cost verification** — after STC embedding, the encoder re-runs UNIWARD on the stego image to verify shadow BER. If verification fails, an **escalation cascade** automatically increases RS parity (4 → 8 → 16 → … → 128) until the shadow survives or capacity is exhausted
+- **Keyed regions, no costs at the decoder** — each passphrase defines a keyed ChaCha20 order over every Y AC coefficient (zeros included). A shadow of `n` RS-coded bits owns the first `n·w` positions of its order and embeds into the coefficient parity with an STC of width `w`. The AC set never changes under embedding, so the decoder rebuilds the order exactly
+- **Cost-adaptive at the encoder** — the trellis minimizes the J-UNIWARD (or SI-UNIWARD) cost of the shadow's changes, so they land in textured areas like the primary's
+- **Wet regions, no collisions** — each shadow treats every earlier shadow's region as wet (infinite cost), and the primary treats all regions as wet. No layer writes into another's region, so every layer arrives error-free; RS parity 4 is only an integrity gate
+- **Headerless decode** — no magic bytes or agreed-upon parameters. For each candidate width the decoder reads a 48-bit syndrome header, requires the first RS block to decode with zero corrections, and only then extracts the full region. AES-256-GCM-SIV authentication is the only validator
+- **Verify = decode** — after the primary is embedded, every shadow is extracted exactly as the decoder reads it
 
-`smart_decode` automatically tries shadow decode as a fallback after primary Ghost decode.
+A single shadow may hold half the Ghost maximum, and the capacity bands bound the total of primary and shadows. Shadows written by core ≤ 0.4.3 (shadow layout v1) still decode. `smart_decode` automatically tries shadow decode as a fallback when the primary Ghost decode finds nothing.
 
 #### SI-UNIWARD (Deep Cover)
 
-When the encoder has access to the original uncompressed pixels (e.g. PNG, HEIC, or RAW input converted to JPEG), **SI-UNIWARD** (Side-Informed UNIWARD) exploits JPEG quantization rounding errors to dramatically reduce embedding costs. Coefficients that were "close to the boundary" between two quantization levels can be flipped at near-zero cost, and the modification direction is chosen to move *toward* the pre-quantization value rather than the default nsF5 direction.
+When the input is not a JPEG (PNG, HEIC, a camera photo), **SI-UNIWARD** (Side-Informed UNIWARD) uses the JPEG quantization rounding errors of the cover as side information. Core writes the cover JPEG itself from the raw pixels (`deep_cover_jpeg`, byte-identical to libjpeg-turbo `cjpeg`; the apps use IJG quality 92), so every rounding error `e` is known exactly. A change toward the pre-quantization value costs the J-UNIWARD cost scaled by `1 − 2|e|`; a change away from it costs the full J-UNIWARD cost.
 
-The result: **~43% higher capacity** at the same detection risk, or equivalently the same capacity with significantly lower distortion. The decoder is completely unchanged — `ghost_decode` works identically on standard and SI-UNIWARD stego images.
+The result: **~25% more capacity** than standard Ghost (max nzAC/4 instead of nzAC/5 frame bits), with even better stealth — measured with SRNet at QF92 (BOSSbase 1.01, 4800 test pairs), the detection error is 0.450 ± 0.003 at the larger payload versus 0.366 ± 0.003 for standard Ghost at its maximum (0.5 = undetectable). The bonus is decided by core from the pixels: a cover that is not the writer's output for those pixels falls back to approximate side information (cost factor floored at 0.3) and standard Ghost capacity, and measures no better than standard Ghost. The decoder is completely unchanged — `ghost_decode` works identically on standard and SI-UNIWARD stego images.
 
-Use `ghost_encode_si` / `ghost_capacity_si` when raw pixels are available alongside the JPEG cover.
+Use `deep_cover_jpeg` to write the cover, then pass the same pixels to `ghost_encode_si` / `ghost_bands_si` / `ghost_capacity_si` (or let `ghost_encode_deep_cover` do both in one call).
 
 ### Armor (Robust)
 
@@ -108,16 +117,16 @@ let optimized = optimize_cover(&raw_pixels_rgb, width, height, &OptimizerConfig 
 
 ### Decode Auto-Detection
 
-`smart_decode` tries all modes automatically — Ghost primary → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
+`smart_decode` tries all modes automatically — Ghost primary (v3, then v1) → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
 
 ### Which Mode Should I Use?
 
 | | Ghost | Armor | Fortress |
 |---|---|---|---|
 | **Goal** | Undetectable | Survives recompression | Survives WhatsApp |
-| **Algorithm** | J-UNIWARD + STC | STDM + Reed-Solomon | BA-QIM + Watson masking |
+| **Algorithm** | J-UNIWARD + ternary STC | STDM + Reed-Solomon | BA-QIM + Watson masking |
 | **Best for** | Direct sharing, AirDrop, email, "send as file" | Social media, cloud storage, cross-platform | WhatsApp, messaging apps with aggressive compression |
-| **Capacity** | High (~1 KB per 12 MP) | Medium | Low (short messages only) |
+| **Capacity** | High (12 MP photo: ~2.6 KB comfort band, ~96 KB max) | Medium | Low (short messages only) |
 | **Resists detection** | Yes (steganalysis-resistant) | Moderate | Moderate |
 | **Resists recompression** | No | Yes (>95% at mild QF drop) | Yes (survives QF ~62) |
 | **Plausible deniability** | Yes (shadow messages) | No | No |
@@ -148,13 +157,25 @@ println!("Integrity: {:.0}%", quality.integrity_percent);
 ```
 
 ```rust
-use phasm_core::{ghost_encode_si, ghost_decode};
+use phasm_core::{
+    deep_cover_jpeg, ghost_bands_si, ghost_encode_si, ghost_decode, JpegImage,
+    DEEP_COVER_DEFAULT_QUALITY,
+};
 
-// SI-UNIWARD: when you have original uncompressed pixels + the JPEG cover
-let raw_pixels_rgb = /* RGB pixel data from PNG/HEIC/RAW */;
-let cover = std::fs::read("photo.jpg").unwrap();
+// Deep Cover (SI-UNIWARD): raw RGB pixels (row-major, 3 bytes per pixel)
+// decoded from a PNG / HEIC / camera photo by your image library
+let (raw_rgb, width, height): (Vec<u8>, u32, u32) = load_rgb("photo.png");
+
+// Core writes the cover JPEG, so the side information is exact
+let cover = deep_cover_jpeg(&raw_rgb, width, height, DEEP_COVER_DEFAULT_QUALITY).unwrap();
+
+// Capacity bar: the same pixels unlock the Deep Cover bands (max nzAC/4)
+let img = JpegImage::from_bytes(&cover).unwrap();
+let bands = ghost_bands_si(&img, &raw_rgb, width, height, 0, 0).unwrap();
+println!("comfort {} B, max {} B", bands.comfort_bytes, bands.max_bytes);
+
 let stego = ghost_encode_si(
-    &cover, raw_pixels_rgb, width, height, "secret message", "passphrase"
+    &cover, &raw_rgb, width, height, "secret message", "passphrase"
 ).unwrap();
 // Decode is identical — no special decoder needed
 let decoded = ghost_decode(&stego, "passphrase").unwrap();
@@ -195,6 +216,7 @@ ghost_decode(jpeg_bytes, passphrase) -> Result<PayloadData>
 ghost_encode_with_files(jpeg_bytes, message, files, passphrase) -> Result<Vec<u8>>
 ghost_encode_with_files_quality(jpeg_bytes, message, files, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_capacity(jpeg_image) -> Result<usize>
+ghost_bands(jpeg_image, shadow_count, shadow_total_bytes) -> Result<GhostBands>
 
 // Ghost shadow messages (plausible deniability)
 ghost_encode_with_shadows(jpeg_bytes, message, files, passphrase, shadows, si) -> Result<Vec<u8>>
@@ -202,22 +224,30 @@ ghost_encode_with_shadows_quality(jpeg_bytes, message, files, passphrase, shadow
 ghost_encode_si_with_shadows(jpeg_bytes, raw_rgb, width, height, message, files, passphrase, shadows) -> Result<Vec<u8>>
 ghost_encode_si_with_shadows_quality(jpeg_bytes, raw_rgb, width, height, message, files, passphrase, shadows) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_shadow_decode(stego_bytes, passphrase) -> Result<PayloadData>
-shadow_capacity(jpeg_bytes) -> Result<usize>
 estimate_shadow_capacity(jpeg_image) -> Result<usize>
-ghost_capacity_with_shadows(jpeg_bytes, shadows) -> Result<usize>
+estimate_shadow_capacity_si(jpeg_image, raw_rgb, width, height) -> Result<usize>
+shadow_capacity(y_nzac) -> usize
+ghost_capacity_with_shadows(jpeg_image, shadow_count, shadow_total_bytes, is_si) -> Result<usize>  // is_si is ignored
 
-// Ghost SI-UNIWARD (stealth + side-informed, ~43% more capacity)
+// Ghost SI-UNIWARD "Deep Cover" (stealth + side-informed, ~25% more capacity with exact SI)
+deep_cover_jpeg(raw_rgb, width, height, quality) -> Result<Vec<u8>>  // the cover JPEG (= libjpeg-turbo cjpeg)
 ghost_encode_si(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<Vec<u8>>
 ghost_encode_si_with_quality(jpeg_bytes, raw_rgb, width, height, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 ghost_encode_si_with_files(jpeg_bytes, raw_rgb, width, height, message, files, passphrase) -> Result<Vec<u8>>
 ghost_encode_si_with_files_quality(jpeg_bytes, raw_rgb, width, height, message, files, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
-ghost_capacity_si(jpeg_image) -> Result<usize>
+ghost_bands_si(jpeg_image, raw_rgb, width, height, shadow_count, shadow_total_bytes) -> Result<GhostBands>
+ghost_capacity_si(jpeg_image, raw_rgb, width, height) -> Result<usize>
+ghost_encode_deep_cover(raw_rgb, width, height, quality, message, files, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
+ghost_encode_deep_cover_with_shadows(raw_rgb, width, height, quality, message, files, passphrase, shadows) -> Result<(Vec<u8>, EncodeQuality)>
+ghost_capacity_deep_cover(raw_rgb, width, height, quality) -> Result<usize>
+DEEP_COVER_DEFAULT_QUALITY = 92
 
 // Armor mode (robust)
 armor_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
 armor_encode_with_quality(jpeg_bytes, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
 armor_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 armor_capacity(jpeg_image) -> Result<usize>
+armor_capacity_info(jpeg_bytes) -> Result<ArmorCapacityInfo>
 
 // Unified decode (auto-detects mode)
 smart_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
@@ -247,122 +277,97 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 - **`ShadowLayer`** — shadow message for plausible deniability (message + passphrase + optional files)
 - **`EncodeQuality`** — encode-time score (0-100), contextual hint key, mode (stealth for Ghost, robustness for Armor)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
+- **`GhostBands`** — Ghost capacity-bar bands in plaintext bytes (`max_bytes`, `comfort_bytes`, `caution_bytes`)
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
 - **`OptimizerConfig`** — optimizer settings (strength, seed, mode)
 - **`OptimizerMode`** — pipeline variant (Ghost, Armor, Fortress)
 
-The SI-UNIWARD functions (`ghost_encode_si`, `ghost_encode_si_with_files`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `pixel_width: u32`, `pixel_height: u32`). The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
+The SI-UNIWARD functions (`ghost_encode_si*`, `ghost_bands_si`, `ghost_capacity_si`, `estimate_shadow_capacity_si`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `width: u32`, `height: u32`). The side information is exact, and the Deep Cover capacity applies, only when the cover JPEG is `deep_cover_jpeg`'s output for those same pixels; any other cover gets approximate side information and standard Ghost capacity. The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
+
+The capacity bands are policy for the apps' capacity bar (comfort ≤ max/4 with a square-root cap on large photos, caution ≤ max/2, max = nzAC/5 frame bits, nzAC/4 with exact side information). The encoder itself enforces only technical feasibility.
 
 ## Video steganography (H.264)
 
-Phase C (closed 2026-05-14) ships H.264 video stego with two encoder
-backends. The **OpenH264 backend is the v1.0 production default**; the
-pure-Rust encoder remains available as an opt-in EXPERIMENTAL path for
-research and source-only consumers who cannot ship the C++ backend.
+H.264 video stego has one encoder and one decoder:
 
-### Encoder selection
+- **Encode** (`h264-encoder`): the [phasm-openh264](https://github.com/cgaffga/phasm-openh264)
+  fork of Cisco's OpenH264 codec (BSD-2-Clause), statically linked via
+  the `core-openh264-sys` workspace member (`openh264-sys/`, built with
+  meson + ninja from the `vendor/phasm-openh264` submodule, pinned by SHA
+  in `openh264-sys/build.rs`). A 1080p × 30-frame stego encode takes
+  about 1.3 s. The stego bits reach the bitstream as overrides at CABAC
+  emit time; the encoder's own state (residuals, motion vectors) is not
+  modified.
+- **Decode** (`h264-decoder`): a pure-Rust CABAC walker with no C
+  dependency, which reads any Annex-B input. Decode-only builds use it
+  without linking OpenH264.
 
-| Backend | CLI flag | Status | 1080p × 30f encode |
-|---------|----------|--------|--------------------|
-| OpenH264 (default) | `--encoder open-h264` | Production | 1.3 s |
-| Pure-Rust (experimental) | `--encoder rust-h264` | EXPERIMENTAL — research-only | ~60 min (extrapolated) |
+Both sides share one wire format through the streaming sessions
+(`StreamingEncodeSession` / `StreamingDecodeSession`, see
+`src/codec/h264/streaming_session.rs`): the same 4-domain canonical
+cover ordering (CS → CSL → MVDs → MVDsl), per-GOP `chunk_frame`
+protocol, STC seed derivation and `CostWeights`. Shadow messages work
+in video too; encode, verify and decode run one GOP at a time, so memory
+is bounded by the GOP, not by the clip length. The CLI's `phasm decode`
+(`cli/src/decode.rs::decode_h264_cabac`) decodes video through
+`StreamingDecodeSession`; `phasm video-encode` and `phasm
+video-capacity` encode and measure. These two subcommands exist only in
+builds with an encoder (`h264-encoder` or `av1-encoder`); a decode-only
+build (`h264-decoder`) lists just `encode`, `decode` and `capacity`, and
+`--codec` offers only the compiled-in codecs.
 
-Per the C.8.14 perf benchmark, OpenH264 stego full is **1365× faster**
-than pure-Rust at 480p × 10f (86 ms vs 117 s), **4114× faster** at
-720p × 16f (370 ms vs 25.4 min), and extrapolates to ~60 min per encode
-at 1080p × 30f on the pure-Rust path versus 1.3 s on OpenH264.
+`phasm video-capacity` prints the same capacity bands as the apps (comfort,
+and max = the red end) plus the technical STC ceiling, which is not a
+recommendation: above the max the video is visibly damaged. `phasm
+video-encode` does not enforce the bands (like image Ghost) but warns on
+stderr when the payload exceeds the max.
 
-The pure-Rust encoder is shipped for transparency, reviewability, and
-WASM/no-FFI use cases. It is not appropriate for production workflows
-above smoke-test scale and carries known visual-quality and stealth-fingerprint
-gaps versus OpenH264. Use it only when you need a pure-Rust path and
-accept the perf + quality trade-off.
+`phasm video-encode` writes its H.264 MP4 with the in-tree muxer in the
+shape of a libavformat transcode with the libopenh264 encoder
+(`MuxerProfile::LavfOpenH264`): a container that agrees with the OpenH264
+bitstream inside it, carrying the source's audio interleaved with the
+video and none of the source file's timestamps or names. (Releases up to
+0.4.3 wrote a HandBrake/x264-style container with a synthesised x264 SEI
+banner, which the OpenH264 bitstream contradicted.)
 
-### Bitstream interchange
+An earlier pure-Rust H.264 encoder and its CAVLC pipeline have been
+retired. The feature name `h264-encoder` now denotes the OpenH264
+encoder (it was called `openh264-backend` before).
 
-Since the streaming session landed (`StreamingEncodeSession` /
-`StreamingDecodeSession`, see `src/codec/h264/streaming_session.rs`),
-both backends converge on a unified wire format: same 4-domain
-canonical cover ordering (CS → CSL → MVDs → MVDsl), same per-GOP
-`chunk_frame` protocol, same STC seed derivation, same `CostWeights`.
-`StreamingDecodeSession` runs a pure-Rust walker on any Annex-B input
-and decodes output from either encoder — OH264 reaches the wire via
-Phase 4 wire_only scratch-table overrides at CABAC emit (encoder
-state untouched), pure-Rust reaches the same wire via residual
-mutation with a cascade-safety filter, but the wire shape is
-identical at the bin level. The CLI's `phasm decode` (in
-`cli/src/decode.rs::decode_h264_cabac`) tries `StreamingDecodeSession`
-first, then falls back to `openh264_stego_decode_yuv` and
-`h264_stego_smart_decode_video_with_payload` for files produced by
-pre-streaming versions.
+In the Phasm apps, video encoding is experimental and off by default
+(Settings → "Enable video (experimental)"); decoding a stego video
+always works. Video is not available in the web tool (WASM).
 
-### Pure-Rust pipeline
+If `vendor/phasm-openh264` is absent, `openh264-sys` builds against
+fail-fast stubs: the build prints a `cargo:warning=...`, and the encoder
+calls return errors at runtime.
 
-`stego/video/h264_pipeline.rs` embeds encrypted messages in CAVLC-coded
-Baseline H.264 streams across four domains (trailing-one signs,
-level-suffix magnitude LSBs, level-suffix sign LSBs, motion-vector
-difference LSBs). The pure-Rust H.264 encoder and its CABAC entropy
-coder are clean-room — derived from ITU-T H.264 spec / ISO/IEC 14496-10
-and published academic literature; numeric tables are transcribed from
-the spec or cited to published sources.
+### Distribution (patent-pool posture)
 
-### OpenH264 backend (v1.0 production default)
+H.264 encoders fall under the
+[Via LA AVC patent pool](https://www.via-la.com/licensing-2/avc-h-264/).
+Source-only distribution is royalty-free; binary distribution above the
+pool's free tier is not. Phasm therefore ships no H.264 encoder outside
+the mobile apps:
 
-The `openh264-backend` Cargo feature wires in the
-[phasm-openh264](https://github.com/cgaffga/phasm-openh264) fork of
-Cisco's OpenH264 codec (BSD-2-Clause), statically linked via the
-`core-openh264-sys` workspace member. The fork is pinned by SHA in
-`core/openh264-sys/build.rs` and reached via git submodule at
-`vendor/phasm-openh264`. The fork submodule is not carried by
-phasmcore's source mirror, so `cargo build --features
-openh264-backend` will **build against fail-fast stubs** unless you
-check out the fork separately:
-
-```bash
-git clone https://github.com/cgaffga/phasmcore.git
-cd phasmcore
-git clone https://github.com/cgaffga/phasm-openh264.git vendor/phasm-openh264
-git -C vendor/phasm-openh264 checkout $(grep -m1 -oE '[a-f0-9]{40}' core/openh264-sys/build.rs)
-cargo build --features openh264-backend
-```
-
-If the submodule is absent, the build prints a `cargo:warning=...`
-explaining the situation and points back here. Backend calls compile
-and link fine but return `-1` / `NULL` at runtime so callers fall back
-to the pure-Rust path with a clear error. Useful state for downstream
-consumers that want to use phasm-core's JPEG path or the pure-Rust
-H.264 path without the C++ toolchain (meson + ninja) the real backend
-needs.
-
-### Source-only distribution (patent-pool posture)
-
-The encoder is gated behind the `h264-encoder` Cargo feature, which is
-**OFF by default**. Pre-built binaries published to GitHub Releases (the
-`phasm` CLI installer at the bottom of this README) do **NOT** bundle
-the H.264 encoder — they ship JPEG steganography only. Consumers who
-want CLI video stego must rebuild from source themselves:
+- the crates.io package does not declare the `h264-encoder` feature;
+- the pre-built `phasm` CLI binaries on GitHub Releases (installers in
+  the CLI section below) contain no video code at all;
+- this repository carries the encoder as **source**: a recursive clone
+  (or a git dependency) builds it, with the OpenH264 fork as a pinned
+  submodule ([BUILDING.md](BUILDING.md));
+- video **decode** alone builds from source without any C code:
 
 ```bash
-cargo install phasm-cli --features h264-encoder
+cargo install --git https://github.com/cgaffga/phasmcore phasm-cli --features h264-decoder
+phasm decode stego.mp4 -p "passphrase"
 ```
 
-This posture accommodates [Via LA's AVC patent-pool](https://www.via-la.com/licensing-2/avc-h-264/)
-licensing for distributed H.264 encoder binaries. Source-only
-distribution is permitted royalty-free; binary distribution above the
-free-tier (100,000 units/year as of 2026) is not. Mobile-app builds
-include the encoder and are subject to the patent-pool terms applicable
-to those distribution channels — not to source consumers of this
-crate.
-
-The `core/cli/Cargo.toml` and `core/Cargo.toml` make this gating
-explicit; do not enable `h264-encoder` for any binary you intend to
-publish through GitHub Releases or other free-tier-blind channels
-without first reviewing the Via LA AVC license terms.
-
-Production-ready path (`openh264-backend`) ships with the v1.0 CLI and
-mobile builds; the pure-Rust `h264-encoder` path remains EXPERIMENTAL
-opt-in via `--encoder rust-h264`. The API and default feature set may
-still evolve; published here for transparency and review.
+Mobile-app builds include the encoder and are subject to the patent-pool
+terms applicable to those distribution channels, not to source consumers
+of this crate. Whoever distributes a binary built with `h264-encoder`
+takes on the AVC patent-pool obligations for it; review the Via LA AVC
+license terms before you publish one.
 
 ## Video steganography (AV1 — Phase A, EXPERIMENTAL)
 
@@ -370,7 +375,7 @@ Phase A landed 2026-05-21 (v0.3-AV1 architectural ship: W2 dav1d hook
 foundation, W3 rav1e WriterStego + cursor parity, W4 real-content
 corpus round-trip, W5 regression-bound drift gate, W6 self-steganalyzer
 v0.3, W7 cross-arch determinism via Rosetta 2). End-to-end stego
-round-trip via the **dav1d** decoder (`av1-backend`) and **rav1e**
+round-trip via the **dav1d** decoder (`av1-decoder`) and **rav1e**
 encoder (`av1-encoder`) through the
 [phasm-dav1d](https://github.com/cgaffga/phasm-dav1d) and
 [phasm-rav1e](https://github.com/cgaffga/phasm-rav1e) forks. Both
@@ -378,28 +383,27 @@ codecs are royalty-free per the
 [AOM AV1 patent license](https://aomedia.org/license/patent-license/) —
 no Via LA-style patent-pool constraint, unlike H.264.
 
-The full AV1 architecture is source-visible in this mirror under
-`src/codec/av1/` + `dav1d-sys/` + `docs/design/video/av1/` for
-transparency and review. The `av1-encoder` and `av1-backend` Cargo
-features themselves are **stripped from the crates.io distribution
-for v0.3** because the build needs the `phasm-rav1e` and `phasm-dav1d`
-forks resolvable as crates, plus the `dav1d-sys/build.rs` stub
-forward-declared instead of including the vendor header. Both unblocks
-are tracked for v0.4+; until then, AV1 features are available when
-building the monorepo with the submodules checked out. Stealth
-calibration vs the H.264 production path is still maturing.
+The AV1 code lives under `src/codec/av1/` + `dav1d-sys/`. phasm-dav1d is
+a pinned submodule (`vendor/phasm-dav1d`); phasm-rav1e is consumed from
+GitHub source only (never published to crates.io) and patched in at a
+pinned commit, so a recursive clone builds AV1 with `make build-video`
+(see [BUILDING.md](BUILDING.md), "The rav1e fork"). The features are **not
+in the crates.io package**: dav1d needs the submodule's sources, which a
+registry package cannot carry, and the rav1e fork needs a `[patch]` that a
+registry package cannot give its users. Stealth calibration vs the H.264
+production path is still maturing.
 
 ## Cargo Features
 
 | Feature | Description |
 |---------|-------------|
 | `parallel` | Enables [Rayon](https://github.com/rayon-rs/rayon) parallelism for J-UNIWARD cost computation, STC embedding, and Armor decode sweeps. Recommended for native builds. |
-| `video` | H.264 video stego pipeline (decoder + bitstream parsing). See "Video steganography (H.264)" above. |
-| `h264-encoder` | Pure-Rust H.264 encoder for video stego encode. Implies `video`. **EXPERIMENTAL — research-only**, ~1365× slower than OpenH264 at 480p × 10f; opt in via `--encoder rust-h264`. Source-only (AVC patent-pool). |
-| `cabac-stego` | Enables the encode-time CABAC stego pipeline at H.264 High Profile + CABAC. Implies `h264-encoder`. EXPERIMENTAL. |
-| `openh264-backend` | **v1.0 production default**. Second H.264 path via the `phasm-openh264` fork (BSD-2-Clause), wired into `phasm decode` as the auto-detect first try. Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). |
-| `av1-backend` | dav1d decoder backend via the [`phasm-dav1d`](https://github.com/cgaffga/phasm-dav1d) fork (BSD-2-Clause, royalty-free per AOM AV1). EXPERIMENTAL — **Phase A 2026-05-21**, stripped from the crates.io distribution for v0.3; available when building the monorepo with `vendor/phasm-dav1d` checked out. |
-| `av1-encoder` | rav1e encoder via the [`phasm-rav1e`](https://github.com/cgaffga/phasm-rav1e) fork (BSD-2-Clause, royalty-free per AOM AV1). EXPERIMENTAL — **Phase A 2026-05-21**, same posture as `av1-backend`. |
+| `simd` | A NEON kernel for the H.264 stego walker (aarch64). The image-side SIMD kernels are always built. |
+| `video` | MP4 demux/mux and H.264 bitstream parsing; the base of the H.264 features. See "Video steganography (H.264)" above. |
+| `h264-decoder` | H.264 video stego decode: pure-Rust CABAC walker + streaming decode session, no C dependency. Implies `video`. |
+| `h264-encoder` | H.264 video stego encode via the `phasm-openh264` fork (BSD-2-Clause, statically linked, needs meson + ninja). Implies `h264-decoder`, `parallel` and `simd`. Builds against fail-fast stubs if `vendor/phasm-openh264` is absent (warns at build time, returns errors at runtime). Builds from a recursive clone; not in the crates.io package (AVC patent pool). |
+| `av1-decoder` | dav1d decoder backend via the [`phasm-dav1d`](https://github.com/cgaffga/phasm-dav1d) fork (BSD-2-Clause, royalty-free per AOM AV1). EXPERIMENTAL. Builds from a recursive clone (`vendor/phasm-dav1d`; meson + ninja); not in the crates.io package. |
+| `av1-encoder` | rav1e encoder via the [`phasm-rav1e`](https://github.com/cgaffga/phasm-rav1e) fork (BSD-2-Clause, royalty-free per AOM AV1), patched in from GitHub (`make build-video`, BUILDING.md). Implies `av1-decoder` and `parallel`. EXPERIMENTAL; same posture as `av1-decoder`. |
 | `wasm` | WASM bridge support via `wasm-bindgen` + `js-sys`. |
 
 ## CLI
@@ -415,8 +419,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cgaffga/phasmcore/relea
 # Windows PowerShell
 powershell -c "irm https://github.com/cgaffga/phasmcore/releases/latest/download/phasm-cli-installer.ps1 | iex"
 
-# Or build from source
-cargo install --path cli
+# Or build from source (in a recursive clone; see BUILDING.md)
+cargo install --path cli                                        # image stego
+cargo install --path cli --features h264-encoder,av1-encoder    # + H.264 and AV1 video
 ```
 
 ### Usage
@@ -433,7 +438,7 @@ phasm encode photo.jpg --mode ghost -m "secret" -p "pass" -o secret.jpg
 phasm encode photo.png --mode ghost -m "hello" -p "pass"
 
 # Shadow messages (plausible deniability)
-phasm encode photo.jpg --mode ghost -m "real" -p "main" --m2 "decoy" --p2 "shadow"
+phasm encode photo.jpg --mode ghost -m "real" -p "main" --shadow-message-2 "decoy" --shadow-passphrase-2 "shadow"
 
 # File attachments
 phasm encode photo.jpg --mode ghost -m "see attached" -p "pass" --attach plans.pdf
@@ -444,8 +449,11 @@ phasm decode stego.jpg -p "passphrase"
 # Extract file attachments
 phasm decode stego.jpg -p "pass" --extract ./output/
 
-# Show capacity
+# Show capacity (Ghost: the apps' comfort / caution / max bands; display only)
 phasm capacity photo.jpg
+# Ghost:   comfort 2563 bytes, caution 47863 bytes, max 95773 bytes
+# Armor:   5210 bytes (Fortress: 135 bytes) on the 1200x1600 cover
+# Shadows: 47115 bytes per layer
 
 # Pipe message from stdin
 echo "hello" | phasm encode photo.jpg -p "pass"
@@ -458,6 +466,8 @@ phasm decode stego.jpg -p "pass" --quiet
 See `phasm encode --help`, `phasm decode --help`, `phasm capacity --help` for all options.
 
 ## Building & Testing
+
+Prerequisites, the full feature matrix, `make` targets and troubleshooting: [BUILDING.md](BUILDING.md).
 
 ```bash
 cargo test -p phasm-core                    # default (single-threaded)
@@ -484,15 +494,17 @@ cargo run -p phasm-core --example test_link -- stego.jpg
 
 - **Zero C FFI** — pure Rust from JPEG parsing to AES encryption, compiles to native and WASM
 - **Deterministic** — identical output across x86, ARM, and WASM using a [pure-IEEE 754 polynomial math module](https://phasm.app/blog/deterministic-cross-platform-math-wasm) (no `f64::sin`/`cos` — they compile to non-deterministic `Math.*` in WASM)
-- **Memory-efficient** — strip-based wavelet computation, compact positions (8 bytes each), 1-bit packed Viterbi back pointers (32× reduction), segmented checkpoint for large images (O(√n) memory), `i8`-quantized SI-UNIWARD rounding errors (8× smaller than `f64`), strip-by-strip luma block computation, strategic `drop()` calls before JPEG output. Supports **200 MP** images under ~1 GB peak memory.
-- **Short messages** — optimized for text payloads under 1 KB
+- **Memory-efficient** — a Ghost encode needs ≈ 7.25 bytes per pixel of fixed buffers (parsed JPEG, keyed order, output) plus ≈ 74 bytes per position of each lane in flight (64 of them the h = 9 trellis back pointers). Costs are computed strip-wise and gathered per lane group, never held for the whole image. Given a memory budget, the encoder walks a ladder: as many in-memory lanes at once as fit, then one lane at a time, then checkpointed lanes (O(√n) memory, twice the trellis work); the output is byte-identical on every rung. Peak stays under 1 GB up to ~100 MP and is ~1.4 GB at 200 MP; measured on an iPhone 16 Pro, a 12 MP encode peaks at 629 MB and a 48 MP encode at 1.03 GB.
+- **Any payload size** — Ghost carries anything from a few characters to hundreds of KB, bounded by the cover's capacity; Armor and Fortress target short messages
 - **Stego output is raw** — the JPEG bytes after encoding must be saved/shared without re-encoding
 
 ### JPEG Codec
 
-The [`jpeg`](src/jpeg/) module is a [from-scratch JPEG coefficient codec](https://phasm.app/blog/pure-rust-jpeg-coefficient-codec) — zero dependencies beyond `std`. It parses JPEG files into DCT coefficient grids, allows modification, and writes them back with **byte-for-byte round-trip fidelity**. Supports both baseline (SOF0) and progressive (SOF2) JPEG input, always outputs baseline.
+The [`jpeg`](src/codec/jpeg/) module is a [from-scratch JPEG coefficient codec](https://phasm.app/blog/pure-rust-jpeg-coefficient-codec) — zero dependencies beyond `std`. It parses JPEG files into DCT coefficient grids, allows modification, and writes them back with **byte-for-byte round-trip fidelity**. Supports both baseline (SOF0) and progressive (SOF2) JPEG input, always outputs baseline.
 
 Original Huffman tables are preserved from the cover image (with fallback to rebuild if needed).
+
+The Deep Cover cover writer (`cover_writer.rs`) encodes RGB pixels to a baseline JPEG that is **byte-identical to libjpeg-turbo `cjpeg -quality Q`** (default options), integer arithmetic only, with identical output on aarch64, x86_64 and wasm32. It also reports every luma coefficient before quantization, which is where Deep Cover's exact side information comes from. The cover carries the most common JPEG signature there is (IJG tables, standard Huffman tables, JFIF) and no phasm-specific marker.
 
 ### Cryptography
 
@@ -507,98 +519,59 @@ All payloads are encrypted before embedding:
 ### Ghost Pipeline
 
 1. Parse JPEG into DCT coefficients
-2. Derive structural key (Argon2id, overlapped with step 3 on multi-core) → permutation seed + STC seed
-3. Compute [J-UNIWARD costs](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) **strip-by-strip** (Daubechies-8 wavelet, 3 subbands, parallel row+column filtering) — positions collected inline, no full CostMap materialized
-4. *(SI-UNIWARD only)* Modulate costs inline using quantized rounding errors (`i8`, <2% precision loss): `cost *= (1 - 2|error|)`. Luma blocks computed in strips of 50 block-rows to minimize peak memory.
-5. Permute coefficient order (Fisher-Yates with ChaCha20)
+2. Derive structural key (Argon2id, overlapped with step 3 on multi-core) → seeds for the keyed coefficient order and the STC matrices (domain-separated from the v1 seeds, so a v3 image never parses as v1 or vice versa)
+3. Compute [J-UNIWARD costs](https://phasm.app/blog/uerd-vs-juniwird-detection-benchmarks) for every Y AC coefficient **strip-by-strip** (Daubechies-8 wavelet, 3 subbands, parallel row+column filtering) — costs are gathered per lane group, never held for the whole image
+4. *(SI-UNIWARD only)* Modulate the costs with the rounding errors (`i8` codes): with exact side information a change toward the pre-quantization value costs `cost × (1 − 2|e|)`, a change away the full cost, and exact ties stay unmodulated; approximate side information floors the factor at 0.3
+5. Order every Y AC coefficient, zeros included, with a keyed Fisher-Yates shuffle (ChaCha20)
 6. Encrypt payload (AES-256-GCM-SIV) and frame (length + CRC)
-7. **Short STC with dynamic w**: embed only the actual `m` message bits (not zero-padded to `m_max`). The encoder picks `w = min(⌊n/m⌋, 10)` — for small messages this means **2,500× fewer coefficient modifications** compared to fixed `w`. The decoder brute-forces all `w` values 1–10 in parallel (`rayon::find_map_first`); CRC32 in the frame format provides instant validation (~0 false positive rate at 2⁻³²).
-8. *(Shadow mode)* Assign `f32::INFINITY` cost to shadow positions → Viterbi routes around them
-9. Embed via [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) (h=7) minimizing weighted distortion; SI-UNIWARD uses informed modification direction (toward pre-quantization value)
+7. **Lanes**: split the order and the frame bits into `L = clamp(min(⌊n / 2²⁰⌋, ⌊m / 4096⌋), 1, 64)` contiguous lanes (`n` AC coefficients, `m` frame bits), planned in parallel
+8. **Ternary embedding per lane** (double-layered STC, Filler–Judas–Fridrich 2011): half of a lane's bits go into the second bit plane `⌊c/2⌋ mod 2` (layer 2, with costs from the marginal flip probabilities of the optimal ternary embedding), the rest into the parity `c mod 2` (layer 1). Each layer is a binary [STC](https://phasm.app/blog/syndrome-trellis-codes-practical-guide) with constraint height **h = 9** and the widest width of a fixed ladder (1, 2, …, 16, then ×1.2 steps) that fits the lane. The ±1 direction of a change carries message bits, so zeros may become ±1 and ±1 may become 0
+9. *(Shadow mode)* Every shadow region is wet (infinite cost) for the primary
 10. Write modified coefficients back to JPEG (with progress reporting per MCU row)
+
+The decoder needs no costs. For each lane count and width the cover admits, it reads lane 0's 48-bit frame header and accepts it only if the header is consistent with that lane count and width; everything else is then determined, and the CRC and the AES-GCM-SIV tag validate. After v3 it tries the v1 decoder (binary STC on the non-zero AC set, h = 7, widths 1–10), so images written by core ≤ 0.4.3 still decode.
 
 #### STC Viterbi Optimizer
 
-The STC encoder uses a Viterbi-style dynamic programming algorithm to find the minimum-cost modification sequence across a trellis with 2^h = 128 states. Two key memory optimizations make it practical for large images (32MP+ photos, 48MP camera sensors):
-
-**1-bit packed back pointers** — The standard Viterbi stores one predecessor state (u32) per trellis state per cover step. Since there are exactly 2 candidate predecessors per target state (stego_bit = 0 or 1), only 1 bit is needed. One `u128` (16 bytes) stores all 128 states' decisions per step, replacing a `Vec<u32>` of 128 entries (512 bytes). **32× memory reduction.**
-
-The forward pass iterates over *target states* instead of source states:
+The STC encoder uses a Viterbi-style dynamic programming algorithm to find the minimum-cost modification sequence across a trellis with 2^h = 512 states (h = 9; the trellis supports any height up to 12). Each target state has exactly 2 candidate predecessors (stego bit 0 or 1), so one bit per state records the choice: a trellis step's back pointers fit in 2^h / 64 = 8 `u64` words, **64 bytes per position**.
 
 ```rust
 for s in 0..num_states {
-    let cost_0 = prev_cost[s]       + rho_0;  // stego=0, pred=s
-    let cost_1 = prev_cost[s ^ col] + rho_1;  // stego=1, pred=s^col
-    if cost_1 < cost_0 {
-        curr_cost[s] = cost_1;
-        packed_bp |= 1u128 << s;  // 1 bit records the choice
-    } else {
-        curr_cost[s] = cost_0;
-    }
+    let a = prev[s] + c0;          // stego bit 0, predecessor s
+    let b = prev[s ^ col] + c1;    // stego bit 1, predecessor s ^ col
+    let take = b < a;
+    cur[s] = if take { b } else { a };
+    word |= (take as u64) << (s & 63);   // 1 bit records the choice
 }
 ```
 
-Traceback reconstructs predecessors from the single bit:
+Traceback reconstructs predecessors from the single bit; at message-block boundaries the pre-shift state follows from the known message bit, so no storage is needed:
 
 ```rust
-let bit = ((back_ptr[j] >> s) & 1) as u8;
-if bit == 1 { s ^= col; }  // undo XOR to get predecessor
+state = ((state << 1) | message_bit) & mask;   // invertible shift
+let bit = ((rows[k + (state >> 6)] >> (state & 63)) & 1) as u8;
+if bit == 1 { state ^= col; }                  // undo XOR to get predecessor
 ```
 
-At message-block boundaries (shift steps), the pre-shift state is fully determined from the known message bit — no storage needed:
+Two memory schedules produce **bit-for-bit identical plans**:
 
-```rust
-s = ((s << 1) | message_bit) & (num_states - 1);  // invertible shift
-```
+- **Inline**: one forward pass that keeps every step's back pointers. A lane of ~2²⁰–2²¹ positions needs 64–128 MB; this is the default on every platform.
+- **Segmented checkpoint**: a forward pass that keeps only the state costs at every K-th message block, then segment by segment from the end: recompute that segment's back pointers from its checkpoint and trace it back. O(√n) memory, twice the trellis work — the lowest rung of the memory ladder, used only when a memory budget requires it.
 
-**Segmented checkpoint Viterbi** — For images with >1M usable positions, even 16 bytes/step can exceed mobile memory (e.g., 100M positions × 16 bytes = 1.6 GB). The segmented approach reduces memory to O(√n):
+The ladder (`memory::ghost_lane_plan`) picks how many lanes run at once and which schedule they use; the output bytes are the same on every rung. Measured on an iPhone 16 Pro: 12 MP encode 2.4 s (peak 629 MB), 48 MP encode 10.3 s (peak 1.03 GB), 12 MP decode 0.42 s.
 
-- **Phase A (forward scan)**: Run the full Viterbi without storing back pointers. Save cost array checkpoints every K = ⌈√m⌉ message blocks (~1 KB each). Total checkpoint memory: ~1.5 MB for maximum payload.
-- **Phase B (segment recomputation)**: Process segments in reverse order. For each segment, re-run the forward pass from its checkpoint storing back pointers for that segment only, then traceback and free. Peak memory: ~200 KB per segment.
-
-The dispatcher auto-selects the optimal path:
-
-```rust
-const SEGMENTED_THRESHOLD: usize = 1_000_000;
-
-if n_used <= SEGMENTED_THRESHOLD {
-    stc_embed_inline(...)   // single pass, all back_ptr in memory
-} else {
-    stc_embed_segmented(...) // checkpoint/recompute, O(√n) memory
-}
-```
-
-Both paths produce **bit-for-bit identical output** (verified by equivalence tests). The segmented path trades 2× compute time for O(√n) memory — typically ~3 MB total for any image size.
-
-| Image | n_used | Inline memory | Segmented memory |
-|-------|--------|--------------|-----------------|
-| 12 MP phone | 2M | 32 MB | 3 MB |
-| 32 MB PNG | 5M | 80 MB | 3 MB |
-| 48 MP camera | 10M | 160 MB | 3 MB |
-| 100 MP medium format | 30M | 480 MB | 3 MB |
-| 200 MP flagship | 59M | 944 MB | 3 MB |
-
-#### Strip-Based UNIWARD & Compact Positions
+#### Strip-Based UNIWARD
 
 The J-UNIWARD cost function requires wavelet decomposition of the entire decompressed image — three directional subbands (LH, HL, HH) via Daubechies-8 filters. For a 200 MP image, storing the full pixel array + 3 wavelet subbands would need ~3.2 GB.
 
 The **strip-based streaming** approach eliminates this:
 
-1. Process the image in horizontal strips of 50 block rows (~400 pixels)
-2. Each strip decompresses its pixel rows (with ±22px padding for the 16-tap wavelet filter boundary), computes row/column-filtered wavelet subbands, and evaluates per-coefficient costs
-3. Embeddable positions are collected inline into a compact `Vec<CoeffPos>` — no full CostMap is ever materialized
+1. Process the image in horizontal strips of block rows
+2. Each strip decompresses its pixel rows (with padding for the 16-tap wavelet filter boundary), computes row/column-filtered wavelet subbands, and evaluates per-coefficient costs
+3. The costs of the lanes being planned are gathered from the strips — no full cost map is ever materialized
 4. Strip memory is freed before the next strip begins
 
-The `CoeffPos` type uses **compact representation**: `u32` flat index + `f32` cost = 8 bytes per position (down from 16 bytes with `usize` + `f64`). The STC accepts `f32` costs directly, promoting to `f64` only for internal Viterbi accumulation.
-
-| Image | DctGrid | Positions | Strip buffers | **Total peak** |
-|-------|---------|-----------|---------------|---------------|
-| 12 MP phone | 24 MB | 48 MB | 12 MB | **84 MB** |
-| 48 MP camera | 96 MB | 190 MB | 30 MB | **316 MB** |
-| 100 MP medium format | 200 MB | 400 MB | 50 MB | **650 MB** |
-| 200 MP flagship | 400 MB | 800 MB | 170 MB | **~1 GB** |
-
-Capacity estimation is instantaneous: it counts non-zero AC coefficients directly from the DctGrid (no wavelet computation needed), since J-UNIWARD assigns finite costs to all non-zero coefficients.
+Capacity estimation is instantaneous: the capacity policy is stated in frame bits per non-zero AC coefficient (max = nzAC/5, nzAC/4 with exact side information), so it counts non-zero AC coefficients directly from the DctGrid — no wavelet computation needed.
 
 ### Armor Pipeline
 
@@ -614,13 +587,13 @@ Capacity estimation is instantaneous: it counts non-zero AC coefficients directl
 
 Both encode and decode pipelines report real-time progress via global atomics (`progress::advance()`). This enables responsive UI feedback on all platforms:
 
-- **Ghost encode**: 177 steps — 5 (parse) + 100 (UNIWARD sub-steps) + 50 (STC Viterbi sub-steps) + 2 (permute + key derivation) + 20 (JPEG write MCU rows)
-- **Ghost encode with shadows**: 277 steps — adds 100 (verification UNIWARD pass) for stego-cost check
-- **Ghost decode**: 107 steps — 5 (parse) + 100 (UNIWARD) + 2 (STC extraction + decrypt). Dynamic w brute-force runs in parallel.
+- **Ghost encode**: 166 steps (`GHOST_ENCODE_STEPS`) — 5 (parse) + 100 (UNIWARD cost pass) + 1 (key + order) + 40 (the trellises of all lanes, by trellis work, from any thread) + 20 (JPEG write MCU rows)
+- **Ghost encode with shadows**: 167 steps (`GHOST_ENCODE_WITH_SHADOWS_STEPS`) plus 5 per shadow trellis; a retried shadow layout raises the total at runtime
+- **Ghost decode**: 9 steps (`GHOST_DECODE_STEPS`) — 5 (parse) + 2 (v3 order + search) + 2 (v1 permutation + extraction). No cost computation.
 - **Armor encode**: 6 steps (STDM path) or 3 steps (Fortress path, auto-adjusted at runtime)
 - **Armor decode**: dynamic total based on candidate count (~50 steps). Phase 1 delta sweep parallelized across ~21 candidates.
 
-Cancellation is cooperative: `progress::cancel()` sets a flag checked at natural loop boundaries via `progress::check_cancelled()`.
+Cancellation is cooperative: `progress::cancel()` sets a flag checked at natural loop boundaries via `progress::check_cancelled()`; every Ghost trellis checks it every 64 k positions.
 
 ### FFT
 
@@ -632,39 +605,50 @@ In-house Cooley-Tukey + Bluestein FFT implementation using deterministic twiddle
 src/
   lib.rs            Public API re-exports
   det_math.rs       Deterministic math (sin/cos/atan2/hypot/exp/powi)
-  jpeg/
-    mod.rs          JpegImage: parse, modify, serialize
-    bitio.rs        Bit-level reader/writer with JPEG byte stuffing
-    dct.rs          DCT coefficient grids and quantization tables
-    error.rs        JPEG parsing errors
-    frame.rs        SOF frame info (dimensions, components, subsampling)
-    huffman.rs      Huffman coding tables (two-level decode, encode)
-    marker.rs       JPEG marker iterator
-    pixels.rs       IDCT/DCT for pixel-domain operations (forward DCT, luma extraction)
-    scan.rs         Entropy-coded scan reader/writer
-    tables.rs       DQT/DHT table parsing
-    zigzag.rs       Zigzag scan order mapping
+  codec/
+    jpeg/
+      mod.rs          JpegImage: parse, modify, serialize
+      bitio.rs        Bit-level reader/writer with JPEG byte stuffing
+      cover_writer.rs Deep Cover cover writer (byte-identical to libjpeg-turbo cjpeg)
+      dct.rs          DCT coefficient grids and quantization tables
+      error.rs        JPEG parsing errors
+      frame.rs        SOF frame info (dimensions, components, subsampling)
+      huffman.rs      Huffman coding tables (two-level decode, encode)
+      marker.rs       JPEG marker iterator
+      pixels.rs       IDCT/DCT for pixel-domain operations (forward DCT, luma extraction)
+      scan.rs         Entropy-coded scan reader/writer
+      tables.rs       DQT/DHT table parsing
+      zigzag.rs       Zigzag scan order mapping
+    h264/           H.264 parsing, CABAC walker, streaming stego sessions, OpenH264 glue (video features)
+    mp4/            MP4/MOV demuxer and muxer (video features)
+    av1/            AV1 stego, experimental (AV1 features)
   stego/
-    mod.rs          Ghost/Armor encode/decode entry points
-    pipeline.rs     Ghost mode pipeline (J-UNIWARD + STC)
+    mod.rs          Ghost/Armor encode/decode entry points, smart_decode
     crypto.rs       AES-256-GCM-SIV + Argon2id key derivation
     frame.rs        Payload framing (length, CRC, mode byte, salt, nonce)
     payload.rs      Payload serialization (Brotli, file attachments)
     permute.rs      Fisher-Yates coefficient permutation
-    side_info.rs    SI-UNIWARD: rounding errors, cost modulation, direction selection
-    shadow.rs       Shadow messages (Y-channel direct LSB + RS ECC, plausible deniability)
-    optimizer.rs    Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
-    quality.rs      Encode quality scoring (stealth for Ghost, robustness for Armor)
-    capacity.rs     Ghost capacity estimation
+    memory.rs       Memory budget + Ghost lane ladder
     progress.rs     Real-time progress tracking (atomics + WASM callback)
     error.rs        StegoError enum
+    ghost/
+      pipeline.rs   Ghost orchestration (encode, decode order, v1 decoder)
+      v3.rs         Ghost v3: ternary STC over all Y AC coefficients, lanes
+      deep_cover.rs Deep Cover: pixels in, writer cover + exact side information
+      side_info.rs  SI-UNIWARD: rounding errors (exact / approximate), cost modulation
+      shadow.rs     Shadow messages (keyed-region STC; layout v1 decode)
+      capacity.rs   Ghost capacity and capacity-bar bands
+      optimizer.rs  Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
+      quality.rs    Encode quality scoring (stealth for Ghost, robustness for Armor)
     cost/
       mod.rs        Cost function trait
       uniward.rs    J-UNIWARD (Daubechies-8 wavelet, 3 subbands)
+      uniward_legacy_v1.rs  v1 J-UNIWARD costs (layout v1 shadow fallback only)
       uerd.rs       UERD cost function (legacy)
     stc/
       mod.rs        Syndrome-Trellis Codes
-      embed.rs      STC Viterbi embedding (1-bit packed + segmented checkpoint)
+      trellis.rs    Viterbi for any constraint height (inline + segmented schedules)
+      embed.rs      Binary STC Viterbi embedding (h <= 7)
       extract.rs    STC extraction (syndrome computation)
       hhat.rs       H-hat submatrix generation (ChaCha20-derived)
     armor/
@@ -682,6 +666,8 @@ src/
       fft2d.rs      2D FFT (Cooley-Tukey + Bluestein)
       resample.rs   Bilinear resampling for geometric correction
 cli/                Command-line interface (phasm binary)
+openh264-sys/       OpenH264 fork build + FFI (h264-encoder)
+dav1d-sys/          dav1d fork build + FFI (AV1)
 test-vectors/       Synthetic JPEG test images
 tests/              Integration tests (round-trip, cross-platform, geometry)
 examples/           CLI tools (encode/decode, timing, diagnostics)
@@ -710,7 +696,7 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 ### Implementation
 - [Building a Pure-Rust JPEG Coefficient Codec](https://phasm.app/blog/pure-rust-jpeg-coefficient-codec)
 - [When f64::sin() Breaks Your Crypto: Building Deterministic Math for WASM Steganography](https://phasm.app/blog/deterministic-cross-platform-math-wasm)
-- [From 480 MB to 3 MB: Fitting Viterbi Steganography on a Phone](https://phasm.app/blog/segmented-viterbi-memory-efficient-stc)
+- [From 600 MB to 3 MB: Fitting Viterbi Steganography on a Phone](https://phasm.app/blog/segmented-viterbi-memory-efficient-stc)
 
 ### Platform Analysis
 - [How 15 Messaging Platforms Process Your Photos](https://phasm.app/blog/how-15-platforms-process-your-photos)
@@ -722,12 +708,12 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 | **Status** | Active (2025–present) | Unmaintained | Unmaintained (2003) | Unmaintained |
 | **Language** | Rust (native + WASM) | Java | C++ | Java |
 | **Encryption** | AES-256-GCM-SIV + Argon2id | DES | Blowfish / AES | None |
-| **Embedding** | J-UNIWARD + STC (h=7) | LSB | LSB-adjacent | DCT histogram shift |
-| **Steganalysis resistance** | High (resists SRNet, XedroudjNet) | Low | Low | Moderate |
+| **Embedding** | J-UNIWARD + ternary STC (h=9) | LSB | LSB-adjacent | DCT histogram shift |
+| **Steganalysis resistance** | High (measured against SRNet) | Low | Low | Moderate |
 | **Survives recompression** | Yes (Armor / Fortress) | No | No | No |
 | **Survives WhatsApp** | Yes (Fortress, short messages) | No | No | No |
 | **Plausible deniability** | Yes (shadow messages) | No | No | No |
-| **Side-informed mode** | Yes (SI-UNIWARD, +43% capacity) | No | No | No |
+| **Side-informed mode** | Yes (SI-UNIWARD with exact side information, +25% capacity) | No | No | No |
 | **File attachments** | Yes (Ghost, up to 2 MB) | No | Yes | No |
 | **Geometric resilience** | Yes (DFT template) | No | No | No |
 | **Platforms** | iOS, Android, Web (WASM), CLI | Desktop (Java) | Linux / Windows CLI | Java |
@@ -741,10 +727,10 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 Yes. Fortress sub-mode (auto-activates for short messages in Armor mode) survives WhatsApp's default recompression pipeline. For longer messages, send the image as a document/file to bypass compression entirely.
 
 **How detectable is Ghost mode?**
-At typical embedding rates (0.4 bpnzAC), even deep-learning steganalysis detectors like SRNet perform near random chance against J-UNIWARD-embedded images. SI-UNIWARD (auto-activated for non-JPEG inputs) further reduces detection risk.
+It depends on how much you hide. The capacity bar's comfort band (max/4) stays close to chance for every detector measured (CNN detection error about 0.40, 0.5 = random guessing). At the maximum (0.20 bits per non-zero AC coefficient), a deep-learning detector trained on Ghost does better than chance: SRNet's detection error is 0.272 at QF75 (BOSSbase 1.01, trained from scratch; the earlier design scored 0.190) and 0.366 at QF92. Deep Cover (SI-UNIWARD with exact side information, auto-activated for non-JPEG inputs) is harder to detect even at its larger maximum: 0.450 at QF92.
 
 **What image sizes are supported?**
-Minimum 200×200 pixels, maximum 8192×8192 / 16 megapixels. Oversized images are automatically downsampled. The engine handles images up to 200 MP internally with ~3 MB peak memory for STC embedding.
+Minimum 200 pixels per side, maximum 16384 pixels per side and 200 megapixels (`validate_encode_dimensions`); the apps downsample larger images first. A Ghost encode peaks under 1 GB up to ~100 MP and at ~1.4 GB at 200 MP, and a memory budget lowers the lane part of that without changing the output.
 
 **Is the output JPEG or PNG?**
 Always JPEG. Input can be any common format (JPEG, PNG, WebP, HEIC) — non-JPEG inputs are auto-converted and enable SI-UNIWARD Deep Cover in Ghost mode.
@@ -761,8 +747,22 @@ Ghost mode is designed to resist this. Shadow messages add plausible deniability
 **Does Phasm work offline?**
 Yes. All processing happens on-device. The web version runs entirely in WebAssembly — no server communication, no account required.
 
+## Acknowledgements
+
+Phasm stands on other people's work. Thank you to:
+
+- **Holub, Fridrich and Denemark** for [J-UNIWARD and SI-UNIWARD](https://doi.org/10.1186/1687-417X-2014-1), the distortion functions behind Ghost mode.
+- **Filler, Judas and Fridrich** for [Syndrome-Trellis Codes](https://doi.org/10.1109/TIFS.2011.2134094), which embed with minimal distortion.
+- **The libjpeg-turbo and Independent JPEG Group authors** for the [JPEG reference work](https://libjpeg-turbo.org) our DCT kernels and cover writer follow.
+- **The [RustCrypto](https://github.com/RustCrypto), [Rayon](https://github.com/rayon-rs/rayon) and [rust-brotli](https://github.com/dropbox/rust-brotli) authors** for AES-GCM-SIV, Argon2, parallelism and Brotli compression.
+- **The VideoLAN [dav1d](https://code.videolan.org/videolan/dav1d) team**, whose AV1 decoder is used for the experimental video feature.
+- **Xiph.Org and the [rav1e](https://github.com/xiph/rav1e) contributors**, whose AV1 encoder is used for the experimental video feature.
+- **Cisco's [OpenH264](https://github.com/cisco/openh264)**, the H.264 codec used for the experimental video feature.
+
+Their copyright notices and license texts are in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES); the apps link to the same list at [phasm.app/licenses](https://phasm.app/licenses).
+
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
 
-Third-party dependency licenses are listed in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).
+Third-party dependency licenses (including the AV1 and H.264 video codecs) are listed in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).

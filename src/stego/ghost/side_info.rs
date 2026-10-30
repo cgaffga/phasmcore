@@ -43,6 +43,11 @@ pub struct SideInfo {
     pub blocks_wide: usize,
     /// Number of 8x8 blocks vertically.
     pub blocks_tall: usize,
+    /// True when the errors are the cover encoder's own rounding (the cover
+    /// was written by phasm's libjpeg-turbo-compatible writer, verified
+    /// coefficient by coefficient). Then `|e| = ½` ties are exact (stored as
+    /// ±127) and every other error is stored as `e · 252` (≤ ±126).
+    exact: bool,
 }
 
 /// Encode a rounding error [-0.5, +0.5] to i8 [-127, +127].
@@ -63,9 +68,8 @@ fn decode_error(val: i8) -> f32 {
 /// approaches zero. Clamping to this floor prevents zero-cost embedding
 /// at quantization midpoints, which is a known detectable artifact.
 ///
-/// Test-only since the production SI-cost floor is applied inline in
-/// `compute_positions_streaming` (the standalone `modulate_costs_si`
-/// pass was retired in #840); the tests below still pin the formula.
+/// Test-only: the production SI cost (`ghost::v3`, floor + 0.3 factor
+/// floor) is applied inline by the encoder; the tests below pin the formula.
 #[cfg(test)]
 const MIN_SI_COST: f32 = 1e-6;
 
@@ -101,7 +105,20 @@ impl SideInfo {
         let bw = cover_grid.blocks_wide();
         let bh = cover_grid.blocks_tall();
         let total_coeffs = bw * bh * 64;
+
+        // Exact side information when the cover's luma is what phasm's
+        // cover writer (= libjpeg-turbo islow) makes of these pixels.
+        if let Some(si) = Self::compute_exact(raw_rgb, pixel_width, pixel_height, cover_grid, qt_values) {
+            return Ok(si);
+        }
+
         let mut errors = vec![0i8; total_coeffs];
+        // Pixels that do not belong to this cover (other dimensions, e.g. a
+        // frontend that downscaled the JPEG but not the pixels) carry no side
+        // information: embed without it rather than with misaligned errors.
+        if !Self::geometry_matches(w, h, bw, bh) {
+            return Ok(SideInfo { rounding_errors: errors, blocks_wide: bw, blocks_tall: bh, exact: false });
+        }
 
         let luma_bw = w.div_ceil(8);
         let luma_bh = h.div_ceil(8);
@@ -149,14 +166,121 @@ impl SideInfo {
             rounding_errors: errors,
             blocks_wide: bw,
             blocks_tall: bh,
+            exact: false,
         })
+    }
+
+    /// Luma block grid `bw × bh` can hold a `w × h` image (MCU 8 or 16).
+    fn geometry_matches(w: usize, h: usize, bw: usize, bh: usize) -> bool {
+        let (wib, hib) = (w.div_ceil(8), h.div_ceil(8));
+        (wib..=wib + 1).contains(&bw) && (hib..=hib + 1).contains(&bh)
+    }
+
+    /// Exact side information, or `None` unless every luma coefficient of
+    /// `cover_grid` equals what libjpeg-turbo's islow path (phasm's cover
+    /// writer, [`crate::codec::jpeg::cover_writer`]) computes from
+    /// `raw_rgb` with this quantization table. Luma does not depend on the
+    /// chroma subsampling, so any libjpeg-turbo islow cover with these tables
+    /// qualifies.
+    pub fn compute_exact(
+        raw_rgb: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+        cover_grid: &DctGrid,
+        qt_values: &[u16; 64],
+    ) -> Option<Self> {
+        use crate::codec::jpeg::cover_writer::{for_each_luma_block, Geometry};
+        let (w, h) = (pixel_width as usize, pixel_height as usize);
+        let (bw, bh) = (cover_grid.blocks_wide(), cover_grid.blocks_tall());
+        if w == 0 || h == 0 || raw_rgb.len() < w * h * 3 || !Self::geometry_matches(w, h, bw, bh) {
+            return None;
+        }
+        let g = Geometry::new(w, h);
+        let mut errors = vec![0i8; bw * bh * 64];
+        let ok = for_each_luma_block(raw_rgb, &g, qt_values, |br, bc, raw, q| {
+            let cover = cover_grid.block(br, bc);
+            let base = (br * bw + bc) * 64;
+            for k in 0..64 {
+                if cover[k] != q[k] {
+                    return false;
+                }
+                errors[base + k] = exact_error_code(raw[k], q[k], qt_values[k]);
+            }
+            true
+        });
+        // Dummy blocks (beyond the image, right/bottom MCU padding) keep 0:
+        // they have no precover.
+        ok.then_some(SideInfo { rounding_errors: errors, blocks_wide: bw, blocks_tall: bh, exact: true })
+    }
+
+    /// Whether [`Self::compute_exact`] would accept these pixels for this
+    /// cover, without building the side information (no allocation; stops
+    /// at the first coefficient that differs). The capacity bands use it:
+    /// the Deep Cover capacity bonus applies exactly when an `encode_si*`
+    /// call with the same arguments embeds with exact side information.
+    pub fn is_exact_for(
+        raw_rgb: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+        cover_grid: &DctGrid,
+        qt_values: &[u16; 64],
+    ) -> bool {
+        use crate::codec::jpeg::cover_writer::{for_each_luma_block, Geometry};
+        let (w, h) = (pixel_width as usize, pixel_height as usize);
+        let (bw, bh) = (cover_grid.blocks_wide(), cover_grid.blocks_tall());
+        if w == 0 || h == 0 || raw_rgb.len() < w * h * 3 || !Self::geometry_matches(w, h, bw, bh) {
+            return false;
+        }
+        for_each_luma_block(raw_rgb, &Geometry::new(w, h), qt_values, |br, bc, _, q| {
+            cover_grid.block(br, bc) == &q[..]
+        })
+    }
+
+    /// Exact side information from [`exact_error_code`] values (flat luma
+    /// order, `bw × bh` blocks), as the Deep Cover writer produces them.
+    pub(crate) fn exact_from_codes(rounding_errors: Vec<i8>, blocks_wide: usize, blocks_tall: usize) -> Self {
+        SideInfo { rounding_errors, blocks_wide, blocks_tall, exact: true }
     }
 
     /// Get the rounding error at a flat index, decoded from i8 to f32.
     #[inline]
     pub fn error_at(&self, flat_idx: usize) -> f32 {
-        decode_error(self.rounding_errors[flat_idx])
+        let v = self.rounding_errors[flat_idx];
+        if self.exact {
+            if v.unsigned_abs() == 127 { v.signum() as f32 * 0.5 } else { v as f32 / 252.0 }
+        } else {
+            decode_error(v)
+        }
     }
+
+    /// Whether the errors are the cover encoder's own (see [`Self::compute_exact`]).
+    #[inline]
+    pub fn is_exact(&self) -> bool {
+        self.exact
+    }
+
+    /// Exact `|e| = ½` tie: both neighbours are equally far from the
+    /// precover (only meaningful when [`Self::is_exact`]).
+    #[inline]
+    pub fn is_tie(&self, flat_idx: usize) -> bool {
+        self.exact && self.rounding_errors[flat_idx].unsigned_abs() == 127
+    }
+}
+
+/// i8 code of the exact rounding error of one coefficient: islow output
+/// `raw` (libjpeg scale, divisor `8q`), quantized value `c`. Ties
+/// (`|raw − 8qc| = 4q`) → ±127, otherwise `round(e · 252)` (≤ ±126).
+#[inline]
+pub(crate) fn exact_error_code(raw: i16, c: i16, q: u16) -> i8 {
+    let d = (q as i32) << 3;
+    let r = raw as i32 - d * c as i32; // e = r / d, |r| ≤ d/2
+    if 2 * r.abs() >= d {
+        return if r > 0 { 127 } else { -127 };
+    }
+    // round(r · 252 / d) half away from zero, in integers.
+    let num = r * 252;
+    let v = (num.abs() + d / 2) / d;
+    (v.min(126) * num.signum()) as i8
 }
 
 /// Convert a horizontal strip of RGB pixels to Y (luminance) 8x8 blocks.
@@ -203,49 +327,6 @@ fn rgb_to_luma_blocks_strip(
     }
 
     blocks
-}
-
-
-/// Determine the modification direction for a coefficient using SI rounding error.
-///
-/// Returns the modified coefficient value (coeff +/- 1).
-///
-/// Rules:
-/// - |coeff| == 1: ALWAYS away from zero (anti-shrinkage, prevents coeff -> 0)
-/// - |coeff| > 1 with side info: toward the pre-quantization value
-///   (error > 0 -> precover was above -> go up; error < 0 -> go down)
-/// - |coeff| > 1 without side info: nsF5 convention (toward zero)
-/// - coeff == 0: should never be called (filtered out as WET)
-#[inline]
-pub fn si_modify_coefficient(coeff: i16, rounding_error: f32) -> i16 {
-    if coeff == 1 {
-        2 // anti-shrinkage: away from zero
-    } else if coeff == -1 {
-        -2 // anti-shrinkage: away from zero
-    } else if rounding_error > 0.0 {
-        coeff + 1 // precover was above -> go up
-    } else {
-        coeff - 1 // precover was at or below -> go down
-    }
-}
-
-/// Standard nsF5 modification direction (no side info).
-///
-/// - |coeff| == 1: away from zero
-/// - |coeff| > 1: toward zero
-#[inline]
-pub fn nsf5_modify_coefficient(coeff: i16) -> i16 {
-    if coeff == 1 {
-        2
-    } else if coeff == -1 {
-        -2
-    } else if coeff > 1 {
-        coeff - 1
-    } else if coeff < -1 {
-        coeff + 1
-    } else {
-        coeff // zero: should never happen
-    }
 }
 
 #[cfg(test)]
@@ -378,46 +459,9 @@ mod tests {
 
     // --- T5: Anti-shrinkage preserved ---
 
-    #[test]
-    fn t5_anti_shrinkage_preserved() {
-        // |coeff| = 1 must always go away from zero
-        assert_eq!(si_modify_coefficient(1, -0.4_f32), 2);
-        assert_eq!(si_modify_coefficient(1, 0.4_f32), 2);
-        assert_eq!(si_modify_coefficient(1, 0.0_f32), 2);
-        assert_eq!(si_modify_coefficient(-1, -0.4_f32), -2);
-        assert_eq!(si_modify_coefficient(-1, 0.4_f32), -2);
-        assert_eq!(si_modify_coefficient(-1, 0.0_f32), -2);
-    }
-
     // --- T6: Direction selection ---
 
-    #[test]
-    fn t6_direction_follows_rounding_error() {
-        // Positive error -> precover above -> go up
-        assert_eq!(si_modify_coefficient(5, 0.3_f32), 6);
-        assert_eq!(si_modify_coefficient(-5, 0.3_f32), -4); // toward zero = up
-
-        // Negative error -> precover below -> go down
-        assert_eq!(si_modify_coefficient(5, -0.3_f32), 4);
-        assert_eq!(si_modify_coefficient(-5, -0.3_f32), -6); // away from zero = down
-
-        // Zero error -> down (the else branch)
-        assert_eq!(si_modify_coefficient(5, 0.0_f32), 4);
-        assert_eq!(si_modify_coefficient(-5, 0.0_f32), -6);
-    }
-
     // --- T6b: nsF5 direction ---
-
-    #[test]
-    fn t6b_nsf5_toward_zero() {
-        assert_eq!(nsf5_modify_coefficient(5), 4);
-        assert_eq!(nsf5_modify_coefficient(-5), -4);
-        assert_eq!(nsf5_modify_coefficient(2), 1);
-        assert_eq!(nsf5_modify_coefficient(-2), -1);
-        // Anti-shrinkage
-        assert_eq!(nsf5_modify_coefficient(1), 2);
-        assert_eq!(nsf5_modify_coefficient(-1), -2);
-    }
 
     // --- T7: i8 encode/decode roundtrip ---
 

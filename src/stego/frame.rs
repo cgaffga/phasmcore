@@ -77,7 +77,15 @@ pub const MAX_FRAME_BITS: usize = MAX_FRAME_BYTES * 8;
 /// Video decoders parse with [`parse_frame_with_max`] at this bound. Until
 /// 2026-10-23 they used [`parse_frame`]'s image bound, so a video message
 /// over 256 KiB encoded "successfully" and then could never be decoded.
-pub const VIDEO_MAX_FRAME_BYTES: usize =
+pub const VIDEO_MAX_FRAME_BYTES: usize = PAYLOAD_MAX_FRAME_BYTES;
+
+/// The largest frame `payload::encode_payload` can produce: the inner-payload
+/// bound, plus its flags byte, plus the extended (v2) frame overhead. The
+/// bound of every carrier whose STC memory does not grow with the frame —
+/// video (per-GOP chunks) and Ghost v3 images (lanes of ≤ 2²¹ positions).
+/// [`MAX_FRAME_BYTES`] stays the bound of the v1 image decoder, which never
+/// produced larger frames.
+pub const PAYLOAD_MAX_FRAME_BYTES: usize =
     crate::stego::payload::MAX_INNER_PAYLOAD_BYTES + 1 + FRAME_OVERHEAD_EXT;
 
 /// Build a payload frame from encrypted components.

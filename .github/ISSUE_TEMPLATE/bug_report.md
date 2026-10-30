@@ -27,8 +27,8 @@ samples will be requested separately under the test-vectors
 policy).
 
 Example:
-1. `cargo run --release --features cabac-stego -- video-encode input.mp4 -m "x" -p "test" -o out.mp4`
-2. `cargo run --release --features cabac-stego -- decode out.mp4 -p "test"`
+1. `cargo run --release -p phasm-cli -- encode photo.jpg --mode ghost -m "x" -p "test" -o out.jpg`
+2. `cargo run --release -p phasm-cli -- decode out.jpg -p "test"`
 3. Decode returns "..." instead of "x".
 -->
 
@@ -37,7 +37,7 @@ Example:
 <!-- Tick the relevant medium. -->
 
 - [ ] Image stego (JPEG / PNG-via-SI / Ghost / Armor)
-- [ ] Video stego (H.264 / CABAC v2)
+- [ ] Video stego (H.264 / AV1)
 - [ ] Shadow messages
 - [ ] CLI tool
 - [ ] iOS / Android / WASM bridge

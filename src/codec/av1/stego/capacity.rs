@@ -108,6 +108,12 @@ pub(crate) const STC_PAYLOAD_RATIO_DEN: usize = 100;
 /// as `Av1StreamingEncodeSession` but skips STC + override apply,
 /// just counts tagged cover positions per GOP.
 ///
+/// **Not the v2 capacity.** It counts every AC sign and Golomb tail, while
+/// the v2 cover is AC signs with 1 ≤ |c| ≤ 5 (`av1_in_cover`), and it has no
+/// damage-aware caps, so its byte caps overstate what an encode takes. Kept
+/// for the raw tag counts (`av1_calibrate`); capacity figures come from
+/// [`av1_capacity`] / [`av1_capacity_stratified`].
+///
 /// Wall-clock is essentially identical to the encode phase of a real
 /// stego (the per-frame encode dominates; STC + override apply is
 /// microseconds). For the API contract, "real probe not analytical"
@@ -396,9 +402,50 @@ pub fn av1_shadow_capacity_for_n(cover_bits: usize, n_shadows: u32) -> usize {
         .saturating_sub(FRAME_OVERHEAD)
 }
 
-/// One-shot capacity API. Buffers all `n_frames` from `yuv`,
-/// runs probe session, returns full capacity info struct including
-/// per-domain breakdown and convenience shadow-n=1 byte cap.
+/// The stratified probe over every GOP of an in-memory clip: exact, not an
+/// estimate (the finite-population correction vanishes, lower bound = mean),
+/// over the v2 cover with the damage-aware caps — the figures the apps show,
+/// measured instead of sampled.
+fn full_probe(
+    yuv: &[u8],
+    params: Av1StreamingEncodeParams,
+    api: &str,
+) -> Result<Av1StratifiedCapacity, Av1StegoError> {
+    let n_frames = params.total_frames_hint;
+    let frame_size = expected_i420_size(params.width, params.height);
+    let total_size = frame_size.saturating_mul(n_frames as usize);
+    if yuv.len() != total_size {
+        return Err(Av1StegoError::InvalidPacket(format!(
+            "{api}: yuv length {} != expected {} ({} frames × {} bytes)",
+            yuv.len(),
+            total_size,
+            n_frames,
+            frame_size
+        )));
+    }
+    let gop_size = params.gop_size.max(1);
+    let mut source =
+        super::whole_video::Av1SliceYuvSource::new(yuv, params.width, params.height, n_frames, gop_size);
+    super::whole_video::Av1GopYuvSource::rewind(&mut source)?;
+    let mut calibration = AllocationCalibration::AV1_1080P_QP30;
+    calibration.k_min = usize::MAX;
+    av1_capacity_stratified(&mut source, n_frames, params, &calibration)
+}
+
+/// One-shot capacity API for an in-memory clip (`phasm video-capacity`,
+/// the CLI encode's announcement): the figures the apps show, from every
+/// GOP ([`full_probe`]).
+///
+/// * `cover_size_bits` — the syntax-dry v2 cover after the damage-aware
+///   caps: the base of the capacity bands.
+/// * `primary_max_message_bytes` — the red end the apps show as the
+///   maximum ([`Av1StratifiedCapacity::max_message_bytes`]).
+/// * `comfort_message_bytes` — the start of the yellow band.
+///
+/// The v2 cover is AC signs only (`av1_in_cover`), so the per-domain
+/// split has no Golomb tails. Before 2026-10-27 this counted every AC sign
+/// and Golomb tail with no damage-aware cap, which overstated the
+/// capacity about 2.6× on a synthetic clip.
 ///
 /// `yuv` is laid out as `n_frames` consecutive I420 frames. Caller
 /// is responsible for matching width/height to the YUV.
@@ -406,71 +453,41 @@ pub fn av1_capacity(
     yuv: &[u8],
     params: Av1StreamingEncodeParams,
 ) -> Result<Av1CapacityInfo, Av1StegoError> {
-    let frame_size = expected_i420_size(params.width, params.height);
-    let total_size = frame_size.saturating_mul(params.total_frames_hint as usize);
-    if yuv.len() != total_size {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "av1_capacity: yuv length {} != expected {} ({} frames × {} bytes)",
-            yuv.len(),
-            total_size,
-            params.total_frames_hint,
-            frame_size
-        )));
-    }
-    let mut probe = Av1StreamingProbeSession::create(params)?;
-    for i in 0..params.total_frames_hint as usize {
-        let start = i * frame_size;
-        let end = start + frame_size;
-        probe.push_frame(&yuv[start..end])?;
-    }
-    let result = probe.finish();
+    let est = full_probe(yuv, params, "av1_capacity")?;
     Ok(Av1CapacityInfo {
-        cover_size_bits: result.cover_bits,
-        primary_max_message_bytes: result.primary_max_message_bytes(),
+        cover_size_bits: est.dry_cover_bits,
+        primary_max_message_bytes: est.max_message_bytes(),
+        comfort_message_bytes: est.comfort_message_bytes(),
         per_domain_bits: Av1PerDomainBits {
-            ac_sign: result.ac_sign_bits,
-            golomb_tail: result.golomb_tail_bits,
+            ac_sign: est.dry_cover_bits,
+            golomb_tail: 0,
             _tier2_reserved: 0,
             _tier3_reserved: 0,
         },
-        n_gops: result.n_gops,
-        shadow_max_message_bytes_n1: result.shadow_max_message_bytes(1),
+        n_gops: est.n_gops,
+        shadow_max_message_bytes_n1: est.shadow_max_message_bytes_n1,
     })
 }
 
-/// One-shot multi-shadow capacity API.
+/// One-shot multi-shadow capacity API, from the same [`full_probe`] as
+/// [`av1_capacity`]: the per-shadow cap for `n_shadows`, and what stays
+/// for the primary below the red end.
 pub fn av1_shadow_capacity(
     yuv: &[u8],
     params: Av1StreamingEncodeParams,
     n_shadows: u32,
 ) -> Result<Av1ShadowCapacityInfo, Av1StegoError> {
-    let frame_size = expected_i420_size(params.width, params.height);
-    let total_size = frame_size.saturating_mul(params.total_frames_hint as usize);
-    if yuv.len() != total_size {
-        return Err(Av1StegoError::InvalidPacket(format!(
-            "av1_shadow_capacity: yuv length {} != expected {} ({} frames × {} bytes)",
-            yuv.len(),
-            total_size,
-            params.total_frames_hint,
-            frame_size
-        )));
-    }
-    let mut probe = Av1StreamingProbeSession::create(params)?;
-    for i in 0..params.total_frames_hint as usize {
-        let start = i * frame_size;
-        let end = start + frame_size;
-        probe.push_frame(&yuv[start..end])?;
-    }
-    let result = probe.finish();
-    let max_message_bytes = result.shadow_max_message_bytes(n_shadows);
-    let primary_residual_bytes = result
-        .primary_max_message_bytes()
+    let est = full_probe(yuv, params, "av1_shadow_capacity")?;
+    let max_message_bytes = av1_shadow_capacity_for_n(est.dry_cover_bits, n_shadows)
+        .min(est.shadow_max_message_bytes_n1);
+    let primary_residual_bytes = est
+        .max_message_bytes()
         .saturating_sub(max_message_bytes.saturating_mul(n_shadows as usize));
     Ok(Av1ShadowCapacityInfo {
-        cover_size_bits: result.cover_bits,
+        cover_size_bits: est.dry_cover_bits,
         max_message_bytes,
         primary_residual_bytes,
-        shadow_slots_total: result.n_gops,
+        shadow_slots_total: est.n_gops,
         n_shadows,
     })
 }
@@ -479,6 +496,7 @@ pub fn av1_shadow_capacity(
 pub struct Av1CapacityInfo {
     pub cover_size_bits: usize,
     pub primary_max_message_bytes: usize,
+    pub comfort_message_bytes: usize,
     pub per_domain_bits: Av1PerDomainBits,
     pub n_gops: u32,
     pub shadow_max_message_bytes_n1: usize,
@@ -569,7 +587,14 @@ pub fn av1_probe_gops_at_with_progress(
     positions: &[u32],
     progress_fn: &mut dyn FnMut(u32, u32, u64),
 ) -> Result<Vec<(usize, usize)>, Av1StegoError> {
-    Ok(probe_gops(source, n_frames, params, positions, progress_fn)?
+    let mut cover_bits_running: u64 = 0;
+    let mut on_gop = |done: u32, total: u32, samples: &[(usize, usize, usize)]| {
+        if let Some(&(_, cover, _)) = samples.last() {
+            cover_bits_running = cover_bits_running.saturating_add(cover as u64);
+        }
+        progress_fn(done, total, cover_bits_running);
+    };
+    Ok(probe_gops(source, n_frames, params, positions, &mut on_gop)?
         .into_iter()
         .map(|(g, cover, _)| (g, cover))
         .collect())
@@ -577,12 +602,14 @@ pub fn av1_probe_gops_at_with_progress(
 
 /// [`av1_probe_gops_at_with_progress`] plus each GOP's count of v2
 /// shadow-eligible positions (spec § 6: a shadow uses only those).
+/// `progress_fn(gops_done, gops_total, samples_so_far)` runs after each
+/// probed GOP.
 fn probe_gops(
     source: &mut dyn super::whole_video::Av1GopYuvSource,
     n_frames: u32,
     params: Av1StreamingEncodeParams,
     positions: &[u32],
-    progress_fn: &mut dyn FnMut(u32, u32, u64),
+    progress_fn: &mut dyn FnMut(u32, u32, &[(usize, usize, usize)]),
 ) -> Result<Vec<(usize, usize, usize)>, Av1StegoError> {
     if n_frames == 0 {
         return Err(Av1StegoError::InvalidPacket(
@@ -618,7 +645,6 @@ fn probe_gops(
     }
 
     let total = positions.len() as u32;
-    let mut cover_bits_running: u64 = 0;
     let mut done: u32 = 0;
     let mut samples: Vec<(usize, usize, usize)> = Vec::with_capacity(positions.len());
     for &gop_idx in positions {
@@ -647,8 +673,8 @@ fn probe_gops(
         let mut cover_bits = 0usize;
         for (_natural, recording) in &per_frame {
             if let Some(tile) = recording.tiles.first() {
-                for &tag in tile.bit_tags.iter() {
-                    if tag == PHASM_TAG_AC_COEFF_SIGN || tag == PHASM_TAG_GOLOMB_TAIL_LSB {
+                for (&tag, m) in tile.bit_tags.iter().zip(&tile.bit_meta) {
+                    if crate::stego::cost::av1_damage::av1_in_cover(tag == PHASM_TAG_AC_COEFF_SIGN, m.coeff_magnitude) {
                         cover_bits += 1;
                     }
                 }
@@ -662,10 +688,18 @@ fn probe_gops(
         .iter()
         .filter(|b| b.is_some())
         .count();
-        samples.push((gop_idx as usize, cover_bits, eligible));
-        cover_bits_running = cover_bits_running.saturating_add(cover_bits as u64);
+        // The planner's per-GOP basis is the quality-safe cover (damage-aware
+        // caps, `density_cap`), so the bands and the deliverable shrink with
+        // the plan. The shadow-eligible count keeps its share of the cover.
+        let safe = super::density_cap::quality_safe_cover(cover_bits, params.width, params.height);
+        let eligible = if safe < cover_bits {
+            (eligible as u128 * safe as u128 / cover_bits as u128) as usize
+        } else {
+            eligible
+        };
+        samples.push((gop_idx as usize, safe, eligible));
         done = done.saturating_add(1);
-        progress_fn(done, total, cover_bits_running);
+        progress_fn(done, total, &samples);
     }
     Ok(samples)
 }
@@ -707,26 +741,23 @@ pub fn av1_capacity_stratified(
 }
 
 /// Same as [`av1_capacity_stratified`] but calls `progress_fn(gops_done,
-/// gops_total, cover_bits_so_far)` AFTER each probed GOP. Mirrors
-/// H.264's `PhasmProbeProgressListener` callback shape so the mobile
-/// encode screen can show a "narrowing-down" primary estimate during
-/// the probe wall-clock instead of a plain "Calculating…" state for
-/// the whole K/n_gops × encode seconds.
+/// gops_total, estimate_bytes)` AFTER each probed GOP, so the encode
+/// screen can show a running estimate instead of a plain "Calculating…"
+/// for the whole probe.
 ///
-/// The UI extrapolates a partial-estimate primary cap via
-///   `est_total_cover ≈ cover_bits_so_far × gops_total / gops_done`
-/// and then re-applies the same STC_PAYLOAD_RATIO + chunk_frame
-/// overhead subtraction the final result uses — see the H.264 listener
-/// doc for the formula + the Swift / Kotlin wrappers for how both
-/// codecs share one progress interface.
+/// `estimate_bytes` is [`Av1StratifiedCapacity::max_message_bytes`]
+/// computed from the GOPs probed so far, the same figure the UI shows
+/// once the probe finishes. Callers display it as is, with no
+/// extrapolation (as H.264's probe listener does). The final event
+/// (`gops_done == gops_total`) equals the returned result's
+/// `max_message_bytes()` exactly. Earlier events can sit above or below
+/// it: the trailing partial GOP is probed last, and the lower bound
+/// moves as samples come in.
 ///
-/// Behaviour on the final GOP: `progress_fn(k, k, final_cover_total)`
-/// fires BEFORE this function returns the full result; a caller that
-/// only reads the final progress event has an estimate that converges
-/// to the returned `Av1StratifiedCapacity.extrapolated_cover_bits_total`
-/// modulo the pessimism-factor adjustment the progress estimate
-/// deliberately omits (it reports raw running cover, letting the UI
-/// apply codec-specific derived values on top).
+/// When the samples disagree too much for the lower bound
+/// ([`ESCALATE_BELOW_MEAN`]), the probe takes more GOPs in further sweeps.
+/// `gops_done` then counts on across sweeps and `gops_total` grows at the
+/// start of each one, so a progress bar may step back once or twice.
 pub fn av1_capacity_stratified_with_progress(
     source: &mut dyn super::whole_video::Av1GopYuvSource,
     n_frames: u32,
@@ -749,16 +780,82 @@ pub fn av1_capacity_stratified_with_progress(
     let (positions, n_full, tail_gop) =
         stratified_probe_positions(n_frames, gop_size, calibration.k_min);
 
-    let samples3 = probe_gops(source, n_frames, params, &positions, progress_fn)?;
+    // Report the policy maximum the probe would return from the GOPs probed
+    // so far, so the running HUD figure and the final one are the same
+    // quantity. Reporting cover bits made the apps extrapolate the
+    // deliverable STC ceiling, about 2× the final figure.
+    let mut on_gop = |done: u32, total: u32, so_far: &[(usize, usize, usize)]| {
+        let estimate = stratified_capacity_from_samples(so_far, n_gops, n_full, tail_gop, calibration)
+            .map_or(0, |c| c.max_message_bytes());
+        progress_fn(done, total, estimate as u64);
+    };
+    let mut samples3 = probe_gops(source, n_frames, params, &positions, &mut on_gop)?;
+
+    // Escalate while the samples disagree too much for the lower bound to
+    // mean anything: double K (stratified, skipping GOPs already probed) up
+    // to every full GOP, where the bound is the exact mean. Each round is a
+    // new sweep (the source only moves forward), so `gops_total` grows
+    // between rounds while `gops_done` counts on.
+    let mut k = samples3.iter().filter(|s| s.0 < n_full).count();
+    while k < n_full && lower_bound_is_weak(&samples3, n_full, calibration, ESCALATE_BELOW_MEAN) {
+        k = (2 * k).min(n_full);
+        let extra: Vec<u32> = stratified_positions(k, n_full)
+            .into_iter()
+            .filter(|&g| !samples3.iter().any(|s| s.0 == g))
+            .map(|g| g as u32)
+            .collect();
+        if extra.is_empty() {
+            continue;
+        }
+        source.rewind()?;
+        let base = samples3.clone();
+        let mut on_more = |done: u32, total: u32, more: &[(usize, usize, usize)]| {
+            let so_far: Vec<_> = base.iter().chain(more).copied().collect();
+            on_gop(base.len() as u32 + done, base.len() as u32 + total, &so_far);
+        };
+        let more = probe_gops(source, n_frames, params, &extra, &mut on_more)?;
+        samples3.extend(more);
+    }
+    stratified_capacity_from_samples(&samples3, n_gops, n_full, tail_gop, calibration).ok_or_else(|| {
+        Av1StegoError::InvalidPacket("av1_capacity_stratified: no samples collected".into())
+    })
+}
+
+/// The probe escalates K while the full-GOP lower bound is below this share
+/// of the sampled mean. At 3/4 a clip as uneven as IMG_4138 (per-GOP cover
+/// 226 k – 3.83 M bits) is probed in full; an even clip stops at `k_min`.
+const ESCALATE_BELOW_MEAN: (usize, usize) = (3, 4);
+
+/// The stratified lower bound over the full-GOP samples in `samples3` is
+/// below `num / den` of their mean (the probe uses [`ESCALATE_BELOW_MEAN`]).
+fn lower_bound_is_weak(
+    samples3: &[(usize, usize, usize)],
+    n_full: usize,
+    calibration: &AllocationCalibration,
+    (num, den): (usize, usize),
+) -> bool {
+    let full: Vec<usize> = samples3.iter().filter(|s| s.0 < n_full).map(|s| s.1).collect();
+    let (mu, lower, _, _) = stratified_cover_estimate(&full, n_full, None, calibration);
+    lower * (den as f64) < mu * (num as f64)
+}
+
+/// The capacity [`av1_capacity_stratified_with_progress`] reports for the
+/// probed `(gop, cover_bits, shadow_eligible)` samples. `None` when there
+/// are none.
+fn stratified_capacity_from_samples(
+    samples3: &[(usize, usize, usize)],
+    n_gops: u32,
+    n_full: usize,
+    tail_gop: Option<usize>,
+    calibration: &AllocationCalibration,
+) -> Option<Av1StratifiedCapacity> {
     // Share of the cover a v2 shadow may use, over the probed GOPs.
     let (sum_cover, sum_eligible) = samples3
         .iter()
         .fold((0usize, 0usize), |(c, e), &(_, cb, el)| (c + cb, e + el));
     let samples: Vec<(usize, usize)> = samples3.iter().map(|&(g, c, _)| (g, c)).collect();
     if samples.is_empty() {
-        return Err(Av1StegoError::InvalidPacket(
-            "av1_capacity_stratified: no samples collected".into(),
-        ));
+        return None;
     }
     let full: Vec<usize> = samples
         .iter()
@@ -770,6 +867,7 @@ pub fn av1_capacity_stratified_with_progress(
     });
     let (mu, cap_per_gop_lower, cap_per_gop_safe, extrapolated_cover_bits) =
         stratified_cover_estimate(&full, n_full, tail_cover, calibration);
+    let dry_cover_bits = dry_cover_expectation(mu, n_full, tail_cover);
 
     // Primary/shadow byte caps mirror `Av1CapacityProbeResult` math.
     let primary_bits = extrapolated_cover_bits
@@ -795,16 +893,24 @@ pub fn av1_capacity_stratified_with_progress(
         .saturating_sub(128) // worst-case RS parity tier
         .saturating_sub(FRAME_OVERHEAD);
 
-    Ok(Av1StratifiedCapacity {
+    Some(Av1StratifiedCapacity {
         samples,
         n_gops,
         cover_bits_mean_per_gop: mu as usize,
         cover_bits_lower_99_9_per_gop: cap_per_gop_lower as usize,
         cover_bits_pessimism_adjusted_per_gop: cap_per_gop_safe as usize,
         extrapolated_cover_bits_total: extrapolated_cover_bits,
+        dry_cover_bits,
         primary_max_message_bytes,
         shadow_max_message_bytes_n1,
     })
+}
+
+/// Expected dry cover of the whole clip: the sampled full-GOP mean times
+/// `n_full`, plus the exactly probed tail. No lower bound, no pessimism —
+/// the capacity bands need the real fill ratio, not a safe one.
+fn dry_cover_expectation(mu: f64, n_full: usize, tail_cover: Option<usize>) -> usize {
+    (mu * n_full as f64) as usize + tail_cover.unwrap_or(0)
 }
 
 /// The GOPs [`av1_capacity_stratified_with_progress`] probes, ascending:
@@ -860,6 +966,9 @@ pub struct Av1StratifiedCapacity {
     /// pessimism_factor`, with `tail_cover` the trailing GOP's exact cover
     /// (0 without one).
     pub extrapolated_cover_bits_total: usize,
+    /// Expected syntax-dry cover positions of the whole clip (mean × full
+    /// GOPs + tail, no pessimism): the base of the capacity bands.
+    pub dry_cover_bits: usize,
     /// Primary payload byte cap from `extrapolated_cover_bits_total`: the
     /// STC payload ratio, minus the chunk-frame overhead for `n_gops` GOPs
     /// and the frame overhead, capped at `MAX_INNER_PAYLOAD_BYTES`.
@@ -868,6 +977,44 @@ pub struct Av1StratifiedCapacity {
     /// the collision formula `min(n, √(1024·n))` bits, minus the
     /// worst-case RS parity and the frame overhead.
     pub shadow_max_message_bytes_n1: usize,
+}
+
+// Capacity policy (spec `stego-cover-order-and-damage-costs.md` § 4a): the
+// fill bar's bands as α = primary payload bits per syntax-dry cover position.
+// The thresholds are AV1's own, from the v2 α sweep in
+// `docs/design/video/av1/v2-gate-results.md` (4 corpus clips × 360p/720p).
+// The v2 STC turns α into a change rate of ≈ α/4.3 on AV1, not H.264's α/2,
+// so the bands are set by quality, against H.264's quality marks.
+
+/// RED end — max: α = 1/8. The heaviest swept α every clip encodes at with
+/// clip-PSNR ≳ 27 dB and worst-block ≳ 13 dB (hardest: iphone5 360p,
+/// 31.2 / 14.6 dB). The deliverable 15 % ratio sits just above it.
+pub const CAP_ALPHA_MAX: (usize, usize) = (1, 8);
+/// YELLOW start — comfort: α = 3/50 (6 %). The heaviest swept α every clip
+/// encodes at with clip-PSNR ≳ 34 dB and worst-block ≳ 16 dB, H.264's
+/// comfort quality (iphone5 360p: 35.1 / 16.9 dB; at 8 %, 33.3 dB).
+pub const CAP_ALPHA_COMFORT: (usize, usize) = (3, 50);
+
+impl Av1StratifiedCapacity {
+    /// Capacity policy — the RED end: `α_max` of the dry cover, clamped to
+    /// the deliverable `primary_max_message_bytes`.
+    pub fn max_message_bytes(&self) -> usize {
+        self.alpha_band_bytes(CAP_ALPHA_MAX).min(self.primary_max_message_bytes)
+    }
+
+    /// Capacity policy — the YELLOW start: `α_comfort` of the dry cover.
+    /// Below this the UI is green.
+    pub fn comfort_message_bytes(&self) -> usize {
+        self.alpha_band_bytes(CAP_ALPHA_COMFORT).min(self.max_message_bytes())
+    }
+
+    fn alpha_band_bytes(&self, (num, den): (usize, usize)) -> usize {
+        // α × dry bits = payload bits; / 8 = bytes; − the framing the
+        // primary cap also subtracts.
+        ((self.dry_cover_bits.saturating_mul(num) / den.max(1)) / 8)
+            .saturating_sub(chunk_frame_v3_1_overhead_bytes(self.n_gops as usize))
+            .saturating_sub(FRAME_OVERHEAD)
+    }
 }
 
 /// Whole-clip cover estimate from stratified full-GOP samples, plus the
@@ -990,6 +1137,7 @@ fn probe_one_keyframe(
         ..Default::default()
     };
     super::whole_video::apply_phasm_av1_speed(&mut config);
+    super::whole_video::apply_phasm_av1_colour(&mut config, params.colour);
     let config = Arc::new(config);
     let mut sequence = Sequence::new(&config);
     super::whole_video::apply_phasm_av1_sequence(&mut sequence);
@@ -1040,6 +1188,137 @@ fn probe_one_keyframe(
 mod tests {
     use super::*;
 
+    /// Measurement for the escalation threshold (not a check): probes every
+    /// GOP of each clip in `PHASM_ESC_CLIPS` (comma-separated) at
+    /// `PHASM_ESC_SIZE` (default 1280x720), then replays the probe's
+    /// escalation from those samples for several thresholds and prints, per
+    /// threshold, the GOPs probed and the maximum and comfort shown, beside
+    /// the full probe's.
+    #[test]
+    #[ignore = "measurement; needs ffmpeg and PHASM_ESC_CLIPS"]
+    fn escalation_threshold_sweep() {
+        use super::super::whole_video::{Av1FileYuvSource, Av1GopYuvSource};
+        let Ok(clips) = std::env::var("PHASM_ESC_CLIPS") else { return };
+        let size = std::env::var("PHASM_ESC_SIZE").unwrap_or_else(|_| "1280x720".into());
+        let (w, h) = size.split_once('x').map(|(a, b)| (a.parse::<u32>().unwrap(), b.parse::<u32>().unwrap())).unwrap();
+        let dir = std::env::var("PHASM_TMP").unwrap_or_else(|_| "/tmp".into());
+        let cal = AllocationCalibration::AV1_1080P_QP30;
+        let thresholds: [(usize, usize); 5] = [(3, 4), (7, 8), (15, 16), (31, 32), (1, 1)];
+        for clip in clips.split(',') {
+            let yuv = format!("{dir}/esc_{}.yuv", std::process::id());
+            let st = std::process::Command::new("ffmpeg")
+                .args(["-y", "-loglevel", "error", "-i", clip, "-vf", &format!("scale={w}:{h}:flags=area")])
+                .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "yuv420p", &yuv])
+                .status()
+                .unwrap();
+            assert!(st.success(), "decode {clip}");
+            let n_frames = (std::fs::metadata(&yuv).unwrap().len() / (w as u64 * h as u64 * 3 / 2)) as u32;
+            let params = Av1StreamingEncodeParams {
+                width: w,
+                height: h,
+                quantizer: 100,
+                gop_size: 30,
+                total_frames_hint: n_frames,
+                colour: Default::default(),
+            };
+            let mut source = Av1FileYuvSource::open(std::path::Path::new(&yuv), w, h, n_frames, 30).unwrap();
+            let n_gops = n_frames.div_ceil(30);
+            let all: Vec<u32> = (0..n_gops).collect();
+            let t0 = std::time::Instant::now();
+            source.rewind().unwrap();
+            let samples = probe_gops(&mut source, n_frames, params, &all, &mut |_, _, _| {}).unwrap();
+            let per_gop_ms = t0.elapsed().as_millis() as f64 / n_gops as f64;
+            let _ = std::fs::remove_file(&yuv);
+            let (positions, n_full, tail) = stratified_probe_positions(n_frames, 30, cal.k_min);
+            let full = stratified_capacity_from_samples(&samples, n_gops, n_full, tail, &cal).unwrap();
+            let name = std::path::Path::new(clip).file_name().unwrap().to_string_lossy().to_string();
+            println!(
+                "ESC {name} {w}x{h} gops={n_gops} per_gop_ms={per_gop_ms:.0} full: max={} comfort={}",
+                full.max_message_bytes(),
+                full.comfort_message_bytes()
+            );
+            for t in thresholds {
+                let pick = |gs: &[u32]| -> Vec<(usize, usize, usize)> {
+                    samples.iter().filter(|s| gs.contains(&(s.0 as u32))).copied().collect()
+                };
+                let mut have: Vec<u32> = positions.clone();
+                let mut s3 = pick(&have);
+                let mut k = s3.iter().filter(|s| s.0 < n_full).count();
+                while k < n_full && lower_bound_is_weak(&s3, n_full, &cal, t) {
+                    k = (2 * k).min(n_full);
+                    for g in stratified_positions(k, n_full) {
+                        if !have.contains(&(g as u32)) {
+                            have.push(g as u32);
+                        }
+                    }
+                    s3 = pick(&have);
+                }
+                let est = stratified_capacity_from_samples(&s3, n_gops, n_full, tail, &cal).unwrap();
+                println!(
+                    "ESC {name} T={}/{} probed={}/{} max={} ({:+.1}%) comfort={}",
+                    t.0,
+                    t.1,
+                    s3.len(),
+                    n_gops,
+                    est.max_message_bytes(),
+                    100.0 * (est.max_message_bytes() as f64 / full.max_message_bytes().max(1) as f64 - 1.0),
+                    est.comfort_message_bytes()
+                );
+            }
+        }
+    }
+
+    fn stratified_with(dry_cover_bits: usize, primary: usize, n_gops: u32) -> Av1StratifiedCapacity {
+        Av1StratifiedCapacity {
+            samples: vec![],
+            n_gops,
+            cover_bits_mean_per_gop: 0,
+            cover_bits_lower_99_9_per_gop: 0,
+            cover_bits_pessimism_adjusted_per_gop: 0,
+            extrapolated_cover_bits_total: 0,
+            dry_cover_bits,
+            primary_max_message_bytes: primary,
+            shadow_max_message_bytes_n1: 0,
+        }
+    }
+
+    #[test]
+    fn bands_are_alpha_of_the_dry_cover() {
+        let (dry, n_gops) = (8_000_000usize, 4u32);
+        let cap = stratified_with(dry, usize::MAX, n_gops);
+        let band = |(num, den): (usize, usize)| {
+            dry * num / den / 8 - chunk_frame_v3_1_overhead_bytes(n_gops as usize) - FRAME_OVERHEAD
+        };
+        assert_eq!(cap.max_message_bytes(), band(CAP_ALPHA_MAX));
+        assert_eq!(cap.comfort_message_bytes(), band(CAP_ALPHA_COMFORT));
+        assert!(cap.comfort_message_bytes() < cap.max_message_bytes());
+    }
+
+    #[test]
+    fn bands_never_exceed_the_deliverable_primary() {
+        let cap = stratified_with(8_000_000, 1_000, 4);
+        assert_eq!(cap.max_message_bytes(), 1_000);
+        assert_eq!(cap.comfort_message_bytes(), 1_000);
+    }
+
+    #[test]
+    fn bands_are_zero_on_a_tiny_cover() {
+        let cap = stratified_with(100, 0, 1);
+        assert_eq!((cap.max_message_bytes(), cap.comfort_message_bytes()), (0, 0));
+    }
+
+    #[test]
+    fn dry_cover_is_the_unpessimised_expectation() {
+        let (mu, _, _, _) = stratified_cover_estimate(
+            &[5_000_000; 8],
+            12,
+            Some(642_285),
+            &AllocationCalibration::AV1_1080P_QP30,
+        );
+        assert_eq!(dry_cover_expectation(mu, 12, Some(642_285)), 5_000_000 * 12 + 642_285);
+        assert_eq!(dry_cover_expectation(0.0, 0, Some(7)), 7);
+    }
+
     #[test]
     fn tail_does_not_widen_the_lower_bound() {
         let (_, lower, _, extrapolated) = stratified_cover_estimate(
@@ -1049,7 +1328,8 @@ mod tests {
             &AllocationCalibration::AV1_1080P_QP30,
         );
         assert_eq!(lower, 5_000_000.0);
-        assert_eq!(extrapolated, ((5_000_000 * 12 + 642_285) as f64 * 0.5) as usize);
+        let pf = AllocationCalibration::AV1_1080P_QP30.pessimism_factor;
+        assert_eq!(extrapolated, ((5_000_000 * 12 + 642_285) as f64 * pf) as usize);
     }
 
     #[test]
@@ -1082,6 +1362,40 @@ mod tests {
     fn clip_shorter_than_one_gop_is_estimated_from_its_tail() {
         let cal = AllocationCalibration::AV1_1080P_QP30;
         let extrapolated = stratified_cover_estimate(&[], 0, Some(400_000), &cal).3;
-        assert_eq!(extrapolated, (400_000.0 * 0.5) as usize);
+        assert_eq!(extrapolated, (400_000.0 * cal.pessimism_factor) as usize);
+    }
+
+    /// The probe hands the planner each GOP's quality-safe cover
+    /// (`density_cap`), so the bands and the deliverable shrink with the
+    /// plan's damage-aware caps.
+    #[test]
+    fn probe_samples_are_the_quality_safe_cover() {
+        // Low-amplitude hashed noise at quantizer 10: many small
+        // coefficients (cover is 1 <= |c| <= 5), denser than the bound.
+        let (w, h, n) = (64u32, 64u32, 4u32);
+        let frame = expected_i420_size(w, h);
+        let yuv: Vec<u8> = (0..frame * n as usize)
+            .map(|i| 120 + ((i.wrapping_mul(2_654_435_761) >> 13) & 0xf) as u8)
+            .collect();
+        let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 10, gop_size: n, total_frames_hint: n, colour: Default::default() };
+        let frames = super::super::whole_video::encode_gop_natural(&yuv, n, params).unwrap();
+        let raw: usize = frames
+            .iter()
+            .filter_map(|(_, r)| r.tiles.first())
+            .flat_map(|t| t.bit_tags.iter().zip(&t.bit_meta))
+            .filter(|(tag, m)| crate::stego::cost::av1_damage::av1_in_cover(**tag == PHASM_TAG_AC_COEFF_SIGN, m.coeff_magnitude))
+            .count();
+        let safe = super::super::density_cap::quality_safe_cover(raw, w, h);
+        assert!(safe < raw, "fixture under the bound: {raw} positions at {w}x{h}");
+        let mut src = super::super::whole_video::Av1SliceYuvSource::new(&yuv, w, h, n, n);
+        super::super::whole_video::Av1GopYuvSource::rewind(&mut src).unwrap();
+        let samples = probe_gops(&mut src, n, params, &[0], &mut |_, _, _| {}).unwrap();
+        assert_eq!(samples[0].1, safe);
+        // The shadow-eligible count keeps its share of the cover.
+        let eligible = super::super::whole_video::shadow_buckets_from_recordings(&frames, w, h)
+            .iter()
+            .filter(|b| b.is_some())
+            .count();
+        assert_eq!(samples[0].2, eligible * safe / raw);
     }
 }

@@ -47,6 +47,24 @@ pub fn generate_hhat(h: usize, w: usize, seed: &[u8; 32]) -> Vec<Vec<u32>> {
     rows
 }
 
+/// [`generate_hhat`] with the first and last bit of every column forced to 1
+/// (rows 0 and `h - 1` all ones). Same RNG draw, so the other bits match
+/// `generate_hhat`'s. EXPERIMENTAL, H.264 only (opt-in through
+/// `PHASM_H264_HHAT_ENDS=1`, see `codec::h264::stego::v2_knobs`): Ghost
+/// images and AV1 keep `generate_hhat`. Measured on the H.264 v2 wet-paper
+/// cover, it narrows the per-passphrase capacity spread
+/// (`docs/design/video/h264/intra-drift-diagnosis.md`, follow-up).
+pub fn generate_hhat_end_set(h: usize, w: usize, seed: &[u8; 32]) -> Vec<Vec<u32>> {
+    let mut rows = generate_hhat(h, w, seed);
+    if h > 0 {
+        for c in 0..w {
+            rows[0][c] = 1;
+            rows[h - 1][c] = 1;
+        }
+    }
+    rows
+}
+
 /// Return the column vector at position `col` as a packed u32 (bottom h bits).
 pub fn column_packed(hhat: &[Vec<u32>], col: usize) -> u32 {
     let h = hhat.len();

@@ -2728,8 +2728,8 @@ fn cap_probe_vs_verified_axes() {
     use phasm_core::codec::h264::streaming_session::h264_diag_verified_gop_consumed;
     const GOP: u32 = 30;
     const K: usize = 4;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32]; // CAP2_TRIAL_SEED
-    const OTHER_SEED: [u8; 32] = [0x5a; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] }; // CAP2_TRIAL_SEED
+    const OTHER_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x5a; 32] };
 
     /// The probe's synthetic trial payload (`cap2_trial_payload`).
     fn trial_payload(len: usize) -> Vec<u8> {
@@ -2783,7 +2783,7 @@ fn cap_probe_vs_verified_axes() {
             let f1 = ((g + 1) * GOP as usize).min(n as usize);
             let gop_yuv = &yuv[f0 * frame_sz..f1 * frame_sz];
             let gn = (f1 - f0) as u32;
-            let run = |payload: &[u8], seed: &[u8; 32]| -> f64 {
+            let run = |payload: &[u8], seed: &phasm_core::stego::cover_order::GopSeeds| -> f64 {
                 h264_diag_verified_gop_consumed(
                     gop_yuv, w, h, gn, 26, GOP, payload, 0, cap as u32, seed, &weights,
                 ).map(|c| c as f64 / cap as f64).unwrap_or(f64::NAN)
@@ -2838,7 +2838,7 @@ fn cap_probe_vs_verified_axes() {
 fn cap_cascade_leak_attribution() {
     use phasm_core::codec::h264::streaming_session::h264_diag_gop_emit_once;
     const GOP: u32 = 30;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] };
 
     fn trial_payload(len: usize) -> Vec<u8> {
         let mut v = Vec::with_capacity(len);
@@ -3273,7 +3273,7 @@ fn cap_probe_vs_emit_cover_content() {
 fn cap_embeddability_is_non_monotone_in_size() {
     use phasm_core::codec::h264::streaming_session::h264_diag_gop_emit_once;
     const GOP: u32 = 30;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] };
 
     fn trial_payload(len: usize) -> Vec<u8> {
         let mut v = Vec::with_capacity(len);
@@ -3365,7 +3365,7 @@ fn cap_embeddability_is_non_monotone_in_size() {
 fn cap_monotonicity_census() {
     use phasm_core::codec::h264::streaming_session::h264_diag_gop_emit_once;
     const GOP: u32 = 30;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] };
     const GOPS_PER_FIXTURE: usize = 4;
     const N_SIZES: usize = 8;
 
@@ -3586,7 +3586,7 @@ fn cap_wet_fraction_census() {
 fn cap_same_size_different_message() {
     use phasm_core::codec::h264::streaming_session::h264_diag_gop_emit_once;
     const GOP: u32 = 30;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] };
     const K: usize = 8;
 
     /// Draw `draw` of a pseudo-random payload of exactly `len` bytes. Draw 0
@@ -3665,7 +3665,7 @@ fn cap_shrink_path_timing() {
     use phasm_core::codec::h264::streaming_session::h264_diag_verified_gop_consumed;
     use std::time::Instant;
     const GOP: u32 = 30;
-    const TRIAL_SEED: [u8; 32] = [0x2c; 32];
+    const TRIAL_SEED: phasm_core::stego::cover_order::GopSeeds = phasm_core::stego::cover_order::GopSeeds { order: [0x5b; 32], hhat: [0x2c; 32] };
     const REPS: usize = 3;
 
     fn trial_payload(len: usize) -> Vec<u8> {

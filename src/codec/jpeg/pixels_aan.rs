@@ -355,6 +355,17 @@ fn idct_kernel_scalar(quantized: &[i16; 64], qt: &[u16; 64], out: &mut [i32; 64]
 // Public API — thin wrappers over the kernel layer
 // ============================================================================
 
+/// libjpeg "islow" forward DCT in place, without quantization.
+///
+/// Input: level-shifted samples (`pixel − 128`). Output: libjpeg scale (8×
+/// the canonical DCT), exactly as libjpeg-turbo's `jpeg_fdct_islow` /
+/// `jsimd_fdct_islow` leave it before `quantize()`. Bit-exact on every
+/// architecture (scalar / NEON / AVX2 / WASM SIMD share one pin). Used by
+/// the Deep Cover writer, which needs the pre-rounding coefficients.
+pub fn fdct_islow(data: &mut [i16; 64]) {
+    fdct_kernel(data);
+}
+
 /// 8×8 forward DCT + quantize (integer LL&M).
 ///
 /// Input: pixel values (~0–255). Out-of-range f64 inputs are rounded

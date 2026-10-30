@@ -28,13 +28,16 @@ pub mod cascade_safety;
 pub use crate::stego::chunk_frame;
 pub mod content_costs;
 pub mod cost_weights;
+pub mod damage;
 pub mod gop_pattern;
 pub mod hook;
 pub mod inject;
 pub mod keys;
 pub mod orchestrate;
 pub mod shadow;
+pub mod quality_predict;
 pub mod tier_filter;
+pub mod v2_knobs;
 
 // OH264 encode-side helper — `h264-encoder` only.
 #[cfg(feature = "h264-encoder")]

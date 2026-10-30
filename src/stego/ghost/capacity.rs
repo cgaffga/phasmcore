@@ -2,187 +2,310 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Ghost mode capacity estimation.
+//! Ghost mode capacity and stealth bands.
 //!
-//! Estimates the maximum plaintext message size that can be embedded in a
-//! given JPEG cover image using Ghost mode. The estimate accounts for:
-//! - Number of usable (non-WET) AC coefficients
-//! - Minimum capacity ratio to ensure reliable STC embedding
-//! - Frame overhead (length, salt, nonce, auth tag, CRC)
+//! The capacity policy (`docs/design/image/ghost-embedding-v3.md`, "Capacity
+//! policy") is stated in **frame bits per non-zero Y AC coefficient**
+//! (bpnzAC), the unit the detectability measurements use:
+//!
+//! | band | frame bits | exact SI (Deep Cover) | meaning |
+//! |---|---|---|---|
+//! | comfort | ≤ max / 4, and ≤ 2240 · √(nzAC / 44 000) | ≤ max / 4, and ≤ 2800 · √(nzAC / 44 000) | near chance for every detector measured |
+//! | caution | ≤ max / 2 | ≤ max / 2 | |
+//! | heavy | ≤ max = nzAC / 5 (0.20 bpnzAC) | ≤ max = nzAC / 4 (0.25 bpnzAC) | detectable by a matched CNN at the max |
+//!
+//! The square-root cap on the comfort band keeps its *absolute* size growing
+//! only with √cover on large photos (the square-root law: a fixed rate gets
+//! more detectable as the cover grows; 280 B of frame at BOSSbase size,
+//! ≈ 2.6 KB at 12 MP). It is max / 4 at the BOSSbase reference size, so it
+//! scales with the maximum.
+//!
+//! **Deep Cover bonus**: when the embed uses *exact* side information — the
+//! cover is what phasm's cover writer makes of the raw pixels, checked
+//! coefficient by coefficient ([`SideInfo::is_exact_for`], the same check
+//! `encode_si*` runs) — the maximum is nzAC / 4 and every band scales with
+//! it (SRNet QF92: exact SI at nzAC / 4 P_E 0.450 vs plain v3 at nzAC / 5
+//! 0.366; `docs/design/image/deep-cover-exact-si.md`). Approximate side
+//! information (any other cover) and plain JPEG input keep nzAC / 5. Core
+//! decides from the pixels; no caller flag can claim the bonus.
+//!
+//! Everything is reported in **plaintext bytes** of the (compressed)
+//! payload: frame bytes minus the frame overhead. With shadows, the shadows'
+//! RS-coded frames are taken off every band (the bands bound the total), and
+//! a single shadow may hold half the maximum — the exact-SI maximum on a
+//! Deep Cover cover.
+//!
+//! These are the policy the apps enforce; the core encoder itself enforces
+//! only technical feasibility (frame ≤ one bit per Y AC coefficient).
 
 use crate::codec::jpeg::JpegImage;
 use crate::codec::jpeg::dct::DctGrid;
-use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::error::StegoError;
+use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 use crate::stego::shadow;
+use super::side_info::SideInfo;
 
-/// Minimum ratio of usable (non-WET) AC coefficients to message bits
-/// for standard J-UNIWARD. A ratio below this produces detectable artifacts.
-const MIN_CAPACITY_RATIO: f64 = 5.0;
+/// Maximum frame bits = nzAC / `MAX_RATE_DIV` (0.20 bpnzAC).
+pub const MAX_RATE_DIV: usize = 5;
 
-/// Minimum ratio for SI-UNIWARD ("Deep Cover").
-///
-/// SI-UNIWARD lowers embedding costs by exploiting quantization rounding errors,
-/// allowing a higher embedding rate at the same steganalysis detectability.
-/// Literature shows ~1.5-2× capacity gain; 3.5 is a conservative estimate (~43%
-/// more capacity than J-UNIWARD's ratio of 5.0).
-const MIN_CAPACITY_RATIO_SI: f64 = 3.5;
+/// Maximum frame bits with exact side information (Deep Cover):
+/// nzAC / `MAX_RATE_DIV_EXACT_SI` (0.25 bpnzAC).
+pub const MAX_RATE_DIV_EXACT_SI: usize = 4;
 
-/// Count non-zero AC coefficients in the DctGrid (fast capacity estimation).
-///
-/// This is equivalent to counting usable positions from a CostMap, since
-/// J-UNIWARD assigns finite costs to all non-zero AC coefficients. This
-/// avoids the expensive UNIWARD cost computation, making capacity estimation
-/// instantaneous even for very large images.
-fn count_nonzero_ac(grid: &DctGrid) -> usize {
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
-    let mut count = 0usize;
-    for br in 0..bt {
-        for bc in 0..bw {
-            let blk = grid.block(br, bc);
-            for k in 1..64 { // skip DC at index 0
-                if blk[k] != 0 {
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
+/// Square-root-law cap on the comfort band: frame bits
+/// `COMFORT_SQRT_BITS · √(nzAC / COMFORT_SQRT_NZAC)` (0.05 bpnzAC at the
+/// BOSSbase mean nzAC), scaled by `MAX_RATE_DIV / rate_div` with the maximum.
+const COMFORT_SQRT_BITS: f64 = 2240.0;
+const COMFORT_SQRT_NZAC: f64 = 44_000.0;
+
+/// Stealth bands of a cover, in plaintext bytes of the primary payload.
+/// Always `comfort ≤ caution ≤ max`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GhostBands {
+    /// The capacity bar's 100 %.
+    pub max_bytes: usize,
+    /// Green up to here.
+    pub comfort_bytes: usize,
+    /// Medium/Low stealth rating boundary.
+    pub caution_bytes: usize,
 }
 
-/// Convert usable position count + capacity ratio → plaintext byte capacity.
-fn capacity_from_usable(usable: usize, ratio: f64) -> usize {
-    let max_frame_bits = (usable as f64 / ratio) as usize;
-    let max_frame_bytes = max_frame_bits / 8;
+/// Count non-zero AC coefficients of the Y grid.
+pub fn count_nonzero_ac(grid: &DctGrid) -> usize {
+    grid.coeffs()
+        .chunks_exact(64)
+        .map(|b| b[1..].iter().filter(|&&c| c != 0).count())
+        .sum()
+}
 
-    if max_frame_bytes <= FRAME_OVERHEAD {
+/// Maximum-rate divisor for a cover: [`MAX_RATE_DIV_EXACT_SI`] when the
+/// embed has exact side information, else [`MAX_RATE_DIV`].
+pub fn rate_div(exact_si: bool) -> usize {
+    if exact_si { MAX_RATE_DIV_EXACT_SI } else { MAX_RATE_DIV }
+}
+
+/// Band thresholds in frame bits for a cover with `nzac` non-zero AC
+/// coefficients and maximum nzAC / `rate_div`: `(max, comfort, caution)`.
+pub fn band_frame_bits(nzac: usize, rate_div: usize) -> (usize, usize, usize) {
+    let max = nzac / rate_div;
+    let sqrt_bits = COMFORT_SQRT_BITS * MAX_RATE_DIV as f64 / rate_div as f64;
+    let sqrt_cap = (sqrt_bits * (nzac as f64 / COMFORT_SQRT_NZAC).sqrt()) as usize;
+    let comfort = (max / 4).min(sqrt_cap);
+    let caution = (max / 2).max(comfort);
+    (max, comfort, caution)
+}
+
+/// Plaintext bytes a frame of `bits` carries.
+pub fn plaintext_for_frame_bits(bits: usize) -> usize {
+    let frame_bytes = bits / 8;
+    if frame_bytes <= FRAME_OVERHEAD {
         return 0;
     }
-
-    let capacity = max_frame_bytes - FRAME_OVERHEAD;
+    let capacity = frame_bytes - FRAME_OVERHEAD;
     if capacity > u16::MAX as usize {
-        // v2 frame needs 4 extra bytes for the extended length header.
-        max_frame_bytes.saturating_sub(FRAME_OVERHEAD_EXT)
+        // Extended frame: 4 extra bytes for the 32-bit length.
+        frame_bytes.saturating_sub(FRAME_OVERHEAD_EXT)
     } else {
         capacity
     }
 }
 
-/// Estimate Ghost mode capacity (standard J-UNIWARD).
-///
-/// Conservative estimate: divides usable coefficient count by
-/// [`MIN_CAPACITY_RATIO`] (5.0) to ensure the STC has sufficient slack for
-/// low-distortion embedding, then subtracts the frame overhead.
+/// RS-coded bits of `count` shadow frames carrying `total_bytes` of
+/// plaintext together (upper bound: every shadow pays its own partial RS
+/// block).
+pub fn shadow_frames_bits(count: usize, total_bytes: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let data = total_bytes + count * crate::stego::shadow_layer::SHADOW_FRAME_OVERHEAD_V1;
+    let k = 255 - shadow::SHADOW_STC_PARITY;
+    let blocks = data.div_ceil(k) + count - 1;
+    (data + blocks * shadow::SHADOW_STC_PARITY) * 8
+}
+
+fn y_nzac(img: &JpegImage) -> Result<usize, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    Ok(count_nonzero_ac(img.dct_grid(0)))
+}
+
+/// Whether `encode_si*` with these pixels embeds into `img` with exact side
+/// information. Errors exactly where `encode_si*` would on the pixel buffer
+/// (empty or shorter than `width · height · 3`); pixels that belong to
+/// another cover are simply not exact.
+pub fn has_exact_side_info(img: &JpegImage, raw_rgb: &[u8], width: u32, height: u32) -> Result<bool, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(3)).unwrap_or(0);
+    if width == 0 || height == 0 || raw_rgb.len() < expected {
+        return Err(StegoError::ImageTooSmall);
+    }
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
+    Ok(SideInfo::is_exact_for(raw_rgb, width, height, img.dct_grid(0), &qt.values))
+}
+
+/// Bands of a cover with `nzac` non-zero AC coefficients at maximum
+/// nzAC / `rate_div`, next to the given shadows.
+fn bands_for(nzac: usize, rate_div: usize, shadow_count: usize, shadow_total_bytes: usize) -> GhostBands {
+    let (max, comfort, caution) = band_frame_bits(nzac, rate_div);
+    let sb = shadow_frames_bits(shadow_count, shadow_total_bytes);
+    let p = |bits: usize| plaintext_for_frame_bits(bits.saturating_sub(sb));
+    let max_bytes = p(max);
+    let caution_bytes = p(caution).min(max_bytes);
+    let comfort_bytes = p(comfort).min(caution_bytes);
+    GhostBands { max_bytes, comfort_bytes, caution_bytes }
+}
+
+/// Stealth bands of the primary payload for a cover carrying `shadow_count`
+/// shadows of `shadow_total_bytes` plaintext together (0, 0 = no shadows),
+/// embedded without side information (JPEG input).
+pub fn ghost_bands(img: &JpegImage, shadow_count: usize, shadow_total_bytes: usize) -> Result<GhostBands, StegoError> {
+    Ok(bands_for(y_nzac(img)?, MAX_RATE_DIV, shadow_count, shadow_total_bytes))
+}
+
+/// [`ghost_bands`] for an `encode_si*` embed with these raw pixels: the
+/// Deep Cover maximum (nzAC / 4) when the side information is exact
+/// ([`has_exact_side_info`]), else the same as [`ghost_bands`].
+pub fn ghost_bands_si(
+    img: &JpegImage,
+    raw_rgb: &[u8],
+    width: u32,
+    height: u32,
+    shadow_count: usize,
+    shadow_total_bytes: usize,
+) -> Result<GhostBands, StegoError> {
+    let div = rate_div(has_exact_side_info(img, raw_rgb, width, height)?);
+    Ok(bands_for(y_nzac(img)?, div, shadow_count, shadow_total_bytes))
+}
+
+/// Ghost capacity (the bands' maximum), plaintext bytes.
 ///
 /// # Errors
-/// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
-/// or its quantization table is missing.
+/// [`StegoError::NoLuminanceChannel`] if the image has no Y component.
 pub fn estimate_capacity(img: &JpegImage) -> Result<usize, StegoError> {
-    if img.num_components() == 0 {
-        return Err(StegoError::NoLuminanceChannel);
-    }
-    let usable = count_nonzero_ac(img.dct_grid(0));
-    Ok(capacity_from_usable(usable, MIN_CAPACITY_RATIO))
+    Ok(ghost_bands(img, 0, 0)?.max_bytes)
 }
 
-/// Estimate Ghost mode capacity with SI-UNIWARD ("Deep Cover").
-///
-/// When the input image is non-JPEG (PNG, HEIC, RAW), SI-UNIWARD exploits
-/// quantization rounding errors to embed at lower distortion per bit. This
-/// allows a higher embedding rate at the same steganalysis risk, resulting
-/// in ~43% more capacity than standard J-UNIWARD.
-///
-/// Uses [`MIN_CAPACITY_RATIO_SI`] (3.5) — conservative relative to the
-/// literature's 1.5-2× improvement at equal detectability.
-///
-/// No raw pixels needed: the position count is identical, only the per-bit
-/// distortion budget changes.
-pub fn estimate_capacity_si(img: &JpegImage) -> Result<usize, StegoError> {
-    if img.num_components() == 0 {
-        return Err(StegoError::NoLuminanceChannel);
-    }
-    let usable = count_nonzero_ac(img.dct_grid(0));
-    Ok(capacity_from_usable(usable, MIN_CAPACITY_RATIO_SI))
+/// Ghost capacity of an `encode_si*` embed with these raw pixels ("Deep
+/// Cover"): nzAC / 4 frame bits with exact side information, else the same
+/// as [`estimate_capacity`].
+pub fn estimate_capacity_si(img: &JpegImage, raw_rgb: &[u8], width: u32, height: u32) -> Result<usize, StegoError> {
+    Ok(ghost_bands_si(img, raw_rgb, width, height, 0, 0)?.max_bytes)
 }
 
-/// Estimate shadow layer capacity for a JPEG image.
-///
-/// Shadow uses direct LSB embedding in the Y (luminance) channel with
-/// cost-pool position selection. Capacity is based on Y nzAC count.
+/// Largest single shadow (plaintext bytes) at maximum nzAC / `rate_div`: a
+/// shadow frame of half the maximum, so the primary — the largest message,
+/// by the auto-sort — still fits next to it.
+pub(crate) fn shadow_capacity_for(nzac: usize, rate_div: usize) -> usize {
+    shadow::shadow_plaintext_for_bits(band_frame_bits(nzac, rate_div).0 / 2)
+}
+
+/// Largest single shadow message (plaintext bytes), JPEG input.
 pub fn estimate_shadow_capacity(img: &JpegImage) -> Result<usize, StegoError> {
-    if img.num_components() == 0 {
-        return Err(StegoError::NoLuminanceChannel);
-    }
-    let y_nzac = count_nonzero_ac(img.dct_grid(0));
-    Ok(shadow::shadow_capacity(y_nzac))
+    Ok(shadow_capacity_for(y_nzac(img)?, MAX_RATE_DIV))
 }
 
-/// Estimate Ghost primary capacity accounting for shadow position overhead.
-///
-/// Subtracts shadow positions from usable Y NZAC before computing primary
-/// capacity. Uses conservative RS parity (16) for the estimate since the
-/// escalation cascade frequently bumps parity above the initial 4.
+/// [`estimate_shadow_capacity`] for an `encode_si*` embed with these raw
+/// pixels: half the Deep Cover maximum with exact side information.
+pub fn estimate_shadow_capacity_si(img: &JpegImage, raw_rgb: &[u8], width: u32, height: u32) -> Result<usize, StegoError> {
+    let div = rate_div(has_exact_side_info(img, raw_rgb, width, height)?);
+    Ok(shadow_capacity_for(y_nzac(img)?, div))
+}
+
+/// Primary capacity (plaintext bytes) next to `shadow_count` shadows of
+/// `shadow_total_bytes` together, without side information. `is_si` does not
+/// change the result: the Deep Cover bonus needs the pixels
+/// ([`ghost_bands_si`]); a flag cannot claim it.
 pub fn estimate_capacity_with_shadows(
     img: &JpegImage,
     shadow_count: usize,
     shadow_total_bytes: usize,
-    is_si: bool,
+    _is_si: bool,
 ) -> Result<usize, StegoError> {
-    if img.num_components() == 0 {
-        return Err(StegoError::NoLuminanceChannel);
-    }
-    let y_nzac = count_nonzero_ac(img.dct_grid(0));
-    let ratio = if is_si { MIN_CAPACITY_RATIO_SI } else { MIN_CAPACITY_RATIO };
+    Ok(ghost_bands(img, shadow_count, shadow_total_bytes)?.max_bytes)
+}
 
-    // Conservative RS parity for capacity estimate (cascade often escalates)
-    let parity = 16usize;
-    // Compute RS-encoded shadow bytes (per shadow: frame_overhead + payload, RS-encoded)
-    let shadow_frame_overhead = 46usize; // plaintext_len(2) + salt(16) + nonce(12) + tag(16)
-    let total_shadow_frame_bytes = shadow_count * shadow_frame_overhead + shadow_total_bytes;
-    // RS encoding expands data: for each 255-byte block, parity bytes added
-    let k = 255 - parity; // 239 data bytes per block
-    let full_blocks = total_shadow_frame_bytes.div_ceil(k);
-    let shadow_rs_bytes = full_blocks * 255;
-    let shadow_bits = shadow_rs_bytes * 8;
-
-    // Subtract shadow positions from available pool
-    let effective_nzac = y_nzac.saturating_sub(shadow_bits);
-    Ok(capacity_from_usable(effective_nzac, ratio))
+/// Deep Cover bands of a cover phasm's writer just made (exact side
+/// information by construction).
+pub(crate) fn ghost_bands_exact(img: &JpegImage, shadow_count: usize, shadow_total_bytes: usize) -> Result<GhostBands, StegoError> {
+    Ok(bands_for(y_nzac(img)?, MAX_RATE_DIV_EXACT_SI, shadow_count, shadow_total_bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn capacity_reasonable_for_photo() {
-        let data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
-        let img = JpegImage::from_bytes(&data).unwrap();
-        let cap = estimate_capacity(&img).unwrap();
-        // 320×240 at 4:2:0 → 40×30=1200 Y blocks → 75,600 AC positions.
-        // Even with many zeros, should have >100 bytes capacity.
-        assert!(cap > 100, "capacity {cap} is too low for 320x240");
-        // But shouldn't be unreasonably high.
-        assert!(cap < 5000, "capacity {cap} is suspiciously high");
+    fn load(name: &str) -> JpegImage {
+        JpegImage::from_bytes(&std::fs::read(format!("test-vectors/image/{name}")).unwrap()).unwrap()
     }
 
     #[test]
-    fn si_capacity_higher_than_standard() {
-        let data = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg").unwrap();
-        let img = JpegImage::from_bytes(&data).unwrap();
-        let cap_j = estimate_capacity(&img).unwrap();
-        let cap_si = estimate_capacity_si(&img).unwrap();
-        // SI should give ~43% more capacity (ratio 3.5 vs 5.0)
-        assert!(
-            cap_si > cap_j,
-            "SI capacity ({cap_si}) should exceed J-UNIWARD capacity ({cap_j})"
-        );
-        // Verify the ratio is approximately 5.0/3.5 ≈ 1.43
-        let ratio = cap_si as f64 / cap_j as f64;
-        assert!(
-            ratio > 1.3 && ratio < 1.6,
-            "SI/J ratio {ratio:.2} should be ~1.43"
-        );
+    fn capacity_reasonable_for_photo() {
+        let img = load("photo_320x240_q75_420.jpg");
+        let cap = estimate_capacity(&img).unwrap();
+        assert!(cap > 100, "capacity {cap} is too low for 320x240");
+        assert!(cap < 5000, "capacity {cap} is suspiciously high");
+        // The maximum is nzAC / 5 frame bits.
+        let nz = count_nonzero_ac(img.dct_grid(0));
+        assert_eq!(cap, nz / 5 / 8 - FRAME_OVERHEAD);
+    }
+
+    #[test]
+    fn band_fractions_small_cover() {
+        // BOSSbase-sized: the square-root cap does not bind.
+        let (max, comfort, caution) = band_frame_bits(40_000, MAX_RATE_DIV);
+        assert_eq!((max, comfort, caution), (8000, 2000, 4000));
+        // Exact SI: nzAC / 4, every band scaled with it.
+        assert_eq!(band_frame_bits(40_000, MAX_RATE_DIV_EXACT_SI), (10_000, 2500, 5000));
+        assert_eq!(rate_div(false), MAX_RATE_DIV);
+        assert_eq!(rate_div(true), MAX_RATE_DIV_EXACT_SI);
+    }
+
+    #[test]
+    fn square_root_cap_on_large_covers() {
+        // 12 MP photo (nzAC ≈ 3.83 M): comfort ≈ 2240 · √87 ≈ 20.9 kbit.
+        let (max, comfort, caution) = band_frame_bits(3_833_089, MAX_RATE_DIV);
+        assert_eq!(max, 766_617);
+        assert_eq!(caution, max / 2);
+        assert!((20_800..=21_000).contains(&comfort), "{comfort}");
+        // Exact SI: the cap scales with the maximum (×5/4), so the bar keeps
+        // its proportions.
+        let (xmax, xcomfort, xcaution) = band_frame_bits(3_833_089, MAX_RATE_DIV_EXACT_SI);
+        assert_eq!(xmax, 958_272);
+        assert_eq!(xcaution, xmax / 2);
+        assert!(xcomfort.abs_diff(comfort * 5 / 4) <= 1, "{xcomfort} vs {comfort}");
+        // Crossover near nzAC ≈ 45.6 k, for both maxima.
+        for div in [MAX_RATE_DIV, MAX_RATE_DIV_EXACT_SI] {
+            let (m, c, _) = band_frame_bits(46_000, div);
+            assert!(c < m / 4);
+            let (m, c, _) = band_frame_bits(45_000, div);
+            assert_eq!(c, m / 4);
+        }
+    }
+
+    #[test]
+    fn bands_are_ordered_and_shadows_reduce_them() {
+        let img = load("photo_640x480_q75_420.jpg");
+        let b = ghost_bands(&img, 0, 0).unwrap();
+        assert!(b.comfort_bytes <= b.caution_bytes && b.caution_bytes <= b.max_bytes);
+        assert!(b.comfort_bytes > 0);
+        let s = ghost_bands(&img, 2, 100).unwrap();
+        assert!(s.max_bytes < b.max_bytes && s.comfort_bytes < b.comfort_bytes);
+        assert_eq!(estimate_capacity_with_shadows(&img, 2, 100, true).unwrap(), s.max_bytes);
+        // A tiny cover: everything zero, still ordered.
+        let t = ghost_bands(&load("tiny_8x8_q95.jpg"), 0, 0).unwrap();
+        assert_eq!(t, GhostBands { max_bytes: 0, comfort_bytes: 0, caution_bytes: 0 });
+    }
+
+    #[test]
+    fn shadow_bits_bound_the_real_frames() {
+        for (count, total) in [(1usize, 10usize), (2, 300), (3, 1000), (1, 60_000)] {
+            let per = total / count;
+            let real: usize = (0..count).map(|_| shadow::shadow_bits_for_plaintext(per)).sum();
+            assert!(shadow_frames_bits(count, total) >= real, "{count} {total}");
+        }
     }
 }

@@ -476,7 +476,7 @@ fn exact_size_mp4_track_dims_are_display_size() {
         .expect("encode");
     let pattern = GopPattern::Ipppp { gop: gop as usize };
     let mp4 = build_mp4_with_pattern(
-        MuxerProfile::HandbrakeX264, &stego, w, h, FrameTiming::FPS_30, pattern, n as usize,
+        MuxerProfile::LavfOpenH264, &stego, w, h, FrameTiming::FPS_30, pattern, n as usize,
     )
     .expect("mux at display size");
     let (tkhd, avc1) = mp4_dims(&mp4);
@@ -489,7 +489,7 @@ fn exact_size_mp4_track_dims_are_display_size() {
     // Muxing with the coded (MB-grid) size must be refused, not shipped.
     let g = FrameGeometry::new(w, h).unwrap();
     let err = build_mp4_with_pattern(
-        MuxerProfile::HandbrakeX264, &stego, g.coded_width(), g.coded_height(), FrameTiming::FPS_30,
+        MuxerProfile::LavfOpenH264, &stego, g.coded_width(), g.coded_height(), FrameTiming::FPS_30,
         pattern, n as usize,
     );
     assert!(err.is_err(), "coded-size mux must be rejected");

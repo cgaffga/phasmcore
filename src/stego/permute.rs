@@ -49,6 +49,45 @@ fn shuffle_portable(positions: &mut [CoeffPos], seed: &[u8; 32]) {
     }
 }
 
+/// The same portable Fisher-Yates shuffle on bare flat indices (4 bytes per
+/// position instead of `CoeffPos`'s 8): `shuffle_u32(idx)` permutes exactly
+/// like `permute_positions` permutes `CoeffPos`es with those indices.
+pub fn shuffle_u32(v: &mut [u32], seed: &[u8; 32]) {
+    let mut rng = shuffle_rng(seed);
+    let mut hi = v.len();
+    while hi > 1 {
+        let lo = hi.saturating_sub(SHUFFLE_CHUNK).max(1);
+        shuffle_u32_steps(v, &mut rng, lo, hi);
+        hi = lo;
+    }
+}
+
+/// `ChaCha20Rng`'s stream; on wasm32 computed with SIMD128
+/// ([`crate::stego::chacha_stream`]; `ppv_lite86` has no wasm SIMD backend).
+#[cfg(target_arch = "wasm32")]
+type ShuffleRng = crate::stego::chacha_stream::ChaCha20Stream;
+#[cfg(not(target_arch = "wasm32"))]
+type ShuffleRng = ChaCha20Rng;
+
+fn shuffle_rng(seed: &[u8; 32]) -> ShuffleRng {
+    ShuffleRng::from_seed(*seed)
+}
+
+/// Fisher-Yates steps per call of [`shuffle_u32_steps`].
+const SHUFFLE_CHUNK: usize = 1 << 16;
+
+/// The steps `i = hi − 1, …, lo` of [`shuffle_u32`]. A function of its own,
+/// not inlined on wasm32: V8 runs a function in baseline code (Liftoff)
+/// until its next call, with no on-stack replacement for Wasm, so a shuffle
+/// of 12 M positions in one loop never left baseline code.
+#[cfg_attr(target_arch = "wasm32", inline(never))]
+fn shuffle_u32_steps(v: &mut [u32], rng: &mut ShuffleRng, lo: usize, hi: usize) {
+    for i in (lo..hi).rev() {
+        let j = rng.gen_range(0..=(i as u32)) as usize;
+        v.swap(i, j);
+    }
+}
+
 /// Apply a portable Fisher-Yates permutation to an externally collected
 /// position vector.
 ///

@@ -29,7 +29,8 @@
 use phasm_core::codec::av1::stego::whole_video::{Av1GopYuvSource, Av1SliceYuvSource};
 use phasm_core::stego::calibration::AllocationCalibration;
 use phasm_core::{
-    av1_capacity_stratified, av1_probe_gops_at, Av1StreamingEncodeParams,
+    av1_capacity, av1_capacity_stratified, av1_probe_gops_at, av1_shadow_capacity,
+    Av1StreamingEncodeParams,
 };
 
 /// Minimal corpus-style tight-I420 YUV. Synthetic gradient on Y +
@@ -125,6 +126,7 @@ fn stratified_full_coverage_matches_natural_encode_per_gop() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
 
     let n_gops = n.div_ceil(gop);
@@ -164,6 +166,7 @@ fn stratified_pull_is_o_gop_memory() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
 
     let frame_size = (w * h * 3 / 2) as usize;
@@ -206,6 +209,7 @@ fn stratified_extrapolation_is_conservative() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let mut cal = AllocationCalibration::AV1_1080P_QP30;
     cal.k_min = 2; // force K < n_gops so FPC > 0
@@ -216,7 +220,9 @@ fn stratified_extrapolation_is_conservative() {
         av1_capacity_stratified(&mut src, n, params, &cal).expect("stratified");
 
     assert_eq!(cap.n_gops, (n.div_ceil(gop)) as u32);
-    assert_eq!(cap.samples.len(), cal.k_min);
+    // At least K; more when the samples disagree too much for the bound
+    // (the probe escalates K, `capacity::ESCALATE_BELOW_MEAN`).
+    assert!(cap.samples.len() >= cal.k_min, "{:?}", cap.samples);
     assert!(cap.cover_bits_mean_per_gop > 0);
     assert!(
         cap.cover_bits_lower_99_9_per_gop <= cap.cover_bits_mean_per_gop,
@@ -231,13 +237,15 @@ fn stratified_extrapolation_is_conservative() {
         cap.cover_bits_pessimism_adjusted_per_gop,
         cap.cover_bits_lower_99_9_per_gop
     );
-    // extrapolated_cover_bits_total = pessimism_adjusted × n_gops.
+    // extrapolated_cover_bits_total = pessimism_adjusted × n_gops, up to
+    // the per-GOP figure's floor (one bit per GOP).
     let expected = cap
         .cover_bits_pessimism_adjusted_per_gop
         .saturating_mul(cap.n_gops as usize);
-    assert_eq!(
-        cap.extrapolated_cover_bits_total, expected,
-        "extrapolation shape: pessimism-adjusted × n_gops"
+    assert!(
+        (expected..=expected + cap.n_gops as usize).contains(&cap.extrapolated_cover_bits_total),
+        "extrapolation shape: pessimism-adjusted × n_gops ({} vs {expected})",
+        cap.extrapolated_cover_bits_total
     );
     // Primary cap is derivable + non-negative.
     // (May be 0 for a tiny fixture after overhead subtraction; it
@@ -258,6 +266,7 @@ fn stratified_positions_must_be_monotonic() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, gop);
     src.rewind().expect("rewind");
@@ -269,4 +278,33 @@ fn stratified_positions_must_be_monotonic() {
         msg.contains("strictly increasing"),
         "unexpected error message: {msg}"
     );
+}
+
+/// The one-shot whole-clip API (`phasm video-capacity`, the CLI encode's
+/// announcement) reports what the apps show, measured on every GOP: the
+/// stratified probe at K = all GOPs, over the v2 cover with the
+/// damage-aware caps. It used to count every AC sign and Golomb tail.
+#[test]
+fn whole_clip_capacity_is_the_full_stratified_probe() {
+    let (w, h, gop, n) = (256, 144, 4, 18); // 4 full GOPs + a 2-frame tail
+    let yuv = make_yuv(w, h, n);
+    let params = Av1StreamingEncodeParams { width: w, height: h, quantizer: 30, gop_size: gop, total_frames_hint: n, colour: Default::default() };
+    let mut cal = AllocationCalibration::AV1_1080P_QP30;
+    cal.k_min = usize::MAX;
+    let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, gop);
+    src.rewind().expect("rewind");
+    let est = av1_capacity_stratified(&mut src, n, params, &cal).expect("stratified");
+    assert_eq!(est.samples.len(), 5, "every GOP probed: {:?}", est.samples);
+
+    let info = av1_capacity(&yuv, params).expect("whole clip");
+    assert!(est.max_message_bytes() > 0, "{est:?}");
+    assert_eq!(info.n_gops, est.n_gops);
+    assert_eq!(info.cover_size_bits, est.dry_cover_bits);
+    assert_eq!(info.primary_max_message_bytes, est.max_message_bytes());
+    assert_eq!(info.comfort_message_bytes, est.comfort_message_bytes());
+    assert_eq!(info.shadow_max_message_bytes_n1, est.shadow_max_message_bytes_n1);
+
+    let shadow = av1_shadow_capacity(&yuv, params, 1).expect("shadow");
+    assert_eq!(shadow.max_message_bytes, est.shadow_max_message_bytes_n1);
+    assert_eq!(shadow.primary_residual_bytes, est.max_message_bytes().saturating_sub(shadow.max_message_bytes));
 }

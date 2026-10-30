@@ -2,9 +2,10 @@
 
 Raw planar yuv420p frames extracted from `IMG_4138.MOV` (a real iPhone
 camera capture on the user's Desktop — NOT committed here). Used by
-the encoder integration suite to catch spec-conformance bugs that
-synthetic patterns (flat frames, `deterministic_yuv420p`) don't
-trigger.
+the retired pure-Rust encoder's integration suite to catch
+spec-conformance bugs that synthetic patterns (flat frames,
+`deterministic_yuv420p`) don't trigger. No current test reads these
+files; they are kept as tiny real-content YUV fixtures.
 
 | File | Size | Frames | Purpose |
 |------|------|--------|---------|

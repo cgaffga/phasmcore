@@ -142,6 +142,7 @@ fn cross_arch_determinism_record_hash() {
     //   - 2026-06-11 (cf v3, #839): 54c11576e2dd28607e84a20303388aeef8c4d46b141b021168d3d864c6aea911 (47128 bytes, chunk_frame v3)
     //   - 2026-10-18 (cf v3.1, #888): f20434ed2845e63caee017d107836d3cdf770289a54a6e4cc602d51fc7f7a1ca (47128 bytes, chunk_frame v3.1)
     //   - 2026-10-23 (MVD cost model, c8b0ea18): ebdc000e4966518842c84dda4527d90a2d005827ec1d0ba7d1d18ec5b2e0e9a0 (47128 bytes)
+    //   - 2026-10-24 (J-UNIWARD border window, fix 1): 7aaaa39e62e8e21d3cac901a4ba9a485e2f030be358f34c7b02fd669c27656a5 (47128 bytes)
     //
     // If this assert ever fires:
     //   1. Print both hashes so the diff is captured in the log.
@@ -151,6 +152,47 @@ fn cross_arch_determinism_record_hash() {
     //      change). If yes, re-record the hash.
     //   3. If no intentional change, the encoder has become non-
     //      deterministic on this arch — investigate before merging.
+    //   - 2026-10-25 (VIDEO STEGO WIRE v2): ab7c8da0ac460da97b1f25d0bc60428692b891fb7af76ba1d41c240fe099931e (47128 bytes, keyed order + per-GOP H-hat + D=E·T·X)
+    //
+    // Re-baselined 2026-10-25 (second v2 re-pin) for the WET-REMOVAL +
+    // κ_t = 1 + Path A ship (maintainer decision; spec § 3/§ 5 amendment,
+    // intra-drift-diagnosis follow-up 3). Three deliberate changes to which
+    // bits the STC embeds, all with the length unchanged (47128 B):
+    //   1. Wet-removal: the primary STC cover is now the SYNTAX-DRY positions
+    //      only (`cost_weights::canonical_dry_mask`) — DC paths, Luma8×8 and
+    //      both MVD domains dropped — so the per-GOP keyed order is a
+    //      permutation of a SHORTER cover and the STC picks different flips.
+    //   2. κ_t = 1 (`DAMAGE_PARAMS.kt16` 32 → 16): re-prices the coefficient
+    //      damage term, so different positions are cheapest.
+    //   3. Path A: the primary H-hat is now `generate_hhat_end_set`
+    //      (`v2_knobs::h264_hhat`), a different parity check.
+    // Verified NOT non-determinism before re-pinning: on macOS aarch64, two
+    // consecutive release runs, `RAYON_NUM_THREADS=1`,
+    // `PHASM_H264_DISABLE_SIMD=1` and `PHASM_H264_FULL_WAVELET=1` all produced
+    // 57e27fe1…, matching a plain release run. The order is the portable u32
+    // Fisher-Yates over ChaCha20, the dry mask is a pure `SyntaxPath`
+    // function, and the damage model is integer (one f64 division per
+    // position, IEEE-exact, encoder-side only). An x86_64 build under Rosetta
+    // was not feasible here (openh264-sys builds the C library for the host
+    // arch only); the Linux x86_64 + aarch64 workflow confirmation is owed for
+    // this pin as for the ones before it.
+    //
+    // Re-baselined 2026-10-25 for VIDEO STEGO WIRE v2 (H.264;
+    // docs/design/video/stego-cover-order-and-damage-costs.md § 3–§ 8). The
+    // primary STC now walks each GOP's combined cover in a keyed order with a
+    // per-GOP H-hat (`stego::cover_order::gop_seeds`, labels `h264-order-v2`
+    // / `h264-hhat-v2`), the MVD domains are wet, and the coefficient costs
+    // carry the damage term D = E·T·X (`stego::damage`). Every embedded bit
+    // moves; the length does not (47128 B). Verified NOT non-determinism
+    // before re-pinning: on macOS aarch64, two consecutive release runs,
+    // `RAYON_NUM_THREADS=1`, `PHASM_H264_DISABLE_SIMD=1` and
+    // `PHASM_H264_FULL_WAVELET=1` all produced ab7c8da0…. The order is the
+    // portable u32 Fisher-Yates over ChaCha20 and the damage model is integer
+    // (one f64 division per position, IEEE-exact, encoder-side only). An
+    // x86_64 build under Rosetta was not feasible here (openh264-sys builds the
+    // C library for the host arch only); the Linux x86_64 + aarch64 workflow
+    // confirmation is owed for this pin as for the ones before it.
+    //
     // Re-baselined 2026-10-24 for the J-UNIWARD border window
     // (`h264_uniward::accumulate_cost_from_field`). Blocks in the first 15
     // pixel rows / columns used to be priced over only the in-plane part of
@@ -199,7 +241,7 @@ fn cross_arch_determinism_record_hash() {
     // workflow_dispatch re-pin protocol documented above — that confirmation is
     // owed for BOTH this pin and the v3 one it replaces.
     const PINNED_SHA256: &str =
-        "7aaaa39e62e8e21d3cac901a4ba9a485e2f030be358f34c7b02fd669c27656a5";
+        "57e27fe110b06db66315d5f53b7c52e44ef591436fcefb8f0dcebead70db728c";
     const PINNED_LEN: usize = 47128;
     assert_eq!(
         stego.len(), PINNED_LEN,

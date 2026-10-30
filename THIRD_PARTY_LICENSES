@@ -1,4 +1,10 @@
-Last updated: 2026-05-21.
+Last updated: 2026-10-29.
+
+(Updated 2026-10-29 for the mobile-app feature set: the iOS/Android apps
+also link the dav1d and rav1e AV1 codecs and rav1e's Rust dependencies.
+New entries: GROUP 5 (av1-grain, v_frame), GROUP 9 (dav1d), GROUP 10
+(rav1e + AOMedia Patent License 1.0), GROUP 11 (ISC-licensed assembly
+headers), and the additional crates in GROUPs 1 and 3.)
 
 (Updated for T3.1 — integer LL&M DCT/IDCT shipped 2026-05-21. New
 attributions appear under GROUP 8 at the bottom of this file:
@@ -7,20 +13,32 @@ libjpeg-turbo SIMD ports (BSD-3-Clause + IJG clause-2) and
 These cover ported algorithmic content; the ports themselves are
 GPL-3.0-only under the phasm umbrella.)
 
-This file lists the licenses of third-party Rust crate dependencies of
-phasm-core (and its companion phasm-cli). The list reflects the
-transitive dependency tree built with the full feature set
-(`--features parallel,video,h264-encoder,cabac-stego`) — the minimal
-default-feature build pulls fewer crates but no different licenses.
+This file lists the licenses of third-party dependencies of phasm-core,
+its companion phasm-cli, and the app/web bridges that embed it (iOS,
+Android, WASM). The Rust crate list is the union of the resolved
+dependency trees (`cargo tree -e normal,build`) of:
 
-The `openh264-backend` feature additionally pulls in the
+  - ios-bridge / android-bridge (the shipped apps):
+    `phasm-core` with `parallel, video, h264-encoder, av1-encoder,
+    av1-decoder`, for aarch64-apple-ios / aarch64-linux-android;
+  - ios-bridge-decode (App Clip), wasm-bridge and wasm-bridge-decode
+    (the website and phasm.link): `parallel` / `wasm`;
+  - phasm-cli (`--features parallel,h264-encoder`).
+
+The `h264-encoder` feature additionally pulls in the
 `phasm-openh264` C/C++ source via the `core-openh264-sys` workspace
 member; that source is BSD-2-Clause licensed and attributed
-separately under GROUP 7 below.
+separately under GROUP 7 below. The `av1-decoder` / `av1-encoder`
+features compile the `phasm-dav1d` C source (core-dav1d-sys, GROUP 9)
+and the `phasm-rav1e` Rust encoder (GROUP 10). The video codecs back an
+experimental feature; they are present in the app binaries, so their
+notices belong here.
 
 All listed licenses are compatible with the phasm-core GPL-3.0-only
-umbrella. No GPL/AGPL/LGPL transitive dependencies exist; permissive
-upstream crates remain re-distributable under their own terms.
+umbrella. No GPL/AGPL/LGPL transitive dependencies exist (every crate's
+`license` field was checked; libfuzzer-sys, NCSA, is an optional rav1e
+fuzzing dependency that no build compiles); permissive upstream crates
+remain re-distributable under their own terms.
 
 Crates are grouped by license family. Within each family, crates that
 require explicit notice retention (BSD, Apache-2.0-only) are spelled
@@ -31,31 +49,39 @@ the choices are summarized.
 ===============================================================================
 GROUP 1 — MIT OR Apache-2.0 (used under the MIT license)
 
-The following 105 crates are dual-licensed MIT OR Apache-2.0 (or
+The following 148 crates are dual-licensed MIT OR Apache-2.0 (or
 equivalent variants like "Apache-2.0 OR MIT", "MIT/Apache-2.0", or
 MIT-only). Used here under the MIT license. See
 https://opensource.org/licenses/MIT for the canonical MIT text.
 
-aead, aes, aes-gcm-siv, anstream, anstyle, anstyle-parse,
-anstyle-query, anstyle-wincon, argon2, autocfg, base64ct, bitflags,
-blake2, block-buffer, bumpalo, cc, cfg-if, cipher, clap, clap_builder,
-clap_derive, clap_lex, color_quant, colorchoice, console, cpufeatures,
-crc32fast, crossbeam-deque, crossbeam-epoch, crossbeam-utils, crunchy,
-crypto-common, ctr, digest, either, encode_unicode, fax, fax_derive,
-fdeflate, find-msvc-tools, flate2, generic-array, getrandom, gif,
-half, heck, hmac, image, image-webp, indicatif, inout,
-is_terminal_polyfill, js-sys, libc, memmap2, num-complex, num-traits,
-number_prefix, once_cell, once_cell_polyfill, opaque-debug,
-password-hash, png, polyval, portable-atomic, ppv-lite86, proc-macro2,
-quick-error, quote, radsort, rand, rand_chacha, rand_core, rayon,
-rayon-core, rustversion, sha2, shlex, simd-adler32, strsim, syn, tiff,
-typenum, unicode-width, universal-hash, utf8parse, version_check,
-wasm-bindgen, wasm-bindgen-macro, wasm-bindgen-macro-support,
-wasm-bindgen-shared, web-time, weezl, windows-link, windows-sys,
-windows-targets, windows_aarch64_gnullvm, windows_aarch64_msvc,
-windows_i686_gnu, windows_i686_gnullvm, windows_i686_msvc,
-windows_x86_64_gnu, windows_x86_64_gnullvm, windows_x86_64_msvc,
-zeroize.
+aead, aes, aes-gcm-siv, aligned, aligned-vec, anstream, anstyle,
+anstyle-parse, anstyle-query, anstyle-wincon, anyhow,
+arg_enum_proc_macro, argon2, arrayvec, as-slice, autocfg,
+av-scenechange, base64ct, bitflags, bitstream-io, blake2,
+block-buffer, built, bumpalo, bytes, cc, cesu8, cfg-if, cipher, clap,
+clap_builder, clap_derive, clap_lex, color_quant, colorchoice,
+combine, console, cpufeatures, crc32fast, crossbeam-deque,
+crossbeam-epoch, crossbeam-utils, crunchy, crypto-common, ctr, digest,
+either, encode_unicode, equator, equator-macro, fax, fax_derive,
+fdeflate, find-msvc-tools, flate2, futures-core, futures-task,
+futures-util, generic-array, getrandom, gif, half, heck, hmac, image,
+image-webp, indicatif, inout, is_terminal_polyfill, itertools, jni,
+jni-sys, jni-sys-macros, jobserver, js-sys, libc, log, maybe-rayon,
+memmap2, nasm-rs, new_debug_unreachable, no_std_io2, nom,
+noop_proc_macro, num-bigint, num-complex, num-derive, num-integer,
+num-rational, num-traits, number_prefix, once_cell,
+once_cell_polyfill, opaque-debug, password-hash, pastey,
+pin-project-lite, png, polyval, portable-atomic, ppv-lite86,
+proc-macro2, profiling, profiling-procmacros, quick-error, quote,
+radsort, rand, rand_chacha, rand_core, rayon, rayon-core, rustversion,
+sha2, shlex, simd-adler32, simd_helpers, slab, stable_deref_trait,
+strsim, syn, thiserror, thiserror-impl, tiff, typenum, unicode-width,
+universal-hash, utf8parse, version_check, wasm-bindgen,
+wasm-bindgen-macro, wasm-bindgen-macro-support, wasm-bindgen-shared,
+web-time, weezl, windows-link, windows-sys, windows-targets,
+windows_aarch64_gnullvm, windows_aarch64_msvc, windows_i686_gnu,
+windows_i686_gnullvm, windows_i686_msvc, windows_x86_64_gnu,
+windows_x86_64_gnullvm, windows_x86_64_msvc, y4m, zeroize.
 
 ===============================================================================
 GROUP 2 — MIT OR Apache-2.0 OR Zlib
@@ -75,6 +101,8 @@ unicode-ident 1.0.24 — (MIT OR Apache-2.0) AND Unicode-3.0. The
     bundled with the crate; see https://www.unicode.org/license.txt
     for the Unicode license text. The crate's Rust source is used
     under MIT.
+memchr 2.8.3 — Unlicense OR MIT.
+same-file 1.0.6, walkdir 2.5.0 — Unlicense/MIT.
 wasi 0.11.1+wasi-snapshot-preview1 — Apache-2.0 WITH LLVM-exception
     OR Apache-2.0 OR MIT. Used under MIT.
 
@@ -102,10 +130,18 @@ of the copyright notice and disclaimer in both source and binary
 redistributions. The full license text appears once below; per-crate
 copyright lines follow.
 
-zerocopy 0.8.39, zerocopy-derive 0.8.39
+zerocopy 0.8.63, zerocopy-derive 0.8.63
 https://github.com/google/zerocopy
 License: BSD-2-Clause OR Apache-2.0 OR MIT
 Copyright (c) 2023 Google LLC.
+
+av1-grain 0.2.5, v_frame 0.3.9
+https://github.com/rust-av/av1-grain, https://github.com/rust-av/v_frame
+License: BSD-2-Clause
+Copyright (c) 2022-2022, the rav1e contributors (av1-grain).
+Copyright (c) 2017-2022, the rav1e contributors (v_frame).
+(Pulled in by rav1e for the AV1 features; the shared text below
+applies, without the third clause.)
 
 moxcms 0.8.1
 https://github.com/awxkee/moxcms
@@ -125,7 +161,7 @@ https://github.com/dropbox/rust-brotli
 License: BSD-3-Clause AND MIT
 Copyright (c) 2016 Dropbox, Inc.
 
-alloc-no-stdlib 2.0.4, alloc-stdlib 0.2.2
+alloc-no-stdlib 2.0.4, alloc-stdlib 0.2.4
 https://github.com/dropbox/rust-alloc-no-stdlib
 License: BSD-3-Clause
 Copyright (c) 2016 Dropbox, Inc.
@@ -136,9 +172,9 @@ License: BSD-3-Clause
 Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence.
 
 ===============================================================================
-GROUP 7 — OpenH264 fork (only when `openh264-backend` feature is enabled)
+GROUP 7 — OpenH264 fork (only when `h264-encoder` feature is enabled)
 
-When the `openh264-backend` Cargo feature is built, `core-openh264-sys`
+When the `h264-encoder` Cargo feature is built, `core-openh264-sys`
 compiles and statically links the `phasm-openh264` C/C++ source tree
 (forked from Cisco's reference OpenH264 codec at
 https://github.com/cisco/openh264). The fork itself lives at
@@ -151,15 +187,49 @@ upstream BSD-2-Clause headers on every modified file and add an
 SPDX-License-Identifier header on every new file (GPL-3.0-only
 for our patches that wrap or call upstream BSD-2 code).
 
-The full BSD-2-Clause license text appears below the GROUP 5 / 6
-shared block.
+Upstream license (the OpenH264 `LICENSE` file, verbatim):
+
+    Copyright (c) 2013, Cisco Systems
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice, this
+      list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above copyright notice, this
+      list of conditions and the following disclaimer in the documentation and/or
+      other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+    ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+    ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The phasm-added files carry their own BSD-2-Clause notice
+(vendor/phasm-openh264/LICENSE-phasm-stego):
+
+    Copyright (c) 2026, Christoph Gaffga (phasm.app stego extension)
+    All rights reserved.
+
+Individual OpenH264 source files carry Cisco Systems copyright lines
+from 2004 to 2022, plus a few contributed files from Loongson
+Technology and Arm Ltd. Their notices are retained in the source files.
 
 OpenH264 also implements parts of the ITU-T H.264 / ISO/IEC 14496-10
 specification, which is subject to Via LA's AVC patent pool. See the
 H.264 / AVC patent-pool note at the bottom of this file.
 
 ===============================================================================
-BSD-2-Clause / BSD-3-Clause license text (applies to GROUP 5, GROUP 6, and GROUP 7)
+BSD-2-Clause / BSD-3-Clause license text (applies to GROUP 5 and GROUP 6;
+GROUP 7, 9 and 10 reproduce their upstream license files verbatim)
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -189,27 +259,24 @@ POSSIBILITY OF SUCH DAMAGE.
 ===============================================================================
 H.264 / AVC patent-pool note (not a software license)
 
-Two H.264 encoder paths exist in the source tree:
+The only H.264 encoder in the source tree is the OpenH264 fork
+pulled in via the `h264-encoder` Cargo feature
+(`core-openh264-sys` + `vendor/phasm-openh264`); the earlier
+pure-Rust encoder has been retired.
 
-  - The pure-Rust H.264 encoder under the `h264-encoder` Cargo
-    feature.
-  - The OpenH264 fork pulled in via the `openh264-backend` feature
-    (`core-openh264-sys` + `vendor/phasm-openh264`).
-
-Both features are gated OFF by default. Distribution of compiled
-binaries that include either encoder is subject to Via LA
+The feature is gated OFF by default. Distribution of compiled
+binaries that include the encoder is subject to Via LA
 Licensing's AVC patent-pool terms; see
 https://www.via-la.com/licensing-2/avc-h-264/. The phasm-cli
 pre-built binaries published on GitHub Releases do NOT bundle
-either encoder.
+the encoder.
 
 For the OpenH264 path specifically, Cisco upstream provides
 binaries under the OpenH264 Binary Royalty-Free License (Cisco
 covers Via LA fees for those Cisco-published binaries). Phasm
 does not redistribute Cisco's pre-built binaries; phasm builds
 the fork from source. AVC patent-pool obligations therefore
-apply to phasm-built binaries that enable `openh264-backend`,
-just as they apply to the pure-Rust `h264-encoder` path.
+apply to phasm-built binaries that enable `h264-encoder`.
 
 This patent-pool obligation is not a software license and is
 listed here for transparency only.
@@ -294,3 +361,242 @@ umbrella.
 
 The BSD-3-Clause license text under "GROUP 5 / 6 / 7 shared block"
 above also applies to the libjpeg-turbo ported content.
+
+===============================================================================
+GROUP 9 — dav1d fork (AV1 decoder; `av1-decoder` / `av1-encoder` features)
+
+When the `av1-decoder` or `av1-encoder` Cargo feature is built,
+`core-dav1d-sys` compiles and statically links the `phasm-dav1d` C
+and assembly source tree (forked from the VideoLAN dav1d AV1 decoder
+at https://code.videolan.org/videolan/dav1d). The fork lives at
+https://github.com/cgaffga/phasm-dav1d and adds phasm-specific hooks
+on the `phasm-stego` branch. dav1d is licensed under the BSD-2-Clause
+license; the phasm patches preserve the upstream headers.
+
+dav1d `COPYING`, verbatim:
+
+    Copyright © 2018-2025, VideoLAN and dav1d authors
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    1. Redistributions of source code must retain the above copyright notice, this
+       list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright notice,
+       this list of conditions and the following disclaimer in the documentation
+       and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+    ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+    ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+    (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+    ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Individual dav1d source files additionally carry BSD-2-Clause notices
+(same terms) for: Two Orioles, LLC; Martin Storsjo; Janne Grunau;
+Loongson Technology Corporation Limited; Nathan Egge; Luca Barbato;
+Bogdan Gligorijevic; Niklas Haas; VideoLabs; Michail Alvanos; Matthias
+Dressel; B Krishnan Iyer; Arm Limited; Sungjoon Moon; and the rav1e
+contributors. Those notices are retained in the source files. The
+x86 assembly helper `src/ext/x86/x86inc.asm` is ISC-licensed (GROUP 11).
+
+AV1 is a royalty-free codec by Alliance for Open Media design; there
+is no AVC-style patent pool to join. See the AOMedia Patent License
+1.0 under GROUP 10.
+
+===============================================================================
+GROUP 10 — rav1e fork (AV1 encoder; `av1-encoder` feature)
+
+When the `av1-encoder` Cargo feature is built, the `phasm-rav1e`
+Rust crate (package name `rav1e`) is compiled into phasm-core. It is
+a fork of the Xiph.Org rav1e AV1 encoder (https://github.com/xiph/rav1e)
+at https://github.com/cgaffga/phasm-rav1e, with phasm-specific hooks
+on the `phasm-stego` branch. rav1e is licensed under the BSD-2-Clause
+license and is accompanied by the Alliance for Open Media Patent
+License 1.0 (its `PATENTS` file), reproduced below as that license
+requires (section 1.2.1.b).
+
+rav1e `LICENSE`, verbatim:
+
+    BSD 2-Clause License
+
+    Copyright (c) 2017-2023, the rav1e contributors
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+
+    * Redistributions of source code must retain the above copyright notice, this
+      list of conditions and the following disclaimer.
+
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+    DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+    FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+    DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+    SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+    OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+rav1e source files additionally carry BSD-2-Clause notices (same
+terms) from: Alliance for Open Media (code derived from libaom, under
+the BSD 2 Clause License plus the AOMedia Patent License 1.0);
+VideoLAN and dav1d authors; Two Orioles, LLC; Martin Storsjo; Janne
+Grunau; VideoLabs; Nathan Egge; Matthias Dressel; B Krishnan Iyer.
+The x86 assembly helper `src/ext/x86/x86inc.asm` is ISC-licensed
+(GROUP 11). rav1e's own Rust dependencies appear in GROUPs 1, 3
+and 5 (aligned, aligned-vec, arg_enum_proc_macro, arrayvec, as-slice,
+av-scenechange, av1-grain, bitstream-io, built, itertools, log,
+maybe-rayon, new_debug_unreachable, nasm-rs, no_std_io2, nom,
+noop_proc_macro, num-bigint, num-derive, num-integer, num-rational,
+pastey, profiling, simd_helpers, thiserror, v_frame, y4m, ...).
+
+rav1e `PATENTS`, verbatim:
+
+    Alliance for Open Media Patent License 1.0
+
+    1. License Terms.
+
+    1.1. Patent License. Subject to the terms and conditions of this License, each
+         Licensor, on behalf of itself and successors in interest and assigns,
+         grants Licensee a non-sublicensable, perpetual, worldwide, non-exclusive,
+         no-charge, royalty-free, irrevocable (except as expressly stated in this
+         License) patent license to its Necessary Claims to make, use, sell, offer
+         for sale, import or distribute any Implementation.
+
+    1.2. Conditions.
+
+    1.2.1. Availability. As a condition to the grant of rights to Licensee to make,
+           sell, offer for sale, import or distribute an Implementation under
+           Section 1.1, Licensee must make its Necessary Claims available under
+           this License, and must reproduce this License with any Implementation
+           as follows:
+
+           a. For distribution in source code, by including this License in the
+              root directory of the source code with its Implementation.
+
+           b. For distribution in any other form (including binary, object form,
+              and/or hardware description code (e.g., HDL, RTL, Gate Level Netlist,
+              GDSII, etc.)), by including this License in the documentation, legal
+              notices, and/or other written materials provided with the
+              Implementation.
+
+    1.2.2. Additional Conditions. This license is directly from Licensor to
+           Licensee.  Licensee acknowledges as a condition of benefiting from it
+           that no rights from Licensor are received from suppliers, distributors,
+           or otherwise in connection with this License.
+
+    1.3. Defensive Termination. If any Licensee, its Affiliates, or its agents
+         initiates patent litigation or files, maintains, or voluntarily
+         participates in a lawsuit against another entity or any person asserting
+         that any Implementation infringes Necessary Claims, any patent licenses
+         granted under this License directly to the Licensee are immediately
+         terminated as of the date of the initiation of action unless 1) that suit
+         was in response to a corresponding suit regarding an Implementation first
+         brought against an initiating entity, or 2) that suit was brought to
+         enforce the terms of this License (including intervention in a third-party
+         action by a Licensee).
+
+    1.4. Disclaimers. The Reference Implementation and Specification are provided
+         "AS IS" and without warranty. The entire risk as to implementing or
+         otherwise using the Reference Implementation or Specification is assumed
+         by the implementer and user. Licensor expressly disclaims any warranties
+         (express, implied, or otherwise), including implied warranties of
+         merchantability, non-infringement, fitness for a particular purpose, or
+         title, related to the material. IN NO EVENT WILL LICENSOR BE LIABLE TO
+         ANY OTHER PARTY FOR LOST PROFITS OR ANY FORM OF INDIRECT, SPECIAL,
+         INCIDENTAL, OR CONSEQUENTIAL DAMAGES OF ANY CHARACTER FROM ANY CAUSES OF
+         ACTION OF ANY KIND WITH RESPECT TO THIS LICENSE, WHETHER BASED ON BREACH
+         OF CONTRACT, TORT (INCLUDING NEGLIGENCE), OR OTHERWISE, AND WHETHER OR
+         NOT THE OTHER PARTRY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+    2. Definitions.
+
+    2.1. Affiliate.  “Affiliate” means an entity that directly or indirectly
+         Controls, is Controlled by, or is under common Control of that party.
+
+    2.2. Control. “Control” means direct or indirect control of more than 50% of
+         the voting power to elect directors of that corporation, or for any other
+         entity, the power to direct management of such entity.
+
+    2.3. Decoder.  "Decoder" means any decoder that conforms fully with all
+         non-optional portions of the Specification.
+
+    2.4. Encoder.  "Encoder" means any encoder that produces a bitstream that can
+         be decoded by a Decoder only to the extent it produces such a bitstream.
+
+    2.5. Final Deliverable.  “Final Deliverable” means the final version of a
+         deliverable approved by the Alliance for Open Media as a Final
+         Deliverable.
+
+    2.6. Implementation.  "Implementation" means any implementation, including the
+         Reference Implementation, that is an Encoder and/or a Decoder. An
+         Implementation also includes components of an Implementation only to the
+         extent they are used as part of an Implementation.
+
+    2.7. License. “License” means this license.
+
+    2.8. Licensee. “Licensee” means any person or entity who exercises patent
+         rights granted under this License.
+
+    2.9. Licensor.  "Licensor" means (i) any Licensee that makes, sells, offers
+         for sale, imports or distributes any Implementation, or (ii) a person
+         or entity that has a licensing obligation to the Implementation as a
+         result of its membership and/or participation in the Alliance for Open
+         Media working group that developed the Specification.
+
+    2.10. Necessary Claims.  "Necessary Claims" means all claims of patents or
+          patent applications, (a) that currently or at any time in the future,
+          are owned or controlled by the Licensor, and (b) (i) would be an
+          Essential Claim as defined by the W3C Policy as of February 5, 2004
+          (https://www.w3.org/Consortium/Patent-Policy-20040205/#def-essential)
+          as if the Specification was a W3C Recommendation; or (ii) are infringed
+          by the Reference Implementation.
+
+    2.11. Reference Implementation. “Reference Implementation” means an Encoder
+          and/or Decoder released by the Alliance for Open Media as a Final
+          Deliverable.
+
+    2.12. Specification. “Specification” means the specification designated by
+          the Alliance for Open Media as a Final Deliverable for which this
+          License was issued.
+
+===============================================================================
+GROUP 11 — ISC-licensed assembly headers (x86 builds of dav1d and rav1e)
+
+`x86inc.asm` (x86 assembly abstraction layer) is shipped inside both
+the dav1d and rav1e source trees and is used when building their x86
+assembly kernels (Android x86_64 emulator builds). It is licensed under the ISC
+license, compatible with GPL-3.0-only:
+
+    Copyright (C) 2005-2024 x264 project
+
+    Authors: Loren Merritt <lorenm@u.washington.edu>
+             Henrik Gramner <henrik@gramner.com>
+             Anton Mitrofanov <BugMaster@narod.ru>
+             Fiona Glaser <fiona@x264.com>
+
+    Permission to use, copy, modify, and/or distribute this software for any
+    purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

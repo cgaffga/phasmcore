@@ -21,6 +21,11 @@ js-sys = "0.3"
 getrandom = { version = "0.2", features = ["js"] }
 sha2 = "0.10"
 
+[features]
+# Node test builds only (byte-identity against native, kernel benches);
+# never in the shipped pkg/.
+test-hooks = ["phasm-core/test-hooks"]
+
 [package.metadata.wasm-pack.profile.release]
 # Skip wasm-opt: Rust edition 2024 emits bulk-memory and nontrapping-fptoint
 # instructions that wasm-opt's validator rejects. These features are supported

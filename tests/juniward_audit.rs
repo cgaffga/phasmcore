@@ -9,6 +9,8 @@
 //! Driven via env vars so this test is a no-op in normal `cargo test` runs:
 //!   PHASM_AUDIT_INPUT   absolute path to a baseline JPEG
 //!   PHASM_AUDIT_OUTPUT  absolute path where cost-map JSON will be written
+//!   PHASM_AUDIT_COSTS   optional: `v1` dumps the legacy (phasm-core 0.4.x)
+//!                       costs instead of the current v2 ones
 //!
 //! JSON shape:
 //!   {
@@ -18,7 +20,8 @@
 //!   }
 //! Non-finite costs (WET) emit as JSON null.
 
-use phasm_core::stego::cost::uniward::compute_uniward;
+use phasm_core::stego::cost::uniward::{compute_positions_streaming_legacy_v1, compute_uniward};
+use phasm_core::stego::cost::CostMap;
 use phasm_core::JpegImage;
 use std::env;
 use std::fs;
@@ -40,7 +43,19 @@ fn dump_cost_map() {
 
     let grid = img.dct_grid(0);
     let qt = img.quant_table(0).expect("quant table 0 missing");
-    let map = compute_uniward(grid, qt);
+    let map = if env::var("PHASM_AUDIT_COSTS").as_deref() == Ok("v1") {
+        // The legacy path yields positions, not a CostMap: scatter them.
+        let (bw, bt) = (grid.blocks_wide(), grid.blocks_tall());
+        let mut m = CostMap::new(bw, bt);
+        for p in compute_positions_streaming_legacy_v1(grid, qt, None).unwrap() {
+            let f = p.flat_idx as usize;
+            let (blk, k) = (f / 64, f % 64);
+            m.set(blk / bw, blk % bw, k / 8, k % 8, p.cost);
+        }
+        m
+    } else {
+        compute_uniward(grid, qt)
+    };
 
     let bw = map.blocks_wide();
     let bt = map.blocks_tall();

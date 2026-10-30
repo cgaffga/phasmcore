@@ -127,7 +127,7 @@ pub fn av1_stego_embed(
     let frames = vec![(natural_packet, recording)];
     let harvest = super::whole_video::harvest_gop(&frames, w as u32, h as u32)?;
     let gop_n = harvest.len();
-    super::whole_video::cascade_one_gop(
+    super::whole_video::cascade_with_replan(
         super::whole_video::Av1CascadeGopInputs {
             gop_idx: 0,
             gop_offset: 0,
@@ -530,8 +530,10 @@ pub fn harvest_cover_bits_from_stego(
     let bits: Vec<u8> = decoded
         .iter()
         .filter(|p| {
-            p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN
-                || p.tag == DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB
+            crate::stego::cost::av1_damage::av1_in_cover(
+                p.tag == DAV1D_PHASM_TAG_AC_COEFF_SIGN,
+                p.coeff_magnitude,
+            )
         })
         .map(|p| p.decoded_value)
         .collect();
@@ -583,7 +585,7 @@ pub(crate) fn extract_first_chunk_frame_match(
             break;
         }
         let used = m_total * w;
-        let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
+        let hhat_matrix = hhat::generate_hhat_end_set(STC_H, w, hhat_seed);
 
         // 80-bit prefix: u32 total_bytes + u32 m_total + u16 payload_len.
         let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 80);
@@ -658,7 +660,7 @@ pub(crate) fn extract_chunk_frame_match(
             break;
         }
         let used = m_total * w;
-        let hhat_matrix = hhat::generate_hhat(STC_H, w, hhat_seed);
+        let hhat_matrix = hhat::generate_hhat_end_set(STC_H, w, hhat_seed);
 
         // 48-bit prefix: u32 m_total + u16 payload_len. Exact m_total reject.
         let prefix_bits = stc_extract_prefix(&cover_bits[..used], &hhat_matrix, w, 48);
@@ -716,6 +718,7 @@ mod tests {
             quantizer: 30,
             gop_size: 1,
             total_frames_hint: 1,
+            colour: Default::default(),
         };
         let (packet, recording) = super::super::whole_video::encode_gop_natural(&yuv, 1, params)
             .expect("natural encode")

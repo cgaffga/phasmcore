@@ -40,18 +40,20 @@ pub use codec::jpeg::frame::FrameInfo;
 pub use codec::jpeg::JpegImage;
 pub use stego::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, ghost_capacity, ghost_capacity_si, StegoError, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
 pub use stego::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
-pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, ghost_capacity_with_shadows};
+pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, estimate_shadow_capacity_si, ghost_capacity_with_shadows, ghost_bands, ghost_bands_si, GhostBands};
 pub use stego::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
 pub use stego::{armor_encode, armor_encode_with_quality, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo};
 pub use stego::EncodeQuality;
+pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET};
+pub use stego::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION, ARMOR_TARGET_DIMENSION};
 pub use stego::{PayloadData, FileEntry, compressed_payload_size};
 pub use stego::progress;
 pub use stego::memory;
 pub use stego::{
-    get_memory_budget, predict_peak_memory, select_ghost_shadow_rung,
+    get_memory_budget, ghost_lane_plan, predict_peak_memory,
     set_memory_budget, set_telemetry_hook,
-    GhostShadowRung, ModeId, TelemetryEvent, TelemetryHook,
+    GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
 pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
 
@@ -114,7 +116,7 @@ pub use codec::h264::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM as CASCA
 // the H.264 surface above.
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::session::{
-    Av1StreamingDecodeSession, Av1StreamingEncodeParams,
+    Av1Colour, Av1StreamingDecodeSession, Av1StreamingEncodeParams,
 };
 #[cfg(feature = "av1-encoder")]
 pub use codec::av1::stego::capacity::{

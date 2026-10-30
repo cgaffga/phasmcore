@@ -48,11 +48,11 @@ on:
   workflow_dispatch:
     inputs:
       rav1e_ref:
-        description: "phasm-rav1e commit (the monorepo's vendor/phasm-rav1e pin)"
-        default: "abe19cd8b369a051bb08ca2c53aceabb920bc00c"
+        description: "phasm-rav1e commit, full 40-char SHA (empty = the pin in scripts/video-cargo.sh)"
+        default: ""
       dav1d_ref:
-        description: "phasm-dav1d commit (must be in dav1d-sys/build.rs's known-good list)"
-        default: "acadfd78b7e066749696cb4f7012e049bc3450c2"
+        description: "phasm-dav1d commit (empty = the submodule pin; must be in dav1d-sys/build.rs's known-good list)"
+        default: ""
 
 permissions:
   contents: read
@@ -80,27 +80,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 150
     steps:
-      # The mirror carries no vendor/ submodules. Check the forks out as
-      # siblings where the manifests look for them: `../vendor/phasm-rav1e`
-      # from Cargo.toml, `../../vendor/phasm-dav1d` from dav1d-sys/build.rs.
-      - name: Checkout phasmcore
+      # dav1d is the vendor/phasm-dav1d submodule. rav1e is not a
+      # submodule: every cargo call below goes through
+      # scripts/video-cargo.sh, which patches the crates.io `rav1e` to
+      # github.com/cgaffga/phasm-rav1e at its pinned rev, or at the
+      # rav1e_ref input (PHASM_RAV1E_REV) for fork-side testing. The
+      # dav1d_ref input moves the dav1d submodule; empty keeps the pin.
+      - name: Checkout phasmcore (with submodules)
         uses: actions/checkout@v4
         with:
           path: phasmcore
+          submodules: recursive
 
-      - name: Checkout phasm-rav1e
-        uses: actions/checkout@v4
-        with:
-          repository: cgaffga/phasm-rav1e
-          ref: ${{ inputs.rav1e_ref }}
-          path: vendor/phasm-rav1e
+      - name: Move dav1d to the requested commit (optional)
+        shell: bash
+        env:
+          DAV1D_REF: ${{ inputs.dav1d_ref }}
+        run: |
+          if [ -n "$DAV1D_REF" ]; then
+            git -C phasmcore/vendor/phasm-dav1d fetch --depth 1 origin "$DAV1D_REF"
+            git -C phasmcore/vendor/phasm-dav1d checkout --detach FETCH_HEAD
+          fi
 
-      - name: Checkout phasm-dav1d
-        uses: actions/checkout@v4
-        with:
-          repository: cgaffga/phasm-dav1d
-          ref: ${{ inputs.dav1d_ref }}
-          path: vendor/phasm-dav1d
+      # Read by scripts/video-cargo.sh; empty means its built-in pin.
+      - name: Select the rav1e fork commit
+        shell: bash
+        env:
+          RAV1E_REF: ${{ inputs.rav1e_ref }}
+        run: |
+          if [ -n "$RAV1E_REF" ]; then
+            echo "PHASM_RAV1E_REV=$RAV1E_REF" >> "$GITHUB_ENV"
+          fi
 
       - name: Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -126,8 +136,8 @@ jobs:
           rustc --version
           cargo --version
           echo "matrix label: ${{ matrix.label }}"
-          echo "phasm-rav1e: $(git -C vendor/phasm-rav1e rev-parse HEAD)"
-          echo "phasm-dav1d: $(git -C vendor/phasm-dav1d rev-parse HEAD)"
+          echo "phasm-rav1e: ${PHASM_RAV1E_REV:-$(sed -n 's/^PHASM_RAV1E_DEFAULT_REV="\(.*\)"$/\1/p' phasmcore/scripts/video-cargo.sh)}"
+          echo "phasm-dav1d: $(git -C phasmcore/vendor/phasm-dav1d rev-parse HEAD)"
           if [ -r /proc/cpuinfo ]; then
             grep -m1 'model name' /proc/cpuinfo || true
             echo "x86 SIMD flags: $(grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' \
@@ -135,37 +145,6 @@ jobs:
           else
             sysctl -n machdep.cpu.brand_string || true
           fi
-
-      # The mirror STRIPS the AV1 features + their path dependencies (the
-      # forks are out of the mirrored tree). Re-add them to this transient
-      # checkout ONLY — never pushed — with rav1e's `asm` + `threading`, the
-      # features phasm-core ships with.
-      - name: Re-enable AV1 on the mirror checkout (CI-only, never pushed)
-        working-directory: phasmcore
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import pathlib, re
-          p = pathlib.Path("Cargo.toml")
-          s = p.read_text()
-          s = re.sub(r'members = \[([^\]]*)\]',
-                     lambda m: m.group(0) if '"dav1d-sys"' in m.group(1)
-                     else 'members = [' + m.group(1) + ', "dav1d-sys"]', s, count=1)
-          if "\nav1-encoder =" not in s:
-              s = s.replace('h264-decoder = ["video"]',
-                            'h264-decoder = ["video"]\n'
-                            'av1-decoder = ["dep:core-dav1d-sys"]\n'
-                            'av1-encoder = ["av1-decoder", "dep:phasm-rav1e", "parallel"]', 1)
-          if "\nphasm-rav1e =" not in s:
-              s = s.replace("[dependencies]\n",
-                            '[dependencies]\n'
-                            'core-dav1d-sys = { path = "dav1d-sys", optional = true }\n'
-                            'phasm-rav1e = { path = "../vendor/phasm-rav1e", package = "rav1e", '
-                            'optional = true, default-features = false, features = ["asm", "threading"] }\n', 1)
-          p.write_text(s)
-          PY
-          echo "--- re-enabled AV1 wiring (CI-only) ---"
-          grep -nE 'members =|^av1-(en|de)coder =|^core-dav1d-sys =|^phasm-rav1e =' Cargo.toml
 
       # Intel SDE is a free download behind a license click-through, so the
       # kit comes from the setup-sde action's GitHub re-host and is checked
@@ -191,7 +170,7 @@ jobs:
         shell: bash
         run: |
           ulimit -c 0
-          cargo test --release \
+          sh scripts/video-cargo.sh test --release \
             --features av1-encoder \
             --test av1_cross_arch_determinism \
             --no-fail-fast \
@@ -203,7 +182,7 @@ jobs:
         shell: bash
         run: |
           ulimit -c 0
-          cargo test --release \
+          sh scripts/video-cargo.sh test --release \
             --features av1-encoder \
             --lib codec::av1 \
             --no-fail-fast
@@ -215,7 +194,7 @@ jobs:
         shell: bash
         run: |
           ulimit -c 0
-          bins=$(cargo test --release --features av1-encoder \
+          bins=$(sh scripts/video-cargo.sh test --release --features av1-encoder \
                    --lib --test av1_cross_arch_determinism --no-run \
                    --message-format=json \
                  | jq -r 'select(.profile.test == true) | .executable | select(. != null)')
@@ -227,13 +206,14 @@ jobs:
           "$SDE" -icx -- "$lib" codec::av1 || status=1
           exit $status
 
-      # Belt-and-suspenders: erase the build dirs and fork checkouts before
+      # Belt-and-suspenders: erase the build dirs and fork checkouts (dav1d
+      # submodule, cargo's clone of the rav1e fork) before
       # the runner VM tears down.
       - name: Erase build outputs (post-run cleanup)
         if: always()
         shell: bash
         run: |
-          rm -rf phasmcore/target vendor/phasm-rav1e vendor/phasm-dav1d \
+          rm -rf phasmcore/target phasmcore/vendor/phasm-dav1d "${CARGO_HOME:-$HOME/.cargo}/git" \
             "$RUNNER_TEMP"/sde-external-*
 
       # EXPLICITLY ABSENT, per the policy block at the top:

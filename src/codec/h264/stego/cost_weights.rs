@@ -29,22 +29,19 @@
 use super::inject::DomainCover;
 use super::orchestrate::{DomainCosts, DomainPlan};
 
-/// Per-domain global cost multipliers. STC combines these with the
-/// per-position distortion costs (from Pass 1) to drive allocation
-/// across all 4 domains in a single STC plan.
+/// Per-domain global cost multipliers (`W_domain` of the v2 cost unit
+/// `cost = W · S · D`, spec § 4). STC combines these with the per-position
+/// costs (J-UNIWARD `S` × damage `D`, from Pass 1) in a single STC plan per
+/// GOP over all 4 domains, walked in one keyed order (§ 3).
 ///
-/// Default values locked on a real-corpus MvdSign density sweep. The
-/// ratios — not the absolute numbers — drive STC behaviour:
-///
-/// - CoeffSign : CoeffSuffix : MvdSign : MvdSuffix = 1 : 3 : 10 : 10
-///
-/// With these defaults, STC's natural utilisation at typical phasm
-/// payloads is ~CoeffSign-only with marginal CoeffSuffix spillover;
-/// MvdSign / MvdSuffix only fire when CoeffSign capacity is
-/// exhausted. This matches the v1.0 stealth profile while keeping
-/// the 4 domains *available* in the cover, eliminating the
-/// "this video has only CS modifications" single-axis fingerprint
-/// concern from the design discussion.
+/// **v2 defaults (2026-10): CoeffSign 1, CoeffSuffix 3, MVD domains wet.**
+/// The MVD domains stay IN the cover (so admitting them later is a
+/// cost-only change, no wire bump) but carry infinite cost: their damage is
+/// mostly MV-predictor-chain propagation (median MVP + P_Skip inheritance),
+/// which the damage model does not price yet, and under the global order
+/// with MVD admitted every flip went to MVD (worst MB ~8 dB, spec § 3). A
+/// separate all-wet MVD block would be infeasible (`MessageTooLarge`), which
+/// is why the domains are scattered through the order rather than dropped.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CostWeights {
     pub coeff_sign: f32,
@@ -54,14 +51,13 @@ pub struct CostWeights {
 }
 
 impl Default for CostWeights {
-    /// Ship defaults — ratios set by the MvdSign density sweep
-    /// documented in `docs/design/video/h264/d07-streaming-4domain.md`.
+    /// Ship defaults (v2): CS : CSL = 1 : 3, MVD wet.
     fn default() -> Self {
         Self {
             coeff_sign: 1.0,
             coeff_suffix: 3.0,
-            mvd_sign: 10.0,
-            mvd_suffix: 10.0,
+            mvd_sign: f32::INFINITY,
+            mvd_suffix: f32::INFINITY,
         }
     }
 }
@@ -310,6 +306,227 @@ fn push_domain(
     }
 }
 
+/// A coefficient position is DRY — kept in the v2 STC cover — iff it is an AC
+/// position of a 4×4 transform block (`coeff_idx != 0`). Everything else is
+/// **syntax-wet** and dropped from the cover entirely (2026-10-25
+/// wet-removal; spec § 3/§ 5 amendment): the DC paths (`Luma4x4{0}`,
+/// `ChromaAc{0}`, `ChromaDc`, `LumaDcIntra16x16`), `Luma8x8` (no 4×4 cost
+/// basis), and both MVD domains (no predictor-chain damage term yet).
+///
+/// The rule is a pure function of the `SyntaxPath`, so the decoder recomputes
+/// it from the walked positions alone — no cost vector, no side channel. That
+/// is why cost-based ∞ (tier filter, shadow overlay, the `frame_idx >=
+/// n_frames` guard) must stay IN the cover as wet: the decoder cannot tell a
+/// cost-∞ dry position from a finite one, so both encoder and decoder keep
+/// every syntax-dry position and let the STC syndrome run over all of them.
+pub fn coeff_is_dry(key: super::hook::PositionKey) -> bool {
+    use super::hook::SyntaxPath;
+    match key.syntax_path() {
+        SyntaxPath::Luma4x4 { coeff_idx, .. } => coeff_idx != 0,
+        SyntaxPath::ChromaAc { coeff_idx, .. } => coeff_idx != 0,
+        SyntaxPath::Luma8x8 { .. }
+        | SyntaxPath::ChromaDc { .. }
+        | SyntaxPath::LumaDcIntra16x16 { .. }
+        | SyntaxPath::Mvd { .. } => false,
+    }
+}
+
+/// The syntax-dry keep-mask over the canonical CS → CSL → MVDs → MVDsl cover
+/// of `cover`: `mask[i]` is true for a position kept in the v2 STC cover.
+/// MVD positions are always false (both domains dropped). Encoder, decoder
+/// and probe build it the same way from the same walked positions.
+pub fn canonical_dry_mask(cover: &DomainCover) -> Vec<bool> {
+    let mut m = Vec::with_capacity(cover.total_len());
+    m.extend(cover.coeff_sign_bypass.positions.iter().map(|&k| coeff_is_dry(k)));
+    m.extend(cover.coeff_suffix_lsb.positions.iter().map(|&k| coeff_is_dry(k)));
+    m.extend(std::iter::repeat(false).take(cover.mvd_sign_bypass.len()));
+    m.extend(std::iter::repeat(false).take(cover.mvd_suffix_lsb.len()));
+    m
+}
+
+/// v2 embedding order of one GOP's combined cover (spec § 3): position
+/// `order[i]` of the canonical CS → CSL → MVDs → MVDsl cover is the `i`-th
+/// STC input. The encoder, the decoder and the capacity probe all apply it
+/// right after the combine step; the STC itself is unchanged.
+#[derive(Debug, Clone)]
+pub struct StcOrder(Vec<u32>);
+
+impl StcOrder {
+    /// The keyed order of an `n`-position cover (`GopSeeds::order`).
+    pub fn new(n: usize, order_seed: &[u8; 32]) -> Self {
+        let _prof = crate::codec::h264::profile::scope("v2.order_build");
+        Self(crate::stego::cover_order::gop_cover_order(n, order_seed))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `order[i]` for every STC index `i`.
+    pub fn as_slice(&self) -> &[u32] {
+        &self.0
+    }
+
+    /// Canonical → STC order: `out[i] = canonical[order[i]]`.
+    pub fn permute<T: Copy>(&self, canonical: &[T]) -> Vec<T> {
+        debug_assert_eq!(canonical.len(), self.0.len());
+        self.0.iter().map(|&j| canonical[j as usize]).collect()
+    }
+
+    /// STC → canonical order: `out[order[i]] = stc[i]`.
+    pub fn unpermute<T: Copy + Default>(&self, stc: &[T]) -> Vec<T> {
+        debug_assert_eq!(stc.len(), self.0.len());
+        let mut out = vec![T::default(); stc.len()];
+        for (i, &j) in self.0.iter().enumerate() {
+            out[j as usize] = stc[i];
+        }
+        out
+    }
+}
+
+/// One GOP's v2 STC input: the combined cover and costs in STC order, with
+/// what is needed to map a plan back.
+///
+/// **Wet-removal (2026-10-25).** `bits` / `costs` / `order` cover the
+/// SYNTAX-DRY positions only ([`canonical_dry_mask`]); the syntax-wet
+/// positions are not in the STC cover at all. To map a plan back,
+/// [`Self::canonical`] starts from the full canonical cover and overwrites
+/// only the dry positions, so a wet position always emits its original cover
+/// bit (never a flip). `boundaries` stays the FULL per-domain lengths, so
+/// [`split_plan_4domain`] over the expanded vector still produces
+/// full-length per-domain plans that line up with the walker's positions.
+#[derive(Debug, Clone)]
+pub struct GopStcInput {
+    /// Dry cover bits in STC order (`len == n_dry`).
+    pub bits: Vec<u8>,
+    /// Dry weighted costs in STC order (`len == n_dry`).
+    pub costs: Vec<f32>,
+    /// FULL per-domain lengths of the canonical combined cover.
+    pub boundaries: DomainBoundaries,
+    /// Keyed order over the DRY positions (`len == n_dry`).
+    pub order: StcOrder,
+    /// Full canonical cover bits (`len == boundaries.total()`), for the
+    /// wet positions on expand-back.
+    full_canonical: Vec<u8>,
+    /// Dry STC index → canonical position (`len == n_dry`).
+    dry_to_canonical: Vec<u32>,
+}
+
+impl GopStcInput {
+    /// Put a canonical combined cover + costs into STC order, dropping the
+    /// syntax-wet positions (`dry_mask[i]` false). `dry_mask` is over the
+    /// canonical cover ([`canonical_dry_mask`]); its length must equal
+    /// `bits.len()`.
+    pub fn from_canonical(
+        bits: Vec<u8>,
+        costs: Vec<f32>,
+        boundaries: DomainBoundaries,
+        dry_mask: &[bool],
+        order_seed: &[u8; 32],
+    ) -> Self {
+        debug_assert_eq!(bits.len(), dry_mask.len());
+        debug_assert_eq!(bits.len(), costs.len());
+        let n_dry = dry_mask.iter().filter(|&&k| k).count();
+        let mut dry_bits = Vec::with_capacity(n_dry);
+        let mut dry_costs = Vec::with_capacity(n_dry);
+        let mut dry_to_canonical = Vec::with_capacity(n_dry);
+        for (i, &keep) in dry_mask.iter().enumerate() {
+            if keep {
+                dry_bits.push(bits[i]);
+                dry_costs.push(costs[i]);
+                dry_to_canonical.push(i as u32);
+            }
+        }
+        let order = StcOrder::new(dry_bits.len(), order_seed);
+        let _prof = crate::codec::h264::profile::scope("v2.order_permute");
+        Self {
+            bits: order.permute(&dry_bits),
+            costs: order.permute(&dry_costs),
+            boundaries,
+            order,
+            full_canonical: bits,
+            dry_to_canonical,
+        }
+    }
+
+    /// An `n_dry`-length STC-order stego vector expanded to the FULL canonical
+    /// cover: dry positions take the stego bit, wet positions keep their
+    /// original cover bit.
+    pub fn canonical(&self, stc_stego_bits: &[u8]) -> Vec<u8> {
+        let _prof = crate::codec::h264::profile::scope("v2.order_permute");
+        let dry_canonical = self.order.unpermute(stc_stego_bits);
+        let mut out = self.full_canonical.clone();
+        for (j, &ci) in self.dry_to_canonical.iter().enumerate() {
+            out[ci as usize] = dry_canonical[j];
+        }
+        out
+    }
+
+    /// An `n_dry`-length STC-order stego vector as a per-domain plan.
+    pub fn split(&self, stc_stego_bits: &[u8]) -> DomainPlan {
+        split_plan_4domain(&self.canonical(stc_stego_bits), &self.boundaries)
+    }
+}
+
+/// [`combine_cover_4domain`] followed by the syntax-dry filter and the v2
+/// order (`GopSeeds::order`).
+pub fn combine_cover_4domain_v2(
+    cover: &DomainCover,
+    costs: &DomainCosts,
+    weights: &CostWeights,
+    order_seed: &[u8; 32],
+) -> GopStcInput {
+    let (bits, c, b) = combine_cover_4domain(cover, costs, weights);
+    GopStcInput::from_canonical(bits, c, b, &canonical_dry_mask(cover), order_seed)
+}
+
+/// [`combine_bits_4domain`] followed by the syntax-dry filter and the v2
+/// order. `cover` supplies the positions for [`canonical_dry_mask`]; the bit
+/// slices (possibly shadow-modified) must line up 1:1 with its domains.
+#[allow(clippy::too_many_arguments)]
+pub fn combine_bits_4domain_v2(
+    coeff_sign_bits: &[u8],
+    coeff_suffix_bits: &[u8],
+    mvd_sign_bits: &[u8],
+    mvd_suffix_bits: &[u8],
+    costs: &DomainCosts,
+    weights: &CostWeights,
+    cover: &DomainCover,
+    order_seed: &[u8; 32],
+) -> GopStcInput {
+    let (bits, c, b) = combine_bits_4domain(
+        coeff_sign_bits, coeff_suffix_bits, mvd_sign_bits, mvd_suffix_bits, costs, weights,
+    );
+    GopStcInput::from_canonical(bits, c, b, &canonical_dry_mask(cover), order_seed)
+}
+
+/// The decoder's view: one GOP's walked cover bits in STC order (no costs),
+/// over the syntax-dry positions only ([`canonical_dry_mask`]) so `n_cover`
+/// and the bit sequence match the encoder's dry cover.
+pub fn gop_stc_cover_bits(cover: &DomainCover, order_seed: &[u8; 32]) -> Vec<u8> {
+    let mask = canonical_dry_mask(cover);
+    let mut dry = Vec::with_capacity(mask.iter().filter(|&&k| k).count());
+    let mut i = 0usize;
+    for d in [
+        &cover.coeff_sign_bypass.bits,
+        &cover.coeff_suffix_lsb.bits,
+        &cover.mvd_sign_bypass.bits,
+        &cover.mvd_suffix_lsb.bits,
+    ] {
+        for &b in d {
+            if mask[i] {
+                dry.push(b);
+            }
+            i += 1;
+        }
+    }
+    StcOrder::new(dry.len(), order_seed).permute(&dry)
+}
+
 /// Reverse [`combine_cover_4domain`]: take a single STC-plan output
 /// vector (length == `boundaries.total()`) and split it into a
 /// [`DomainPlan`] with 4 per-domain stego-bit vectors.
@@ -346,6 +563,24 @@ mod tests {
     /// these tests verify bit-level concatenation, not position
     /// fidelity (which is tested by Phase 0 walker-parity gates).
     fn mock_domain_bits(bits: Vec<u8>) -> DomainBits {
+        // AC Luma4x4 positions (coeff_idx != 0) are syntax-DRY — kept in the
+        // v2 cover. The non-v2 concat tests only read the bits, so the path
+        // kind is immaterial there; the v2 tests need dry positions.
+        let positions: Vec<PositionKey> = (0..bits.len() as u32)
+            .map(|i| {
+                PositionKey::new(
+                    0, i,
+                    EmbedDomain::CoeffSignBypass,
+                    SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx: 1, kind: BinKind::Sign },
+                )
+            })
+            .collect();
+        let magnitudes = vec![0u16; bits.len()];
+        DomainBits { bits, positions, magnitudes }
+    }
+
+    /// A DC (syntax-WET) mock: `LumaDcIntra16x16{0}`, dropped from the v2 cover.
+    fn mock_dc_bits(bits: Vec<u8>) -> DomainBits {
         let positions: Vec<PositionKey> = (0..bits.len() as u32)
             .map(|i| {
                 PositionKey::new(
@@ -355,20 +590,91 @@ mod tests {
                 )
             })
             .collect();
-        let magnitudes = vec![0u16; bits.len()];
-        DomainBits { bits, positions, magnitudes }
+        DomainBits { bits: bits.clone(), positions, magnitudes: vec![0u16; bits.len()] }
     }
 
-    /// CostWeights default values must match Phase 0.5 measurement
-    /// outcome — locked in `d07-streaming-4domain.md` and
-    /// `memory/h264_mvdsign_density_sweep_493_0b.md`.
+    /// v2 defaults: CS : CSL = 1 : 3, both MVD domains wet (in the cover,
+    /// infinite cost) — spec § 3 / § 5.
     #[test]
-    fn cost_weights_default_matches_phase_0_5() {
+    fn cost_weights_default_is_v2_mvd_wet() {
         let w = CostWeights::default();
         assert_eq!(w.coeff_sign, 1.0);
         assert_eq!(w.coeff_suffix, 3.0);
-        assert_eq!(w.mvd_sign, 10.0);
-        assert_eq!(w.mvd_suffix, 10.0);
+        assert!(w.mvd_sign.is_infinite() && w.mvd_sign.is_sign_positive());
+        assert!(w.mvd_suffix.is_infinite() && w.mvd_suffix.is_sign_positive());
+        assert_eq!(w, CostWeights::conservative_cs_csl_only());
+    }
+
+    /// Wet-removal (2026-10-25): the v2 cover is the SYNTAX-DRY positions
+    /// only; the keyed order is over them; `split` expands back to the full
+    /// canonical cover with wet positions unchanged; the decoder's view
+    /// matches. Here the 340 AC coeff positions are dry and the 30 MVD
+    /// positions are dropped.
+    #[test]
+    fn v2_cover_drops_syntax_wet_and_round_trips() {
+        let mut cover = DomainCover::default();
+        cover.coeff_sign_bypass = mock_domain_bits((0..300).map(|i| (i % 3 == 0) as u8).collect());
+        cover.coeff_suffix_lsb = mock_domain_bits((0..40).map(|i| (i % 2) as u8).collect());
+        cover.mvd_sign_bypass = mock_domain_bits(vec![1; 25]);
+        cover.mvd_suffix_lsb = mock_domain_bits(vec![0, 1, 1, 0, 1]);
+        let costs = DomainCosts {
+            coeff_sign_bypass: (0..300).map(|i| i as f32).collect(),
+            coeff_suffix_lsb: vec![2.0; 40],
+            mvd_sign_bypass: vec![1.0; 25],
+            mvd_suffix_lsb: vec![1.0; 5],
+        };
+        let w = CostWeights::default();
+        let (canon_bits, _canon_costs, _) = combine_cover_4domain(&cover, &costs, &w);
+        let a = combine_cover_4domain_v2(&cover, &costs, &w, &[3u8; 32]);
+        let b = combine_cover_4domain_v2(&cover, &costs, &w, &[4u8; 32]);
+        // Only the 340 dry positions are in the STC cover; the 30 MVD ones
+        // (and any DC/8x8, none here) are gone.
+        assert_eq!(a.bits.len(), 340);
+        assert_eq!(a.order.len(), 340);
+        assert_ne!(a.order.as_slice(), b.order.as_slice());
+        // The dropped domains were the only wet ones, so no ∞ is left.
+        assert!(a.costs.iter().all(|c| c.is_finite()));
+        // Expand-back reproduces the FULL canonical cover (wet = original).
+        assert_eq!(a.canonical(&a.bits), canon_bits);
+        let plan = a.split(&a.bits);
+        assert_eq!(plan.coeff_sign_bypass, cover.coeff_sign_bypass.bits);
+        assert_eq!(plan.coeff_suffix_lsb, cover.coeff_suffix_lsb.bits);
+        assert_eq!(plan.mvd_sign_bypass, cover.mvd_sign_bypass.bits);
+        assert_eq!(plan.mvd_suffix_lsb, cover.mvd_suffix_lsb.bits);
+        // The decoder's view is the same dry STC-order vector.
+        assert_eq!(gop_stc_cover_bits(&cover, &[3u8; 32]), a.bits);
+    }
+
+    /// A DC (syntax-wet) position is dropped from the v2 cover and never
+    /// flips: flipping every dry STC bit leaves the DC cover bit untouched.
+    #[test]
+    fn v2_wet_positions_never_flip() {
+        let mut cover = DomainCover::default();
+        // 4 AC dry + 2 DC wet in CS; 1 AC dry in CSL; 1 MVD (wet).
+        let mut cs = mock_domain_bits(vec![1, 0, 1, 0]);
+        cs.extend(mock_dc_bits(vec![1, 1]));
+        cover.coeff_sign_bypass = cs;
+        cover.coeff_suffix_lsb = mock_domain_bits(vec![0]);
+        cover.mvd_sign_bypass = mock_domain_bits(vec![1]);
+        let costs = DomainCosts {
+            coeff_sign_bypass: vec![1.0; 6],
+            coeff_suffix_lsb: vec![1.0],
+            mvd_sign_bypass: vec![1.0],
+            mvd_suffix_lsb: vec![],
+        };
+        let w = CostWeights::default();
+        let a = combine_cover_4domain_v2(&cover, &costs, &w, &[7u8; 32]);
+        assert_eq!(a.bits.len(), 5); // 4 CS-AC + 1 CSL-AC dry
+        // Flip every dry STC bit, expand, split.
+        let flipped: Vec<u8> = a.bits.iter().map(|b| 1 - b).collect();
+        let plan = a.split(&flipped);
+        // The two DC positions (indices 4,5 of CS) keep their cover bits.
+        assert_eq!(plan.coeff_sign_bypass[4], 1);
+        assert_eq!(plan.coeff_sign_bypass[5], 1);
+        // The MVD position keeps its cover bit.
+        assert_eq!(plan.mvd_sign_bypass, vec![1]);
+        // The 4 AC CS bits flipped.
+        assert_eq!(&plan.coeff_sign_bypass[..4], &[0, 1, 0, 1]);
     }
 
     /// Conservative variant excludes MVD domains via WET-∞ weight.
@@ -397,7 +703,7 @@ mod tests {
             mvd_suffix_lsb: vec![7.0, 8.0],
         };
 
-        let weights = CostWeights::default();
+        let weights = CostWeights { coeff_sign: 1.0, coeff_suffix: 3.0, mvd_sign: 10.0, mvd_suffix: 10.0 };
         let (bits, weighted_costs, b) = combine_cover_4domain(&cover, &costs, &weights);
 
         // Bits concatenated in canonical order.
@@ -443,7 +749,7 @@ mod tests {
             mvd_suffix_lsb: vec![f32::INFINITY],         // WET on MVDsl[0]
         };
 
-        let weights = CostWeights::default();
+        let weights = CostWeights { coeff_sign: 1.0, coeff_suffix: 3.0, mvd_sign: 10.0, mvd_suffix: 10.0 };
         let (_, weighted_costs, _) = combine_cover_4domain(&cover, &costs, &weights);
 
         // CS[0] = 1.0 × 1 = 1.0

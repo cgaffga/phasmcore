@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
+// The decode path only needs the demux helpers (`ensure_ffmpeg_available`,
+// `temp_path_with_ext`, `extract_annexb_from_mp4`); the rest serves the
+// encode subcommands and is unused in a decode-only (`h264-decoder`) build.
+#![cfg_attr(not(any(feature = "h264-encoder", feature = "av1-encoder")), allow(dead_code))]
+
 //! Phase 4b: shell-out to ffmpeg to transcode non-Baseline inputs into
 //! H.264 Baseline CAVLC MP4, which is the only format the Rust H.264
 //! pipeline accepts. Used by the CLI `video-encode` and `video-capacity`
@@ -264,6 +269,120 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
         .map(|t| (t * 1_000_000.0).round() as u64)
         .unwrap_or(0);
     Ok(VideoProbe { width, height, n_frames, frame_rate, has_audio, video_start_us })
+}
+
+/// The first video stream's colour tags as ITU-T H.273 codes:
+/// `(primaries, transfer, matrix, full_range)`, 2 (unspecified) for a tag
+/// the source does not carry. What the raw decode ([`decode_to_yuv_aligned`],
+/// `-pix_fmt yuv420p`) leaves true of its frames: it changes the bit depth
+/// but neither the primaries, the transfer nor the matrix, and it converts a
+/// `yuvj*` (full-range) source to studio range.
+#[cfg(feature = "video")]
+pub fn probe_colour_h273(input: &Path) -> (u8, u8, u8, bool) {
+    use std::process::Command;
+    let unspecified = (2, 2, 2, false);
+    let Ok(result) = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=pix_fmt,color_range,color_space,color_transfer,color_primaries",
+            "-of", "default=noprint_wrappers=1",
+        ])
+        .arg(input)
+        .output()
+    else {
+        return unspecified;
+    };
+    if !result.status.success() {
+        return unspecified;
+    }
+    let out = String::from_utf8_lossy(&result.stdout);
+    let field = |k: &str| out.lines().find_map(|l| l.strip_prefix(k)).map(str::trim).unwrap_or("");
+    let primaries = match field("color_primaries=") {
+        "bt709" => 1,
+        "bt470m" => 4,
+        "bt470bg" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "film" => 8,
+        "bt2020" => 9,
+        "smpte428" => 10,
+        "smpte431" => 11,
+        "smpte432" => 12,
+        "ebu3213" | "jedec-p22" => 22,
+        _ => 2,
+    };
+    let transfer = match field("color_transfer=") {
+        "bt709" => 1,
+        "gamma22" => 4,
+        "gamma28" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "linear" => 8,
+        "log100" => 9,
+        "log316" => 10,
+        "iec61966-2-4" => 11,
+        "bt1361e" => 12,
+        "iec61966-2-1" => 13,
+        "bt2020-10" => 14,
+        "bt2020-12" => 15,
+        "smpte2084" => 16,
+        "smpte428" => 17,
+        "arib-std-b67" => 18,
+        _ => 2,
+    };
+    let matrix = match field("color_space=") {
+        "gbr" => 0,
+        "bt709" => 1,
+        "fcc" => 4,
+        "bt470bg" => 5,
+        "smpte170m" => 6,
+        "smpte240m" => 7,
+        "ycgco" => 8,
+        "bt2020nc" => 9,
+        "bt2020c" => 10,
+        "smpte2085" => 11,
+        "chroma-derived-nc" => 12,
+        "chroma-derived-c" => 13,
+        "ictcp" => 14,
+        _ => 2,
+    };
+    let full_range = field("color_range=") == "pc" && !field("pix_fmt=").starts_with("yuvj");
+    (primaries, transfer, matrix, full_range)
+}
+
+/// Presentation times (µs) of the first video stream's frames, in the order
+/// the raw decode ([`decode_to_yuv_aligned`], one output frame per decoded
+/// frame) emits them, on the source's timeline. `None` when ffprobe fails or
+/// a frame has no timestamp.
+#[cfg(feature = "video")]
+pub fn probe_frame_times_us(input: &Path) -> Option<Vec<i64>> {
+    use std::process::Command;
+    let result = Command::new("ffprobe")
+        .args([
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "frame=best_effort_timestamp_time",
+            "-of", "csv=p=0",
+        ])
+        .arg(input)
+        .output()
+        .ok()?;
+    if !result.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&result.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            l.trim()
+                .trim_end_matches(',')
+                .parse::<f64>()
+                .ok()
+                .filter(|t| t.is_finite())
+                .map(|t| (t * 1_000_000.0).round() as i64)
+        })
+        .collect()
 }
 
 #[cfg(feature = "video")]
@@ -549,24 +668,24 @@ fn decode_to_yuv_cropped(
     Ok(())
 }
 
-/// §Stealth.L4.* — output container profile selection. Drives whether
-/// the CLI muxes via the phasm-owned HandBrake/x264-medium builder or
-/// via ffmpeg passthrough. Default is `HandbrakeX264` because the
-/// strategy doc (`docs/design/video/h264/stealth-strategy.md`) names it as
-/// the v1.0 ship target — output lands inside the libx264 container
-/// metaclass instead of phasm's own (per Yang/EVA + Altinisik).
+/// Output container profile selection: the phasm-owned builder or the
+/// legacy shell-out mux. Default is `LavfOpenH264` — the container a
+/// libavformat transcoder writes around a libopenh264 encode, which is what
+/// the OpenH264 bitstream inside it is (2026-10-29; it replaced a
+/// HandBrake/x264 profile whose x264 SEI banner and HandBrake `©too` the
+/// bitstream contradicted — `docs/design/video/h264/openh264-stealth-report.md`,
+/// "Container layer").
 #[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum MuxProfile {
-    /// HandBrake/x264-medium container shape (default). Video-only —
-    /// drops audio from the input. Lands at the Yang/EVA libx264-class
-    /// leaf; topology matches the Altinisik tree-hash reference.
+    /// In-tree builder, `MuxerProfile::LavfOpenH264` (default). Passes the
+    /// source's audio through, interleaved with the video.
     #[default]
-    #[value(name = "handbrake-x264")]
-    HandbrakeX264,
-    /// FFmpeg native mux with audio passthrough. Larger L4
-    /// fingerprint distance from libx264 (ffmpeg-class instead of
-    /// HandBrake-class) but preserves audio.
+    #[value(name = "lavf-openh264")]
+    LavfOpenH264,
+    /// Legacy shell-out mux (`mux_annexb_to_mp4`) with audio passthrough.
+    /// Not used: it mis-times streams whose POC resets every GOP
+    /// (2026-05-24, see `write_and_mux_oh264`).
     #[value(name = "ffmpeg")]
     Ffmpeg,
 }
@@ -585,13 +704,13 @@ pub fn parse_frame_rate(s: &str) -> (u32, u32) {
     }
 }
 
-/// Branching mux: handbrake-x264 → phasm's clean-room HandBrake mux
-/// (`phasm_core::codec::mp4::build::build_mp4_with_pattern_audio` when
-/// audio is present, `_with_pattern` otherwise); ffmpeg → the legacy
+/// Branching mux: lavf-openh264 → phasm's in-tree builder
+/// (`phasm_core::codec::mp4::build::build_mp4_with_pattern_audio_lead_in`
+/// when audio is present, `_with_pattern` otherwise); ffmpeg → the legacy
 /// shell-out path with audio passthrough via `-c:a copy`.
 ///
 /// Returns whether the chosen profile silently dropped audio.
-/// Currently `false` for both branches — HandBrake mux now passes
+/// Currently `false` for both branches — the in-tree builder passes
 /// audio through (§Stealth.L4.5) and ffmpeg always has. Kept as a
 /// `bool` return for forward compatibility with future profiles
 /// that may yet drop audio (e.g. an Apple-rotation profile that
@@ -611,7 +730,7 @@ pub fn mux_annexb_to_mp4_with_profile(
     output: &Path,
 ) -> Result<bool, CliError> {
     let dropped_audio = match profile {
-        MuxProfile::HandbrakeX264 => {
+        MuxProfile::LavfOpenH264 => {
             let annex_b = std::fs::read(annex_b_path)?;
             let (fps_num, fps_den) = parse_frame_rate(frame_rate);
             let timing = phasm_core::codec::mp4::build::FrameTiming { fps_num, fps_den };
@@ -622,29 +741,29 @@ pub fn mux_annexb_to_mp4_with_profile(
                     ))
                 })?;
                 // The audio keeps the source's placement, so the video must
-                // too: frame 0 is held for the source's video lead-in.
+                // too: the source's video lead-in becomes a leading empty edit.
                 phasm_core::codec::mp4::build::build_mp4_with_pattern_audio_lead_in(
-                    phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
+                    phasm_core::codec::mp4::build::MuxerProfile::LavfOpenH264,
                     &annex_b,
                     width, height, timing, gop_pattern, n_display_frames,
                     &source_mp4,
                     video_lead_in_us,
                 )
                 .map_err(|e| CliError::InvalidArgs(format!(
-                    "HandBrake mux with audio failed: {e}"
+                    "MP4 mux with audio failed: {e}"
                 )))?
             } else {
                 phasm_core::codec::mp4::build::build_mp4_with_pattern(
-                    phasm_core::codec::mp4::build::MuxerProfile::HandbrakeX264,
+                    phasm_core::codec::mp4::build::MuxerProfile::LavfOpenH264,
                     &annex_b,
                     width, height, timing, gop_pattern, n_display_frames,
                 )
                 .map_err(|e| CliError::InvalidArgs(format!(
-                    "HandBrake mux failed: {e}"
+                    "MP4 mux failed: {e}"
                 )))?
             };
             std::fs::write(output, mp4)?;
-            false // §Stealth.L4.5: HandBrake profile now passes audio through.
+            false // §Stealth.L4.5: the in-tree builder passes audio through.
         }
         MuxProfile::Ffmpeg => {
             mux_annexb_to_mp4(annex_b_path, audio_source, frame_rate, output)?;

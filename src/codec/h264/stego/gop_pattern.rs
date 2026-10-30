@@ -623,11 +623,10 @@ mod tests {
     /// inside stbl. Just enough structure for the L3.2 analyser to
     /// run; not a decodable stream.
     fn build_h264_mp4_for_test(gop_size: usize, with_ctts: bool) -> Vec<u8> {
-        // We piggyback on the existing h264_handbrake_mux integration
-        // path: build a minimal Annex-B with `n=2 × gop_size` access
-        // units, mux via build_mp4, and inject a fake `ctts` box if
-        // requested. For unit-test scope, hand-crafted bytes are
-        // simpler — see the section below.
+        // We piggyback on the in-tree MP4 builder: build a minimal Annex-B
+        // with `n=2 × gop_size` access units, mux via build_mp4, and
+        // inject a fake `ctts` box if requested. For unit-test scope,
+        // hand-crafted bytes are simpler — see the section below.
         // (Helper kept inline to avoid pulling in a wider test fixture
         //  module from outside h264/stego/.)
         use crate::codec::mp4::build::{build_mp4, FrameTiming, MuxerProfile};
@@ -651,7 +650,7 @@ mod tests {
             }
         }
         let mut mp4 = build_mp4(
-            MuxerProfile::HandbrakeX264,
+            MuxerProfile::LavfOpenH264,
             &annexb,
             64,
             64,

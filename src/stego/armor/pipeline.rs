@@ -18,7 +18,7 @@
 //! - DFT ring payload: resize-robust second layer in frequency domain
 
 use crate::codec::jpeg::JpegImage;
-use crate::codec::jpeg::dct::DctGrid;
+use crate::codec::jpeg::dct::{DctGrid, QuantTable};
 use crate::codec::jpeg::pixels;
 // Armor's pre-clamp + QF-settle pixel-domain round-trips run
 // through the integer LL&M path (NEON / AVX2 / WASM SIMD / scalar,
@@ -31,9 +31,9 @@ use crate::stego::armor::embedding::{self, stdm_embed, stdm_extract_soft};
 use crate::stego::armor::fft2d;
 use crate::stego::armor::fortress;
 use crate::stego::armor::repetition;
-use crate::stego::armor::resample;
-use crate::stego::armor::selection::compute_stability_map;
-use crate::stego::armor::spreading::{generate_spreading_vectors, SPREAD_LEN};
+use crate::stego::armor::resample::CorrectedLuma;
+use crate::stego::armor::selection::{self, compute_stability_map};
+use crate::stego::armor::spreading::{generate_spreading_vectors, spreading_vectors_range, SPREAD_LEN};
 use crate::stego::armor::template;
 use crate::stego::crypto;
 use crate::stego::error::StegoError;
@@ -520,7 +520,9 @@ fn compute_integrity(signal_strength: f64, rs_stats: &ecc::RsDecodeStats, refere
     (combined * 100.0).round().clamp(0.0, 100.0) as u8
 }
 
-/// Compute average |LLR| from a slice of raw LLR values (Phase 1 path).
+/// Compute average |LLR| from a slice of raw LLR values (the Phase 1 path
+/// computes the same running sum while streaming).
+#[cfg(test)]
 fn compute_avg_abs_llr(llrs: &[f64]) -> f64 {
     if llrs.is_empty() {
         return 0.0;
@@ -555,7 +557,7 @@ pub fn armor_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
         Err(new_err) => {
             // Try geometric recovery (Phase 3).
             progress::advance(); // phase 3
-            match try_geometric_recovery(stego_bytes, passphrase) {
+            match try_geometric_recovery(&img, passphrase) {
                 Ok(result) => Ok(result),
                 Err(_) => Err(new_err),
             }
@@ -568,32 +570,45 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
-
-    // 1. Compute frequency-restricted stability map.
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img
         .quant_table(qt_id)
         .ok_or(StegoError::NoLuminanceChannel)?;
-    let cost_map = compute_stability_map(img.dct_grid(0), qt);
+    let grid = img.dct_grid(0);
+    try_armor_decode_coeffs(grid, grid.blocks_wide(), grid.blocks_tall(), qt, passphrase)
+}
 
-    // 2. Derive structural key.
+/// The Armor STDM decode over any source of Y coefficients: the parsed grid,
+/// or the stable coefficients of a geometry-corrected image.
+///
+/// Working set: the embedding order as `u32` (15 per block), the spreading
+/// vectors only while small (`SpreadVectors`), and the LLR cache. No cost map,
+/// no `CoeffPos`, no per-candidate LLR vectors in Phase 1.
+fn try_armor_decode_coeffs<C: ArmorCoeffs + ?Sized>(
+    src: &C,
+    blocks_wide: usize,
+    blocks_tall: usize,
+    qt: &QuantTable,
+    passphrase: &str,
+) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    // 1. Derive structural key.
     let structural_key = crypto::derive_armor_structural_key(passphrase)?;
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let spread_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
 
-    // 3. Select and permute stable positions.
-    let positions = permute::select_and_permute(&cost_map, &perm_seed);
+    // 2. Stable positions (zigzag 1..=MAX_ARMOR_ZIGZAG of every block),
+    //    permuted — the order `select_and_permute(compute_stability_map)` gives.
+    let mut positions = selection::armor_positions(blocks_wide, blocks_tall, &perm_seed);
     let num_units = positions.len() / SPREAD_LEN;
     if num_units == 0 {
         return Err(StegoError::ImageTooSmall);
     }
-    let n_used = num_units * SPREAD_LEN;
-    let positions = &positions[..n_used];
+    positions.truncate(num_units * SPREAD_LEN);
+    let positions = &positions[..];
 
-    // 4. Generate spreading vectors for all units.
-    let vectors = generate_spreading_vectors(&spread_seed, num_units);
-
-    let grid = img.dct_grid(0);
+    // 3. Spreading vectors for all units.
+    let vectors = SpreadVectors::new(&spread_seed, num_units);
+    let grid = src; // the coefficient source the extraction helpers read
 
     // 5. Extract 1-byte header at bootstrap delta.
     if num_units <= HEADER_UNITS {
@@ -766,37 +781,72 @@ pub(crate) fn try_armor_decode(img: &JpegImage, passphrase: &str) -> Result<(Pay
 /// Used by the parallel smart_decode path to run STDM and Phase 3 concurrently
 /// with Fortress (which runs on a separate thread).
 #[allow(dead_code)] // Reserved for parallel smart_decode path (deferred wiring).
-pub(crate) fn armor_decode_no_fortress(img: &JpegImage, stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
-    match try_armor_decode(img, passphrase) {
+pub(crate) fn armor_decode_no_fortress(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    armor_decode_no_fortress_unless(img, passphrase, &|| false).expect("never stopped")
+}
+
+/// [`armor_decode_no_fortress`], skipped (`None`) when `stop()` is true
+/// before the STDM attempt or before geometric recovery — for
+/// `smart_decode`, which stops it once an attempt it prefers succeeded.
+pub(crate) fn armor_decode_no_fortress_unless(
+    img: &JpegImage,
+    passphrase: &str,
+    stop: &dyn Fn() -> bool,
+) -> Option<Result<(PayloadData, DecodeQuality), StegoError>> {
+    if stop() {
+        return None;
+    }
+    Some(match try_armor_decode(img, passphrase) {
         Ok(result) => Ok(result),
         Err(_stdm_err) => {
-            progress::check_cancelled()?;
-            match try_geometric_recovery(stego_bytes, passphrase) {
+            if stop() {
+                return None;
+            }
+            if let Err(e) = progress::check_cancelled() {
+                return Some(Err(e));
+            }
+            match try_geometric_recovery(img, passphrase) {
                 Ok(result) => Ok(result),
                 Err(_) => Err(_stdm_err),
             }
         }
-    }
+    })
 }
 
 /// Phase 3 geometric recovery: detect DFT template, estimate transform, resample, retry.
 /// Also tries DFT ring payload extraction as fallback.
-pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
+///
+/// Bounded working set, bit-identical to the whole-image form (luma f64 →
+/// `fft2d` → resample → `luma_f64_to_jpeg` → decode → `fft2d` again): the
+/// spectrum is computed strip-wise and only where detection and the ring read
+/// it (`fft2d::partial_spectrum`), and the corrected image is streamed block
+/// row by block row (`CorrectedLuma`) — once for the STDM retry, keeping only
+/// the coefficients it reads, and once more for the ring fallback. The parsed
+/// image is only read.
+pub(crate) fn try_geometric_recovery(img: &JpegImage, passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::stego::armor::dft_payload;
-
-    let img = JpegImage::from_bytes(stego_bytes)?;
 
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
-
-    // Convert to pixel domain and compute 2D FFT.
-    let (luma_pixels, w, h) = pixels::jpeg_to_luma_f64(&img)
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt = img
+        .quant_table(qt_id)
         .ok_or(StegoError::NoLuminanceChannel)?;
-    let spectrum = fft2d::fft2d(&luma_pixels, w, h);
+    let grid = img.dct_grid(0);
+    let (bw, bh) = (grid.blocks_wide(), grid.blocks_tall());
+    let (w, h) = (bw * 8, bh * 8);
 
-    // Generate expected template peaks and search for them.
+    // Generate expected template peaks; compute the luma spectrum where the
+    // search and the ring read it, and search for the peaks.
     let peaks = template::generate_template_peaks(passphrase, w, h)?;
+    let mut rects = vec![dft_payload::ring_rect(w, h)];
+    rects.extend(template::template_search_rects(&peaks, w, h));
+    let spectrum = fft2d::partial_spectrum(
+        w, h, &rects,
+        |br, strip| pixels::luma_block_row_f64(grid, &qt.values, br, strip),
+        fft2d::PARTIAL_SPECTRUM_PASS_BYTES,
+    );
     let detected = template::detect_template(&spectrum, &peaks);
 
     // Estimate the geometric transform from detected peaks.
@@ -829,27 +879,14 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
         return Err(StegoError::FrameCorrupted);
     }
 
-    // P0: Drop spectrum — only needed for template detection and ring extraction above.
+    // Only needed for template detection and ring extraction above.
     drop(spectrum);
+    progress::check_cancelled()?;
 
-    // Resample the pixel image to undo the geometric transform.
-    let corrected_pixels = resample::resample_bilinear(
-        &luma_pixels, w, h, &transform, w, h,
-    );
-
-    // P0: Drop luma_pixels — only needed for FFT and resample.
-    drop(luma_pixels);
-
-    // P0: Move img instead of clone — img is not used after correction.
-    let mut corrected_img = img;
-    pixels::luma_f64_to_jpeg(&corrected_pixels, w, h, &mut corrected_img)
-        .ok_or(StegoError::NoLuminanceChannel)?;
-
-    // P0: Drop corrected_pixels — written into corrected_img.
-    drop(corrected_pixels);
-
-    // Retry standard decode on the corrected image (no re-encode/re-parse needed).
-    match try_armor_decode(&corrected_img, passphrase) {
+    // Undo the geometric transform (resample + re-quantize, streamed) and
+    // retry the standard decode on the corrected coefficients it reads.
+    let stable = StableCoeffs::from_corrected(&mut CorrectedLuma::new(grid, &qt.values, &transform));
+    match try_armor_decode_coeffs(&stable, bw, bh, qt, passphrase) {
         Ok((text, mut quality)) => {
             quality.geometry_corrected = true;
             quality.template_peaks_detected = detected.len() as u8;
@@ -861,9 +898,25 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
             // STDM decode failed after geometry correction -- try DFT ring
             // Recompute FFT from corrected image for ring extraction
             {
-                let (cp, cw, ch) = pixels::jpeg_to_luma_f64(&corrected_img)
-                    .ok_or(StegoError::NoLuminanceChannel)?;
-                let corrected_spectrum = fft2d::fft2d(&cp, cw, ch);
+                drop(stable);
+                progress::check_cancelled()?;
+                let (cw, ch) = (w, h);
+                let mut corrected = CorrectedLuma::new(grid, &qt.values, &transform);
+                let mut blocks = vec![[0i16; 64]; bw];
+                let corrected_spectrum = fft2d::partial_spectrum(
+                    w, h, &[dft_payload::ring_rect(w, h)],
+                    |br, strip| {
+                        corrected.block_row(br, &mut blocks);
+                        for (bc, block) in blocks.iter().enumerate() {
+                            let px = pixels::idct_block_f64(block, &qt.values);
+                            for row in 0..8 {
+                                let o = row * w + bc * 8;
+                                strip[o..o + 8].copy_from_slice(&px[row * 8..row * 8 + 8]);
+                            }
+                        }
+                    },
+                    fft2d::PARTIAL_SPECTRUM_PASS_BYTES,
+                );
                 if let Some(ring_bytes) = dft_payload::extract_ring_payload(&corrected_spectrum, passphrase)
                     && let Ok(text) = std::str::from_utf8(&ring_bytes) {
                         let ring_cap = dft_payload::ring_capacity(cw, ch);
@@ -894,25 +947,18 @@ pub(crate) fn try_geometric_recovery(stego_bytes: &[u8], passphrase: &str) -> Re
 /// Extract the 1-byte mean-QT header from embedding units using soft majority voting.
 ///
 /// Reads 7 copies x 1 byte x 8 bits = 56 units at the given delta and offset.
-fn extract_header_byte(
-    grid: &DctGrid,
-    positions: &[crate::stego::permute::CoeffPos],
-    vectors: &[[f64; SPREAD_LEN]],
+fn extract_header_byte<C: ArmorCoeffs + ?Sized>(
+    grid: &C,
+    positions: &[u32],
+    vectors: &SpreadVectors,
     delta: f64,
     offset: usize,
 ) -> u8 {
     let mut header_llrs = [0.0f64; 56]; // 7 copies x 8 bits
+    let vecs = vectors.range(offset, 56);
     for i in 0..56 {
-        let unit_idx = offset + i;
-        let group_start = unit_idx * SPREAD_LEN;
-        let group = &positions[group_start..group_start + SPREAD_LEN];
-
-        let mut coeffs = [0.0f64; SPREAD_LEN];
-        for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
-        }
-
-        header_llrs[i] = stdm_extract_soft(&coeffs, &vectors[unit_idx], delta);
+        let coeffs = unit_coeffs(grid, positions, offset + i);
+        header_llrs[i] = stdm_extract_soft(&coeffs, &vecs[i], delta);
     }
 
     // Majority vote across 7 copies for each of 8 bits
@@ -930,10 +976,10 @@ fn extract_header_byte(
 }
 
 /// Phase 1 decode: extract all bits with given delta, then RS decode.
-fn decode_phase1_with_offset(
-    grid: &DctGrid,
-    positions: &[crate::stego::permute::CoeffPos],
-    vectors: &[[f64; SPREAD_LEN]],
+fn decode_phase1_with_offset<C: ArmorCoeffs + ?Sized>(
+    grid: &C,
+    positions: &[u32],
+    vectors: &SpreadVectors,
     delta: f64,
     num_units: usize,
     payload_offset: usize,
@@ -941,29 +987,27 @@ fn decode_phase1_with_offset(
 ) -> Result<(PayloadData, DecodeQuality), StegoError> {
     let payload_units = num_units - payload_offset;
 
-    // Extract all LLRs from payload region
-    let mut all_llrs = Vec::with_capacity(payload_units);
-    for unit_idx in payload_offset..num_units {
-        let group_start = unit_idx * SPREAD_LEN;
-        let group = &positions[group_start..group_start + SPREAD_LEN];
-
-        let mut coeffs = [0.0f64; SPREAD_LEN];
-        for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
+    // Extract the payload LLRs chunk by chunk, keeping only the hard bits and
+    // the running |LLR| sum (the same in-order sum `compute_avg_abs_llr`
+    // takes over the whole vector).
+    let mut abs_sum = 0.0f64;
+    let mut extracted_bits: Vec<u8> = Vec::with_capacity(payload_units);
+    let mut start = payload_offset;
+    while start < num_units {
+        let n = UNIT_CHUNK.min(num_units - start);
+        let vecs = vectors.range(start, n);
+        for k in 0..n {
+            let llr = stdm_extract_soft(&unit_coeffs(grid, positions, start + k), &vecs[k], delta);
+            abs_sum += llr.abs();
+            extracted_bits.push(if llr >= 0.0 { 0 } else { 1 });
         }
-
-        all_llrs.push(stdm_extract_soft(&coeffs, &vectors[unit_idx], delta));
+        start += n;
     }
 
-    // Compute signal strength from raw LLRs (before hard decision)
-    let signal_strength = compute_avg_abs_llr(&all_llrs);
+    // Signal strength from raw LLRs (before hard decision)
+    let signal_strength = if payload_units == 0 { 0.0 } else { abs_sum / payload_units as f64 };
     // Reference LLR for pristine STDM embedding: delta / 2
     let reference_llr = delta / 2.0;
-
-    // Convert LLRs to hard bits
-    let extracted_bits: Vec<u8> = all_llrs.iter()
-        .map(|&llr| if llr >= 0.0 { 0 } else { 1 })
-        .collect();
 
     let extracted_bytes = frame::bits_to_bytes(&extracted_bits);
     let (decoded_frame, rs_stats) = try_rs_decode_frame(&extracted_bytes)?;
@@ -1048,12 +1092,12 @@ const LLR_CACHE_MAX: usize = 5;
 ///
 /// P2b: Uses LRU eviction when the cache exceeds `LLR_CACHE_MAX` entries.
 /// The caller reads from the cache snapshot later; no return value needed.
-fn get_or_extract_llrs(
+fn get_or_extract_llrs<C: ArmorCoeffs + ?Sized>(
     cache: &mut Vec<(f64, Vec<f64>)>,
     delta: f64,
-    grid: &DctGrid,
-    positions: &[crate::stego::permute::CoeffPos],
-    vectors: &[[f64; SPREAD_LEN]],
+    grid: &C,
+    positions: &[u32],
+    vectors: &SpreadVectors,
     num_units: usize,
     payload_offset: usize,
 ) {
@@ -1069,25 +1113,19 @@ fn get_or_extract_llrs(
         }
     }
 
-    // Extract fresh LLRs
-    let unit_indices: Vec<usize> = (payload_offset..num_units).collect();
-
-    let extract_one = |&unit_idx: &usize| -> f64 {
-        let group_start = unit_idx * SPREAD_LEN;
-        let group = &positions[group_start..group_start + SPREAD_LEN];
-
-        let mut coeffs = [0.0f64; SPREAD_LEN];
-        for (k, pos) in group.iter().enumerate() {
-            coeffs[k] = flat_get(grid, pos.flat_idx as usize) as f64;
+    // Extract fresh LLRs, chunk by chunk (each unit's LLR is independent).
+    let mut llrs = vec![0.0f64; num_units - payload_offset];
+    let fill = |(ci, out): (usize, &mut [f64])| {
+        let start = payload_offset + ci * UNIT_CHUNK;
+        let vecs = vectors.range(start, out.len());
+        for (k, llr) in out.iter_mut().enumerate() {
+            *llr = stdm_extract_soft(&unit_coeffs(grid, positions, start + k), &vecs[k], delta);
         }
-
-        stdm_extract_soft(&coeffs, &vectors[unit_idx], delta)
     };
-
     #[cfg(feature = "parallel")]
-    let llrs: Vec<f64> = unit_indices.par_iter().map(extract_one).collect();
+    llrs.par_chunks_mut(UNIT_CHUNK).enumerate().for_each(fill);
     #[cfg(not(feature = "parallel"))]
-    let llrs: Vec<f64> = unit_indices.iter().map(extract_one).collect();
+    llrs.chunks_mut(UNIT_CHUNK).enumerate().for_each(fill);
 
     // P2b: Evict oldest entry if cache is full
     if cache.len() >= LLR_CACHE_MAX {
@@ -1405,6 +1443,105 @@ fn try_rs_decode_frame(extracted_bytes: &[u8]) -> Result<(Vec<u8>, ecc::RsDecode
     }
 
     Err(StegoError::FrameCorrupted)
+}
+
+// --- Decoder coefficient sources and spreading vectors ---
+
+/// Where the STDM decoder reads Y coefficients from, by flat index.
+pub(crate) trait ArmorCoeffs: Sync {
+    fn coeff(&self, flat_idx: usize) -> i16;
+}
+
+impl ArmorCoeffs for DctGrid {
+    #[inline]
+    fn coeff(&self, flat_idx: usize) -> i16 {
+        flat_get(self, flat_idx)
+    }
+}
+
+/// The Armor positions (zigzag 1..=MAX_ARMOR_ZIGZAG) of a geometry-corrected
+/// image: everything the STDM decoder reads, 15 of 64 coefficients per block.
+struct StableCoeffs {
+    per_block: usize,
+    slot_of: [u8; 64],
+    data: Vec<i16>,
+}
+
+impl StableCoeffs {
+    fn from_corrected(corrected: &mut CorrectedLuma) -> Self {
+        let slots = selection::stable_slots();
+        let mut slot_of = [u8::MAX; 64];
+        for (k, &f) in slots.iter().enumerate() {
+            slot_of[f] = k as u8;
+        }
+        let (bw, bh) = (corrected.blocks_wide(), corrected.blocks_tall());
+        let per_block = slots.len();
+        let mut data = vec![0i16; bw * bh * per_block];
+        let mut blocks = vec![[0i16; 64]; bw];
+        for br in 0..bh {
+            corrected.block_row(br, &mut blocks);
+            for (bc, block) in blocks.iter().enumerate() {
+                let base = (br * bw + bc) * per_block;
+                for (k, &f) in slots.iter().enumerate() {
+                    data[base + k] = block[f];
+                }
+            }
+        }
+        StableCoeffs { per_block, slot_of, data }
+    }
+}
+
+impl ArmorCoeffs for StableCoeffs {
+    #[inline]
+    fn coeff(&self, flat_idx: usize) -> i16 {
+        let slot = self.slot_of[flat_idx % 64];
+        assert!(slot != u8::MAX, "StableCoeffs: position {flat_idx} is not an Armor position");
+        self.data[(flat_idx / 64) * self.per_block + slot as usize]
+    }
+}
+
+/// The coefficients of embedding unit `unit_idx`, as f64.
+#[inline]
+fn unit_coeffs<C: ArmorCoeffs + ?Sized>(src: &C, positions: &[u32], unit_idx: usize) -> [f64; SPREAD_LEN] {
+    let group = &positions[unit_idx * SPREAD_LEN..(unit_idx + 1) * SPREAD_LEN];
+    let mut coeffs = [0.0f64; SPREAD_LEN];
+    for (k, &pos) in group.iter().enumerate() {
+        coeffs[k] = src.coeff(pos as usize) as f64;
+    }
+    coeffs
+}
+
+/// Units the decoder extracts per spreading-vector chunk.
+const UNIT_CHUNK: usize = 4096;
+
+/// Largest spreading-vector table the decoder keeps (64 bytes per unit, one
+/// unit per 8 positions): up to ~2M units (~70 MP) the vectors are generated
+/// once — below the geometry stage's peak, so the table costs no peak there;
+/// above that every extraction pass regenerates its chunks
+/// (`spreading_vectors_range`, bit-identical), trading ChaCha20 time (~1.5x
+/// the STDM search) for the table's memory.
+const SPREAD_TABLE_BYTES: usize = 128 << 20;
+
+/// The decoder's spreading vectors: a table while small, regenerated per chunk
+/// on large covers.
+struct SpreadVectors {
+    seed: [u8; 32],
+    table: Option<Vec<[f64; SPREAD_LEN]>>,
+}
+
+impl SpreadVectors {
+    fn new(seed: &[u8; 32], count: usize) -> Self {
+        let table = (count * std::mem::size_of::<[f64; SPREAD_LEN]>() <= SPREAD_TABLE_BYTES)
+            .then(|| generate_spreading_vectors(seed, count));
+        SpreadVectors { seed: *seed, table }
+    }
+
+    fn range(&self, start: usize, count: usize) -> std::borrow::Cow<'_, [[f64; SPREAD_LEN]]> {
+        match &self.table {
+            Some(t) => std::borrow::Cow::Borrowed(&t[start..start + count]),
+            None => std::borrow::Cow::Owned(spreading_vectors_range(&self.seed, start, count)),
+        }
+    }
 }
 
 // --- DctGrid flat access helpers ---

@@ -254,9 +254,9 @@ fn decode_av1_streaming(
     // (`split_av1_into_samples`) now emits the `sequence_header_obu`
     // IN-BAND at the start of every sync (keyframe) sample. The
     // streaming decode session's `split_av1_into_gops` walker splits
-    // on those in-band SHs to recover per-GOP slabs. av1C still
-    // carries a redundant SH (mandatory per AV1-ISOBMFF § 2.3.1), but
-    // we no longer re-inject it before each sample — that would
+    // on those in-band SHs to recover per-GOP slabs. av1C carries no
+    // SH (rav1e's 4-byte record, as the librav1e wrapper stores it),
+    // and re-injecting one before each sample would
     // produce SH-only slabs interleaved with real GOPs and trip
     // `NoCoverPositions`. The earlier MOBOOM.T3.11 workaround is
     // retired here.

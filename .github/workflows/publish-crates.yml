@@ -7,13 +7,20 @@
 #
 # License-compliance constraint (Via LA AVC patent obligations)
 # --------------------------------------------------------------
-# `phasm-core` is published with **default features only** (`default = []`
-# in Cargo.toml). The H.264 encoder lives behind the `h264-encoder`
-# feature and is therefore NOT compiled into the published artefact.
-# Source consumers wanting video-stego rebuild from source themselves
-# with `cargo install phasm-core --features h264-encoder` (or, for the
-# CLI, `cargo install phasm-cli --features h264-encoder` once that crate
-# is publish-ready — see "phasm-cli" note below).
+# The repository declares the video encoders (`h264-encoder`, `av1-encoder`,
+# `av1-decoder`) and builds them from its vendor/ submodules (OpenH264,
+# dav1d) and the rav1e fork patched in from GitHub. The crates.io package
+# does NOT: `scripts/strip-for-crates-io.py` removes those features, their
+# three dependencies and the targets that need them before
+# `cargo publish` runs (see the script header for why each one cannot go to
+# a registry). `phasm-core` is then published with default features
+# (`default = []`), so the package carries image stego plus the opt-in
+# `video` / `h264-decoder` reader and no encoder. Source consumers wanting
+# video encode build from a recursive clone (`make cli-video`) or a git
+# dependency plus the `[patch.crates-io]` snippet for rav1e (BUILDING.md).
+#
+# The strip leaves the checkout dirty, hence `--allow-dirty` on publish. The
+# checkout needs no submodules: after the strip nothing references vendor/.
 #
 # This mirrors the cargo-dist binary build (release.yml), which also
 # omits the encoder for the same patent reason. Same constraint, two
@@ -34,7 +41,7 @@
 #      Cargo.toml mods in this stage-only setup.
 #   3. Source-install consumers can still build the CLI directly:
 #         cargo install --git https://github.com/cgaffga/phasmcore phasm-cli
-#      (optionally with `--features h264-encoder` for video stego).
+#      (optionally with `--features h264-encoder,av1-encoder` for video).
 # To enable CLI publishing later, add `version = "0.1.0"` to the
 # `phasm-core` dep in `core/cli/Cargo.toml`, then uncomment the
 # `publish-cli` job below.
@@ -70,12 +77,22 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Sanity build (default features — no h264-encoder, no cabac-stego)
+      - name: Strip the manifest to the crates.io flavour
+        # Removes h264-encoder / av1-encoder / av1-decoder, their deps
+        # (core-openh264-sys, core-dav1d-sys, phasm-rav1e), the targets that
+        # need them, and excludes vendor/. Fails if anything survives.
+        run: python3 scripts/strip-for-crates-io.py .
+
+      - name: Sanity build (default features, no encoder)
         # Confirms the no-encoder build doesn't transitively pull in
         # encoder code via a feature-gate mistake. If a future change
         # accidentally re-routes encoder code into the default cfg, this
         # step fails before we hit the registry.
         run: cargo build --release --no-default-features
+        working-directory: .
+
+      - name: Sanity build (h264-decoder, the max crates.io video config)
+        run: cargo build --release --features h264-decoder
         working-directory: .
 
       - name: Publish phasm-core to crates.io
@@ -85,15 +102,18 @@ jobs:
         # means the published .crate ships with zero optional features
         # turned on at compile-time.
         #
+        # `--allow-dirty`: the strip step above edited Cargo.toml and
+        # cli/Cargo.toml and removed the encoder-only bin sources.
+        #
         # Source on crates.io still contains the encoder modules (the
         # source is what cargo-dist's release.yml also builds with
         # default features — same source, same constraint). What
         # matters for the patent obligation is what GETS COMPILED on a
-        # default `cargo install`: with `default = []` and the encoder
-        # behind `h264-encoder`, the answer is "no encoder."
+        # default `cargo install`: the published manifest has no
+        # `h264-encoder` feature at all, so the answer is "no encoder."
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p phasm-core --token "$CARGO_REGISTRY_TOKEN"
+        run: cargo publish -p phasm-core --allow-dirty --token "$CARGO_REGISTRY_TOKEN"
         working-directory: .
 
   # ─────────────────────────────────────────────────────────────────────
@@ -104,7 +124,10 @@ jobs:
   #         phasm-core = { path = "..", features = ["parallel", "video"] }
   #      to
   #         phasm-core = { path = "..", version = "0.1.0", features = ["parallel", "video"] }
-  #   2. Uncomment the job below.
+  #   2. Uncomment the job below, and give it the same
+  #      `python3 scripts/strip-for-crates-io.py .` step as publish-core
+  #      (plus `--allow-dirty`) — cli/Cargo.toml forwards the encoder
+  #      features too.
   #   3. Bump versions in lockstep so phasm-cli's `version = "x.y"`
   #      always matches the just-published phasm-core version.
   #

@@ -1,0 +1,124 @@
+# Source build with every video codec, the way BUILDING.md tells a third
+# party to do it: recursive clone, install meson + ninja + nasm, `make`.
+# OpenH264 and dav1d come from the vendor/ submodules; the make targets run
+# cargo through scripts/video-cargo.sh, which patches the crates.io `rav1e`
+# to the phasm-rav1e fork on GitHub at the pinned commit.
+#
+# Guards the git-build path (submodule pins, the rav1e patch, the -sys build
+# scripts' vendor lookup, the Makefile, check-deps.sh) against silent rot.
+# It fails when:
+#   - a submodule pin or the rav1e rev does not resolve, or a build script
+#     misses vendor/ (an unpatched rav1e stops at the fork guard);
+#   - OpenH264 or dav1d is built as the fail-fast STUB instead of the real
+#     codec (scripts/check-video-backends.sh reads the build-script output);
+#   - an H.264 or AV1 encode does not decode back to its message — library
+#     round-trip tests plus the CLI's video-encode + decode on a sample clip.
+#
+# ─────────────────────────────────────────────────────────────────────
+# NO BINARY PERSISTENCE (same posture as openh264-cross-arch.yml).
+# ─────────────────────────────────────────────────────────────────────
+#
+# This job compiles the H.264 encoder on a GitHub-owned runner VM. Per the
+# AVC patent posture, phasm distributes source only, so nothing built here
+# may outlive the job:
+#
+#   - permissions: contents: read  → no commits, releases, packages.
+#   - NO actions/cache             → target/ never persists.
+#   - NO actions/upload-artifact   → no downloadable build outputs.
+#   - NO if: failure() upload step.
+#   - ulimit -c 0                  → no core dumps.
+#   - Explicit rm -rf at job end, though the runner VM is destroyed
+#     regardless.
+#   - The smoke clips are written under target/ and erased with it; the log
+#     shows decoded text only, never stream bytes.
+#
+# What persists: the text job log. No binary.
+
+name: video-build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  video:
+    name: video build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the compiler; rustup (preinstalled on the
+      # runners) installs it on the first cargo call. Do it up front so the
+      # log shows the version.
+      - name: Rust toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # meson + ninja build OpenH264 and dav1d; nasm assembles their x86
+      # kernels and rav1e's (unused on arm64). ffmpeg is the CLI's runtime
+      # reader for the cover video (smoke test only).
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends meson ninja-build nasm ffmpeg
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install meson ninja nasm ffmpeg
+
+      - name: check-deps
+        run: sh scripts/check-deps.sh video
+
+      - name: Submodule pins + rav1e fork rev
+        run: |
+          git submodule status --recursive
+          grep '^PHASM_RAV1E_DEFAULT_REV=' scripts/video-cargo.sh
+
+      # Builds the library with every video feature, then fails on a stub.
+      - name: make build-video
+        run: |
+          ulimit -c 0
+          make build-video
+
+      - name: make cli-video
+        run: |
+          ulimit -c 0
+          make cli-video
+
+      - name: make test-video (H.264 + AV1 round trips)
+        run: |
+          ulimit -c 0
+          make test-video
+
+      - name: make smoke-video (CLI encode + decode, both codecs)
+        run: |
+          ulimit -c 0
+          make smoke-video
+
+      # Belt-and-suspenders: erase the build dir (which holds the meson
+      # build dirs and the smoke clips) before the runner VM tears down.
+      - name: Erase build outputs (post-run cleanup)
+        if: always()
+        shell: bash
+        run: rm -rf target
+
+      # EXPLICITLY ABSENT, per the policy block at the top:
+      #   - actions/upload-artifact
+      #   - actions/cache
+      #   - if: failure() upload step
+      #   - docker push / ghcr.io publish

@@ -8,8 +8,8 @@
 //! `encode_frame_with_phasm_tee` and concatenated by the streaming
 //! session) and partitions it into:
 //!
-//! 1. The leading `sequence_header_obu` bytes, used by [`super::Av1cData`]
-//!    to populate the `av1C` ConfigOBUs field.
+//! 1. The leading `sequence_header_obu` bytes, which the muxer parses for
+//!    the `av1C` fields and the `colr` box.
 //! 2. Per-frame OBU byte groups, one MP4 sample each.
 //! 3. Sync (sample_is_sync) flags per sample — `true` for keyframes
 //!    (the frame immediately following a sequence_header_obu).
@@ -35,8 +35,8 @@ pub const OBU_FRAME: u8 = 6;
 #[derive(Debug, Clone)]
 pub struct Av1SampleSplit {
     /// The first `sequence_header_obu` bytes encountered in the
-    /// stream. Used by [`super::Av1cData`] to populate the `av1C`
-    /// box's `ConfigOBUs` field. Empty if no sequence header was
+    /// stream; the muxer parses it for the `av1C` fields and `colr`.
+    /// Empty if no sequence header was
     /// found (caller should treat this as an error — every valid
     /// AV1 stream starts with at least one).
     pub sequence_header_obu: Vec<u8>,
@@ -50,9 +50,10 @@ pub struct Av1SampleSplit {
     /// `sequence_header_obu`s are PREPENDED to sync samples (sample
     /// where `sync[i] == true`). This makes the MP4 robust under
     /// random-access seeks and decodable by ffmpeg/libdav1d/VLC etc.,
-    /// matching the convention real-world AV1 encoders use. The same
-    /// SH bytes also live in `av1C` (redundant per AV1-ISOBMFF § 2.2.1
-    /// but explicitly allowed). Non-sync samples carry no SH.
+    /// matching the convention real-world AV1 encoders use. `av1C`
+    /// carries no config OBUs (rav1e's 4-byte record, as the librav1e
+    /// wrapper stores it), so these are the only copies. Non-sync
+    /// samples carry no SH.
     /// `temporal_delimiter_obu`s remain STRIPPED (optional per spec,
     /// adding them wastes bits).
     pub samples: Vec<Vec<u8>>,
@@ -87,9 +88,8 @@ pub struct Av1SampleSplit {
 /// sample's bytes start with the most-recently-seen `sequence_header_obu`.
 /// This makes the MP4 decodable by ffmpeg/libdav1d/VLC/Chromium (which
 /// don't carry SH state across random-access seek points), matching the
-/// convention real-world AV1 encoders use. av1C still carries the SH
-/// (mandatory per AV1-ISOBMFF § 2.3.1; in-band SH is allowed in
-/// addition per § 2.2.1).
+/// convention real-world AV1 encoders use, and the only copies: `av1C`
+/// carries rav1e's 4-byte record without config OBUs.
 pub fn split_av1_into_samples(bytes: &[u8]) -> Result<Av1SampleSplit, Mp4Error> {
     let mut sequence_header_obu: Vec<u8> = Vec::new();
     let mut samples: Vec<Vec<u8>> = Vec::new();
@@ -286,6 +286,11 @@ pub struct Av1SequenceHeaderInfo {
     pub chroma_subsampling_x: bool,
     pub chroma_subsampling_y: bool,
     pub chroma_sample_position: u8,
+    /// `(color_primaries, transfer_characteristics, matrix_coefficients)`
+    /// when the sequence header carries a colour description.
+    pub color_description: Option<(u8, u8, u8)>,
+    /// `color_range`: full (true) or studio swing.
+    pub full_range: bool,
 }
 
 /// VP.8 entry point: parse an AV1 `sequence_header_obu` (full OBU
@@ -461,14 +466,16 @@ pub fn parse_sequence_header_obu(obu_bytes: &[u8]) -> Option<Av1SequenceHeaderIn
         (2, 2, 2) // UNSPECIFIED defaults
     };
 
+    let full_range;
     let (subsampling_x, subsampling_y, chroma_sample_position) = if monochrome {
-        let _color_range = br.read_bits(1)?;
+        full_range = br.read_bits(1)? != 0;
         (true, true, 0u8)
     } else if cp == 1 && tc == 13 && mc == 0 {
         // sRGB
+        full_range = true;
         (false, false, 0u8)
     } else {
-        let _color_range = br.read_bits(1)?;
+        full_range = br.read_bits(1)? != 0;
         let (sx, sy) = if seq_profile == 0 {
             (true, true)
         } else if seq_profile == 1 {
@@ -504,6 +511,8 @@ pub fn parse_sequence_header_obu(obu_bytes: &[u8]) -> Option<Av1SequenceHeaderIn
         chroma_subsampling_x: subsampling_x,
         chroma_subsampling_y: subsampling_y,
         chroma_sample_position,
+        color_description: color_description_present_flag.then_some((cp, tc, mc)),
+        full_range,
     })
 }
 

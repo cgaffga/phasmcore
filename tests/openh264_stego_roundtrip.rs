@@ -106,7 +106,7 @@ fn c813_roundtrip_with_file_attachment() {
 /// that demonstrably carried an attachment decoded as text-only on both
 /// phones — the defect the user hit. This test drives the exact chain:
 ///
-///   `create_with_files` → Annex-B → HandBrake-profile MP4 mux →
+///   `create_with_files` → Annex-B → in-tree MP4 mux →
 ///   `h264_ghost_decode`
 ///
 /// and asserts the attachment comes back byte-identical.
@@ -130,10 +130,9 @@ fn d15_bridge_path_roundtrip_with_file_attachment() {
     let annex_b = oh264_stream::encode_with_files(&yuv, w, h, n_frames, 22, msg, &files, pass)
         .expect("encode_with_files");
 
-    // Mux exactly as the bridges do (`phasm_h264_mux_annexb_to_mp4` /
-    // `NativeBridge.h264MuxAnnexbToMp4` → HandbrakeX264 profile).
+    // Mux with the in-tree builder (the CLI's container).
     let mp4 = build_mp4(
-        MuxerProfile::HandbrakeX264,
+        MuxerProfile::LavfOpenH264,
         &annex_b,
         w,
         h,
@@ -158,6 +157,67 @@ fn d15_bridge_path_roundtrip_with_file_attachment() {
         payload.files[0].content.len(),
         mp4.len()
     );
+}
+
+/// The CLI's container (`MuxerProfile::LavfOpenH264`) carries exactly the
+/// encoder's NAL units (the input's, minus AUD / SPS / PPS, which live in
+/// `avcC`) and a real OpenH264 stego stream decodes out of it.
+#[test]
+fn lavf_profile_carries_the_encoder_nals_and_decodes() {
+    use phasm_core::codec::mp4::build::{build_mp4, FrameTiming, MuxerProfile};
+    use phasm_core::codec::mp4::demux::demux;
+
+    let _g = session_guard().lock().unwrap_or_else(|p| p.into_inner());
+    let (w, h, n_frames) = (640u32, 368u32, 8u32);
+    let yuv = ensure_yuv("iphone7_smoke", "IMG_4138.MOV", w, h, n_frames);
+    let (msg, pass) = ("container carries the encoder's bits", "lavf-profile");
+    let annex_b = oh264_stream::encode(&yuv, w, h, n_frames, 22, msg, pass).expect("encode");
+    let t = FrameTiming { fps_num: 30, fps_den: 1 };
+    let lavf = build_mp4(MuxerProfile::LavfOpenH264, &annex_b, w, h, t).expect("lavf mux");
+
+    let nals = |mp4: &[u8]| -> Vec<Vec<u8>> {
+        let parsed = demux(mp4).expect("demux");
+        let v = &parsed.tracks[parsed.video_track_idx.expect("video")];
+        let mut out = Vec::new();
+        for s in &v.samples {
+            let d = &mp4[s.offset as usize..(s.offset + s.size as u64) as usize];
+            let mut i = 0;
+            while i < d.len() {
+                let n = u32::from_be_bytes(d[i..i + 4].try_into().unwrap()) as usize;
+                out.push(d[i + 4..i + 4 + n].to_vec());
+                i += 4 + n;
+            }
+        }
+        out
+    };
+    let lavf_nals = nals(&lavf);
+    assert!(lavf_nals.iter().all(|n| n[0] & 0x1F != 6), "no SEI in the encoder's output");
+    // The encoder's NAL units: every Annex-B NAL but AUD (9) / SPS (7) / PPS (8).
+    let mut want: Vec<Vec<u8>> = Vec::new();
+    let sc_at: Vec<(usize, usize)> = (0..annex_b.len().saturating_sub(3))
+        .filter_map(|i| {
+            if annex_b[i..i + 3] == [0, 0, 1] {
+                Some((i, 3))
+            } else {
+                None
+            }
+        })
+        .collect();
+    for (k, &(at, len)) in sc_at.iter().enumerate() {
+        let start = at + len;
+        let mut end = sc_at.get(k + 1).map_or(annex_b.len(), |n| n.0);
+        while end > start && annex_b[end - 1] == 0 {
+            end -= 1; // the next start code's leading zero byte(s)
+        }
+        let nal = &annex_b[start..end];
+        if !nal.is_empty() && !matches!(nal[0] & 0x1F, 7..=9) {
+            want.push(nal.to_vec());
+        }
+    }
+    assert_eq!(lavf_nals, want, "the muxed samples are the encoder's NAL units");
+
+    let payload = phasm_core::stego::video::h264_ghost_decode(&lavf, pass).expect("decode from the lavf mux");
+    assert_eq!(payload.text, msg);
 }
 
 #[test]

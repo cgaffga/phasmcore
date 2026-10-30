@@ -196,6 +196,7 @@ fn container_child_offset(box_type: &[u8; 4]) -> Option<usize> {
         b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"dinf"
         | b"udta" | b"edts" => Some(0),
         b"meta" => Some(4),
+        b"ilst" => Some(0),
         b"dref" | b"stsd" => Some(8),
         b"avc1" => Some(78),
         _ => None,
@@ -309,102 +310,6 @@ fn build_minimal_annexb() -> Vec<u8> {
 }
 
 #[test]
-fn phasm_handbrake_output_lands_at_libx264_class_leaf() {
-    let annex_b = build_minimal_annexb();
-    let mp4 = build_mp4(
-        MuxerProfile::HandbrakeX264,
-        &annex_b,
-        1920,
-        1080,
-        FrameTiming::FPS_30,
-    )
-    .expect("build_mp4");
-
-    let leaf = eva_classify(&mp4);
-    assert_eq!(
-        leaf,
-        EvaLeaf::LibX264Class,
-        "phasm HandBrake output must classify as libx264-class — \
-         was {leaf:?}, which moves the file out of the populous \
-         metaclass and into a Yang/EVA leaf the strategy doc forbids",
-    );
-}
-
-#[test]
-fn phasm_handbrake_output_has_no_editor_traces() {
-    // §Stealth.L4.3 — phasm must NOT emit any of the atoms that
-    // Yang/EVA's strongest splitters key on (uuid/userType, XMP_,
-    // ©mod/©swr/©day/©xyz). All Adobe/Premiere/Apple-iTunes traces
-    // must be absent from the HandBrake profile output.
-    let annex_b = build_minimal_annexb();
-    let mp4 = build_mp4(
-        MuxerProfile::HandbrakeX264,
-        &annex_b,
-        1920,
-        1080,
-        FrameTiming::FPS_30,
-    )
-    .unwrap();
-
-    assert!(!has_box(&mp4, b"uuid"), "no `uuid` atom (Adobe/external-editor tell)");
-    assert!(!has_box(&mp4, b"meta"), "no `meta` atom in HandBrake output");
-    assert!(!has_path(&mp4, &[b"moov", b"udta", b"XMP_"]), "no XMP_");
-    assert!(!has_path(&mp4, &[b"moov", b"udta", &[0xA9, b'm', b'o', b'd']]), "no ©mod");
-    assert!(!has_path(&mp4, &[b"moov", b"udta", &[0xA9, b's', b'w', b'r']]), "no ©swr");
-    assert!(!has_path(&mp4, &[b"moov", b"udta", &[0xA9, b'd', b'a', b'y']]), "no ©day");
-    assert!(!has_path(&mp4, &[b"moov", b"udta", &[0xA9, b'x', b'y', b'z']]), "no ©xyz");
-    // ©too IS expected — that's the HandBrake plaintext marker.
-    assert!(has_path(&mp4, &[b"moov", b"udta", &[0xA9, b't', b'o', b'o']]), "©too present");
-}
-
-#[test]
-fn phasm_handbrake_topology_matches_libx264_metaclass() {
-    // Altinisik 2022 tree-hash equivalent: assert phasm's atom
-    // topology equals the canonical HandBrake/x264 shape (no
-    // accidental additions, no missing required atoms).
-    let annex_b = build_minimal_annexb();
-    let mp4 = build_mp4(
-        MuxerProfile::HandbrakeX264,
-        &annex_b,
-        1920,
-        1080,
-        FrameTiming::FPS_30,
-    )
-    .unwrap();
-
-    let topology = topology_signature(&mp4);
-    let expected: Vec<&str> = vec![
-        "ftyp",
-        "mdat",
-        "moov",
-        "moov/mvhd",
-        "moov/trak",
-        "moov/trak/mdia",
-        "moov/trak/mdia/hdlr",
-        "moov/trak/mdia/mdhd",
-        "moov/trak/mdia/minf",
-        "moov/trak/mdia/minf/dinf",
-        "moov/trak/mdia/minf/dinf/dref",
-        "moov/trak/mdia/minf/dinf/dref/url ",
-        "moov/trak/mdia/minf/stbl",
-        "moov/trak/mdia/minf/stbl/stco",
-        "moov/trak/mdia/minf/stbl/stsc",
-        "moov/trak/mdia/minf/stbl/stsd",
-        "moov/trak/mdia/minf/stbl/stsd/avc1",
-        "moov/trak/mdia/minf/stbl/stsd/avc1/avcC",
-        "moov/trak/mdia/minf/stbl/stss",
-        "moov/trak/mdia/minf/stbl/stsz",
-        "moov/trak/mdia/minf/stbl/stts",
-        "moov/trak/mdia/minf/vmhd",
-        "moov/trak/tkhd",
-        "moov/udta",
-        "moov/udta/\u{a9}too",
-    ];
-    let expected_owned: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
-    assert_eq!(topology, expected_owned, "atom topology drift vs HandBrake reference");
-}
-
-#[test]
 fn classifier_discriminates_apple_mp4_from_libx264() {
     // Negative control: hand-craft a minimal ftyp with `mp42` major +
     // `[mp42, isom, avc1, mp41]` compatibles (modern Apple .mp4) and
@@ -472,3 +377,75 @@ fn phasm_avcc_carries_decodable_sps_pps() {
     assert_eq!(avcc.sps_nalus.len(), 1);
     assert_eq!(avcc.pps_nalus.len(), 1);
 }
+
+// ─── LavfOpenH264 profile (the CLI default since 2026-10-29) ─────────
+
+/// IDR + three P access units: enough for a `stss`.
+fn build_annexb_gop() -> Vec<u8> {
+    let mut out = build_minimal_annexb();
+    for _ in 0..3 {
+        out.extend_from_slice(&[0, 0, 0, 1, 0x09, 0x30, 0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x10]);
+    }
+    out
+}
+
+#[test]
+fn lavf_openh264_output_lands_at_the_libavformat_leaf() {
+    // The `iso2` leaf is libavformat's brand set — every encode it muxes,
+    // libx264 and libopenh264 alike, lands there.
+    let mp4 = build_mp4(MuxerProfile::LavfOpenH264, &build_annexb_gop(), 1920, 1080, FrameTiming::FPS_30)
+        .expect("build_mp4");
+    assert_eq!(eva_classify(&mp4), EvaLeaf::LibX264Class);
+    assert!(!has_box(&mp4, b"uuid"));
+    assert!(!has_path(&mp4, &[b"moov", b"udta", b"XMP_"]));
+    assert!(!has_path(&mp4, &[b"moov", b"udta", &[0xA9, b't', b'o', b'o']]), "no QuickTime-style ©too");
+}
+
+#[test]
+fn lavf_openh264_topology_matches_the_reference_muxer() {
+    // The atom tree of the reference muxer's own output (libavformat
+    // 62.12.101, video-only, no B-frames), minus `avc1/colr`: that muxer
+    // writes `colr` only for a stream whose SPS carries a colour
+    // description, which the OpenH264 fork's SPS does not.
+    let mp4 = build_mp4(MuxerProfile::LavfOpenH264, &build_annexb_gop(), 1920, 1080, FrameTiming::FPS_30)
+        .unwrap();
+    let expected: Vec<String> = [
+        "free",
+        "ftyp",
+        "mdat",
+        "moov",
+        "moov/mvhd",
+        "moov/trak",
+        "moov/trak/edts",
+        "moov/trak/edts/elst",
+        "moov/trak/mdia",
+        "moov/trak/mdia/hdlr",
+        "moov/trak/mdia/mdhd",
+        "moov/trak/mdia/minf",
+        "moov/trak/mdia/minf/dinf",
+        "moov/trak/mdia/minf/dinf/dref",
+        "moov/trak/mdia/minf/dinf/dref/url ",
+        "moov/trak/mdia/minf/stbl",
+        "moov/trak/mdia/minf/stbl/stco",
+        "moov/trak/mdia/minf/stbl/stsc",
+        "moov/trak/mdia/minf/stbl/stsd",
+        "moov/trak/mdia/minf/stbl/stsd/avc1",
+        "moov/trak/mdia/minf/stbl/stsd/avc1/avcC",
+        "moov/trak/mdia/minf/stbl/stsd/avc1/btrt",
+        "moov/trak/mdia/minf/stbl/stss",
+        "moov/trak/mdia/minf/stbl/stsz",
+        "moov/trak/mdia/minf/stbl/stts",
+        "moov/trak/mdia/minf/vmhd",
+        "moov/trak/tkhd",
+        "moov/udta",
+        "moov/udta/meta",
+        "moov/udta/meta/hdlr",
+        "moov/udta/meta/ilst",
+        "moov/udta/meta/ilst/\u{a9}too",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(topology_signature(&mp4), expected, "atom topology drift vs the reference muxer");
+}
+

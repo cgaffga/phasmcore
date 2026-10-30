@@ -61,7 +61,7 @@ fn wv6_g1_clean_per_gop_encode_is_deterministic() {
     let (w, h, n) = (1072u32, 1920u32, 30u32);
     let opts = EncodeOpts { qp: 26, intra_period: 60 };
     let weights = CostWeights::default();
-    let hhat_seed = [42u8; 32];
+    let hhat_seed = phasm_core::stego::cover_order::GopSeeds { order: [42u8; 32], hhat: [42u8; 32] };
     // A modest primary payload (the 1080p cover is huge, so this fits easily).
     let frame_bits: Vec<u8> = (0..2048u32).map(|i| (i & 1) as u8).collect();
 

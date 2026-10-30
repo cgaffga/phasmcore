@@ -107,10 +107,9 @@ fn build_mp4_av1_single_keyframe_produces_valid_mp4() {
     assert!(fourccs.contains(&b"mdat".as_slice()), "mdat box must be present");
     assert!(fourccs.contains(&b"moov".as_slice()), "moov box must be present");
 
-    // Box order: ftyp → mdat → moov (HandBrake convention).
-    assert_eq!(fourccs[0], b"ftyp");
-    assert_eq!(fourccs[1], b"mdat");
-    assert_eq!(fourccs[2], b"moov");
+    // Box order: ftyp → free → mdat → moov (the libavformat layout, no
+    // fast-start).
+    assert_eq!(fourccs, [b"ftyp", b"free", b"mdat", b"moov"]);
 }
 
 #[test]

@@ -1,10 +1,13 @@
 # H.264 Encoder Corpus
 
-Test vectors for Phase 6 encoder fingerprint regression + decode
-oracle harness. Used by:
+Small external-encoder clips (libx264, VideoToolbox) for the ffmpeg
+decode-oracle harness. Currently used by `core/tests/h264_oracle_test.rs`,
+which checks that the oracle can decode every clip. They were also the
+fingerprint-regression corpus of the retired pure-Rust encoder; that
+design is frozen in:
 
-- `docs/design/video/h264/encoder-algorithms/fingerprint-regression.md`
-- `docs/design/video/h264/encoder-algorithms/oracle-harness.md`
+- `docs/design/video/_archive/h264/encoder-algorithms/fingerprint-regression.md`
+- `docs/design/video/_archive/h264/encoder-algorithms/oracle-harness.md`
 
 ## Regenerating
 

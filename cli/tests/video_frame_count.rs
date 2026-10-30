@@ -13,9 +13,11 @@
 //! 361 -> 362, ...); clips whose video starts with the file were not.
 //!
 //! The duplicate also stood in, one frame coarse, for the late video's
-//! lead-in against the audio. Without it the lead-in is carried by holding
-//! frame 0 for it (`build_mp4_with_pattern_audio_lead_in`), so these tests
-//! also pin the video's placement against the passed-through audio.
+//! lead-in against the audio. Without it the lead-in is carried by a leading
+//! empty edit in whole frames (`build_mp4_with_pattern_audio_lead_in`, the
+//! `LavfOpenH264` profile — as the tool that made the source writes it), so
+//! these tests also pin the video's placement against the passed-through
+//! audio.
 //!
 //! Each case builds its own fixture, runs the real binary, then checks the
 //! output's video sample count, decoded frame count and timing against the
@@ -140,31 +142,36 @@ fn encode_and_check(src: &Path, out: &Path, extra: &[&str]) {
         "{}: output decodes to {:?} frames, source to {:?}",
         src.display(), ov.frames, sv.frames,
     );
-    // The output video always starts at 0 (no edit list, like x264).
-    assert!(ov.start.abs() < 0.001, "{}: output video starts at {}", out.display(), ov.start);
-
+    // The empty edit carries the lead-in in whole frames; the fixtures'
+    // lead-ins are whole frames already, so it lands within a millisecond.
     match (probed(src, "a"), probed(out, "a")) {
         (Some(sa), Some(oa)) => {
             // The audio keeps its placement, so the video must keep its own
-            // against it: the source's lead-in is held on frame 0 and the
-            // video ends exactly where the source's does.
+            // against it: it starts and ends where the source's does.
             assert!(
                 (oa.start - sa.start).abs() < 0.001,
                 "{}: audio starts at {} s, source {} s", out.display(), oa.start, sa.start,
             );
-            let (src_end, out_end) = (sv.start + sv.duration, ov.duration);
+            assert!(
+                (ov.start - sv.start).abs() < 0.001,
+                "{}: output video starts at {} s, source at {} s", out.display(), ov.start, sv.start,
+            );
+            let (src_end, out_end) = (sv.start + sv.duration, ov.start + ov.duration);
             assert!(
                 (out_end - src_end).abs() < 0.001,
-                "{}: output video ends at {out_end} s, source at {src_end} s \
-                 (source video starts {} s in)",
-                src.display(), sv.start,
+                "{}: output video ends at {out_end} s, source at {src_end} s",
+                src.display(),
             );
         }
-        (None, None) => assert!(
-            (ov.duration - sv.duration).abs() < 0.001,
-            "{}: output video lasts {} s, source {} s",
-            src.display(), ov.duration, sv.duration,
-        ),
+        (None, None) => {
+            // Video alone starts the movie.
+            assert!(ov.start.abs() < 0.001, "{}: output video starts at {}", out.display(), ov.start);
+            assert!(
+                (ov.duration - sv.duration).abs() < 0.001,
+                "{}: output video lasts {} s, source {} s",
+                src.display(), ov.duration, sv.duration,
+            );
+        }
         (s, o) => panic!(
             "{}: audio present in source={} output={}",
             src.display(), s.is_some(), o.is_some(),

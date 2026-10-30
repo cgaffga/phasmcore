@@ -250,7 +250,7 @@ unsafe extern "C" fn meta_hook_cb(
 pub fn decode_with_recording(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, false)
+    decode_with_recording_inner(av1_bytes, true, false, None)
 }
 
 /// Variant of [`decode_with_recording`] that also extracts the last
@@ -265,7 +265,7 @@ pub fn decode_with_recording(
 pub fn decode_with_recording_with_pixels(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, true)
+    decode_with_recording_inner(av1_bytes, true, true, None)
 }
 
 /// Layout mirror of dav1d's `Dav1dPicture` prefix (through
@@ -327,9 +327,40 @@ pub(super) unsafe fn copy_plane(
     out
 }
 
+/// Per-frame 16×16 luma block sums of a decoded AV1 stream, in decode order
+/// (decode-and-replan's view of what a viewer sees, spec § 7). Only 8-bit
+/// 4:2:0 pictures are graded; any other picture is an error.
+#[cfg(feature = "av1-encoder")]
+pub fn decode_luma_block_grids(
+    av1_bytes: &[u8],
+) -> Result<Vec<super::flood::LumaBlockGrid>, Av1DecodeError> {
+    let mut grids = Vec::new();
+    let mut bad: Option<Av1DecodeError> = None;
+    // Pixels only: no symbol recording (it would hold every 50/50 bit of the
+    // GOP, ~100 MB at 1080p, for nothing).
+    decode_with_recording_inner(av1_bytes, false, false, Some(&mut |view: &Dav1dPictureView| {
+        if view.p_layout != 1 || view.p_bpc != 8 {
+            bad.get_or_insert(Av1DecodeError::UnsupportedPicture { layout: view.p_layout, bpc: view.p_bpc });
+            return;
+        }
+        let (w, h) = (view.p_w as usize, view.p_h as usize);
+        let stride = view.stride[0] as usize;
+        // SAFETY: dav1d's luma plane holds `h` rows of `stride` bytes, of
+        // which the first `w` are visible; the picture is live for the call.
+        let y = unsafe { core::slice::from_raw_parts(view.data[0] as *const u8, stride * (h - 1) + w) };
+        grids.push(super::flood::LumaBlockGrid::from_plane(y, w, h, stride));
+    }))?;
+    match bad {
+        Some(e) => Err(e),
+        None => Ok(grids),
+    }
+}
+
 fn decode_with_recording_inner(
     av1_bytes: &[u8],
+    record: bool,
     capture_pixels: bool,
+    mut on_picture: Option<&mut dyn FnMut(&Dav1dPictureView)>,
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
     let mut recorder = RecorderState::default();
     let eagain = dav1d_err_again();
@@ -352,18 +383,22 @@ fn decode_with_recording_inner(
 
         // Register the recording hook with cookie pointing at our
         // stack-allocated recorder.
-        settings.phasm_hooks = Dav1dPhasmHooks {
-            cookie: &mut recorder as *mut RecorderState
-                as *mut core::ffi::c_void,
-            bit_hook: Some(bit_hook_cb),
-            tag_hook: None, // not used for v0.3 recording
-            meta_hook: Some(meta_hook_cb),
-            block_hook: None, // not used for stego recording — only the
-                              // av1_block_hist stealth-audit binary
-                              // registers this
-            sym_hook: None,
-            mag_hook: Some(mag_hook_cb),
-        };
+        // Without `record` the hooks stay unset (the zeroed settings): a
+        // plain decode, for callers that only want pixels.
+        if record {
+            settings.phasm_hooks = Dav1dPhasmHooks {
+                cookie: &mut recorder as *mut RecorderState
+                    as *mut core::ffi::c_void,
+                bit_hook: Some(bit_hook_cb),
+                tag_hook: None, // not used for v0.3 recording
+                meta_hook: Some(meta_hook_cb),
+                block_hook: None, // not used for stego recording — only the
+                                  // av1_block_hist stealth-audit binary
+                                  // registers this
+                sym_hook: None,
+                mag_hook: Some(mag_hook_cb),
+            };
+        }
 
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
         let rc = dav1d_open(&mut ctx, &settings);
@@ -425,6 +460,9 @@ fn decode_with_recording_inner(
                 // via the Dav1dPictureView layout mirror BEFORE unref.
                 // We keep the LAST picture we see — v0.3 is
                 // single-frame so this is fine.
+                if let Some(cb) = on_picture.as_mut() {
+                    cb(&*(&pic as *const Dav1dPicture as *const Dav1dPictureView));
+                }
                 if capture_pixels {
                     let view = &*(&pic as *const Dav1dPicture as *const Dav1dPictureView);
                     // 8-bit 4:2:0 only (Dav1dPixelLayout I420 == 1): other
@@ -1242,6 +1280,7 @@ mod tests {
                 quantizer: 100,
                 gop_size: n,
                 total_frames_hint: n,
+                colour: Default::default(),
             };
             let gop = crate::codec::av1::stego::whole_video::encode_gop_natural(&out.stdout, n, params)
                 .expect("encode");

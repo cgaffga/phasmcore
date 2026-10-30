@@ -6,7 +6,7 @@ use crate::error::CliError;
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
-use phasm_core::{optimize_cover, OptimizerConfig, OptimizerMode, ARMOR_TARGET_DIMENSION};
+use phasm_core::{deep_cover_jpeg, optimize_cover, OptimizerConfig, OptimizerMode, ARMOR_TARGET_DIMENSION};
 use std::io::Cursor;
 use std::path::Path;
 
@@ -124,7 +124,14 @@ pub fn prepare_image(
     } else {
         DEFAULT_QF_ARMOR
     });
-    let jpeg_bytes = compress_to_jpeg(&rgb_pixels, width, height, effective_qf)?;
+    // Ghost (Deep Cover): phasm writes the cover itself, so the side
+    // information is the cover's exact rounding (libjpeg-turbo-identical
+    // writer; docs/design/image/deep-cover-exact-si.md).
+    let jpeg_bytes = if mode == "ghost" {
+        deep_cover_jpeg(&rgb_pixels, width, height, effective_qf)?
+    } else {
+        compress_to_jpeg(&rgb_pixels, width, height, effective_qf)?
+    };
 
     Ok(PreparedImage {
         jpeg_bytes,

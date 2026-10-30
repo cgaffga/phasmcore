@@ -372,8 +372,8 @@ fn iso_mp4a(entry: &[u8]) -> Option<Vec<u8>> {
 /// or time the track.
 const SOURCE_METADATA_BOXES: [&[u8; 4]; 5] = [b"udta", b"meta", b"uuid", b"free", b"skip"];
 
-/// The `hdlr` name phasm gives an audio track: HandBrake's, as the video
-/// track's `VideoHandler` (`build.rs`) is.
+/// The `hdlr` name phasm gives an audio track, as the video track's
+/// `VideoHandler` (`build.rs`) is the libavformat default.
 const SOUND_HANDLER_NAME: &[u8] = b"SoundHandler";
 
 /// Where in the track [`scrub_children`] is.

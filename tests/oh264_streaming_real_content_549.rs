@@ -408,7 +408,7 @@ fn phase_c_pass1_bytewise_parity() {
         let yuv = ensure_real_yuv("Artlist_CarPlane.mp4", 1072, 1920, 12);
         let opts = EncodeOpts { qp: 26, intra_period: 12 };
         let frame_bits: Vec<u8> = (0..480u32).map(|i| (i & 1) as u8).collect();
-        let hhat_seed = [42u8; 32];
+        let hhat_seed = phasm_core::stego::cover_order::GopSeeds { order: [42u8; 32], hhat: [42u8; 32] };
         let weights = CostWeights::default();
 
         // First call.

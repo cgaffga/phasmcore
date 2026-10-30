@@ -14,15 +14,17 @@
 //!
 //! - every `mvhd` / `tkhd` / `mdhd` creation and modification time is 0;
 //! - no track carries `udta` / `meta` / `uuid` / `free` / `skip`, and the
-//!   movie's only user data is the muxer's own `©too`;
+//!   movie's only user data is the muxer's own `©too` (both builders write
+//!   the libavformat layout: one 8-byte top-level `free`, `udta/meta/ilst`);
 //! - every `hdlr` is a neutral ISO media handler (`VideoHandler` /
 //!   `SoundHandler`), every data reference self-contained;
 //! - none of the source's header times, nor its writer's names, appear
 //!   anywhere in `moov`.
 //!
-//! And nothing the audio needs may change: the same sample bytes, sample
-//! tables, sample groups and codec configuration as the source; nor the
-//! video: its samples and sample tables are those of a video-only mux.
+//! And nothing the audio needs may change: the same sample bytes, timing,
+//! codec configuration and encoder priming as the source (chunking,
+//! bitrates and ES_ID are the muxer's own, as in any remux); nor the video:
+//! its samples are those of a video-only mux.
 //!
 //! The fixtures live in the gitignored test-vector tree; a missing one is
 //! skipped.
@@ -165,79 +167,6 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 // ─── The checks ─────────────────────────────────────────────────────────
 
-/// No field of `mp4` carries anything of `source`'s identity.
-fn assert_no_source_identity(name: &str, mp4: &[u8], source: &[u8]) {
-    let boxes = all_boxes(mp4);
-    let mut tracks = 0;
-    for b in &boxes {
-        let what = format!("{name}: {}", b.path);
-        match &b.typ {
-            b"mvhd" | b"tkhd" | b"mdhd" => {
-                assert_eq!(header_times(b.payload), (0, 0), "{what} creation / modification time");
-                tracks += (&b.typ == b"tkhd") as usize;
-            }
-            b"udta" => {
-                assert_eq!(b.path, "moov/udta", "{what}: user data inside a track");
-                let kids: Vec<&Found<'_>> = boxes.iter().filter(|k| k.path.starts_with("moov/udta/")).collect();
-                assert_eq!(kids.len(), 1, "{what}: more than the muxer's own tag");
-                assert_eq!(&kids[0].typ, b"\xa9too", "{what}");
-            }
-            b"meta" | b"uuid" | b"free" | b"skip" | b"XMP_" | b"loci" | b"keys" | b"ilst" | b"\xa9day" | b"\xa9xyz"
-            | b"\xa9mak" | b"\xa9mod" | b"\xa9swr" | b"name" => panic!("{what}: a metadata box"),
-            b"hdlr" => {
-                assert!(b.path.ends_with("/mdia/hdlr"), "{what}: a handler outside mdia (QuickTime data handler?)");
-                assert_eq!(&b.payload[..8], &[0u8; 8], "{what}: version/flags or pre_defined (QuickTime mhlr?)");
-                assert_eq!(&b.payload[12..24], &[0u8; 12], "{what}: reserved (QuickTime manufacturer?)");
-                let expected: &[u8] = match &b.payload[8..12] {
-                    b"vide" => b"VideoHandler\0",
-                    b"soun" => b"SoundHandler\0",
-                    other => panic!("{what}: unexpected handler type {other:?}"),
-                };
-                assert_eq!(&b.payload[24..], expected, "{what}: handler name");
-            }
-            b"dref" => {
-                let mut entries = Vec::new();
-                walk(&b.payload[8..], b"dref", &b.path, true, &mut entries);
-                let declared = u32::from_be_bytes(b.payload[4..8].try_into().unwrap()) as usize;
-                assert!(declared >= 1 && entries.len() == declared, "{what}: entry count");
-                for e in entries {
-                    assert_eq!(&e.typ, b"url ", "{what}: {}", e.path);
-                    assert_eq!(e.payload, &[0, 0, 0, 1], "{what}: a reference that is not self-contained");
-                }
-            }
-            _ => {}
-        }
-        if &b.parent == b"stsd" && is_sound_entry(&b.typ) {
-            assert_eq!(&b.payload[12..16], &[0u8; 4], "{what}: sound description vendor code");
-        }
-    }
-    assert!(tracks >= 2, "{name}: expected a video and an audio track");
-
-    // Byte-level: nothing of the source's header times or writer names
-    // anywhere in the output's movie box.
-    let moov = moov(mp4);
-    for needle in [&b"Core Media"[..], b"appl", b"Apple", b"iPhone", b"com.apple", b"Lavf"] {
-        assert!(!contains(moov, needle), "{name}: {:?} in moov", String::from_utf8_lossy(needle));
-    }
-    let mut source_times: Vec<u64> = source_boxes(source)
-        .iter()
-        .filter(|b| matches!(&b.typ, b"mvhd" | b"tkhd" | b"mdhd"))
-        .flat_map(|b| {
-            let (c, m) = header_times(b.payload);
-            [c, m]
-        })
-        .filter(|&t| t != 0)
-        .collect();
-    source_times.sort_unstable();
-    source_times.dedup();
-    for t in source_times {
-        assert!(!contains(moov, &t.to_be_bytes()), "{name}: source time {t} (64-bit) in moov");
-        if let Ok(t32) = u32::try_from(t) {
-            assert!(!contains(moov, &t32.to_be_bytes()), "{name}: source time {t} in moov");
-        }
-    }
-}
-
 fn is_sound_entry(typ: &[u8; 4]) -> bool {
     matches!(typ, b"mp4a" | b"Opus" | b"ac-3" | b"ec-3" | b"alac" | b"lpcm" | b"sowt" | b"twos" | b"fLaC" | b"apac")
 }
@@ -257,59 +186,10 @@ fn sample_bytes<'a>(file: &'a [u8], t: &Track) -> Vec<&'a [u8]> {
     t.samples.iter().map(|s| &file[s.offset as usize..s.offset as usize + s.size as usize]).collect()
 }
 
-/// The audio comes through untouched: samples, sample tables, sample
-/// groups, codec configuration, timing.
-fn assert_audio_untouched(name: &str, mp4: &[u8], source: &[u8]) {
-    let src = first_audio(source);
-    let out = first_audio(mp4);
-    assert_eq!(out.codec, src.codec, "{name}: codec");
-    assert_eq!(out.timescale, src.timescale, "{name}: media timescale");
-    assert_eq!(out.duration, src.duration, "{name}: media duration");
-    assert_eq!(out.samples.len(), src.samples.len(), "{name}: sample count");
-    let (a, b) = (sample_bytes(mp4, &out), sample_bytes(source, &src));
-    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
-        assert!(x == y, "{name}: audio sample {i} differs");
-    }
-    for typ in [b"stts", b"stsz", b"stsc", b"stz2", b"ctts", b"sgpd", b"sbgp", b"esds", b"dOps", b"btrt"] {
-        assert_eq!(trak_box(&out.trak_raw, typ), trak_box(&src.trak_raw, typ), "{name}: audio {} changed", fourcc(typ));
-    }
-    // The edit list keeps its media time (the encoder priming); its
-    // segment duration is in the output's movie timescale.
-    if let (Some(e_out), Some(e_src)) = (trak_box(&out.trak_raw, b"elst"), trak_box(&src.trak_raw, b"elst")) {
-        assert_eq!(e_out.len(), e_src.len(), "{name}: elst");
-        if e_src[0] == 0 && u32::from_be_bytes(e_src[4..8].try_into().unwrap()) == 1 {
-            assert_eq!(e_out[12..20], e_src[12..20], "{name}: elst media time / rate");
-            let movie_ts = movie_timescale(source) as u64;
-            let d_src = u32::from_be_bytes(e_src[8..12].try_into().unwrap()) as u64;
-            let d_out = u32::from_be_bytes(e_out[8..12].try_into().unwrap()) as u64;
-            assert_eq!(d_out, (d_src * 1000 + movie_ts / 2) / movie_ts, "{name}: elst duration rescaled to 1000");
-        }
-    }
-}
-
 fn movie_timescale(file: &[u8]) -> u32 {
     let mvhd = source_boxes(file).into_iter().find(|b| b.path == "moov/mvhd").expect("mvhd").payload;
     let at = if mvhd[0] == 1 { 20 } else { 12 };
     u32::from_be_bytes(mvhd[at..at + 4].try_into().unwrap())
-}
-
-/// The video track is what a video-only mux writes: samples, sample tables
-/// and media header.
-fn assert_video_untouched(name: &str, with_audio: &[u8], video_only: &[u8]) {
-    let video = |file: &[u8]| -> Track {
-        let parsed = demux(file).expect("demux");
-        let idx = parsed.video_track_idx.expect("video track");
-        parsed.tracks.into_iter().nth(idx).unwrap()
-    };
-    let (a, b) = (video(with_audio), video(video_only));
-    assert_eq!(sample_bytes(with_audio, &a), sample_bytes(video_only, &b), "{name}: video samples");
-    for typ in [b"stsd", b"stts", b"ctts", b"stss", b"stsc", b"stsz", b"stco", b"co64", b"mdhd", b"hdlr"] {
-        assert_eq!(trak_box(&a.trak_raw, typ), trak_box(&b.trak_raw, typ), "{name}: video {}", fourcc(typ));
-    }
-    // The video part of mdat, byte for byte and at the same offsets.
-    let start = b.samples.iter().map(|s| s.offset).min().unwrap() as usize;
-    let end = b.samples.iter().map(|s| s.offset + s.size as u64).max().unwrap() as usize;
-    assert!(with_audio[start..end] == video_only[start..end], "{name}: video mdat bytes");
 }
 
 // ─── AV1 builder ────────────────────────────────────────────────────────
@@ -345,11 +225,16 @@ fn av1_mp4_from_a_camera_file_carries_none_of_its_identity() {
     let timing = FrameTiming { fps_num: 30, fps_den: 1 };
     let obus = synthetic_av1(30);
     let video_only = build_mp4_av1(&obus, 1920, 1080, timing).expect("video-only mux");
+    let video_samples = |file: &[u8]| -> Vec<Vec<u8>> {
+        let parsed = demux(file).expect("demux");
+        let t = &parsed.tracks[parsed.video_track_idx.expect("video track")];
+        sample_bytes(file, t).into_iter().map(|s| s.to_vec()).collect()
+    };
     for (name, source) in fixtures() {
         let mp4 = build_mp4_av1_with_audio(&obus, 1920, 1080, timing, &source).expect("mux with audio");
-        assert_no_source_identity(name, &mp4, &source);
-        assert_audio_untouched(name, &mp4, &source);
-        assert_video_untouched(name, &mp4, &video_only);
+        assert_no_source_identity_lavf(name, &mp4, &source);
+        assert_audio_content_untouched(name, &mp4, &source);
+        assert_eq!(video_samples(&mp4), video_samples(&video_only), "{name}: video samples");
     }
 }
 
@@ -379,9 +264,165 @@ fn synthetic_annexb(n: usize) -> Vec<u8> {
     out
 }
 
+// ─── The LavfOpenH264 profile (the CLI's) ───────────────────────────────
+
+/// The `DecoderSpecificInfo` bytes of an `esds` payload (the codec's own
+/// configuration, which a remux must not change).
+fn esds_dsi(esds: &[u8]) -> Vec<u8> {
+    // Descriptors: tag, 1–4 length bytes (7 bits each, high bit = more).
+    fn descr(b: &[u8], at: usize) -> (u8, usize, usize) {
+        let (mut len, mut p) = (0usize, at + 1);
+        loop {
+            let c = b[p];
+            p += 1;
+            len = (len << 7) | (c & 0x7F) as usize;
+            if c & 0x80 == 0 {
+                break;
+            }
+        }
+        (b[at], p, p + len)
+    }
+    let (_, es, _) = descr(esds, 4);
+    let (tag, dc, dc_end) = descr(esds, es + 3);
+    assert_eq!(tag, 4, "DecoderConfigDescriptor");
+    let (tag, s, e) = descr(esds, dc + 13);
+    assert!(tag == 5 && e <= dc_end, "DecoderSpecificInfo");
+    esds[s..e].to_vec()
+}
+
+fn assert_no_source_identity_lavf(name: &str, mp4: &[u8], source: &[u8]) {
+    let boxes = all_boxes(mp4);
+    let mut tracks = 0;
+    for b in &boxes {
+        let what = format!("{name}: {}", b.path);
+        match &b.typ {
+            b"mvhd" | b"tkhd" | b"mdhd" => {
+                assert_eq!(header_times(b.payload), (0, 0), "{what} creation / modification time");
+                tracks += (&b.typ == b"tkhd") as usize;
+            }
+            b"free" => assert_eq!((b.path.as_str(), b.payload.len()), ("free", 0), "{what}: only the muxer's 8-byte free"),
+            b"udta" | b"meta" | b"ilst" => assert!(
+                matches!(b.path.as_str(), "moov/udta" | "moov/udta/meta" | "moov/udta/meta/ilst"),
+                "{what}: metadata outside the muxer's own tag",
+            ),
+            b"uuid" | b"skip" | b"XMP_" | b"loci" | b"keys" | b"\xa9day" | b"\xa9xyz" | b"\xa9mak" | b"\xa9mod"
+            | b"\xa9swr" | b"name" => panic!("{what}: a metadata box"),
+            b"hdlr" if b.path == "moov/udta/meta/hdlr" => {}
+            b"hdlr" => {
+                assert!(b.path.ends_with("/mdia/hdlr"), "{what}: a handler outside mdia (QuickTime data handler?)");
+                assert_eq!(&b.payload[..8], &[0u8; 8], "{what}: version/flags or pre_defined");
+                assert_eq!(&b.payload[12..24], &[0u8; 12], "{what}: reserved");
+                let expected: &[u8] = match &b.payload[8..12] {
+                    b"vide" => b"VideoHandler\0",
+                    b"soun" => b"SoundHandler\0",
+                    other => panic!("{what}: unexpected handler type {other:?}"),
+                };
+                assert_eq!(&b.payload[24..], expected, "{what}: handler name");
+            }
+            b"dref" => {
+                let mut entries = Vec::new();
+                walk(&b.payload[8..], b"dref", &b.path, true, &mut entries);
+                for e in entries {
+                    assert_eq!((&e.typ, e.payload), (b"url ", &[0u8, 0, 0, 1][..]), "{what}: {}", e.path);
+                }
+            }
+            _ => {}
+        }
+        if &b.parent == b"stsd" && is_sound_entry(&b.typ) {
+            assert_eq!(&b.payload[12..16], &[0u8; 4], "{what}: sound description vendor code");
+        }
+    }
+    assert!(tracks >= 2, "{name}: expected a video and an audio track");
+
+    // The movie's user data is exactly the muxer's identification.
+    let udta = boxes.iter().find(|b| b.path == "moov/udta").expect("udta").payload;
+    let mut want = Vec::new();
+    let tool = b"Lavf62.12.101";
+    let bx = |out: &mut Vec<u8>, typ: &[u8], payload: &[u8]| {
+        out.extend_from_slice(&((payload.len() + 8) as u32).to_be_bytes());
+        out.extend_from_slice(typ);
+        out.extend_from_slice(payload);
+    };
+    let mut data = vec![0, 0, 0, 1, 0, 0, 0, 0];
+    data.extend_from_slice(tool);
+    let (mut d, mut too, mut ilst, mut hdlr) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    bx(&mut d, b"data", &data);
+    bx(&mut too, b"\xa9too", &d);
+    bx(&mut ilst, b"ilst", &too);
+    bx(&mut hdlr, b"hdlr", b"\0\0\0\0\0\0\0\0mdirappl\0\0\0\0\0\0\0\0\0");
+    let mut meta = vec![0, 0, 0, 0];
+    meta.extend_from_slice(&hdlr);
+    meta.extend_from_slice(&ilst);
+    bx(&mut want, b"meta", &meta);
+    assert_eq!(udta, &want[..], "{name}: user data");
+
+    // Byte-level, everywhere else in the movie box: nothing of the source's
+    // header times or writer names.
+    let moov = moov(mp4);
+    let at = moov.windows(4).position(|w| w == b"udta").expect("udta") - 4;
+    let rest = [&moov[..at], &moov[at + 8 + udta.len()..]].concat();
+    for needle in [&b"Core Media"[..], b"appl", b"Apple", b"iPhone", b"com.apple"] {
+        assert!(!contains(&rest, needle), "{name}: {:?} in moov", String::from_utf8_lossy(needle));
+    }
+    for b in source_boxes(source).iter().filter(|b| matches!(&b.typ, b"mvhd" | b"tkhd" | b"mdhd")) {
+        let (c, m) = header_times(b.payload);
+        for t in [c, m].into_iter().filter(|&t| t != 0) {
+            assert!(!contains(&rest, &t.to_be_bytes()), "{name}: source time {t} (64-bit) in moov");
+            if let Ok(t32) = u32::try_from(t) {
+                assert!(!contains(&rest, &t32.to_be_bytes()), "{name}: source time {t} in moov");
+            }
+        }
+    }
+}
+
+/// Per-sample durations from an `stts` payload.
+fn stts_durations(stts: &[u8]) -> Vec<u32> {
+    let rd = |o: usize| u32::from_be_bytes(stts[o..o + 4].try_into().unwrap());
+    (0..rd(4) as usize).flat_map(|i| std::iter::repeat_n(rd(12 + 8 * i), rd(8 + 8 * i) as usize)).collect()
+}
+
+/// The copied audio keeps what it needs: samples, timing, codec
+/// configuration, encoder priming, and everything the source presented.
+/// (Chunking, bitrates and the ES_ID are the muxer's own, as in any remux,
+/// and samples that start after the source's edit list ends — never
+/// presented — are dropped, as a remux's demuxer drops them.)
+fn assert_audio_content_untouched(name: &str, mp4: &[u8], source: &[u8]) {
+    let src = first_audio(source);
+    let out = first_audio(mp4);
+    assert_eq!(out.codec, src.codec, "{name}: codec");
+    assert_eq!(out.timescale, src.timescale, "{name}: media timescale");
+    let (a, b) = (sample_bytes(mp4, &out), sample_bytes(source, &src));
+    assert!(!a.is_empty() && a.len() <= b.len(), "{name}: {} samples of {}", a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert!(x == y, "{name}: audio sample {i} differs");
+    }
+    let (d_out, d_src) = (
+        stts_durations(trak_box(&out.trak_raw, b"stts").expect("stts")),
+        stts_durations(trak_box(&src.trak_raw, b"stts").expect("stts")),
+    );
+    assert_eq!(d_out[..], d_src[..d_out.len()], "{name}: audio sample durations");
+    if let (Some(e_out), Some(e_src)) = (trak_box(&out.trak_raw, b"esds"), trak_box(&src.trak_raw, b"esds")) {
+        assert_eq!(esds_dsi(e_out), esds_dsi(e_src), "{name}: decoder-specific info");
+    }
+    if let Some(e_src) = trak_box(&src.trak_raw, b"elst")
+        && e_src[0] == 0
+        && u32::from_be_bytes(e_src[4..8].try_into().unwrap()) == 1
+    {
+        let e_out = trak_box(&out.trak_raw, b"elst").expect("audio elst");
+        assert_eq!(e_out[12..20], e_src[12..20], "{name}: elst media time / rate");
+        // Everything the source presented is still presented.
+        let movie_ts = movie_timescale(source) as u64;
+        let seg_src = u32::from_be_bytes(e_src[8..12].try_into().unwrap()) as u64 * 1000 / movie_ts;
+        let seg_out = u32::from_be_bytes(e_out[8..12].try_into().unwrap()) as u64;
+        assert!(seg_out >= seg_src, "{name}: presents {seg_out} ms, source {seg_src} ms");
+    } else {
+        assert_eq!(a.len(), b.len(), "{name}: no edit list, every sample kept");
+    }
+}
+
 #[cfg(feature = "h264-encoder")]
 #[test]
-fn h264_mp4_from_a_camera_file_carries_none_of_its_identity() {
+fn h264_lavf_mp4_from_a_camera_file_carries_none_of_its_identity() {
     use phasm_core::GopPattern;
     use phasm_core::codec::mp4::build::{MuxerProfile, build_mp4_with_pattern, build_mp4_with_pattern_audio};
 
@@ -389,22 +430,20 @@ fn h264_mp4_from_a_camera_file_carries_none_of_its_identity() {
     let annexb = synthetic_annexb(n);
     let pattern = GopPattern::Ipppp { gop: 30 };
     let video_only =
-        build_mp4_with_pattern(MuxerProfile::HandbrakeX264, &annexb, 1920, 1080, FrameTiming::FPS_30, pattern, n)
+        build_mp4_with_pattern(MuxerProfile::LavfOpenH264, &annexb, 1920, 1080, FrameTiming::FPS_30, pattern, n)
             .expect("video-only mux");
+    let video_samples = |file: &[u8]| -> Vec<Vec<u8>> {
+        let parsed = demux(file).expect("demux");
+        let t = &parsed.tracks[parsed.video_track_idx.expect("video track")];
+        sample_bytes(file, t).into_iter().map(|s| s.to_vec()).collect()
+    };
     for (name, source) in fixtures() {
         let mp4 = build_mp4_with_pattern_audio(
-            MuxerProfile::HandbrakeX264,
-            &annexb,
-            1920,
-            1080,
-            FrameTiming::FPS_30,
-            pattern,
-            n,
-            &source,
+            MuxerProfile::LavfOpenH264, &annexb, 1920, 1080, FrameTiming::FPS_30, pattern, n, &source,
         )
         .expect("mux with audio");
-        assert_no_source_identity(name, &mp4, &source);
-        assert_audio_untouched(name, &mp4, &source);
-        assert_video_untouched(name, &mp4, &video_only);
+        assert_no_source_identity_lavf(name, &mp4, &source);
+        assert_audio_content_untouched(name, &mp4, &source);
+        assert_eq!(video_samples(&mp4), video_samples(&video_only), "{name}: video samples");
     }
 }

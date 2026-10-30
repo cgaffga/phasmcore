@@ -33,6 +33,7 @@ use crate::codec::h264::stego::{
     Axis, BinKind, DomainCover, MvdSlot, ResidualPathKind,
 };
 use crate::codec::h264::stego::hook::MvdPositionMeta;
+use crate::codec::h264::stego::damage::MbSyntax;
 
 /// Decode-side recorder. Mirrors the encode-side cover capture
 /// (the shared `stego::inject` enumerate/extract primitives) but
@@ -111,6 +112,14 @@ impl PositionRecorder {
     /// `take_cover().mvd_sign_bypass.positions`.
     pub fn take_mvd_meta(&mut self) -> Vec<MvdPositionMeta> {
         std::mem::take(&mut self.mvd_meta)
+    }
+
+    /// Record one walked macroblock's syntax (called once per MB, in walk
+    /// order, by the slice walker) into the cover's
+    /// [`crate::codec::h264::stego::damage::MbSyntaxMap`] — the input of the
+    /// v2 damage model.
+    pub fn on_mb(&mut self, mb: MbSyntax) {
+        self.cover.mb_syntax.mbs.push(mb);
     }
 
     /// Record a residual block's bypass-bin positions + bits across

@@ -59,6 +59,7 @@ fn stego_clip() -> Vec<u8> {
         quantizer: 60,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let yuv = synthetic_clip(w, h, n);
     let primary = payload::encode_payload(PRIMARY_TEXT, &[]).unwrap();

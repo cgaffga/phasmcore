@@ -3,7 +3,7 @@
 Thank you for your interest. **phasm** is a steganography engine
 for hiding encrypted messages in media. Today it ships
 production-grade JPEG image stego (Ghost / Armor / SI-UNIWARD /
-Shadow) and an in-development H.264 video stego pipeline; future
+Shadow) and an experimental H.264 video stego pipeline; future
 media types (audio, PDF, animated formats) are planned.
 
 This file lives alongside the public mirror at
@@ -68,11 +68,11 @@ coding.
 | 🟡 Yellow (discuss first) | New cost functions, new embedding domains, new image formats (PNG-direct, WebP, HEIC, AVIF), new shadow-message strategies. |
 | 🔴 Red | Changes to the AES-256-GCM-SIV / Argon2id / ChaCha20 primitives. New ciphers. Breaking JPEG byte-for-byte round-trip. Adding heavy crate dependencies. |
 
-### Video stego (in development, source-only)
+### Video stego (experimental; decode-only in this mirror)
 
 | Color | Examples |
 |---|---|
-| 🟢 Green | Bug fixes in the CABAC parser, encoder corrections with H.264-spec citation, small synthetic test vectors, determinism fixes. |
+| 🟢 Green | Bug fixes in the H.264 parser / CABAC walker with H.264-spec citation, small synthetic test vectors, determinism fixes. |
 | 🟡 Yellow | New `EmbedDomain`, mode-decision changes (re-runs steganalysis), B-frame partition variants, capacity-API work, file attachments in CABAC stego, default `gop_size` tuning. |
 | 🔴 Red | Direct ports from `x264` / `libx264` / `OpenH264` / `ffmpeg` source — see clean-room policy below. Adding `h264-encoder` to default features (Via LA AVC patent obligations). Reviving HEVC (archived behind `hevc-archive` for a reason). Bundling large fixture videos. |
 
@@ -108,9 +108,11 @@ your contribution targets:
    `HashMap` iteration in code paths that affect output bytes
    (the default hasher is randomized; iteration order varies
    per process).
-2. **Pure-Rust core.** No new C/C++ FFI in `core/`. Platform
-   bridges (`ios-bridge/`, `android-bridge/`, `wasm-bridge/`) are
-   the only place FFI lives.
+2. **Pure-Rust core.** No new C/C++ FFI in `core/`. The only C
+   code in `core/` is the vendored video codec forks behind their
+   `-sys` crates (`openh264-sys/`, `dav1d-sys/`); otherwise the
+   platform bridges (`ios-bridge/`, `android-bridge/`,
+   `wasm-bridge/`) are the only place FFI lives.
 3. **All encryption is AES-256-GCM-SIV + Argon2id key derivation
    + ChaCha20 PRNG.** Don't propose alternatives. Per-call
    non-determinism (random salt + nonce per encrypt) is
@@ -128,7 +130,7 @@ your contribution targets:
    fine. Real-world fixtures (camera footage, full-resolution
    images) stay gitignored — place sources in
    `test-vectors/<format>/real-world/source/` and let `regen.sh`
-   produce derived files to `/tmp` on demand. PRs adding large
+   produce derived files to `$PHASM_TMP` (default `/tmp`) on demand. PRs adding large
    binary blobs will be reverted.
 6. **No conditional spaghetti per format / variant.** Design ONE
    universal code path. Branching internally on "is this Baseline
@@ -137,24 +139,29 @@ your contribution targets:
 
 ## Development setup
 
-Toolchain: stable Rust (any recent version).
+Toolchain: Rust 1.93.1, pinned in `rust-toolchain.toml` (rustup
+picks it up automatically).
 
 Feature matrix:
 
 | Command | What it builds |
 |---|---|
 | `cargo build` | default features — image stego only, no video, no encoder |
-| `cargo build --features video` | adds image stego + video decode-only |
-| `cargo build --features video,h264-encoder` | full H.264 stack (source-only build; never enabled in cargo-dist GitHub-release binaries) |
-| `cargo build --features cabac-stego` | production CABAC v2 path (implies the above) |
+| `cargo build --features parallel` | image stego with Rayon parallelism (what the CLI uses) |
+| `cargo build --features h264-decoder` | adds H.264 video stego decode (pure Rust, no C) |
 | `cargo build --features wasm` | WASM target (use the `wasm-bridge/` crate for the actual bundling) |
 
-Test suite: `cargo test --features cabac-stego` runs the lib tests
-(~1100+) plus the cabac-stego integration tests.
+The H.264 encoder (`h264-encoder`) and the AV1 features are not
+declared in this mirror (see the README's "Video steganography"
+section).
 
-`ffmpeg` is required for some integration tests and for the CLI's
-CABAC path. `brew install ffmpeg` on macOS, package manager on
-Linux.
+Test suite: `cargo test -p phasm-core` (add `--features parallel`
+for the Rayon paths, `--features h264-decoder` for the video
+decode tests).
+
+`ffmpeg` is required for some video integration tests and for the
+CLI's video commands. `brew install ffmpeg` on macOS, package
+manager on Linux.
 
 ## Coding conventions
 
@@ -184,7 +191,7 @@ Linux.
 ## Commit + PR conventions
 
 - Subject: imperative mood, ≤72 chars. Subsystem prefix when
-  helpful: `jpeg: ...`, `h264 cabac: ...`, `stego/armor: ...`,
+  helpful: `jpeg: ...`, `h264: ...`, `stego/armor: ...`,
   `det_math: ...`, `cli: ...`. See `git log --oneline` for the
   in-tree style.
 - Body: explain the *why*, not the *what*. Reviewers can read

@@ -4,7 +4,8 @@
 // build.rs for core-dav1d-sys.
 //
 // W2.3 (2026-05-21) — real meson + ninja static build of the
-// phasm-dav1d submodule at ../../vendor/phasm-dav1d. Emits Cargo
+// phasm-dav1d submodule at vendor/phasm-dav1d (../vendor in the
+// phasmcore mirror, ../../vendor in the monorepo). Emits Cargo
 // link directives so downstream Rust code can call into libdav1d
 // via extern "C". Falls back to a fail-fast stub build when the
 // submodule is absent (e.g., source archive distributions).
@@ -36,18 +37,22 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
-    // Locate submodule at <project root>/vendor/phasm-dav1d (two
-    // levels up from core/dav1d-sys/).
-    let submodule_path_raw = manifest_dir
-        .join("..")
-        .join("..")
-        .join("vendor")
-        .join("phasm-dav1d");
-
-    let submodule_path = match submodule_path_raw.canonicalize() {
-        Ok(p) if p.join("meson.build").exists() => p,
-        _ => {
-            build_stub(&manifest_dir, &submodule_path_raw);
+    // Locate the vendor/phasm-dav1d submodule. Two layouts carry it:
+    //   - phasmcore mirror: <root>/dav1d-sys + <root>/vendor/… (one level up)
+    //   - monorepo:         <root>/core/dav1d-sys + <root>/vendor/… (two up)
+    // The first candidate holding a meson.build wins.
+    let candidates = [
+        manifest_dir.join("..").join("vendor").join("phasm-dav1d"),
+        manifest_dir.join("..").join("..").join("vendor").join("phasm-dav1d"),
+    ];
+    let found = candidates.iter().find_map(|c| match c.canonicalize() {
+        Ok(p) if p.join("meson.build").exists() => Some(p),
+        _ => None,
+    });
+    let submodule_path = match found {
+        Some(p) => p,
+        None => {
+            build_stub(&manifest_dir, &candidates);
             return;
         }
     };
@@ -140,9 +145,13 @@ fn main() {
             "acadfd78b7e066749696cb4f7012e049bc3450c2",
         ];
 
-        // phasm-rav1e PINNED_SHAS (parallel pin list — documentation
-        // only). Most recent: 6254b700 (W3.10.4-fix replay() resets
-        // dest tag — root-cause for AC + GOLOMB tag attribution gap).
+        // phasm-rav1e is not pinned by a list here. It is a `[patch]` of
+        // the crates.io package `rav1e`: the monorepo patches it to the
+        // vendor/phasm-rav1e submodule (repo-root .cargo/config.toml),
+        // phasmcore builds to github.com/cgaffga/phasm-rav1e at the rev in
+        // scripts/video-cargo.sh, and sync-phasmcore.sh keeps that rev equal
+        // to the submodule gitlink. Current pin: abe19cd8 (the
+        // origin/phasm-stego tip as of 2026-10-29).
         let head_output = Command::new("git")
             .arg("-C")
             .arg(&submodule_path)
@@ -573,11 +582,12 @@ fn ndk_host_tag() -> String {
 /// Mirrors openh264-sys's build_stub. Compiles the no-op
 /// phasm_dav1d_stub.c so cargo link succeeds; downstream FFI calls
 /// (none yet in W2.3) return error codes at runtime.
-fn build_stub(manifest_dir: &std::path::Path, expected_submodule_path: &std::path::Path) {
-    println!(
-        "cargo:warning=phasm-dav1d submodule not found at {}",
-        expected_submodule_path.display()
-    );
+fn build_stub(manifest_dir: &std::path::Path, searched: &[PathBuf]) {
+    println!("cargo:warning=phasm-dav1d submodule not found (searched:");
+    for p in searched {
+        println!("cargo:warning=    {}", p.display());
+    }
+    println!("cargo:warning=  )");
     println!("cargo:warning=  → building dav1d-sys with fail-fast stubs only.");
     println!("cargo:warning=  → FFI calls return error codes at runtime.");
     println!("cargo:warning=  → to enable the real backend, run:");
@@ -593,9 +603,8 @@ fn build_stub(manifest_dir: &std::path::Path, expected_submodule_path: &std::pat
 
     println!("cargo:rustc-check-cfg=cfg(phasm_dav1d_stub)");
     println!("cargo:rustc-cfg=phasm_dav1d_stub");
-    println!(
-        "cargo:rerun-if-changed={}",
-        expected_submodule_path.display()
-    );
+    for p in searched {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
     println!("cargo:rerun-if-changed={}", shim_dir.display());
 }

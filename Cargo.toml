@@ -1,9 +1,14 @@
 [workspace]
-members = ["cli"]
+members = ["cli", "openh264-sys", "dav1d-sys"]
+# On the phasmcore mirror (core/ is the repo root) the C codec forks are git
+# submodules under vendor/, inside this workspace's directory. Keep cargo
+# from ever treating anything under vendor/ as part of this workspace. No-op
+# in the monorepo, where vendor/ sits outside core/.
+exclude = ["vendor"]
 
 [package]
 name = "phasm-core"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
@@ -22,7 +27,8 @@ parallel = ["rayon"]
 # Android / x86_64 / WASM. Set `PHASM_H264_DISABLE_SIMD=1` env var to
 # force scalar even when this feature is compiled in (debug / A-B).
 simd = []
-# `video` enables the active H.264 Baseline CAVLC pipeline (production).
+# `video` enables MP4 demux/mux + H.264 bitstream parsing (the base of
+# `h264-decoder`; the CAVLC pipeline was retired in 2026-06).
 # Pulls in memmap2 for the path-based streaming API used by the iOS +
 # Android bridges to avoid loading entire videos into heap.
 video = ["memmap2"]
@@ -31,7 +37,53 @@ video = ["memmap2"]
 # decode-only WASM can decode phasm H.264 stego without linking OpenH264).
 # Implied by `h264-encoder`.
 h264-decoder = ["video"]
+# `h264-encoder` — H.264 stego ENCODE via the statically-linked
+# cgaffga/phasm-openh264 fork (vendor/phasm-openh264 submodule, pinned at
+# tag phasm-stego-v0.1.0). Builds OpenH264 via meson+ninja
+# (core-openh264-sys/build.rs) and reaches the stego wire through the C
+# ABI at codec/api/wels/wels_stego.h. Implies `h264-decoder` (encode and
+# decode share the walker-derived cover model) plus `parallel` + `simd`.
+#
+# The name `h264-encoder` previously denoted the pure-Rust encoder, which
+# — together with `cabac-stego` — was retired in the video-retirement
+# Phase 3 (2026-06); the name is now REUSED for the OpenH264 encoder, the
+# only H.264 encoder. The pre-Phase-5 feature name was `openh264-backend`.
+# See docs/design/video/_RETIREMENT-PLAN.md.
+#
+# Patent posture: H.264 / AVC Via LA pool. Self-build only — no pre-built
+# binaries of the fork are redistributed, and crates.io publishes ship
+# default features only (no `h264-encoder`). See
+# vendor/phasm-openh264/README.md "Patent licensing" for details.
+h264-encoder = ["h264-decoder", "parallel", "simd", "dep:core-openh264-sys"]
+# `av1-decoder` enables phasm-dav1d (forked AV1 decoder, BSD-2, at
+# vendor/phasm-dav1d submodule) via core-dav1d-sys — the AV1 analogue of
+# `h264-decoder`. See core/dav1d-sys/build.rs +
+# docs/design/video/av1/build-plumbing.md section 2. (Pre-Phase-5 feature
+# name: `av1-backend`.)
+#
+# Patent posture: AV1 royalty-free by AOMedia design. No Via LA
+# equivalent. Can ship enabled in crates.io publishes.
+av1-decoder = ["dep:core-dav1d-sys"]
+# `av1-encoder` enables the cgaffga/phasm-rav1e fork (pure-Rust AV1
+# encoder + phasm-stego hooks), patched in from GitHub at a pinned commit
+# (see the `phasm-rav1e` dependency below and BUILDING.md). The dep key
+# `phasm-rav1e` is the crate name in the code (`phasm_rav1e::…`); the
+# package is `rav1e`, which is what `[patch.crates-io]` replaces.
+#
+# Mirrors the `h264-encoder` feature shape, including implying the
+# decoder: the encode verifies and rebuilds through phasm-dav1d (the
+# whole-video encode, the capacity probe and the Pass-2 rebuild all need
+# it), so `av1-encoder` alone did not compile (2026-10-24). Phase A
+# workstream W3.
+#
+# Patent posture: AV1 royalty-free by AOMedia design. Like
+# `av1-decoder`, can ship enabled in crates.io publishes.
+av1-encoder = ["av1-decoder", "dep:phasm-rav1e", "parallel"]
 wasm = ["js-sys", "wasm-bindgen"]
+# Test hooks for byte-identity checks of a build against native (a settable
+# deterministic salt/nonce seed, for hosts without environment variables).
+# Never enabled in shipped builds.
+test-hooks = []
 # T3.1 — integer fixed-point 8×8 DCT/IDCT (LL&M, libjpeg-turbo
 # `jfdctint.c` / `jidctint.c` port) shipped 2026-05-21 with NEON
 # (aarch64) + AVX2 (x86_64) + WASM SIMD128 + scalar paths, all
@@ -60,6 +112,39 @@ zeroize = "1"
 memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
+core-openh264-sys = { path = "openh264-sys", optional = true }
+core-dav1d-sys = { path = "dav1d-sys", optional = true }
+# `phasm-rav1e` is the cgaffga/phasm-rav1e fork (rav1e + the phasm-stego
+# hooks), consumed from GitHub source only; it is never published to
+# crates.io. The line names the crates.io package `rav1e` so that every
+# build can resolve the manifest from the registry index alone: cargo
+# resolves optional dependencies too, and a git or submodule-path dependency
+# here would be cloned (or required on disk) even for image-only builds.
+# Nothing is downloaded or compiled unless `av1-encoder` is on.
+#
+# Builds with `av1-encoder` MUST patch the package to the fork:
+#   - phasmcore clone: `make build-video` & co. (scripts/video-cargo.sh adds
+#     `--config patch.crates-io.rav1e.{git,rev}` at the pinned fork commit);
+#   - git-dependency consumers: the `[patch.crates-io]` snippet in BUILDING.md;
+#   - monorepo: the repo-root .cargo/config.toml patches it to the
+#     vendor/phasm-rav1e submodule.
+# Upstream rav1e lacks the stego hooks, so an unpatched av1-encoder build
+# fails at the guard in src/codec/av1/mod.rs, which names the fix.
+#
+# `default-features = false` keeps rav1e's CLI dependencies (clap, y4m,
+# ivf, …) out of phasm-core, so the features it needs are named here.
+#
+# `asm`: rav1e's NEON (aarch64) and SSE/AVX2/AVX-512 (x86_64, nasm at
+# build time) kernels. 3.55x faster on a 1080p GOP; the cgPhone AV1
+# encode went 716 s -> 314 s. The output is byte-identical to the
+# pure-Rust kernels at every CPU level up to AVX2 / NEON
+# (tests/av1_cross_arch_determinism.rs; phasmcore av1-cross-arch run
+# 40117142903 on Linux x86_64 AVX2, Linux arm64, macOS arm64,
+# 2026-10-24), and at AVX512 / AVX512ICL under Intel SDE as Ice Lake (run
+# 40119030909).
+# `threading`: without it rav1e's tile-level parallelism runs sequentially.
+phasm-rav1e = { package = "rav1e", version = "=0.8.0", optional = true, default-features = false, features = ["asm", "threading"] }
+
 # Dev-only deps. Used by the M1 memory-audit harness
 # (core/tests/perf_memory_audit.rs) to synthesize JPEG fixtures at
 # arbitrary MP without bundling huge binary blobs in test-vectors/.
@@ -70,6 +155,73 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # the cleanest cross-Unix way; non-Unix targets fall through with
 # RSS=0 (the test still gates wall time on those).
 libc = "0.2"
+
+# `h264_cabac_decoder` is a standalone spec-direct CABAC decoder
+# (debugging aid) that imports the H.264 walker/parser modules at
+# module scope, so it only builds when the decode feature is present.
+# Without this gate it fails `cargo test` / `cargo build` in the
+# default (no-video) configuration. The two `openh264_*` examples are
+# self-gated via `#[cfg]/#[cfg(not)]` mains and need no entry here.
+[[example]]
+name = "h264_cabac_decoder"
+required-features = ["h264-decoder"]
+
+# `av1_calibrate` is the G.2 Phase 2 calibration measurement binary.
+# Same gating idiom — the file is `#![cfg(all(feature = "av1-encoder",
+# feature = "av1-decoder"))]` at module scope and Cargo would otherwise
+# fail with `main not found` on default-feature builds.
+[[bin]]
+name = "av1_calibrate"
+required-features = ["av1-encoder", "av1-decoder"]
+
+# `av1_stealth_sweep` — G.2 Phase 2 Tier 2 AUC-vs-utilization measurement
+# binary. Parameterizes the W6 self-steganalyzer's measurement loop on
+# utilization rate. Same gating as av1_calibrate.
+[[bin]]
+name = "av1_stealth_sweep"
+required-features = ["av1-encoder", "av1-decoder"]
+
+# `h264_calibrate` — #844 codec-parity Tier 1 calibration binary for the
+# H.264 path. Runs `StreamingProbeSession` at the production GOP size and
+# emits per-GOP cap-byte stats as JSON. Same module-scope `#![cfg(all(...))]`
+# gating idiom as the AV1 binaries.
+[[bin]]
+name = "h264_calibrate"
+required-features = ["h264-encoder", "h264-decoder"]
+
+# `h264_stealth_sweep` — #844 Tier 2 W6 AUC-vs-utilization measurement on the
+# H.264 CoeffSign domain. Same gating idiom as h264_calibrate.
+[[bin]]
+name = "h264_stealth_sweep"
+required-features = ["h264-encoder", "h264-decoder"]
+
+# `h264_alloc_shape_sweep` — Tier 3 allocation-SHAPE AUC (spread vs
+# concentrate), the measurement `calibration.rs` still lists as
+# design-default. Multi-GOP + per-GOP W6 features + plan-parameterized, which
+# is what Tier 2 (single-GOP, no plan) structurally cannot measure.
+[[bin]]
+name = "h264_alloc_shape_sweep"
+required-features = ["h264-encoder", "h264-decoder"]
+
+# stealth-audit-2026-06-29: AV1 per-block histogram collector. Drives
+# dav1d (via core-dav1d-sys) with the new `block_hook` to walk every
+# decoded Av1Block and tally partition / mode / MV / ref distributions.
+# Output is TSV — feed both phasm and rav1e-CLI streams through and
+# compare via χ² / KS tests downstream. See
+# `docs/design/video/av1/stealth-audit-speed-preset-2026-06-29.md`.
+[[bin]]
+name = "av1_block_hist"
+required-features = ["av1-encoder", "av1-decoder"]
+
+# cargo-dist: phasm-core is a library; its [[bin]] targets are H.264 / AV1
+# calibration tools that need the encoder features. cargo-dist ignores
+# `required-features` and would try to package them ("failed to find bin
+# av1_block_hist" sank the v0.4.0 Release), so phasm-core is not a dist app.
+# The released binary comes from phasm-cli (cli/Cargo.toml).
+[package.metadata.dist]
+dist = false
+
+# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
@@ -97,6 +249,9 @@ lto = "thin"
 # published decode-only mirror compile (without it the staged tree hits
 # E0133). If we ever wrap them, drop this line.
 unsafe_op_in_unsafe_fn = "warn"
+# `examples/mem_probe.rs` builds in the ios-bridge allocator under
+# `--cfg phasm_large_alloc` (footprint measurements).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(phasm_large_alloc)'] }
 
 [lints.clippy]
 needless_range_loop = "allow"

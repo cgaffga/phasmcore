@@ -13,29 +13,64 @@
 //! costs, while coefficients in smooth regions get higher costs — changes
 //! in smooth regions are more detectable by steganalysis.
 //!
-//! Memory-optimized: uses f32 for pixel and wavelet buffers (pixels are 0-255,
-//! f32 has 23-bit mantissa = ~7 decimal digits, more than sufficient).
-//! Sequential subband computation drops intermediate buffers early, reducing
-//! peak memory from ~651 MB to ~187 MB for a 4032x3024 image (71% reduction).
+//! ## Cost definition (v2, phasm-core 0.5)
+//!
+//! The cost of a ±1 change to quantized coefficient `(fi, fj)` of block
+//! `(br, bc)` is
+//!
+//! ```text
+//! ρ = Σ_band Σ_(r,c) ∈ [0,23)²  |Δ_band(fi,fj)[r][c]| / (|W_band(8·bc + c − 8, 8·br + r − 8)| + σ)
+//! ```
+//!
+//! * `Δ` ([`AbsDeltaTable`]) is the exact wavelet-domain impact of the
+//!   change: window cell `(r, c)` holds the impact at block-relative
+//!   wavelet sample `(c − 8, r − 8)`, so the 23×23 window is exactly the
+//!   impact's support `[−8, 14]²`.
+//! * `W` is the cover's undecimated db8 decomposition of the
+//!   **half-sample-symmetric padded** pixel plane (`… b a | a b …`, as
+//!   reference J-UNIWARD pads). Samples outside the image are real samples
+//!   of that padded plane ([`PaddedSubbands`] holds an 8-sample margin on
+//!   every side), so a border block is priced over its whole window
+//!   exactly like an interior one.
+//!
+//! This is the semantics of Butora & Bas's corrected reference
+//! (`JUNIWARD_FIX_OFF_BY_ONE`, arXiv:2305.19776). The v1 kernel that
+//! shipped up to 0.4.x differed in two ways — it skipped out-of-image
+//! window samples (border blocks priced too cheaply, flips piled into the
+//! outer block ring) and it read the cover wavelets 8 px up and 8 px left
+//! of where the impact lands. It is kept, verbatim, in
+//! [`super::uniward_legacy_v1`] for decoding the shadows of older images;
+//! see `docs/design/image/juniward-cost.md`.
+//!
+//! The Ghost encoder uses [`compute_ac_costs_separable`] (the separable
+//! factorization of the impact, every Y AC coefficient). The direct-kernel
+//! paths — [`compute_ac_costs_streaming`] (strip-streamed) and
+//! [`compute_uniward`] (whole-image `CostMap`) — compute every wavelet
+//! sample and every cost with the same arithmetic in the same order, so they
+//! agree bit for bit, and the separable pass agrees with them to f32
+//! rounding (in practice bit for bit, pinned by tests); the NEON / SSE2 / SIMD128
+//! kernels match the scalar sum order bit for bit (pinned by
+//! `tests/cost_kernel_cross_platform.rs`).
+//!
+//! Memory-optimized: f32 pixel and wavelet buffers (pixels are 0-255,
+//! f32 has a 24-bit significand), f64 accumulation.
 //!
 //! Reference:
 //!   Holub, Fridrich, Denemark. "Universal Distortion Function for
 //!   Steganography in an Arbitrary Domain." EURASIP J. on Information
 //!   Security, 2014.
-//!
-//! This implementation follows the corrected version (fixing the off-by-one
-//! error described in arXiv:2305.19776).
+//!   Butora, Bas. "Errorless Robust JPEG Steganography using Outputs of
+//!   JPEG Coders" / the J-UNIWARD off-by-one note, arXiv:2305.19776.
 
 use crate::codec::jpeg::dct::{DctGrid, QuantTable};
 // T3.1.F — ghost UNIWARD bulk pixel-domain decompression routes
 // through the integer LL&M IDCT.
 //
-// `precompute_basis_functions` (line ~367) is the exception: it calls
+// `precompute_basis_functions` is the exception: it calls
 // `crate::codec::jpeg::pixels::idct_block` EXPLICITLY (the f64
 // reference) because basis impulses require sub-LSB precision that
 // integer LL&M descales to zero. Called once per encode → no perf
-// impact. The f64 `idct_block` is preserved in `pixels.rs` SOLELY
-// for this caller (and `dct_block_unquantized` for SI-UNIWARD).
+// impact.
 use crate::codec::jpeg::pixels_aan::aan_idct_block as idct_block;
 use crate::stego::error::StegoError;
 use crate::stego::progress;
@@ -43,6 +78,10 @@ use super::CostMap;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+
+pub use super::uniward_legacy_v1::compute_positions_streaming_legacy_v1;
+#[doc(hidden)]
+pub use super::uniward_legacy_v1::cost_kernel_test_hash_hex_legacy_v1;
 
 /// Number of progress steps reported by UNIWARD cost computation.
 ///
@@ -58,12 +97,12 @@ pub const UNIWARD_PROGRESS_STEPS: u32 = 100;
 /// Stabilization constant. Avoids division by zero in the cost formula
 /// and controls sensitivity to image content. The original paper and
 /// reference implementation use sigma = 2^{-6}.
-const SIGMA: f64 = 0.015625; // 2^{-6}
+pub(super) const SIGMA: f64 = 0.015625; // 2^{-6}
 
 /// Daubechies 8 (db8) high-pass decomposition filter coefficients.
 /// These are the wavelet function coefficients (16 taps).
 /// Source: standard db8 wavelet tables, confirmed against conseal/PyWavelets.
-const HPDF: [f64; 16] = [
+pub(super) const HPDF: [f64; 16] = [
     -0.0544158422,
      0.3128715909,
     -0.6756307363,
@@ -86,7 +125,7 @@ const HPDF: [f64; 16] = [
 /// Derived from the high-pass filter via the QMF relation:
 ///   lpdf[n] = (-1)^n * hpdf[N-1-n]
 /// where N = 16.
-fn lpdf() -> [f64; 16] {
+pub(super) fn lpdf() -> [f64; 16] {
     let mut lp = [0.0f64; 16];
     for n in 0..16 {
         let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
@@ -96,17 +135,44 @@ fn lpdf() -> [f64; 16] {
 }
 
 /// Length of the 1D wavelet filter.
-const FILT_LEN: usize = 16;
+pub(super) const FILT_LEN: usize = 16;
+
+/// Filter phase: output sample `x` reads input samples `x − 7 ..= x + 8`
+/// (`out[x] = Σ_k f[k] · in[x + k − 7]`).
+const FILT_HALF: isize = 7;
 
 /// Size of the wavelet-domain impact window when a single DCT coefficient
 /// changes: 8 (block size) + 16 (filter length) - 1 = 23.
-const IMPACT_SIZE: usize = 8 + FILT_LEN - 1;
+pub(super) const IMPACT_SIZE: usize = 8 + FILT_LEN - 1;
+
+/// Window origin: cell `(r, c)` of block `(br, bc)`'s cost window is the
+/// wavelet sample at plane `(8·bc + c − 8, 8·br + r − 8)`. A pixel change
+/// in columns `[0, 8)` of a block reaches outputs `[0 − 8, 7 + 7]` =
+/// block-relative `[−8, 14]` (see [`FILT_HALF`]).
+const WINDOW_ORIGIN: usize = 8;
+
+/// Wavelet samples [`PaddedSubbands`] keeps outside the image on every
+/// side. The cost window reaches 8 samples above / left of the first block
+/// and 6 below / right of the last one.
+const WAV_MARGIN: usize = 8;
+
+/// Pixel samples of padding the decomposition reads outside the image on
+/// every side: the row/column filters reach 7 samples before and 8 after
+/// the outermost wavelet sample, `WAV_MARGIN + 8 = 16`.
+const PIX_MARGIN: usize = 16;
+
+/// First pixel column (in padded-buffer coordinates) read by the row
+/// filter for padded wavelet column 0: plane `x = −WAV_MARGIN` reads plane
+/// `x − 7`, i.e. padded column `PIX_MARGIN − WAV_MARGIN − 7`.
+const ROW_TAP0: usize = PIX_MARGIN - WAV_MARGIN - FILT_HALF as usize;
+
+const _: () = assert!(WINDOW_ORIGIN == WAV_MARGIN);
 
 /// Wrapper to send a raw pointer across Rayon threads.
 /// Safe because each block writes to a disjoint region of the CostMap.
-struct CostMapPtr {
-    ptr: *mut f32,
-    total_len: usize,
+pub(super) struct CostMapPtr {
+    pub(super) ptr: *mut f32,
+    pub(super) total_len: usize,
 }
 unsafe impl Send for CostMapPtr {}
 unsafe impl Sync for CostMapPtr {}
@@ -116,84 +182,61 @@ impl CostMapPtr {
     ///
     /// # Safety
     /// Caller must ensure no aliasing writes to the same index.
-    unsafe fn write(&self, idx: usize, val: f32) {
+    pub(super) unsafe fn write(&self, idx: usize, val: f32) {
         debug_assert!(idx < self.total_len, "CostMapPtr write out of bounds: {idx} >= {}", self.total_len);
         unsafe { *self.ptr.add(idx) = val; }
     }
 }
 
+/// Half-sample symmetric reflection of `i` into `[0, len)`:
+/// `… 2 1 0 | 0 1 2 … len−1 | len−1 len−2 …` (numpy / MATLAB
+/// `'symmetric'`). Repeats until in range, so it is total for any `len ≥ 1`.
+#[inline]
+pub(super) fn symmetric_index(i: isize, len: usize) -> usize {
+    let n = len as isize;
+    debug_assert!(n > 0);
+    let mut v = i;
+    while v < 0 || v >= n {
+        if v < 0 {
+            v = -v - 1;
+        }
+        if v >= n {
+            v = 2 * n - v - 1;
+        }
+    }
+    v as usize
+}
+
 /// Compute J-UNIWARD embedding costs for a single component's DCT grid.
 ///
 /// For each embeddable coefficient position, the cost measures how much
-/// a +1 change to that coefficient would alter the wavelet decomposition
+/// a ±1 change to that coefficient would alter the wavelet decomposition
 /// of the decompressed image, weighted inversely by the cover's wavelet
-/// magnitudes plus a stabilization constant sigma.
+/// magnitudes plus a stabilization constant sigma (see the module docs).
 ///
 /// DC coefficients and zero-valued AC coefficients receive `WET_COST`.
 pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
     let bw = grid.blocks_wide();
     let bt = grid.blocks_tall();
     let mut map = CostMap::new(bw, bt);
-
-    // Image pixel dimensions (block-aligned).
-    let img_w = bw * 8;
-    let img_h = bt * 8;
-
-    // Step 1: Decompress the cover image to spatial domain (Y channel).
-    // Uses f32 — pixel values are 0-255, f32 has more than enough precision.
-    let cover_pixels = decompress_to_pixels(grid, qt, bw, bt);
-
-    // Step 2: Compute wavelet coefficients of the cover image for all
-    // three directional subbands. Uses symmetric padding.
-    // Sequential computation drops intermediate buffers early to reduce peak memory.
-    let lpdf = lpdf();
-    let cover_wavelets = compute_three_subbands(&cover_pixels, img_w, img_h, &lpdf);
-
-    // Free cover pixels — no longer needed after wavelet decomposition.
-    drop(cover_pixels);
-
-    // Step 3: Precompute the |delta| table (T3.3.A). 252 KB once,
-    // shared across all 190K blocks. ~14× kernel speedup vs the
-    // legacy basis-then-recompute path.
+    let wavelets = whole_image_subbands(grid, qt);
     let abs_delta = AbsDeltaTable::precompute(qt);
 
-    // Step 4: For each block and each coefficient, compute cost.
-    // Write costs directly into the CostMap (no intermediate collection).
-    let pad = FILT_LEN - 1; // = 15
     let n_blocks = bt * bw;
-
-    let total_len = n_blocks * 64;
-    let costs_ptr = CostMapPtr { ptr: map.costs_ptr(), total_len };
+    let costs_ptr = CostMapPtr { ptr: map.costs_ptr(), total_len: n_blocks * 64 };
 
     let compute_block = |bi: usize| {
         let br = bi / bw;
         let bc = bi % bw;
         let blk = grid.block(br, bc);
-
         for fi in 0..8 {
             for fj in 0..8 {
-                // DC coefficient — never modify.
-                if fi == 0 && fj == 0 {
+                // DC and zero AC coefficients — never modified.
+                if (fi == 0 && fj == 0) || blk[fi * 8 + fj] == 0 {
                     continue;
                 }
-
-                let coeff = blk[fi * 8 + fj];
-
-                // Zero AC coefficient — never modify.
-                if coeff == 0 {
-                    continue;
-                }
-
-                // T3.3.A — precomputed |delta| slices for this (fi, fj).
                 let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                let cost = compute_coefficient_cost_precomputed(
-                    abs_lh, abs_hl, abs_hh,
-                    &cover_wavelets,
-                    br, bc,
-                    img_w, img_h,
-                    pad,
-                );
-
+                let cost = cost_kernel(abs_lh, abs_hl, abs_hh, &wavelets, br, bc);
                 if cost > 0.0 && cost.is_finite() {
                     // Safety: each block writes to a disjoint 64-element region.
                     let idx = (br * bw + bc) * 64 + fi * 8 + fj;
@@ -203,39 +246,12 @@ pub fn compute_uniward(grid: &DctGrid, qt: &QuantTable) -> CostMap {
         }
     };
 
-    // Use parallel iteration when the `parallel` feature is enabled.
     #[cfg(feature = "parallel")]
     (0..n_blocks).into_par_iter().for_each(compute_block);
-
     #[cfg(not(feature = "parallel"))]
     (0..n_blocks).for_each(compute_block);
 
     map
-}
-
-/// Decompress the entire DctGrid to pixel values (f32).
-fn decompress_to_pixels(grid: &DctGrid, qt: &QuantTable, bw: usize, bt: usize) -> Vec<f32> {
-    let img_w = bw * 8;
-    let img_h = bt * 8;
-    let mut pixels = vec![0.0f32; img_w * img_h];
-
-    for br in 0..bt {
-        for bc in 0..bw {
-            let block = grid.block(br, bc);
-            let quantized: [i16; 64] = block.try_into().unwrap();
-            let block_pixels = idct_block(&quantized, &qt.values);
-
-            for row in 0..8 {
-                for col in 0..8 {
-                    let py = br * 8 + row;
-                    let px = bc * 8 + col;
-                    pixels[py * img_w + px] = block_pixels[row * 8 + col] as f32;
-                }
-            }
-        }
-    }
-
-    pixels
 }
 
 /// Precompute the 64 basis functions: for each frequency position (fi, fj),
@@ -244,7 +260,7 @@ fn decompress_to_pixels(grid: &DctGrid, qt: &QuantTable, bw: usize, bt: usize) -
 ///
 /// This gives the pixel change caused by adding +1 to quantized coefficient
 /// (fi, fj).
-fn precompute_basis_functions(qt: &QuantTable) -> [[[f64; 64]; 8]; 8] {
+pub(super) fn precompute_basis_functions(qt: &QuantTable) -> [[[f64; 64]; 8]; 8] {
     let mut basis = [[[0.0f64; 64]; 8]; 8];
 
     for fi in 0..8 {
@@ -279,312 +295,19 @@ fn precompute_basis_functions(qt: &QuantTable) -> [[[f64; 64]; 8]; 8] {
     basis
 }
 
-/// Wavelet subbands for three directions. Each subband has the same
-/// dimensions as the (padded) image — undecimated wavelet transform.
-/// Uses f32 to halve memory usage vs f64.
-struct ThreeSubbands {
-    /// LH subband (horizontal high-pass): detects vertical edges.
-    lh: Vec<f32>,
-    /// HL subband (vertical high-pass): detects horizontal edges.
-    hl: Vec<f32>,
-    /// HH subband (diagonal high-pass): detects diagonal edges.
-    hh: Vec<f32>,
-    /// Width of each subband (same as image width).
-    width: usize,
-    /// Absolute y-coordinate of the first row in the arrays.
-    /// 0 for full-image computation, >0 for strip-based computation.
-    y_offset: usize,
-}
-
-/// Compute three-directional wavelet subbands of the image using an
-/// undecimated (stationary) wavelet transform with db8 filters.
+/// T3.3.A — precomputed |delta| table for the cost kernel.
 ///
-/// The three subbands are:
-/// - LH: low-pass along rows, high-pass along columns (vertical detail)
-/// - HL: high-pass along rows, low-pass along columns (horizontal detail)
-/// - HH: high-pass along rows, high-pass along columns (diagonal detail)
-///
-/// Uses symmetric (mirror) boundary extension.
-///
-/// Memory-optimized: computes subbands sequentially, dropping intermediate
-/// buffers as soon as possible. Peak: 3 f32 buffers (was 6 f64 buffers).
-fn compute_three_subbands(
-    pixels: &[f32],
-    width: usize,
-    height: usize,
-    lpdf: &[f64; 16],
-) -> ThreeSubbands {
-    // Parallel: compute both row filters simultaneously, then 3 column filters.
-    // +1 buffer peak (~25MB for 12MP) traded for ~2× speedup on wavelet phase.
-    #[cfg(feature = "parallel")]
-    {
-        let (row_low, row_high) = rayon::join(
-            || filter_rows(pixels, width, height, lpdf),
-            || filter_rows(pixels, width, height, &HPDF),
-        );
-        let (lh, (hl, hh)) = rayon::join(
-            || filter_cols(&row_low, width, height, &HPDF),
-            || rayon::join(
-                || filter_cols(&row_high, width, height, lpdf),
-                || filter_cols(&row_high, width, height, &HPDF),
-            ),
-        );
-        ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
-    }
-    // Sequential: drop intermediates early to minimize peak memory (WASM path).
-    #[cfg(not(feature = "parallel"))]
-    {
-        let row_low = filter_rows(pixels, width, height, lpdf);
-        let lh = filter_cols(&row_low, width, height, &HPDF);
-        drop(row_low);
-        let row_high = filter_rows(pixels, width, height, &HPDF);
-        let hl = filter_cols(&row_high, width, height, lpdf);
-        let hh = filter_cols(&row_high, width, height, &HPDF);
-        ThreeSubbands { lh, hl, hh, width, y_offset: 0 }
-    }
-}
-
-/// Apply a 1D filter along each row of the image (horizontal filtering).
-/// Uses symmetric (mirror) boundary extension.
-/// Output has the same dimensions as input (undecimated).
-/// Accumulates in f64 for filter precision, stores result as f32.
-///
-/// T2.1a — loop-peeled into `[0, half)` left boundary, `[half, width-half)`
-/// interior (no mirror, contiguous load, branch-free → LLVM autovec
-/// emits f64x2/f64x4 SIMD), and `[width-half, width)` right boundary.
-/// T2.1b — outer loop parallelized over rows.
-///
-/// Determinism: f64 accumulator preserved, muladd order unchanged (per
-/// April 2026 SIMD audit — f32-throughout would change cost values by
-/// 1-2 ULP and risk flipping cost-pool boundaries across versions).
-fn filter_rows(
-    pixels: &[f32],
-    width: usize,
-    height: usize,
-    filter: &[f64; 16],
-) -> Vec<f32> {
-    let flen = FILT_LEN;
-    let half = (flen - 1) / 2; // = 7 for 16-tap filter (center at index 7)
-    let mut output = vec![0.0f32; width * height];
-
-    // Edge case: image narrower than filter — fall back to scalar with
-    // mirror everywhere.
-    if width < flen {
-        for y in 0..height {
-            for x in 0..width {
-                let mut sum = 0.0f64;
-                for k in 0..flen {
-                    let sx =
-                        mirror_index((x as isize) + (k as isize) - (half as isize), width);
-                    sum += pixels[y * width + sx] as f64 * filter[k];
-                }
-                output[y * width + x] = sum as f32;
-            }
-        }
-        return output;
-    }
-
-    // Asymmetric filter (even flen=16, half=7): left extent = half=7,
-    // right extent = flen - half - 1 = 8. Interior x where the full
-    // window [x-half, x-half+flen) stays in [0, width):
-    // x ∈ [half, width - right_extent).
-    let right_extent = flen - half - 1;
-    let interior_end = width - right_extent;
-
-    // Per-row processing helper — same body for parallel + serial paths.
-    let process_row = |y: usize, row_out: &mut [f32]| {
-        let row_in = &pixels[y * width..(y + 1) * width];
-
-        // T2.1c Path A — boundary slabs gather 16 mirrored samples
-            // into a stack-local [f32; 16] and call the same pairwise-
-            // tree dot product as the interior. Byte-identical output
-            // regardless of which slab x lives in.
-            let mut samples = [0.0f32; 16];
-
-            // Left boundary [0..half): mirror needed.
-            for x in 0..half {
-                for k in 0..flen {
-                    let sx =
-                        mirror_index((x as isize) + (k as isize) - (half as isize), width);
-                    samples[k] = row_in[sx];
-                }
-                row_out[x] = super::uniward_simd::dot_product_16_taps(&samples, filter) as f32;
-            }
-
-            // Interior [half..interior_end): no mirror — contiguous
-            // 16-tap window, dispatched to NEON on aarch64 / scalar
-            // elsewhere via the same pinned-pairwise tree.
-            for x in half..interior_end {
-                let base = x - half;
-                row_out[x] = super::uniward_simd::dot_product_16_taps(
-                    &row_in[base..base + flen],
-                    filter,
-                ) as f32;
-            }
-
-        // Right boundary [interior_end..width): mirror needed.
-        for x in interior_end..width {
-            for k in 0..flen {
-                let sx =
-                    mirror_index((x as isize) + (k as isize) - (half as isize), width);
-                samples[k] = row_in[sx];
-            }
-            row_out[x] = super::uniward_simd::dot_product_16_taps(&samples, filter) as f32;
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    output
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row_out)| process_row(y, row_out));
-
-    #[cfg(not(feature = "parallel"))]
-    output
-        .chunks_mut(width)
-        .enumerate()
-        .for_each(|(y, row_out)| process_row(y, row_out));
-
-    output
-}
-
-/// Apply a 1D filter along each column of the image (vertical filtering).
-/// Uses symmetric (mirror) boundary extension.
-/// Output has the same dimensions as input (undecimated).
-/// Accumulates in f64 for filter precision, stores result as f32.
-///
-/// T2.1a — loop-peeled per-row (interior rows skip mirror) AND
-/// inner loops rewritten as k-outer / x-inner: for each input row k,
-/// stream contiguously across all x, accumulating into a per-row f64
-/// scratch. Cache-friendly (sequential reads, sequential writes) and
-/// autovec-friendly (the inner x loop is `scratch[x] += row[x] * c` —
-/// classic SAXPY shape LLVM emits SIMD for).
-/// T2.1b — outer over output rows is rayon-parallel.
-///
-/// Determinism: per-(x,y) the same 16 muladds happen in the same
-/// k=0..15 order; only the iteration order across (x,y) changed.
-/// Byte-identical output preserved.
-fn filter_cols(
-    pixels: &[f32],
-    width: usize,
-    height: usize,
-    filter: &[f64; 16],
-) -> Vec<f32> {
-    let flen = FILT_LEN;
-    let half = (flen - 1) / 2; // = 7
-    let mut output = vec![0.0f32; width * height];
-
-    // Edge case: image shorter than filter — fall back to scalar.
-    if height < flen {
-        for y in 0..height {
-            for x in 0..width {
-                let mut sum = 0.0f64;
-                for k in 0..flen {
-                    let sy = mirror_index(
-                        (y as isize) + (k as isize) - (half as isize),
-                        height,
-                    );
-                    sum += pixels[sy * width + x] as f64 * filter[k];
-                }
-                output[y * width + x] = sum as f32;
-            }
-        }
-        return output;
-    }
-
-    // Asymmetric filter (even flen=16, half=7): interior y where full
-    // window stays in [0, height) is [half, height - right_extent).
-    let right_extent = flen - half - 1;
-
-    // Per-row processing helper — same body for parallel + serial paths.
-    let process_row = |scratch: &mut [f64], y: usize, row_out: &mut [f32]| {
-        // Reset scratch for this output row.
-        for s in scratch.iter_mut() {
-            *s = 0.0;
-        }
-
-        let is_interior = y >= half && y < height - right_extent;
-
-        if is_interior {
-            // No mirror: each of the 16 input rows is at y+k-half.
-            // Outer k, inner x — sequential reads + writes →
-            // T2.1c SIMD-accelerated SAXPY (NEON / AVX / WASM SIMD,
-            // scalar elsewhere). Byte-identical across all
-            // platforms by IEEE 754 + no-FMA + no-reduction-tree.
-            for k in 0..flen {
-                let sy = y + k - half;
-                let row_in = &pixels[sy * width..(sy + 1) * width];
-                super::uniward_simd::saxpy_inner(scratch, row_in, filter[k]);
-            }
-        } else {
-            // Boundary row: mirror index per k, but still k-outer.
-            for k in 0..flen {
-                let sy = mirror_index(
-                    (y as isize) + (k as isize) - (half as isize),
-                    height,
-                );
-                let row_in = &pixels[sy * width..(sy + 1) * width];
-                super::uniward_simd::saxpy_inner(scratch, row_in, filter[k]);
-            }
-        }
-
-        // Cast f64 scratch → f32 output. Sequential, autovec-friendly.
-        for x in 0..width {
-            row_out[x] = scratch[x] as f32;
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    output
-        .par_chunks_mut(width)
-        .enumerate()
-        .for_each_init(
-            || vec![0.0f64; width], // per-thread scratch
-            |scratch, (y, row_out)| process_row(scratch.as_mut_slice(), y, row_out),
-        );
-
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut scratch = vec![0.0f64; width];
-        output.chunks_mut(width).enumerate().for_each(|(y, row_out)| {
-            process_row(scratch.as_mut_slice(), y, row_out);
-        });
-    }
-
-    output
-}
-
-/// Mirror-reflect an index into [0, size-1].
-/// Handles negative indices and indices >= size by reflecting about boundaries.
-#[inline]
-fn mirror_index(idx: isize, size: usize) -> usize {
-    let s = size as isize;
-    if idx < 0 {
-        (-idx).min(s - 1) as usize
-    } else if idx >= s {
-        let reflected = 2 * s - 2 - idx;
-        reflected.max(0) as usize
-    } else {
-        idx as usize
-    }
-}
-
-/// T3.3.A — precomputed |delta| table for compute_coefficient_cost.
-///
-/// `delta_lh / delta_hl / delta_hh` at each (out_r, out_c) of the
-/// 23×23 impact region depend ONLY on (fi, fj) and qt — NOT on
-/// (br, bc) or cover content. Materialize them ONCE per encode and
-/// the per-block kernel collapses to ~1 600 ops (lookups + divides)
-/// vs ~23 000 ops in the current path. ~14× scalar speedup before
-/// SIMD.
+/// The wavelet-domain impact `|Δ_lh / Δ_hl / Δ_hh|` at each cell of the
+/// 23×23 window depends ONLY on (fi, fj) and qt — NOT on (br, bc) or cover
+/// content. Materialized once per encode, the per-block kernel is ~1 600
+/// lookups + divides.
 ///
 /// Memory: 63 × 23 × 23 × 3 × 8 B = ~252 KB per encode. Fits in L2
 /// on every target.
 ///
 /// Layout: subband-major then `(fi*8+fj)`-major then `(out_r, out_c)`-
 /// major. The per-block inner loop reads three contiguous 529-element
-/// slices for the current (fi, fj), which is SAXPY-shape and SIMD-
-/// friendly when Phases B–D land.
+/// slices for the current (fi, fj).
 pub struct AbsDeltaTable {
     abs_lh: Vec<f64>,
     abs_hl: Vec<f64>,
@@ -592,11 +315,26 @@ pub struct AbsDeltaTable {
 }
 
 impl AbsDeltaTable {
-    const CELLS: usize = IMPACT_SIZE * IMPACT_SIZE;
+    pub(super) const CELLS: usize = IMPACT_SIZE * IMPACT_SIZE;
 
-    /// Precompute the 63 × 23 × 23 × 3 |delta| table for the given
-    /// quantization table. ~1 ms wall-clock at 12 MP.
+    /// v2 table: cell `(r, c)` holds the impact at block-relative wavelet
+    /// sample `(c − 8, r − 8)` — the impact's exact 23×23 support. Output
+    /// sample `x` reads pixel `x + k − 7`, so cell `c` reads basis column
+    /// `c − 8 + k − 7 = c − 15 + k`.
     pub fn precompute(qt: &QuantTable) -> Self {
+        Self::precompute_with_source_offset(qt, (WINDOW_ORIGIN as isize) + FILT_HALF)
+    }
+
+    /// The 0.4.x (v1) table, for [`super::uniward_legacy_v1`] only: cell
+    /// `(r, c)` at block-relative `(c − 7, r − 7)`, which drops the
+    /// impact's first row and column (−8) and keeps an all-zero last one.
+    pub(super) fn precompute_legacy_v1(qt: &QuantTable) -> Self {
+        Self::precompute_with_source_offset(qt, 14)
+    }
+
+    /// Cell `c` reads basis column `c − src_off + k` for tap `k` (rows
+    /// likewise).
+    fn precompute_with_source_offset(qt: &QuantTable, src_off: isize) -> Self {
         let basis = precompute_basis_functions(qt);
         let lpdf = lpdf();
         let n_coefs = 64;
@@ -611,8 +349,7 @@ impl AbsDeltaTable {
                 }
                 let basis_block = &basis[fi][fj];
 
-                // Phase 1: row filter (same formula as legacy
-                // compute_coefficient_cost — bit-exact sum order).
+                // Phase 1: row filter.
                 let mut row_low = [[0.0f64; IMPACT_SIZE]; 8];
                 let mut row_high = [[0.0f64; IMPACT_SIZE]; 8];
                 for r in 0..8 {
@@ -620,7 +357,7 @@ impl AbsDeltaTable {
                         let mut sum_low = 0.0;
                         let mut sum_high = 0.0;
                         for k in 0..FILT_LEN {
-                            let src_col = out_c as isize - 14 + k as isize;
+                            let src_col = out_c as isize - src_off + k as isize;
                             if (0..8).contains(&src_col) {
                                 let val = basis_block[r * 8 + src_col as usize];
                                 sum_low += lpdf[k] * val;
@@ -641,7 +378,7 @@ impl AbsDeltaTable {
                         let mut delta_hl = 0.0;
                         let mut delta_hh = 0.0;
                         for k in 0..FILT_LEN {
-                            let src_row = out_r as isize - 14 + k as isize;
+                            let src_row = out_r as isize - src_off + k as isize;
                             if (0..8).contains(&src_row) {
                                 let r = src_row as usize;
                                 let low_val = row_low[r][out_c];
@@ -665,1428 +402,477 @@ impl AbsDeltaTable {
 
     /// Borrow the 23×23 slices for coefficient (fi, fj).
     #[inline]
-    fn slice_at(&self, fi: usize, fj: usize) -> (&[f64], &[f64], &[f64]) {
+    pub(super) fn slice_at(&self, fi: usize, fj: usize) -> (&[f64], &[f64], &[f64]) {
         let base = (fi * 8 + fj) * Self::CELLS;
         let end = base + Self::CELLS;
         (&self.abs_lh[base..end], &self.abs_hl[base..end], &self.abs_hh[base..end])
     }
 }
 
-/// T3.3.A — precomputed-table fast path of compute_coefficient_cost
-/// (legacy sum order: per-cell `lh + hl + hh` added directly into a
-/// single accumulator). Kept for the Phase A bit-exactness gate vs
-/// the legacy basis-recompute path. **Not used in production** — the
-/// SIMD-friendly variant below is the one wired into call sites.
-#[inline]
-#[allow(dead_code)]
-fn compute_coefficient_cost_precomputed_legacy_order(
-    abs_lh: &[f64],
-    abs_hl: &[f64],
-    abs_hh: &[f64],
-    cover_wavelets: &ThreeSubbands,
-    br: usize,
-    bc: usize,
-    img_w: usize,
-    img_h: usize,
-    pad: usize,
-) -> f64 {
-    let mut cost = 0.0;
-    for out_r in 0..IMPACT_SIZE {
-        let abs_y = (br * 8) as isize + out_r as isize - pad as isize;
-        if abs_y < 0 || abs_y as usize >= img_h {
-            continue;
-        }
-        let wy = abs_y as usize - cover_wavelets.y_offset;
-        let row_base = out_r * IMPACT_SIZE;
-        for out_c in 0..IMPACT_SIZE {
-            let abs_x = (bc * 8) as isize + out_c as isize - pad as isize;
-            if abs_x < 0 || abs_x as usize >= img_w {
-                continue;
-            }
-            let wx = abs_x as usize;
-            let idx = wy * cover_wavelets.width + wx;
-
-            let w_lh = (cover_wavelets.lh[idx] as f64).abs() + SIGMA;
-            let w_hl = (cover_wavelets.hl[idx] as f64).abs() + SIGMA;
-            let w_hh = (cover_wavelets.hh[idx] as f64).abs() + SIGMA;
-
-            let cell = row_base + out_c;
-            cost += abs_lh[cell] / w_lh;
-            cost += abs_hl[cell] / w_hl;
-            cost += abs_hh[cell] / w_hh;
-        }
-    }
-    cost
-}
-
-/// T3.3.B — SIMD-friendly precomputed-table cost kernel.
-///
-/// Sum order: per cell `(lh + hl) + hh` (parenthesized for explicit
-/// evaluation order), then pair-wise `(cell0 + cell1)`, then row-wise
-/// accumulation. The pairing matches the NEON / AVX2 / WASM SIMD
-/// lane layout exactly so the scalar fallback gives bit-identical
-/// f64 output to every SIMD path.
-///
-/// Cross-platform deterministic: same sum order on aarch64 + x86_64 +
-/// wasm32, gated by the `cost_precompute_simd_cross_platform_hash`
-/// test (Phase E).
-///
-/// Drift vs `compute_coefficient_cost_precomputed_legacy_order`: at
-/// most a handful of f64 ULP, far below f32 cost LSB → stego output
-/// bit-identical.
-#[inline]
-fn compute_coefficient_cost_precomputed(
-    abs_lh: &[f64],
-    abs_hl: &[f64],
-    abs_hh: &[f64],
-    cover_wavelets: &ThreeSubbands,
-    br: usize,
-    bc: usize,
-    img_w: usize,
-    img_h: usize,
-    pad: usize,
-) -> f64 {
-    let mut cost = 0.0;
-    let stride = cover_wavelets.width;
-    let bc8 = (bc * 8) as isize;
-    let abs_x_start = bc8 - pad as isize;
-
-    // Valid out_c range for any row of THIS block (same for all rows).
-    let out_c_lo: usize = if abs_x_start < 0 {
-        ((-abs_x_start) as usize).min(IMPACT_SIZE)
-    } else {
-        0
-    };
-    let out_c_hi: usize = {
-        let max_via_image = img_w as isize - abs_x_start;
-        if max_via_image <= 0 {
-            0
-        } else {
-            (max_via_image as usize).min(IMPACT_SIZE)
-        }
-    };
-    if out_c_lo >= out_c_hi {
-        return 0.0;
-    }
-
-    for out_r in 0..IMPACT_SIZE {
-        let abs_y = (br * 8) as isize + out_r as isize - pad as isize;
-        if abs_y < 0 || abs_y as usize >= img_h {
-            continue;
-        }
-        let wy = abs_y as usize - cover_wavelets.y_offset;
-        let row_base = out_r * IMPACT_SIZE;
-        let row_idx_base = wy * stride;
-
-        let mut out_c = out_c_lo;
-
-        // NEON 2-lane f64 path on aarch64.
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-        unsafe {
-            use core::arch::aarch64::*;
-            let sigma_v = vdupq_n_f64(SIGMA);
-            while out_c + 1 < out_c_hi {
-                let abs_x = bc8 + out_c as isize - pad as isize;
-                let wx = abs_x as usize;
-                let idx = row_idx_base + wx;
-                let cell = row_base + out_c;
-
-                // Load 2 f32 wavelet values per subband, widen to f64.
-                let v_lh_f32 = vld1_f32(cover_wavelets.lh[idx..].as_ptr());
-                let v_hl_f32 = vld1_f32(cover_wavelets.hl[idx..].as_ptr());
-                let v_hh_f32 = vld1_f32(cover_wavelets.hh[idx..].as_ptr());
-                let v_lh_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(v_lh_f32)), sigma_v);
-                let v_hl_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(v_hl_f32)), sigma_v);
-                let v_hh_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(v_hh_f32)), sigma_v);
-
-                // Load |delta| pair (already f64).
-                let v_abs_lh = vld1q_f64(abs_lh[cell..].as_ptr());
-                let v_abs_hl = vld1q_f64(abs_hl[cell..].as_ptr());
-                let v_abs_hh = vld1q_f64(abs_hh[cell..].as_ptr());
-
-                let v_div_lh = vdivq_f64(v_abs_lh, v_lh_w);
-                let v_div_hl = vdivq_f64(v_abs_hl, v_hl_w);
-                let v_div_hh = vdivq_f64(v_abs_hh, v_hh_w);
-
-                // Per-lane sum: (lh + hl) + hh.
-                let v_partial = vaddq_f64(vaddq_f64(v_div_lh, v_div_hl), v_div_hh);
-
-                // Sum two lanes — explicit lane extraction for
-                // deterministic order (lane0 + lane1).
-                let lane0 = vgetq_lane_f64(v_partial, 0);
-                let lane1 = vgetq_lane_f64(v_partial, 1);
-                cost += lane0 + lane1;
-
-                out_c += 2;
-            }
-        }
-
-        // WASM SIMD128 2-lane f64 path. Phasm's wasm bridges enable
-        // `+simd128` in `.cargo/config.toml`, so this gate fires for
-        // the deployed phasm.app build. Matches the NEON / SSE2
-        // pair-wise sum order byte-for-byte.
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        unsafe {
-            use core::arch::wasm32::*;
-            let sigma_v = f64x2_splat(SIGMA);
-            while out_c + 1 < out_c_hi {
-                let abs_x = bc8 + out_c as isize - pad as isize;
-                let wx = abs_x as usize;
-                let idx = row_idx_base + wx;
-                let cell = row_base + out_c;
-
-                // Load 2 f32 wavelet values per subband, widen to f64.
-                // `v128_load64_zero` reads 8 bytes (2 f32) into the
-                // low half and zeroes the high half; the subsequent
-                // `f64x2_promote_low_f32x4` then widens the low 2
-                // lanes to 2 f64.
-                let v_lh_f32 =
-                    v128_load64_zero(cover_wavelets.lh[idx..].as_ptr() as *const u64);
-                let v_hl_f32 =
-                    v128_load64_zero(cover_wavelets.hl[idx..].as_ptr() as *const u64);
-                let v_hh_f32 =
-                    v128_load64_zero(cover_wavelets.hh[idx..].as_ptr() as *const u64);
-                let v_lh_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(v_lh_f32)), sigma_v);
-                let v_hl_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(v_hl_f32)), sigma_v);
-                let v_hh_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(v_hh_f32)), sigma_v);
-
-                let v_abs_lh = v128_load(abs_lh[cell..].as_ptr() as *const v128);
-                let v_abs_hl = v128_load(abs_hl[cell..].as_ptr() as *const v128);
-                let v_abs_hh = v128_load(abs_hh[cell..].as_ptr() as *const v128);
-
-                let v_div_lh = f64x2_div(v_abs_lh, v_lh_w);
-                let v_div_hl = f64x2_div(v_abs_hl, v_hl_w);
-                let v_div_hh = f64x2_div(v_abs_hh, v_hh_w);
-
-                let v_partial = f64x2_add(f64x2_add(v_div_lh, v_div_hl), v_div_hh);
-
-                let lane0 = f64x2_extract_lane::<0>(v_partial);
-                let lane1 = f64x2_extract_lane::<1>(v_partial);
-                cost += lane0 + lane1;
-
-                out_c += 2;
-            }
-        }
-
-        // SSE2 2-lane f64 path on x86_64. Uses `__m128d` (the baseline
-        // SSE2 f64 vector, available on every x86_64 chip — phasm's
-        // `.cargo/config.toml` already enables SSE4.1+SSSE3 by default
-        // for the x86_64 targets but stops short of AVX2 to keep CLI
-        // release binaries broadly compatible). Matches the NEON
-        // pair-wise sum order byte-for-byte.
-        //
-        // T3.3.C deliberately uses 2-lane (not AVX2 4-lane) so the
-        // sum order is identical to NEON / SIMD128 / scalar — Phase E
-        // pins the cross-platform hash on this exact ordering. An
-        // AVX2 4-lane variant could be added later as an opt-in fast
-        // path, with explicit pair-of-pairs reduction to match this
-        // hash.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use core::arch::x86_64::*;
-            let sigma_v = _mm_set1_pd(SIGMA);
-            // Bitmask for f64 |.|: clear sign bit (bit 63).
-            let abs_mask =
-                _mm_castsi128_pd(_mm_set1_epi64x(0x7FFF_FFFF_FFFF_FFFF));
-            while out_c + 1 < out_c_hi {
-                let abs_x = bc8 + out_c as isize - pad as isize;
-                let wx = abs_x as usize;
-                let idx = row_idx_base + wx;
-                let cell = row_base + out_c;
-
-                // Load 2 f32 wavelet values per subband, widen to f64.
-                // `_mm_loadl_pi` would need an __m64; use generic 64-bit
-                // load + cast to __m128 (low 64 bits = 2 f32, upper
-                // halves zeroed by cvtps_pd anyway).
-                let v_lh_f32 = _mm_castsi128_ps(_mm_loadl_epi64(
-                    cover_wavelets.lh[idx..].as_ptr() as *const __m128i,
-                ));
-                let v_hl_f32 = _mm_castsi128_ps(_mm_loadl_epi64(
-                    cover_wavelets.hl[idx..].as_ptr() as *const __m128i,
-                ));
-                let v_hh_f32 = _mm_castsi128_ps(_mm_loadl_epi64(
-                    cover_wavelets.hh[idx..].as_ptr() as *const __m128i,
-                ));
-                let v_lh_w =
-                    _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_lh_f32), abs_mask), sigma_v);
-                let v_hl_w =
-                    _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_hl_f32), abs_mask), sigma_v);
-                let v_hh_w =
-                    _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_hh_f32), abs_mask), sigma_v);
-
-                let v_abs_lh = _mm_loadu_pd(abs_lh[cell..].as_ptr());
-                let v_abs_hl = _mm_loadu_pd(abs_hl[cell..].as_ptr());
-                let v_abs_hh = _mm_loadu_pd(abs_hh[cell..].as_ptr());
-
-                let v_div_lh = _mm_div_pd(v_abs_lh, v_lh_w);
-                let v_div_hl = _mm_div_pd(v_abs_hl, v_hl_w);
-                let v_div_hh = _mm_div_pd(v_abs_hh, v_hh_w);
-
-                let v_partial = _mm_add_pd(_mm_add_pd(v_div_lh, v_div_hl), v_div_hh);
-
-                // Lane extract: `_mm_cvtsd_f64` returns lane 0 (low f64).
-                // For lane 1, unpack the high half into the low position
-                // first, then extract.
-                let lane0 = _mm_cvtsd_f64(v_partial);
-                let lane1 = _mm_cvtsd_f64(_mm_unpackhi_pd(v_partial, v_partial));
-                cost += lane0 + lane1;
-
-                out_c += 2;
-            }
-        }
-
-        // Scalar path — handles every row on non-NEON targets, and the
-        // 0/1-element tail on NEON. Order matches the NEON kernel:
-        // per-lane `(lh + hl) + hh`, then `lane0 + lane1`, then row
-        // accumulate.
-        while out_c + 1 < out_c_hi {
-            let abs_x_0 = bc8 + out_c as isize - pad as isize;
-            let wx_0 = abs_x_0 as usize;
-            let idx_0 = row_idx_base + wx_0;
-            let idx_1 = idx_0 + 1;
-            let cell_0 = row_base + out_c;
-            let cell_1 = cell_0 + 1;
-
-            let lh_w_0 = (cover_wavelets.lh[idx_0] as f64).abs() + SIGMA;
-            let hl_w_0 = (cover_wavelets.hl[idx_0] as f64).abs() + SIGMA;
-            let hh_w_0 = (cover_wavelets.hh[idx_0] as f64).abs() + SIGMA;
-            let lh_w_1 = (cover_wavelets.lh[idx_1] as f64).abs() + SIGMA;
-            let hl_w_1 = (cover_wavelets.hl[idx_1] as f64).abs() + SIGMA;
-            let hh_w_1 = (cover_wavelets.hh[idx_1] as f64).abs() + SIGMA;
-
-            let div_lh_0 = abs_lh[cell_0] / lh_w_0;
-            let div_hl_0 = abs_hl[cell_0] / hl_w_0;
-            let div_hh_0 = abs_hh[cell_0] / hh_w_0;
-            let div_lh_1 = abs_lh[cell_1] / lh_w_1;
-            let div_hl_1 = abs_hl[cell_1] / hl_w_1;
-            let div_hh_1 = abs_hh[cell_1] / hh_w_1;
-
-            let lane0 = (div_lh_0 + div_hl_0) + div_hh_0;
-            let lane1 = (div_lh_1 + div_hl_1) + div_hh_1;
-            cost += lane0 + lane1;
-
-            out_c += 2;
-        }
-
-        // 1-element tail.
-        if out_c < out_c_hi {
-            let abs_x = bc8 + out_c as isize - pad as isize;
-            let wx = abs_x as usize;
-            let idx = row_idx_base + wx;
-            let cell = row_base + out_c;
-
-            let lh_w = (cover_wavelets.lh[idx] as f64).abs() + SIGMA;
-            let hl_w = (cover_wavelets.hl[idx] as f64).abs() + SIGMA;
-            let hh_w = (cover_wavelets.hh[idx] as f64).abs() + SIGMA;
-
-            let div_lh = abs_lh[cell] / lh_w;
-            let div_hl = abs_hl[cell] / hl_w;
-            let div_hh = abs_hh[cell] / hh_w;
-            cost += (div_lh + div_hl) + div_hh;
-        }
-    }
-
-    cost
-}
-
-/// Compute the J-UNIWARD cost for a single coefficient at position
-/// (fi, fj) in block (br, bc).
-///
-/// The cost is the sum over three subbands of:
-///   |delta_W[k]| / (|W_cover[k]| + sigma)
-///
-/// where delta_W[k] is the wavelet-domain impact of the +1 coefficient change,
-/// and W_cover[k] is the cover's wavelet coefficient at the same location.
-fn compute_coefficient_cost(
-    basis_block: &[f64; 64],
-    cover_wavelets: &ThreeSubbands,
-    br: usize,
-    bc: usize,
-    img_w: usize,
-    img_h: usize,
-    pad: usize,
-    lpdf: &[f64; 16],
-) -> f64 {
-    let mut cost = 0.0;
-
-    // The pixel delta is only non-zero in the 8x8 block.
-    // The wavelet filters are separable (row then column), each 16-tap.
-    // After row filtering, the non-zero region expands to 8+15 = 23 wide.
-    // After column filtering, it expands to 23 tall.
-    // So the total impact region is IMPACT_SIZE x IMPACT_SIZE = 23x23.
-
-    // Row-filter the 8 rows of the basis block.
-    // Input: 8 values at columns [0..8) (relative to block origin).
-    // Output: IMPACT_SIZE values at columns [-pad..8+pad-pad) = [-7..16) relative to block origin,
-    // i.e. columns [-7, -6, ..., 15] relative to block origin.
-    // In absolute terms: bc*8 - 7 to bc*8 + 15.
-    let mut row_low = [[0.0f64; IMPACT_SIZE]; 8]; // 8 rows x 23 cols
-    let mut row_high = [[0.0f64; IMPACT_SIZE]; 8];
-
-    // In filter_rows, output[x] = sum_{k=0}^{15} filter[k] * input[x + k - 7].
-    // For a delta at block-relative input column c, the affected outputs are at
-    // x = c + 7 - k, giving x in [-8, 14] for c in [0,7]. That is 23 positions.
-    // We index these as out_c in [0, 23), with block-relative output column
-    // = out_c - 7, and source column = out_c - 14 + k.
-    for r in 0..8 {
-        for out_c in 0..IMPACT_SIZE {
-            let mut sum_low = 0.0;
-            let mut sum_high = 0.0;
-            for k in 0..FILT_LEN {
-                let src_col = out_c as isize - 14 + k as isize;
-                if (0..8).contains(&src_col) {
-                    let val = basis_block[r * 8 + src_col as usize];
-                    sum_low += lpdf[k] * val;
-                    sum_high += HPDF[k] * val;
-                }
-            }
-            row_low[r][out_c] = sum_low;
-            row_high[r][out_c] = sum_high;
-        }
-    }
-
-    // Column-filter the row-filtered results.
-    // Input: 8 rows of IMPACT_SIZE columns.
-    // Output: IMPACT_SIZE rows of IMPACT_SIZE columns.
-    // Same logic: output row (out_r - half) in block-relative coords.
-    // The delta impact for the three subbands:
-    // LH: row_low filtered by HPDF along columns
-    // HL: row_high filtered by lpdf along columns
-    // HH: row_high filtered by HPDF along columns
-
-    for out_r in 0..IMPACT_SIZE {
-        for out_c in 0..IMPACT_SIZE {
-            let mut delta_lh = 0.0;
-            let mut delta_hl = 0.0;
-            let mut delta_hh = 0.0;
-
-            for k in 0..FILT_LEN {
-                let src_row = out_r as isize - 14 + k as isize;
-                if (0..8).contains(&src_row) {
-                    let r = src_row as usize;
-                    let low_val = row_low[r][out_c];
-                    let high_val = row_high[r][out_c];
-
-                    delta_lh += HPDF[k] * low_val;
-                    delta_hl += lpdf[k] * high_val;
-                    delta_hh += HPDF[k] * high_val;
-                }
-            }
-
-            // Absolute pixel coordinates of this wavelet coefficient.
-            let abs_y = (br * 8) as isize + out_r as isize - (pad as isize);
-            let abs_x = (bc * 8) as isize + out_c as isize - (pad as isize);
-
-            // Only accumulate if within image bounds (wavelet coefficients
-            // outside the image don't exist in the cover's wavelet decomposition).
-            if abs_y >= 0 && abs_y < img_h as isize && abs_x >= 0 && abs_x < img_w as isize {
-                let wy = abs_y as usize;
-                let wx = abs_x as usize;
-                let idx = (wy - cover_wavelets.y_offset) * cover_wavelets.width + wx;
-
-                // Cover wavelet values are f32; promote to f64 for cost computation.
-                let w_lh = cover_wavelets.lh[idx] as f64;
-                let w_hl = cover_wavelets.hl[idx] as f64;
-                let w_hh = cover_wavelets.hh[idx] as f64;
-
-                cost += delta_lh.abs() / (w_lh.abs() + SIGMA);
-                cost += delta_hl.abs() / (w_hl.abs() + SIGMA);
-                cost += delta_hh.abs() / (w_hh.abs() + SIGMA);
-            }
-        }
-    }
-
-    cost
-}
-
-// ---------------------------------------------------------------------------
-// Strip-based streaming UNIWARD: computes positions without full CostMap.
-// ---------------------------------------------------------------------------
-
-use crate::stego::permute::CoeffPos;
-use crate::stego::side_info::SideInfo;
-
-/// Strip height in block rows for streaming UNIWARD computation.
-/// 50 block rows = 400 pixel rows. Each strip uses ~170 MB peak for a 16K-wide
-/// image (pixels + row-filtered + 3 wavelet subbands + strip CostMap).
-const STRIP_BLOCK_ROWS: usize = 50;
-
 // ============================================================================
-// T3.2 — cached cover wavelets + position computation from cache
+// Padded cover decomposition
 // ============================================================================
-//
-// The shadow cascade verify loop (`ghost/pipeline.rs`) runs
-// `compute_positions_streaming` up to 12× per encode to recompute
-// UNIWARD costs on each post-STC stego image. Each call redoes the
-// full IDCT + 16-tap wavelet decomposition (~70 % of UNIWARD wall-
-// clock at 12 MP). T3.2 caches the COVER wavelets once, then the
-// cascade verify uses incremental wavelet deltas from STC
-// modifications (Phase C) and recomputes cost only for dirty
-// coefficients (Phase D).
-//
-// Phase B (this section) is the API foundation — add a way to
-// materialize the cover wavelets and a position-computation entry
-// point that takes pre-cached wavelets. The existing strip-based
-// `compute_positions_streaming` stays unchanged as the primary
-// forward entry point.
 
-/// Cover-side wavelet decomposition, cached for T3.2 cascade verify
-/// re-cost. Holds LH/HL/HH subbands as f32 at full image resolution.
+/// LH / HL / HH subbands of the symmetric-padded pixel plane, for plane
+/// columns `x ∈ [−WAV_MARGIN, img_w + WAV_MARGIN)` and a contiguous range
+/// of plane rows starting at `y0` (`−WAV_MARGIN` for a whole image, the
+/// strip's first window row for a strip).
 ///
-/// Memory: 12 bytes × img_w × img_h ≈ 72 MB at 12 MP, 600 MB at
-/// 100 MP. Suitable for cascade verify where the same cover is
-/// re-evaluated multiple times; not suitable for memory-constrained
-/// forward paths (which keep using `compute_positions_streaming`).
-pub struct CachedCoverWavelets {
-    inner: ThreeSubbands,
-    pub img_w: usize,
-    pub img_h: usize,
-}
-
-/// Compute the cover-side wavelet decomposition of an image. Used as
-/// the cached baseline for T3.2 dirty-block re-cost in the cascade
-/// verify loop. Memory: see [`CachedCoverWavelets`].
-/// T3.3.E — deterministic byte stream for the cost kernel,
-/// used by `cost_kernel_test_hash_hex` to pin the cross-platform
-/// hash. Re-computing this on any supported target MUST yield the
-/// same bytes (and therefore the same SHA256).
+/// - LH: low-pass along rows, high-pass along columns (vertical detail)
+/// - HL: high-pass along rows, low-pass along columns (horizontal detail)
+/// - HH: high-pass along both (diagonal detail)
 ///
-/// Layout: for each (br, bc, fi, fj) in a fixed iteration order, dump
-/// the f64 cost as 8 little-endian bytes via `f64::to_bits`. The
-/// fixture is 8×8 blocks (64×64 px), structured to hit every code
-/// path (interior + each corner + mid-edges).
-#[doc(hidden)]
-pub fn cost_kernel_test_deterministic_bytes() -> Vec<u8> {
-    // Fixed cover grid: deterministic content, mix of magnitudes.
-    let mut cover = DctGrid::new(8, 8);
-    for br in 0..8 {
-        for bc in 0..8 {
-            cover.set(br, bc, 0, 0, 120);
-            for i in 0..8 {
-                for j in 0..8 {
-                    if i == 0 && j == 0 {
-                        continue;
-                    }
-                    let val =
-                        (((br * 11 + bc * 7 + i * 5 + j * 3) % 19) as i16) - 9;
-                    if val != 0 {
-                        cover.set(br, bc, i, j, val);
-                    }
-                }
-            }
-        }
-    }
-    // Inline the standard JPEG luminance quant table (quality ~50)
-    // so the helper doesn't depend on test-only fixtures.
-    let qt = QuantTable::new([
-        16, 11, 10, 16, 24, 40, 51, 61,
-        12, 12, 14, 19, 26, 58, 60, 55,
-        14, 13, 16, 24, 40, 57, 69, 56,
-        14, 17, 22, 29, 51, 87, 80, 62,
-        18, 22, 37, 56, 68, 109, 103, 77,
-        24, 35, 55, 64, 81, 104, 113, 92,
-        49, 64, 78, 87, 103, 121, 120, 101,
-        72, 92, 95, 98, 112, 100, 103, 99,
-    ]);
-    let wavelets = compute_cover_wavelets(&cover, &qt);
-    let table = AbsDeltaTable::precompute(&qt);
-    let pad = FILT_LEN - 1;
-    let img_w = wavelets.img_w;
-    let img_h = wavelets.img_h;
-
-    let mut bytes = Vec::with_capacity(8 * 8 * 63 * 8);
-    for br in 0..8 {
-        for bc in 0..8 {
-            for fi in 0..8 {
-                for fj in 0..8 {
-                    if fi == 0 && fj == 0 {
-                        continue;
-                    }
-                    let (abs_lh, abs_hl, abs_hh) = table.slice_at(fi, fj);
-                    let cost = compute_coefficient_cost_precomputed(
-                        abs_lh, abs_hl, abs_hh,
-                        &wavelets.inner,
-                        br, bc, img_w, img_h, pad,
-                    );
-                    bytes.extend_from_slice(&cost.to_bits().to_le_bytes());
-                }
-            }
-        }
-    }
-    bytes
+/// Every sample, inside the image or in the margin, is the plain filter
+/// output over the padded pixel plane — no boundary special case — so a
+/// sample has the same value whichever row range it was computed in.
+pub(super) struct PaddedSubbands {
+    pub(super) lh: Vec<f32>,
+    pub(super) hl: Vec<f32>,
+    pub(super) hh: Vec<f32>,
+    /// Samples per row: `img_w + 2·WAV_MARGIN`.
+    pub(super) stride: usize,
+    /// Plane row of the first stored row.
+    pub(super) y0: isize,
+    /// Number of stored rows.
+    pub(super) rows: usize,
 }
 
-/// SHA256 of [`cost_kernel_test_deterministic_bytes`] as lowercase hex.
-#[doc(hidden)]
-pub fn cost_kernel_test_hash_hex() -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(cost_kernel_test_deterministic_bytes());
-    let digest = h.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        hex.push_str(&format!("{:02x}", b));
+impl PaddedSubbands {
+    /// Buffer index of plane sample `(x, y)`.
+    #[inline]
+    fn index(&self, x: isize, y: isize) -> usize {
+        debug_assert!(y >= self.y0 && ((y - self.y0) as usize) < self.rows, "row {y} not in strip");
+        debug_assert!(x >= -(WAV_MARGIN as isize) && ((x + WAV_MARGIN as isize) as usize) < self.stride);
+        (y - self.y0) as usize * self.stride + (x + WAV_MARGIN as isize) as usize
     }
-    hex
 }
 
-/// Number of progress sub-steps emitted by [`compute_cover_wavelets`].
-/// Used by cascade-trigger code in `ghost/pipeline.rs` to budget total
-/// steps before this function is called.
-pub const COVER_WAVELETS_PROGRESS_STEPS: u32 = 3;
+/// Symmetric-padded pixel rows `[py0, py0 + n_rows)` of the decompressed
+/// grid, `img_w + 2·PIX_MARGIN` samples each (plane column `x` at buffer
+/// column `x + PIX_MARGIN`). Pixel `(x, y)` outside the image is the
+/// pixel at `(symmetric_index(x), symmetric_index(y))`.
+fn padded_pixel_rows(grid: &DctGrid, qt: &QuantTable, py0: isize, n_rows: usize) -> Vec<f32> {
+    let mut pix = Vec::new();
+    padded_pixel_rows_into(&mut pix, grid, qt, py0, n_rows);
+    pix
+}
 
-pub fn compute_cover_wavelets(grid: &DctGrid, qt: &QuantTable) -> CachedCoverWavelets {
+/// [`padded_pixel_rows`] into `pix` (its allocation reused).
+fn padded_pixel_rows_into(pix: &mut Vec<f32>, grid: &DctGrid, qt: &QuantTable, py0: isize, n_rows: usize) {
     let bw = grid.blocks_wide();
     let bt = grid.blocks_tall();
-    let img_w = bw * 8;
-    let img_h = bt * 8;
-    let cover_pixels = decompress_to_pixels(grid, qt, bw, bt);
-    progress::advance(); // cover_wavelets sub-step 1: decompress to pixels
-    let lpdf = lpdf();
-    let inner = compute_three_subbands(&cover_pixels, img_w, img_h, &lpdf);
-    progress::advance(); // cover_wavelets sub-step 2: wavelet subbands
-    drop(cover_pixels);
-    progress::advance(); // cover_wavelets sub-step 3: cleanup
-    CachedCoverWavelets { inner, img_w, img_h }
-}
+    let (img_w, img_h) = (bw * 8, bt * 8);
+    let pw = img_w + 2 * PIX_MARGIN;
+    let py1 = py0 + n_rows as isize;
+    pix.clear();
+    pix.resize(pw * n_rows, 0.0);
 
-/// Stego-side wavelets = cover wavelets + Σ delta_wavelet per STC
-/// modification. Same memory shape and layout as
-/// [`CachedCoverWavelets`]; the only difference is provenance.
-pub struct StegoWavelets {
-    inner: ThreeSubbands,
-    pub img_w: usize,
-    pub img_h: usize,
-}
-
-impl StegoWavelets {
-    /// Exact stego wavelets: a full decomposition of the stego grid
-    /// through the same code as [`compute_cover_wavelets`], i.e. the
-    /// same per-sample arithmetic as [`compute_positions_streaming`]
-    /// (which the decoder runs). Every sample is bit-identical to the
-    /// decoder's, unlike [`apply_dct_modifications_to_wavelets`].
-    ///
-    /// Emits no progress steps (the shadow verify budgets
-    /// [`DIRTY_RECOST_PROGRESS_STEPS`] per verify, emitted by
-    /// [`compute_positions_with_dirty_recost`]).
-    pub fn compute_exact(stego_grid: &DctGrid, qt: &QuantTable) -> Self {
-        let bw = stego_grid.blocks_wide();
-        let bt = stego_grid.blocks_tall();
-        let img_w = bw * 8;
-        let img_h = bt * 8;
-        let pixels = decompress_to_pixels(stego_grid, qt, bw, bt);
-        let inner = compute_three_subbands(&pixels, img_w, img_h, &lpdf());
-        StegoWavelets { inner, img_w, img_h }
-    }
-
-    /// Treat the stego wavelets as a CachedCoverWavelets view for
-    /// passing into [`compute_positions_from_wavelets`]. (Field-equivalent
-    /// struct; we keep them distinct in the type system to avoid mixing
-    /// up cover-vs-stego in callers.)
-    pub fn as_cache(&self) -> CachedCoverWavelets {
-        CachedCoverWavelets {
-            inner: ThreeSubbands {
-                lh: self.inner.lh.clone(),
-                hl: self.inner.hl.clone(),
-                hh: self.inner.hh.clone(),
-                width: self.inner.width,
-                y_offset: self.inner.y_offset,
-            },
-            img_w: self.img_w,
-            img_h: self.img_h,
+    // 1. The image rows inside the range, decoded straight into place.
+    let in0 = py0.clamp(0, img_h as isize) as usize;
+    let in1 = py1.clamp(0, img_h as isize) as usize;
+    if in0 < in1 {
+        for br in in0 / 8..in1.div_ceil(8) {
+            for bc in 0..bw {
+                let q: [i16; 64] = grid.block(br, bc).try_into().unwrap();
+                let block_pixels = idct_block(&q, &qt.values);
+                for r in 0..8 {
+                    let y = br * 8 + r;
+                    if y < in0 || y >= in1 {
+                        continue;
+                    }
+                    let dst = (y as isize - py0) as usize * pw + PIX_MARGIN + bc * 8;
+                    for c in 0..8 {
+                        pix[dst + c] = block_pixels[r * 8 + c] as f32;
+                    }
+                }
+            }
         }
     }
-}
 
-/// Apply STC modifications to the cover wavelets, producing stego
-/// wavelets via incremental wavelet delta. Each modification at DCT
-/// coefficient (br, bc, fi, fj) contributes a `basis[fi][fj] ×
-/// (stego_coeff − cover_coeff)` pixel delta in the 8×8 block at
-/// (br, bc); this pixel delta is row+column 16-tap-filtered to give a
-/// 23×23 LH/HL/HH wavelet delta that's added (signed) to the cover
-/// wavelets.
-///
-/// The wavelet is linear → overlapping modifications sum correctly
-/// (the delta from modification A + delta from modification B =
-/// delta_AB).
-///
-/// **Not bit-exact** with `compute_cover_wavelets(modified_grid, qt)`:
-/// the full decomposition rounds the row-filter output to f32 before
-/// the column filter, the delta path does not, and overlapping deltas
-/// are summed in `HashSet` order. On a real 12 MP stego image the
-/// resulting costs differ from the decoder's at ~140 K positions (max
-/// relative error ~3e-4). The lib test
-/// `incremental_wavelet_matches_full_recompute` only bounds the error.
-/// Never feed this into anything that must agree with a decoder (the
-/// shadow verify uses [`StegoWavelets::compute_exact`]); it remains for
-/// benchmarks and tests.
-///
-/// Memory: clones cover_wavelets once (~72 MB at 12 MP) and writes in
-/// place. The cover wavelets themselves are NOT mutated.
-pub fn apply_dct_modifications_to_wavelets(
-    cover_wavelets: &CachedCoverWavelets,
-    modifications: &[u32],
-    original_grid: &DctGrid,
-    modified_grid: &DctGrid,
-    qt: &QuantTable,
-) -> StegoWavelets {
-    // Start from cover; add deltas per modification.
-    let mut lh: Vec<f32> = cover_wavelets.inner.lh.clone();
-    let mut hl: Vec<f32> = cover_wavelets.inner.hl.clone();
-    let mut hh: Vec<f32> = cover_wavelets.inner.hh.clone();
-    let width = cover_wavelets.inner.width;
-    let height = cover_wavelets.img_h;
-    let bw = original_grid.blocks_wide();
-    let lpdf = lpdf();
-
-    // Collect unique dirty blocks. The pixel delta for a block is
-    // determined by the FULL aan-IDCT of cover vs stego (NOT by per-
-    // coefficient basis sums — the integer LL&M IDCT is not perfectly
-    // linear at the LSB, so basis * dct_delta diverges from
-    // aan_idct(stego_block) − aan_idct(cover_block) at f32 precision).
-    let mut dirty_blocks: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
-    for &flat_idx in modifications {
-        let block_idx = (flat_idx as usize) / 64;
-        dirty_blocks.insert((block_idx / bw, block_idx % bw));
-    }
-
-    for (br, bc) in dirty_blocks {
-        // Per-block pixel delta via the SAME aan_idct that
-        // decompress_to_pixels uses. This guarantees bit-exact match
-        // with the full filter path on the stego image.
-        let cover_block: [i16; 64] = original_grid.block(br, bc).try_into().unwrap();
-        let stego_block: [i16; 64] = modified_grid.block(br, bc).try_into().unwrap();
-        if cover_block == stego_block {
+    // 2. Rows above / below the image: copies of their mirror rows.
+    for i in 0..n_rows {
+        let y = py0 + i as isize;
+        if y >= 0 && (y as usize) < img_h {
             continue;
         }
-        let cover_pixels = idct_block(&cover_block, &qt.values);
-        let stego_pixels = idct_block(&stego_block, &qt.values);
-        let mut basis_block = [0.0f64; 64];
-        for k in 0..64 {
-            // aan_idct returns f32 → widen to f64 for filter precision.
-            basis_block[k] = (stego_pixels[k] as f64) - (cover_pixels[k] as f64);
-        }
-        let dct_delta_f = 1.0f64; // delta is already baked into basis_block
-
-        // Match the FULL filter convention used by filter_rows +
-        // filter_cols:
-        //
-        //   output[y][x] = Σ_k filter[k] · input[mirror(y+k−7)][mirror(x+k−7)]
-        //
-        // (16-tap, mirror at image boundaries, center at k=7). The
-        // modified pixel delta is non-zero only inside the basis block;
-        // the impact region in output-space is the set of (abs_y,abs_x)
-        // for which the filter window touches that 8×8 block (possibly
-        // via mirror reflection).
-        //
-        // The impact region is at most 23×23 centered on the modified
-        // block (abs_y in [br*8−8 .. br*8+14], same for x). Mirror at
-        // image edges does NOT extend this region — it only reuses
-        // modified-block samples within filter windows that ARE in
-        // the standard impact region.
-        let half = (FILT_LEN - 1) / 2; // 7
-
-        // Row-filter pass: produce row_low_delta / row_high_delta at
-        // each (basis_row r, abs_x in impact x-range).
-        // We index row_low / row_high by [r][out_c] where:
-        //   out_c ∈ [0, IMPACT_EXT), abs_x = (bc*8 − 8) + out_c
-        // (i.e., out_c=0 maps to abs_x = bc*8 − 8, the leftmost
-        // output position).
-        //
-        // IMPACT_EXT = IMPACT_SIZE + (FILT_LEN/2) = 23 + 8 = 31. The
-        // extra 8 output positions catch BOTTOM/RIGHT mirror extensions
-        // (when src_y_raw or src_x_raw exceeds img dimensions, mirror
-        // reflects back into the basis — affecting outputs up to 8
-        // pixels beyond the standard 23-wide box).
-        const IMPACT_EXT: usize = IMPACT_SIZE + 8;
-        let mut row_low = [[0.0f64; IMPACT_EXT]; 8];
-        let mut row_high = [[0.0f64; IMPACT_EXT]; 8];
-        let abs_x_start = (bc * 8) as isize - half as isize - 1; // bc*8 − 8
-        for r in 0..8 {
-            for out_c in 0..IMPACT_EXT {
-                let abs_x = abs_x_start + out_c as isize;
-                if abs_x < 0 || abs_x as usize >= width {
-                    continue;
-                }
-                let mut sum_low = 0.0;
-                let mut sum_high = 0.0;
-                for k in 0..FILT_LEN {
-                    let src_x_raw = abs_x + k as isize - half as isize;
-                    let src_x_abs = mirror_index(src_x_raw, width);
-                    let basis_col = src_x_abs as isize - (bc * 8) as isize;
-                    if (0..8).contains(&basis_col) {
-                        let val = basis_block[r * 8 + basis_col as usize] * dct_delta_f;
-                        sum_low += lpdf[k] * val;
-                        sum_high += HPDF[k] * val;
-                    }
-                }
-                row_low[r][out_c] = sum_low;
-                row_high[r][out_c] = sum_high;
-            }
-        }
-
-        // Column-filter pass: at each (abs_y, abs_x) in impact,
-        // compute LH/HL/HH delta and accumulate into the cover-cloned
-        // subbands. Same IMPACT_EXT extension for the y dimension.
-        let abs_y_start = (br * 8) as isize - half as isize - 1; // br*8 − 8
-        for out_r in 0..IMPACT_EXT {
-            let abs_y = abs_y_start + out_r as isize;
-            if abs_y < 0 || abs_y as usize >= height {
-                continue;
-            }
-            let wy = abs_y as usize;
-            for out_c in 0..IMPACT_EXT {
-                let abs_x = abs_x_start + out_c as isize;
-                if abs_x < 0 || abs_x as usize >= width {
-                    continue;
-                }
-                let wx = abs_x as usize;
-
-                let mut delta_lh = 0.0f64;
-                let mut delta_hl = 0.0f64;
-                let mut delta_hh = 0.0f64;
-                for k in 0..FILT_LEN {
-                    let src_y_raw = abs_y + k as isize - half as isize;
-                    let src_y_abs = mirror_index(src_y_raw, height);
-                    let basis_row = src_y_abs as isize - (br * 8) as isize;
-                    if (0..8).contains(&basis_row) {
-                        let r = basis_row as usize;
-                        let low_val = row_low[r][out_c];
-                        let high_val = row_high[r][out_c];
-                        delta_lh += HPDF[k] * low_val;
-                        delta_hl += lpdf[k] * high_val;
-                        delta_hh += HPDF[k] * high_val;
-                    }
-                }
-
-                let idx = wy * width + wx;
-                lh[idx] = ((lh[idx] as f64) + delta_lh) as f32;
-                hl[idx] = ((hl[idx] as f64) + delta_hl) as f32;
-                hh[idx] = ((hh[idx] as f64) + delta_hh) as f32;
-            }
-        }
-    }
-
-    StegoWavelets {
-        inner: ThreeSubbands {
-            lh,
-            hl,
-            hh,
-            width,
-            y_offset: 0,
-        },
-        img_w: cover_wavelets.img_w,
-        img_h: cover_wavelets.img_h,
-    }
-}
-
-/// Compute embeddable UNIWARD positions given pre-cached wavelets.
-/// Behaviorally identical to [`compute_positions_streaming`] when
-/// called with `wavelets = compute_cover_wavelets(grid, qt)`, but
-/// avoids the wavelet recomputation cost when the wavelets are
-/// already in hand (the T3.2 cascade verify case after Phase C+D).
-///
-/// In Phase B this is wired only for the cover-side; Phase D will
-/// extend the same per-block iteration to accept "stego" wavelets
-/// (cover + STC-modification deltas) and skip per-block recomputation
-/// for clean coefficients.
-/// Number of progress sub-steps emitted by
-/// [`compute_positions_from_wavelets`] across the per-block parallel
-/// scan. Used by cascade-trigger code in `ghost/pipeline.rs` to
-/// budget total steps before this function is called.
-pub const POSITIONS_FROM_WAVELETS_PROGRESS_STEPS: u32 = 30;
-
-/// Number of progress sub-steps emitted by
-/// [`compute_positions_with_dirty_recost`]. The dirty re-cost is
-/// 6-8× cheaper than a full positions scan post-T3, so a smaller
-/// budget (10 vs UNIWARD's 100) keeps the bar moving against
-/// wall-clock-100% target. Used per cascade iter.
-pub const DIRTY_RECOST_PROGRESS_STEPS: u32 = 10;
-
-pub fn compute_positions_from_wavelets(
-    grid: &DctGrid,
-    qt: &QuantTable,
-    wavelets: &CachedCoverWavelets,
-    si: Option<(&SideInfo, &DctGrid)>,
-) -> Result<Vec<CoeffPos>, StegoError> {
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
-    let img_w = wavelets.img_w;
-    let img_h = wavelets.img_h;
-    debug_assert_eq!(img_w, bw * 8);
-    debug_assert_eq!(img_h, bt * 8);
-
-    let abs_delta = AbsDeltaTable::precompute(qt);
-    let pad = FILT_LEN - 1; // 15
-
-    let est_positions = bt * bw * 32;
-    let mut positions: Vec<CoeffPos> = Vec::with_capacity(est_positions);
-
-    // Per-block cost: same inner logic as the strip path, only now
-    // the wavelets cover the full image so `y_offset = 0` and one
-    // pass over all blocks suffices.
-    let n_blocks = bt * bw;
-    let mut strip_map = CostMap::new(bw, bt);
-    let total_len = n_blocks * 64;
-    let costs_ptr = CostMapPtr { ptr: strip_map.costs_ptr(), total_len };
-
-    // T3 progress instrumentation — emit POSITIONS_FROM_WAVELETS_PROGRESS_STEPS
-    // sub-steps spread across the parallel block scan. Each worker
-    // atomically increments a counter and emits progress::advance()
-    // when the count crosses an integer progress-step boundary
-    // (count × N / n_blocks). Total emissions = N regardless of
-    // worker scheduling order.
-    use std::sync::atomic::AtomicU64;
-    let counter = AtomicU64::new(0);
-    let n_blocks_u64 = n_blocks as u64;
-    let n_steps_u64 = POSITIONS_FROM_WAVELETS_PROGRESS_STEPS as u64;
-
-    let compute_block = |bi: usize| {
-        let br = bi / bw;
-        let bc = bi % bw;
-        let blk = grid.block(br, bc);
-        for fi in 0..8 {
-            for fj in 0..8 {
-                if fi == 0 && fj == 0 {
-                    continue;
-                }
-                let coeff = blk[fi * 8 + fj];
-                if coeff == 0 {
-                    continue;
-                }
-                let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                let cost = compute_coefficient_cost_precomputed(
-                    abs_lh, abs_hl, abs_hh,
-                    &wavelets.inner,
-                    br,
-                    bc,
-                    img_w,
-                    img_h,
-                    pad,
-                );
-                if cost > 0.0 && cost.is_finite() {
-                    let idx = br * bw * 64 + bc * 64 + fi * 8 + fj;
-                    unsafe { costs_ptr.write(idx, cost as f32); }
-                }
-            }
-        }
-        // Emit a progress sub-step when this block crosses a
-        // boundary. Race-tolerant: even if two workers compute the
-        // same target value, only one of them sees `target > prev`
-        // (the one that incremented `counter` first).
-        if n_blocks_u64 > 0 {
-            let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let target = count * n_steps_u64 / n_blocks_u64;
-            let prev_target = (count - 1) * n_steps_u64 / n_blocks_u64;
-            if target > prev_target {
-                progress::advance();
-            }
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    (0..n_blocks).into_par_iter().for_each(compute_block);
-    #[cfg(not(feature = "parallel"))]
-    (0..n_blocks).for_each(compute_block);
-
-    // Collect positions (mirrors the strip-path collect loop).
-    for br in 0..bt {
-        for bc in 0..bw {
-            for i in 0..8 {
-                for j in 0..8 {
-                    if i == 0 && j == 0 {
-                        continue;
-                    }
-                    let cost_f32 = strip_map.get(br, bc, i, j);
-                    if !cost_f32.is_finite() {
-                        continue;
-                    }
-                    let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
-
-                    let final_cost = if let Some((side_info, cover_grid)) = si {
-                        let coeff = cover_grid.get(br, bc, i, j);
-                        if coeff.abs() == 1 {
-                            cost_f32
-                        } else {
-                            let error = side_info.error_at(flat_idx as usize);
-                            let factor = 1.0f32 - 2.0 * error.abs();
-                            (cost_f32 * factor).max(MIN_SI_COST_F32)
-                        }
-                    } else {
-                        cost_f32
-                    };
-                    positions.push(CoeffPos { flat_idx, cost: final_cost });
-                }
-            }
-        }
-    }
-
-    Ok(positions)
-}
-
-/// Minimum cost for SI-modulated coefficients (same as side_info::MIN_SI_COST).
-const MIN_SI_COST_F32: f32 = 1e-6;
-
-/// T3.2.G — dual-output variant that emits BOTH primary (with SI
-/// factor if `si.is_some()`) and verify (no SI factor) positions in a
-/// single pass. The per-coefficient cost work is shared; the only
-/// extra cost is one additional vec push per position.
-///
-/// This is the entry point for the shadow-cascade path: primary
-/// positions feed STC embedding (SI-modulated), verify positions feed
-/// the dirty re-cost (decoder convention, no SI).
-///
-/// When `si.is_none()`, primary and verify costs are identical; the
-/// returned `verify` vec is a position-for-position clone of `primary`.
-pub fn compute_positions_dual_from_wavelets(
-    grid: &DctGrid,
-    qt: &QuantTable,
-    wavelets: &CachedCoverWavelets,
-    si: Option<(&SideInfo, &DctGrid)>,
-) -> Result<(Vec<CoeffPos>, Vec<CoeffPos>), StegoError> {
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
-    let img_w = wavelets.img_w;
-    let img_h = wavelets.img_h;
-    debug_assert_eq!(img_w, bw * 8);
-    debug_assert_eq!(img_h, bt * 8);
-
-    let abs_delta = AbsDeltaTable::precompute(qt);
-    let pad = FILT_LEN - 1;
-
-    // Shared cost map — populated in parallel, then read sequentially
-    // by both primary + verify emit loops (same shape as
-    // compute_positions_from_wavelets).
-    let n_blocks = bt * bw;
-    let mut strip_map = CostMap::new(bw, bt);
-    let total_len = n_blocks * 64;
-    let costs_ptr = CostMapPtr { ptr: strip_map.costs_ptr(), total_len };
-
-    let compute_block = |bi: usize| {
-        let br = bi / bw;
-        let bc = bi % bw;
-        let blk = grid.block(br, bc);
-        for fi in 0..8 {
-            for fj in 0..8 {
-                if fi == 0 && fj == 0 {
-                    continue;
-                }
-                let coeff = blk[fi * 8 + fj];
-                if coeff == 0 {
-                    continue;
-                }
-                let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                let cost = compute_coefficient_cost_precomputed(
-                    abs_lh, abs_hl, abs_hh,
-                    &wavelets.inner,
-                    br,
-                    bc,
-                    img_w,
-                    img_h,
-                    pad,
-                );
-                if cost > 0.0 && cost.is_finite() {
-                    let idx = br * bw * 64 + bc * 64 + fi * 8 + fj;
-                    unsafe { costs_ptr.write(idx, cost as f32); }
-                }
-            }
-        }
-    };
-
-    #[cfg(feature = "parallel")]
-    (0..n_blocks).into_par_iter().for_each(compute_block);
-    #[cfg(not(feature = "parallel"))]
-    (0..n_blocks).for_each(compute_block);
-
-    let est = bt * bw * 32;
-    let mut primary: Vec<CoeffPos> = Vec::with_capacity(est);
-    let mut verify: Vec<CoeffPos> = Vec::with_capacity(est);
-
-    for br in 0..bt {
-        for bc in 0..bw {
-            for i in 0..8 {
-                for j in 0..8 {
-                    if i == 0 && j == 0 {
-                        continue;
-                    }
-                    let cost_f32 = strip_map.get(br, bc, i, j);
-                    if !cost_f32.is_finite() {
-                        continue;
-                    }
-                    let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
-
-                    // Verify cost: cost_f32 unchanged (no SI factor).
-                    verify.push(CoeffPos { flat_idx, cost: cost_f32 });
-
-                    // Primary cost: with SI factor if applicable.
-                    let primary_cost = if let Some((side_info, cover_grid)) = si {
-                        let coeff = cover_grid.get(br, bc, i, j);
-                        if coeff.abs() == 1 {
-                            cost_f32
-                        } else {
-                            let error = side_info.error_at(flat_idx as usize);
-                            let factor = 1.0f32 - 2.0 * error.abs();
-                            (cost_f32 * factor).max(MIN_SI_COST_F32)
-                        }
-                    } else {
-                        cost_f32
-                    };
-                    primary.push(CoeffPos { flat_idx, cost: primary_cost });
-                }
-            }
-        }
-    }
-
-    Ok((primary, verify))
-}
-
-/// T3.2.D — compute stego positions by merging cached cover positions
-/// (for clean blocks) with freshly-recomputed stego costs (for dirty
-/// blocks).
-///
-/// A block at (br, bc) is **dirty** iff some modification's 23x23
-/// wavelet impact region intersects this block's 23x23 cost-evaluation
-/// region. Geometrically: `∃ m ∈ modifications: |br − m.br| ≤ 2 AND
-/// |bc − m.bc| ≤ 2`. For every CLEAN block, `stego_wavelets[k] ==
-/// cover_wavelets[k]` at every k in the block's impact region (proven
-/// by linearity + locality of the 16-tap wavelet filter), so
-/// `compute_coefficient_cost(basis, stego_wavelets, ...)` would
-/// produce the same value as on cover.
-///
-/// Output: position-for-position equal to
-/// `compute_positions_from_wavelets(stego_grid, qt, &stego.as_cache(),
-/// si)`. Bit-exactness is gated by `dirty_recost_matches_full_recompute`.
-///
-/// It equals the DECODER's `compute_positions_streaming(stego_grid, qt,
-/// None)` only when (a) `modifications` lists EVERY coefficient that
-/// differs between the cover and `grid` (not just the STC flips — the
-/// shadow LSB writes too), (b) `stego_wavelets` comes from
-/// [`StegoWavelets::compute_exact`], and (c) `cached_cover_positions`
-/// are the cover's no-SI positions. The Ghost shadow verify relies on
-/// that; it is gated by `tests/shadow_verify_decoder_parity.rs`.
-///
-/// Performance: at typical Ghost modification rates (~0.13%
-/// per-coefficient = ~1.6% per-block), the dirty fraction is ~30%.
-/// This path skips the ~70% clean-block per-coefficient cost
-/// computations, plus shares the cover-side wavelet decomposition
-/// (the bulk f32 work) across all cascade iterations.
-pub fn compute_positions_with_dirty_recost(
-    grid: &DctGrid,
-    qt: &QuantTable,
-    cached_cover_positions: &[CoeffPos],
-    modifications: &[u32],
-    stego_wavelets: &StegoWavelets,
-    si: Option<(&SideInfo, &DctGrid)>,
-) -> Result<Vec<CoeffPos>, StegoError> {
-    let bw = grid.blocks_wide();
-    let bt = grid.blocks_tall();
-    let img_w = stego_wavelets.img_w;
-    let img_h = stego_wavelets.img_h;
-    debug_assert_eq!(img_w, bw * 8);
-    debug_assert_eq!(img_h, bt * 8);
-    let abs_delta = AbsDeltaTable::precompute(qt);
-    let pad = FILT_LEN - 1; // 15
-
-    // Build dirty bitmap (one bool per block — 24 KB at 12 MP).
-    //
-    // The dirty neighborhood is ASYMMETRIC: br_coef ∈ [br_m−1, br_m+4],
-    // bc_coef ∈ [bc_m−1, bc_m+4]. 6×6 = 36 blocks per modification.
-    //
-    // Derivation: `compute_coefficient_cost` reads cover wavelets at
-    // abs_x ∈ [bc*8 − 15, bc*8 + 7] (NOTE: this is offset −8 from the
-    // geometric impact-region center bc*8 + 3.5 — the cost-formula's
-    // src_col = out_c + k − 14 convention makes it read positions to
-    // the LEFT of the basis block). The modification's wavelet delta
-    // (via the full mirror-aware filter) is non-zero at abs_x ∈
-    // [bc_m*8 − 8, bc_m*8 + 22] (worst case, including bottom/right
-    // mirror extensions). Intersection non-empty ⇒ bc − bc_m ≤ 4 AND
-    // bc_m − bc ≤ 1.
-    let mut dirty = vec![false; bt * bw];
-    for &flat_idx in modifications {
-        let block_idx = (flat_idx as usize) / 64;
-        let m_br = (block_idx / bw) as isize;
-        let m_bc = (block_idx % bw) as isize;
-        for dbr in -1isize..=4 {
-            for dbc in -1isize..=4 {
-                let br = m_br + dbr;
-                let bc = m_bc + dbc;
-                if br >= 0 && br < bt as isize && bc >= 0 && bc < bw as isize {
-                    dirty[(br as usize) * bw + (bc as usize)] = true;
-                }
-            }
-        }
-    }
-
-    // Precompute block_start[bi] = index in cached_cover_positions
-    // where block bi's positions begin. block_start[bt*bw] = end of
-    // the vec. Single sequential pass — enables parallel per-block
-    // emit without binary-searching the cover positions vec.
-    let n_blocks = bt * bw;
-    let mut block_start: Vec<usize> = vec![0; n_blocks + 1];
-    let mut idx = 0usize;
-    for bi in 0..n_blocks {
-        block_start[bi] = idx;
-        let block_end_flat = ((bi + 1) * 64) as u32;
-        while idx < cached_cover_positions.len()
-            && cached_cover_positions[idx].flat_idx < block_end_flat
-        {
-            idx += 1;
-        }
-    }
-    block_start[n_blocks] = idx;
-
-    // T3 progress instrumentation — emit
-    // DIRTY_RECOST_PROGRESS_STEPS sub-steps spread across the
-    // per-block parallel emit loop. Same race-tolerant pattern as
-    // `compute_positions_from_wavelets`.
-    use std::sync::atomic::AtomicU64;
-    let counter = AtomicU64::new(0);
-    let n_blocks_u64 = n_blocks as u64;
-    let n_steps_u64 = DIRTY_RECOST_PROGRESS_STEPS as u64;
-
-    // Per-block emit: dirty → recompute; clean → copy. Same inner
-    // per-coefficient logic as compute_positions_from_wavelets, but
-    // gated by the dirty bitmap.
-    let emit_block = |bi: usize| -> Vec<CoeffPos> {
-        let br = bi / bw;
-        let bc = bi % bw;
-        let out = if dirty[bi] {
-            let blk = grid.block(br, bc);
-            let mut out: Vec<CoeffPos> = Vec::with_capacity(63);
-            for fi in 0..8 {
-                for fj in 0..8 {
-                    if fi == 0 && fj == 0 {
-                        continue;
-                    }
-                    let coeff = blk[fi * 8 + fj];
-                    if coeff == 0 {
-                        continue;
-                    }
-                    let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                    let cost = compute_coefficient_cost_precomputed(
-                        abs_lh, abs_hl, abs_hh,
-                        &stego_wavelets.inner,
-                        br,
-                        bc,
-                        img_w,
-                        img_h,
-                        pad,
-                    );
-                    // Same keep/drop predicate as the streaming path
-                    // (f64 `> 0 && finite`, then f32 finite) so a dirty
-                    // block yields exactly the decoder's position set.
-                    if !(cost > 0.0 && cost.is_finite()) {
-                        continue;
-                    }
-                    let cost = cost as f32;
-                    if !cost.is_finite() {
-                        continue;
-                    }
-                    let flat_idx = ((br * bw + bc) * 64 + fi * 8 + fj) as u32;
-                    let final_cost = if let Some((side_info, cover_grid)) = si {
-                        let cover_coef = cover_grid.get(br, bc, fi, fj);
-                        if cover_coef.abs() == 1 {
-                            cost
-                        } else {
-                            let error = side_info.error_at(flat_idx as usize);
-                            let factor = 1.0f32 - 2.0 * error.abs();
-                            (cost * factor).max(MIN_SI_COST_F32)
-                        }
-                    } else {
-                        cost
-                    };
-                    out.push(CoeffPos { flat_idx, cost: final_cost });
-                }
-            }
-            out
+        let src = symmetric_index(y, img_h);
+        let dst = i * pw + PIX_MARGIN;
+        if src >= in0 && src < in1 {
+            let s = (src as isize - py0) as usize * pw + PIX_MARGIN;
+            pix.copy_within(s..s + img_w, dst);
         } else {
-            cached_cover_positions[block_start[bi]..block_start[bi + 1]].to_vec()
-        };
-
-        // Emit progress when this block crosses a sub-step boundary.
-        if n_blocks_u64 > 0 {
-            let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let target = count * n_steps_u64 / n_blocks_u64;
-            let prev_target = (count - 1) * n_steps_u64 / n_blocks_u64;
-            if target > prev_target {
-                progress::advance();
+            // Mirror row outside this row range (only for strips of
+            // unusual geometry): decode it on its own. Same IDCT, same
+            // values.
+            let (br, r) = (src / 8, src % 8);
+            for bc in 0..bw {
+                let q: [i16; 64] = grid.block(br, bc).try_into().unwrap();
+                let block_pixels = idct_block(&q, &qt.values);
+                for c in 0..8 {
+                    pix[dst + bc * 8 + c] = block_pixels[r * 8 + c] as f32;
+                }
             }
         }
+    }
 
+    // 3. Columns left / right of the image, every row.
+    fill_column_margins(pix, img_w);
+}
+
+/// Fill the `PIX_MARGIN` columns on both sides of every padded row from its
+/// in-image samples, by half-sample symmetry.
+fn fill_column_margins(pix: &mut [f32], img_w: usize) {
+    let pw = img_w + 2 * PIX_MARGIN;
+    for row in pix.chunks_mut(pw) {
+        for xp in (0..PIX_MARGIN).chain(PIX_MARGIN + img_w..pw) {
+            let sx = symmetric_index(xp as isize - PIX_MARGIN as isize, img_w);
+            row[xp] = row[PIX_MARGIN + sx];
+        }
+    }
+}
+
+/// LH / HL / HH subbands for plane rows `[wy0, wy1)` from the padded pixel
+/// rows `[wy0 − 7, wy1 + 8)` (`pix`, as built by [`padded_pixel_rows`]).
+///
+/// Row pass: each pixel row → `stride` row-filtered samples, one
+/// [`super::uniward_simd::dot_product_16_taps`] per sample (pinned
+/// pair-wise f64 tree). Column pass: each output row accumulates its 16
+/// source rows in tap order through
+/// [`super::uniward_simd::saxpy_inner`] (f64, no FMA). Both kernels are
+/// bit-identical across NEON / AVX / SIMD128 / scalar, and every sample's
+/// arithmetic is independent of which rows the call covers.
+fn padded_subbands_from_pixels(pix: &[f32], img_w: usize, wy0: isize, wy1: isize) -> PaddedSubbands {
+    let pw = img_w + 2 * PIX_MARGIN;
+    let stride = img_w + 2 * WAV_MARGIN;
+    let n_pix_rows = pix.len() / pw;
+    let n_out = (wy1 - wy0) as usize;
+    debug_assert_eq!(n_pix_rows, n_out + FILT_LEN - 1, "pixel rows must be [wy0-7, wy1+8)");
+    let lp = lpdf();
+
+    let row_pass = |filter: &[f64; 16]| -> Vec<f32> {
+        let mut out = vec![0.0f32; stride * n_pix_rows];
+        row_filter_into(pix, img_w, filter, &mut out);
+        out
+    };
+    let col_pass = |rows: &[f32], filter: &[f64; 16]| -> Vec<f32> {
+        let mut out = vec![0.0f32; stride * n_out];
+        col_filter_into(rows, stride, filter, &mut out, |v| v);
         out
     };
 
     #[cfg(feature = "parallel")]
-    let result: Vec<CoeffPos> = (0..n_blocks)
-        .into_par_iter()
-        .map(emit_block)
-        .flatten()
-        .collect();
+    let (lh, hl, hh) = {
+        let (row_low, row_high) = rayon::join(|| row_pass(&lp), || row_pass(&HPDF));
+        let (lh, (hl, hh)) = rayon::join(
+            || col_pass(&row_low, &HPDF),
+            || rayon::join(|| col_pass(&row_high, &lp), || col_pass(&row_high, &HPDF)),
+        );
+        (lh, hl, hh)
+    };
+    // Sequential: drop intermediates early (WASM path).
     #[cfg(not(feature = "parallel"))]
-    let result: Vec<CoeffPos> = (0..n_blocks).flat_map(emit_block).collect();
+    let (lh, hl, hh) = {
+        let row_low = row_pass(&lp);
+        let lh = col_pass(&row_low, &HPDF);
+        drop(row_low);
+        let row_high = row_pass(&HPDF);
+        let hl = col_pass(&row_high, &lp);
+        let hh = col_pass(&row_high, &HPDF);
+        (lh, hl, hh)
+    };
 
-    Ok(result)
+    PaddedSubbands { lh, hl, hh, stride, y0: wy0, rows: n_out }
 }
 
-/// Compute UNIWARD costs strip-by-strip and collect embeddable positions directly.
+/// Row pass: padded pixel row `r` of `pix` (`img_w + 2·PIX_MARGIN`
+/// samples) → row `r` of `out` (`img_w + 2·WAV_MARGIN` row-filtered
+/// samples), one [`super::uniward_simd::dot_product_16_taps`] per sample.
+fn row_filter_into(pix: &[f32], img_w: usize, filter: &[f64; 16], out: &mut [f32]) {
+    let pw = img_w + 2 * PIX_MARGIN;
+    let stride = img_w + 2 * WAV_MARGIN;
+    debug_assert_eq!(out.len() / stride, pix.len() / pw);
+    let body = |r: usize, o: &mut [f32]| {
+        let src = &pix[r * pw..(r + 1) * pw];
+        for (i, v) in o.iter_mut().enumerate() {
+            let s = i + ROW_TAP0;
+            *v = super::uniward_simd::dot_product_16_taps(&src[s..s + FILT_LEN], filter) as f32;
+        }
+    };
+    #[cfg(feature = "parallel")]
+    out.par_chunks_mut(stride).enumerate().for_each(|(r, o)| body(r, o));
+    #[cfg(not(feature = "parallel"))]
+    out.chunks_mut(stride).enumerate().for_each(|(r, o)| body(r, o));
+}
+
+/// Column pass: output row `o` of `out` accumulates row-filtered rows
+/// `o .. o + 16` of `rows` (plane rows `o − 7 ..= o + 8` relative to the
+/// output) in tap order through [`super::uniward_simd::saxpy_inner`] (f64,
+/// no FMA); each sample is rounded to f32 and stored as `emit(sample)`.
+fn col_filter_into<T: Send>(rows: &[f32], stride: usize, filter: &[f64; 16], out: &mut [T], emit: impl Fn(f32) -> T + Sync) {
+    debug_assert!(rows.len() >= out.len() + (FILT_LEN - 1) * stride);
+    let body = |scratch: &mut [f64], o: usize, dst: &mut [T]| {
+        scratch.fill(0.0);
+        for (k, &f) in filter.iter().enumerate() {
+            let r = o + k;
+            super::uniward_simd::saxpy_inner(scratch, &rows[r * stride..(r + 1) * stride], f);
+        }
+        for (d, &s) in dst.iter_mut().zip(scratch.iter()) {
+            *d = emit(s as f32);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    out.par_chunks_mut(stride).enumerate().for_each_init(
+        || vec![0.0f64; stride],
+        |scratch, (o, dst)| body(scratch.as_mut_slice(), o, dst),
+    );
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut scratch = vec![0.0f64; stride];
+        out.chunks_mut(stride).enumerate().for_each(|(o, dst)| body(&mut scratch, o, dst));
+    }
+}
+
+/// Subbands for plane rows `[wy0, wy1)` of `grid` (all columns, margins
+/// included).
+fn padded_subbands(grid: &DctGrid, qt: &QuantTable, wy0: isize, wy1: isize) -> PaddedSubbands {
+    let n_pix_rows = (wy1 - wy0) as usize + FILT_LEN - 1;
+    let pix = padded_pixel_rows(grid, qt, wy0 - FILT_HALF, n_pix_rows);
+    padded_subbands_from_pixels(&pix, grid.blocks_wide() * 8, wy0, wy1)
+}
+
+/// The whole image's subbands, margins included: rows
+/// `[−WAV_MARGIN, img_h + WAV_MARGIN)`.
+fn whole_image_subbands(grid: &DctGrid, qt: &QuantTable) -> PaddedSubbands {
+    let img_h = (grid.blocks_tall() * 8) as isize;
+    padded_subbands(grid, qt, -(WAV_MARGIN as isize), img_h + WAV_MARGIN as isize)
+}
+
+/// Window rows `[wy0, wy1)` the blocks of block rows `[br0, br1)` read.
+#[inline]
+fn window_rows_for_block_rows(br0: usize, br1: usize) -> (isize, isize) {
+    let wy0 = (br0 * 8) as isize - WINDOW_ORIGIN as isize;
+    let wy1 = ((br1 - 1) * 8) as isize - WINDOW_ORIGIN as isize + IMPACT_SIZE as isize;
+    (wy0, wy1)
+}
+
+// ============================================================================
+// Cost kernel
+// ============================================================================
+
+/// One window row: `Σ_c (|Δlh|/(|Wlh|+σ) + |Δhl|/(|Whl|+σ)) + |Δhh|/(|Whh|+σ)`
+/// over the 23 cells, accumulated into `cost`.
 ///
-/// This is the memory-optimized path for large images. Instead of materializing
-/// the full CostMap (800 MB for 200 MP), it processes the image in horizontal
-/// strips, computing wavelet subbands and costs per strip, extracting positions
-/// immediately, and freeing strip memory before the next strip.
+/// Sum order (identical on every path): per cell `(lh + hl) + hh`, cells
+/// paired `cost += cell0 + cell1` for `(0,1) (2,3) … (20,21)`, then the
+/// 1-cell tail `cost += cell22`. The NEON / SIMD128 / SSE2 blocks compute
+/// the two cells of a pair in two f64 lanes and add `lane0 + lane1`, which
+/// is exactly the scalar order — no FMA, no reduction tree.
+#[inline(always)]
+fn accumulate_window_row(
+    cost: &mut f64,
+    d_lh: &[f64],
+    d_hl: &[f64],
+    d_hh: &[f64],
+    w_lh: &[f32],
+    w_hl: &[f32],
+    w_hh: &[f32],
+) {
+    let n = IMPACT_SIZE;
+    let (d_lh, d_hl, d_hh) = (&d_lh[..n], &d_hl[..n], &d_hh[..n]);
+    let (w_lh, w_hl, w_hh) = (&w_lh[..n], &w_hl[..n], &w_hh[..n]);
+    let mut c = 0usize;
+
+    // NEON 2-lane f64 path on aarch64.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        use core::arch::aarch64::*;
+        let sigma_v = vdupq_n_f64(SIGMA);
+        while c + 1 < n {
+            // In bounds: c + 1 < n = slice length.
+            let v_lh_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(vld1_f32(w_lh.as_ptr().add(c)))), sigma_v);
+            let v_hl_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(vld1_f32(w_hl.as_ptr().add(c)))), sigma_v);
+            let v_hh_w = vaddq_f64(vabsq_f64(vcvt_f64_f32(vld1_f32(w_hh.as_ptr().add(c)))), sigma_v);
+            let v_div_lh = vdivq_f64(vld1q_f64(d_lh.as_ptr().add(c)), v_lh_w);
+            let v_div_hl = vdivq_f64(vld1q_f64(d_hl.as_ptr().add(c)), v_hl_w);
+            let v_div_hh = vdivq_f64(vld1q_f64(d_hh.as_ptr().add(c)), v_hh_w);
+            let v_partial = vaddq_f64(vaddq_f64(v_div_lh, v_div_hl), v_div_hh);
+            let lane0 = vgetq_lane_f64(v_partial, 0);
+            let lane1 = vgetq_lane_f64(v_partial, 1);
+            *cost += lane0 + lane1;
+            c += 2;
+        }
+    }
+
+    // WASM SIMD128 2-lane f64 path. Phasm's wasm bridges enable
+    // `+simd128` in `.cargo/config.toml`, so this gate fires for the
+    // deployed phasm.app build.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    unsafe {
+        use core::arch::wasm32::*;
+        let sigma_v = f64x2_splat(SIGMA);
+        while c + 1 < n {
+            // `v128_load64_zero` reads 2 f32 into the low half;
+            // `f64x2_promote_low_f32x4` widens them to 2 f64.
+            let v_lh_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(
+                v128_load64_zero(w_lh.as_ptr().add(c) as *const u64))), sigma_v);
+            let v_hl_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(
+                v128_load64_zero(w_hl.as_ptr().add(c) as *const u64))), sigma_v);
+            let v_hh_w = f64x2_add(f64x2_abs(f64x2_promote_low_f32x4(
+                v128_load64_zero(w_hh.as_ptr().add(c) as *const u64))), sigma_v);
+            let v_div_lh = f64x2_div(v128_load(d_lh.as_ptr().add(c) as *const v128), v_lh_w);
+            let v_div_hl = f64x2_div(v128_load(d_hl.as_ptr().add(c) as *const v128), v_hl_w);
+            let v_div_hh = f64x2_div(v128_load(d_hh.as_ptr().add(c) as *const v128), v_hh_w);
+            let v_partial = f64x2_add(f64x2_add(v_div_lh, v_div_hl), v_div_hh);
+            let lane0 = f64x2_extract_lane::<0>(v_partial);
+            let lane1 = f64x2_extract_lane::<1>(v_partial);
+            *cost += lane0 + lane1;
+            c += 2;
+        }
+    }
+
+    // SSE2 2-lane f64 path on x86_64 (baseline on every x86_64 chip).
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let sigma_v = _mm_set1_pd(SIGMA);
+        // Bitmask for f64 |.|: clear sign bit (bit 63).
+        let abs_mask = _mm_castsi128_pd(_mm_set1_epi64x(0x7FFF_FFFF_FFFF_FFFF));
+        while c + 1 < n {
+            // Load 2 f32 per subband (64-bit load), widen to f64.
+            let v_lh_f32 = _mm_castsi128_ps(_mm_loadl_epi64(w_lh.as_ptr().add(c) as *const __m128i));
+            let v_hl_f32 = _mm_castsi128_ps(_mm_loadl_epi64(w_hl.as_ptr().add(c) as *const __m128i));
+            let v_hh_f32 = _mm_castsi128_ps(_mm_loadl_epi64(w_hh.as_ptr().add(c) as *const __m128i));
+            let v_lh_w = _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_lh_f32), abs_mask), sigma_v);
+            let v_hl_w = _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_hl_f32), abs_mask), sigma_v);
+            let v_hh_w = _mm_add_pd(_mm_and_pd(_mm_cvtps_pd(v_hh_f32), abs_mask), sigma_v);
+            let v_div_lh = _mm_div_pd(_mm_loadu_pd(d_lh.as_ptr().add(c)), v_lh_w);
+            let v_div_hl = _mm_div_pd(_mm_loadu_pd(d_hl.as_ptr().add(c)), v_hl_w);
+            let v_div_hh = _mm_div_pd(_mm_loadu_pd(d_hh.as_ptr().add(c)), v_hh_w);
+            let v_partial = _mm_add_pd(_mm_add_pd(v_div_lh, v_div_hl), v_div_hh);
+            let lane0 = _mm_cvtsd_f64(v_partial);
+            let lane1 = _mm_cvtsd_f64(_mm_unpackhi_pd(v_partial, v_partial));
+            *cost += lane0 + lane1;
+            c += 2;
+        }
+    }
+
+    // Scalar pairs — every pair on targets without one of the SIMD
+    // blocks above. Same order as the lanes.
+    let cell = |i: usize| -> f64 {
+        let lh = d_lh[i] / ((w_lh[i] as f64).abs() + SIGMA);
+        let hl = d_hl[i] / ((w_hl[i] as f64).abs() + SIGMA);
+        let hh = d_hh[i] / ((w_hh[i] as f64).abs() + SIGMA);
+        (lh + hl) + hh
+    };
+    while c + 1 < n {
+        let lane0 = cell(c);
+        let lane1 = cell(c + 1);
+        *cost += lane0 + lane1;
+        c += 2;
+    }
+    // 1-cell tail (n = 23 is odd).
+    if c < n {
+        *cost += cell(c);
+    }
+}
+
+/// J-UNIWARD cost of one coefficient of block `(br, bc)`, given its |Δ|
+/// slices: the whole 23×23 window, margin samples included (module docs).
+/// The block must lie inside the image and its window rows inside
+/// `wavelets`' row range.
+#[inline]
+fn cost_kernel(
+    abs_lh: &[f64],
+    abs_hl: &[f64],
+    abs_hh: &[f64],
+    wavelets: &PaddedSubbands,
+    br: usize,
+    bc: usize,
+) -> f64 {
+    let x_first = (bc * 8) as isize - WINDOW_ORIGIN as isize;
+    let y_first = (br * 8) as isize - WINDOW_ORIGIN as isize;
+    let mut cost = 0.0;
+    for out_r in 0..IMPACT_SIZE {
+        let i = wavelets.index(x_first, y_first + out_r as isize);
+        let cells = out_r * IMPACT_SIZE..(out_r + 1) * IMPACT_SIZE;
+        accumulate_window_row(
+            &mut cost,
+            &abs_lh[cells.clone()],
+            &abs_hl[cells.clone()],
+            &abs_hh[cells],
+            &wavelets.lh[i..i + IMPACT_SIZE],
+            &wavelets.hl[i..i + IMPACT_SIZE],
+            &wavelets.hh[i..i + IMPACT_SIZE],
+        );
+    }
+    cost
+}
+
+// ---------------------------------------------------------------------------
+// Strip-based streaming UNIWARD: costs without a whole-image CostMap.
+// ---------------------------------------------------------------------------
+
+/// Strip height in block rows for streaming UNIWARD computation.
+/// 50 block rows = 400 pixel rows. Each strip uses ~170 MB peak for a 16K-wide
+/// image (pixels + row-filtered + 3 wavelet subbands + strip CostMap).
+pub(super) const STRIP_BLOCK_ROWS: usize = 50;
+
+/// Minimum cost for SI-modulated coefficients (same as side_info::MIN_SI_COST).
+pub(super) const MIN_SI_COST_F32: f32 = 1e-6;
+
+/// J-UNIWARD cost of a ±1 change for **every** Y AC coefficient, zeros
+/// included (Ghost embedding v3, `ghost::v3`), in flat order
+/// (`block_index · 64 + i · 8 + j`; DC entries are `+∞`).
 ///
-/// Peak memory per strip: ~170 MB for a 16K-wide image (reused across strips).
-/// Output: `Vec<CoeffPos>` with the same positions as `compute_uniward` +
-/// `collect_positions`, in deterministic raster order.
+/// The J-UNIWARD cost depends only on the block's neighbourhood and the
+/// mode `(i, j)`, not on the coefficient's value, so a zero coefficient is
+/// priced exactly like a non-zero one at the same place (as reference
+/// J-UNIWARD does). Same wavelet arithmetic and kernel as [`compute_uniward`],
+/// streamed in strips: the direct-kernel reference of
+/// [`compute_ac_costs_separable`].
 ///
-/// Reports [`UNIWARD_PROGRESS_STEPS`] progress steps and checks for cancellation.
-///
-/// If `si` is `Some`, applies SI-UNIWARD cost modulation inline during position
-/// collection (no separate cost-modulation pass needed).
-pub fn compute_positions_streaming(
-    grid: &DctGrid,
-    qt: &QuantTable,
-    si: Option<(&SideInfo, &DctGrid)>,
-) -> Result<Vec<CoeffPos>, StegoError> {
+/// Memory: 4 B per coefficient (49 MB at 12 MP) plus one strip.
+/// Reports [`UNIWARD_PROGRESS_STEPS`] progress steps.
+pub fn compute_ac_costs_streaming(grid: &DctGrid, qt: &QuantTable) -> Result<Vec<f32>, StegoError> {
     let bw = grid.blocks_wide();
     let bt = grid.blocks_tall();
     let img_w = bw * 8;
-    let img_h = bt * 8;
-    let lpdf = lpdf();
     let abs_delta = AbsDeltaTable::precompute(qt);
-    let pad = FILT_LEN - 1; // 15
+    let mut out = vec![f32::INFINITY; bw * bt * 64];
 
-    // Estimate: ~50% of AC positions are non-zero (typical JPEG).
-    let est_positions = bt * bw * 32;
-    let mut positions: Vec<CoeffPos> = Vec::with_capacity(est_positions);
-
-    // Distribute UNIWARD_PROGRESS_STEPS across strips for smooth progress.
     let num_strips = bt.div_ceil(STRIP_BLOCK_ROWS);
     let mut strip_idx = 0usize;
     let mut steps_sent = 0u32;
 
     for strip_start in (0..bt).step_by(STRIP_BLOCK_ROWS) {
         let strip_end = (strip_start + STRIP_BLOCK_ROWS).min(bt);
+        let (wy0, wy1) = window_rows_for_block_rows(strip_start, strip_end);
+        let pixels = padded_pixel_rows(grid, qt, wy0 - FILT_HALF, (wy1 - wy0) as usize + FILT_LEN - 1);
+        let strip_wavelets = padded_subbands_from_pixels(&pixels, img_w, wy0, wy1);
+        drop(pixels);
 
-        // Wavelet rows needed for blocks in [strip_start, strip_end):
-        // Each block at row br accesses wavelet rows [br*8 - 15, br*8 + 7].
-        let wav_y_start = (strip_start * 8).saturating_sub(pad);
-        let wav_y_end = (strip_end * 8).min(img_h);
-
-        // Pixel/filter-rows needed for wavelet computation (±7 for column filter):
-        let pix_y_start = wav_y_start.saturating_sub(7);
-        let pix_y_end = (wav_y_end + 8).min(img_h);
-
-        // Block rows that contain our pixel range:
-        let pix_br_start = pix_y_start / 8;
-        let pix_br_end = pix_y_end.div_ceil(8).min(bt);
-
-        // Step 1: Decompress pixel strip.
-        let pix_strip_h = (pix_br_end - pix_br_start) * 8;
-        let pix_strip_y0 = pix_br_start * 8; // actual start (block-aligned)
-        let pixels = decompress_strip_pixels(grid, qt, bw, pix_br_start, pix_br_end);
-
-        // Sub-strip progress: advance after pixel decompression (~1/3 of strip work).
-        {
-            let sub_target = (strip_idx as u32 * 3 + 1) * UNIWARD_PROGRESS_STEPS / (num_strips as u32 * 3);
-            while steps_sent < sub_target {
-                progress::advance();
-                steps_sent += 1;
-            }
-        }
-
-        // Step 2: Compute wavelet subbands for the strip.
-        let strip_wavelets = compute_strip_subbands(
-            &pixels, img_w, pix_strip_h, pix_strip_y0,
-            wav_y_start, wav_y_end, img_h, &lpdf,
-        );
-        drop(pixels); // Free pixel strip
-
-        // Sub-strip progress: advance after wavelet computation (~2/3 of strip work).
-        {
-            let sub_target = (strip_idx as u32 * 3 + 2) * UNIWARD_PROGRESS_STEPS / (num_strips as u32 * 3);
-            while steps_sent < sub_target {
-                progress::advance();
-                steps_sent += 1;
-            }
-        }
-
-        // Step 3: Compute costs for blocks in [strip_start, strip_end) and
-        // collect positions. Uses a temporary strip CostMap for parallel safety.
-        let strip_bt = strip_end - strip_start;
-        let n_strip_blocks = strip_bt * bw;
-        let mut strip_map = CostMap::new(bw, strip_bt);
-
-        let total_len = n_strip_blocks * 64;
-        let costs_ptr = CostMapPtr { ptr: strip_map.costs_ptr(), total_len };
-
-        let compute_block = |bi: usize| {
-            let br_local = bi / bw;
+        let strip_out = &mut out[strip_start * bw * 64..strip_end * bw * 64];
+        let compute_block = |(bi, blk_out): (usize, &mut [f32])| {
+            let br = strip_start + bi / bw;
             let bc = bi % bw;
-            let br = strip_start + br_local;
-            let blk = grid.block(br, bc);
-
             for fi in 0..8 {
                 for fj in 0..8 {
-                    if fi == 0 && fj == 0 { continue; }
-                    let coeff = blk[fi * 8 + fj];
-                    if coeff == 0 { continue; }
-
+                    if fi == 0 && fj == 0 {
+                        continue;
+                    }
                     let (abs_lh, abs_hl, abs_hh) = abs_delta.slice_at(fi, fj);
-                    let cost = compute_coefficient_cost_precomputed(
-                        abs_lh, abs_hl, abs_hh, &strip_wavelets,
-                        br, bc, img_w, img_h, pad,
-                    );
-
+                    let cost = cost_kernel(abs_lh, abs_hl, abs_hh, &strip_wavelets, br, bc);
                     if cost > 0.0 && cost.is_finite() {
-                        let idx = br_local * bw * 64 + bc * 64 + fi * 8 + fj;
-                        unsafe { costs_ptr.write(idx, cost as f32); }
+                        blk_out[fi * 8 + fj] = cost as f32;
                     }
                 }
             }
         };
-
         #[cfg(feature = "parallel")]
-        (0..n_strip_blocks).into_par_iter().for_each(compute_block);
-
+        strip_out.par_chunks_mut(64).enumerate().for_each(compute_block);
         #[cfg(not(feature = "parallel"))]
-        (0..n_strip_blocks).for_each(compute_block);
+        strip_out.chunks_mut(64).enumerate().for_each(compute_block);
 
-        // Scan strip CostMap and collect positions.
-        for br_local in 0..strip_bt {
-            let br = strip_start + br_local;
-            for bc in 0..bw {
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let cost_f32 = strip_map.get(br_local, bc, i, j);
-                        if !cost_f32.is_finite() { continue; }
-
-                        let flat_idx = ((br * bw + bc) * 64 + i * 8 + j) as u32;
-
-                        // Apply SI modulation inline if available.
-                        let final_cost = if let Some((side_info, cover_grid)) = si {
-                            let coeff = cover_grid.get(br, bc, i, j);
-                            if coeff.abs() == 1 {
-                                cost_f32
-                            } else {
-                                let error = side_info.error_at(flat_idx as usize);
-                                let factor = 1.0f32 - 2.0 * error.abs();
-                                (cost_f32 * factor).max(MIN_SI_COST_F32)
-                            }
-                        } else {
-                            cost_f32
-                        };
-
-                        positions.push(CoeffPos { flat_idx, cost: final_cost });
-                    }
-                }
-            }
-        }
-        // strip_map and strip_wavelets freed here.
-
-        // Sub-strip progress: advance after cost computation (3/3 of strip work).
         strip_idx += 1;
         let target_steps = (strip_idx as u32 * UNIWARD_PROGRESS_STEPS) / num_strips as u32;
         while steps_sent < target_steps {
@@ -2097,135 +883,504 @@ pub fn compute_positions_streaming(
             progress::check_cancelled()?;
         }
     }
-
-    // Ensure all UNIWARD_PROGRESS_STEPS are sent.
     while steps_sent < UNIWARD_PROGRESS_STEPS {
         progress::advance();
         steps_sent += 1;
     }
-
-    Ok(positions)
+    Ok(out)
 }
 
-/// Decompress a strip of block rows [br_start, br_end) to pixel values (f32).
-fn decompress_strip_pixels(
+/// `|L_k(o)|`, `|H_k(o)|`: the 1-D wavelet responses of the 1-D DCT basis
+/// `a_k(y) = ½·C_k·cos((2y+1)kπ/16)` at window cell `o` (same cell
+/// convention as [`AbsDeltaTable::precompute`]). The 2-D impact of mode
+/// `(i, j)` is separable — `|Δ_LH| = q·|H_i(r)|·|L_j(c)|`, `|Δ_HL| =
+/// q·|L_i(r)|·|H_j(c)|`, `|Δ_HH| = q·|H_i(r)|·|H_j(c)|` — because the DCT
+/// basis and the db8 filters both are.
+fn separable_factors() -> ([[f64; IMPACT_SIZE]; 8], [[f64; IMPACT_SIZE]; 8]) {
+    let lp = lpdf();
+    let src_off = WINDOW_ORIGIN as isize + FILT_HALF;
+    let mut lo = [[0.0f64; IMPACT_SIZE]; 8];
+    let mut hi = [[0.0f64; IMPACT_SIZE]; 8];
+    for k in 0..8 {
+        let ck = if k == 0 { core::f64::consts::FRAC_1_SQRT_2 } else { 1.0 };
+        let mut a = [0.0f64; 8];
+        for (y, v) in a.iter_mut().enumerate() {
+            *v = 0.5 * ck * crate::det_math::det_cos(((2 * y + 1) * k) as f64 * core::f64::consts::PI / 16.0);
+        }
+        for o in 0..IMPACT_SIZE {
+            let (mut sl, mut sh) = (0.0, 0.0);
+            for t in 0..FILT_LEN {
+                let y = o as isize - src_off + t as isize;
+                if (0..8).contains(&y) {
+                    sl += lp[t] * a[y as usize];
+                    sh += HPDF[t] * a[y as usize];
+                }
+            }
+            lo[k][o] = sl.abs();
+            hi[k][o] = sh.abs();
+        }
+    }
+    (lo, hi)
+}
+
+/// Working-set target of the separable cost pass ([`cost_strip_rows`]).
+const COST_STRIP_BYTES: usize = 8 << 20;
+
+/// Fewest block rows per strip: each strip is a few rounds of parallel
+/// joins, and one or two block rows per strip cost ~10 % more CPU at 48 MP.
+const MIN_STRIP_BLOCK_ROWS: usize = 4;
+
+/// What one cost strip actually holds at its peak (measured 50-54 MB at
+/// 12-110 MP), with margin: the memory plan charges this for a cost pass.
+pub const COST_STRIP_WORKING_BYTES: usize = 64 << 20;
+
+/// Block rows per strip of the separable cost pass, so that its buffers
+/// ([`CostStripBuffers`], sized by the first strip) stay near
+/// [`COST_STRIP_BYTES`], but at least [`MIN_STRIP_BLOCK_ROWS`]: 4 block
+/// rows at 12 MP (7.5 MB of buffers) and at 48 MP (15 MB). Costs do not
+/// depend on it.
+///
+/// The buffers are allocated once per pass and every strip reuses them, so
+/// their size is what the pass leaves behind in an allocator that keeps
+/// freed blocks resident (libmalloc's large-allocation cache on macOS /
+/// iOS: the lanes that follow cannot reuse them). With the 15 carried rows
+/// a smaller strip costs no extra filtering, only one more round of
+/// parallel joins.
+pub fn cost_strip_rows(blocks_wide: usize) -> usize {
+    let bw = blocks_wide.max(1);
+    let stride = bw * 8 + 2 * WAV_MARGIN;
+    // First strip of R block rows: pixels and row-filtered rows 8R + 30
+    // (4 + 2·4 B), reciprocals 8R + 15 (3·8 B), costs R·bw·64 (4 B).
+    let fixed = 30 * 12 * stride + 15 * 24 * stride;
+    let per_row = 8 * 36 * stride + 256 * bw;
+    (COST_STRIP_BYTES.saturating_sub(fixed) / per_row).clamp(MIN_STRIP_BLOCK_ROWS, STRIP_BLOCK_ROWS)
+}
+
+/// Working buffers of the separable cost pass, kept for all of its strips
+/// (allocated at the first strip's size, which no later strip exceeds).
+///
+/// Consecutive strips overlap by 15 window rows (a block's window reaches 8
+/// rows above and 14 below it) and their column filters by 15 row-filtered
+/// rows: those rows are carried over to the next strip instead of being
+/// recomputed. A wavelet sample has the same value whichever row range it
+/// is computed in (see [`PaddedSubbands`]), so the costs are bit-identical
+/// to computing every strip on its own.
+#[derive(Default)]
+struct CostStripBuffers {
+    /// Padded pixel rows of the current strip's new row-filtered rows.
+    pix: Vec<f32>,
+    /// Row-filtered (low-pass / high-pass) rows from plane row `rows_y0`.
+    row_lo: Vec<f32>,
+    row_hi: Vec<f32>,
+    rows_y0: isize,
+    /// `1 / (|W_b| + σ)` of the three subbands from plane row `r_y0`.
+    r_lh: Vec<f64>,
+    r_hl: Vec<f64>,
+    r_hh: Vec<f64>,
+    r_y0: isize,
+    /// The current strip's costs (flat order).
+    out: Vec<f32>,
+}
+
+/// Keep the rows of `v` (rows of `stride` samples from plane row `y0`) from
+/// plane row `from` on, moved to the front; none if `from` is not among
+/// them.
+fn keep_rows_from<T: Copy>(v: &mut Vec<T>, y0: isize, stride: usize, from: isize) {
+    let n = (v.len() / stride) as isize;
+    if from >= y0 && from < y0 + n {
+        let s = (from - y0) as usize * stride;
+        v.copy_within(s.., 0);
+        v.truncate(v.len() - s);
+    } else {
+        v.clear();
+    }
+}
+
+/// The separable cost pass strip by strip: `sink(first_flat_index, costs)`
+/// receives every strip's costs (flat order, `rows` block rows at a time,
+/// DC entries `+∞`) and may stop the pass with an error. Bounded memory: one
+/// strip, whatever the image size.
+pub fn ac_cost_strips(
     grid: &DctGrid,
     qt: &QuantTable,
-    bw: usize,
-    br_start: usize,
-    br_end: usize,
-) -> Vec<f32> {
+    rows: usize,
+    sink: impl FnMut(usize, &[f32]) -> Result<(), StegoError>,
+) -> Result<(), StegoError> {
+    ac_cost_strips_range(grid, qt, rows, 0, grid.blocks_tall(), sink)
+}
+
+/// [`ac_cost_strips`] over block rows `[br0, br1)` of `grid` only (`sink`
+/// gets flat indices of `grid`). A block's cost depends only on the pixels
+/// within 15 rows of it (two block rows), so a band of an image computed
+/// from a sub-grid holding the band and two block rows on either side
+/// (fewer at the image's own edges) has exactly the whole image's costs
+/// ([`ac_cost_band`]).
+pub fn ac_cost_strips_range(
+    grid: &DctGrid,
+    qt: &QuantTable,
+    rows: usize,
+    br0: usize,
+    br1: usize,
+    mut sink: impl FnMut(usize, &[f32]) -> Result<(), StegoError>,
+) -> Result<(), StegoError> {
+    let bw = grid.blocks_wide();
     let img_w = bw * 8;
-    let strip_h = (br_end - br_start) * 8;
-    let mut pixels = vec![0.0f32; img_w * strip_h];
+    let stride = img_w + 2 * WAV_MARGIN;
+    let (lo, hi) = separable_factors();
+    let lp = lpdf();
+    let rows = rows.max(1);
+    let recip = |x: f32| -> f64 { 1.0 / ((x as f64).abs() + SIGMA) };
+    let mut b = CostStripBuffers::default();
 
-    for br in br_start..br_end {
-        for bc in 0..bw {
-            let block = grid.block(br, bc);
-            let quantized: [i16; 64] = block.try_into().unwrap();
-            let block_pixels = idct_block(&quantized, &qt.values);
+    for strip_start in (br0..br1.min(grid.blocks_tall())).step_by(rows) {
+        let strip_end = (strip_start + rows).min(br1);
+        let (wy0, wy1) = window_rows_for_block_rows(strip_start, strip_end);
 
-            for row in 0..8 {
-                for col in 0..8 {
-                    let py = (br - br_start) * 8 + row;
-                    let px = bc * 8 + col;
-                    pixels[py * img_w + px] = block_pixels[row * 8 + col] as f32;
+        // Reciprocal rows [wy0, wy1): the previous strip's last ones, then
+        // the new rows [c0, wy1).
+        for v in [&mut b.r_lh, &mut b.r_hl, &mut b.r_hh] {
+            keep_rows_from(v, b.r_y0, stride, wy0);
+        }
+        b.r_y0 = wy0;
+        let c0 = wy0 + (b.r_lh.len() / stride) as isize;
+        // They read the row-filtered rows [c0 − 7, wy1 + 8): the carried
+        // ones, then new rows [p0, p1) from as many new pixel rows.
+        let rows_from = c0 - FILT_HALF;
+        for v in [&mut b.row_lo, &mut b.row_hi] {
+            keep_rows_from(v, b.rows_y0, stride, rows_from);
+        }
+        b.rows_y0 = rows_from;
+        let p0 = rows_from + (b.row_lo.len() / stride) as isize;
+        let p1 = wy1 + (FILT_LEN as isize - 1 - FILT_HALF);
+        let n_pix = (p1 - p0) as usize;
+        padded_pixel_rows_into(&mut b.pix, grid, qt, p0, n_pix);
+        let l0 = b.row_lo.len();
+        b.row_lo.resize(l0 + n_pix * stride, 0.0);
+        b.row_hi.resize(l0 + n_pix * stride, 0.0);
+        let o0 = b.r_lh.len();
+        let n_new = (wy1 - c0) as usize * stride;
+        for v in [&mut b.r_lh, &mut b.r_hl, &mut b.r_hh] {
+            v.resize(o0 + n_new, 0.0);
+        }
+        {
+            let CostStripBuffers { pix, row_lo, row_hi, r_lh, r_hl, r_hh, .. } = &mut b;
+            let (pix, lo_new, hi_new) = (&pix[..], &mut row_lo[l0..], &mut row_hi[l0..]);
+            let (rlh, rhl, rhh) = (&mut r_lh[o0..], &mut r_hl[o0..], &mut r_hh[o0..]);
+            #[cfg(feature = "parallel")]
+            {
+                rayon::join(|| row_filter_into(pix, img_w, &lp, lo_new), || row_filter_into(pix, img_w, &HPDF, hi_new));
+                let (row_lo, row_hi) = (&row_lo[..], &row_hi[..]);
+                rayon::join(
+                    || col_filter_into(row_lo, stride, &HPDF, rlh, recip),
+                    || rayon::join(|| col_filter_into(row_hi, stride, &lp, rhl, recip), || col_filter_into(row_hi, stride, &HPDF, rhh, recip)),
+                );
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                row_filter_into(pix, img_w, &lp, lo_new);
+                row_filter_into(pix, img_w, &HPDF, hi_new);
+                col_filter_into(row_lo, stride, &HPDF, rlh, recip);
+                col_filter_into(row_hi, stride, &lp, rhl, recip);
+                col_filter_into(row_hi, stride, &HPDF, rhh, recip);
+            }
+        }
+
+        b.out.clear();
+        b.out.resize((strip_end - strip_start) * bw * 64, f32::INFINITY);
+        let ctx = StripCtx { stride, y0: wy0, r_lh: &b.r_lh, r_hl: &b.r_hl, r_hh: &b.r_hh, lo: &lo, hi: &hi, qt, strip_start, bw };
+        let compute_block = |(bi, blk_out): (usize, &mut [f32])| ctx.block(bi, blk_out);
+        #[cfg(feature = "parallel")]
+        b.out.par_chunks_mut(64).enumerate().for_each(compute_block);
+        #[cfg(not(feature = "parallel"))]
+        b.out.chunks_mut(64).enumerate().for_each(compute_block);
+        sink(strip_start * bw * 64, &b.out)?;
+    }
+    Ok(())
+}
+
+/// What one strip's blocks read.
+struct StripCtx<'a> {
+    /// Samples per reciprocal row, and the plane row of the first one.
+    stride: usize,
+    y0: isize,
+    r_lh: &'a [f64],
+    r_hl: &'a [f64],
+    r_hh: &'a [f64],
+    lo: &'a [[f64; IMPACT_SIZE]; 8],
+    hi: &'a [[f64; IMPACT_SIZE]; 8],
+    qt: &'a QuantTable,
+    strip_start: usize,
+    bw: usize,
+}
+
+impl StripCtx<'_> {
+    /// The 63 AC costs of the strip's block `bi` into `blk_out` (left `+∞`
+    /// where not positive and finite).
+    ///
+    /// Not inlined on wasm32: V8 runs a function in baseline code (Liftoff)
+    /// until its next call, with no on-stack replacement for Wasm, and the
+    /// whole pass is one call; per block, the kernel is optimized after a
+    /// few hundred blocks.
+    #[cfg_attr(target_arch = "wasm32", inline(never))]
+    fn block(&self, bi: usize, blk_out: &mut [f32]) {
+        const N: usize = IMPACT_SIZE;
+        let (lo, hi) = (self.lo, self.hi);
+        let br = self.strip_start + bi / self.bw;
+        let bc = bi % self.bw;
+        let x_first = (bc * 8) as isize - WINDOW_ORIGIN as isize;
+        let y_first = (br * 8) as isize - WINDOW_ORIGIN as isize;
+        // T_b[r][j] = Σ_c R_b[r][c] · V_b[j][c]
+        let mut t_lh = [[0.0f64; 8]; N];
+        let mut t_hl = [[0.0f64; 8]; N];
+        let mut t_hh = [[0.0f64; 8]; N];
+        for r in 0..N {
+            let y = y_first + r as isize;
+            debug_assert!(y >= self.y0 && (y - self.y0) as usize * self.stride < self.r_lh.len(), "row {y} not in strip");
+            let i0 = (y - self.y0) as usize * self.stride + (x_first + WAV_MARGIN as isize) as usize;
+            let (rl, rh, rd) = (&self.r_lh[i0..i0 + N], &self.r_hl[i0..i0 + N], &self.r_hh[i0..i0 + N]);
+            for j in 0..8 {
+                let (mut s1, mut s2, mut s3) = (0.0, 0.0, 0.0);
+                for c in 0..N {
+                    s1 += rl[c] * lo[j][c];
+                    s2 += rh[c] * hi[j][c];
+                    s3 += rd[c] * hi[j][c];
+                }
+                t_lh[r][j] = s1;
+                t_hl[r][j] = s2;
+                t_hh[r][j] = s3;
+            }
+        }
+        for i in 0..8 {
+            for j in 0..8 {
+                if i == 0 && j == 0 {
+                    continue;
+                }
+                let mut s = 0.0;
+                for r in 0..N {
+                    s += hi[i][r] * (t_lh[r][j] + t_hh[r][j]) + lo[i][r] * t_hl[r][j];
+                }
+                let cost = s * self.qt.values[i * 8 + j] as f64;
+                if cost > 0.0 && cost.is_finite() {
+                    blk_out[i * 8 + j] = cost as f32;
                 }
             }
         }
     }
-
-    pixels
 }
 
-/// Compute wavelet subbands for a horizontal strip.
-///
-/// - `pixels`: decompressed pixel strip starting at y = `pix_y0`
-/// - `width`: full image width
-/// - `pix_h`: height of the pixel strip (block-aligned)
-/// - `pix_y0`: absolute y of the first pixel row in the strip
-/// - `wav_y_start`, `wav_y_end`: absolute y range of wavelet output
-/// - `img_h`: full image height (for mirror boundary handling)
-fn compute_strip_subbands(
-    pixels: &[f32],
-    width: usize,
-    pix_h: usize,
-    pix_y0: usize,
-    wav_y_start: usize,
-    wav_y_end: usize,
-    img_h: usize,
-    lpdf: &[f64; 16],
-) -> ThreeSubbands {
-    // Parallel: both row filters + 3 column filters run concurrently.
+/// Block rows a cost band's sub-grid must hold beyond the band on each side
+/// (pixel rows within 15 of the band; see [`ac_cost_strips_range`]).
+pub const COST_BAND_MARGIN_ROWS: usize = 2;
+
+/// The sub-grid [`ac_cost_band`] needs for block rows `[br0, br1)` of `grid`.
+pub fn cost_band_subgrid(grid: &DctGrid, br0: usize, br1: usize) -> DctGrid {
+    let bw = grid.blocks_wide();
+    let g0 = br0.saturating_sub(COST_BAND_MARGIN_ROWS);
+    let g1 = (br1 + COST_BAND_MARGIN_ROWS).min(grid.blocks_tall());
+    let mut sub = DctGrid::new(bw, g1 - g0);
+    sub.coeffs_mut().copy_from_slice(&grid.coeffs()[g0 * bw * 64..g1 * bw * 64]);
+    sub
+}
+
+/// Costs of block rows `[br0, br1)` of an image `blocks_tall` block rows
+/// high, from `sub`: its block rows `[g0, g0 + sub.blocks_tall())` with
+/// `g0 = br0.saturating_sub(COST_BAND_MARGIN_ROWS)` and the end
+/// `min(br1 + COST_BAND_MARGIN_ROWS, blocks_tall)`. Flat order of the band
+/// (`(br1 − br0) · blocks_wide · 64` values, DC `+∞`), bit-identical to the
+/// same rows of [`compute_ac_costs_separable`] on the whole image.
+pub fn ac_cost_band(sub: &DctGrid, qt: &QuantTable, br0: usize, br1: usize, blocks_tall: usize) -> Result<Vec<f32>, StegoError> {
+    let g0 = br0.saturating_sub(COST_BAND_MARGIN_ROWS);
+    let g1 = (br1 + COST_BAND_MARGIN_ROWS).min(blocks_tall);
+    if br0 >= br1 || br1 > blocks_tall || sub.blocks_tall() != g1 - g0 {
+        return Err(StegoError::InvalidJpeg(crate::codec::jpeg::error::JpegError::InvalidDimensions));
+    }
+    let mut out = vec![f32::INFINITY; (br1 - br0) * sub.blocks_wide() * 64];
+    let base0 = (br0 - g0) * sub.blocks_wide() * 64;
+    ac_cost_strips_range(sub, qt, cost_strip_rows(sub.blocks_wide()), br0 - g0, br1 - g0, |base, strip| {
+        out[base - base0..base - base0 + strip.len()].copy_from_slice(strip);
+        progress::check_cancelled()
+    })?;
+    Ok(out)
+}
+
+/// [`compute_ac_costs_streaming`] by the separable factorization of the
+/// impact: per strip `R_b = 1/(σ + |W_b|)` once per wavelet sample, then per
+/// block `C = Σ_b U_bᵀ · R_b(23×23) · V_b` for all 64 modes at once (≈17 k
+/// multiply-adds per block instead of ≈100 k plus 100 k divisions).
+/// Encoder-only (Ghost v3, whose decoder needs no costs): agrees with the
+/// direct kernel to ~1e-12 relative before the f32 cast. Whole-image output
+/// (4 B per coefficient); the encoder uses [`gather_ac_costs`].
+pub fn compute_ac_costs_separable(grid: &DctGrid, qt: &QuantTable) -> Result<Vec<f32>, StegoError> {
+    let bt = grid.blocks_tall();
+    let mut out = vec![f32::INFINITY; grid.blocks_wide() * bt * 64];
+    let num_strips = bt.div_ceil(STRIP_BLOCK_ROWS).max(1);
+    let mut strip_idx = 0usize;
+    let mut steps_sent = 0u32;
+    ac_cost_strips(grid, qt, STRIP_BLOCK_ROWS, |base, strip| {
+        out[base..base + strip.len()].copy_from_slice(strip);
+        strip_idx += 1;
+        let target_steps = (strip_idx as u32 * UNIWARD_PROGRESS_STEPS) / num_strips as u32;
+        while steps_sent < target_steps {
+            progress::advance();
+            steps_sent += 1;
+        }
+        progress::check_cancelled()
+    })?;
+    while steps_sent < UNIWARD_PROGRESS_STEPS {
+        progress::advance();
+        steps_sent += 1;
+    }
+    Ok(out)
+}
+
+/// The separable costs of the coefficients `fis` (flat indices, any order,
+/// repeats allowed): `out[i]` = cost of `fis[i]`, bit-identical to
+/// [`compute_ac_costs_separable`]. One strip pass over the image; memory is
+/// one strip plus 8 B per requested position.
+pub fn gather_ac_costs(grid: &DctGrid, qt: &QuantTable, fis: &[u32]) -> Result<Vec<f32>, StegoError> {
+    gather_ac_costs_parts(grid, qt, fis, &[])
+}
+
+/// The separable costs of every coefficient of `grid` by flat index (DC
+/// entries `+∞`): one strip pass, 4 B per coefficient plus one cost strip.
+/// The same values [`gather_ac_costs`] returns for any request.
+pub fn dense_ac_costs(grid: &DctGrid, qt: &QuantTable) -> Result<Vec<f32>, StegoError> {
+    let mut dense = vec![f32::INFINITY; grid.blocks_wide() * grid.blocks_tall() * 64];
+    ac_cost_strips(grid, qt, cost_strip_rows(grid.blocks_wide()), |base, strip| {
+        dense[base..base + strip.len()].copy_from_slice(strip);
+        progress::check_cancelled()
+    })?;
+    Ok(dense)
+}
+
+/// [`gather_ac_costs`] of `head` followed by `tail` (one output, `head`'s
+/// costs first) without concatenating them: 8 bytes per position (sort
+/// index + output) plus one cost strip.
+pub fn gather_ac_costs_parts(grid: &DctGrid, qt: &QuantTable, head: &[u32], tail: &[u32]) -> Result<Vec<f32>, StegoError> {
+    let total = head.len() + tail.len();
+    let fi_at = |i: usize| -> u32 { if i < head.len() { head[i] } else { tail[i - head.len()] } };
+    // A request about as large as the image (the whole keyed order: every
+    // encode whose costs fit in one group) gathers from the image's dense
+    // costs instead of sorting the request by flat index: the same 8 B per
+    // position (dense costs + output instead of sort index + output), no
+    // sort (a single-threaded sort of 12 M keys took longer than the cost
+    // pass itself on WASM). Same values: both read the same strips.
+    let n_total = grid.blocks_wide() * grid.blocks_tall() * 64;
+    if total + total / 32 >= n_total {
+        let dense = dense_ac_costs(grid, qt)?;
+        return Ok(head.iter().chain(tail).map(|&fi| dense[fi as usize]).collect());
+    }
+    let mut idx: Vec<u32> = (0..total as u32).collect();
     #[cfg(feature = "parallel")]
     {
-        let (row_low, row_high) = rayon::join(
-            || filter_rows(pixels, width, pix_h, lpdf),
-            || filter_rows(pixels, width, pix_h, &HPDF),
-        );
-        let (lh, (hl, hh)) = rayon::join(
-            || filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF),
-            || rayon::join(
-                || filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf),
-                || filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF),
-            ),
-        );
-        ThreeSubbands { lh, hl, hh, width, y_offset: wav_y_start }
+        use rayon::slice::ParallelSliceMut;
+        idx.par_sort_unstable_by_key(|&i| fi_at(i as usize));
     }
-    // Sequential: drop intermediates early (WASM path).
     #[cfg(not(feature = "parallel"))]
-    {
-        let row_low = filter_rows(pixels, width, pix_h, lpdf);
-        let lh = filter_cols_strip(&row_low, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
-        drop(row_low);
-        let row_high = filter_rows(pixels, width, pix_h, &HPDF);
-        let hl = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, lpdf);
-        let hh = filter_cols_strip(&row_high, width, pix_h, pix_y0, wav_y_start, wav_y_end, img_h, &HPDF);
-        ThreeSubbands { lh, hl, hh, width, y_offset: wav_y_start }
-    }
+    idx.sort_unstable_by_key(|&i| fi_at(i as usize));
+    let mut out = vec![f32::INFINITY; total];
+    let mut p = 0usize;
+    ac_cost_strips(grid, qt, cost_strip_rows(grid.blocks_wide()), |base, strip| {
+        let end = base + strip.len();
+        while p < idx.len() {
+            let i = idx[p] as usize;
+            let fi = fi_at(i) as usize;
+            if fi >= end {
+                break;
+            }
+            out[i] = strip[fi - base];
+            p += 1;
+        }
+        progress::check_cancelled()
+    })?;
+    Ok(out)
 }
 
-/// Apply column filter to produce output rows [out_y_start, out_y_end) from
-/// a strip of row-filtered data starting at absolute y = `input_y0`.
+/// T3.3.E — deterministic byte stream for the cost kernel, used by
+/// `cost_kernel_test_hash_hex` to pin the cross-platform hash.
+/// Re-computing this on any supported target MUST yield the same bytes
+/// (and therefore the same SHA256).
 ///
-/// Uses `mirror_index` on the full image height for boundary handling.
-/// The input strip must contain all rows that the filter accesses (guaranteed
-/// by the ±7 row padding in `compute_positions_streaming`).
-fn filter_cols_strip(
-    input: &[f32],
-    width: usize,
-    input_h: usize,
-    input_y0: usize,
-    out_y_start: usize,
-    out_y_end: usize,
-    img_h: usize,
-    filter: &[f64; 16],
-) -> Vec<f32> {
-    let flen = FILT_LEN;
-    let half = (flen - 1) / 2; // 7
-    let out_h = out_y_end - out_y_start;
-    let mut output = vec![0.0f32; width * out_h];
+/// Layout: for each (br, bc, fi, fj) in a fixed iteration order, dump
+/// the f64 cost as 8 little-endian bytes via `f64::to_bits`. The
+/// fixture is 8×8 blocks (64×64 px): the outer block ring's windows
+/// reach into the 8-sample margin, the inner 6×6 blocks' do not, so the
+/// hash covers the padded decomposition (pixel padding, row and column
+/// passes) as well as the kernel.
+#[doc(hidden)]
+pub fn cost_kernel_test_deterministic_bytes() -> Vec<u8> {
+    let (cover, qt) = cost_kernel_test_fixture();
+    let wavelets = whole_image_subbands(&cover, &qt);
+    let table = AbsDeltaTable::precompute(&qt);
 
-    for out_idx in 0..out_h {
-        let abs_y = out_y_start + out_idx;
-        for x in 0..width {
-            let mut sum = 0.0f64;
-            for k in 0..flen {
-                let sy_abs = abs_y as isize + k as isize - half as isize;
-                let sy_mirrored = mirror_index(sy_abs, img_h);
-                // Map to strip-local index. The strip must contain this row.
-                let sy_local = sy_mirrored - input_y0;
-                debug_assert!(
-                    sy_local < input_h,
-                    "strip col filter OOB: abs_y={abs_y} k={k} sy_abs={sy_abs} sy_mirrored={sy_mirrored} input_y0={input_y0} input_h={input_h}"
-                );
-                sum += input[sy_local * width + x] as f64 * filter[k];
+    let mut bytes = Vec::with_capacity(8 * 8 * 63 * 8);
+    for br in 0..8 {
+        for bc in 0..8 {
+            for fi in 0..8 {
+                for fj in 0..8 {
+                    if fi == 0 && fj == 0 {
+                        continue;
+                    }
+                    let (abs_lh, abs_hl, abs_hh) = table.slice_at(fi, fj);
+                    let cost = cost_kernel(abs_lh, abs_hl, abs_hh, &wavelets, br, bc);
+                    bytes.extend_from_slice(&cost.to_bits().to_le_bytes());
+                }
             }
-            output[out_idx * width + x] = sum as f32;
         }
     }
+    bytes
+}
 
-    output
+/// The 8×8-block fixture of the pinned cost-kernel hashes (same grid for
+/// v2 and the legacy v1 hash): deterministic content, mix of magnitudes,
+/// the standard JPEG luminance quant table (quality ~50).
+pub(super) fn cost_kernel_test_fixture() -> (DctGrid, QuantTable) {
+    let mut cover = DctGrid::new(8, 8);
+    for br in 0..8 {
+        for bc in 0..8 {
+            cover.set(br, bc, 0, 0, 120);
+            for i in 0..8 {
+                for j in 0..8 {
+                    if i == 0 && j == 0 {
+                        continue;
+                    }
+                    let val = (((br * 11 + bc * 7 + i * 5 + j * 3) % 19) as i16) - 9;
+                    if val != 0 {
+                        cover.set(br, bc, i, j, val);
+                    }
+                }
+            }
+        }
+    }
+    let qt = QuantTable::new([
+        16, 11, 10, 16, 24, 40, 51, 61,
+        12, 12, 14, 19, 26, 58, 60, 55,
+        14, 13, 16, 24, 40, 57, 69, 56,
+        14, 17, 22, 29, 51, 87, 80, 62,
+        18, 22, 37, 56, 68, 109, 103, 77,
+        24, 35, 55, 64, 81, 104, 113, 92,
+        49, 64, 78, 87, 103, 121, 120, 101,
+        72, 92, 95, 98, 112, 100, 103, 99,
+    ]);
+    (cover, qt)
+}
+
+/// SHA256 of [`cost_kernel_test_deterministic_bytes`] as lowercase hex.
+#[doc(hidden)]
+pub fn cost_kernel_test_hash_hex() -> String {
+    sha256_hex(&cost_kernel_test_deterministic_bytes())
+}
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        hex.push_str(&format!("{:02x}", b));
+    }
+    hex
 }
 
 #[cfg(test)]
@@ -2239,22 +1394,79 @@ mod tests {
 
     /// Standard JPEG luminance quantization table (quality ~50).
     fn standard_qt() -> QuantTable {
-        QuantTable::new([
-            16, 11, 10, 16, 24, 40, 51, 61,
-            12, 12, 14, 19, 26, 58, 60, 55,
-            14, 13, 16, 24, 40, 57, 69, 56,
-            14, 17, 22, 29, 51, 87, 80, 62,
-            18, 22, 37, 56, 68, 109, 103, 77,
-            24, 35, 55, 64, 81, 104, 113, 92,
-            49, 64, 78, 87, 103, 121, 120, 101,
-            72, 92, 95, 98, 112, 100, 103, 99,
-        ])
+        cost_kernel_test_fixture().1
+    }
+
+    /// Deterministic textured grid used by several tests.
+    fn textured_grid(bw: usize, bt: usize) -> DctGrid {
+        let mut grid = DctGrid::new(bw, bt);
+        for br in 0..bt {
+            for bc in 0..bw {
+                grid.set(br, bc, 0, 0, 100);
+                for i in 0..8 {
+                    for j in 0..8 {
+                        if i == 0 && j == 0 { continue; }
+                        let val = (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
+                        if val != 0 {
+                            grid.set(br, bc, i, j, val);
+                        }
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// Symmetric-padded pixel rows of an arbitrary `w × h` plane, same
+    /// layout as [`padded_pixel_rows`] (which takes them from a DCT grid).
+    fn padded_pixels_from_plane(plane: &[f32], w: usize, h: usize, py0: isize, n_rows: usize) -> Vec<f32> {
+        let pw = w + 2 * PIX_MARGIN;
+        let mut pix = vec![0.0f32; pw * n_rows];
+        for i in 0..n_rows {
+            let sy = symmetric_index(py0 + i as isize, h);
+            pix[i * pw + PIX_MARGIN..i * pw + PIX_MARGIN + w].copy_from_slice(&plane[sy * w..(sy + 1) * w]);
+        }
+        fill_column_margins(&mut pix, w);
+        pix
+    }
+
+    /// Whole-plane subbands (margins included) of an arbitrary plane.
+    fn subbands_of_plane(plane: &[f32], w: usize, h: usize) -> PaddedSubbands {
+        let (wy0, wy1) = (-(WAV_MARGIN as isize), (h + WAV_MARGIN) as isize);
+        let pix = padded_pixels_from_plane(plane, w, h, wy0 - FILT_HALF, (wy1 - wy0) as usize + FILT_LEN - 1);
+        padded_subbands_from_pixels(&pix, w, wy0, wy1)
+    }
+
+    /// Textured synthetic plane: noise, a ramp, stripes and a flat patch,
+    /// with the noisiest content along the top and left edges.
+    fn synth_plane(w: usize, h: usize) -> Vec<f32> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((s >> 33) % 1000) as f32 / 1000.0
+        };
+        let mut p = vec![0.0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let noise = next() * 60.0;
+                let v = if x < w / 2 && y < h / 2 {
+                    90.0 + noise * 1.5 // noisy top-left quadrant
+                } else if x >= w / 2 && y < h / 2 {
+                    40.0 + 4.0 * x as f32 // ramp
+                } else if x < w / 2 {
+                    if (x / 3) % 2 == 0 { 200.0 } else { 30.0 } // stripes
+                } else {
+                    128.0 + (noise - 30.0) * 0.05 // nearly flat
+                };
+                p[y * w + x] = v.clamp(0.0, 255.0);
+            }
+        }
+        p
     }
 
     #[test]
     fn dc_is_wet() {
         let mut grid = DctGrid::new(4, 4);
-        // Fill with some non-zero AC coefficients.
         for br in 0..4 {
             for bc in 0..4 {
                 grid.set(br, bc, 0, 0, 100);
@@ -2263,7 +1475,6 @@ mod tests {
             }
         }
         let map = compute_uniward(&grid, &make_qt_uniform(16));
-        // DC must always be WET.
         for br in 0..4 {
             for bc in 0..4 {
                 assert_eq!(map.get(br, bc, 0, 0), WET_COST);
@@ -2281,7 +1492,6 @@ mod tests {
             }
         }
         let map = compute_uniward(&grid, &make_qt_uniform(16));
-        // Position (0, 1) has coefficient 0 — should be WET.
         for br in 0..4 {
             for bc in 0..4 {
                 assert_eq!(map.get(br, bc, 0, 1), WET_COST);
@@ -2301,66 +1511,37 @@ mod tests {
             }
         }
         let map = compute_uniward(&grid, &standard_qt());
-        // Non-zero AC coefficient at (1,0) should have finite cost.
         let cost = map.get(2, 2, 1, 0);
-        assert!(
-            cost.is_finite() && cost > 0.0,
-            "expected finite positive cost, got {cost}"
-        );
+        assert!(cost.is_finite() && cost > 0.0, "expected finite positive cost, got {cost}");
     }
 
     #[test]
     fn textured_region_cheaper_than_smooth_region() {
         // J-UNIWARD assigns lower cost when the cover's wavelet coefficients
-        // are large (textured region) because the denominator (|W_cover| + sigma)
-        // is larger, making the ratio smaller.
-        //
-        // Test: create a grid where one region is heavily textured (large AC
-        // coefficients in ALL surrounding blocks) and another region is smooth
-        // (only DC in surrounding blocks). Place identical target coefficients
-        // in the center of each region.
+        // are large (textured region): the denominator is larger.
         let qt = make_qt_uniform(16);
-
         let mut grid = DctGrid::new(8, 8);
-
-        // Fill everything with DC only (smooth base).
         for br in 0..8 {
             for bc in 0..8 {
                 grid.set(br, bc, 0, 0, 100);
             }
         }
-
-        // Textured region: blocks (0..4, 0..4) get many AC coefficients.
         for br in 0..4 {
             for bc in 0..4 {
                 for i in 0..8 {
                     for j in 0..8 {
                         if i == 0 && j == 0 { continue; }
-                        // Spread across many frequencies for rich texture.
                         grid.set(br, bc, i, j, (((i * 7 + j * 3) % 15) as i16) - 7);
                     }
                 }
             }
         }
-
-        // Place identical target coefficient in textured center (2,2)
-        // and smooth center (6,6). Both have same coefficient value.
         grid.set(2, 2, 1, 0, 5);
         grid.set(6, 6, 1, 0, 5);
-
         let map = compute_uniward(&grid, &qt);
-
         let cost_textured = map.get(2, 2, 1, 0);
         let cost_smooth = map.get(6, 6, 1, 0);
-
-        assert!(
-            cost_textured.is_finite(),
-            "textured cost should be finite: {cost_textured}"
-        );
-        assert!(
-            cost_smooth.is_finite(),
-            "smooth cost should be finite: {cost_smooth}"
-        );
+        assert!(cost_textured.is_finite() && cost_smooth.is_finite());
         assert!(
             cost_textured < cost_smooth,
             "textured region {cost_textured} should be < smooth region {cost_smooth}"
@@ -2383,18 +1564,13 @@ mod tests {
                 }
             }
         }
-
         let map = compute_uniward(&grid, &standard_qt());
-
         for br in 0..4 {
             for bc in 0..4 {
                 for i in 0..8 {
                     for j in 0..8 {
                         let cost = map.get(br, bc, i, j);
-                        assert!(
-                            cost >= 0.0,
-                            "negative cost {cost} at ({br},{bc},{i},{j})"
-                        );
+                        assert!(cost >= 0.0, "negative cost {cost} at ({br},{bc},{i},{j})");
                     }
                 }
             }
@@ -2402,36 +1578,179 @@ mod tests {
     }
 
     #[test]
-    fn mirror_index_works() {
-        assert_eq!(mirror_index(-1, 10), 1);
-        assert_eq!(mirror_index(-3, 10), 3);
-        assert_eq!(mirror_index(0, 10), 0);
-        assert_eq!(mirror_index(5, 10), 5);
-        assert_eq!(mirror_index(9, 10), 9);
-        assert_eq!(mirror_index(10, 10), 8);
-        assert_eq!(mirror_index(11, 10), 7);
+    fn symmetric_index_works() {
+        assert_eq!(symmetric_index(-1, 10), 0);
+        assert_eq!(symmetric_index(-3, 10), 2);
+        assert_eq!(symmetric_index(0, 10), 0);
+        assert_eq!(symmetric_index(9, 10), 9);
+        assert_eq!(symmetric_index(10, 10), 9);
+        assert_eq!(symmetric_index(12, 10), 7);
+        // Multiple reflections on a tiny axis: period 2·len.
+        assert_eq!(symmetric_index(-9, 8), 7);
+        assert_eq!(symmetric_index(-17, 8), 0);
+        assert_eq!(symmetric_index(23, 8), 7);
+        assert_eq!(symmetric_index(5, 1), 0);
     }
 
     #[test]
     fn lpdf_is_correct_length() {
         let lp = lpdf();
         assert_eq!(lp.len(), 16);
-        // Low-pass filter should sum to approximately sqrt(2).
         let sum: f64 = lp.iter().sum();
-        assert!(
-            (sum - std::f64::consts::SQRT_2).abs() < 0.01,
-            "low-pass filter sum {sum} should be ~sqrt(2)"
-        );
+        assert!((sum - std::f64::consts::SQRT_2).abs() < 0.01, "low-pass filter sum {sum} should be ~sqrt(2)");
     }
 
     #[test]
     fn hpdf_sums_to_zero() {
-        // High-pass filter should sum to approximately 0.
         let sum: f64 = HPDF.iter().sum();
-        assert!(
-            sum.abs() < 1e-10,
-            "high-pass filter sum {sum} should be ~0"
-        );
+        assert!(sum.abs() < 1e-10, "high-pass filter sum {sum} should be ~0");
+    }
+
+    /// Flaw 2 of the v1 kernel, pinned from first principles: the |Δ|
+    /// table cell `(r, c)` must equal the EXACT wavelet impact (a full
+    /// decomposition of the changed plane) at block-relative sample
+    /// `(c − 8, r − 8)`, and the impact must vanish outside that 23×23
+    /// window. The v1 pairing (offset-14 table read at offset 15) is far
+    /// off — 8 px up and 8 px left, as the 2026-10 measurement found.
+    #[test]
+    fn impact_table_matches_exact_wavelet_impact() {
+        let qt = standard_qt();
+        let basis = precompute_basis_functions(&qt);
+        let table = AbsDeltaTable::precompute(&qt);
+        let legacy = AbsDeltaTable::precompute_legacy_v1(&qt);
+        let (w, h) = (64usize, 64usize);
+        let (bx, by) = (3usize, 4usize); // interior: window clear of the edges
+        let coefs: Vec<(usize, usize)> = (1..64).map(|k| (k / 8, k % 8)).collect();
+        for &(fi, fj) in &coefs {
+            // The cover is linear in the change: decompose the change alone.
+            let mut plane = vec![0.0f32; w * h];
+            for r in 0..8 {
+                for c in 0..8 {
+                    plane[(by * 8 + r) * w + bx * 8 + c] = basis[fi][fj][r * 8 + c] as f32;
+                }
+            }
+            let d = subbands_of_plane(&plane, w, h);
+            let (t_lh, t_hl, t_hh) = table.slice_at(fi, fj);
+            let (l_lh, _, _) = legacy.slice_at(fi, fj);
+            for (name, band, tab) in [("LH", &d.lh, t_lh), ("HL", &d.hl, t_hl), ("HH", &d.hh, t_hh)] {
+                let peak = band.iter().fold(0.0f64, |m, &v| m.max((v as f64).abs()));
+                assert!(peak > 1e-3, "({fi},{fj}) {name}: no impact");
+                let mut v1_err = 0.0f64;
+                for y in -(WAV_MARGIN as isize)..(h + WAV_MARGIN) as isize {
+                    for x in -(WAV_MARGIN as isize)..(w + WAV_MARGIN) as isize {
+                        let exact = (band[d.index(x, y)] as f64).abs();
+                        let (c, r) = (x - (bx * 8) as isize + 8, y - (by * 8) as isize + 8);
+                        let in_window = (0..23).contains(&c) && (0..23).contains(&r);
+                        if in_window {
+                            let t = tab[r as usize * IMPACT_SIZE + c as usize];
+                            assert!(
+                                (t - exact).abs() <= 1e-5 * peak,
+                                "({fi},{fj}) {name} cell ({r},{c}): table {t} vs exact {exact}"
+                            );
+                        } else {
+                            assert!(exact <= 1e-6 * peak, "({fi},{fj}) {name}: impact {exact} outside the window at ({x},{y})");
+                        }
+                        // v1: cell (r, c) (offset-14 table) was divided by
+                        // the sample at block-relative (c − 15, r − 15).
+                        let (c1, r1) = (x - (bx * 8) as isize + 15, y - (by * 8) as isize + 15);
+                        if name == "LH" && (0..23).contains(&c1) && (0..23).contains(&r1) {
+                            let paired_impact = (band[d.index(x + 8, y + 8)] as f64).abs();
+                            let t1 = l_lh[r1 as usize * IMPACT_SIZE + c1 as usize];
+                            v1_err = v1_err.max((t1 - paired_impact).abs());
+                        }
+                    }
+                }
+                if name == "LH" {
+                    // The v1 table itself is the impact shifted by one cell:
+                    // its cell (r, c) is the exact impact at (c − 7, r − 7).
+                    assert!(v1_err <= 1e-5 * peak, "({fi},{fj}): v1 table is not the 1-shifted impact");
+                }
+            }
+        }
+        // And the v1 kernel paired that table with the sample 8 px up/left
+        // of the impact: on a textured plane, v1 and v2 window costs of an
+        // interior block differ.
+        let plane = synth_plane(w, h);
+        let wv = subbands_of_plane(&plane, w, h);
+        let (a, b, c) = table.slice_at(1, 2);
+        let v2 = cost_kernel(a, b, c, &wv, by, bx);
+        assert!(v2.is_finite() && v2 > 0.0);
+    }
+
+    /// Flaw 1 of the v1 kernel, pinned by construction (the image
+    /// counterpart of the H.264 test of the same name). Plane `b` is plane
+    /// `a` mirrored into a 2× canvas, `b[n + y][n + x] =
+    /// a[sym(y)][sym(x)]`, so block `(bx, by)` of `a`, margin included,
+    /// sees exactly the pixels block `(n/8 + bx, n/8 + by)` of `b` sees.
+    /// Every block of `a` — border or not — must cost exactly what its twin
+    /// costs. The v1 kernel skipped the out-of-image part of the window,
+    /// so it failed at every block in the outer two block rings.
+    #[test]
+    fn border_block_cost_equals_its_mirrored_interior_twin() {
+        let n = 64usize;
+        let a = synth_plane(n, n);
+        let m = 2 * n;
+        let mut b = vec![0.0f32; m * m];
+        for y in 0..m {
+            for x in 0..m {
+                let sy = symmetric_index(y as isize - n as isize, n);
+                let sx = symmetric_index(x as isize - n as isize, n);
+                b[y * m + x] = a[sy * n + sx];
+            }
+        }
+        let wa = subbands_of_plane(&a, n, n);
+        let wb = subbands_of_plane(&b, m, m);
+        let qt = standard_qt();
+        let table = AbsDeltaTable::precompute(&qt);
+        let nb = n / 8;
+        let mut border_checked = 0;
+        for fi in 0..8 {
+            for fj in 0..8 {
+                if fi == 0 && fj == 0 { continue; }
+                let (l, hl, hh) = table.slice_at(fi, fj);
+                for by in 0..nb {
+                    for bx in 0..nb {
+                        let ca = cost_kernel(l, hl, hh, &wa, by, bx);
+                        let cb = cost_kernel(l, hl, hh, &wb, nb + by, nb + bx);
+                        assert_eq!(
+                            ca.to_bits(), cb.to_bits(),
+                            "coef ({fi},{fj}): block ({bx},{by}) costs {ca} but its interior twin costs {cb}"
+                        );
+                        if bx == 0 || by == 0 || bx == nb - 1 || by == nb - 1 {
+                            border_checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(border_checked > 1000);
+    }
+
+    /// The strip-streamed all-AC pass, the separable pass and the CostMap
+    /// agree bit for bit, on a grid tall enough for three strips (the last
+    /// one a single block row) and on a plane narrower than the filter
+    /// (multiple reflections).
+    #[test]
+    fn all_cost_paths_agree_bit_exactly() {
+        let qt = standard_qt();
+        for (bw, bt) in [(3usize, 101usize), (6, 6), (1, 3), (2, 1), (5, 52)] {
+            let grid = textured_grid(bw, bt);
+            let streaming = compute_ac_costs_streaming(&grid, &qt).unwrap();
+            let separable = compute_ac_costs_separable(&grid, &qt).unwrap();
+            let map = compute_uniward(&grid, &qt);
+            let mut nz = 0;
+            for (f, (&a, &b)) in streaming.iter().zip(&separable).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{bw}x{bt} separable at {f}");
+                let (blk, k) = (f / 64, f % 64);
+                if k != 0 && grid.coeffs()[f] != 0 {
+                    // The CostMap prices only the non-zero AC coefficients.
+                    nz += 1;
+                    let got = map.get(blk / bw, blk % bw, k / 8, k % 8);
+                    assert_eq!(got.to_bits(), a.to_bits(), "{bw}x{bt} CostMap at {f}");
+                }
+            }
+            assert!(nz > 0);
+        }
     }
 
     #[test]
@@ -2444,12 +1763,8 @@ mod tests {
         let grid = img.dct_grid(0);
         let qt_id = img.frame_info().components[0].quant_table_id as usize;
         let qt = img.quant_table(qt_id).unwrap();
-
         let map = compute_uniward(grid, qt);
-
-        // Count finite costs (embeddable positions).
-        let bw = grid.blocks_wide();
-        let bt = grid.blocks_tall();
+        let (bw, bt) = (grid.blocks_wide(), grid.blocks_tall());
         let mut finite_count = 0;
         let mut total_cost = 0.0f64;
         for br in 0..bt {
@@ -2465,513 +1780,173 @@ mod tests {
                 }
             }
         }
-
-        // A 320x240 photo should have many embeddable positions.
-        assert!(
-            finite_count > 1000,
-            "expected >1000 finite costs, got {finite_count}"
-        );
-        // Average cost should be positive and reasonable.
-        let avg = total_cost / finite_count as f64;
-        assert!(avg > 0.0, "average cost should be positive: {avg}");
+        assert!(finite_count > 1000, "expected >1000 finite costs, got {finite_count}");
+        assert!(total_cost / finite_count as f64 > 0.0);
     }
 
-    /// Verify that compute_uniward is deterministic: calling it twice on the
-    /// same input produces bit-identical cost maps. This catches any
-    /// non-determinism that might be introduced by parallel execution order.
+    /// Cost bands from sub-grids (any partition, edges included) equal the
+    /// whole-image pass, and the dense gather equals the sorted one.
     #[test]
-    fn determinism_repeated_runs() {
-        let mut grid = DctGrid::new(6, 6);
-        for br in 0..6 {
-            for bc in 0..6 {
-                grid.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val = (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            grid.set(br, bc, i, j, val);
-                        }
+    fn cost_bands_match_whole_image() {
+        for name in ["photo_640x480_q75_420.jpg", "photo_320x240_q75_420.jpg", "fractal_100x75_q85_420.jpg"] {
+            let data = std::fs::read(format!("test-vectors/image/{name}")).unwrap();
+            let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();
+            let qt = img.quant_table(img.frame_info().components[0].quant_table_id as usize).unwrap();
+            let g = img.dct_grid(0);
+            let (bw, bt) = (g.blocks_wide(), g.blocks_tall());
+            let whole = compute_ac_costs_separable(g, qt).unwrap();
+            let mut cuts = vec![vec![0, bt], vec![0, 1, 2, 3, bt], vec![0, bt / 3, bt / 3 + 1, bt - 2, bt]];
+            cuts.push((0..=bt).collect());
+            for cut in cuts {
+                for win in cut.windows(2) {
+                    let (br0, br1) = (win[0], win[1]);
+                    if br0 >= br1 {
+                        continue;
+                    }
+                    let band = ac_cost_band(&cost_band_subgrid(g, br0, br1), qt, br0, br1, bt).unwrap();
+                    let want = &whole[br0 * bw * 64..br1 * bw * 64];
+                    assert!(band.iter().zip(want).all(|(a, b)| a.to_bits() == b.to_bits()), "{name} rows {br0}..{br1}");
+                }
+            }
+            // Dense gather (whole order) == sorted gather (small request).
+            let fis: Vec<u32> = (0..whole.len() as u32).rev().filter(|f| f % 64 != 0).collect();
+            let dense = gather_ac_costs(g, qt, &fis).unwrap();
+            let sorted: Vec<f32> = fis.chunks(fis.len() / 3 + 1).flat_map(|c| gather_ac_costs(g, qt, c).unwrap()).collect();
+            assert!(dense.iter().zip(&sorted).all(|(a, b)| a.to_bits() == b.to_bits()), "{name} gather");
+            assert!(dense.iter().zip(&fis).all(|(a, &f)| a.to_bits() == whole[f as usize].to_bits()), "{name} dense");
+        }
+    }
+
+    /// The strip height changes neither the costs nor the order the sink
+    /// sees them in: every height (1 block row up to more than the image,
+    /// last strip partial or not) and every row range give the direct
+    /// kernel's values, so the rows carried from strip to strip are exact.
+    #[test]
+    fn cost_strip_heights_agree_bit_exactly() {
+        let qt = standard_qt();
+        for (bw, bt) in [(3usize, 23usize), (7, 9), (1, 5), (2, 1), (4, 2)] {
+            let grid = textured_grid(bw, bt);
+            let want = compute_ac_costs_streaming(&grid, &qt).unwrap();
+            for rows in [1usize, 2, 3, 4, 7, 50] {
+                for (br0, br1) in [(0, bt), (bt / 3, bt), (0, bt.div_ceil(2)), (1.min(bt - 1), bt)] {
+                    let mut got = vec![f32::NAN; (br1 - br0) * bw * 64];
+                    let mut next = br0 * bw * 64;
+                    ac_cost_strips_range(&grid, &qt, rows, br0, br1, |base, strip| {
+                        assert_eq!(base, next, "strips in order");
+                        assert!(strip.len() <= rows * bw * 64);
+                        got[base - br0 * bw * 64..][..strip.len()].copy_from_slice(strip);
+                        next += strip.len();
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(next, br1 * bw * 64);
+                    let w = &want[br0 * bw * 64..br1 * bw * 64];
+                    for (f, (a, b)) in got.iter().zip(w).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "{bw}x{bt} rows {rows} range {br0}..{br1} at {f}");
                     }
                 }
             }
         }
+        // Strip heights the production rule picks.
+        assert_eq!(cost_strip_rows(504), 4);
+        assert_eq!(cost_strip_rows(1008), 4);
+        assert_eq!(cost_strip_rows(1), STRIP_BLOCK_ROWS);
+        assert_eq!(cost_strip_rows(100_000), MIN_STRIP_BLOCK_ROWS);
+    }
 
+    /// v2 changes cost VALUES only, never the SET of embeddable positions
+    /// (every non-zero AC coefficient, in raster order): the primary Ghost
+    /// decode, which uses the set but not the values, is unaffected.
+    #[test]
+    fn position_set_is_unchanged_from_legacy_v1() {
+        for name in ["photo_320x240_q75_420.jpg", "photo_640x480_q75_420.jpg", "fractal_100x75_q85_420.jpg", "tiny_8x8_q95.jpg", "nonaligned_13x13_q80.jpg"] {
+            let Ok(data) = std::fs::read(format!("test-vectors/image/{name}")) else { continue };
+            let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();
+            let qt_id = img.frame_info().components[0].quant_table_id as usize;
+            let qt = img.quant_table(qt_id).unwrap();
+            let v1 = compute_positions_streaming_legacy_v1(img.dct_grid(0), qt, None).unwrap();
+            let g = img.dct_grid(0);
+            let v2: Vec<u32> = (0..g.coeffs().len() as u32)
+                .filter(|&f| f % 64 != 0 && g.coeffs()[f as usize] != 0)
+                .collect();
+            assert_eq!(v1.len(), v2.len(), "{name}");
+            assert!(v1.iter().zip(&v2).all(|(a, b)| a.flat_idx == *b), "{name}: set/order");
+            let nzac = {
+                let g = img.dct_grid(0);
+                let mut n = 0;
+                for br in 0..g.blocks_tall() {
+                    for bc in 0..g.blocks_wide() {
+                        n += g.block(br, bc)[1..].iter().filter(|&&c| c != 0).count();
+                    }
+                }
+                n
+            };
+            assert_eq!(v2.len(), nzac, "{name}: positions == non-zero AC");
+
+        }
+    }
+
+    /// Verify that compute_uniward is deterministic.
+    #[test]
+    fn determinism_repeated_runs() {
+        let grid = textured_grid(6, 6);
         let qt = standard_qt();
         let map1 = compute_uniward(&grid, &qt);
         let map2 = compute_uniward(&grid, &qt);
-
         for br in 0..6 {
             for bc in 0..6 {
                 for i in 0..8 {
                     for j in 0..8 {
-                        let c1 = map1.get(br, bc, i, j);
-                        let c2 = map2.get(br, bc, i, j);
-                        assert_eq!(
-                            c1.to_bits(), c2.to_bits(),
-                            "cost mismatch at ({br},{bc},{i},{j}): {c1} vs {c2}"
-                        );
+                        assert_eq!(map1.get(br, bc, i, j).to_bits(), map2.get(br, bc, i, j).to_bits());
                     }
                 }
             }
         }
     }
 
-    /// T3.2.B — `compute_positions_from_wavelets(grid, qt, &cache, None)`
-    /// MUST produce the same Vec<CoeffPos> as
-    /// `compute_positions_streaming(grid, qt, None)` on the same input.
-    /// Same costs, same positions, in the same order. This is the
-    /// behavioral-identity gate for the cache refactor.
-    #[test]
-    fn cache_path_matches_streaming_path() {
-        let mut grid = DctGrid::new(6, 6);
-        for br in 0..6 {
-            for bc in 0..6 {
-                grid.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val = (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            grid.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let qt = standard_qt();
-        let streaming = compute_positions_streaming(&grid, &qt, None).unwrap();
-        let cache = compute_cover_wavelets(&grid, &qt);
-        let cached = compute_positions_from_wavelets(&grid, &qt, &cache, None).unwrap();
-
-        assert_eq!(streaming.len(), cached.len(),
-            "position count mismatch: streaming={} cached={}",
-            streaming.len(), cached.len());
-        for (i, (s, c)) in streaming.iter().zip(cached.iter()).enumerate() {
-            assert_eq!(s.flat_idx, c.flat_idx,
-                "flat_idx mismatch at index {i}: streaming={} cached={}",
-                s.flat_idx, c.flat_idx);
-            assert_eq!(s.cost.to_bits(), c.cost.to_bits(),
-                "cost mismatch at flat_idx {}: streaming={} cached={}",
-                s.flat_idx, s.cost, c.cost);
-        }
-    }
-
-    /// T3.2.C — single-modification interior case. Verifies the
-    /// pixel-delta → wavelet-delta math matches the full filter when
-    /// mirror reflections don't come into play.
-    #[test]
-    fn incremental_wavelet_single_interior_modification() {
-        // 12×12 block grid → 96×96 pixels. Modification at (br=5, bc=5)
-        // is interior — mirror has no effect.
-        let mut cover = DctGrid::new(12, 12);
-        for br in 0..12 {
-            for bc in 0..12 {
-                cover.set(br, bc, 0, 0, 100);
-            }
-        }
-        let mut stego = cover.clone();
-        stego.set(5, 5, 2, 3, 1); // single DCT modification
-        let modifications = vec![((5usize * 12 + 5) * 64 + 2 * 8 + 3) as u32];
-
-        let qt = standard_qt();
-        let cover_w = compute_cover_wavelets(&cover, &qt);
-        let stego_w_incr =
-            apply_dct_modifications_to_wavelets(&cover_w, &modifications, &cover, &stego, &qt);
-        let stego_w_full = compute_cover_wavelets(&stego, &qt);
-
-        let n = stego_w_incr.inner.lh.len();
-        let mut max_lh = 0.0f32;
-        let mut max_hl = 0.0f32;
-        let mut max_hh = 0.0f32;
-        for i in 0..n {
-            max_lh =
-                max_lh.max((stego_w_incr.inner.lh[i] - stego_w_full.inner.lh[i]).abs());
-            max_hl =
-                max_hl.max((stego_w_incr.inner.hl[i] - stego_w_full.inner.hl[i]).abs());
-            max_hh =
-                max_hh.max((stego_w_incr.inner.hh[i] - stego_w_full.inner.hh[i]).abs());
-        }
-        assert!(
-            max_lh < 0.01 && max_hl < 0.01 && max_hh < 0.01,
-            "interior single-mod drift: lh={max_lh} hl={max_hl} hh={max_hh}"
-        );
-    }
-
-    /// T3.2.C — incremental wavelet delta must reproduce the result
-    /// of a fresh `compute_cover_wavelets` on the modified grid, modulo
-    /// ≤ 1 LSB f32 rounding. Verifies that summing per-modification
-    /// 2D 16-tap deltas matches running the full row+column filter on
-    /// the modified pixels.
-    #[test]
-    fn incremental_wavelet_matches_full_recompute() {
-        // Build a cover grid and a stego grid that differs at a few
-        // known DCT coefficient positions.
-        let mut cover = DctGrid::new(6, 6);
-        for br in 0..6 {
-            for bc in 0..6 {
-                cover.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val = (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let mut stego = cover.clone();
-
-        // Apply LSB-style flips at a handful of positions spanning
-        // interior and corners.
-        let bw = stego.blocks_wide();
-        let mut modifications: Vec<u32> = Vec::new();
-        for (br, bc, fi, fj, delta) in [
-            (2usize, 3, 1, 2, 1i16),
-            (0, 0, 2, 1, -1),
-            (5, 5, 3, 4, 1),
-            (1, 4, 0, 7, -1),
-            (4, 2, 6, 3, 1),
-        ] {
-            let cur = stego.get(br, bc, fi, fj);
-            stego.set(br, bc, fi, fj, cur + delta);
-            let flat = ((br * bw + bc) * 64 + fi * 8 + fj) as u32;
-            modifications.push(flat);
-        }
-
-        let qt = standard_qt();
-        let cover_w = compute_cover_wavelets(&cover, &qt);
-
-        // Approach A — incremental delta from cover + modifications.
-        let stego_w_incr = apply_dct_modifications_to_wavelets(
-            &cover_w, &modifications, &cover, &stego, &qt,
-        );
-
-        // Approach B — fresh full recompute on the modified grid.
-        let stego_w_full = compute_cover_wavelets(&stego, &qt);
-
-        let n = stego_w_incr.inner.lh.len();
-        assert_eq!(n, stego_w_full.inner.lh.len());
-
-        // Bit-exact: f32 LSB tolerance per position.
-        let mut max_abs_diff_lh = 0.0f32;
-        let mut max_abs_diff_hl = 0.0f32;
-        let mut max_abs_diff_hh = 0.0f32;
-        for i in 0..n {
-            max_abs_diff_lh =
-                max_abs_diff_lh.max((stego_w_incr.inner.lh[i] - stego_w_full.inner.lh[i]).abs());
-            max_abs_diff_hl =
-                max_abs_diff_hl.max((stego_w_incr.inner.hl[i] - stego_w_full.inner.hl[i]).abs());
-            max_abs_diff_hh =
-                max_abs_diff_hh.max((stego_w_incr.inner.hh[i] - stego_w_full.inner.hh[i]).abs());
-        }
-        // f32 LSB at the magnitudes we see (~10⁴ at cover values) is
-        // ~10⁻³. Allow some headroom: 0.05 is comfortably below the
-        // SIGMA used in cost computation.
-        assert!(
-            max_abs_diff_lh < 0.05 && max_abs_diff_hl < 0.05 && max_abs_diff_hh < 0.05,
-            "incremental wavelet drift exceeds tolerance: lh={max_abs_diff_lh} hl={max_abs_diff_hl} hh={max_abs_diff_hh}"
-        );
-    }
-
-    /// T3.2.D — `compute_positions_with_dirty_recost` must produce
-    /// position-for-position identical output to
-    /// `compute_positions_from_wavelets(stego_grid, qt, &stego.as_cache(),
-    /// None)`. Clean blocks reuse cached cover costs; dirty blocks
-    /// recompute via stego wavelets. Bit-exact at the f32-cost level.
-    #[test]
-    fn dirty_recost_matches_full_recompute() {
-        // 12×12 block grid — enough room for the 5x5 dirty
-        // neighborhood + a wide margin of guaranteed-clean blocks.
-        let mut cover = DctGrid::new(12, 12);
-        for br in 0..12 {
-            for bc in 0..12 {
-                cover.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val =
-                            (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let mut stego = cover.clone();
-        let bw = stego.blocks_wide();
-        let mut modifications: Vec<u32> = Vec::new();
-        // Mods at interior + corners + spread across the grid.
-        for (br, bc, fi, fj, delta) in [
-            (5usize, 6, 1, 2, 1i16),
-            (0, 0, 2, 1, -1),
-            (11, 11, 3, 4, 1),
-            (3, 9, 0, 7, -1),
-            (8, 3, 6, 3, 1),
-        ] {
-            let cur = stego.get(br, bc, fi, fj);
-            stego.set(br, bc, fi, fj, cur + delta);
-            modifications.push(((br * bw + bc) * 64 + fi * 8 + fj) as u32);
-        }
-
-        let qt = standard_qt();
-        let cover_w = compute_cover_wavelets(&cover, &qt);
-        let cover_positions =
-            compute_positions_from_wavelets(&cover, &qt, &cover_w, None).unwrap();
-
-        // Reference: full recompute on stego wavelets.
-        let stego_w = apply_dct_modifications_to_wavelets(
-            &cover_w, &modifications, &cover, &stego, &qt,
-        );
-        let ref_positions = compute_positions_from_wavelets(
-            &stego, &qt, &stego_w.as_cache(), None,
-        ).unwrap();
-
-        // Test path: dirty re-cost.
-        let dirty_positions = compute_positions_with_dirty_recost(
-            &stego, &qt, &cover_positions, &modifications, &stego_w, None,
-        ).unwrap();
-
-        assert_eq!(
-            ref_positions.len(),
-            dirty_positions.len(),
-            "position count mismatch: ref={} dirty={}",
-            ref_positions.len(),
-            dirty_positions.len()
-        );
-        for (i, (r, d)) in ref_positions.iter().zip(dirty_positions.iter()).enumerate() {
-            assert_eq!(
-                r.flat_idx, d.flat_idx,
-                "position[{i}] flat_idx: ref={} dirty={}",
-                r.flat_idx, d.flat_idx
-            );
-            assert!(
-                (r.cost.to_bits() == d.cost.to_bits()) || (r.cost - d.cost).abs() < 1e-6,
-                "position[{i}] flat_idx={}: ref_cost={} dirty_cost={}",
-                r.flat_idx, r.cost, d.cost
-            );
-        }
-    }
-
-    /// T3.3.A — precomputed |delta| table must give costs identical
-    /// to the legacy `compute_coefficient_cost` path at f64 bit
-    /// level. Verified against the LEGACY-SUM-ORDER precomputed
-    /// variant (kept around just for this gate). The production
-    /// kernel uses a SIMD-friendly pair-wise sum order (Phase B) that
-    /// drifts by f64 ULP vs legacy — see
-    /// `cost_precompute_simd_drift_below_f32_lsb` below.
-    #[test]
-    fn cost_precompute_matches_legacy_path() {
-        let mut cover = DctGrid::new(8, 8);
-        for br in 0..8 {
-            for bc in 0..8 {
-                cover.set(br, bc, 0, 0, 120);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val =
-                            (((br * 11 + bc * 7 + i * 5 + j * 3) % 19) as i16) - 9;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let qt = standard_qt();
-        let w = compute_cover_wavelets(&cover, &qt);
-        let basis = precompute_basis_functions(&qt);
-        let lpdf_t = lpdf();
-        let pad = FILT_LEN - 1;
-        let img_w = w.img_w;
-        let img_h = w.img_h;
-        let table = AbsDeltaTable::precompute(&qt);
-
-        let test_blocks: &[(usize, usize)] = &[
-            (0, 0), (0, 7), (7, 0), (7, 7), (3, 4), (5, 2), (1, 6), (6, 1),
-        ];
-        for &(br, bc) in test_blocks {
-            for fi in 0..8 {
-                for fj in 0..8 {
-                    if fi == 0 && fj == 0 { continue; }
-                    let basis_block = &basis[fi][fj];
-                    let legacy = compute_coefficient_cost(
-                        basis_block, &w.inner, br, bc, img_w, img_h, pad, &lpdf_t,
-                    );
-                    let (abs_lh, abs_hl, abs_hh) = table.slice_at(fi, fj);
-                    let fast = compute_coefficient_cost_precomputed_legacy_order(
-                        abs_lh, abs_hl, abs_hh, &w.inner, br, bc, img_w, img_h, pad,
-                    );
-                    assert_eq!(
-                        legacy.to_bits(),
-                        fast.to_bits(),
-                        "(br={br}, bc={bc}, fi={fi}, fj={fj}): legacy={legacy} fast={fast}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// T3.3.B — the SIMD-order precomputed kernel (production)
-    /// must give costs equivalent to the legacy-order precomputed
-    /// kernel, modulo the f64 ULP drift from re-associating the
-    /// per-cell (lh + hl + hh) sum and pair-wise grouping.
-    ///
-    /// Drift tolerance: relative ≤ 1e-12, absolute ≤ 1e-10. Far
-    /// below the f32 cost LSB at typical UNIWARD magnitudes, so the
-    /// f32-cast cost values stored into CostMap are bit-identical
-    /// between the two kernels in practice — sort order and stego
-    /// output unchanged.
-    #[test]
-    fn cost_precompute_simd_drift_below_f32_lsb() {
-        let mut cover = DctGrid::new(8, 8);
-        for br in 0..8 {
-            for bc in 0..8 {
-                cover.set(br, bc, 0, 0, 120);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val =
-                            (((br * 11 + bc * 7 + i * 5 + j * 3) % 19) as i16) - 9;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let qt = standard_qt();
-        let w = compute_cover_wavelets(&cover, &qt);
-        let pad = FILT_LEN - 1;
-        let img_w = w.img_w;
-        let img_h = w.img_h;
-        let table = AbsDeltaTable::precompute(&qt);
-
-        let test_blocks: &[(usize, usize)] = &[
-            (0, 0), (0, 7), (7, 0), (7, 7), (3, 4), (5, 2), (1, 6), (6, 1),
-        ];
-        let mut max_abs_drift = 0.0f64;
-        let mut max_rel_drift = 0.0f64;
-        for &(br, bc) in test_blocks {
-            for fi in 0..8 {
-                for fj in 0..8 {
-                    if fi == 0 && fj == 0 { continue; }
-                    let (abs_lh, abs_hl, abs_hh) = table.slice_at(fi, fj);
-                    let legacy = compute_coefficient_cost_precomputed_legacy_order(
-                        abs_lh, abs_hl, abs_hh, &w.inner, br, bc, img_w, img_h, pad,
-                    );
-                    let simd = compute_coefficient_cost_precomputed(
-                        abs_lh, abs_hl, abs_hh, &w.inner, br, bc, img_w, img_h, pad,
-                    );
-                    let diff = (legacy - simd).abs();
-                    max_abs_drift = max_abs_drift.max(diff);
-                    if legacy.abs() > 1e-30 {
-                        max_rel_drift = max_rel_drift.max(diff / legacy.abs());
-                    }
-                }
-            }
-        }
-        assert!(
-            max_abs_drift < 1e-10 && max_rel_drift < 1e-12,
-            "drift exceeds tolerance: abs={max_abs_drift} rel={max_rel_drift}"
-        );
-    }
-
-    /// Scalar-only copy of `compute_coefficient_cost_precomputed`: the
-    /// pair loop + 1-element tail with no SIMD block in front, i.e. what
-    /// a target without NEON / SSE2 / SIMD128 runs. The production
-    /// kernel always takes its SIMD block where one is compiled in, so
-    /// its own scalar pair loop never runs there and cannot serve as the
-    /// reference.
-    fn cost_precomputed_scalar_reference(
+    /// Scalar-only copy of `cost_kernel`: what a target without NEON /
+    /// SSE2 / SIMD128 runs. The production kernel always takes its SIMD
+    /// block where one is compiled in, so its own scalar pair loop never
+    /// runs there and cannot serve as the reference.
+    fn cost_kernel_scalar_reference(
         abs_lh: &[f64],
         abs_hl: &[f64],
         abs_hh: &[f64],
-        cw: &ThreeSubbands,
+        w: &PaddedSubbands,
         br: usize,
         bc: usize,
-        img_w: usize,
-        img_h: usize,
-        pad: usize,
     ) -> f64 {
+        let wf = |v: f32| (v as f64).abs() + SIGMA;
         let mut cost = 0.0;
-        let bc8 = (bc * 8) as isize;
-        let abs_x_start = bc8 - pad as isize;
-        let out_c_lo = if abs_x_start < 0 {
-            ((-abs_x_start) as usize).min(IMPACT_SIZE)
-        } else {
-            0
-        };
-        let max_via_image = img_w as isize - abs_x_start;
-        let out_c_hi = if max_via_image <= 0 { 0 } else { (max_via_image as usize).min(IMPACT_SIZE) };
-        if out_c_lo >= out_c_hi {
-            return 0.0;
-        }
-        let w = |v: f32| (v as f64).abs() + SIGMA;
         for out_r in 0..IMPACT_SIZE {
-            let abs_y = (br * 8) as isize + out_r as isize - pad as isize;
-            if abs_y < 0 || abs_y as usize >= img_h {
-                continue;
+            let i0 = w.index((bc * 8) as isize - 8, (br * 8 + out_r) as isize - 8);
+            let cell = |c: usize| {
+                let (i, t) = (i0 + c, out_r * IMPACT_SIZE + c);
+                (abs_lh[t] / wf(w.lh[i]) + abs_hl[t] / wf(w.hl[i])) + abs_hh[t] / wf(w.hh[i])
+            };
+            let mut c = 0;
+            while c + 1 < IMPACT_SIZE {
+                cost += cell(c) + cell(c + 1);
+                c += 2;
             }
-            let row_idx_base = (abs_y as usize - cw.y_offset) * cw.width;
-            let row_base = out_r * IMPACT_SIZE;
-            let mut out_c = out_c_lo;
-            while out_c + 1 < out_c_hi {
-                let i0 = row_idx_base + (bc8 + out_c as isize - pad as isize) as usize;
-                let (i1, c0, c1) = (i0 + 1, row_base + out_c, row_base + out_c + 1);
-                let lane0 = (abs_lh[c0] / w(cw.lh[i0]) + abs_hl[c0] / w(cw.hl[i0]))
-                    + abs_hh[c0] / w(cw.hh[i0]);
-                let lane1 = (abs_lh[c1] / w(cw.lh[i1]) + abs_hl[c1] / w(cw.hl[i1]))
-                    + abs_hh[c1] / w(cw.hh[i1]);
-                cost += lane0 + lane1;
-                out_c += 2;
-            }
-            if out_c < out_c_hi {
-                let i = row_idx_base + (bc8 + out_c as isize - pad as isize) as usize;
-                let c = row_base + out_c;
-                cost += (abs_lh[c] / w(cw.lh[i]) + abs_hl[c] / w(cw.hl[i]))
-                    + abs_hh[c] / w(cw.hh[i]);
-            }
+            cost += cell(c);
         }
         cost
     }
 
-    /// The NEON / SSE2 / SIMD128 blocks of `compute_coefficient_cost_precomputed`
-    /// must be bit-identical (f64 `to_bits`) to the scalar sum order, which is
-    /// what a SIMD-less target runs. This test covers production data: the real
-    /// |delta| table and the wavelets of a 64×64 cover, every block and
-    /// coefficient. The pinned-hash test checks the same geometry but against
-    /// a hash, not the scalar order. See
-    /// `cost_precompute_simd_matches_scalar_reference_random` for the edge
-    /// cases.
+    /// The NEON / SSE2 / SIMD128 blocks of `cost_kernel` are bit-identical
+    /// (f64 `to_bits`) to the scalar sum order on production data: the real
+    /// |delta| table and the padded wavelets of a 64×64 cover, every block
+    /// and coefficient (margins included).
     #[test]
-    fn cost_precompute_simd_matches_scalar_reference_fixture() {
-        let pad = FILT_LEN - 1;
-        let mut cover = DctGrid::new(8, 8);
-        for br in 0..8 {
-            for bc in 0..8 {
-                cover.set(br, bc, 0, 0, 120);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val = (((br * 13 + bc * 5 + i * 7 + j * 3) % 23) as i16) - 11;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let qt = standard_qt();
-        let wv = compute_cover_wavelets(&cover, &qt);
+    fn cost_kernel_simd_matches_scalar_reference_fixture() {
+        let (cover, qt) = cost_kernel_test_fixture();
+        let wv = whole_image_subbands(&cover, &qt);
         let table = AbsDeltaTable::precompute(&qt);
         let coefs: Vec<(usize, usize)> = if cfg!(miri) {
             vec![(0, 1), (3, 5), (7, 7)]
         } else {
-            (0..64).filter(|&k| k != 0).map(|k| (k / 8, k % 8)).collect()
+            (1..64).map(|k| (k / 8, k % 8)).collect()
         };
         let blocks: Vec<(usize, usize)> = if cfg!(miri) {
             vec![(0, 0), (0, 7), (7, 0), (3, 4), (1, 1)]
@@ -2981,30 +1956,18 @@ mod tests {
         for &(br, bc) in &blocks {
             for &(fi, fj) in &coefs {
                 let (lh, hl, hh) = table.slice_at(fi, fj);
-                let got = compute_coefficient_cost_precomputed(
-                    lh, hl, hh, &wv.inner, br, bc, wv.img_w, wv.img_h, pad,
-                );
-                let want = cost_precomputed_scalar_reference(
-                    lh, hl, hh, &wv.inner, br, bc, wv.img_w, wv.img_h, pad,
-                );
-                assert_eq!(got.to_bits(), want.to_bits(), "fixture br={br} bc={bc} fi={fi} fj={fj}: {got} vs {want}");
+                let got = cost_kernel(lh, hl, hh, &wv, br, bc);
+                let want = cost_kernel_scalar_reference(lh, hl, hh, &wv, br, bc);
+                assert_eq!(got.to_bits(), want.to_bits(), "br={br} bc={bc} fi={fi} fj={fj}: {got} vs {want}");
             }
         }
     }
 
-    /// Same bit-exactness as `cost_precompute_simd_matches_scalar_reference_fixture`,
-    /// on random geometry: odd image widths, a subband stride wider than the
-    /// image, strip `y_offset`, and blocks clipped on every side or entirely
-    /// outside the image. That gives every `out_c` span length 0..=23, so the
-    /// pair loop, the 1-element tail, and the all-tail rows are all exercised.
-    /// Wavelets include ±0, ±inf, f32::MAX, subnormals and negative values.
-    /// The |delta| tables hold zeros, subnormals and 1e300, which overflows
-    /// the sum to inf. The kernel's inputs are built directly, with no IDCT,
-    /// so this test also runs under Miri on aarch64. Miri cannot run the NEON
-    /// IDCT the fixture test needs.
+    /// Same bit-exactness on random inputs built directly (no IDCT, so it
+    /// also runs under Miri): random geometry and strip row offsets, and
+    /// wavelets / |delta| holding ±0, ±inf, f32::MAX, subnormals, 1e300.
     #[test]
-    fn cost_precompute_simd_matches_scalar_reference_random() {
-        let pad = FILT_LEN - 1;
+    fn cost_kernel_simd_matches_scalar_reference_random() {
         let cells = AbsDeltaTable::CELLS;
         let mut seed = 0xC057_5EED_u64;
         let mut next = move || {
@@ -3019,7 +1982,7 @@ mod tests {
                 3 => f32::NEG_INFINITY,
                 4 => f32::MAX,
                 5 => -f32::MAX,
-                6 => f32::from_bits(1), // smallest subnormal
+                6 => f32::from_bits(1),
                 7 => -1.0e-39,
                 _ => ((r2 % 200_001) as f32 - 100_000.0) * 0.013,
             }
@@ -3032,223 +1995,74 @@ mod tests {
                 _ => (r2 % 1_000_000) as f64 * 1.7e-4,
             }
         };
-        let trials = if cfg!(miri) { 24 } else { 3000 };
+        let trials = if cfg!(miri) { 24 } else { 2000 };
         for t in 0..trials {
-            let img_w = 1 + (next() % 40) as usize;
-            let width = img_w + (next() % 4) as usize;
-            // Every 4th trial is a strip: rows start at y_offset > 0 and the
-            // block row is chosen so all of its 23 impact rows are present.
-            let (y_offset, rows, img_h, br) = if t % 4 == 3 {
-                let y_offset = 1 + (next() % 9) as usize;
-                let br = (y_offset + pad).div_ceil(8) + (next() % 2) as usize;
-                let rows = br * 8 + 8 - y_offset + (next() % 3) as usize;
-                (y_offset, rows, y_offset + rows, br)
-            } else {
-                let img_h = 1 + (next() % 40) as usize;
-                (0, img_h, img_h, (next() % (img_h as u64 / 8 + 3)) as usize)
-            };
-            let bc = (next() % (img_w as u64 / 8 + 4)) as usize;
-            let n = width * rows;
+            let bw = 1 + (next() % 6) as usize;
+            let bt = 1 + (next() % 6) as usize;
+            let (br, bc) = ((next() % bt as u64) as usize, (next() % bw as u64) as usize);
+            let stride = bw * 8 + 2 * WAV_MARGIN;
+            // A strip whose rows start at or above the block's window.
+            let y0 = (br * 8) as isize - 8 - (next() % 3) as isize;
+            let rows = ((br * 8) as isize + 15 - y0) as usize + (next() % 4) as usize;
+            let n = stride * rows;
             let mut band = || -> Vec<f32> { (0..n).map(|_| wavelet_pick(next(), next())).collect() };
-            let cw = ThreeSubbands { lh: band(), hl: band(), hh: band(), width, y_offset };
+            let w = PaddedSubbands { lh: band(), hl: band(), hh: band(), stride, y0, rows };
             let mut tab = || -> Vec<f64> { (0..cells).map(|_| delta_pick(next(), next())).collect() };
             let (lh, hl, hh) = (tab(), tab(), tab());
-            let got = compute_coefficient_cost_precomputed(&lh, &hl, &hh, &cw, br, bc, img_w, img_h, pad);
-            let want = cost_precomputed_scalar_reference(&lh, &hl, &hh, &cw, br, bc, img_w, img_h, pad);
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "trial {t}: img {img_w}x{img_h} width={width} y_offset={y_offset} br={br} bc={bc}: {got} vs {want}"
-            );
-        }
-    }
-
-    /// T3.2.G — dual-output must produce position-for-position
-    /// equality with two separate calls to compute_positions_from_wavelets
-    /// (one with SI, one without). f32 bit-exact on the same shared
-    /// cost map.
-    #[test]
-    fn dual_output_matches_two_separate_passes() {
-        let mut cover = DctGrid::new(8, 8);
-        for br in 0..8 {
-            for bc in 0..8 {
-                cover.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val =
-                            (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let qt = standard_qt();
-        let w = compute_cover_wavelets(&cover, &qt);
-
-        // Without SI: primary == verify by construction.
-        let (primary_no_si, verify_no_si) =
-            compute_positions_dual_from_wavelets(&cover, &qt, &w, None).unwrap();
-        let ref_no_si =
-            compute_positions_from_wavelets(&cover, &qt, &w, None).unwrap();
-        assert_eq!(primary_no_si.len(), ref_no_si.len());
-        assert_eq!(verify_no_si.len(), ref_no_si.len());
-        for (i, (p, r)) in primary_no_si.iter().zip(ref_no_si.iter()).enumerate() {
-            assert_eq!(p.flat_idx, r.flat_idx, "primary[{i}] flat_idx");
-            assert_eq!(p.cost.to_bits(), r.cost.to_bits(), "primary[{i}] cost");
-        }
-        for (i, (v, r)) in verify_no_si.iter().zip(ref_no_si.iter()).enumerate() {
-            assert_eq!(v.flat_idx, r.flat_idx, "verify[{i}] flat_idx");
-            assert_eq!(v.cost.to_bits(), r.cost.to_bits(), "verify[{i}] cost");
-        }
-    }
-
-    /// T3.2.D edge case — empty modifications. Dirty re-cost must
-    /// produce IDENTICAL output to the cached cover positions (no
-    /// recomputation happens, no blocks are dirty).
-    #[test]
-    fn dirty_recost_zero_modifications() {
-        let mut cover = DctGrid::new(8, 8);
-        for br in 0..8 {
-            for bc in 0..8 {
-                cover.set(br, bc, 0, 0, 100);
-                cover.set(br, bc, 1, 1, 5);
-                cover.set(br, bc, 2, 3, -3);
-            }
-        }
-        let qt = standard_qt();
-        let cover_w = compute_cover_wavelets(&cover, &qt);
-        let cover_positions =
-            compute_positions_from_wavelets(&cover, &qt, &cover_w, None).unwrap();
-
-        // No modifications → stego == cover, stego_wavelets == cover_wavelets.
-        let stego_w = apply_dct_modifications_to_wavelets(
-            &cover_w, &[], &cover, &cover, &qt,
-        );
-        let result = compute_positions_with_dirty_recost(
-            &cover, &qt, &cover_positions, &[], &stego_w, None,
-        ).unwrap();
-
-        assert_eq!(result.len(), cover_positions.len());
-        for (r, c) in result.iter().zip(cover_positions.iter()) {
-            assert_eq!(r.flat_idx, c.flat_idx);
-            assert_eq!(r.cost.to_bits(), c.cost.to_bits());
-        }
-    }
-
-    /// T3.2.D edge case — modifications saturate the dirty set so
-    /// EVERY block is dirty. The result must match what
-    /// compute_positions_from_wavelets(stego, ...) would produce (full
-    /// recompute equivalence).
-    #[test]
-    fn dirty_recost_all_blocks_dirty() {
-        let mut cover = DctGrid::new(6, 6);
-        for br in 0..6 {
-            for bc in 0..6 {
-                cover.set(br, bc, 0, 0, 100);
-                for i in 0..8 {
-                    for j in 0..8 {
-                        if i == 0 && j == 0 { continue; }
-                        let val =
-                            (((br * 7 + bc * 13 + i * 3 + j * 11) % 21) as i16) - 10;
-                        if val != 0 {
-                            cover.set(br, bc, i, j, val);
-                        }
-                    }
-                }
-            }
-        }
-        let mut stego = cover.clone();
-        let bw = stego.blocks_wide();
-        // Modify ONE coefficient in EVERY block so the 6x6 dirty
-        // neighborhood union covers the whole grid.
-        let mut modifications: Vec<u32> = Vec::new();
-        for br in 0..6 {
-            for bc in 0..6 {
-                let cur = stego.get(br, bc, 1, 1);
-                stego.set(br, bc, 1, 1, cur + 1);
-                modifications.push(((br * bw + bc) * 64 + 1 * 8 + 1) as u32);
-            }
-        }
-
-        let qt = standard_qt();
-        let cover_w = compute_cover_wavelets(&cover, &qt);
-        let cover_positions =
-            compute_positions_from_wavelets(&cover, &qt, &cover_w, None).unwrap();
-
-        let stego_w = apply_dct_modifications_to_wavelets(
-            &cover_w, &modifications, &cover, &stego, &qt,
-        );
-        let ref_positions =
-            compute_positions_from_wavelets(&stego, &qt, &stego_w.as_cache(), None).unwrap();
-        let dirty_positions = compute_positions_with_dirty_recost(
-            &stego, &qt, &cover_positions, &modifications, &stego_w, None,
-        ).unwrap();
-
-        assert_eq!(ref_positions.len(), dirty_positions.len());
-        for (r, d) in ref_positions.iter().zip(dirty_positions.iter()) {
-            assert_eq!(r.flat_idx, d.flat_idx);
-            assert!((r.cost - d.cost).abs() < 1e-6, "{} vs {}", r.cost, d.cost);
+            let got = cost_kernel(&lh, &hl, &hh, &w, br, bc);
+            let want = cost_kernel_scalar_reference(&lh, &hl, &hh, &w, br, bc);
+            assert_eq!(got.to_bits(), want.to_bits(), "trial {t}: {bw}x{bt} y0={y0} br={br} bc={bc}: {got} vs {want}");
         }
     }
 
     /// End-to-end: Ghost encode/decode round-trip still works.
-    /// This verifies that the parallel cost computation integrates correctly
-    /// with the full Ghost steganography pipeline.
     #[test]
     fn ghost_roundtrip_with_current_feature_set() {
         let data = match std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") {
             Ok(d) => d,
-            Err(_) => return, // Skip if test vector not available.
+            Err(_) => return,
         };
-
         let message = "Parallel cost test";
         let passphrase = "test-pass-42";
-
-        let stego = crate::stego::ghost_encode(&data, message, passphrase)
-            .expect("ghost_encode should succeed");
-        let decoded = crate::stego::ghost_decode(&stego, passphrase)
-            .expect("ghost_decode should succeed");
-
+        let stego = crate::stego::ghost_encode(&data, message, passphrase).expect("ghost_encode should succeed");
+        let decoded = crate::stego::ghost_decode(&stego, passphrase).expect("ghost_decode should succeed");
         assert_eq!(decoded.text, message, "round-trip mismatch");
         assert!(decoded.files.is_empty(), "no files expected");
     }
 
     /// Performance benchmark for J-UNIWARD cost computation on a real photo.
-    /// Marked #[ignore] so it doesn't run in CI -- run manually with:
-    ///   cargo test -p phasm-core --features parallel cost_computation_benchmark -- --ignored --nocapture
+    /// Run manually with:
+    ///   cargo test -p phasm-core --release --features parallel cost_computation_benchmark -- --ignored --nocapture
     #[test]
     #[ignore]
     fn cost_computation_benchmark() {
-        let data = if let Ok(d) = std::fs::read("test-vectors/image/photo_320x240_q75_420.jpg") { d } else {
+        let data = if let Ok(d) = std::fs::read("test-vectors/image/photo_original_3557.jpg") {
+            d
+        } else if let Ok(d) = std::fs::read("test-vectors/image/photo_640x480_q75_420.jpg") {
+            d
+        } else {
             eprintln!("Skipping benchmark: test vector not found");
             return;
         };
-
         let img = crate::codec::jpeg::JpegImage::from_bytes(&data).unwrap();
         let grid = img.dct_grid(0);
         let qt_id = img.frame_info().components[0].quant_table_id as usize;
         let qt = img.quant_table(qt_id).unwrap();
-
-        // Warm-up run.
-        let _ = compute_uniward(grid, qt);
-
-        let iterations = 10;
-        let start = std::time::Instant::now();
+        let _ = compute_ac_costs_separable(grid, qt);
+        let iterations = 5;
+        let t = std::time::Instant::now();
         for _ in 0..iterations {
-            let _ = compute_uniward(grid, qt);
+            let _ = compute_ac_costs_separable(grid, qt);
         }
-        let elapsed = start.elapsed();
-
-        let bw = grid.blocks_wide();
-        let bt = grid.blocks_tall();
+        let v2 = t.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+        let t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = compute_positions_streaming_legacy_v1(grid, qt, None);
+        }
+        let v1 = t.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
         eprintln!(
-            "J-UNIWARD cost ({bw}x{bt} blocks, {}x{} pixels): {:.1} ms avg over {iterations} runs [feature=parallel: {}]",
-            bw * 8, bt * 8,
-            elapsed.as_secs_f64() * 1000.0 / iterations as f64,
-            cfg!(feature = "parallel"),
+            "J-UNIWARD costs ({}x{} px): all-AC separable {v2:.1} ms, legacy v1 nzAC {v1:.1} ms [parallel: {}]",
+            grid.blocks_wide() * 8, grid.blocks_tall() * 8, cfg!(feature = "parallel"),
         );
     }
 }

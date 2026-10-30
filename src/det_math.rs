@@ -378,6 +378,55 @@ pub fn det_exp(x: f64) -> f64 {
     }
 }
 
+/// Deterministic natural logarithm for finite `x > 0` (NaN for `x < 0` or
+/// NaN, `-∞` for 0, `+∞` for `+∞`).
+///
+/// Range reduction by exponent-bit extraction to `x = 2^k · m` with
+/// `m ∈ [√½, √2)`, then `ln m = 2·atanh(s)`, `s = (m − 1)/(m + 1)`
+/// (`|s| < 0.1716`), summed as an odd series up to `s^23` (truncation
+/// < 1e-18 relative). Pure IEEE 754 `+ − × ÷` and bit casts: bit-exact on
+/// every target. About 1 ulp from `f64::ln`; used encoder-side (Ghost v3
+/// payload split), never for anything a decoder recomputes.
+pub fn det_ln(x: f64) -> f64 {
+    if x.is_nan() || x < 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x.is_infinite() {
+        return f64::INFINITY;
+    }
+    let mut bits = x.to_bits();
+    let mut k: i64 = 0;
+    if (bits >> 52) == 0 {
+        // Subnormal: scale into the normal range first.
+        bits = (x * f64::from_bits(0x4350_0000_0000_0000)).to_bits(); // × 2^54
+        k = -54;
+    }
+    k += ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000); // [1, 2)
+    if m >= core::f64::consts::SQRT_2 {
+        m *= 0.5;
+        k += 1;
+    }
+    let s = (m - 1.0) / (m + 1.0);
+    let s2 = s * s;
+    // atanh(s)/s = Σ s^(2j)/(2j+1), j = 0..11, Horner from the top.
+    let mut p = 1.0 / 23.0;
+    let mut d = 21.0;
+    while d > 0.0 {
+        p = 1.0 / d + s2 * p;
+        d -= 2.0;
+    }
+    let ln_m = 2.0 * s * p;
+    // ln 2 split for an exact k·ln2_hi.
+    const LN2_HI: f64 = 6.931_471_803_691_238_164_90e-01;
+    const LN2_LO: f64 = 1.908_214_929_270_587_700_02e-10;
+    let kf = k as f64;
+    kf * LN2_HI + (ln_m + kf * LN2_LO)
+}
+
 /// Deterministic integer-exponent power: `base^n` for `n: i32`.
 ///
 /// Uses exponentiation-by-squaring with bit-exact IEEE 754 multiply.
@@ -423,6 +472,25 @@ mod tests {
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         if a.is_nan() && b.is_nan() { return true; }
         (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn ln_matches_std_within_2_ulp() {
+        let mut x = 1e-310f64; // subnormal start
+        while x < 1e300 {
+            let a = det_ln(x);
+            let b = x.ln();
+            let tol = 4.0 * f64::EPSILON * b.abs().max(1.0);
+            assert!((a - b).abs() <= tol, "x={x:e} det={a} std={b}");
+            x *= 1.37;
+        }
+        for &x in &[1.0f64, 2.0, 0.5, core::f64::consts::E, 0.999_999, 1.000_001, 1.4142, 1.4143] {
+            assert!((det_ln(x) - x.ln()).abs() <= 4.0 * f64::EPSILON, "x={x}");
+        }
+        assert_eq!(det_ln(1.0), 0.0);
+        assert!(det_ln(0.0) == f64::NEG_INFINITY);
+        assert!(det_ln(-1.0).is_nan());
+        assert!(det_ln(f64::INFINITY) == f64::INFINITY);
     }
 
     #[test]

@@ -103,6 +103,9 @@ pub(crate) fn remap_cover_frame_idx(cover: &mut DomainCover, base: u32) {
             );
         }
     }
+    for mb in cover.mb_syntax.mbs.iter_mut() {
+        mb.frame_idx += base;
+    }
 }
 
 // ─── Cross-domain orchestration ──────────────────────────────────
@@ -121,6 +124,12 @@ pub struct DomainCover {
     pub coeff_suffix_lsb: DomainBits,
     pub mvd_sign_bypass: DomainBits,
     pub mvd_suffix_lsb: DomainBits,
+    /// Per-MB syntax of the walked stream (intra flag, QP, key frame) — what
+    /// the v2 damage model (`stego::damage`) prices positions from. Filled by
+    /// the CABAC walker; keyed by the same frame index as the positions, so
+    /// [`remap_cover_frame_idx`] and [`DomainCover::extend_from`] carry it.
+    /// Empty for synthetic covers (then no position is damage-priced).
+    pub mb_syntax: super::damage::MbSyntaxMap,
 }
 
 /// Cover bits + the positions that produced them, in emit order.
@@ -203,6 +212,11 @@ impl DomainCover {
         self.coeff_suffix_lsb.extend(other.coeff_suffix_lsb);
         self.mvd_sign_bypass.extend(other.mvd_sign_bypass);
         self.mvd_suffix_lsb.extend(other.mvd_suffix_lsb);
+        if self.mb_syntax.mb_w == 0 {
+            self.mb_syntax.mb_w = other.mb_syntax.mb_w;
+            self.mb_syntax.mb_h = other.mb_syntax.mb_h;
+        }
+        self.mb_syntax.mbs.extend(other.mb_syntax.mbs);
     }
 }
 

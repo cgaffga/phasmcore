@@ -87,6 +87,7 @@ fn pull_whole_video_one_shadow_roundtrip() {
         quantizer,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let yuv = corpus_yuv_concat(w, h, n);
 
@@ -189,6 +190,7 @@ fn whole_video_shadow_roundtrip_primary_beyond_even_split() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let yuv = corpus_yuv_concat(w, h, n);
     let (primary_pass, shadow_pass) = ("wv-beyond-primary", "shadow-pass");
@@ -262,6 +264,7 @@ fn whole_video_shadow_header_incapable_gop_fails_fast() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let primary_payload = payload::encode_payload("primary", &[]).unwrap();
     let (cipher, nonce, salt) = crypto::encrypt(&primary_payload, "p").unwrap();

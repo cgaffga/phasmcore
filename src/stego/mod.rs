@@ -22,6 +22,8 @@
 pub mod error;
 pub mod stc;
 pub mod crypto;
+#[doc(hidden)]
+pub mod chacha_stream;
 pub mod frame;
 pub mod chunk_frame;
 pub mod gop_cache;
@@ -45,9 +47,9 @@ pub use error::StegoError;
 pub use ghost::quality;
 pub use ghost::quality::EncodeQuality;
 pub use memory::{
-    get_memory_budget, predict_peak_memory, select_ghost_shadow_rung,
+    get_memory_budget, ghost_lane_plan, predict_peak_memory,
     set_memory_budget, set_telemetry_hook,
-    GhostShadowRung, ModeId, TelemetryEvent, TelemetryHook,
+    GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
 pub use ghost::optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
 #[doc(hidden)]
@@ -96,15 +98,20 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     }
     Ok(())
 }
+pub use ghost::session::{GhostEncodeSession, GhostTaskRunner, TASK_TARGET_OFFSET as GHOST_TASK_TARGET_OFFSET};
+#[doc(hidden)]
+pub use ghost::session::run_split_encode_locally;
 pub use ghost::pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
 pub use ghost::pipeline::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
 pub use ghost::pipeline::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS};
 pub use ghost::pipeline::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
 pub use shadow::shadow_capacity;
-pub use capacity::estimate_shadow_capacity;
+pub use capacity::{estimate_shadow_capacity, estimate_shadow_capacity_si};
 pub use capacity::estimate_capacity as ghost_capacity;
 pub use capacity::estimate_capacity_si as ghost_capacity_si;
+pub use ghost::deep_cover::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
+pub use capacity::{ghost_bands, ghost_bands_si, GhostBands};
 pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 pub use payload::{PayloadData, FileEntry, compressed_payload_size};
@@ -178,30 +185,46 @@ pub fn smart_decode(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData
 /// than the misleading `FrameCorrupted`.
 fn try_armor_modes(
     img: &crate::codec::jpeg::JpegImage,
-    stego_bytes: &[u8],
     passphrase: &str,
     saw_decryption_failed: &mut bool,
 ) -> Option<(PayloadData, DecodeQuality)> {
-    use crate::stego::armor::fortress;
-    use crate::stego::armor::pipeline::armor_decode_no_fortress;
+    try_armor_modes_unless(img, passphrase, saw_decryption_failed, &|| false).expect("never stopped")
+}
 
+/// [`try_armor_modes`], abandoned (`None`) when `stop()` is true before an
+/// attempt starts (before Fortress, before STDM, before geometric
+/// recovery). The parallel `smart_decode` runs it next to the v1 cost
+/// pools, which it prefers, and stops it when they succeed; a running
+/// attempt finishes first (its result is then ignored).
+fn try_armor_modes_unless(
+    img: &crate::codec::jpeg::JpegImage,
+    passphrase: &str,
+    saw_decryption_failed: &mut bool,
+    stop: &dyn Fn() -> bool,
+) -> Option<Option<(PayloadData, DecodeQuality)>> {
+    use crate::stego::armor::fortress;
+    use crate::stego::armor::pipeline::armor_decode_no_fortress_unless;
+
+    if stop() {
+        return None;
+    }
     // Fortress first (fast).
     if img.num_components() > 0
         && let Ok(result) = fortress::fortress_decode(img, passphrase)
     {
-        return Some(result);
+        return Some(Some(result));
     }
 
-    // Armor STDM + geometric recovery (the geometric-recovery stage still
-    // re-parses internally — that path resamples the image, so it can't reuse
-    // the original parse).
-    match armor_decode_no_fortress(img, stego_bytes, passphrase) {
-        Ok(result) => Some(result),
+    // Armor STDM + geometric recovery. Both read this parse; the geometric
+    // stage streams its spectrum and corrected image with a bounded working
+    // set instead of re-parsing or copying the image.
+    match armor_decode_no_fortress_unless(img, passphrase, stop)? {
+        Ok(result) => Some(Some(result)),
         Err(StegoError::DecryptionFailed) => {
             *saw_decryption_failed = true;
-            None
+            Some(None)
         }
-        Err(_) => None,
+        Err(_) => Some(None),
     }
 }
 
@@ -236,7 +259,8 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     //
     // So order the attempts by likelihood rather than skipping: large inputs try
     // Ghost first and fall back to Armor/Fortress at the end. That keeps the
-    // expensive Armor FFT (~30-60s, ~16 bytes/px at 60 MP) off the common path
+    // expensive Armor attempt (STDM sweep + geometric recovery: FFT, resample;
+    // bounded working set, but seconds of work at 48 MP) off the common path
     // without ever making a real payload undecodable.
     //
     // Regression: an earlier version *skipped* Armor above this size, which
@@ -247,7 +271,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
 
     if armor_first
         && let Some(result) =
-            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
+            try_armor_modes(&img, passphrase, &mut saw_decryption_failed)
     {
         return Ok(result);
     }
@@ -258,53 +282,25 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let (armor_done, _) = progress::get();
     progress::set_total(armor_done + GHOST_DECODE_STEPS);
 
-    // Compute Y-channel UNIWARD positions ONCE and share with
-    // both Ghost branches (each takes ownership of its own clone since
-    // both mutate: permute vs sort). Saves one compute_positions
-    // (~1-10s, ~170MB-1GB scratch) on the dominant
-    // "neither-Fortress-nor-Armor-matched" path. Falls back to per-mode
-    // compute if shared compute fails (NoLuminanceChannel etc).
-    let shared_positions = if img.num_components() > 0 {
-        let qt_id = img.frame_info().components[0].quant_table_id as usize;
-        img.quant_table(qt_id)
-            .and_then(|qt| cost::uniward::compute_positions_streaming(img.dct_grid(0), qt, None).ok())
-    } else {
-        None
-    };
-    let positions_for_shadow = shared_positions.as_ref().map(|p| p.clone());
-
-    match shared_positions {
-        Some(p) => match ghost::pipeline::ghost_decode_from_image_with_positions(&img, passphrase, p) {
-            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
-            Err(_) => {}
-        },
-        None => match ghost::pipeline::ghost_decode_from_image(&img, passphrase) {
-            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
-            Err(_) => {}
-        },
+    // Ghost primary (v3, then v1), then the shadow layouts (v3, layout v1).
+    // No decoder computes costs, except the v1 cost-pool fallback inside the
+    // shadow attempt, which runs only after everything else in it failed.
+    match ghost::pipeline::ghost_decode_from_image(&img, passphrase) {
+        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+        Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+        Err(_) => {}
     }
-
-    // Try Ghost shadow (Y-channel direct LSB + RS).
-    match positions_for_shadow {
-        Some(p) => match ghost::pipeline::ghost_shadow_decode_from_image_with_positions(&img, passphrase, p) {
-            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
-            Err(_) => {}
-        },
-        None => match ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase) {
-            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
-            Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
-            Err(_) => {}
-        },
+    match ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase) {
+        Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+        Err(StegoError::DecryptionFailed) => { saw_decryption_failed = true; }
+        Err(_) => {}
     }
 
     // Deferred Armor/Fortress for large inputs: Ghost didn't match, so give the
     // unlikely-but-possible full-resolution Armor case its turn.
     if !armor_first
         && let Some(result) =
-            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
+            try_armor_modes(&img, passphrase, &mut saw_decryption_failed)
     {
         return Ok(result);
     }
@@ -316,18 +312,39 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 }
 
-/// Parallel smart_decode: three-way concurrent decode via rayon.
+/// Parallel smart_decode: the serial path's attempts and preference order,
+/// with independent attempts run side by side.
 ///
-/// Parses the JPEG once and shares `&JpegImage` across threads.
-/// Runs Fortress, STDM+Phase3, and Ghost in parallel.
-/// Preference order: Fortress > Armor STDM > Ghost.
+/// Every attempt computes exactly what it computes alone (results depend
+/// only on the image and the passphrase), and the results are read in the
+/// fixed preference order below, so the returned payload, mode and error
+/// are those of the attempts run one after another. An attempt runs ahead
+/// only next to attempts it ranks *below* or that start at the same time
+/// anyway; once a preferred attempt succeeds, the lower ones are abandoned
+/// at their next check (they are joined, so the call returns when they
+/// reach it — the uninterruptible pieces are one Fortress / STDM /
+/// geometric / Ghost attempt). The keys are shared across threads
+/// ([`crypto::KeyScope`]): no stage derives a key another already derived.
+///
+/// - Inputs ≤ [`ARMOR_TARGET_DIMENSION`]: Fortress, Armor STDM (+ geometric
+///   recovery) and Ghost (primary, then — only if it found nothing — the
+///   cost-free shadow layouts) run concurrently; preference Fortress >
+///   Armor STDM > Ghost primary > Ghost shadow. Fortress succeeding skips
+///   geometric recovery and the Ghost attempts not yet started; STDM
+///   succeeding skips the Ghost attempts not yet started. The v1 cost-pool
+///   shadow fallback runs last, alone.
+/// - Larger inputs (Armor deferred, see the serial path): Ghost primary
+///   alone, then the shadow layouts alone (a Ghost passphrase never shares
+///   the cores with speculative work), then the v1 cost pools and the
+///   Armor attempts — side by side if [`memory::decode_overlap_ok`] allows
+///   it (Armor stopped when the pools succeed), else one after another.
+///   The Armor chain's Fortress, STDM and template keys are derived in
+///   parallel when it starts.
 #[cfg(feature = "parallel")]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::codec::jpeg::JpegImage;
-    use crate::stego::armor::fortress;
-    use crate::stego::armor::pipeline::armor_decode_no_fortress;
 
-    // In parallel mode all three branches advance the same global counter
+    // In parallel mode the attempts advance the same global counter
     // concurrently.  We init with 0 (indeterminate) — try_armor_decode will
     // set a real total once it knows the candidate count.  The cap in
     // advance() prevents step from ever exceeding total.
@@ -335,66 +352,85 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     progress::check_cancelled()?;
 
     let img = JpegImage::from_bytes(stego_bytes)?;
+    let keys = crypto::KeyScope::new(passphrase);
 
     // See the serial path for the full rationale: Armor/Fortress is the less
     // likely mode above ARMOR_TARGET_DIMENSION but NOT impossible, so large
-    // inputs *defer* the Armor attempts to a fallback stage below rather than
-    // skipping them. Deferring instead of running them inside the join also
-    // keeps the Armor FFT working set from overlapping Ghost's, which is what
-    // the original size check was really protecting.
+    // inputs *defer* the Armor attempts rather than skipping them. Deferring
+    // also keeps the Armor working set from overlapping Ghost's primary.
     let fi = img.frame_info();
     let max_dim = fi.width.max(fi.height) as u32;
-    let armor_first = max_dim <= ARMOR_TARGET_DIMENSION;
-
-    // Compute shared Y-channel UNIWARD positions ONCE before the
-    // rayon::join and clone for shadow. Avoids 2× concurrent
-    // compute_positions_streaming runs (each peaking at ~170MB-1GB
-    // scratch on big images). Net: 1 × compute scratch instead of 2 ×
-    // concurrent (~1GB savings on 200MP), plus 50% CPU saved. Falls
-    // back to per-mode compute when shared compute fails
-    // (NoLuminanceChannel etc).
-    //
-    // Trade-off: compute_positions now runs *before* rayon::join, so it
-    // doesn't overlap with Fortress / Armor work. Same wall-clock
-    // overall (Ghost branches were the bottleneck) but slightly less
-    // parallelism on the "neither matched" path.
-    let shared_positions = if img.num_components() > 0 {
-        let qt_id = img.frame_info().components[0].quant_table_id as usize;
-        img.quant_table(qt_id)
-            .and_then(|qt| cost::uniward::compute_positions_streaming(img.dct_grid(0), qt, None).ok())
+    if max_dim <= ARMOR_TARGET_DIMENSION {
+        decode_armor_first(&img, passphrase)
     } else {
-        None
-    };
-    let positions_for_shadow = shared_positions.as_ref().map(|p| p.clone());
+        decode_armor_deferred(&img, passphrase, &keys)
+    }
+}
+
+/// [`smart_decode_inner`] (parallel) for inputs ≤ [`ARMOR_TARGET_DIMENSION`].
+#[cfg(feature = "parallel")]
+fn decode_armor_first(
+    img: &crate::codec::jpeg::JpegImage,
+    passphrase: &str,
+) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    use crate::stego::armor::fortress;
+    use crate::stego::armor::pipeline::armor_decode_no_fortress_unless;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Preference ranks; `best` = the best rank that succeeded so far. An
+    // attempt is skipped (`None`) once one it ranks below succeeded.
+    const FORTRESS: usize = 0;
+    const STDM: usize = 1;
+    const GHOST: usize = 2;
+    const SHADOW: usize = 3;
+    let best = AtomicUsize::new(usize::MAX);
+    let beaten = |rank: usize| best.load(Ordering::Relaxed) < rank;
 
     let (fortress_result, (stdm_result, (ghost_result, shadow_result))) = rayon::join(
         || {
-            if armor_first && img.num_components() > 0 {
-                fortress::fortress_decode(&img, passphrase)
+            let r = if img.num_components() > 0 {
+                fortress::fortress_decode(img, passphrase)
             } else {
                 Err(StegoError::FrameCorrupted)
+            };
+            if r.is_ok() {
+                best.fetch_min(FORTRESS, Ordering::Relaxed);
             }
+            r
         },
         || rayon::join(
             || {
-                if armor_first {
-                    armor_decode_no_fortress(&img, stego_bytes, passphrase)
-                } else {
-                    Err(StegoError::FrameCorrupted)
+                let r = armor_decode_no_fortress_unless(img, passphrase, &|| beaten(STDM));
+                if matches!(r, Some(Ok(_))) {
+                    best.fetch_min(STDM, Ordering::Relaxed);
                 }
+                r
             },
-            || rayon::join(
-                || match shared_positions {
-                    Some(p) => ghost::pipeline::ghost_decode_from_image_with_positions(&img, passphrase, p),
-                    None => ghost::pipeline::ghost_decode_from_image(&img, passphrase),
-                },
-                || match positions_for_shadow {
-                    Some(p) => ghost::pipeline::ghost_shadow_decode_from_image_with_positions(&img, passphrase, p),
-                    None => ghost::pipeline::ghost_shadow_decode_from_image(&img, passphrase),
-                },
-            ),
+            || {
+                if beaten(GHOST) {
+                    return (None, None);
+                }
+                // Primary, then — only if it found nothing — the cost-free
+                // shadow layouts (v3, layout v1 legacy tier). The v1
+                // cost-pool retry waits until every attempt failed (below).
+                let primary = ghost::pipeline::ghost_decode_from_image(img, passphrase);
+                if primary.is_ok() || matches!(primary, Err(StegoError::Cancelled)) {
+                    return (Some(primary), Some(Err(StegoError::FrameCorrupted)));
+                }
+                if beaten(SHADOW) {
+                    return (Some(primary), None);
+                }
+                let shadow = ghost::pipeline::ghost_shadow_decode_current(img, passphrase);
+                (Some(primary), Some(shadow))
+            },
         ),
     );
+
+    // An attempt is `None` only if one it ranks below succeeded — and that
+    // one returns before the `None` is read.
+    let stdm_result = stdm_result.unwrap_or(Err(StegoError::FrameCorrupted));
+    let ghost_result = ghost_result.unwrap_or(Err(StegoError::FrameCorrupted));
+    let shadow_result = shadow_result.unwrap_or(Err(StegoError::FrameCorrupted));
 
     // Prefer Fortress (fastest, most robust).
     if let Ok((payload, quality)) = fortress_result {
@@ -422,14 +458,17 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
         || matches!(&ghost_result, Err(StegoError::DecryptionFailed))
         || matches!(&shadow_result, Err(StegoError::DecryptionFailed));
 
-    // Deferred Armor/Fortress for large inputs (see `armor_first`): Ghost
-    // didn't match, so give full-resolution Armor its turn — now, with the
-    // parallel Ghost working set already released.
-    if !armor_first
-        && let Some(result) =
-            try_armor_modes(&img, stego_bytes, passphrase, &mut saw_decryption_failed)
-    {
-        return Ok(result);
+    // Ghost shadow under the legacy (phasm-core ≤ 0.4.x) costs: a shadow
+    // of an older image whose cost pool only those costs select. Run only
+    // now, once nothing else matched, so a successful decode never pays
+    // for the recompute.
+    if img.num_components() > 0 && !matches!(&shadow_result, Err(StegoError::Cancelled)) {
+        match ghost::pipeline::ghost_shadow_decode_legacy_v1(img, passphrase) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => saw_decryption_failed = true,
+            Err(StegoError::Cancelled) => return Err(StegoError::Cancelled),
+            Err(_) => {}
+        }
     }
 
     if saw_decryption_failed {
@@ -437,4 +476,102 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     }
 
     Err(stdm_result.unwrap_err())
+}
+
+/// [`smart_decode_inner`] (parallel) for inputs above
+/// [`ARMOR_TARGET_DIMENSION`]: Armor deferred to the end. Preference: Ghost
+/// primary > Ghost shadow (v3, legacy tier) > v1 cost pools > Fortress >
+/// Armor STDM (+ geometric) — the serial order.
+#[cfg(feature = "parallel")]
+fn decode_armor_deferred(
+    img: &crate::codec::jpeg::JpegImage,
+    passphrase: &str,
+    keys: &crypto::KeyScope,
+) -> Result<(PayloadData, DecodeQuality), StegoError> {
+    use crypto::DecodeKey;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Keys the Armor chain derives one after another once it runs (Fortress,
+    // then STDM, then — if STDM failed — geometric recovery's template).
+    // The ring key is left to geometric recovery: a wrong passphrase rarely
+    // gets that far.
+    const ARMOR_KEYS: [DecodeKey; 3] = [DecodeKey::Fortress, DecodeKey::Armor, DecodeKey::Template];
+
+    // Ghost primary, alone: a primary passphrase never shares the cores.
+    let ghost_result = ghost::pipeline::ghost_decode_from_image(img, passphrase);
+    if let Ok(payload) = ghost_result {
+        return Ok((payload, DecodeQuality::ghost()));
+    }
+
+    // The shadow layouts (v3, layout v1's legacy tier), alone — skipped (as
+    // the dummy `FrameCorrupted`) when the primary was cancelled.
+    let shadow_result = if matches!(ghost_result, Err(StegoError::Cancelled)) {
+        Err(StegoError::FrameCorrupted)
+    } else {
+        ghost::pipeline::ghost_shadow_decode_current(img, passphrase)
+    };
+    if let Ok(payload) = shadow_result {
+        return Ok((payload, DecodeQuality::ghost()));
+    }
+
+    let mut saw_decryption_failed = matches!(&ghost_result, Err(StegoError::DecryptionFailed))
+        || matches!(&shadow_result, Err(StegoError::DecryptionFailed));
+
+    // Ghost shadow under the legacy (phasm-core ≤ 0.4.x) costs, then the
+    // deferred Armor/Fortress (full-resolution Armor must stay decodable).
+    // Side by side when both fit (`memory::decode_overlap_ok`): the Armor
+    // chain, which ranks below the cost pools, stops at its next attempt
+    // once they succeed, and its result is read only if they failed.
+    if img.num_components() > 0 && !matches!(&shadow_result, Err(StegoError::Cancelled)) {
+        let grid = img.dct_grid(0);
+        let heap = memory::DecodeStageHeap::for_cover(grid.coeffs().len(), ghost::capacity::count_nonzero_ac(grid));
+        if memory::decode_overlap_ok(heap.legacy_order.max(heap.legacy_pools), heap.armor) {
+            keys.prederive(&ARMOR_KEYS);
+            let pools_won = AtomicBool::new(false);
+            let (legacy_result, armor) = rayon::join(
+                || {
+                    let r = ghost::pipeline::ghost_shadow_decode_legacy_v1(img, passphrase);
+                    if r.is_ok() {
+                        pools_won.store(true, Ordering::Relaxed);
+                    }
+                    r
+                },
+                || {
+                    let mut saw = false;
+                    try_armor_modes_unless(img, passphrase, &mut saw, &|| pools_won.load(Ordering::Relaxed))
+                        .map(|hit| (hit, saw))
+                },
+            );
+            match legacy_result {
+                Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+                Err(StegoError::DecryptionFailed) => saw_decryption_failed = true,
+                Err(StegoError::Cancelled) => return Err(StegoError::Cancelled),
+                Err(_) => {}
+            }
+            // Stopped only when the pools succeeded, which returned above.
+            let (hit, saw) = armor.unwrap_or((None, false));
+            if let Some(result) = hit {
+                return Ok(result);
+            }
+            saw_decryption_failed |= saw;
+            return if saw_decryption_failed { Err(StegoError::DecryptionFailed) } else { Err(StegoError::FrameCorrupted) };
+        }
+        match ghost::pipeline::ghost_shadow_decode_legacy_v1(img, passphrase) {
+            Ok(payload) => return Ok((payload, DecodeQuality::ghost())),
+            Err(StegoError::DecryptionFailed) => saw_decryption_failed = true,
+            Err(StegoError::Cancelled) => return Err(StegoError::Cancelled),
+            Err(_) => {}
+        }
+    }
+
+    keys.prederive(&ARMOR_KEYS);
+    if let Some(result) = try_armor_modes(img, passphrase, &mut saw_decryption_failed) {
+        return Ok(result);
+    }
+
+    if saw_decryption_failed {
+        Err(StegoError::DecryptionFailed)
+    } else {
+        Err(StegoError::FrameCorrupted)
+    }
 }

@@ -79,3 +79,6 @@ third_party/*/
 # through and kept showing as live-modified while the queue ran.
 # Queue is done; untracked + ignored.
 runs/2026-05-14-e9-srnet-queue/*.log
+
+# Trained detector weights (SRNet etc.), kept on EXTDISK, never committed or backed up
+models/

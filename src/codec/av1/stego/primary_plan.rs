@@ -65,6 +65,20 @@ pub fn gop_primary_caps(cover_bits: &[usize], wet_bits: &[usize]) -> Vec<GopPrim
         .collect()
 }
 
+/// [`gop_primary_caps`] with the damage-aware weight of each GOP of a
+/// `width × height` clip (`density_cap::quality_safe_usable`): a GOP with
+/// dense cover carries less, so its flips per pixel at the red end stay
+/// those of a GOP at the bound. Both encodes plan from these.
+pub fn damage_aware_caps(cover_bits: &[usize], wet_bits: &[usize], width: u32, height: u32) -> Vec<GopPrimaryCap> {
+    assert_eq!(cover_bits.len(), wet_bits.len(), "one wet count per GOP");
+    let usable: Vec<usize> = cover_bits
+        .iter()
+        .zip(wet_bits)
+        .map(|(&cover, &wet)| super::density_cap::quality_safe_usable(cover, wet, width, height))
+        .collect();
+    gop_primary_caps(&usable, &vec![0; usable.len()])
+}
+
 /// Index of the first GOP that cannot carry even a chunk header, or
 /// `caps.len()`. Message bytes never go at or past it.
 pub fn window_end(caps: &[GopPrimaryCap]) -> usize {
@@ -235,5 +249,23 @@ mod tests {
         assert_eq!(shrink_step(800), 700);
         assert_eq!(shrink_step(1), 0);
         assert_eq!(shrink_step(0), 0);
+    }
+
+    #[test]
+    fn dense_gops_carry_less() {
+        let (w, h) = (1280u32, 720u32);
+        let px = (w * h) as usize;
+        // GOP 0 calm (1 position per pixel), GOP 1 dense (4 per pixel).
+        let raw = gop_primary_caps(&[px, 4 * px], &[0, 0]);
+        let caps = damage_aware_caps(&[px, 4 * px], &[0, 0], w, h);
+        assert_eq!(caps[0], raw[0]);
+        assert_eq!(caps[1], gop_primary_caps(&[px, px * 3 / 2], &[0, 0])[1]);
+        // A message the raw caps took is refused.
+        let safe_total: usize = caps.iter().map(|c| c.payload_bytes).sum();
+        assert!(plan_primary(&raw, safe_total + 1).is_ok());
+        assert!(matches!(plan_primary(&caps, safe_total + 1), Err(Av1StegoError::MessageTooLarge { .. })));
+        // Shadow-wet positions come off before the weight.
+        let wet = damage_aware_caps(&[4 * px], &[4000], w, h);
+        assert_eq!(wet[0], gop_primary_caps(&[(4 * px - 4000) * 3 / 8], &[0])[0]);
     }
 }

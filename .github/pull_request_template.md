@@ -16,7 +16,7 @@ clean-room / crypto invariants.
 <!-- Tick all that apply. -->
 
 - [ ] Image stego (JPEG / Ghost / Armor / SI-UNIWARD / Shadow)
-- [ ] Video stego (H.264 CABAC v2 / streaming orchestrator)
+- [ ] Video stego (H.264 / AV1 streaming sessions)
 - [ ] New media type (please describe)
 - [ ] Cross-cutting (det_math, crypto, stc, codec parser, FFI)
 - [ ] Tooling (CLI, examples, build scripts)
@@ -30,8 +30,8 @@ clean-room / crypto invariants.
 
 <!--
 What did you run to validate the change? Be specific. Examples:
-  - `cargo test --features cabac-stego`
-  - `cargo test --release --features cabac-stego --test h264_stego_streaming_orchestrator_v2`
+  - `cargo test -p phasm-core --features parallel`
+  - `cargo test --release --features parallel --test armor_roundtrip`
   - `./build.sh test-all`
   - Manual: encoded a 1080p clip, decoded round-trip, payload preserved
 -->

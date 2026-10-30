@@ -79,6 +79,40 @@ pub struct Av1StreamingEncodeParams {
     /// Caller's promise of how many frames will be pushed in total.
     /// Drives `total_chunks = ceil(total_frames_hint / gop_size)`.
     pub total_frames_hint: u32,
+    /// The colour the sequence header signals (and the MP4 `colr` then
+    /// carries): the source's, as a transcode passes it on.
+    pub colour: Av1Colour,
+}
+
+/// An AV1 encode's colour signalling, as ITU-T H.273 codes: the sequence
+/// header's colour description and the MP4 `colr`.
+///
+/// The MP4 names libavcodec's librav1e wrapper as the encoder, and that
+/// wrapper always hands rav1e the colour the decoded source frames carry —
+/// the source's tags, unspecified (2) when it has none — so a phasm file
+/// signals its source's colour the same way. The pixels are the source's
+/// own (decoded and scaled, never converted), so the tags stay true of them.
+/// Signalling only: the cover and the decoder are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Av1Colour {
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    pub full_range: bool,
+}
+
+impl Av1Colour {
+    /// BT.709 primaries, transfer and matrix, studio range: an SDR phone or
+    /// camera clip. The default when the caller knows nothing better.
+    pub const BT709: Self = Self { primaries: 1, transfer: 1, matrix: 1, full_range: false };
+    /// A source without colour tags.
+    pub const UNSPECIFIED: Self = Self { primaries: 2, transfer: 2, matrix: 2, full_range: false };
+}
+
+impl Default for Av1Colour {
+    fn default() -> Self {
+        Self::BT709
+    }
 }
 
 /// Streaming AV1 stego decode session. Accumulates incoming stego AV1

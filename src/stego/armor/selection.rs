@@ -50,11 +50,52 @@ fn compute_stability_map_freq_only(grid: &DctGrid) -> CostMap {
     cost_map
 }
 
+/// The Armor embedding order as bare flat indices, for the decoder.
+///
+/// Equal to `select_and_permute(&compute_stability_map(grid, qt), seed)`
+/// mapped to `flat_idx`: the stability map marks exactly the zigzag
+/// 1..=MAX_ARMOR_ZIGZAG positions of every block, collected in raster order,
+/// and `shuffle_u32` is the same Fisher-Yates. It needs no cost map (4 bytes
+/// per coefficient) and holds 4 bytes per selected position instead of 8.
+pub fn armor_positions(blocks_wide: usize, blocks_tall: usize, seed: &[u8; 32]) -> Vec<u32> {
+    let slots = stable_slots();
+    let blocks = blocks_wide * blocks_tall;
+    let mut positions = Vec::with_capacity(blocks * slots.len());
+    for b in 0..blocks {
+        let base = (b * 64) as u32;
+        positions.extend(slots.iter().map(|&s| base + s as u32));
+    }
+    crate::stego::permute::shuffle_u32(&mut positions, seed);
+    positions
+}
+
+/// Natural-order indices (row * 8 + col) of the Armor positions within a
+/// block, ascending: the AC coefficients with zigzag index 1..=MAX_ARMOR_ZIGZAG.
+pub fn stable_slots() -> Vec<usize> {
+    (1..64)
+        .filter(|&f| (1..=MAX_ARMOR_ZIGZAG).contains(&NATURAL_TO_ZIGZAG[f]))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codec::jpeg::dct::{DctGrid, QuantTable};
     use crate::stego::cost::WET_COST;
+
+    #[test]
+    fn armor_positions_match_the_stability_map_order() {
+        let qt = QuantTable::new([8; 64]);
+        for &(bw, bt) in &[(1usize, 1usize), (3, 2), (17, 9)] {
+            let grid = DctGrid::new(bw, bt);
+            let seed = [bw as u8 ^ 0x5a; 32];
+            let reference: Vec<u32> = crate::stego::ghost::permute::select_and_permute(
+                &compute_stability_map(&grid, &qt), &seed,
+            ).iter().map(|p| p.flat_idx).collect();
+            assert_eq!(armor_positions(bw, bt, &seed), reference, "{bw}x{bt}");
+        }
+        assert_eq!(stable_slots().len(), MAX_ARMOR_ZIGZAG);
+    }
 
     #[test]
     fn stability_map_dc_is_wet_lowfreq_ac_is_stable() {

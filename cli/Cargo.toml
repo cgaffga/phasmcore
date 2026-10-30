@@ -1,6 +1,6 @@
 [package]
 name = "phasm-cli"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "CLI for phasm-core steganography"
@@ -10,6 +10,26 @@ authors = ["Christoph Gaffga"]
 [[bin]]
 name = "phasm"
 path = "src/main.rs"
+
+# One-off measurement helper for the AV1 W2 speed × QP sweep. Demuxes
+# an MP4 produced by phasm AV1 stego encode, splices the av1C
+# sequence_header_obu before every sync sample, and writes a raw
+# "section 5" OBU stream to stdout — feedable straight into the
+# stand-alone `dav1d` CLI. Required because ffmpeg's MP4 demuxer
+# does NOT splice av1C → samples; phasm's iOS / streaming-decoder
+# paths do. Gated behind `av1-encoder` (needs `codec::mp4` + Track::is_av1).
+[[bin]]
+name = "av1_obu_extract"
+path = "src/bin/av1_obu_extract.rs"
+required-features = ["av1-encoder"]
+
+
+# cargo-dist packages only `phasm`. It ignores `required-features`, so
+# without this it would also try to ship av1_obu_extract (needs
+# av1-encoder) and fail the Release workflow, as it did on v0.4.0.
+[package.metadata.dist]
+binaries = { "*" = ["phasm"] }
+
 [dependencies]
 # IMPORTANT: do NOT add `video` or any H.264 feature to phasm-core's
 # features here. The GitHub-release CLI binary distributed via
@@ -43,3 +63,34 @@ video = ["phasm-core/video", "dep:memmap2"]
 # stego videos (e.g. on a machine that can't / won't link OpenH264).
 # Forwards to phasm-core's `h264-decoder` feature.
 h264-decoder = ["video", "phasm-core/h264-decoder"]
+# Production OpenH264-backend video stego (encode + decode). Default
+# encoder for `phasm video-encode`. Links the vendored OpenH264 fork
+# via `core-openh264-sys` (meson+ninja build at `vendor/phasm-openh264`).
+# Source-only; the cargo-dist GitHub-release binary excludes this for
+# AVC patent reasons.
+#
+# Implies `h264-decoder` at the CLI level too. phasm-core's
+# `h264-encoder` already implies its own `h264-decoder`, but that does
+# NOT reach this crate's `#[cfg(feature = "h264-decoder")]` gates — so a
+# `--features h264-encoder` build used to ENCODE through the streaming
+# session and then DECODE through the legacy `h264_ghost_decode`
+# fallback, which returns text only and silently dropped every file
+# attachment (2026-10-20, docs/notes/2026-10-20-video-encode-ux-defects.md
+# D14). A binary that can write a format must be able to read it back.
+h264-encoder = ["video", "h264-decoder", "phasm-core/h264-encoder"]
+# AV1 stego encode + decode. Links the phasm-rav1e fork (pure-Rust AV1
+# encoder, patched in from GitHub: build with `make cli-video` or see
+# BUILDING.md) + phasm-dav1d fork (BSD-2 AV1 decoder, via
+# `core-dav1d-sys`). AVC's licensing concerns don't apply (AV1 is
+# royalty-free under AOMedia), so `av1-encoder` ships in the
+# cargo-dist binary once enabled in cargo-dist.toml.
+#
+# Pairs encoder + decoder unconditionally because phasm-core's
+# `codec::av1::stego::session` has unconditional `phasm_rav1e::*` use
+# statements at module top — a standalone `av1-decoder` would fail to
+# compile. Tracked as a follow-on; in practice the CLI's three AV1
+# subcommands all want both anyway (`video-encode` needs encode,
+# `decode` + `video-capacity` need probe sessions that live in the
+# encoder module).
+av1-encoder = ["video", "phasm-core/av1-encoder", "phasm-core/av1-decoder"]
+av1-decoder = ["av1-encoder"]

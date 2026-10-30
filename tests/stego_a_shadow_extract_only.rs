@@ -50,20 +50,20 @@ fn shadow_extract_only_on_user_video() {
 
     // Try shadow extract with "s"
     let s_start = std::time::Instant::now();
-    let result_s = shadow_extract(&walk.cover, "s", None, Some(&safe_msl));
+    let result_s = shadow_extract(&walk.cover, "s");
     let dt_s = s_start.elapsed();
     eprintln!("shadow_extract(\"s\"): {:?} ({:?})", result_s.as_ref().map(|p| &p.text), dt_s);
 
     // Try with empty pass too
     let e_start = std::time::Instant::now();
-    let result_empty = shadow_extract(&walk.cover, "", None, Some(&safe_msl));
+    let result_empty = shadow_extract(&walk.cover, "");
     let dt_empty = e_start.elapsed();
     eprintln!("shadow_extract(\"\"): {:?} ({:?})", result_empty.as_ref().map(|p| &p.text), dt_empty);
 
     // Try common variations in case the iOS UI added/stripped whitespace
     for variation in &["s ", " s", "S"] {
         let start = std::time::Instant::now();
-        let result = shadow_extract(&walk.cover, variation, None, Some(&safe_msl));
+        let result = shadow_extract(&walk.cover, variation);
         eprintln!("shadow_extract(\"{}\"): {:?} ({:?})", variation, result.as_ref().map(|p| &p.text), start.elapsed());
     }
 }

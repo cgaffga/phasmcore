@@ -50,6 +50,7 @@ fn a_decode_cancel_stops_every_av1_decode_finish() {
         quantizer: 30,
         gop_size: gop,
         total_frames_hint: n,
+        colour: Default::default(),
     };
     let yuv = corpus_yuv_concat(w, h, n);
     let (pp, sp) = ("cancel-primary", "cancel-shadow");

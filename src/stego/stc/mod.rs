@@ -20,3 +20,4 @@ pub mod hhat;
 pub mod embed;
 pub mod extract;
 pub mod streaming_segmented;
+pub mod trellis;

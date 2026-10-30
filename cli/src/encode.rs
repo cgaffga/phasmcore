@@ -8,10 +8,10 @@ use crate::output::{self, OutputMode};
 use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
 use phasm_core::{
-    compressed_payload_size, ghost_encode_si_with_shadows_quality,
+    compressed_payload_size, ghost_bands, ghost_bands_si, ghost_encode_si_with_shadows_quality,
     ghost_encode_with_shadows_quality, armor_encode_with_quality,
     ghost_encode_si_with_files_quality, ghost_encode_with_files_quality,
-    EncodeQuality, FileEntry, ShadowLayer, ARMOR_TARGET_DIMENSION,
+    EncodeQuality, FileEntry, JpegImage, ShadowLayer, ARMOR_TARGET_DIMENSION,
 };
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -152,6 +152,12 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
         );
     }
 
+    // Ghost: show the apps' capacity bands and warn above the red end. Display
+    // only: core enforces technical feasibility, so the encode still runs.
+    if mode == "ghost" {
+        announce_ghost_bands(&prepared, &message, &files, &shadows, args.quiet);
+    }
+
     // 6. Progress bar
     let progress_handle = if args.progress {
         Some(spawn_progress_bar())
@@ -193,6 +199,51 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
     output::print_encode_result(&output_path, &quality, deep_cover, mode_name, &cover, elapsed, out_mode);
 
     Ok(())
+}
+
+/// Print the bands the apps show for this Ghost embed (stderr, like the other
+/// progress lines) and warn when the primary payload is above the red end.
+/// The bands are those of the cover as `encode` embeds it (Deep Cover with
+/// the pixels, plain otherwise) next to the shadows, whose plaintext sizes are
+/// counted the way the apps count them. A failure to measure is not reported
+/// here: the encode reports its own error.
+fn announce_ghost_bands(
+    prepared: &crate::image_conv::PreparedImage,
+    message: &str,
+    files: &[FileEntry],
+    shadows: &[ShadowLayer],
+    quiet: bool,
+) {
+    if quiet {
+        return;
+    }
+    let shadow_total: usize = shadows
+        .iter()
+        .map(|s| s.message.len() + 1 + s.files.iter().map(|f| f.content.len()).sum::<usize>())
+        .sum();
+    let bands = JpegImage::from_bytes(&prepared.jpeg_bytes).ok().and_then(|img| {
+        match &prepared.raw_pixels {
+            Some(px) => ghost_bands_si(&img, px, prepared.width, prepared.height, shadows.len(), shadow_total),
+            None => ghost_bands(&img, shadows.len(), shadow_total),
+        }
+        .ok()
+    });
+    let Some(b) = bands else { return };
+    let payload = compressed_payload_size(message, files);
+    eprintln!("  max: {} B   comfort: {} B   payload: {payload} B", b.max_bytes, b.comfort_bytes);
+    warn_over_max(payload, b.max_bytes);
+}
+
+/// The CLI shows the capacity bands but does not enforce them: a payload
+/// above the red end still encodes, with a warning on stderr.
+fn warn_over_max(payload: usize, max: usize) {
+    if payload <= max {
+        return;
+    }
+    eprintln!(
+        "warning: the payload ({payload} B) exceeds the recommended maximum for this image \
+         ({max} B); expect a detectable embedding. `phasm capacity` shows the bands."
+    );
 }
 
 fn get_message(flag: &Option<String>) -> Result<String, CliError> {

@@ -59,7 +59,7 @@ fn v1_video_does_not_decode() {
 fn decode_uses_the_encoders_gop_index_for_a_partial_tail() {
     let (w, h, gop, n) = (256u32, 144u32, 8u32, 20u32);
     let yuv = corpus_yuv(w, h, n);
-    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: 30, gop_size: gop, total_frames_hint: n };
+    let p = Av1StreamingEncodeParams { width: w, height: h, quantizer: 30, gop_size: gop, total_frames_hint: n, colour: Default::default() };
     let text: String = (0..1500).map(|i| (b'a' + (i * 7 % 26) as u8) as char).collect();
     let f = framed(&text, "tail");
     let mut src = Av1SliceYuvSource::new(&yuv, w, h, n, gop);
