@@ -30,6 +30,87 @@ pub struct ScanComponent {
     pub ac_table: usize,
 }
 
+/// One step of a scan's coding order ([`walk_scan`]).
+#[derive(Clone, Copy)]
+pub(crate) enum ScanStep {
+    /// A new row of coding units (MCU rows; block rows of a non-interleaved
+    /// scan) starts. Progress reporting only.
+    Row(usize),
+    /// A restart marker precedes the next block: DC predictions (and a
+    /// progressive EOB run) reset.
+    Restart,
+    /// The next block: scan component `sci`, block row `br` / column `bc`
+    /// in that component's (MCU-padded) grid.
+    Block { sci: usize, br: usize, bc: usize },
+}
+
+/// Rows of coding units of a scan (see [`ScanStep::Row`]).
+pub(crate) fn scan_unit_rows(frame: &FrameInfo, scan_components: &[ScanComponent]) -> usize {
+    if scan_components.len() == 1 {
+        frame.comp_blocks_tall(scan_components[0].comp_idx)
+    } else {
+        frame.mcus_tall as usize
+    }
+}
+
+/// Visit the blocks of a scan in coding order (T.81 A.2, the one place this
+/// order lives: decode, encode and the Huffman statistics all walk it).
+///
+/// - A scan with **one** component is non-interleaved (A.2.2), whatever the
+///   frame's sampling factors or the scan's spectral selection (DC scans
+///   too): it codes the component's `ceil(xᵢ/8) × ceil(yᵢ/8)` blocks
+///   ([`FrameInfo::comp_blocks_wide`]) in raster order, one block per MCU.
+///   The MCU padding (dummy blocks) is not coded and stays as it is (zero
+///   after a decode).
+/// - A scan with several components is interleaved (A.2.3): whole MCUs of
+///   the padded grid, each component's `Hᵢ × Vᵢ` blocks in turn, dummy
+///   blocks included.
+///
+/// Restart intervals count MCUs, i.e. blocks of a non-interleaved scan.
+pub(crate) fn walk_scan<E>(
+    frame: &FrameInfo,
+    scan_components: &[ScanComponent],
+    restart_interval: u16,
+    mut f: impl FnMut(ScanStep) -> std::result::Result<(), E>,
+) -> std::result::Result<(), E> {
+    let ri = restart_interval as usize;
+    let mut unit = 0usize;
+    if scan_components.len() == 1 {
+        let c = scan_components[0].comp_idx;
+        let (bw, bt) = (frame.comp_blocks_wide(c), frame.comp_blocks_tall(c));
+        for br in 0..bt {
+            f(ScanStep::Row(br))?;
+            for bc in 0..bw {
+                if ri > 0 && unit > 0 && unit.is_multiple_of(ri) {
+                    f(ScanStep::Restart)?;
+                }
+                f(ScanStep::Block { sci: 0, br, bc })?;
+                unit += 1;
+            }
+        }
+        return Ok(());
+    }
+    for mcu_row in 0..frame.mcus_tall as usize {
+        f(ScanStep::Row(mcu_row))?;
+        for mcu_col in 0..frame.mcus_wide as usize {
+            if ri > 0 && unit > 0 && unit.is_multiple_of(ri) {
+                f(ScanStep::Restart)?;
+            }
+            for (sci, sc) in scan_components.iter().enumerate() {
+                let comp = &frame.components[sc.comp_idx];
+                let (hs, vs) = (comp.h_sampling as usize, comp.v_sampling as usize);
+                for v in 0..vs {
+                    for h in 0..hs {
+                        f(ScanStep::Block { sci, br: mcu_row * vs + v, bc: mcu_col * hs + h })?;
+                    }
+                }
+            }
+            unit += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Decode the entropy-coded scan data into DctGrids.
 ///
 /// - `data`: full JPEG file bytes
@@ -39,7 +120,8 @@ pub struct ScanComponent {
 /// - `dc_specs`/`ac_specs`: Huffman table specs, indexed by table ID
 /// - `restart_interval`: from DRI marker, 0 = no restarts
 ///
-/// Returns (grids, end_position). `end_position` is the byte after the last scan byte.
+/// Block order: [`walk_scan`]. Returns (grids, end_position). `end_position`
+/// is the byte after the last scan byte.
 pub fn decode_scan(
     data: &[u8],
     scan_start: usize,
@@ -68,7 +150,7 @@ pub fn decode_scan(
         }
     }
 
-    // Allocate DctGrids
+    // Allocate DctGrids (MCU-padded; every block the walk visits fits).
     let mut grids: Vec<DctGrid> = Vec::with_capacity(scan_components.len());
     for sc in scan_components {
         let bw = frame.blocks_wide(sc.comp_idx);
@@ -80,113 +162,68 @@ pub fn decode_scan(
     let mut dc_pred = vec![0i32; scan_components.len()];
 
     let mut reader = BitReader::new(data, scan_start);
-    let mut mcu_count = 0usize;
 
-    for mcu_row in 0..frame.mcus_tall as usize {
-        for mcu_col in 0..frame.mcus_wide as usize {
-            // Check for restart
-            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
+    walk_scan(frame, scan_components, restart_interval, |step| {
+        let (sci, block_row, block_col) = match step {
+            ScanStep::Row(_) => return Ok(()),
+            ScanStep::Restart => {
                 reader.byte_align();
                 // Look for RST marker — accept any RST without strict sequence
                 // validation, matching libjpeg/libjpeg-turbo behavior.
                 let _rst = reader.check_restart_marker()?;
-                // Reset DC predictors
                 dc_pred.fill(0);
+                return Ok(());
             }
+            ScanStep::Block { sci, br, bc } => (sci, br, bc),
+        };
+        let sc = &scan_components[sci];
+        let dc_tab = dc_tables[sc.dc_table].as_ref().unwrap();
+        let ac_tab = ac_tables[sc.ac_table].as_ref().unwrap();
 
-            // Decode blocks for each component in this MCU
-            for (sci, sc) in scan_components.iter().enumerate() {
-                let comp = &frame.components[sc.comp_idx];
-                let dc_tab = dc_tables[sc.dc_table].as_ref().unwrap();
-                let ac_tab = ac_tables[sc.ac_table].as_ref().unwrap();
+        let mut zz = [0i16; 64];
 
-                for v in 0..comp.v_sampling as usize {
-                    for h in 0..comp.h_sampling as usize {
-                        let block_row = mcu_row * (comp.v_sampling as usize) + v;
-                        let block_col = mcu_col * (comp.h_sampling as usize) + h;
-
-                        // Bounds check: skip blocks outside the grid (malformed JPEGs)
-                        let blocks_tall = grids[sci].blocks_tall();
-                        let blocks_wide = grids[sci].blocks_wide();
-                        if block_row >= blocks_tall || block_col >= blocks_wide {
-                            // Still need to consume the entropy-coded data for this block
-                            // to keep the bitstream in sync, so decode but discard.
-                            let dc_size = dc_tab.decode(&mut reader)?;
-                            if dc_size > 0 {
-                                let dc_bits = reader.read_bits(dc_size)?;
-                                let dc_diff = extend_sign(dc_bits, dc_size);
-                                dc_pred[sci] += dc_diff as i32;
-                            }
-                            let mut k = 1;
-                            while k < 64 {
-                                let rs = ac_tab.decode(&mut reader)?;
-                                let run = (rs >> 4) as usize;
-                                let size = rs & 0x0F;
-                                if size == 0 {
-                                    if run == 0 || run != 15 { break; }
-                                    k += 16;
-                                    continue;
-                                }
-                                k += run;
-                                if k >= 64 { return Err(JpegError::HuffmanDecode); }
-                                let _ac_bits = reader.read_bits(size)?;
-                                k += 1;
-                            }
-                            continue;
-                        }
-
-                        let mut zz = [0i16; 64];
-
-                        // Decode DC coefficient
-                        let dc_size = dc_tab.decode(&mut reader)?;
-                        if dc_size > 0 {
-                            let dc_bits = reader.read_bits(dc_size)?;
-                            let dc_diff = extend_sign(dc_bits, dc_size);
-                            dc_pred[sci] += dc_diff as i32;
-                        }
-                        zz[0] = dc_pred[sci].clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-
-                        // Decode AC coefficients
-                        let mut k = 1;
-                        while k < 64 {
-                            let rs = ac_tab.decode(&mut reader)?;
-                            let run = (rs >> 4) as usize;
-                            let size = rs & 0x0F;
-
-                            if size == 0 {
-                                if run == 0 {
-                                    // EOB — remaining ACs are zero
-                                    break;
-                                } else if run == 15 {
-                                    // ZRL — skip 16 zeros
-                                    k += 16;
-                                    continue;
-                                } else {
-                                    break;
-                                }
-                            }
-
-                            k += run;
-                            if k >= 64 {
-                                return Err(JpegError::HuffmanDecode);
-                            }
-                            let ac_bits = reader.read_bits(size)?;
-                            zz[k] = extend_sign(ac_bits, size);
-                            k += 1;
-                        }
-
-                        // Convert zigzag to natural order and store
-                        let block = grids[sci].block_mut(block_row, block_col);
-                        for zi in 0..64 {
-                            block[ZIGZAG_TO_NATURAL[zi]] = zz[zi];
-                        }
-                    }
-                }
-            }
-
-            mcu_count += 1;
+        // Decode DC coefficient
+        let dc_size = dc_tab.decode(&mut reader)?;
+        if dc_size > 0 {
+            let dc_bits = reader.read_bits(dc_size)?;
+            let dc_diff = extend_sign(dc_bits, dc_size);
+            dc_pred[sci] += dc_diff as i32;
         }
-    }
+        zz[0] = dc_pred[sci].clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+
+        // Decode AC coefficients
+        let mut k = 1;
+        while k < 64 {
+            let rs = ac_tab.decode(&mut reader)?;
+            let run = (rs >> 4) as usize;
+            let size = rs & 0x0F;
+
+            if size == 0 {
+                if run == 15 {
+                    // ZRL — skip 16 zeros
+                    k += 16;
+                    continue;
+                }
+                // EOB — remaining ACs are zero
+                break;
+            }
+
+            k += run;
+            if k >= 64 {
+                return Err(JpegError::HuffmanDecode);
+            }
+            let ac_bits = reader.read_bits(size)?;
+            zz[k] = extend_sign(ac_bits, size);
+            k += 1;
+        }
+
+        // Convert zigzag to natural order and store
+        let block = grids[sci].block_mut(block_row, block_col);
+        for zi in 0..64 {
+            block[ZIGZAG_TO_NATURAL[zi]] = zz[zi];
+        }
+        Ok(())
+    })?;
 
     // Find end position: align to byte, then skip past any trailing marker
     let end_pos = reader.position();
@@ -216,6 +253,8 @@ pub fn encode_scan(
 /// what would otherwise be a long blocking operation.
 pub const JPEG_WRITE_STEPS: u32 = 20;
 
+/// Block order: [`walk_scan`] — a single-component scan (grayscale) is
+/// written non-interleaved, without its dummy blocks, as T.81 requires.
 pub fn encode_scan_with_progress(
     frame: &FrameInfo,
     scan_components: &[ScanComponent],
@@ -248,19 +287,20 @@ pub fn encode_scan_with_progress(
     let mut output = Vec::new();
     let mut writer = BitWriter::new();
     let mut dc_pred = vec![0i32; scan_components.len()];
-    let mut mcu_count = 0usize;
     let mut restart_count = 0u16;
-    let mcus_tall = frame.mcus_tall as usize;
-    let row_interval = if mcus_tall > 0 { (mcus_tall / JPEG_WRITE_STEPS as usize).max(1) } else { 1 };
+    let unit_rows = scan_unit_rows(frame, scan_components);
+    let row_interval = if unit_rows > 0 { (unit_rows / JPEG_WRITE_STEPS as usize).max(1) } else { 1 };
 
-    for mcu_row in 0..mcus_tall {
-        if let Some(ref cb) = on_progress
-            && mcu_row > 0 && mcu_row % row_interval == 0 {
-                cb();
+    walk_scan(frame, scan_components, restart_interval, |step| {
+        let (sci, block_row, block_col) = match step {
+            ScanStep::Row(r) => {
+                if let Some(cb) = on_progress
+                    && r > 0 && r % row_interval == 0 {
+                        cb();
+                    }
+                return Ok(());
             }
-        for mcu_col in 0..frame.mcus_wide as usize {
-            // Insert restart marker if needed
-            if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
+            ScanStep::Restart => {
                 // Flush current segment
                 let segment = std::mem::take(&mut writer).flush();
                 output.extend_from_slice(&segment);
@@ -273,97 +313,92 @@ pub fn encode_scan_with_progress(
 
                 // Reset DC predictors
                 dc_pred.fill(0);
+                return Ok(());
             }
+            ScanStep::Block { sci, br, bc } => (sci, br, bc),
+        };
+        let sc = &scan_components[sci];
+        let dc_tab = dc_tables[sc.dc_table].as_ref().unwrap();
+        let ac_tab = ac_tables[sc.ac_table].as_ref().unwrap();
 
-            // Encode blocks for each component in this MCU
-            for (sci, sc) in scan_components.iter().enumerate() {
-                let comp = &frame.components[sc.comp_idx];
-                let dc_tab = dc_tables[sc.dc_table].as_ref().unwrap();
-                let ac_tab = ac_tables[sc.ac_table].as_ref().unwrap();
-
-                for v in 0..comp.v_sampling as usize {
-                    for h in 0..comp.h_sampling as usize {
-                        let block_row = mcu_row * (comp.v_sampling as usize) + v;
-                        let block_col = mcu_col * (comp.h_sampling as usize) + h;
-
-                        // Read block and convert natural → zigzag
-                        let block = grids[sci].block(block_row, block_col);
-                        let mut zz = [0i16; 64];
-                        for ni in 0..64 {
-                            zz[NATURAL_TO_ZIGZAG[ni]] = block[ni];
-                        }
-
-                        // Encode DC
-                        let dc_diff = (zz[0] as i32 - dc_pred[sci]) as i16;
-                        dc_pred[sci] = zz[0] as i32;
-                        let (dc_bits, dc_size) = encode_value(dc_diff);
-                        let (dc_code, dc_code_len) = dc_tab.encode(dc_size)?;
-                        writer.write_bits(dc_code, dc_code_len);
-                        if dc_size > 0 {
-                            writer.write_bits(dc_bits, dc_size);
-                        }
-
-                        // Encode AC
-                        let mut k = 1;
-                        while k < 64 {
-                            // Find run of zeros
-                            let mut run = 0usize;
-                            while k + run < 64 && zz[k + run] == 0 {
-                                run += 1;
-                            }
-
-                            if k + run >= 64 {
-                                // EOB
-                                let (eob_code, eob_len) = ac_tab.encode(0x00)?;
-                                writer.write_bits(eob_code, eob_len);
-                                break;
-                            }
-
-                            // Emit ZRL (16 zeros) as needed
-                            while run >= 16 {
-                                let (zrl_code, zrl_len) = ac_tab.encode(0xF0)?;
-                                writer.write_bits(zrl_code, zrl_len);
-                                run -= 16;
-                                k += 16;
-                            }
-
-                            k += run;
-                            let (ac_bits, ac_size) = encode_value(zz[k]);
-                            let rs = ((run as u8) << 4) | ac_size;
-                            let (ac_code, ac_code_len) = ac_tab.encode(rs)?;
-                            writer.write_bits(ac_code, ac_code_len);
-                            if ac_size > 0 {
-                                writer.write_bits(ac_bits, ac_size);
-                            }
-                            k += 1;
-                        }
-                    }
-                }
-            }
-
-            mcu_count += 1;
+        // Read block and convert natural → zigzag
+        let block = grids[sci].block(block_row, block_col);
+        let mut zz = [0i16; 64];
+        for ni in 0..64 {
+            zz[NATURAL_TO_ZIGZAG[ni]] = block[ni];
         }
-    }
+
+        // Encode DC
+        let dc_diff = (zz[0] as i32 - dc_pred[sci]) as i16;
+        dc_pred[sci] = zz[0] as i32;
+        let (dc_bits, dc_size) = encode_value(dc_diff);
+        let (dc_code, dc_code_len) = dc_tab.encode(dc_size)?;
+        writer.write_bits(dc_code, dc_code_len);
+        if dc_size > 0 {
+            writer.write_bits(dc_bits, dc_size);
+        }
+
+        // Encode AC
+        let mut k = 1;
+        while k < 64 {
+            // Find run of zeros
+            let mut run = 0usize;
+            while k + run < 64 && zz[k + run] == 0 {
+                run += 1;
+            }
+
+            if k + run >= 64 {
+                // EOB
+                let (eob_code, eob_len) = ac_tab.encode(0x00)?;
+                writer.write_bits(eob_code, eob_len);
+                break;
+            }
+
+            // Emit ZRL (16 zeros) as needed
+            while run >= 16 {
+                let (zrl_code, zrl_len) = ac_tab.encode(0xF0)?;
+                writer.write_bits(zrl_code, zrl_len);
+                run -= 16;
+                k += 16;
+            }
+
+            k += run;
+            let (ac_bits, ac_size) = encode_value(zz[k]);
+            let rs = ((run as u8) << 4) | ac_size;
+            let (ac_code, ac_code_len) = ac_tab.encode(rs)?;
+            writer.write_bits(ac_code, ac_code_len);
+            if ac_size > 0 {
+                writer.write_bits(ac_bits, ac_size);
+            }
+            k += 1;
+        }
+        Ok(())
+    })?;
 
     // Flush final segment
     output.extend_from_slice(&writer.flush());
     Ok(output)
 }
 
-/// Decode a single progressive scan into existing DctGrids.
+/// Decode one scan of a multi-scan (progressive, or sequential with
+/// several scans) JPEG into existing DctGrids.
 ///
 /// Progressive JPEG has multiple scans, each contributing partial coefficient data.
 /// This function decodes one scan (identified by its SOS parameters) and accumulates
-/// the results into the provided grids.
+/// the results into the provided grids (indexed by frame component).
 ///
-/// The four scan types are:
+/// The four progressive scan types are:
 /// - **DC first** (Ss=0, Se=0, Ah=0): Initial DC coefficients, shifted left by Al
 /// - **DC refining** (Ss=0, Se=0, Ah>0): One correction bit per DC coefficient
 /// - **AC first** (Ss>0, Ah=0): Initial AC coefficients for a spectral band
 /// - **AC refining** (Ss>0, Ah>0): Correction bits for previously-decoded AC coefficients
 ///
+/// A sequential scan (Ss=0, Se=63, Ah=Al=0) is a DC first plus an AC first
+/// over 1..63 per block (a baseline EOB is an EOB run of one block).
+/// Block order: [`walk_scan`] (single-component scans non-interleaved).
+///
 /// Returns the byte position after the scan data.
-#[allow(unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 pub fn decode_progressive_scan(
     data: &[u8],
     scan_start: usize,
@@ -381,8 +416,12 @@ pub fn decode_progressive_scan(
     let al = params.al;
 
     // Validate parameters
-    if ss > 63 || se > 63 || ss > se {
+    if ss > 63 || se > 63 || ss > se || al > 13 {
         return Err(JpegError::InvalidMarkerData("invalid spectral selection"));
+    }
+    // AC bands are coded per component only (T.81 G.1.1.1.1).
+    if ss > 0 && scan_components.len() != 1 {
+        return Err(JpegError::InvalidMarkerData("interleaved AC scan"));
     }
 
     // Build Huffman decode tables (only for tables actually needed by this scan)
@@ -390,15 +429,15 @@ pub fn decode_progressive_scan(
     let mut ac_tables: [Option<HuffmanDecodeTable>; 4] = [None, None, None, None];
 
     for sc in scan_components {
-        // DC tables needed for DC scans (ss == 0)
+        // DC tables needed for DC first scans (ss == 0)
         if ss == 0 && ah == 0 && dc_tables[sc.dc_table].is_none() {
             let spec = dc_specs[sc.dc_table]
                 .as_ref()
                 .ok_or(JpegError::InvalidHuffmanTableId(sc.dc_table as u8))?;
             dc_tables[sc.dc_table] = Some(HuffmanDecodeTable::build(&spec.bits, &spec.huffval)?);
         }
-        // AC tables needed for AC scans (ss > 0)
-        if ss > 0 && ac_tables[sc.ac_table].is_none() {
+        // AC tables needed whenever the band reaches past DC
+        if se > 0 && ac_tables[sc.ac_table].is_none() {
             let spec = ac_specs[sc.ac_table]
                 .as_ref()
                 .ok_or(JpegError::InvalidHuffmanTableId(sc.ac_table as u8))?;
@@ -408,102 +447,42 @@ pub fn decode_progressive_scan(
 
     let mut reader = BitReader::new(data, scan_start);
     let mut dc_pred = vec![0i32; scan_components.len()];
-    let mut mcu_count = 0usize;
 
     // For AC scans, track the End-of-Band run counter
     let mut eob_run: u32 = 0;
+    let ac_start = ss.max(1);
 
-    // Determine if this is a non-interleaved scan (single component)
-    // Non-interleaved scans process blocks in raster order within that component.
-    let non_interleaved = scan_components.len() == 1 && (ss > 0 || se > 0 || frame.components.len() == 1);
+    walk_scan(frame, scan_components, restart_interval, |step| {
+        let (sci, block_row, block_col) = match step {
+            ScanStep::Row(_) => return Ok(()),
+            ScanStep::Restart => {
+                reader.byte_align();
+                let _rst = reader.check_restart_marker()?;
+                dc_pred.fill(0);
+                eob_run = 0;
+                return Ok(());
+            }
+            ScanStep::Block { sci, br, bc } => (sci, br, bc),
+        };
+        let sc = &scan_components[sci];
+        let grid = &mut grids[sc.comp_idx];
 
-    if non_interleaved && scan_components.len() == 1 {
-        // Non-interleaved scan: iterate blocks in raster order for the single component
-        let sc = &scan_components[0];
-        let bw = frame.blocks_wide(sc.comp_idx);
-        let bt = frame.blocks_tall(sc.comp_idx);
-
-        // For non-interleaved scans, MCU = 1 block
-        // Restart interval counts blocks, not MCUs
-        let mut block_count = 0usize;
-
-        for block_row in 0..bt {
-            for block_col in 0..bw {
-                // Handle restart markers
-                if restart_interval > 0 && block_count > 0 && block_count.is_multiple_of(restart_interval as usize) {
-                    reader.byte_align();
-                    let _rst = reader.check_restart_marker()?;
-                    dc_pred[0] = 0;
-                    eob_run = 0;
-                }
-
-                let grid = &mut grids[sc.comp_idx];
-
-                if ss == 0 {
-                    // DC scan
-                    if ah == 0 {
-                        // DC first scan
-                        decode_dc_first(&mut reader, &dc_tables, sc, &mut dc_pred[0], al, grid, block_row, block_col)?;
-                    } else {
-                        // DC refining scan
-                        decode_dc_refine(&mut reader, al, grid, block_row, block_col)?;
-                    }
-                }
-
-                if se > 0 {
-                    // AC scan (might also include DC if ss == 0, but for progressive
-                    // AC and DC are always in separate scans)
-                    let ac_start = if ss == 0 { 1 } else { ss };
-                    if ah == 0 {
-                        // AC first scan
-                        decode_ac_first(&mut reader, &ac_tables, sc, al, ac_start, se, &mut eob_run, grid, block_row, block_col)?;
-                    } else {
-                        // AC refining scan
-                        decode_ac_refine(&mut reader, &ac_tables, sc, al, ac_start, se, &mut eob_run, grid, block_row, block_col)?;
-                    }
-                }
-
-                block_count += 1;
+        if ss == 0 {
+            if ah == 0 {
+                decode_dc_first(&mut reader, &dc_tables, sc, &mut dc_pred[sci], al, grid, block_row, block_col)?;
+            } else {
+                decode_dc_refine(&mut reader, al, grid, block_row, block_col)?;
             }
         }
-    } else {
-        // Interleaved scan (DC scans with multiple components)
-        for mcu_row in 0..frame.mcus_tall as usize {
-            for mcu_col in 0..frame.mcus_wide as usize {
-                // Handle restart markers
-                if restart_interval > 0 && mcu_count > 0 && mcu_count.is_multiple_of(restart_interval as usize) {
-                    reader.byte_align();
-                    let _rst = reader.check_restart_marker()?;
-                    dc_pred.fill(0);
-                    eob_run = 0;
-                }
-
-                for (sci, sc) in scan_components.iter().enumerate() {
-                    let comp = &frame.components[sc.comp_idx];
-
-                    for v in 0..comp.v_sampling as usize {
-                        for h in 0..comp.h_sampling as usize {
-                            let block_row = mcu_row * (comp.v_sampling as usize) + v;
-                            let block_col = mcu_col * (comp.h_sampling as usize) + h;
-
-                            let grid = &mut grids[sc.comp_idx];
-
-                            if ss == 0 {
-                                if ah == 0 {
-                                    decode_dc_first(&mut reader, &dc_tables, sc, &mut dc_pred[sci], al, grid, block_row, block_col)?;
-                                } else {
-                                    decode_dc_refine(&mut reader, al, grid, block_row, block_col)?;
-                                }
-                            }
-                            // Interleaved scans are DC-only in progressive JPEG
-                        }
-                    }
-                }
-
-                mcu_count += 1;
+        if se > 0 {
+            if ah == 0 {
+                decode_ac_first(&mut reader, &ac_tables, sc, al, ac_start, se, &mut eob_run, grid, block_row, block_col)?;
+            } else {
+                decode_ac_refine(&mut reader, &ac_tables, sc, al, ac_start, se, &mut eob_run, grid, block_row, block_col)?;
             }
         }
-    }
+        Ok(())
+    })?;
 
     let end_pos = reader.position();
     Ok(end_pos)

@@ -2,7 +2,7 @@
 //
 // Usage:
 //   cargo run --release --example mem_probe -- <op> <image> [passphrase] [message-file]
-//   op: parse | capacity | decode | ghost | shadow | encode | encode-budget
+//   op: parse | capacity | decode | ghost | shadow | encode | encode-budget | build-cover
 // `encode-budget` sets a 1.67 GB memory budget first (what cgPhone reports).
 //   op encode-si <raw-rgb-file> <pass> <message-file> <width> <height>: Deep
 //   Cover as the apps do it (cover written by `deep_cover_jpeg` at QF92, then
@@ -222,6 +222,23 @@ fn main() {
                         format!("{} positions", p.len())
                     }
                 }
+            }
+            "build-cover" => {
+                // `build_cover` as the bridges call it: <raw-rgb-file> as the
+                // source pixels (a PNG, so core writes the cover), Ghost,
+                // original size. args: width height. Measures core's peak
+                // with the caller's pixels already resident (`bytes`).
+                let (w, h): (u32, u32) = (args[4].parse().unwrap(), args[5].parse().unwrap());
+                let req = phasm_core::CoverRequest {
+                    mode: phasm_core::CoverMode::Ghost,
+                    wand: true,
+                    ghost_quality: None,
+                    ghost_max_side: None,
+                    armor_preset: phasm_core::ArmorCoverPreset::Standard,
+                };
+                let png = b"\x89PNG\r\n\x1a\n".to_vec();
+                let out = phasm_core::build_cover(&png, Some((&bytes, w, h)), &req).unwrap();
+                format!("cover {} B, returned si copy {} B, deep_cover {}", out.jpeg.len(), out.si_pixels.as_ref().map_or(0, |v| v.len()), out.deep_cover)
             }
             "encode-si" => {
                 phasm_core::set_memory_budget(Some(1674 << 20));

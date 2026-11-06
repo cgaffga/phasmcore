@@ -107,7 +107,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.features }}
         run: >
           cargo +nightly miri test --target x86_64-unknown-linux-gnu --lib --
-          pixels_aan uniward_simd fft2d_simd optimizer_simd embedding_simd
+          pixels_aan uniward_simd fft2d_simd embedding_simd
           viterbi_step_matches_scalar_for_every_state_count
           stc_embed_h0_keeps_the_cover
           cost_precompute_simd_matches_scalar_reference_random

@@ -29,7 +29,8 @@
 //!   cargo test --release --features h264-encoder --test d19_shadow_collision_mc \
 //!     -- --ignored --nocapture --test-threads=1
 
-use rand::{Rng, SeedableRng};
+use phasm_core::stego::rng_compat::Rand08;
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 const TIERS: [usize; 6] = [4, 8, 16, 32, 64, 128];
@@ -65,7 +66,7 @@ fn trial(pool: usize, n: usize, payload: usize, rng: &mut ChaCha8Rng, last: &mut
             }
             let mut v = Vec::with_capacity(max_bits);
             while v.len() < max_bits {
-                let x = rng.gen_range(0..pool);
+                let x = rng.gen_range08(0..pool);
                 if !taken[x] {
                     taken[x] = true;
                     v.push(x as u32);
@@ -89,7 +90,7 @@ fn trial(pool: usize, n: usize, payload: usize, rng: &mut ChaCha8Rng, last: &mut
             let mut errs = vec![0usize; blocks];
             let mut last_byte_marked = usize::MAX;
             for (i, &pos) in orders[s][..bits].iter().enumerate() {
-                if last[pos as usize] != s as u8 && rng.gen_bool(0.5) {
+                if last[pos as usize] != s as u8 && rng.gen_bool08(0.5) {
                     let byte = i / 8;
                     if byte != last_byte_marked {
                         errs[block_of(byte)] += 1;

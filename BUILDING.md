@@ -194,7 +194,7 @@ line. Typed out, it is:
 
 ```bash
 cargo --config 'patch.crates-io.rav1e.git="https://github.com/cgaffga/phasm-rav1e"' \
-      --config 'patch.crates-io.rav1e.rev="abe19cd8b369a051bb08ca2c53aceabb920bc00c"' \
+      --config 'patch.crates-io.rav1e.rev="5d17e129310bc0d8a80a6218fa1965e990755a5d"' \
       build --release -p phasm-cli --features h264-encoder,av1-encoder
 ```
 
@@ -258,11 +258,11 @@ phasm-core cannot do this for you:
 phasm-core = { git = "https://github.com/cgaffga/phasmcore", tag = "vX.Y.Z", features = ["h264-encoder", "av1-encoder"] }
 
 [patch.crates-io]
-rav1e = { git = "https://github.com/cgaffga/phasm-rav1e", rev = "abe19cd8b369a051bb08ca2c53aceabb920bc00c" }
+rav1e = { git = "https://github.com/cgaffga/phasm-rav1e", rev = "5d17e129310bc0d8a80a6218fa1965e990755a5d" }
 ```
 
 Take the `rev` from `PHASM_RAV1E_DEFAULT_REV` in `scripts/video-cargo.sh` of
-the phasmcore commit you depend on (it is `abe19cd8b369a051bb08ca2c53aceabb920bc00c`
+the phasmcore commit you depend on (it is `5d17e129310bc0d8a80a6218fa1965e990755a5d`
 for this one). Without the patch, the build stops at the error shown in
 [The rav1e fork](#the-rav1e-fork).
 
@@ -281,7 +281,7 @@ manifest, so the patch goes on the command line:
 ```bash
 cargo install --git https://github.com/cgaffga/phasmcore phasm-cli --features h264-encoder,av1-encoder \
   --config 'patch.crates-io.rav1e.git="https://github.com/cgaffga/phasm-rav1e"' \
-  --config 'patch.crates-io.rav1e.rev="abe19cd8b369a051bb08ca2c53aceabb920bc00c"'
+  --config 'patch.crates-io.rav1e.rev="5d17e129310bc0d8a80a6218fa1965e990755a5d"'
 ```
 
 ## Patents

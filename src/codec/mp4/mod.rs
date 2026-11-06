@@ -499,16 +499,6 @@ pub(crate) fn read_u64(data: &[u8], offset: usize) -> Result<u64, Mp4Error> {
     ]))
 }
 
-/// Write big-endian u32 into a buffer.
-pub(crate) fn write_u32(buf: &mut Vec<u8>, val: u32) {
-    buf.extend_from_slice(&val.to_be_bytes());
-}
-
-/// Write big-endian u64 into a buffer.
-pub(crate) fn write_u64(buf: &mut Vec<u8>, val: u64) {
-    buf.extend_from_slice(&val.to_be_bytes());
-}
-
 /// Parsed box header: type code, total box size (including header), header length,
 /// and the offset where box content begins.
 #[derive(Debug, Clone, Copy)]

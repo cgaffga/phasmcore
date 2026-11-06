@@ -225,6 +225,7 @@ unsafe extern "C" {
 
 // ABI verification helpers exposed by the shim. Each returns the
 // C-side value so the Rust test can cross-check.
+#[cfg(test)]
 unsafe extern "C" {
     fn phasm_dav1d_abi_phasm_hooks_size() -> core::ffi::c_uint;
     fn phasm_dav1d_abi_phasm_hooks_align() -> core::ffi::c_uint;

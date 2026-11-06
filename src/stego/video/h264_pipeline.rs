@@ -31,6 +31,7 @@ use crate::stego::error::StegoError;
 ///
 /// Requires the `h264-decoder` feature; without it (the no-walker container-only
 /// `video` build) this returns an `InvalidVideo` error.
+#[cfg_attr(not(feature = "h264-decoder"), allow(unused_variables))]
 pub fn h264_ghost_decode(
     mp4_bytes: &[u8],
     passphrase: &str,

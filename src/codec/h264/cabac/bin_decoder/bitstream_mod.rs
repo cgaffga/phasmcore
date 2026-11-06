@@ -48,7 +48,6 @@
 //! scope by `strip_repack_roundtrip_on_synthetic_ep_pattern`.
 
 use crate::codec::h264::bitstream::{
-    insert_emulation_prevention, parse_nal_units_annexb,
     remove_emulation_prevention_with_map, EpByteMap,
 };
 use crate::codec::h264::{H264Error, NalType, NalUnit};

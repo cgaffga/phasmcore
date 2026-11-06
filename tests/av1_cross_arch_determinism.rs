@@ -61,7 +61,8 @@ struct Fixture {
     gop: u32,
     /// SHA-256 of the stego stream, recorded on macOS aarch64 on
     /// 2026-10-24 (phasm-rav1e `abe19cd8`, phasm-dav1d `acadfd78`), where
-    /// RUST and NEON, dav1d asm and C all produced it. Any change to what
+    /// RUST and NEON, dav1d asm and C all produced it (unchanged at
+    /// phasm-rav1e `5d17e129`, 2026-11-05). Any change to what
     /// the encoder writes (fork pins, cost model, framing) moves it:
     /// re-record and say why here.
     pinned_sha256: &'static str,

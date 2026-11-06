@@ -1,6 +1,6 @@
 [package]
 name = "phasm-cli"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "CLI for phasm-core steganography"
@@ -42,6 +42,9 @@ binaries = { "*" = ["phasm"] }
 phasm-core = { path = "..", features = ["parallel"] }
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff", "gif"] }
+# ICC profile parsing + conversion to sRGB for the cover pixels (src/color.rs).
+# Already in the build: the `image` crate links the same version.
+moxcms = "0.8"
 indicatif = "0.17"
 rpassword = "7"
 # Optional, video-only: mmap the decoded YUV temp file in the non-shadow

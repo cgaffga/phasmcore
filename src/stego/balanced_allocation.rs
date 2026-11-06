@@ -529,6 +529,7 @@ fn t_critical_99_9(k: usize) -> f64 {
 /// trailing `n_gops - w` GOPs zero (natural tail). The remainder from
 /// floor division is spread across the leading-most GOPs so
 /// `Σ plan == message_len` exactly.
+#[cfg(test)] // the baseline the planner tests compare against
 fn uniform_split(message_len: usize, w: usize, n_gops: usize) -> Vec<usize> {
     let mut plan = vec![0; n_gops];
     if w == 0 {

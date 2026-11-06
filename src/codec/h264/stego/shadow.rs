@@ -88,7 +88,7 @@ use crate::stego::shadow_layer::{
     MAX_SHADOW_FRAME_BYTES, SHADOW_FRAME_OVERHEAD, SHADOW_PARITY_TIERS,
 };
 
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -335,6 +335,7 @@ pub(super) fn priority_slots(cover: &DomainCover, perm_seed: &[u8; 32]) -> Vec<S
 /// `intra_index` identify one), so the order is strict and the retained set
 /// is independent of push order.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))] // used by the encoder-side streaming shadow path
 struct TopNEntry {
     bucket: u8,
     priority: u32,
@@ -343,6 +344,7 @@ struct TopNEntry {
     domain: EmbedDomain,
 }
 
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 impl TopNEntry {
     #[inline]
     fn order_key(&self) -> (u8, u32, u8, usize) {
@@ -370,12 +372,14 @@ impl PartialOrd for TopNEntry {
 /// position is `ChaCha20(perm_seed).seek(key.raw()*2).next_u32()`, position-
 /// local and order-independent, and the bucket is a function of the
 /// position's syntax alone.
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 pub(crate) struct StreamingTopN {
     rng: ChaCha20Rng,
     capacity: usize,
     heap: BinaryHeap<TopNEntry>,
 }
 
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 impl StreamingTopN {
     pub(crate) fn new(perm_seed: &[u8; 32], capacity: usize) -> Self {
         Self {
@@ -434,6 +438,7 @@ impl StreamingTopN {
 /// One retained slot inside [`ShadowBitTopN`] — the [`TopNEntry`] order plus
 /// the cover **bit** riding along. Ord/Eq ignore `bit`.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 struct BitTopNEntry {
     bucket: u8,
     priority: u32,
@@ -441,6 +446,7 @@ struct BitTopNEntry {
     intra_index: usize,
     bit: u8,
 }
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 impl BitTopNEntry {
     #[inline]
     fn order_key(&self) -> (u8, u32, u8, usize) {
@@ -470,12 +476,14 @@ impl PartialOrd for BitTopNEntry {
 /// [`into_sorted_bits`](Self::into_sorted_bits) drains the retained bits in
 /// that order — exactly the `all_lsbs` prefix
 /// [`decode_shadow_from_priority_lsbs`] consumes.
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 pub(crate) struct ShadowBitTopN {
     rng: ChaCha20Rng,
     capacity: usize,
     heap: BinaryHeap<BitTopNEntry>,
 }
 
+#[cfg_attr(not(any(test, feature = "h264-encoder")), allow(dead_code))]
 impl ShadowBitTopN {
     pub(crate) fn new(perm_seed: &[u8; 32], capacity: usize) -> Self {
         Self {

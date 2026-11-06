@@ -651,7 +651,8 @@ fn sha256_hex_of(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::codec::jpeg::pixels::{dct_block, idct_block};
-    use rand::{Rng, SeedableRng};
+    use crate::stego::rng_compat::Rand08;
+    use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
     /// Standard luma QT for QF=50 (libjpeg / Annex K).
@@ -694,7 +695,7 @@ mod tests {
         for _ in 0..200 {
             let mut pixels = [0.0f64; 64];
             for i in 0..64 {
-                pixels[i] = rng.gen_range(0..=255) as f64;
+                pixels[i] = rng.gen_range08(0..=255) as f64;
             }
             let f = dct_block(&pixels, &LUMA_Q50);
             let a = aan_dct_block(&pixels, &LUMA_Q50);
@@ -730,9 +731,9 @@ mod tests {
             // and ghost_roundtrip integration tests). The synthetic
             // values here are bounded accordingly.
             let mut q = [0i16; 64];
-            q[0] = rng.gen_range(-100..=100) as i16;
+            q[0] = rng.gen_range08(-100..=100) as i16;
             for i in 1..64 {
-                q[i] = rng.gen_range(-4..=4) as i16;
+                q[i] = rng.gen_range08(-4..=4) as i16;
             }
             let f = idct_block(&q, &LUMA_Q50);
             let a = aan_idct_block(&q, &LUMA_Q50);
@@ -826,7 +827,7 @@ mod tests {
         for _ in 0..50 {
             let mut pixels = [0.0f64; 64];
             for i in 0..64 {
-                pixels[i] = rng.gen_range(0..=255) as f64;
+                pixels[i] = rng.gen_range08(0..=255) as f64;
             }
             let f_q = dct_block(&pixels, &LUMA_Q50);
             let f_back = idct_block(&f_q, &LUMA_Q50);
@@ -900,7 +901,7 @@ mod tests {
             let mut a = [0i16; 64];
             for v in &mut a {
                 // Pre-shifted sample range [-128, 127]
-                *v = (rng.gen_range(0..=255i32) - 128) as i16;
+                *v = (rng.gen_range08(0..=255i32) - 128) as i16;
             }
             let mut b = a;
             super::fdct_kernel_scalar(&mut a);
@@ -1000,9 +1001,9 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(0xD17C_7EE0_BEEF_F00D);
         for round in 0..500 {
             let mut q = [0i16; 64];
-            q[0] = rng.gen_range(-100..=100) as i16;
+            q[0] = rng.gen_range08(-100..=100) as i16;
             for i in 1..64 {
-                q[i] = rng.gen_range(-4..=4) as i16;
+                q[i] = rng.gen_range08(-4..=4) as i16;
             }
             let mut a = [0i32; 64];
             let mut b = [0i32; 64];
@@ -1080,7 +1081,7 @@ mod tests {
         let mut rng = ChaCha20Rng::seed_from_u64(0xBA5E_BA11);
         let mut pixels = [0.0f64; 64];
         for i in 0..64 {
-            pixels[i] = rng.gen_range(0..=255) as f64;
+            pixels[i] = rng.gen_range08(0..=255) as f64;
         }
         let a1 = aan_dct_block(&pixels, &LUMA_Q50);
         let a2 = aan_dct_block(&pixels, &LUMA_Q50);

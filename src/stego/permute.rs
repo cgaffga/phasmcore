@@ -13,10 +13,11 @@
 //!
 //! The Fisher-Yates shuffle uses `u32` for `gen_range` (not `usize`) to ensure
 //! identical permutations on all platforms. `usize` is 32-bit on WASM but
-//! 64-bit on native, which causes `rand::Rng::gen_range` to consume different
+//! 64-bit on native, which causes `gen_range` to consume different
 //! amounts of PRNG entropy per step — producing completely different shuffles.
+//! The draws use `rand` 0.8's sampler ([`crate::stego::rng_compat`]).
 
-use rand::Rng;
+use crate::stego::rng_compat::Rand08;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
@@ -44,7 +45,7 @@ fn shuffle_portable(positions: &mut [CoeffPos], seed: &[u8; 32]) {
     let mut rng = ChaCha20Rng::from_seed(*seed);
     let n = positions.len();
     for i in (1..n).rev() {
-        let j = rng.gen_range(0..=(i as u32)) as usize;
+        let j = rng.gen_range08(0..=(i as u32)) as usize;
         positions.swap(i, j);
     }
 }
@@ -83,7 +84,7 @@ const SHUFFLE_CHUNK: usize = 1 << 16;
 #[cfg_attr(target_arch = "wasm32", inline(never))]
 fn shuffle_u32_steps(v: &mut [u32], rng: &mut ShuffleRng, lo: usize, hi: usize) {
     for i in (lo..hi).rev() {
-        let j = rng.gen_range(0..=(i as u32)) as usize;
+        let j = rng.gen_range08(0..=(i as u32)) as usize;
         v.swap(i, j);
     }
 }

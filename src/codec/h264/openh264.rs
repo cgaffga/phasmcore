@@ -43,10 +43,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use core_openh264_sys::{
     phasm_decoder_create, phasm_decoder_decode_frame, phasm_decoder_destroy,
-    phasm_decoder_flush_frame, phasm_decoder_initialize,
+    phasm_decoder_flush_frame,
     phasm_decoder_initialize_with_options, phasm_encoder_create, phasm_encoder_destroy,
     phasm_encoder_encode_frame, phasm_encoder_get_dec_pic_y, phasm_encoder_initialize,
-    phasm_encoder_set_dual_recon_enabled, phasm_encoder_uninitialize,
+    phasm_encoder_set_dual_recon_enabled,
     PhasmDecoderHandle, PhasmEncoderHandle, PhasmStegoCallbacks, PhasmStegoMdCost, PhasmStegoPos,
     WelsRegisterPhasmStegoCallbacks, WelsStegoAbiVersion, WelsStegoSetFrameNum,
     WelsStegoSetPassMode, PHASM_FRAME_IDR, PHASM_FRAME_P, PHASM_STEGO_ABI_VERSION,
@@ -1624,6 +1624,7 @@ mod tests {
         struct FireRecord {
             frame_num: u32,
             domain: u8,
+            #[allow(dead_code)]
             block_cat: u8,
             #[allow(dead_code)]
             mb_x: u16,
@@ -3434,30 +3435,6 @@ mod tests {
 
     // ---------------- B.7 round-trip via walker (post-A.5(j)) ----------------
 
-    /// Full key for a COEFF_SIGN wire-bound position. Includes the
-    /// fields that PhasmStegoPos carries for that domain. Unique
-    /// per coefficient on the wire once the A.5(j) filter is applied.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    struct WireKey {
-        mb_x: u16,
-        mb_y: u16,
-        block_cat: u8,
-        sub_block: u8,
-        coeff_idx: u8,
-    }
-
-    impl WireKey {
-        fn from_pos(pos: &Position) -> Self {
-            Self {
-                mb_x: pos.mb_x,
-                mb_y: pos.mb_y,
-                block_cat: pos.block_cat,
-                sub_block: pos.sub_block,
-                coeff_idx: pos.coeff_idx,
-            }
-        }
-    }
-
     /// B.7 round-trip via walker — **B.8 key-based version**.
     ///
     /// Pass 1: encode (no overrides), capture every COEFF_SIGN fire +
@@ -3551,7 +3528,7 @@ mod tests {
         // ---------- Walk Pass 1 + index by canonical phasm PositionKey ----------
         let walk_p1 = walk_annex_b_for_cover(&p1_bytes[..p1_len]).expect("walker p1");
         let p1_positions = &walk_p1.cover.coeff_sign_bypass.positions;
-        let p1_bits = &walk_p1.cover.coeff_sign_bypass.bits;
+        let _p1_bits = &walk_p1.cover.coeff_sign_bypass.bits;
         let mb_width = MB_W as u32;
 
         let mut walker_by_key: HashMap<u64, usize> = HashMap::with_capacity(p1_positions.len());
@@ -3902,7 +3879,6 @@ mod tests {
         // IDR with whatever override_map currently holds, returns the
         // produced Annex-B bytes.
         let encode_once = {
-            let override_map = override_map.clone();
             let mb_type_table = mb_type_table.clone();
             let applied_count = applied_count.clone();
             move || -> (Vec<u8>, usize) {
@@ -3991,10 +3967,10 @@ mod tests {
             walk_annex_b_for_cover(&baseline_bytes).expect("baseline walker");
         let baseline_positions = baseline_walk.cover.coeff_sign_bypass.positions.clone();
         let baseline_bits = baseline_walk.cover.coeff_sign_bypass.bits.clone();
-        let mb_width = MB_W as u32;
+        let _mb_width = MB_W as u32;
 
         // walker_by_key for baseline.
-        let baseline_by_key: HashMap<u64, usize> = baseline_positions
+        let _baseline_by_key: HashMap<u64, usize> = baseline_positions
             .iter()
             .enumerate()
             .map(|(i, k)| (k.raw(), i))
@@ -4292,7 +4268,9 @@ mod tests {
         struct Fire {
             mb_addr: u32,
             block_cat: u8,
+            #[allow(dead_code)]
             sub_block: u8,
+            #[allow(dead_code)]
             coeff_idx: u8,
             bit: u8,
         }
@@ -4467,14 +4445,7 @@ mod tests {
         assert_eq!(filtered.len(), wbits.len(), "A.5(j) parity broken");
     }
 
-    /// H.264 4×4 zigzag scan table: scan_index → raster_index within
-    /// a 4×4 block (per spec § 6.5.1). The 0th scan position is the
-    /// DC at raster (0,0); positions move along the zigzag pattern.
-    const ZZ_SCAN_4X4: [u8; 16] = [
-        0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15,
-    ];
-
-    /// Inverse of `ZZ_SCAN_4X4`: raster_index → scan_index. Lets us
+    /// Inverse of the H.264 4×4 zigzag scan (spec § 6.5.1): raster_index → scan_index. Lets us
     /// translate an encoder hook's raster coeff_idx into the walker's
     /// scan-order coeff_idx.
     const INV_ZZ_SCAN_4X4: [u8; 16] = [

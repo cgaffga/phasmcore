@@ -108,6 +108,7 @@ fn is_avx_available() -> bool {
 /// on non-aarch64 targets and as the byte-equivalence reference in
 /// tests.
 #[inline]
+#[allow(dead_code)] // the fallback (x86 without AVX, targets without SIMD) and the tests' reference
 fn saxpy_inner_scalar(scratch: &mut [f64], row_in: &[f32], coef: f64) {
     for x in 0..scratch.len() {
         scratch[x] += row_in[x] as f64 * coef;
@@ -119,36 +120,38 @@ fn saxpy_inner_scalar(scratch: &mut [f64], row_in: &[f32], coef: f64) {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn saxpy_inner_neon(scratch: &mut [f64], row_in: &[f32], coef: f64) {
-    use core::arch::aarch64::*;
+    unsafe {
+        use core::arch::aarch64::*;
 
-    let n = scratch.len();
-    let coef_v = vdupq_n_f64(coef);
+        let n = scratch.len();
+        let coef_v = vdupq_n_f64(coef);
 
-    let scratch_ptr = scratch.as_mut_ptr();
-    let row_ptr = row_in.as_ptr();
+        let scratch_ptr = scratch.as_mut_ptr();
+        let row_ptr = row_in.as_ptr();
 
-    let mut x = 0;
-    // Vector loop: 2 elements per iteration.
-    while x + 2 <= n {
-        // Load 2 f32s, convert to f64x2 (widening).
-        let r_f32x2 = vld1_f32(row_ptr.add(x));
-        let r_f64x2 = vcvt_f64_f32(r_f32x2);
+        let mut x = 0;
+        // Vector loop: 2 elements per iteration.
+        while x + 2 <= n {
+            // Load 2 f32s, convert to f64x2 (widening).
+            let r_f32x2 = vld1_f32(row_ptr.add(x));
+            let r_f64x2 = vcvt_f64_f32(r_f32x2);
 
-        // Multiply by broadcast coef.
-        let prod = vmulq_f64(r_f64x2, coef_v);
+            // Multiply by broadcast coef.
+            let prod = vmulq_f64(r_f64x2, coef_v);
 
-        // Load scratch[x..x+2], add, store.
-        let s = vld1q_f64(scratch_ptr.add(x));
-        let new_v = vaddq_f64(s, prod);
-        vst1q_f64(scratch_ptr.add(x), new_v);
+            // Load scratch[x..x+2], add, store.
+            let s = vld1q_f64(scratch_ptr.add(x));
+            let new_v = vaddq_f64(s, prod);
+            vst1q_f64(scratch_ptr.add(x), new_v);
 
-        x += 2;
-    }
+            x += 2;
+        }
 
-    // Tail: handle the 0 or 1 remaining elements scalar.
-    while x < n {
-        *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
-        x += 1;
+        // Tail: handle the 0 or 1 remaining elements scalar.
+        while x < n {
+            *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
+            x += 1;
+        }
     }
 }
 
@@ -158,36 +161,38 @@ unsafe fn saxpy_inner_neon(scratch: &mut [f64], row_in: &[f32], coef: f64) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn saxpy_inner_avx(scratch: &mut [f64], row_in: &[f32], coef: f64) {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    let n = scratch.len();
-    let coef_v = _mm256_set1_pd(coef);
+        let n = scratch.len();
+        let coef_v = _mm256_set1_pd(coef);
 
-    let scratch_ptr = scratch.as_mut_ptr();
-    let row_ptr = row_in.as_ptr();
+        let scratch_ptr = scratch.as_mut_ptr();
+        let row_ptr = row_in.as_ptr();
 
-    let mut x = 0;
-    // Vector loop: 4 elements per iteration (f64x4).
-    while x + 4 <= n {
-        // Load 4 f32s (__m128 = f32x4), widen to f64x4.
-        let r_f32x4 = _mm_loadu_ps(row_ptr.add(x));
-        let r_f64x4 = _mm256_cvtps_pd(r_f32x4);
+        let mut x = 0;
+        // Vector loop: 4 elements per iteration (f64x4).
+        while x + 4 <= n {
+            // Load 4 f32s (__m128 = f32x4), widen to f64x4.
+            let r_f32x4 = _mm_loadu_ps(row_ptr.add(x));
+            let r_f64x4 = _mm256_cvtps_pd(r_f32x4);
 
-        // Multiply by broadcast coef (separate mul — no FMA).
-        let prod = _mm256_mul_pd(r_f64x4, coef_v);
+            // Multiply by broadcast coef (separate mul — no FMA).
+            let prod = _mm256_mul_pd(r_f64x4, coef_v);
 
-        // Load scratch[x..x+4], add (separate, no FMA), store.
-        let s = _mm256_loadu_pd(scratch_ptr.add(x));
-        let new_v = _mm256_add_pd(s, prod);
-        _mm256_storeu_pd(scratch_ptr.add(x), new_v);
+            // Load scratch[x..x+4], add (separate, no FMA), store.
+            let s = _mm256_loadu_pd(scratch_ptr.add(x));
+            let new_v = _mm256_add_pd(s, prod);
+            _mm256_storeu_pd(scratch_ptr.add(x), new_v);
 
-        x += 4;
-    }
+            x += 4;
+        }
 
-    // Tail: handle 0-3 remaining elements scalar.
-    while x < n {
-        *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
-        x += 1;
+        // Tail: handle 0-3 remaining elements scalar.
+        while x < n {
+            *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
+            x += 1;
+        }
     }
 }
 
@@ -248,72 +253,75 @@ pub fn dot_product_16_taps(row_in: &[f32], filter: &[f64; 16]) -> f64 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn dot_product_16_taps_avx(row_in: &[f32], filter: &[f64; 16]) -> f64 {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    debug_assert!(row_in.len() >= 16);
+        debug_assert!(row_in.len() >= 16);
 
-    let row_ptr = row_in.as_ptr();
-    let filter_ptr = filter.as_ptr();
+        let row_ptr = row_in.as_ptr();
+        let filter_ptr = filter.as_ptr();
 
-    // Load 16 f32s as 4 f32x4 (__m128).
-    let r0 = _mm_loadu_ps(row_ptr);
-    let r1 = _mm_loadu_ps(row_ptr.add(4));
-    let r2 = _mm_loadu_ps(row_ptr.add(8));
-    let r3 = _mm_loadu_ps(row_ptr.add(12));
+        // Load 16 f32s as 4 f32x4 (__m128).
+        let r0 = _mm_loadu_ps(row_ptr);
+        let r1 = _mm_loadu_ps(row_ptr.add(4));
+        let r2 = _mm_loadu_ps(row_ptr.add(8));
+        let r3 = _mm_loadu_ps(row_ptr.add(12));
 
-    // Widen f32x4 → f64x4. Lane 0..3 of v0 = row[0..3], etc.
-    let v0 = _mm256_cvtps_pd(r0); // {row[0], row[1], row[2], row[3]}
-    let v1 = _mm256_cvtps_pd(r1); // {row[4]..row[7]}
-    let v2 = _mm256_cvtps_pd(r2); // {row[8]..row[11]}
-    let v3 = _mm256_cvtps_pd(r3); // {row[12]..row[15]}
+        // Widen f32x4 → f64x4. Lane 0..3 of v0 = row[0..3], etc.
+        let v0 = _mm256_cvtps_pd(r0); // {row[0], row[1], row[2], row[3]}
+        let v1 = _mm256_cvtps_pd(r1); // {row[4]..row[7]}
+        let v2 = _mm256_cvtps_pd(r2); // {row[8]..row[11]}
+        let v3 = _mm256_cvtps_pd(r3); // {row[12]..row[15]}
 
-    // Filter as 4 f64x4.
-    let f0 = _mm256_loadu_pd(filter_ptr);
-    let f1 = _mm256_loadu_pd(filter_ptr.add(4));
-    let f2 = _mm256_loadu_pd(filter_ptr.add(8));
-    let f3 = _mm256_loadu_pd(filter_ptr.add(12));
+        // Filter as 4 f64x4.
+        let f0 = _mm256_loadu_pd(filter_ptr);
+        let f1 = _mm256_loadu_pd(filter_ptr.add(4));
+        let f2 = _mm256_loadu_pd(filter_ptr.add(8));
+        let f3 = _mm256_loadu_pd(filter_ptr.add(12));
 
-    // Multiply (separate mul — no FMA, matches scalar semantics).
-    let p0_p3 = _mm256_mul_pd(v0, f0);
-    let p4_p7 = _mm256_mul_pd(v1, f1);
-    let p8_p11 = _mm256_mul_pd(v2, f2);
-    let p12_p15 = _mm256_mul_pd(v3, f3);
+        // Multiply (separate mul — no FMA, matches scalar semantics).
+        let p0_p3 = _mm256_mul_pd(v0, f0);
+        let p4_p7 = _mm256_mul_pd(v1, f1);
+        let p8_p11 = _mm256_mul_pd(v2, f2);
+        let p12_p15 = _mm256_mul_pd(v3, f3);
 
-    // Extract products to scalar [f64; 16].
-    let mut products = [0.0f64; 16];
-    _mm256_storeu_pd(products.as_mut_ptr(), p0_p3);
-    _mm256_storeu_pd(products.as_mut_ptr().add(4), p4_p7);
-    _mm256_storeu_pd(products.as_mut_ptr().add(8), p8_p11);
-    _mm256_storeu_pd(products.as_mut_ptr().add(12), p12_p15);
+        // Extract products to scalar [f64; 16].
+        let mut products = [0.0f64; 16];
+        _mm256_storeu_pd(products.as_mut_ptr(), p0_p3);
+        _mm256_storeu_pd(products.as_mut_ptr().add(4), p4_p7);
+        _mm256_storeu_pd(products.as_mut_ptr().add(8), p8_p11);
+        _mm256_storeu_pd(products.as_mut_ptr().add(12), p12_p15);
 
-    // Scalar pairwise reduce — IDENTICAL source to the scalar
-    // fallback fn. Guarantees bit-equivalence at the reduce stage.
-    // (SIMD multiplies above produce f64 results uniquely
-    // specified by IEEE 754 for given inputs, matching scalar mul.)
-    let s0 = products[0] + products[1];
-    let s1 = products[2] + products[3];
-    let s2 = products[4] + products[5];
-    let s3 = products[6] + products[7];
-    let s4 = products[8] + products[9];
-    let s5 = products[10] + products[11];
-    let s6 = products[12] + products[13];
-    let s7 = products[14] + products[15];
+        // Scalar pairwise reduce — IDENTICAL source to the scalar
+        // fallback fn. Guarantees bit-equivalence at the reduce stage.
+        // (SIMD multiplies above produce f64 results uniquely
+        // specified by IEEE 754 for given inputs, matching scalar mul.)
+        let s0 = products[0] + products[1];
+        let s1 = products[2] + products[3];
+        let s2 = products[4] + products[5];
+        let s3 = products[6] + products[7];
+        let s4 = products[8] + products[9];
+        let s5 = products[10] + products[11];
+        let s6 = products[12] + products[13];
+        let s7 = products[14] + products[15];
 
-    let t0 = s0 + s1;
-    let t1 = s2 + s3;
-    let t2 = s4 + s5;
-    let t3 = s6 + s7;
+        let t0 = s0 + s1;
+        let t1 = s2 + s3;
+        let t2 = s4 + s5;
+        let t3 = s6 + s7;
 
-    let u0 = t0 + t1;
-    let u1 = t2 + t3;
+        let u0 = t0 + t1;
+        let u1 = t2 + t3;
 
-    u0 + u1
+        u0 + u1
+    }
 }
 
 /// Scalar reference implementation. Always available; used directly
 /// on non-aarch64 targets and as the byte-equivalence reference in
 /// tests. **Pairwise tree** — same shape as the NEON path.
 #[inline]
+#[allow(dead_code)] // the fallback (x86 without AVX, targets without SIMD) and the tests' reference
 fn dot_product_16_taps_scalar(row_in: &[f32], filter: &[f64; 16]) -> f64 {
     // 16 products
     let p0 = row_in[0] as f64 * filter[0];
@@ -363,65 +371,67 @@ fn dot_product_16_taps_scalar(row_in: &[f32], filter: &[f64; 16]) -> f64 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn dot_product_16_taps_neon(row_in: &[f32], filter: &[f64; 16]) -> f64 {
-    use core::arch::aarch64::*;
+    unsafe {
+        use core::arch::aarch64::*;
 
-    debug_assert!(row_in.len() >= 16);
+        debug_assert!(row_in.len() >= 16);
 
-    let row_ptr = row_in.as_ptr();
-    let filter_ptr = filter.as_ptr();
+        let row_ptr = row_in.as_ptr();
+        let filter_ptr = filter.as_ptr();
 
-    // Load 16 f32s as 4 f32x4.
-    let r0q = vld1q_f32(row_ptr);
-    let r1q = vld1q_f32(row_ptr.add(4));
-    let r2q = vld1q_f32(row_ptr.add(8));
-    let r3q = vld1q_f32(row_ptr.add(12));
+        // Load 16 f32s as 4 f32x4.
+        let r0q = vld1q_f32(row_ptr);
+        let r1q = vld1q_f32(row_ptr.add(4));
+        let r2q = vld1q_f32(row_ptr.add(8));
+        let r3q = vld1q_f32(row_ptr.add(12));
 
-    // Widen f32x4 → 2 × f64x2 (low half + high half).
-    // Each f64x2 holds two consecutive widened f32 values.
-    let v0 = vcvt_f64_f32(vget_low_f32(r0q)); // {row[0], row[1]}
-    let v1 = vcvt_high_f64_f32(r0q); // {row[2], row[3]}
-    let v2 = vcvt_f64_f32(vget_low_f32(r1q)); // {row[4], row[5]}
-    let v3 = vcvt_high_f64_f32(r1q); // {row[6], row[7]}
-    let v4 = vcvt_f64_f32(vget_low_f32(r2q)); // {row[8], row[9]}
-    let v5 = vcvt_high_f64_f32(r2q); // {row[10], row[11]}
-    let v6 = vcvt_f64_f32(vget_low_f32(r3q)); // {row[12], row[13]}
-    let v7 = vcvt_high_f64_f32(r3q); // {row[14], row[15]}
+        // Widen f32x4 → 2 × f64x2 (low half + high half).
+        // Each f64x2 holds two consecutive widened f32 values.
+        let v0 = vcvt_f64_f32(vget_low_f32(r0q)); // {row[0], row[1]}
+        let v1 = vcvt_high_f64_f32(r0q); // {row[2], row[3]}
+        let v2 = vcvt_f64_f32(vget_low_f32(r1q)); // {row[4], row[5]}
+        let v3 = vcvt_high_f64_f32(r1q); // {row[6], row[7]}
+        let v4 = vcvt_f64_f32(vget_low_f32(r2q)); // {row[8], row[9]}
+        let v5 = vcvt_high_f64_f32(r2q); // {row[10], row[11]}
+        let v6 = vcvt_f64_f32(vget_low_f32(r3q)); // {row[12], row[13]}
+        let v7 = vcvt_high_f64_f32(r3q); // {row[14], row[15]}
 
-    // Filter as 8 f64x2.
-    let f0 = vld1q_f64(filter_ptr);
-    let f1 = vld1q_f64(filter_ptr.add(2));
-    let f2 = vld1q_f64(filter_ptr.add(4));
-    let f3 = vld1q_f64(filter_ptr.add(6));
-    let f4 = vld1q_f64(filter_ptr.add(8));
-    let f5 = vld1q_f64(filter_ptr.add(10));
-    let f6 = vld1q_f64(filter_ptr.add(12));
-    let f7 = vld1q_f64(filter_ptr.add(14));
+        // Filter as 8 f64x2.
+        let f0 = vld1q_f64(filter_ptr);
+        let f1 = vld1q_f64(filter_ptr.add(2));
+        let f2 = vld1q_f64(filter_ptr.add(4));
+        let f3 = vld1q_f64(filter_ptr.add(6));
+        let f4 = vld1q_f64(filter_ptr.add(8));
+        let f5 = vld1q_f64(filter_ptr.add(10));
+        let f6 = vld1q_f64(filter_ptr.add(12));
+        let f7 = vld1q_f64(filter_ptr.add(14));
 
-    // Multiply (separate vmulq — no FMA, matches scalar two-rounding semantics).
-    let p0 = vmulq_f64(v0, f0); // {p0, p1}
-    let p1 = vmulq_f64(v1, f1); // {p2, p3}
-    let p2 = vmulq_f64(v2, f2); // {p4, p5}
-    let p3 = vmulq_f64(v3, f3); // {p6, p7}
-    let p4 = vmulq_f64(v4, f4); // {p8, p9}
-    let p5 = vmulq_f64(v5, f5); // {p10, p11}
-    let p6 = vmulq_f64(v6, f6); // {p12, p13}
-    let p7 = vmulq_f64(v7, f7); // {p14, p15}
+        // Multiply (separate vmulq — no FMA, matches scalar two-rounding semantics).
+        let p0 = vmulq_f64(v0, f0); // {p0, p1}
+        let p1 = vmulq_f64(v1, f1); // {p2, p3}
+        let p2 = vmulq_f64(v2, f2); // {p4, p5}
+        let p3 = vmulq_f64(v3, f3); // {p6, p7}
+        let p4 = vmulq_f64(v4, f4); // {p8, p9}
+        let p5 = vmulq_f64(v5, f5); // {p10, p11}
+        let p6 = vmulq_f64(v6, f6); // {p12, p13}
+        let p7 = vmulq_f64(v7, f7); // {p14, p15}
 
-    // L1: 8 vectors → 4. vpaddq_f64(a, b) = {a[0]+a[1], b[0]+b[1]}.
-    let s01 = vpaddq_f64(p0, p1); // {s0, s1} = {p0+p1, p2+p3}
-    let s23 = vpaddq_f64(p2, p3); // {s2, s3} = {p4+p5, p6+p7}
-    let s45 = vpaddq_f64(p4, p5); // {s4, s5} = {p8+p9, p10+p11}
-    let s67 = vpaddq_f64(p6, p7); // {s6, s7} = {p12+p13, p14+p15}
+        // L1: 8 vectors → 4. vpaddq_f64(a, b) = {a[0]+a[1], b[0]+b[1]}.
+        let s01 = vpaddq_f64(p0, p1); // {s0, s1} = {p0+p1, p2+p3}
+        let s23 = vpaddq_f64(p2, p3); // {s2, s3} = {p4+p5, p6+p7}
+        let s45 = vpaddq_f64(p4, p5); // {s4, s5} = {p8+p9, p10+p11}
+        let s67 = vpaddq_f64(p6, p7); // {s6, s7} = {p12+p13, p14+p15}
 
-    // L2: 4 → 2.
-    let t01 = vpaddq_f64(s01, s23); // {t0, t1}
-    let t23 = vpaddq_f64(s45, s67); // {t2, t3}
+        // L2: 4 → 2.
+        let t01 = vpaddq_f64(s01, s23); // {t0, t1}
+        let t23 = vpaddq_f64(s45, s67); // {t2, t3}
 
-    // L3: 2 → 1.
-    let u01 = vpaddq_f64(t01, t23); // {u0, u1}
+        // L3: 2 → 1.
+        let u01 = vpaddq_f64(t01, t23); // {u0, u1}
 
-    // L4: horizontal final.
-    vaddvq_f64(u01)
+        // L4: horizontal final.
+        vaddvq_f64(u01)
+    }
 }
 
 // ─── T2.1e WASM SIMD128 implementations ─────────────────────────
@@ -434,48 +444,50 @@ unsafe fn dot_product_16_taps_neon(row_in: &[f32], filter: &[f64; 16]) -> f64 {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 unsafe fn saxpy_inner_wasm(scratch: &mut [f64], row_in: &[f32], coef: f64) {
-    use core::arch::wasm32::*;
+    unsafe {
+        use core::arch::wasm32::*;
 
-    let n = scratch.len();
-    let coef_v = f64x2_splat(coef);
+        let n = scratch.len();
+        let coef_v = f64x2_splat(coef);
 
-    let scratch_ptr = scratch.as_mut_ptr();
-    let row_ptr = row_in.as_ptr();
+        let scratch_ptr = scratch.as_mut_ptr();
+        let row_ptr = row_in.as_ptr();
 
-    let mut x = 0;
-    // Vector loop: 4 elements per iteration (2 × f64x2).
-    while x + 4 <= n {
-        // Load 4 f32s as f32x4 v128.
-        let r_q = v128_load(row_ptr.add(x) as *const v128);
+        let mut x = 0;
+        // Vector loop: 4 elements per iteration (2 × f64x2).
+        while x + 4 <= n {
+            // Load 4 f32s as f32x4 v128.
+            let r_q = v128_load(row_ptr.add(x) as *const v128);
 
-        // Widen low half (lanes 0, 1) to f64x2.
-        let r_lo = f64x2_promote_low_f32x4(r_q);
+            // Widen low half (lanes 0, 1) to f64x2.
+            let r_lo = f64x2_promote_low_f32x4(r_q);
 
-        // Shuffle high half (lanes 2, 3) to low positions, then widen.
-        let r_hi_q = i32x4_shuffle::<2, 3, 2, 3>(r_q, r_q);
-        let r_hi = f64x2_promote_low_f32x4(r_hi_q);
+            // Shuffle high half (lanes 2, 3) to low positions, then widen.
+            let r_hi_q = i32x4_shuffle::<2, 3, 2, 3>(r_q, r_q);
+            let r_hi = f64x2_promote_low_f32x4(r_hi_q);
 
-        // Multiply both halves by coef (separate mul — no FMA).
-        let prod_lo = f64x2_mul(r_lo, coef_v);
-        let prod_hi = f64x2_mul(r_hi, coef_v);
+            // Multiply both halves by coef (separate mul — no FMA).
+            let prod_lo = f64x2_mul(r_lo, coef_v);
+            let prod_hi = f64x2_mul(r_hi, coef_v);
 
-        // Load scratch[x..x+2] and scratch[x+2..x+4], add, store.
-        let s_lo = v128_load(scratch_ptr.add(x) as *const v128);
-        let s_hi = v128_load(scratch_ptr.add(x + 2) as *const v128);
+            // Load scratch[x..x+2] and scratch[x+2..x+4], add, store.
+            let s_lo = v128_load(scratch_ptr.add(x) as *const v128);
+            let s_hi = v128_load(scratch_ptr.add(x + 2) as *const v128);
 
-        let new_lo = f64x2_add(s_lo, prod_lo);
-        let new_hi = f64x2_add(s_hi, prod_hi);
+            let new_lo = f64x2_add(s_lo, prod_lo);
+            let new_hi = f64x2_add(s_hi, prod_hi);
 
-        v128_store(scratch_ptr.add(x) as *mut v128, new_lo);
-        v128_store(scratch_ptr.add(x + 2) as *mut v128, new_hi);
+            v128_store(scratch_ptr.add(x) as *mut v128, new_lo);
+            v128_store(scratch_ptr.add(x + 2) as *mut v128, new_hi);
 
-        x += 4;
-    }
+            x += 4;
+        }
 
-    // Tail: 0-3 elements scalar.
-    while x < n {
-        *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
-        x += 1;
+        // Tail: 0-3 elements scalar.
+        while x < n {
+            *scratch_ptr.add(x) += *row_ptr.add(x) as f64 * coef;
+            x += 1;
+        }
     }
 }
 
@@ -485,80 +497,82 @@ unsafe fn saxpy_inner_wasm(scratch: &mut [f64], row_in: &[f32], coef: f64) {
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 unsafe fn dot_product_16_taps_wasm(row_in: &[f32], filter: &[f64; 16]) -> f64 {
-    use core::arch::wasm32::*;
+    unsafe {
+        use core::arch::wasm32::*;
 
-    debug_assert!(row_in.len() >= 16);
+        debug_assert!(row_in.len() >= 16);
 
-    let row_ptr = row_in.as_ptr();
-    let filter_ptr = filter.as_ptr();
+        let row_ptr = row_in.as_ptr();
+        let filter_ptr = filter.as_ptr();
 
-    // Load 16 f32s as 4 v128 (f32x4 each).
-    let r0q = v128_load(row_ptr as *const v128);
-    let r1q = v128_load(row_ptr.add(4) as *const v128);
-    let r2q = v128_load(row_ptr.add(8) as *const v128);
-    let r3q = v128_load(row_ptr.add(12) as *const v128);
+        // Load 16 f32s as 4 v128 (f32x4 each).
+        let r0q = v128_load(row_ptr as *const v128);
+        let r1q = v128_load(row_ptr.add(4) as *const v128);
+        let r2q = v128_load(row_ptr.add(8) as *const v128);
+        let r3q = v128_load(row_ptr.add(12) as *const v128);
 
-    // Promote each f32x4 to 2 f64x2 (low half direct + high half
-    // via shuffle-to-low). 8 f64x2 vectors hold all 16 widened f64s.
-    let v0 = f64x2_promote_low_f32x4(r0q); // {row[0], row[1]}
-    let v1 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r0q, r0q)); // {row[2], row[3]}
-    let v2 = f64x2_promote_low_f32x4(r1q); // {row[4], row[5]}
-    let v3 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r1q, r1q)); // {row[6], row[7]}
-    let v4 = f64x2_promote_low_f32x4(r2q); // {row[8], row[9]}
-    let v5 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r2q, r2q)); // {row[10], row[11]}
-    let v6 = f64x2_promote_low_f32x4(r3q); // {row[12], row[13]}
-    let v7 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r3q, r3q)); // {row[14], row[15]}
+        // Promote each f32x4 to 2 f64x2 (low half direct + high half
+        // via shuffle-to-low). 8 f64x2 vectors hold all 16 widened f64s.
+        let v0 = f64x2_promote_low_f32x4(r0q); // {row[0], row[1]}
+        let v1 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r0q, r0q)); // {row[2], row[3]}
+        let v2 = f64x2_promote_low_f32x4(r1q); // {row[4], row[5]}
+        let v3 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r1q, r1q)); // {row[6], row[7]}
+        let v4 = f64x2_promote_low_f32x4(r2q); // {row[8], row[9]}
+        let v5 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r2q, r2q)); // {row[10], row[11]}
+        let v6 = f64x2_promote_low_f32x4(r3q); // {row[12], row[13]}
+        let v7 = f64x2_promote_low_f32x4(i32x4_shuffle::<2, 3, 2, 3>(r3q, r3q)); // {row[14], row[15]}
 
-    // Filter as 8 f64x2.
-    let f0 = v128_load(filter_ptr as *const v128);
-    let f1 = v128_load(filter_ptr.add(2) as *const v128);
-    let f2 = v128_load(filter_ptr.add(4) as *const v128);
-    let f3 = v128_load(filter_ptr.add(6) as *const v128);
-    let f4 = v128_load(filter_ptr.add(8) as *const v128);
-    let f5 = v128_load(filter_ptr.add(10) as *const v128);
-    let f6 = v128_load(filter_ptr.add(12) as *const v128);
-    let f7 = v128_load(filter_ptr.add(14) as *const v128);
+        // Filter as 8 f64x2.
+        let f0 = v128_load(filter_ptr as *const v128);
+        let f1 = v128_load(filter_ptr.add(2) as *const v128);
+        let f2 = v128_load(filter_ptr.add(4) as *const v128);
+        let f3 = v128_load(filter_ptr.add(6) as *const v128);
+        let f4 = v128_load(filter_ptr.add(8) as *const v128);
+        let f5 = v128_load(filter_ptr.add(10) as *const v128);
+        let f6 = v128_load(filter_ptr.add(12) as *const v128);
+        let f7 = v128_load(filter_ptr.add(14) as *const v128);
 
-    // Multiply (separate, no FMA).
-    let p0 = f64x2_mul(v0, f0);
-    let p1 = f64x2_mul(v1, f1);
-    let p2 = f64x2_mul(v2, f2);
-    let p3 = f64x2_mul(v3, f3);
-    let p4 = f64x2_mul(v4, f4);
-    let p5 = f64x2_mul(v5, f5);
-    let p6 = f64x2_mul(v6, f6);
-    let p7 = f64x2_mul(v7, f7);
+        // Multiply (separate, no FMA).
+        let p0 = f64x2_mul(v0, f0);
+        let p1 = f64x2_mul(v1, f1);
+        let p2 = f64x2_mul(v2, f2);
+        let p3 = f64x2_mul(v3, f3);
+        let p4 = f64x2_mul(v4, f4);
+        let p5 = f64x2_mul(v5, f5);
+        let p6 = f64x2_mul(v6, f6);
+        let p7 = f64x2_mul(v7, f7);
 
-    // Extract products to scalar [f64; 16].
-    let mut products = [0.0f64; 16];
-    v128_store(products.as_mut_ptr() as *mut v128, p0);
-    v128_store(products.as_mut_ptr().add(2) as *mut v128, p1);
-    v128_store(products.as_mut_ptr().add(4) as *mut v128, p2);
-    v128_store(products.as_mut_ptr().add(6) as *mut v128, p3);
-    v128_store(products.as_mut_ptr().add(8) as *mut v128, p4);
-    v128_store(products.as_mut_ptr().add(10) as *mut v128, p5);
-    v128_store(products.as_mut_ptr().add(12) as *mut v128, p6);
-    v128_store(products.as_mut_ptr().add(14) as *mut v128, p7);
+        // Extract products to scalar [f64; 16].
+        let mut products = [0.0f64; 16];
+        v128_store(products.as_mut_ptr() as *mut v128, p0);
+        v128_store(products.as_mut_ptr().add(2) as *mut v128, p1);
+        v128_store(products.as_mut_ptr().add(4) as *mut v128, p2);
+        v128_store(products.as_mut_ptr().add(6) as *mut v128, p3);
+        v128_store(products.as_mut_ptr().add(8) as *mut v128, p4);
+        v128_store(products.as_mut_ptr().add(10) as *mut v128, p5);
+        v128_store(products.as_mut_ptr().add(12) as *mut v128, p6);
+        v128_store(products.as_mut_ptr().add(14) as *mut v128, p7);
 
-    // Scalar pairwise reduce — IDENTICAL source to scalar fallback.
-    let s0 = products[0] + products[1];
-    let s1 = products[2] + products[3];
-    let s2 = products[4] + products[5];
-    let s3 = products[6] + products[7];
-    let s4 = products[8] + products[9];
-    let s5 = products[10] + products[11];
-    let s6 = products[12] + products[13];
-    let s7 = products[14] + products[15];
+        // Scalar pairwise reduce — IDENTICAL source to scalar fallback.
+        let s0 = products[0] + products[1];
+        let s1 = products[2] + products[3];
+        let s2 = products[4] + products[5];
+        let s3 = products[6] + products[7];
+        let s4 = products[8] + products[9];
+        let s5 = products[10] + products[11];
+        let s6 = products[12] + products[13];
+        let s7 = products[14] + products[15];
 
-    let t0 = s0 + s1;
-    let t1 = s2 + s3;
-    let t2 = s4 + s5;
-    let t3 = s6 + s7;
+        let t0 = s0 + s1;
+        let t1 = s2 + s3;
+        let t2 = s4 + s5;
+        let t3 = s6 + s7;
 
-    let u0 = t0 + t1;
-    let u1 = t2 + t3;
+        let u0 = t0 + t1;
+        let u1 = t2 + t3;
 
-    u0 + u1
+        u0 + u1
+    }
 }
 
 #[cfg(test)]

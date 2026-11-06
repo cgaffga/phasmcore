@@ -18,7 +18,6 @@
 //! manually.
 
 use crate::error::CliError;
-use phasm_core::StegoError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -28,20 +27,6 @@ use std::process::Command;
 /// invocation.
 pub const TRANSCODE_SUGGESTION: &str =
     "ffmpeg -i input.mp4 -c:v libx264 -profile:v baseline -level 3.1 -crf 18 -c:a copy output.mp4";
-
-/// Heuristic: did a `StegoError::InvalidVideo` from the H.264 pipeline
-/// indicate the input needs re-encoding to Baseline CAVLC? Matches the
-/// error text produced by `h264_ghost_encode/capacity/decode` when the
-/// PPS says CABAC or when the SPS is a non-Baseline profile we don't
-/// support yet.
-pub fn is_non_baseline_error(err: &StegoError) -> bool {
-    if let StegoError::InvalidVideo(msg) = err {
-        let lower = msg.to_lowercase();
-        lower.contains("cabac") || lower.contains("baseline")
-    } else {
-        false
-    }
-}
 
 /// Check that `ffmpeg` is runnable (returns exit 0 on `ffmpeg -version`).
 pub fn ensure_ffmpeg_available() -> Result<(), CliError> {
@@ -57,68 +42,6 @@ pub fn ensure_ffmpeg_available() -> Result<(), CliError> {
              `apt install ffmpeg` on Debian/Ubuntu) or pre-transcode the input manually:\n  {TRANSCODE_SUGGESTION}"
         ))),
     }
-}
-
-/// Transcode `input` to H.264 Baseline CAVLC MP4 at `output`. Uses
-/// libx264 with `-profile:v baseline -level 3.1 -crf 18`. Audio is
-/// stream-copied (`-c:a copy`) to preserve the original track.
-///
-/// Returns an error if ffmpeg exits non-zero; captures stderr so the
-/// user sees ffmpeg's diagnostic instead of a bare exit code.
-pub fn transcode_to_baseline(input: &Path, output: &Path) -> Result<(), CliError> {
-    let result = Command::new("ffmpeg")
-        .arg("-y") // overwrite output
-        .arg("-i")
-        .arg(input)
-        .args([
-            "-c:v", "libx264",
-            "-profile:v", "baseline",
-            "-level", "3.1",
-            "-crf", "18",
-            "-c:a", "copy",
-        ])
-        .arg(output)
-        .output()
-        .map_err(|e| {
-            CliError::InvalidArgs(format!(
-                "failed to spawn ffmpeg: {e}\n\nInstall ffmpeg or transcode manually:\n  {TRANSCODE_SUGGESTION}"
-            ))
-        })?;
-
-    if !result.status.success() {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        // ffmpeg writes a lot of info to stderr even on success; the last
-        // ~25 lines are usually where the actual error lives.
-        let tail: String = stderr
-            .lines()
-            .rev()
-            .take(25)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(CliError::InvalidArgs(format!(
-            "ffmpeg transcode failed (exit {}). Last ffmpeg output:\n\n{tail}",
-            result.status.code().unwrap_or(-1),
-        )));
-    }
-    Ok(())
-}
-
-/// Build a transcode-output tempfile path next to the system temp dir
-/// with a unique name. Caller is responsible for cleaning it up.
-pub fn temp_transcode_path(original: &Path) -> PathBuf {
-    let stem = original
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("phasm_transcode");
-    let pid = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("{stem}_phasm_baseline_{pid}_{ts}.mp4"))
 }
 
 // ─── Streaming-session ffmpeg helpers (video feature) ────────────
@@ -277,7 +200,7 @@ pub fn probe_video(input: &Path) -> Result<VideoProbe, CliError> {
 /// `-pix_fmt yuv420p`) leaves true of its frames: it changes the bit depth
 /// but neither the primaries, the transfer nor the matrix, and it converts a
 /// `yuvj*` (full-range) source to studio range.
-#[cfg(feature = "video")]
+#[cfg(feature = "av1-encoder")]
 pub fn probe_colour_h273(input: &Path) -> (u8, u8, u8, bool) {
     use std::process::Command;
     let unspecified = (2, 2, 2, false);
@@ -355,7 +278,7 @@ pub fn probe_colour_h273(input: &Path) -> (u8, u8, u8, bool) {
 /// the raw decode ([`decode_to_yuv_aligned`], one output frame per decoded
 /// frame) emits them, on the source's timeline. `None` when ffprobe fails or
 /// a frame has no timestamp.
-#[cfg(feature = "video")]
+#[cfg(feature = "av1-encoder")]
 pub fn probe_frame_times_us(input: &Path) -> Option<Vec<i64>> {
     use std::process::Command;
     let result = Command::new("ffprobe")
@@ -434,12 +357,13 @@ fn probe_has_audio(input: &Path) -> bool {
 /// lines with `crop_bottom = 4`, as on an iPhone). Odd sizes cannot be
 /// expressed in 4:2:0 crop units, so they lose their last row/column.
 #[cfg(feature = "video")]
+#[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // the H.264 paths and a test
 pub const H264_SIZE_ALIGN: u32 = 2;
 
 /// Size granularity for AV1: any even size. rav1e pads to its 8-px grid
 /// internally and signals the exact frame size, so nothing is cropped
 /// beyond an odd source's last row/column (as the apps do).
-#[cfg(feature = "video")]
+#[cfg(feature = "av1-encoder")]
 pub const AV1_SIZE_ALIGN: u32 = 2;
 
 /// Largest multiple of `align` that is `<= d` (and `>= align`). Both
@@ -450,15 +374,6 @@ pub const AV1_SIZE_ALIGN: u32 = 2;
 pub fn aligned_dim(d: u32, align: u32) -> u32 {
     let a = align.max(1);
     ((d / a) * a).max(a)
-}
-
-/// Decode the input MP4 to raw YUV420p planar frames at `output`.
-/// Used to feed the v2 streaming orchestrator, which takes raw YUV.
-/// Prefer [`decode_to_yuv_aligned`] for the encode/capacity paths — it CROPS
-/// any non-grid-aligned source so the encoder accepts it.
-#[cfg(feature = "video")]
-pub fn decode_to_yuv(input: &Path, output: &Path) -> Result<(), CliError> {
-    decode_to_yuv_cropped(input, output, None)
 }
 
 /// Decode + CROP to the encoder's size grid: drops the right/bottom edge strip
@@ -813,7 +728,7 @@ pub fn mux_annexb_to_mp4(
 /// Extract the H.264 video track from an MP4 as raw Annex-B bytes
 /// (start-code-prefixed NAL stream, the format the CABAC decoder
 /// consumes). Uses ffmpeg's `h264_mp4toannexb` bitstream filter.
-#[cfg(feature = "video")]
+#[cfg(feature = "h264-decoder")]
 pub fn extract_annexb_from_mp4(input: &Path, output: &Path) -> Result<(), CliError> {
     use std::process::Command;
     let result = Command::new("ffmpeg")

@@ -134,7 +134,7 @@ fn oh264_wire_only_two_sequential_calls_bisect() {
     let opts = EncodeOpts { qp: 26, intra_period: 60 };
     let weights = CostWeights::default();
     let hhat_seed = phasm_core::stego::cover_order::GopSeeds { order: [42u8; 32], hhat: [42u8; 32] };
-    let frame_bits: Vec<u8> = (0..224u8).map(|i| (i & 1)).collect();
+    let frame_bits: Vec<u8> = (0..224u8).map(|i| i & 1).collect();
 
     // Build YUV once, encode twice.
     let mut yuv: Vec<u8> = Vec::new();

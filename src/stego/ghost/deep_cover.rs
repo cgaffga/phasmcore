@@ -32,14 +32,20 @@ use crate::stego::payload::FileEntry;
 pub const DEEP_COVER_DEFAULT_QUALITY: u8 = 92;
 
 /// The cover JPEG phasm writes for `raw_rgb` (row-major RGB, 3 bytes per
-/// pixel) at IJG `quality`, and its exact side information.
+/// pixel) at IJG `quality`, and its exact side information — `None` when the
+/// pixels are a JPEG decoded on this grid (no precover; plain Ghost v3,
+/// [`super::side_info::is_decoded_jpeg_on_grid`]).
 pub fn deep_cover(
     raw_rgb: &[u8],
     width: u32,
     height: u32,
     quality: u8,
-) -> Result<(JpegImage, Vec<u8>, SideInfo), StegoError> {
+) -> Result<(JpegImage, Vec<u8>, Option<SideInfo>), StegoError> {
     crate::stego::validate_encode_dimensions(width, height)?;
+    if super::side_info::is_decoded_jpeg_on_grid(raw_rgb, width, height) {
+        let bytes = deep_cover_jpeg(raw_rgb, width, height, quality)?;
+        return Ok((JpegImage::from_bytes(&bytes)?, bytes, None));
+    }
     let g = Geometry::new(width as usize, height as usize);
     let (bw, bh) = (g.y_blocks_wide(), g.y_blocks_tall());
     let qy = cover_writer::scaled_quant_table(&cover_writer::STD_LUMA_QT, quality);
@@ -51,7 +57,7 @@ pub fn deep_cover(
         }
     })?;
     let img = JpegImage::from_bytes(&bytes)?;
-    Ok((img, bytes, SideInfo::exact_from_codes(errors, bw, bh)))
+    Ok((img, bytes, Some(SideInfo::exact_from_codes(errors, bw, bh))))
 }
 
 /// Just the cover JPEG bytes (what [`ghost_encode_deep_cover`] embeds into).
@@ -72,7 +78,7 @@ pub fn ghost_encode_deep_cover(
     passphrase: &str,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let (img, bytes, si) = deep_cover(raw_rgb, width, height, quality)?;
-    pipeline::ghost_encode_impl(&bytes, message, files, passphrase, Some(si), Some(img))
+    pipeline::ghost_encode_impl(&bytes, message, files, passphrase, si, Some(img))
 }
 
 /// [`ghost_encode_deep_cover`] with shadow messages.
@@ -88,14 +94,18 @@ pub fn ghost_encode_deep_cover_with_shadows(
     shadows: &[ShadowLayer],
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let (img, bytes, si) = deep_cover(raw_rgb, width, height, quality)?;
-    pipeline::shadows_encode(&bytes, message, files, passphrase, shadows, Some(si), Some(img))
+    pipeline::shadows_encode(&bytes, message, files, passphrase, shadows, si, Some(img))
 }
 
 /// Ghost capacity of the Deep Cover cover these pixels produce: the exact-SI
-/// maximum (nzAC / 4 frame bits; the writer's cover is exact by construction).
+/// maximum (nzAC / 4 frame bits; the writer's cover is exact by construction),
+/// or nzAC / 10 when the pixels are a JPEG decoded on this grid
+/// (`capacity::SiKind`).
 pub fn ghost_capacity_deep_cover(raw_rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<usize, StegoError> {
+    use super::capacity::SiKind;
     let img = JpegImage::from_bytes(&deep_cover_jpeg(raw_rgb, width, height, quality)?)?;
-    Ok(super::capacity::ghost_bands_exact(&img, 0, 0)?.max_bytes)
+    let kind = if super::side_info::is_decoded_jpeg_on_grid(raw_rgb, width, height) { SiKind::DecodedJpeg } else { SiKind::Exact };
+    Ok(super::capacity::ghost_bands_for_kind(&img, kind, 0, 0)?.max_bytes)
 }
 
 #[cfg(test)]
@@ -123,6 +133,7 @@ mod tests {
         let (w, h) = (251usize, 211usize);
         let rgb = textured(w, h);
         let (img, bytes, si) = deep_cover(&rgb, w as u32, h as u32, 85).unwrap();
+        let si = si.expect("textured random pixels are a precover");
         assert!(si.is_exact());
         // The legacy entry point recognises the writer's cover and computes
         // the same exact side information.
@@ -164,17 +175,18 @@ mod tests {
 
     /// A message whose payload is exactly `bytes` (incompressible text).
     fn payload_of(bytes: usize, seed: u64) -> String {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
         let alphabet: Vec<char> = (b'!'..=b'~').map(|b| b as char).collect();
-        let mut msg: String = (0..bytes).map(|_| alphabet[rng.r#gen::<usize>() % alphabet.len()]).collect();
+        let mut msg: String = (0..bytes).map(|_| alphabet[rng.gen08::<usize>() % alphabet.len()]).collect();
         // The payload is the flags byte plus the (raw or compressed) text:
         // trim or pad until it is exactly `bytes`.
         while compressed_payload_size(&msg, &[]) > bytes {
             msg.pop();
         }
         while compressed_payload_size(&msg, &[]) < bytes {
-            msg.push(alphabet[rng.r#gen::<usize>() % alphabet.len()]);
+            msg.push(alphabet[rng.gen08::<usize>() % alphabet.len()]);
         }
         assert_eq!(compressed_payload_size(&msg, &[]), bytes);
         msg
@@ -228,6 +240,50 @@ mod tests {
         // Same bytes: a parse of the cover gives the same answer.
         let again = JpegImage::from_bytes(&bytes).unwrap();
         assert_eq!(ghost_bands_si(&again, &rgb, w as u32, h as u32, 0, 0).unwrap(), si);
+    }
+
+    /// A JPEG decoded and re-written at the same size (the 2026-10-31 arm D
+    /// failure): the writer's cover is exact for the pixels, but the pixels
+    /// are no precover, so the encode falls back to plain Ghost and the bands,
+    /// the shadow capacity and the one-call Deep Cover API use the decoded-JPEG
+    /// maximum nzAC / 10.
+    #[test]
+    fn a_decoded_jpeg_gets_no_side_information() {
+        let (w, h) = (320usize, 240usize);
+        let src = deep_cover_jpeg(&textured(w, h), w as u32, h as u32, 90).unwrap();
+        let rgb = image::load_from_memory(&src).unwrap().to_rgb8().into_raw();
+        assert!(crate::codec::jpeg::history::is_aligned_jpeg_decode(&rgb, w as u32, h as u32));
+        let bytes = deep_cover_jpeg(&rgb, w as u32, h as u32, DEEP_COVER_DEFAULT_QUALITY).unwrap();
+        let img = JpegImage::from_bytes(&bytes).unwrap();
+        let qt = img.quant_table(0).unwrap().values;
+        assert!(SideInfo::is_exact_for(&rgb, w as u32, h as u32, img.dct_grid(0), &qt), "the cover is the writer's");
+        assert!(SideInfo::for_embed(&rgb, w as u32, h as u32, img.dct_grid(0), &qt).unwrap().is_none());
+        use super::super::capacity::{si_kind, SiKind, MAX_RATE_DIV_DECODED_JPEG};
+        assert_eq!(si_kind(&img, &rgb, w as u32, h as u32).unwrap(), SiKind::DecodedJpeg);
+        let nz = super::super::capacity::count_nonzero_ac(img.dct_grid(0));
+        let cut = ghost_bands_si(&img, &rgb, w as u32, h as u32, 0, 0).unwrap();
+        let plain = ghost_bands(&img, 0, 0).unwrap();
+        assert_eq!(cut.max_bytes, crate::stego::ghost::capacity::plaintext_for_frame_bits(nz / MAX_RATE_DIV_DECODED_JPEG));
+        assert!(cut.max_bytes < plain.max_bytes && cut.comfort_bytes <= plain.comfort_bytes);
+        assert_eq!(
+            estimate_shadow_capacity_si(&img, &rgb, w as u32, h as u32).unwrap(),
+            crate::stego::shadow::shadow_plaintext_for_bits(nz / MAX_RATE_DIV_DECODED_JPEG / 2)
+        );
+        assert_eq!(ghost_capacity_deep_cover(&rgb, w as u32, h as u32, DEEP_COVER_DEFAULT_QUALITY).unwrap(), cut.max_bytes);
+        // The SI encodes are byte for byte plain Ghost on that cover.
+        let msg = "decoded jpeg";
+        let _seed = crate::stego::crypto::DeterministicSeedGuard::set("2026");
+        let (plain_stego, _) = pipeline::ghost_encode_impl(&bytes, msg, &[], "pw", None, None).unwrap();
+        let (si_stego, _) =
+            pipeline::ghost_encode_si_with_files_quality(&bytes, &rgb, w as u32, h as u32, msg, &[], "pw").unwrap();
+        assert_eq!(si_stego, plain_stego);
+        let (dc, _) = ghost_encode_deep_cover(&rgb, w as u32, h as u32, DEEP_COVER_DEFAULT_QUALITY, msg, &[], "pw").unwrap();
+        assert_eq!(dc, plain_stego);
+        assert_eq!(crate::stego::ghost_decode(&dc, "pw").unwrap().text, msg);
+        // The precover the JPEG was made from keeps its bonus.
+        let pre = textured(w, h);
+        let pimg = JpegImage::from_bytes(&deep_cover_jpeg(&pre, w as u32, h as u32, DEEP_COVER_DEFAULT_QUALITY).unwrap()).unwrap();
+        assert!(ghost_bands_si(&pimg, &pre, w as u32, h as u32, 0, 0).unwrap().max_bytes > ghost_bands(&pimg, 0, 0).unwrap().max_bytes);
     }
 
     #[test]

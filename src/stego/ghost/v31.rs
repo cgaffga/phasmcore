@@ -2,31 +2,44 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Ghost embedding v3: ternary STC over **all** Y AC coefficients, the way
+//! Ghost embedding v3.1: ternary STC over **all** Y AC coefficients, the way
 //! reference J-UNIWARD embeds. Design and evidence:
-//! `docs/design/image/ghost-embedding-v3.md`.
+//! `docs/design/image/ghost-embedding-v3.md` (v3.1 section). v3.1 replaced
+//! v3 (core 0.5 / apps 1.9) for encoding; v3 images still decode
+//! ([`super::v3_legacy`], decode-only).
 //!
 //! - **Cover** = every Y AC coefficient, zeros included, in a keyed
-//!   permutation. The set never changes, so no direction is forbidden and the
-//!   decoder needs no costs at all.
-//! - **Symbols** = the two lowest bit planes of the coefficient value:
-//!   `P1 = c mod 2` (parity) and `P2 = ⌊c/2⌋ mod 2`. Every ±1 change flips
-//!   P1; exactly one of the two directions also flips P2 (`+1` when `c` is
-//!   odd, `−1` when even).
+//!   permutation (the v3 order). The set never changes, so no direction is
+//!   forbidden and the decoder needs no costs at all.
+//! - **Symbols** = two bit planes of the coefficient value: `P1 = c mod 2`
+//!   (parity) and `P2 = ⌊(c + s)/2⌋ mod 2` with a keyed bit `s` per
+//!   coefficient ([`PairKey`]). Every ±1 change flips P1; exactly one of the
+//!   two directions also flips P2 (`+1` when `c + s` is odd, `−1` when
+//!   even). With `s` keyed, which pair `{2k, 2k+1}` or `{2k−1, 2k}` a value
+//!   belongs to is secret, so an excess of either layer's changes has no
+//!   directional signature (v3: `s = 0`, R3.16).
 //! - **Ternary embedding** = the double-layered STC construction (Filler,
-//!   Judas, Fridrich 2011, §VI): layer 2 embeds half the bits into P2 with
-//!   costs from the marginal P2-flip probabilities of the optimal ternary
+//!   Judas, Fridrich 2011, §VI): layer 2 embeds its bits into P2 with costs
+//!   from the marginal P2-flip probabilities of the optimal ternary
 //!   embedding; layer 1 embeds the rest into P1, where layer-2 flips are
 //!   fixed and every other change takes the P2-preserving direction.
-//! - **Costs** (encoder only) = J-UNIWARD (symmetric ρ⁺ = ρ⁻) or, with side
-//!   information, `ρ·(1 − 2|e|)` toward the precover and `ρ` away when it is
-//!   exact (Deep Cover: core wrote the cover from the same pixels; ties keep
-//!   `ρ`), or `ρ·max(1 − 2|e|, 0.3)` toward the precover when approximate.
+//! - **Codes** = mixed-width STCs ([`trellis::Code`]): 48 header blocks of a
+//!   ladder width (the decoder finds the frame length there), then blocks of
+//!   `w` and `w + 1` positions so every position of the lane is used (v3:
+//!   one ladder width, 0–17 % of a lane idle, R3.18).
+//! - **Costs** (encoder only) = J-UNIWARD on the unrounded decompressed
+//!   image (symmetric ρ⁺ = ρ⁻) or, with side information, `ρ·(1 − 2|e|)`
+//!   toward the precover and `ρ` away when it is exact (Deep Cover: core
+//!   wrote the cover from the same pixels; ties keep `ρ`), or
+//!   `ρ·max(1 − 2|e|, 0.3)` toward the precover when approximate.
 //! - **Lanes**: covers of more than 2²⁰ AC coefficients are cut into
 //!   independent STC pairs (lanes) that are planned in parallel.
 //!
-//! Seeds are domain-separated from the v1 decoder's (SHA-256 of a label and
-//! the structural key), so a v3 image never parses as v1 or vice versa.
+//! The H-hat and pair seeds are domain-separated from v3's and v1's
+//! (SHA-256 of a label and the structural key), so a v3.1 image never
+//! parses as v3 or v1 or vice versa (the AES tag and CRC are the
+//! validators). The order is v3's on purpose: one shuffle per decode reads
+//! both generations ([`decode_all`]).
 
 use crate::codec::jpeg::JpegImage;
 use crate::codec::jpeg::dct::DctGrid;
@@ -36,16 +49,22 @@ use crate::stego::frame;
 use crate::stego::payload::PayloadData;
 use crate::stego::progress;
 use crate::stego::side_info::SideInfo;
+use crate::stego::stc::trellis::Code;
 use crate::stego::stc::{hhat, trellis};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// STC constraint height of every v3 trellis (primary layers and shadows).
-/// Part of the wire format. Frozen at 9 (2026-10-27) after the height sweep
-/// (`ghost-embedding-v3.md`, "STC constraint height"): −5.4 % distortion and
-/// −4.9 % changes against h = 7 on BOSSbase; 2.5 s for a 12 MP encode on an
-/// iPhone 16 Pro, with every lane on the in-memory Viterbi.
-pub const V3_STC_H: usize = 9;
+/// STC constraint height of every v3.1 trellis (primary layers and
+/// shadows). Part of the wire format; v3's height (frozen at 9 on
+/// 2026-10-27 after the height sweep, `ghost-embedding-v3.md`, "STC
+/// constraint height").
+pub const V31_STC_H: usize = 9;
+
+/// Header blocks of every layer code: the first `min(HEADER_BLOCKS, m)`
+/// blocks have the ladder width ([`choose_w`]), so the decoder can read the
+/// frame length (48 bits) before it knows the frame length. Part of the
+/// wire format.
+pub const HEADER_BLOCKS: usize = 48;
 
 /// Largest |coefficient| a baseline 8-bit JPEG AC coefficient may take.
 const COEFF_MAX: i16 = 1023;
@@ -55,10 +74,13 @@ const MIN_SI_COST: f32 = 1e-6;
 const LAMBDA_SAMPLES: usize = 1 << 15;
 
 /// Domain-separated seeds.
-pub struct V3Seeds {
+pub struct V31Seeds {
+    /// The keyed order (v3's label: shared on purpose).
     pub perm: [u8; 32],
     pub hhat1: [u8; 32],
     pub hhat2: [u8; 32],
+    /// The pair bits `s` ([`PairKey`]).
+    pub pair: [u8; 32],
 }
 
 fn label_hash(label: &[u8], key: &[u8]) -> [u8; 32] {
@@ -68,19 +90,21 @@ fn label_hash(label: &[u8], key: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-pub fn v3_seeds(structural_key: &[u8; 64]) -> V3Seeds {
-    V3Seeds {
+pub fn v31_seeds(structural_key: &[u8; 64]) -> V31Seeds {
+    V31Seeds {
         perm: label_hash(b"phasm-ghost-v3/perm\0", structural_key),
-        hhat1: label_hash(b"phasm-ghost-v3/hhat1", structural_key),
-        hhat2: label_hash(b"phasm-ghost-v3/hhat2", structural_key),
+        hhat1: label_hash(b"phasm-ghost-v3.1/hhat1", structural_key),
+        hhat2: label_hash(b"phasm-ghost-v3.1/hhat2", structural_key),
+        pair: label_hash(b"phasm-ghost-v3.1/pair", structural_key),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Width ladder, H-hat
+// Width ladder, H-hat, layer codes
 // ---------------------------------------------------------------------------
 
-/// The STC widths an encoder may use: 1..=16, then ×≈1.2 steps.
+/// The header widths of v3.1 and the shadow widths of v3 and v3.1 (wire,
+/// unchanged from v3): 1..=16, then ×≈1.2 steps.
 pub(crate) fn ladder() -> impl Iterator<Item = usize> {
     let mut w = 1usize;
     std::iter::from_fn(move || {
@@ -98,16 +122,61 @@ pub fn choose_w(n: usize, m: usize) -> Option<usize> {
     ladder().take_while(|&w| m.saturating_mul(w) <= n).last()
 }
 
-/// The STC submatrix of a v3 trellis: random columns with the first and last
-/// bit set (the standard STC construction; plain random odd-weight columns
-/// cost ~20 % more distortion — `stc_coding_loss`).
-pub fn v3_hhat(w: usize, seed: &[u8; 32], h: usize) -> Vec<Vec<u32>> {
+/// The STC submatrix of a v3.1 trellis: random columns with the first and
+/// last bit set (the standard STC construction; plain random odd-weight
+/// columns cost ~20 % more distortion — `stc_coding_loss`).
+pub fn v31_hhat(w: usize, seed: &[u8; 32], h: usize) -> Vec<Vec<u32>> {
     hhat::generate_hhat_end_set(h, w, seed)
 }
 
 /// Packed H-hat columns (bit `r` = row `r`).
 pub(crate) fn packed_cols(hh: &[Vec<u32>], w: usize) -> Vec<u32> {
     (0..w).map(|c| hhat::column_packed(hh, c)).collect()
+}
+
+/// Block structure of one layer of a lane: `m` bits over `n` positions,
+/// the first `min(HEADER_BLOCKS, m)` blocks of the ladder width
+/// `choose_w(n, m)`, the other blocks sharing the remaining positions evenly
+/// (widths `short_w` and `short_w + 1`). Every position is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerShape {
+    pub m: usize,
+    pub head: usize,
+    pub head_w: usize,
+    pub rest_n: usize,
+    pub short_w: usize,
+}
+
+impl LayerShape {
+    /// `None` if `m == 0` or `m > n`.
+    pub fn new(n: usize, m: usize) -> Option<Self> {
+        let head_w = choose_w(n, m)?;
+        let head = HEADER_BLOCKS.min(m);
+        let rest_n = n - head * head_w;
+        let short_w = if m > head { rest_n / (m - head) } else { 0 };
+        Some(Self { m, head, head_w, rest_n, short_w })
+    }
+
+    /// Positions the layer's trellis walks (the whole lane when it carries
+    /// more than the header).
+    pub fn n(&self) -> usize {
+        self.head * self.head_w + if self.m > self.head { self.rest_n } else { 0 }
+    }
+
+    /// Average block width (memory and progress estimates).
+    pub fn avg_w(&self) -> usize {
+        self.n().div_ceil(self.m.max(1)).max(1)
+    }
+
+    /// The layer's code with its H-hat columns (`seed`: the layer's H-hat
+    /// seed; one H-hat per width).
+    pub fn code(&self, seed: &[u8; 32], h: usize) -> Code {
+        let cols = |w: usize| -> Vec<u32> { if w == 0 { Vec::new() } else { packed_cols(&v31_hhat(w, seed, h), w) } };
+        let rm = self.m - self.head;
+        let long = if rm > 0 && self.rest_n % rm != 0 { cols(self.short_w + 1) } else { Vec::new() };
+        Code::new(self.m, self.head, cols(self.head_w), if rm > 0 { self.rest_n } else { 0 }, cols(self.short_w), long)
+            .expect("a layer shape gives a consistent code")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +203,7 @@ pub fn ac_count(grid: &DctGrid) -> usize {
 pub use crate::stego::permute::shuffle_u32;
 
 /// The keyed embedding order: all AC flat indices, permuted.
-pub fn order(grid: &DctGrid, seeds: &V3Seeds) -> Vec<u32> {
+pub fn order(grid: &DctGrid, seeds: &V31Seeds) -> Vec<u32> {
     let mut o = ac_flat_indices(grid);
     shuffle_u32(&mut o, &seeds.perm);
     o
@@ -145,21 +214,50 @@ fn coeff(grid: &DctGrid, fi: u32) -> i16 {
     grid.coeffs()[fi as usize]
 }
 
+/// The keyed pair bit `s` of every coefficient of the Y grid, by flat index:
+/// bit `fi` of the ChaCha20 keystream of the pair seed (byte `fi / 8`, bit
+/// `fi mod 8`). Part of the wire format.
+pub struct PairKey {
+    words: Vec<u64>,
+}
+
+impl PairKey {
+    pub fn new(seed: &[u8; 32], total_coefficients: usize) -> Self {
+        use crate::stego::rng_compat::WordRng;
+        use rand::SeedableRng;
+        // The raw keystream (no `rand` sampler involved; pinned by
+        // `rng_golden_tests`, `ghost_v31_pairs`).
+        let mut bytes = vec![0u8; total_coefficients.div_ceil(64) * 8];
+        WordRng::fill_bytes(&mut rand_chacha::ChaCha20Rng::from_seed(*seed), &mut bytes);
+        Self { words: bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect() }
+    }
+
+    /// `s` of coefficient `fi` (0 or 1).
+    #[inline]
+    pub fn get(&self, fi: u32) -> i16 {
+        ((self.words[fi as usize >> 6] >> (fi & 63)) & 1) as i16
+    }
+}
+
 #[inline]
 pub fn plane1(c: i16) -> u8 {
     (c & 1) as u8
 }
 
+/// Bit plane 2 of a coefficient value `c` with pair bit `s`: `⌊(c + s)/2⌋ mod 2`.
 #[inline]
-pub fn plane2(c: i16) -> u8 {
-    ((c >> 1) & 1) as u8
+pub fn plane2(c: i16, s: i16) -> u8 {
+    // Wrapping: a crafted JPEG can hold |c| = 32767; the wrap moves the sum by
+    // 2^16, which leaves both bits read here unchanged.
+    ((c.wrapping_add(s) >> 1) & 1) as u8
 }
 
 /// The direction (+1/−1) of the ±1 change that also flips P2.
 #[inline]
-fn dir2(c: i16) -> i16 {
-    if c & 1 != 0 { 1 } else { -1 }
+fn dir2(c: i16, s: i16) -> i16 {
+    if c.wrapping_add(s) & 1 != 0 { 1 } else { -1 }
 }
+
 
 /// A set of flat coefficient indices that must not change (positions owned
 /// by shadow layers). One bit per coefficient.
@@ -183,13 +281,60 @@ impl WetMask {
     }
 }
 
+/// Luma blocks of the image itself: `(ceil(Wy / 8), ceil(Hy / 8))` with the
+/// luma plane's own size `ceil(W · h / hmax)` x `ceil(H · v / vmax)` (T.81 A.1.1).
+/// The coefficient grid can be larger: it is padded to whole MCUs.
+pub fn real_luma_blocks(img: &JpegImage) -> (usize, usize) {
+    let fi = img.frame_info();
+    let c = &fi.components[0];
+    let comp = |size: u16, f: u8, max: u8| (size as usize * f as usize).div_ceil(max.max(1) as usize);
+    (
+        comp(fi.width, c.h_sampling, fi.max_h_sampling).div_ceil(8),
+        comp(fi.height, c.v_sampling, fi.max_v_sampling).div_ceil(8),
+    )
+}
+
+/// Every position of the luma blocks outside the image ("dummy" blocks: the
+/// MCU padding of e.g. a 4:2:0 image with an odd block count), or `None` when
+/// there are none. libjpeg writes them with all AC zero (DC copied from the
+/// neighbour), so a non-zero AC there is a deterministic stego tell (Benes,
+/// Harmann & Boehme, "Steganalysis Exploiting JPEG Block Padding", WIFS 2026).
+/// Every encoder treats them as wet: never changed, still read by the
+/// decoder (no wire change). Other encoders may put content there; it is
+/// left untouched as well.
+pub fn dummy_block_wet(img: &JpegImage) -> Option<WetMask> {
+    let grid = img.dct_grid(0);
+    let (bw, bt) = (grid.blocks_wide(), grid.blocks_tall());
+    let (rw, rt) = real_luma_blocks(img);
+    if rw >= bw && rt >= bt {
+        return None;
+    }
+    let mut wet = WetMask::new(grid.coeffs().len());
+    for br in 0..bt {
+        for bc in 0..bw {
+            if br >= rt || bc >= rw {
+                let base = ((br * bw + bc) * 64) as u32;
+                for k in 0..64 {
+                    wet.set(base + k);
+                }
+            }
+        }
+    }
+    Some(wet)
+}
+
+/// [`WetMask::new`] for `img`'s luma grid with the dummy blocks already wet.
+pub fn wet_mask_for(img: &JpegImage) -> WetMask {
+    dummy_block_wet(img).unwrap_or_else(|| WetMask::new(img.dct_grid(0).coeffs().len()))
+}
+
 // ---------------------------------------------------------------------------
 // Costs and the payload split
 // ---------------------------------------------------------------------------
 
 /// What an encode did (quality scoring and measurement).
 #[derive(Debug, Clone, Default)]
-pub struct V3Stats {
+pub struct V31Stats {
     pub n: usize,
     pub m: usize,
     /// Lanes used.
@@ -199,6 +344,8 @@ pub struct V3Stats {
     pub w1: usize,
     pub w2: usize,
     pub changes: usize,
+    /// Changes made by layer 2 (P2 flips); the rest are layer 1's.
+    pub changes2: usize,
     /// Σ ρ of the applied changes (direction-specific cost).
     pub distortion: f64,
     pub median_cost: f32,
@@ -420,9 +567,14 @@ pub(crate) fn share(total: usize, l: usize, k: usize) -> std::ops::Range<usize> 
 }
 
 /// Layer split of a lane's `c` frame bits: layer 1 (P1) carries the first
-/// `c − c/2`, layer 2 (P2) the last `c/2`. Fixed: for J-UNIWARD and
-/// SI-UNIWARD costs the optimal split is 0.50–0.51 (the P2-flipping
-/// direction is a coin flip relative to the cheap direction).
+/// `c − c/2`, layer 2 (P2) the last `c/2`. Fixed (wire). The optimal ternary
+/// embedding puts a share of 0.504–0.510 of the entropy into P2 at
+/// 0.05–0.25 bpnzAC (BOSSbase, Gibbs model), so with a 50/50 split layer 1
+/// makes 2–5 % more changes than layer 2 — but the distortion of the fixed
+/// split is within 0.02 % of the optimal split's (R3.16 measurement,
+/// `ghost-embedding-v3.md`, v3.1). The excess of layer-1 changes was a
+/// directional signature only while the pair structure was fixed (v3); with
+/// keyed pairs ([`PairKey`]) it has none.
 pub fn layer_split(c: usize) -> (usize, usize) {
     (c - c / 2, c / 2)
 }
@@ -430,10 +582,7 @@ pub fn layer_split(c: usize) -> (usize, usize) {
 /// Trellis positions a lane of `nk` positions walks for `bits` frame bits
 /// (both layers; the unit of the lane progress meter).
 fn lane_work(nk: usize, bits: usize) -> usize {
-    let (m1, m2) = layer_split(bits);
-    let w1 = choose_w(nk, m1).unwrap_or(0);
-    let w2 = if m2 > 0 { choose_w(nk, m2).unwrap_or(0) } else { 0 };
-    m1 * w1 + m2 * w2
+    LaneGeom::new(nk, bits).map_or(0, |g| g.n1() + g.n2())
 }
 
 /// Working memory of one lane: per position the flip map (1 B), one layer's
@@ -441,19 +590,23 @@ fn lane_work(nk: usize, bits: usize) -> usize {
 /// trellis plan (1 B) — 8 B with slack — plus the trellis back pointers
 /// (in-memory table, or tail / segment buffers + checkpoints).
 pub fn lane_bytes(nk: usize, bits: usize, h: usize, inline_limit: usize, threads: usize) -> usize {
-    let (m1, m2) = layer_split(bits);
-    let w1 = choose_w(nk, m1).unwrap_or(1);
-    let w2 = if m2 > 0 { choose_w(nk, m2).unwrap_or(1) } else { 1 };
-    let trellis = trellis::working_bytes(m1 * w1, w1, h, inline_limit, threads)
-        .max(trellis::working_bytes(m2 * w2, w2, h, inline_limit, threads));
+    let trellis = match LaneGeom::new(nk, bits) {
+        Ok(g) => [g.s1, g.s2]
+            .iter()
+            .flatten()
+            .map(|s| trellis::working_bytes(s.n(), s.avg_w(), h, inline_limit, threads))
+            .max()
+            .unwrap_or(0),
+        Err(_) => trellis::working_bytes(nk, 1, h, inline_limit, threads),
+    };
     nk * 8 + trellis
 }
 
 /// Encoder knobs that do not change the output.
 #[derive(Clone, Debug)]
 pub struct EncodeOpts {
-    /// STC constraint height ([`V3_STC_H`]; other values only for measurement:
-    /// the decoder reads `V3_STC_H`).
+    /// STC constraint height ([`V31_STC_H`]; other values only for measurement:
+    /// the decoder reads `V31_STC_H`).
     pub h: usize,
     /// Lanes planned at the same time (at most the workers; memory:
     /// [`lane_bytes`] each).
@@ -474,7 +627,7 @@ pub struct EncodeOpts {
 impl Default for EncodeOpts {
     fn default() -> Self {
         Self {
-            h: V3_STC_H,
+            h: V31_STC_H,
             parallel_lanes: usize::MAX,
             lane_inline_bytes: crate::stego::memory::LANE_INLINE_BYTES,
             group_positions: usize::MAX,
@@ -581,6 +734,8 @@ pub(crate) struct LanePlan {
     distortion: f64,
     w1: usize,
     w2: usize,
+    /// Changes made by layer 2 (P2 flips).
+    changes2: usize,
 }
 
 /// A lane's position costs: aligned with its slice of the order (the cost
@@ -609,19 +764,22 @@ pub(crate) struct LaneInput<'a> {
     pub(crate) si: Option<&'a SideInfo>,
     pub(crate) ord: &'a [u32],
     pub(crate) rho: Rho<'a>,
+    /// The pair bits `s` (by flat index).
+    pub(crate) pairs: &'a PairKey,
     /// Every position's value and `(a, b)` up to the cache's length, read
     /// once (the split encode's coordinator; `LaneCache`).
     pub(crate) cache: Option<&'a LaneCache>,
 }
 
-/// A lane's values and `(a, b)` costs, gathered in one pass: the layer
-/// inputs and the lane's changes then read them in order instead of each
-/// gathering every position from the grid, the costs and the side
+/// A lane's values, pair bits and `(a, b)` costs, gathered in one pass: the
+/// layer inputs and the lane's changes then read them in order instead of
+/// each gathering every position from the grid, the costs and the side
 /// information again (random access; on WASM the coordinator's three such
-/// passes paced the helpers). 10 B per position. Same values as
+/// passes paced the helpers). 11 B per position. Same values as
 /// [`LaneInput`] computes, so the same plan.
 pub(crate) struct LaneCache {
     vals: Vec<i16>,
+    pairs: Vec<u8>,
     a: Vec<f32>,
     b: Vec<f32>,
 }
@@ -630,15 +788,17 @@ impl LaneCache {
     /// The first `len` positions of `inp`'s lane.
     pub(crate) fn build(inp: &LaneInput<'_>, len: usize) -> Self {
         let mut vals = Vec::with_capacity(len);
+        let mut pairs = Vec::with_capacity(len);
         let mut a = Vec::with_capacity(len);
         let mut b = Vec::with_capacity(len);
         for_each_index(len, |i| {
             vals.push(inp.value(i));
+            pairs.push(inp.pair(i) as u8);
             let (x, y) = inp.ab(i);
             a.push(x);
             b.push(y);
         });
-        Self { vals, a, b }
+        Self { vals, pairs, a, b }
     }
 }
 
@@ -677,6 +837,17 @@ impl LaneInput<'_> {
         value(self.grid, self.overlay, self.ord[i])
     }
 
+    /// The pair bit `s` of position `i`.
+    #[inline]
+    fn pair(&self, i: usize) -> i16 {
+        if let Some(c) = self.cache
+            && i < c.pairs.len()
+        {
+            return c.pairs[i] as i16;
+        }
+        self.pairs.get(self.ord[i])
+    }
+
     /// `(a, b)`: the cost of the P2-flipping direction, of the other one.
     #[inline]
     fn ab(&self, i: usize) -> (f32, f32) {
@@ -695,35 +866,44 @@ impl LaneInput<'_> {
             Rho::Flat(r) => r[fi as usize],
         };
         let (rp, rm) = pm_costs(rho, c, si_term(self.si, fi as usize));
-        if dir2(c) > 0 { (rp, rm) } else { (rm, rp) }
+        if dir2(c, self.pairs.get(fi)) > 0 { (rp, rm) } else { (rm, rp) }
     }
 }
 
-/// A lane's layer split and widths.
+/// A lane's layer split and layer shapes.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct LaneGeom {
+pub struct LaneGeom {
     pub(crate) nk: usize,
     pub(crate) m1: usize,
     pub(crate) m2: usize,
-    pub(crate) w1: usize,
-    pub(crate) w2: usize,
+    pub(crate) s1: Option<LayerShape>,
+    pub(crate) s2: Option<LayerShape>,
 }
 
 impl LaneGeom {
-    pub(crate) fn new(nk: usize, bits: usize) -> Result<Self, StegoError> {
+    pub fn new(nk: usize, bits: usize) -> Result<Self, StegoError> {
         let (m1, m2) = layer_split(bits);
-        let w1 = choose_w(nk, m1).ok_or(StegoError::MessageTooLarge)?;
-        let w2 = if m2 > 0 { choose_w(nk, m2).ok_or(StegoError::MessageTooLarge)? } else { 0 };
-        Ok(Self { nk, m1, m2, w1, w2 })
+        let s1 = Some(LayerShape::new(nk, m1).ok_or(StegoError::MessageTooLarge)?);
+        let s2 = if m2 > 0 { Some(LayerShape::new(nk, m2).ok_or(StegoError::MessageTooLarge)?) } else { None };
+        Ok(Self { nk, m1, m2, s1, s2 })
     }
 
     /// Positions the layer-1 / layer-2 trellis walks.
     pub(crate) fn n1(&self) -> usize {
-        self.m1 * self.w1
+        self.s1.map_or(0, |s| s.n())
     }
 
     pub(crate) fn n2(&self) -> usize {
-        self.m2 * self.w2
+        self.s2.map_or(0, |s| s.n())
+    }
+
+    /// Header (ladder) width of layer 1 / layer 2 (statistics).
+    pub(crate) fn w1(&self) -> usize {
+        self.s1.map_or(0, |s| s.head_w)
+    }
+
+    pub(crate) fn w2(&self) -> usize {
+        self.s2.map_or(0, |s| s.head_w)
     }
 }
 
@@ -745,7 +925,7 @@ fn layer2_input_into(inp: &LaneInput<'_>, g: &LaneGeom, lam: f64, cover2: &mut V
     cover2.reserve(n2);
     cost2.reserve(n2);
     for_each_index(n2, |i| {
-        cover2.push(plane2(inp.value(i)));
+        cover2.push(plane2(inp.value(i), inp.pair(i)));
         let (a, b) = inp.ab(i);
         cost2.push(if !a.is_finite() {
             f32::INFINITY
@@ -797,23 +977,24 @@ fn layer1_input_into(inp: &LaneInput<'_>, g: &LaneGeom, flip2: &[bool], cover1: 
 /// The lane's changes from its planned layers.
 pub(crate) fn lane_plan(inp: &LaneInput<'_>, g: &LaneGeom, flip2: &[bool], cover1: &[u8], stego1: &[u8]) -> LanePlan {
     let n1 = g.n1();
-    let mut plan = LanePlan { changes: Vec::new(), distortion: 0.0, w1: g.w1, w2: g.w2 };
+    let mut plan = LanePlan { changes: Vec::new(), distortion: 0.0, w1: g.w1(), w2: g.w2(), changes2: 0 };
     for_each_index(g.nk.min(n1.max(g.n2())), |i| {
         if flip2[i] {
             plan.distortion += inp.ab(i).0 as f64;
-            plan.changes.push((i as u32, dir2(inp.value(i))));
+            plan.changes.push((i as u32, dir2(inp.value(i), inp.pair(i))));
+            plan.changes2 += 1;
         } else if i < n1 && stego1[i] != cover1[i] {
             plan.distortion += inp.ab(i).1 as f64;
-            plan.changes.push((i as u32, -dir2(inp.value(i))));
+            plan.changes.push((i as u32, -dir2(inp.value(i), inp.pair(i))));
         }
     });
     plan
 }
 
-/// The packed H-hat columns of layer 1 / layer 2 at width `w`.
-pub(crate) fn layer_cols(seeds: &V3Seeds, layer: u8, w: usize, h: usize) -> Vec<u32> {
-    let seed = if layer == 1 { &seeds.hhat1 } else { &seeds.hhat2 };
-    packed_cols(&v3_hhat(w, seed, h), w)
+/// The code of layer 1 / layer 2 of a lane.
+pub fn layer_code(seeds: &V31Seeds, layer: u8, g: &LaneGeom, h: usize) -> Code {
+    let (seed, shape) = if layer == 1 { (&seeds.hhat1, g.s1) } else { (&seeds.hhat2, g.s2) };
+    shape.expect("the layer exists").code(seed, h)
 }
 
 /// Plan one lane: layer 2 (P2) then layer 1 (P1).
@@ -849,7 +1030,7 @@ fn plan_lane(
     inp: &LaneInput<'_>,
     bits: &[u8],
     lam: f64,
-    seeds: &V3Seeds,
+    seeds: &V31Seeds,
     opts: &EncodeOpts,
     inline: usize,
     threads: usize,
@@ -866,8 +1047,8 @@ fn plan_lane(
     let (mut cover, mut cost) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
     let r2 = if g.m2 > 0 {
         layer2_input_into(inp, &g, lam, &mut cover, &mut cost);
-        let cols2 = layer_cols(seeds, 2, g.w2, h);
-        Some(trellis::embed(&cover, &cost, l2, &cols2, h, inline, threads, &tick)?.ok_or(StegoError::MessageTooLarge)?)
+        let code2 = layer_code(seeds, 2, &g, h);
+        Some(trellis::embed_code(&cover, &cost, l2, &code2, h, inline, threads, &tick)?.ok_or(StegoError::MessageTooLarge)?)
     } else {
         None
     };
@@ -879,8 +1060,8 @@ fn plan_lane(
         }
     }
     layer1_input_into(inp, &g, &flip2, &mut cover, &mut cost);
-    let cols1 = layer_cols(seeds, 1, g.w1, h);
-    let r1 = trellis::embed(&cover, &cost, l1, &cols1, h, inline, threads, &tick)?
+    let code1 = layer_code(seeds, 1, &g, h);
+    let r1 = trellis::embed_code(&cover, &cost, l1, &code1, h, inline, threads, &tick)?
         .ok_or(StegoError::MessageTooLarge)?;
     Ok(lane_plan(inp, &g, &flip2, &cover, &r1.stego_bits))
 }
@@ -907,6 +1088,7 @@ pub(crate) fn sample_stats(
     overlay: Option<&Overlay>,
     wet: Option<&WetMask>,
     si: Option<&SideInfo>,
+    pairs: &PairKey,
 ) -> (f64, f32, Vec<(f64, f64)>) {
     let n = ord.len();
     // Sample costs → (a, b) pairs exactly as the lanes form them.
@@ -917,7 +1099,7 @@ pub(crate) fn sample_stats(
         }
         let c = value(grid, overlay, fi);
         let (rp, rm) = pm_costs(rho, c, si_term(si, fi as usize));
-        if dir2(c) > 0 { (rp, rm) } else { (rm, rp) }
+        if dir2(c, pairs.get(fi)) > 0 { (rp, rm) } else { (rm, rp) }
     };
     let mut median_cost = 0.0;
     let mut med: Vec<f32> = samples[..n_med]
@@ -957,10 +1139,10 @@ pub(crate) fn assemble(
     median_cost: f32,
     sample_ab: &[(f64, f64)],
     bound: bool,
-) -> V3Plan {
+) -> V31Plan {
     let n = ord.len();
     let l = plans.len();
-    let mut stats = V3Stats { n, m, median_cost, lanes: l, ..Default::default() };
+    let mut stats = V31Stats { n, m, median_cost, lanes: l, ..Default::default() };
     if bound {
         stats.bound_distortion = bound_distortion(sample_ab, n, m);
     }
@@ -977,23 +1159,26 @@ pub(crate) fn assemble(
             changes.push((fi, value(grid, overlay, fi) + d));
         }
         stats.changes += changes.len() - stats.changes;
+        stats.changes2 += p.changes2;
         stats.distortion += p.distortion;
     }
-    V3Plan { stats, changes }
+    V31Plan { stats, changes }
 }
 
 /// A planned embedding: statistics and the new value of every changed
 /// coefficient (`(flat index, value)`, values relative to the overlay).
-pub struct V3Plan {
-    pub stats: V3Stats,
+pub struct V31Plan {
+    pub stats: V31Stats,
     pub changes: Vec<(u32, i16)>,
 }
 
 /// Plan the embedding of `frame_bits` into the Y channel of `cover` (read
 /// only; costs are always the cover's).
 ///
-/// `wet`: positions owned by shadow layers (never changed; the primary's
-/// order skips nothing, their bits are simply not the primary's to set).
+/// `wet`: positions owned by shadow layers and the dummy blocks (never
+/// changed; the primary's order skips nothing, their bits are simply not the
+/// primary's to set). Build it with [`wet_mask_for`]; `None` = the dummy
+/// blocks only.
 /// `overlay`: values of those layers not yet written into `cover`.
 /// The plan is independent of `opts.parallel_lanes`, `opts.lane_inline_bytes`,
 /// `opts.group_positions` and `opts.progress_steps`.
@@ -1005,12 +1190,17 @@ pub fn plan(
     wet: Option<&WetMask>,
     overlay: Option<&Overlay>,
     opts: &EncodeOpts,
-) -> Result<V3Plan, StegoError> {
+) -> Result<V31Plan, StegoError> {
     let t = tstart();
-    let seeds = v3_seeds(structural_key);
+    // Callers that pass a mask build it with `wet_mask_for` (dummy blocks
+    // included); without one, the dummy blocks are the only wet positions.
+    let dummies = if wet.is_none() { dummy_block_wet(cover) } else { None };
+    let wet = wet.or(dummies.as_ref());
+    let seeds = v31_seeds(structural_key);
     let grid = cover.dct_grid(0);
     let ord = order(grid, &seeds);
     tlog("order", t);
+    let pairs = PairKey::new(&seeds.pair, grid.coeffs().len());
     let n = ord.len();
     let m = frame_bits.len();
     if m == 0 || m > n {
@@ -1060,7 +1250,7 @@ pub fn plan(
             // Same values as the gather, so the same plan.
             let dense = crate::stego::cost::uniward::dense_ac_costs(grid, luma_qt(cover)?)?;
             let tail: Vec<f32> = samples.iter().map(|&k| dense[ord[k] as usize]).collect();
-            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si);
+            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si, &pairs);
             tlog("lambda", t);
             GroupCosts::Flat(dense)
         } else if g == 0 {
@@ -1073,7 +1263,7 @@ pub fn plan(
             )?;
             drop(sample_fis);
             let tail = all.split_off(r.len());
-            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si);
+            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si, &pairs);
             tlog("lambda", t);
             GroupCosts::Lane(all)
         } else {
@@ -1096,6 +1286,7 @@ pub fn plan(
                     GroupCosts::Lane(v) => Rho::Lane(&v[lr.start - r.start..lr.end - r.start]),
                     GroupCosts::Flat(d) => Rho::Flat(d),
                 },
+                pairs: &pairs,
                 cache: None,
             };
             let threads = lane_threads(nb, workers);
@@ -1130,7 +1321,7 @@ pub fn encode(
     structural_key: &[u8; 64],
     si: Option<&SideInfo>,
     opts: &EncodeOpts,
-) -> Result<V3Stats, StegoError> {
+) -> Result<V31Stats, StegoError> {
     let p = plan(img, frame_bits, structural_key, si, None, None, opts)?;
     let coeffs = img.dct_grid_mut(0).coeffs_mut();
     for &(fi, v) in &p.changes {
@@ -1219,28 +1410,13 @@ fn frame_bits_from_prefix(fb: &[u8]) -> Option<usize> {
     None
 }
 
-/// `stc_extract_prefix` over the bit-packed positions `[start, start + len)`
-/// of `words`: the first `k` syndrome bits.
-fn extract_bits(words: &[u64], start: usize, len: usize, hh: &[Vec<u32>], w: usize, k: usize) -> Vec<u8> {
-    if w == 0 || k == 0 {
-        return Vec::new();
-    }
-    let cols = packed_cols(hh, w);
-    let max_i = k.min(len.div_ceil(w));
-    let mut out = Vec::with_capacity(max_i);
-    let mut state = 0u32;
-    for i in 0..max_i {
-        let a = start + i * w;
-        let b = (a + w).min(start + len);
-        for (c, j) in (a..b).enumerate() {
-            if (words[j >> 6] >> (j & 63)) & 1 != 0 {
-                state ^= cols[c];
-            }
-        }
-        out.push((state & 1) as u8);
-        state >>= 1;
-    }
-    out
+/// The first `k` syndrome bits of `code` over the bit-packed positions from
+/// `start` of `words`.
+fn extract_code(words: &[u64], start: usize, code: &Code, k: usize) -> Vec<u8> {
+    trellis::syndrome_prefix(code, k, |j| {
+        let j = start + j;
+        (words[j >> 6] >> (j & 63)) & 1 != 0
+    })
 }
 
 /// Smallest frame the encoder writes (bits): overhead + 1 byte.
@@ -1267,47 +1443,65 @@ fn lane_m_range(n: usize, l: usize) -> Option<(usize, usize)> {
     (lo <= hi && lo <= n && lanes(n, lo) == l).then_some((lo, hi.min(n)))
 }
 
-/// Try to decode a v3 primary. `None` = no v3 frame found for this
-/// passphrase (the caller then tries v1); `Some(Err(DecryptionFailed))` = a
-/// v3 frame with a valid CRC whose ciphertext did not authenticate.
+/// The bit planes a Ghost decode reads along the keyed order (shared by v3.1
+/// and v3), one bit per position.
+pub struct DecodePlanes {
+    pub n: usize,
+    /// `c mod 2` (both generations).
+    pub p1: Vec<u64>,
+    /// v3.1's `⌊(c + s)/2⌋ mod 2`.
+    pub p2: Vec<u64>,
+    /// v3's `⌊c/2⌋ mod 2` (`v3_legacy`).
+    pub p2_v3: Vec<u64>,
+}
+
+/// The planes of `img` along the keyed order of `structural_key`: one
+/// shuffle (the order itself, 4 B per position, is dropped at once).
+pub fn decode_planes(img: &JpegImage, structural_key: &[u8; 64]) -> DecodePlanes {
+    let seeds = v31_seeds(structural_key);
+    // The order is v3's (shared on purpose, see the module docs).
+    debug_assert_eq!(seeds.perm, super::v3_legacy::perm_seed(structural_key));
+    let grid = img.dct_grid(0);
+    let ord = order(grid, &seeds);
+    let pairs = PairKey::new(&seeds.pair, grid.coeffs().len());
+    let n = ord.len();
+    let mut p1 = vec![0u64; n.div_ceil(64)];
+    let mut p2 = vec![0u64; n.div_ceil(64)];
+    let mut p2_v3 = vec![0u64; n.div_ceil(64)];
+    for (i, &fi) in ord.iter().enumerate() {
+        let c = coeff(grid, fi);
+        p1[i >> 6] |= (plane1(c) as u64) << (i & 63);
+        p2[i >> 6] |= (plane2(c, pairs.get(fi)) as u64) << (i & 63);
+        p2_v3[i >> 6] |= (super::v3_legacy::plane2(c) as u64) << (i & 63);
+    }
+    DecodePlanes { n, p1, p2, p2_v3 }
+}
+
+/// Try to decode a v3.1 primary from its planes. `None` = no v3.1 frame
+/// found for this passphrase; `Some(Err(DecryptionFailed))` = a v3.1 frame
+/// with a valid CRC whose ciphertext did not authenticate.
 ///
 /// Search: for each lane count `l` the cover admits, and each ladder width
-/// `w` lane 0's layer 1 can have with `l` lanes (from the interval of frame
-/// sizes that give `l` lanes), read lane 0's first 48 layer-1 syndrome bits
-/// (the frame header) and accept the candidate only if the announced frame
-/// length gives back exactly `l` lanes and width `w`. Everything else is
-/// then determined.
-pub fn decode(
-    img: &JpegImage,
+/// `w` lane 0's layer-1 header can have with `l` lanes (from the interval of
+/// frame sizes that give `l` lanes), read lane 0's first 48 layer-1 syndrome
+/// bits (the frame header, in the code's 48 header blocks of width `w`) and
+/// accept the candidate only if the announced frame length gives back
+/// exactly `l` lanes and header width `w`. Everything else is then
+/// determined.
+pub fn decode_v31(
+    planes: &DecodePlanes,
     passphrase: &str,
     structural_key: &[u8; 64],
-    parse_and_decrypt: impl Fn(&[u8], &str) -> Result<PayloadData, StegoError>,
+    parse_and_decrypt: &dyn Fn(&[u8], &str) -> Result<PayloadData, StegoError>,
 ) -> Option<Result<PayloadData, StegoError>> {
-    if img.num_components() == 0 {
-        return None;
-    }
-    let t = tstart();
-    let seeds = v3_seeds(structural_key);
-    let h = V3_STC_H;
-    let grid = img.dct_grid(0);
-    // The two bit planes along the order, one bit per position; the order
-    // itself (4 B per position) is dropped right after.
-    let (p1, p2, n) = {
-        let ord = order(grid, &seeds);
-        let n = ord.len();
-        let mut p1 = vec![0u64; n.div_ceil(64)];
-        let mut p2 = vec![0u64; n.div_ceil(64)];
-        for (i, &fi) in ord.iter().enumerate() {
-            let c = coeff(grid, fi);
-            p1[i >> 6] |= (plane1(c) as u64) << (i & 63);
-            p2[i >> 6] |= (plane2(c) as u64) << (i & 63);
-        }
-        (p1, p2, n)
-    };
+    let n = planes.n;
     if n == 0 {
         return None;
     }
-    tlog("dec order+planes", t);
+    let t = tstart();
+    let seeds = v31_seeds(structural_key);
+    let h = V31_STC_H;
+    let (p1, p2) = (&planes.p1, &planes.p2);
     let mut saw_decrypt_fail = false;
     let l_max = (n / LANE_POSITIONS).clamp(1, MAX_LANES);
     for l in 1..=l_max {
@@ -1319,29 +1513,17 @@ pub fn decode(
             continue;
         };
         for w in ladder().skip_while(|&w| w < w_min).take_while(|&w| w <= w_max) {
-            if n0 / w < 16 {
+            if n0 / w < HEADER_BLOCKS {
                 break;
             }
-            let hh1 = v3_hhat(w, &seeds.hhat1, h);
-            let lim = (n0 / w) * w;
-            let pre = extract_bits(&p1, r0.start, lim, &hh1, w, 48.min(n0 / w));
-            let m = if pre.len() >= 48 {
-                match frame_bits_from_prefix(&pre) {
-                    Some(m) => m,
-                    None => continue,
-                }
-            } else {
-                let v1 = bits_to_usize(&pre[..16]);
-                if v1 == 0 {
-                    continue;
-                }
-                (frame::FRAME_OVERHEAD + v1) * 8
-            };
+            let head = Code::uniform(&packed_cols(&v31_hhat(w, &seeds.hhat1, h), w), HEADER_BLOCKS);
+            let pre = extract_code(p1, r0.start, &head, HEADER_BLOCKS);
+            let Some(m) = frame_bits_from_prefix(&pre) else { continue };
             if m > n || lanes(n, m) != l {
                 continue;
             }
             let (m1_0, _) = layer_split(share(m, l, 0).len());
-            if choose_w(n0, m1_0) != Some(w) {
+            if LayerShape::new(n0, m1_0).map(|s| (s.head, s.head_w)) != Some((HEADER_BLOCKS, w)) {
                 continue;
             }
             // Candidate accepted: read every lane.
@@ -1349,19 +1531,13 @@ pub fn decode(
             let mut ok = true;
             for k in 0..l {
                 let rk = share(n, l, k);
-                let nk = rk.len();
-                let (m1, m2) = layer_split(share(m, l, k).len());
-                let w1 = choose_w(nk, m1);
-                let w2 = if m2 > 0 { choose_w(nk, m2) } else { Some(0) };
-                let (Some(w1), Some(w2)) = (w1, w2) else {
+                let Ok(g) = LaneGeom::new(rk.len(), share(m, l, k).len()) else {
                     ok = false;
                     break;
                 };
-                let hh1k = v3_hhat(w1, &seeds.hhat1, h);
-                fbits.extend(extract_bits(&p1, rk.start, m1 * w1, &hh1k, w1, m1));
-                if m2 > 0 {
-                    let hh2k = v3_hhat(w2, &seeds.hhat2, h);
-                    fbits.extend(extract_bits(&p2, rk.start, m2 * w2, &hh2k, w2, m2));
+                fbits.extend(extract_code(p1, rk.start, &layer_code(&seeds, 1, &g, h), g.m1));
+                if g.m2 > 0 {
+                    fbits.extend(extract_code(p2, rk.start, &layer_code(&seeds, 2, &g, h), g.m2));
                 }
             }
             if !ok {
@@ -1380,6 +1556,36 @@ pub fn decode(
     if saw_decrypt_fail { Some(Err(StegoError::DecryptionFailed)) } else { None }
 }
 
+/// Decode a Ghost primary of the generations that share the keyed order —
+/// v3.1, then v3 ([`super::v3_legacy`], decode-only) — from one shuffle.
+/// `None` = neither found a frame for this passphrase (the caller then tries
+/// v1); `Some(Err(DecryptionFailed))` = a frame with a valid CRC whose
+/// ciphertext did not authenticate (and no success).
+pub fn decode_all(
+    img: &JpegImage,
+    passphrase: &str,
+    structural_key: &[u8; 64],
+    parse_and_decrypt: &dyn Fn(&[u8], &str) -> Result<PayloadData, StegoError>,
+) -> Option<Result<PayloadData, StegoError>> {
+    if img.num_components() == 0 {
+        return None;
+    }
+    let t = tstart();
+    let planes = decode_planes(img, structural_key);
+    tlog("dec order+planes", t);
+    let mut fail = None;
+    match decode_v31(&planes, passphrase, structural_key, parse_and_decrypt) {
+        Some(Ok(p)) => return Some(Ok(p)),
+        Some(Err(e)) => fail = Some(Err(e)),
+        None => {}
+    }
+    match super::v3_legacy::decode_planes(&planes.p1, &planes.p2_v3, planes.n, passphrase, structural_key, parse_and_decrypt) {
+        Some(Ok(p)) => Some(Ok(p)),
+        Some(Err(e)) => Some(Err(e)),
+        None => fail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1596,73 @@ mod tests {
         let stride = (ab.len() / LAMBDA_SAMPLES).max(1);
         let sample: Vec<(f64, f64)> = ab.iter().step_by(stride).map(|&(a, b)| (a as f64, b as f64)).collect();
         bound_distortion(&sample, n, m)
+    }
+
+    /// A smooth 4:2:0 cover with an odd luma block count both ways
+    /// (648x488: 81x61 real blocks in an 82x62 MCU grid): on such content the
+    /// dummy blocks' costs equal the real ones, and before 2026-11-02 v3 wrote
+    /// non-zero AC into them (fix list 2.10). Every encode path, at the bands'
+    /// maximum, must leave them exactly as the cover had them.
+    #[test]
+    fn dummy_blocks_untouched_at_max_payload() {
+        use crate::stego::payload::compressed_payload_size;
+        use crate::stego::{deep_cover_jpeg, ghost_bands, ghost_bands_si, ShadowLayer};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
+        let (w, h) = (648u32, 488u32);
+        let mut px = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                // A soft diagonal gradient with a faint ripple (no texture).
+                let r = (x * 3 / 4 + y / 3) as f32 + 2.0 * ((x as f32) / 37.0).sin();
+                px.push(r.clamp(0.0, 255.0) as u8);
+                px.push((40 + x / 6 + y * 3 / 8) as u8);
+                px.push((200 - y / 4) as u8);
+            }
+        }
+        let cover = deep_cover_jpeg(&px, w, h, 92).unwrap();
+        let cimg = JpegImage::from_bytes(&cover).unwrap();
+        let dummies = dummy_block_wet(&cimg).expect("odd block counts give dummy blocks");
+        assert_eq!(real_luma_blocks(&cimg), (81, 61));
+        let n = cimg.dct_grid(0).coeffs().len();
+        let dummy_pos: Vec<usize> = (0..n).filter(|&i| dummies.get(i as u32)).collect();
+        assert_eq!(dummy_pos.len(), (82 * 62 - 81 * 61) * 64);
+
+        // The longest random text whose compressed payload fits `max`.
+        let msg_for = |max: usize| -> String {
+            let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(max as u64);
+            let all: String = (0..max * 2).map(|_| (b'a' + rng.gen_range08(0..26u8)) as char).collect();
+            let (mut lo, mut hi) = (0usize, all.len());
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if compressed_payload_size(&all[..mid], &[]) <= max { lo = mid } else { hi = mid - 1 }
+            }
+            all[..lo].to_string()
+        };
+        let check = |what: &str, stego: &[u8], pass: &str, msg: &str| {
+            let simg = JpegImage::from_bytes(stego).unwrap();
+            let (c, s) = (cimg.dct_grid(0).coeffs(), simg.dct_grid(0).coeffs());
+            let changed = dummy_pos.iter().filter(|&&i| c[i] != s[i]).count();
+            assert_eq!(changed, 0, "{what}: {changed} dummy-block coefficients changed");
+            assert_eq!(crate::stego::ghost_decode(stego, pass).unwrap().text, msg, "{what}");
+        };
+        let _seed = crate::stego::crypto::DeterministicSeedGuard::set("2102");
+
+        let plain_msg = msg_for(ghost_bands(&cimg, 0, 0).unwrap().max_bytes);
+        check("plain", &crate::stego::ghost_encode(&cover, &plain_msg, "pw").unwrap(), "pw", &plain_msg);
+
+        let si_msg = msg_for(ghost_bands_si(&cimg, &px, w, h, 0, 0).unwrap().max_bytes);
+        check("deep cover", &crate::stego::ghost_encode_si(&cover, &px, w, h, &si_msg, "pw").unwrap(), "pw", &si_msg);
+
+        let (split, _, _) =
+            crate::stego::run_split_encode_locally(&cover, &si_msg, &[], "pw", Some((&px, w, h)), 3, None).unwrap();
+        check("split session", &split, "pw", &si_msg);
+
+        let shadow = ShadowLayer { message: "shadow".into(), passphrase: "other".into(), files: vec![] };
+        let sh_msg = msg_for(ghost_bands(&cimg, 1, 6).unwrap().max_bytes);
+        let with = crate::stego::ghost_encode_with_shadows(&cover, &sh_msg, &[], "pw", &[shadow], None).unwrap();
+        check("shadows", &with, "pw", &sh_msg);
+        assert_eq!(crate::stego::ghost_shadow_decode(&with, "other").unwrap().text, "shadow");
     }
 
     #[test]
@@ -1420,16 +1693,55 @@ mod tests {
 
     #[test]
     fn planes_and_direction() {
-        for c in -50i16..=50 {
-            let up = c + 1;
-            let dn = c - 1;
-            assert_ne!(plane1(c), plane1(up));
-            assert_ne!(plane1(c), plane1(dn));
-            let flips_up = plane2(c) != plane2(up);
-            let flips_dn = plane2(c) != plane2(dn);
-            assert!(flips_up ^ flips_dn, "c={c}");
-            assert_eq!(dir2(c) > 0, flips_up, "c={c}");
+        for s in 0..2i16 {
+            for c in (-1023i16..=1023).filter(|c| c.abs() <= 50 || c.abs() >= 1020) {
+                let up = c + 1;
+                let dn = c - 1;
+                assert_ne!(plane1(c), plane1(up));
+                assert_ne!(plane1(c), plane1(dn));
+                let flips_up = plane2(c, s) != plane2(up, s);
+                let flips_dn = plane2(c, s) != plane2(dn, s);
+                assert!(flips_up ^ flips_dn, "c={c} s={s}");
+                assert_eq!(dir2(c, s) > 0, flips_up, "c={c} s={s}");
+            }
         }
+        // s = 0 is v3's plane 2; s = 1 shifts the pairs by one.
+        for c in -50i16..=50 {
+            assert_eq!(plane2(c, 0), crate::stego::ghost::v3_legacy::plane2(c));
+            assert_eq!(plane2(c, 1), crate::stego::ghost::v3_legacy::plane2(c + 1));
+        }
+    }
+
+    /// Crafted JPEGs can carry |c| up to 32767 (magnitude category 15): the
+    /// pair bits must not overflow and must match the exact i32 arithmetic.
+    #[test]
+    fn plane2_extreme_coefficients() {
+        for s in 0..2i16 {
+            for c in [i16::MIN, i16::MIN + 1, -32766, 32766, i16::MAX] {
+                let exact = (((c as i32 + s as i32) >> 1) & 1) as u8;
+                assert_eq!(plane2(c, s), exact, "c={c} s={s}");
+                let odd = (c as i32 + s as i32) & 1 != 0;
+                assert_eq!(dir2(c, s) > 0, odd, "c={c} s={s}");
+            }
+        }
+    }
+
+    /// The keyed pair bits are balanced and differ between keys.
+    #[test]
+    fn pair_key_is_balanced() {
+        let a = PairKey::new(&[1u8; 32], 1 << 20);
+        let b = PairKey::new(&[2u8; 32], 1 << 20);
+        let ones = (0..1u32 << 20).filter(|&fi| a.get(fi) == 1).count();
+        assert!((ones as f64 / (1 << 20) as f64 - 0.5).abs() < 0.005, "{ones}");
+        let same = (0..1u32 << 20).filter(|&fi| a.get(fi) == b.get(fi)).count();
+        assert!((same as f64 / (1 << 20) as f64 - 0.5).abs() < 0.005, "{same}");
+    }
+
+    /// v3.1 reads its order from v3's seed (one shuffle decodes both).
+    #[test]
+    fn order_is_shared_with_v3() {
+        let key = [0x5au8; 64];
+        assert_eq!(v31_seeds(&key).perm, crate::stego::ghost::v3_legacy::perm_seed(&key));
     }
 
     /// Diagnostic: STC distortion vs the binary bound on synthetic profiles.
@@ -1437,7 +1749,8 @@ mod tests {
     #[test]
     #[ignore]
     fn stc_coding_loss() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(1);
         let n = 200_000usize;
         for profile in ["constant", "uniform", "lognormal"] {
@@ -1445,22 +1758,22 @@ mod tests {
                 let m = n / inv_alpha;
                 let costs: Vec<f32> = (0..n)
                     .map(|i| match profile {
-                        "uniform" => rng.r#gen::<f32>() + 1e-3,
+                        "uniform" => rng.gen08::<f32>() + 1e-3,
                         "constant" => 1.0,
                         "square" => {
                             let x = (i as f32 + 1.0) / n as f32;
                             x * x
                         }
-                        _ => (rng.r#gen::<f32>() * 8.0).exp(),
+                        _ => (rng.gen08::<f32>() * 8.0).exp(),
                     })
                     .collect();
-                let cover: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
-                let msg: Vec<u8> = (0..m).map(|_| rng.r#gen::<u8>() & 1).collect();
+                let cover: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
+                let msg: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
                 let w = n / m;
-                let hh = hhat::generate_hhat(V3_STC_H, w, &[3u8; 32]);
-                let r = embed::stc_embed(&cover, &costs, &msg, &hh, V3_STC_H, w).unwrap();
-                let hh_e = hhat::generate_hhat_end_set(V3_STC_H, w, &[3u8; 32]);
-                let re = embed::stc_embed(&cover, &costs, &msg, &hh_e, V3_STC_H, w).unwrap();
+                let hh = hhat::generate_hhat(V31_STC_H, w, &[3u8; 32]);
+                let r = embed::stc_embed(&cover, &costs, &msg, &hh, V31_STC_H, w).unwrap();
+                let hh_e = hhat::generate_hhat_end_set(V31_STC_H, w, &[3u8; 32]);
+                let re = embed::stc_embed(&cover, &costs, &msg, &hh_e, V31_STC_H, w).unwrap();
                 assert_eq!(extract::stc_extract_prefix(&r.stego_bits, &hh, w, m), msg);
                 let ab: Vec<(f32, f32)> = costs.iter().map(|&c| (c, f32::INFINITY)).collect();
                 let b = bound_of(&ab, n, m);
@@ -1474,7 +1787,8 @@ mod tests {
     #[test]
     #[ignore]
     fn hhat_search() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let n = 60_000usize;
         let ws: Vec<usize> = std::env::var("HHAT_WS")
             .ok()
@@ -1485,9 +1799,9 @@ mod tests {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(99);
         let loads: Vec<(Vec<u8>, Vec<f32>, Vec<u8>)> = (0..3)
             .map(|_| {
-                let costs: Vec<f32> = (0..n).map(|_| rng.r#gen::<f32>() + 1e-3).collect();
-                let cover: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
-                let msg: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
+                let costs: Vec<f32> = (0..n).map(|_| rng.gen08::<f32>() + 1e-3).collect();
+                let cover: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
+                let msg: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
                 (cover, costs, msg)
             })
             .collect();
@@ -1505,20 +1819,20 @@ mod tests {
             for t in 0..tries {
                 let cols: Vec<u32> = if t == 0 {
                     // the keyed end-set construction, seed [3; 32]
-                    let hh = hhat::generate_hhat_end_set(V3_STC_H, w, &[3u8; 32]);
+                    let hh = hhat::generate_hhat_end_set(V31_STC_H, w, &[3u8; 32]);
                     (0..w).map(|c| hhat::column_packed(&hh, c)).collect()
                 } else {
-                    (0..w).map(|_| (srng.r#gen::<u32>() & 0x7f) | 0x41).collect()
+                    (0..w).map(|_| (srng.gen08::<u32>() & 0x7f) | 0x41).collect()
                 };
-                let mut hh = vec![vec![0u32; w]; V3_STC_H];
+                let mut hh = vec![vec![0u32; w]; V31_STC_H];
                 for (c, &v) in cols.iter().enumerate() {
-                    for r in 0..V3_STC_H {
+                    for r in 0..V31_STC_H {
                         hh[r][c] = (v >> r) & 1;
                     }
                 }
                 let d: f64 = loads
                     .iter()
-                    .map(|(cv, c, msg)| embed::stc_embed(cv, c, &msg[..m], &hh, V3_STC_H, w).unwrap().total_cost)
+                    .map(|(cv, c, msg)| embed::stc_embed(cv, c, &msg[..m], &hh, V31_STC_H, w).unwrap().total_cost)
                     .sum();
                 losses.push((d / bound, cols));
             }
@@ -1606,12 +1920,13 @@ mod tests {
     #[test]
     fn roundtrip_heavy_payload() {
         use crate::stego::ghost::pipeline::{ghost_decode, ghost_encode};
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let cover = load("photo_320x240_q75_420.jpg");
         let img = JpegImage::from_bytes(&cover).unwrap();
         let v2_cap = crate::stego::ghost::capacity::estimate_capacity(&img).unwrap();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(5);
-        let msg: String = (0..v2_cap * 2).map(|_| (b'!' + rng.r#gen::<u8>() % 90) as char).collect();
+        let msg: String = (0..v2_cap * 2).map(|_| (b'!' + rng.gen08::<u8>() % 90) as char).collect();
         let stego = ghost_encode(&cover, &msg, "heavy").unwrap();
         assert_eq!(ghost_decode(&stego, "heavy").unwrap().text, msg);
     }
@@ -1716,13 +2031,14 @@ mod tests {
     #[test]
     fn roundtrip_multi_lane() {
         use crate::stego::ghost::pipeline::{ghost_decode, ghost_encode};
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let cover = synth_jpeg(1600, 1600);
         let img = JpegImage::from_bytes(&cover).unwrap();
         let n = img.dct_grid(0).blocks_wide() * img.dct_grid(0).blocks_tall() * 63;
         assert!(n >= 2 * LANE_POSITIONS, "n={n}");
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(11);
-        let big: String = (0..3000).map(|_| (b'!' + rng.r#gen::<u8>() % 90) as char).collect();
+        let big: String = (0..3000).map(|_| (b'!' + rng.gen08::<u8>() % 90) as char).collect();
         let m_bits = (frame::FRAME_OVERHEAD + 3000) * 8; // upper bound; compression may shrink it
         assert!(lanes(n, m_bits) >= 2);
         for msg in [big.as_str(), "tiny"] {
@@ -1757,17 +2073,102 @@ mod tests {
     /// decodes: v3 frames are bounded only by the payload format (a 48 MP
     /// photo's capacity is ~370 KB; regression of 2026-10-27, found on
     /// cgPhone).
+    ///
+    /// The cover is 2400 × 2400 (5.7 M positions, layer width 4), not
+    /// 1600 × 1600: there this frame filled 92 % of the positions, layer
+    /// width 2, where the layer-1 trellis (its layer-2 flips wet, ~16 %) is
+    /// infeasible for about one frame in six — and the frame bits follow the
+    /// random salt and nonce, so the test failed intermittently with
+    /// `MessageTooLarge` (2026-10-31; budget- and worker-independent).
+    /// Fixed salt/nonce on top, so the test cannot flake.
     #[test]
     fn roundtrip_frame_over_256k() {
+        use crate::stego::crypto::DeterministicSeedGuard;
         use crate::stego::ghost::pipeline::{ghost_decode, ghost_encode};
-        use rand::{Rng, SeedableRng};
-        let cover = synth_jpeg(1600, 1600);
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
+        let _g = DeterministicSeedGuard::set("256");
+        let cover = synth_jpeg(2400, 2400);
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(256);
         let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .";
-        let msg: String = (0..390_000).map(|_| alphabet[rng.gen_range(0..64)] as char).collect();
+        let msg: String = (0..390_000).map(|_| alphabet[rng.gen_range08(0..64)] as char).collect();
         assert!(crate::stego::payload::compressed_payload_size(&msg, &[]) > crate::stego::frame::MAX_FRAME_BYTES);
         let stego = ghost_encode(&cover, &msg, "big-frame").unwrap();
         assert_eq!(ghost_decode(&stego, "big-frame").unwrap().text, msg);
+    }
+
+    /// A Ghost encode at the cover's maximum (the capacity bar's 100 %)
+    /// writes the same bytes under any memory budget and worker count: the
+    /// budget picks the memory layout (in-memory vs checkpointed trellises,
+    /// cost groups, lanes at once), never the result — the decoder does not
+    /// know the budget. Distinct plans are asserted so the test keeps
+    /// covering several rungs.
+    #[test]
+    fn encode_bytes_independent_of_budget_and_workers() {
+        use crate::stego::crypto::DeterministicSeedGuard;
+        use crate::stego::ghost::pipeline::{ghost_decode, ghost_encode};
+        use crate::stego::memory::{budget_test_lock, ghost_lane_plan, set_memory_budget, ModeId};
+        let cover = synth_jpeg(1600, 1600);
+        let img = JpegImage::from_bytes(&cover).unwrap();
+        let n = ac_count(img.dct_grid(0));
+        let max = crate::stego::ghost::capacity::ghost_bands(&img, 0, 0).unwrap().max_bytes;
+        let mut x = 0x2545_f491u32;
+        let mut msg: String = (0..max)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[(x % 62) as usize] as char
+            })
+            .collect();
+        while crate::stego::payload::compressed_payload_size(&msg, &[]) > max {
+            msg.pop();
+        }
+        let m = (crate::stego::payload::compressed_payload_size(&msg, &[]) + frame::FRAME_OVERHEAD) * 8;
+        assert!(lanes(n, m) >= 2, "n={n} m={m}");
+
+        let _b = budget_test_lock();
+        let _s = DeterministicSeedGuard::set("1031");
+        // (workers, budget): unlimited; 1 MB (one checkpointed lane per cost
+        // group); 200 MB (in-memory lanes with a smaller table on one
+        // worker, checkpointed lanes on several).
+        #[cfg(feature = "parallel")]
+        let workers = [1usize, 4];
+        #[cfg(not(feature = "parallel"))]
+        let workers = [1usize];
+        let budgets = [None, Some(1usize << 20), Some(200 << 20)];
+        let mut base: Option<Vec<u8>> = None;
+        let mut plans = Vec::new();
+        for &k in &workers {
+            #[cfg(feature = "parallel")]
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(k).build().unwrap();
+            let run = |f: &(dyn Fn() -> Vec<u8> + Sync)| -> Vec<u8> {
+                #[cfg(feature = "parallel")]
+                return pool.install(f);
+                #[cfg(not(feature = "parallel"))]
+                return f();
+            };
+            for &b in &budgets {
+                set_memory_budget(b);
+                let p = run(&|| {
+                    let p = ghost_lane_plan(ModeId::GhostNoShadow, 1600, 1600, n, m, V31_STC_H);
+                    format!("{:?}/{}/{}/{}", p.rung, p.parallel_lanes, p.lane_inline_bytes, p.group_positions).into_bytes()
+                });
+                let out = run(&|| ghost_encode(&cover, &msg, "budget").unwrap());
+                set_memory_budget(None);
+                plans.push(String::from_utf8(p).unwrap());
+                match &base {
+                    None => {
+                        assert_eq!(ghost_decode(&out, "budget").unwrap().text, msg);
+                        base = Some(out);
+                    }
+                    Some(want) => assert!(&out == want, "workers {k} budget {b:?} ({}): bytes differ", plans.last().unwrap()),
+                }
+            }
+        }
+        plans.sort();
+        plans.dedup();
+        assert!(plans.len() >= 3, "too few distinct plans: {plans:?}");
     }
 
     /// Peak lane memory does not grow as the message shrinks: at every frame
@@ -1785,8 +2186,8 @@ mod tests {
                     let l = lanes(n, m);
                     let k = workers.min(l);
                     let nk = share(n, l, 0).len();
-                    let inline = crate::stego::memory::LANE_INLINE_BYTES.min(lane_inline_share(n, nk, k, V3_STC_H, workers));
-                    (k * lane_bytes(nk, m.div_ceil(l), V3_STC_H, inline, lane_threads(k, workers)), k * nk * 8)
+                    let inline = crate::stego::memory::LANE_INLINE_BYTES.min(lane_inline_share(n, nk, k, V31_STC_H, workers));
+                    (k * lane_bytes(nk, m.div_ceil(l), V31_STC_H, inline, lane_threads(k, workers)), k * nk * 8)
                 };
                 let full = [n / 16, n / 8, n / 5].into_iter().map(|m| total(m).0).max().unwrap();
                 // Checkpoints and the wave buffers of the recomputed part
@@ -1805,12 +2206,13 @@ mod tests {
     /// checkpointed trellis.
     #[test]
     fn plan_is_independent_of_memory_knobs() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let cover = JpegImage::from_bytes(&synth_jpeg(1600, 1600)).unwrap();
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(9);
         let key = [0x33u8; 64];
         for m in [3_000usize, 40_000] {
-            let bits: Vec<u8> = (0..m).map(|_| rng.r#gen::<u8>() & 1).collect();
+            let bits: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
             let base = plan(&cover, &bits, &key, None, None, None, &EncodeOpts::default()).unwrap();
             let cases = [
                 EncodeOpts { group_positions: 1, ..Default::default() },
@@ -1957,7 +2359,8 @@ mod tests {
     #[test]
     #[ignore]
     fn stc_height_sweep() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         fn viterbi(cover: &[u8], cost: &[f64], msg: &[u8], cols: &[u32], h: usize) -> f64 {
             let w = cols.len();
             let ns = 1usize << h;
@@ -1990,9 +2393,9 @@ mod tests {
         }
         let n = 40_000usize;
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(3);
-        let costs: Vec<f64> = (0..n).map(|_| (rng.r#gen::<f64>() * 8.0 * core::f64::consts::LN_2).exp()).collect();
-        let cover: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
-        let msg: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
+        let costs: Vec<f64> = (0..n).map(|_| (rng.gen08::<f64>() * 8.0 * core::f64::consts::LN_2).exp()).collect();
+        let cover: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
+        let msg: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
         for inv_alpha in [2usize, 5, 20, 50] {
             let m = n / inv_alpha;
             let ab: Vec<(f32, f32)> = costs.iter().map(|&c| (c as f32, f32::INFINITY)).collect();
@@ -2002,7 +2405,7 @@ mod tests {
                 let mut best = f64::INFINITY;
                 let mut sum = 0.0;
                 for t in 0..3 {
-                    let cols: Vec<u32> = (0..inv_alpha).map(|_| (rng.r#gen::<u32>() & ((1 << h) - 1)) | 1 | (1 << (h - 1))).collect();
+                    let cols: Vec<u32> = (0..inv_alpha).map(|_| (rng.gen08::<u32>() & ((1 << h) - 1)) | 1 | (1 << (h - 1))).collect();
                     let d = viterbi(&cover, &costs, &msg[..m], &cols, h);
                     best = best.min(d);
                     sum += d;
@@ -2022,7 +2425,8 @@ mod tests {
     #[test]
     #[ignore]
     fn height_sweep_covers() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let dir = std::env::var("V3_SWEEP_COVERS").expect("V3_SWEEP_COVERS");
         let n_covers: usize = std::env::var("V3_SWEEP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
         let heights: Vec<usize> = std::env::var("V3_SWEEP_H")
@@ -2046,7 +2450,7 @@ mod tests {
             for (ri, &rate) in rates.iter().enumerate() {
                 let m = ((rate * nz as f64) as usize).max(64);
                 let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64((ci * 16 + ri) as u64);
-                let bits: Vec<u8> = (0..m).map(|_| rng.r#gen::<u8>() & 1).collect();
+                let bits: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
                 for &h in &heights {
                     let mut im = img.clone();
                     let t0 = std::time::Instant::now();
@@ -2068,6 +2472,22 @@ mod tests {
         shuffle_u32(&mut a, &seed);
         permute_positions(&mut b, &seed);
         assert!(a.iter().zip(&b).all(|(x, y)| *x == y.flat_idx));
+    }
+
+    /// One shuffle reads both generations: v3.1's search finds only v3.1
+    /// frames, `decode_all` finds either.
+    #[test]
+    fn decode_all_reads_v31_then_v3() {
+        let pass = "wire-format-cross-platform-test";
+        let key = crate::stego::crypto::derive_structural_key(pass).unwrap();
+        let parse = &crate::stego::ghost::pipeline::try_parse_and_decrypt;
+        for (name, is_v31) in [("ghost_v31_2026_11_03.jpg", true), ("ghost_v3_2026_11_03.jpg", false)] {
+            let img = JpegImage::from_bytes(&load(&format!("wire-format/{name}"))).unwrap();
+            let planes = decode_planes(&img, &key);
+            assert_eq!(decode_v31(&planes, pass, &key, parse).is_some(), is_v31, "{name}");
+            let got = decode_all(&img, pass, &key, parse).expect("a frame").unwrap();
+            assert_eq!(got.text, "Hello from the wire-format gate!", "{name}");
+        }
     }
 
     #[test]

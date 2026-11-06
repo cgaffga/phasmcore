@@ -1,27 +1,16 @@
 // Copyright (c) 2026 Christoph Gaffga
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! T3.1 perf comparison — f64 path vs integer LL&M + SIMD path.
+//! T3.1 perf: the f64 reference DCT vs the integer LL&M + SIMD kernels
+//! (always built since Phase F removed the `aan-dct` feature), and the
+//! Armor / Ghost encode time of a 4032×3024 (12 MP) iPhone JPEG.
 //!
 //! Run with:
 //!   cargo test --release --test perf_t31_aan_vs_f64 -- --nocapture
-//!   cargo test --release --features aan-dct --test perf_t31_aan_vs_f64 -- --nocapture
-//!
-//! Then diff the two outputs. The active-path label in the output
-//! identifies which config ran.
-//!
-//! Workload: armor-encode a 4032×3024 (12 MP) iPhone JPEG 5 times.
-//! Armor encode exercises:
-//!   - pre_clamp_y_channel (IDCT + clamp + DCT per Y block)
-//!   - Fortress pre-settle (IDCT + DCT per Y/Cb/Cr block at QF=75)
-//!   - FFT-based DFT template
-//!   - STDM embedding + RS ECC
-//! The IDCT/DCT-bound pre-clamp + pre-settle phases dominate; LL&M
-//! SIMD wins land there.
 
 use std::time::Instant;
 
-const FIXTURE_PATH: &str = "../test-vectors/photo_original_3557.jpg";
+const FIXTURE_PATH: &str = "test-vectors/image/photo_original_3557.jpg";
 
 /// Micro-bench: just the IDCT + DCT kernels in a tight loop. Isolates
 /// the SIMD win from rayon-saturated multi-threaded encode flows.
@@ -33,12 +22,6 @@ fn t31_kernel_microbench() {
         69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64,
         81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99,
     ];
-    let label = if cfg!(feature = "aan-dct") {
-        "aan-dct (integer LL&M + SIMD)"
-    } else {
-        "default (f64 path)"
-    };
-
     // ~50K blocks ≈ a 12 MP image worth of luma blocks.
     let n_blocks = 50_000usize;
     // Deterministic input (avoid optimizer eliding the loop).
@@ -55,7 +38,7 @@ fn t31_kernel_microbench() {
         let _ = idct_block(&q, &qt);
     }
 
-    // f64 path (always reachable, even under aan-dct).
+    // f64 reference path.
     let t = Instant::now();
     let mut sink = 0i64;
     for _ in 0..n_blocks {
@@ -64,12 +47,11 @@ fn t31_kernel_microbench() {
         sink = sink.wrapping_add(q[0] as i64).wrapping_add(r[0] as i64);
     }
     let f64_ms = t.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("=== T3.1 kernel microbench — {label} ===");
+    eprintln!("=== T3.1 kernel microbench ===");
     eprintln!("{n_blocks} blocks × (dct_block + idct_block) f64 reference:");
     eprintln!("  total: {f64_ms:.1} ms  per-block: {:.2} µs  (sink={sink})", f64_ms * 1000.0 / n_blocks as f64);
 
-    // aan path (only callable when feature is on).
-    #[cfg(feature = "aan-dct")]
+    // Integer LL&M + SIMD path.
     {
         use phasm_core::codec::jpeg::pixels_aan::{aan_dct_block, aan_idct_block};
         let t = Instant::now();
@@ -113,12 +95,6 @@ fn bench_encode(
     if bytes.is_empty() {
         return;
     }
-    let label = if cfg!(feature = "aan-dct") {
-        "aan-dct (integer LL&M + SIMD)"
-    } else {
-        "default (f64 path)"
-    };
-
     let _ = op(&bytes, "warmup", "warmup");
 
     let iters = 5usize;
@@ -130,7 +106,7 @@ fn bench_encode(
     }
     times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mean = times_ms.iter().sum::<f64>() / iters as f64;
-    eprintln!("=== T3.1 {name} perf — {label} ===");
+    eprintln!("=== T3.1 {name} perf ===");
     eprintln!(
         "iters {iters}  min {:.1} median {:.1} mean {:.1} max {:.1} ms",
         times_ms[0],

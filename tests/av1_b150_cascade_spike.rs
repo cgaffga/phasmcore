@@ -44,7 +44,7 @@ use phasm_rav1e::phasm_stego::{
 };
 use phasm_rav1e::prelude::Sequence;
 use phasm_rav1e::EncoderConfig;
-use rand::seq::SliceRandom;
+use phasm_core::stego::rng_compat::Rand08;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
@@ -327,7 +327,7 @@ fn run_spike_for_fixture(spec: &Fixture) -> Vec<SpikeRow> {
     let mut rng = ChaCha8Rng::seed_from_u64(SAMPLE_SEED);
     let n_sample = N_POSITIONS_PER_FIXTURE.min(ac_positions.len());
     let mut sampled: Vec<_> = ac_positions.clone();
-    sampled.shuffle(&mut rng);
+    rng.shuffle08(&mut sampled);
     sampled.truncate(n_sample);
 
     let w_y = spec.width as usize;

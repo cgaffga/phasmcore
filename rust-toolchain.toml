@@ -7,16 +7,18 @@
 #
 # Why a specific channel and not "stable"? Reproducibility — `stable` is a
 # moving target that floats over time. Pinning freezes the compiler so
-# anyone who clones at paper-v1.0 builds with the same toolchain the paper
+# anyone who clones at paper-v3.1 builds with the same toolchain the paper
 # was written against.
 #
-# Channel choice: matches the local environment the paper was developed on
-# (rustc 1.93.1 / 2026-02-11). When tagging paper-v1.0, re-trigger the
-# bit-exact CI workflow with this pin honored (the CI workflow currently
-# uses dtolnay/rust-toolchain@stable; switching to @1.93.1 on the paper-v1.0
-# ref makes the pin binding).
+# Channel choice: rustc 1.99.1 (2026-10-13), bumped from 1.93.1 on
+# 2026-11-02 when the machine's stable moved (maintainer decision); the
+# determinism suite (tests/cross_platform.rs), the core lib and Armor suites
+# passed on it. The paper's Appendix D must name this version. When tagging
+# paper-v3.1, re-trigger the bit-exact CI workflow with this pin honored (the
+# CI workflow currently uses dtolnay/rust-toolchain@stable; switching to
+# @1.99.1 on the paper-v3.1 ref makes the pin binding).
 
 [toolchain]
-channel = "1.93.1"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

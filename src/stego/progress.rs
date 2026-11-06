@@ -106,10 +106,12 @@ impl Channel {
         self.state().cancelled.load(Ordering::Relaxed)
     }
 
-    /// This channel's `(step, total)`.
+    /// This channel's `(step, total)`; with a known total the step never
+    /// exceeds it.
     pub fn get(self) -> (u32, u32) {
         let st = self.state();
-        (st.step.load(Ordering::Relaxed), st.total.load(Ordering::Relaxed))
+        let (step, total) = (st.step.load(Ordering::Relaxed), st.total.load(Ordering::Relaxed));
+        (if total > 0 { step.min(total) } else { step }, total)
     }
 
     /// Hand this channel's cancel flag to the caller: from now on [`init`]
@@ -178,9 +180,14 @@ pub fn init(total: u32) {
 
 /// Set (or update) the total without resetting the current step.
 /// Used by pipeline code that discovers the real total mid-flight
-/// (e.g. after counting delta candidates).
+/// (e.g. after counting delta candidates). Steps already taken stay below
+/// the total: workers of the parallel `smart_decode` advance freely while the
+/// total is still 0, and a later, smaller total showed "Step 56 / 50".
 pub fn set_total(total: u32) {
-    state().total.store(total, Ordering::Relaxed);
+    let st = state();
+    let step = st.step.load(Ordering::Relaxed);
+    let total = if total > 0 { total.max(step.saturating_add(1)) } else { total };
+    st.total.store(total, Ordering::Relaxed);
     notify();
 }
 
@@ -236,7 +243,7 @@ pub fn advance() {
         st.step.fetch_add(1, Ordering::Relaxed);
     } else {
         // Cap at total-1 so the bar never hits 100% before finish().
-        let _ = st.step.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+        let _ = st.step.try_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
             if s + 1 < total { Some(s + 1) } else { Some(s) }
         });
     }
@@ -312,6 +319,25 @@ fn notify() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steps taken while the total was unknown never exceed a later total
+    /// (Android review A#17, "Step 56 / 50").
+    #[test]
+    fn set_total_never_falls_below_the_step() {
+        run_decode(|| {
+            init(0);
+            for _ in 0..56 {
+                advance();
+            }
+            set_total(50);
+            let (step, total) = get();
+            assert_eq!((step, total), (56, 57));
+            advance();
+            assert!(get().0 < get().1);
+            init(10);
+            assert_eq!(get(), (0, 10));
+        });
+    }
 
     #[test]
     fn cancel_flag_propagates() {

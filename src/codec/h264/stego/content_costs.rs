@@ -86,10 +86,6 @@ use std::collections::HashMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-/// Default `QP` value used when the caller doesn't pass one. Matches
-/// `EncodeOpts::default().qp` (=26) in the OH264 path.
-const DEFAULT_QP: i32 = 26;
-
 /// Stabilisation constant for the MVD-domain texture proxy. Avoids a
 /// zero-cost position in perfectly flat macroblocks, which STC would
 /// otherwise flood.
@@ -497,6 +493,7 @@ fn fill_frame_costs(
 /// `core/tests/cap2_mask_equivalence.rs`, which asserts identical
 /// `per_tier_payload` from both paths. If that gate ever fires, the probe is
 /// wrong — fix it, don't re-baseline it.
+#[cfg(feature = "h264-encoder")]
 pub(crate) fn compute_cost_mask(cover: &DomainCover, n_frames: u32) -> DomainCosts {
     // `1.0`, not the real cost: any finite value yields the same reachability,
     // and a constant makes it obvious at a glance that magnitudes are unused.

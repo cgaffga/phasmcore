@@ -8,7 +8,7 @@
 //! seeded by the structural key. Each vector maps one message bit to a group
 //! of L DCT coefficients.
 
-use rand::Rng;
+use crate::stego::rng_compat::Rand08;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
@@ -25,8 +25,9 @@ pub fn generate_spreading_vectors(seed: &[u8; 32], count: usize) -> Vec<[f64; SP
 
 /// ChaCha20 keystream words one vector consumes.
 ///
-/// `gen_range(-1.0..1.0)` on f64 draws exactly one `u64` (two words) per
-/// value and never rejects: rand maps the draw to `v * 2.0 - 1.0` with
+/// `gen_range08(-1.0..1.0)` (`rand` 0.8's sampler, `stego::rng_compat`) on
+/// f64 draws exactly one `u64` (two words) per value and never rejects: it
+/// maps the draw to `v * 2.0 - 1.0` with
 /// `v` in `[0, 1 - 2^-52]`, which is exact and at most `1 - 2^-51 < 1`.
 /// So vector `i` is a pure function of keystream words `16 i .. 16 i + 16`
 /// (one ChaCha20 block), and any vector can be generated on its own.
@@ -46,7 +47,7 @@ pub fn spreading_vectors_range(seed: &[u8; 32], start: usize, count: usize) -> V
         // Generate random values and normalize
         for val in v.iter_mut() {
             // Uniform random in [-1, 1], then normalize afterward
-            *val = rng.gen_range(-1.0..1.0);
+            *val = rng.gen_range08(-1.0..1.0);
         }
 
         // Normalize to unit length

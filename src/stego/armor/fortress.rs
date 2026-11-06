@@ -47,7 +47,7 @@ use crate::stego::crypto;
 use crate::stego::error::StegoError;
 use crate::stego::frame;
 
-use rand::Rng;
+use crate::stego::rng_compat::Rand08;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -55,7 +55,7 @@ use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
 /// Fixed QIM step for the magic header (always step=12, majority-voted 7x).
-const HEADER_QIM_STEP: f64 = 12.0;
+pub(crate) const HEADER_QIM_STEP: f64 = 12.0;
 
 /// Minimum repetition factor for Fortress encode.
 /// r≥15 ensures sufficient majority-voting margin at the BER levels observed
@@ -81,10 +81,10 @@ const FORTRESS_HEADER_COPIES: usize = 7;
 // On decode, r is brute-forced per candidate, so the step is implicitly known.
 
 /// Adaptive fortress parameters for a given repetition factor.
-struct AdaptiveParams {
-    base_step: f64,
-    watson_lo: f64,
-    watson_hi: f64,
+pub(crate) struct AdaptiveParams {
+    pub(crate) base_step: f64,
+    pub(crate) watson_lo: f64,
+    pub(crate) watson_hi: f64,
 }
 
 /// Determine adaptive QIM step and Watson range from repetition factor.
@@ -97,7 +97,7 @@ struct AdaptiveParams {
 /// BER stays at floor 17% (diff=2 blocks just survive), and majority voting
 /// at r=61 handles 17% BER with error rate ≈ 10⁻⁸. Beyond 61, quality
 /// gains are imperceptible but diff=2 blocks start flipping.
-fn adaptive_params(r: usize) -> AdaptiveParams {
+pub(crate) fn adaptive_params(r: usize) -> AdaptiveParams {
     const R_MIN: f64 = 15.0;
     const R_MAX: f64 = 61.0;
     // Clamp r into [R_MIN, R_MAX], compute t in [0, 1]
@@ -120,7 +120,7 @@ fn adaptive_params(r: usize) -> AdaptiveParams {
 /// Base Watson curve: maps AC energy ratio to a factor in [0.3, 1.5].
 /// This defines the SHAPE of the adaptation; the output range is then
 /// remapped to the adaptive [watson_lo, watson_hi] range via `adaptive_params`.
-fn watson_base_factor(ratio: f64) -> f64 {
+pub(crate) fn watson_base_factor(ratio: f64) -> f64 {
     const R0: f64 = 0.01;
     const R1: f64 = 0.35;
     const R2: f64 = 2.0;
@@ -144,20 +144,20 @@ fn watson_base_factor(ratio: f64) -> f64 {
 }
 
 /// Remap a base Watson factor from [0.3, 1.5] to a custom [lo, hi] range.
-fn remap_watson(base_factor: f64, lo: f64, hi: f64) -> f64 {
+pub(crate) fn remap_watson(base_factor: f64, lo: f64, hi: f64) -> f64 {
     let t = (base_factor - 0.3) / (1.5 - 0.3);
     lo + t * (hi - lo)
 }
 
 /// Pre-computed energy ratios for all blocks. Computed once per image,
 /// reused across adaptive candidates on decode.
-struct EnergyRatios {
-    ratios: Vec<f64>,
+pub(crate) struct EnergyRatios {
+    pub(crate) ratios: Vec<f64>,
 }
 
 /// Compute per-block AC energy ratios (energy / median).
 /// Only counts |c| >= 2 AC coefficients for recompression stability.
-fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
+pub(crate) fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     let blocks_wide = grid.blocks_wide();
     let blocks_tall = grid.blocks_tall();
     let total_blocks = blocks_wide * blocks_tall;
@@ -203,6 +203,52 @@ fn compute_energy_ratios(grid: &DctGrid) -> EnergyRatios {
     EnergyRatios { ratios }
 }
 
+/// [`compute_energy_ratios`] over an encoder block geometry (`enc_bw` x
+/// `enc_bh`, blocks mapped by row/col; blocks outside the received grid count
+/// 0), with the AC coefficients optionally requantized from the received
+/// table to `requant.1` (the QF75 table the encoder pre-settled to).
+fn compute_energy_ratios_mapped(
+    grid: &DctGrid,
+    enc_bw: usize,
+    enc_bh: usize,
+    requant: Option<(&[u16; 64], &[u16; 64])>,
+) -> EnergyRatios {
+    let total_blocks = enc_bw * enc_bh;
+    let ratio: Option<[f64; 64]> =
+        requant.map(|(qr, q75)| std::array::from_fn(|k| qr[k] as f64 / q75[k] as f64));
+    let compute_energy = |block_idx: usize| -> f64 {
+        let br = block_idx / enc_bw;
+        let bc = block_idx % enc_bw;
+        if br >= grid.blocks_tall() || bc >= grid.blocks_wide() {
+            return 0.0;
+        }
+        let block = grid.block(br, bc);
+        let mut energy: f64 = 0.0;
+        for k in 1..64 {
+            let c = match &ratio {
+                Some(r) => (block[k] as f64 * r[k]).round(),
+                None => block[k] as f64,
+            };
+            if c.abs() >= 2.0 {
+                energy += c * c;
+            }
+        }
+        energy
+    };
+    let ac_energies: Vec<f64> = (0..total_blocks).map(compute_energy).collect();
+    let median = if total_blocks == 0 {
+        1.0
+    } else {
+        let mut scratch = ac_energies.clone();
+        let mid = total_blocks / 2;
+        let (_, m, _) = scratch.select_nth_unstable_by(mid, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        (*m).max(1.0)
+    };
+    EnergyRatios { ratios: ac_energies.iter().map(|&e| e / median).collect() }
+}
+
 /// Compute Watson step factors from energy ratios + adaptive range.
 fn watson_factors(ratios: &EnergyRatios, watson_lo: f64, watson_hi: f64) -> Vec<f64> {
     ratios
@@ -230,12 +276,12 @@ fn watson_factors_from_base(base_factors: &[f64], watson_lo: f64, watson_hi: f64
 // --- BA-QIM core functions ---
 
 /// Convert a quantized DC coefficient to block-average brightness.
-fn dc_to_avg(dc: i16, qt_dc: u16) -> f64 {
+pub(crate) fn dc_to_avg(dc: i16, qt_dc: u16) -> f64 {
     dc as f64 * qt_dc as f64 / 8.0
 }
 
 /// Convert a block-average brightness back to a quantized DC coefficient.
-fn avg_to_dc(avg: f64, qt_dc: u16) -> i16 {
+pub(crate) fn avg_to_dc(avg: f64, qt_dc: u16) -> i16 {
     (avg * 8.0 / qt_dc as f64).round() as i16
 }
 
@@ -243,7 +289,7 @@ fn avg_to_dc(avg: f64, qt_dc: u16) -> i16 {
 ///
 /// Bit 0 grid: ..., -step, 0, step, 2*step, ...
 /// Bit 1 grid: ..., -step/2, step/2, 3*step/2, ...
-fn qim_embed_avg(avg: f64, step: f64, bit: u8) -> f64 {
+pub(crate) fn qim_embed_avg(avg: f64, step: f64, bit: u8) -> f64 {
     let offset = if bit == 0 { 0.0 } else { step / 2.0 };
     let shifted = avg - offset;
     let quantized = (shifted / step).round() * step;
@@ -254,7 +300,7 @@ fn qim_embed_avg(avg: f64, step: f64, bit: u8) -> f64 {
 ///
 /// Returns positive for bit 0, negative for bit 1.
 /// Magnitude indicates confidence.
-fn qim_extract_soft(avg: f64, step: f64) -> f64 {
+pub(crate) fn qim_extract_soft(avg: f64, step: f64) -> f64 {
     let half = step / 2.0;
     // Distance to nearest bit-0 grid point
     let d0 = (avg / step).round() * step;
@@ -271,12 +317,12 @@ fn qim_extract_soft(avg: f64, step: f64) -> f64 {
 /// Generate a permuted list of block indices using Fisher-Yates shuffle.
 ///
 /// Uses `u32` for cross-platform portability (WASM is 32-bit).
-fn permute_blocks(total_blocks: usize, seed: &[u8; 32]) -> Vec<usize> {
+pub(crate) fn permute_blocks(total_blocks: usize, seed: &[u8; 32]) -> Vec<usize> {
     let mut indices: Vec<usize> = (0..total_blocks).collect();
     let mut rng = ChaCha20Rng::from_seed(*seed);
     let n = indices.len();
     for i in (1..n).rev() {
-        let j = rng.gen_range(0..=(i as u32)) as usize;
+        let j = rng.gen_range08(0..=(i as u32)) as usize;
         indices.swap(i, j);
     }
     indices
@@ -348,28 +394,34 @@ pub fn fortress_max_frame_bytes_ext(img: &JpegImage, _compact: bool) -> Result<u
     Ok(best_frame_bytes)
 }
 
-/// Estimate fortress plaintext capacity (max message bytes).
-///
-/// Uses full frame overhead (50 bytes). For compact frame capacity, use
-/// `fortress_capacity_compact`.
+/// Fortress plaintext capacity (max payload bytes) of the production format,
+/// Fortress T: the largest frame tier minus the full frame overhead (50 B).
+/// The same for every passphrase. A payload of exactly this size takes the
+/// Fortress path; one more byte goes to STDM. For compact frames (empty
+/// passphrase) use `fortress_capacity_compact`.
 pub fn fortress_capacity(img: &JpegImage) -> Result<usize, StegoError> {
+    let max_frame = super::fortress_tile::max_frame_bytes(img);
+    Ok(max_frame.saturating_sub(frame::FRAME_OVERHEAD))
+}
+
+/// [`fortress_capacity`] for compact frames (empty passphrase, 22 B overhead).
+pub fn fortress_capacity_compact(img: &JpegImage) -> Result<usize, StegoError> {
+    let max_frame = super::fortress_tile::max_frame_bytes(img);
+    Ok(max_frame.saturating_sub(frame::FORTRESS_COMPACT_FRAME_OVERHEAD))
+}
+
+/// Capacity of Fortress CC (core 0.6 development format before Fortress T).
+pub fn fortress_cc_capacity(img: &JpegImage) -> usize {
+    fortress_cc_max_frame_bytes(img, &FortressCcParams::default()).saturating_sub(frame::FRAME_OVERHEAD)
+}
+
+/// Capacity of the core <= 0.5.x Fortress format (RS + repetition, r >= 15).
+pub fn fortress_legacy_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let max_frame = fortress_max_frame_bytes(img)?;
     if max_frame <= frame::FRAME_OVERHEAD {
         return Ok(0);
     }
     Ok(max_frame - frame::FRAME_OVERHEAD)
-}
-
-/// Estimate fortress plaintext capacity for compact frame mode (empty passphrase).
-///
-/// Uses the smaller compact frame overhead (22 bytes instead of 50), giving
-/// 28 more bytes of message capacity.
-pub fn fortress_capacity_compact(img: &JpegImage) -> Result<usize, StegoError> {
-    let max_frame = fortress_max_frame_bytes_ext(img, true)?;
-    if max_frame <= frame::FORTRESS_COMPACT_FRAME_OVERHEAD {
-        return Ok(0);
-    }
-    Ok(max_frame - frame::FORTRESS_COMPACT_FRAME_OVERHEAD)
 }
 
 // --- Fortress encode ---
@@ -501,16 +553,87 @@ pub fn fortress_decode(
     img: &JpegImage,
     passphrase: &str,
 ) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality), StegoError> {
+    fortress_decode_opts(img, passphrase, &super::pipeline::ArmorDecodeOpts::default())
+        .map(|(p, q, _, _)| (p, q))
+}
+
+/// Fortress decode with the prototype decoder fixes of `opts` (geometry,
+/// erasures, QF75 requantization). Returns the encoder geometry that worked
+/// and whether it was the native (received) one.
+#[allow(clippy::type_complexity)]
+pub fn fortress_decode_opts(
+    img: &JpegImage,
+    passphrase: &str,
+    opts: &super::pipeline::ArmorDecodeOpts,
+) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality, (usize, usize), bool), StegoError> {
+    let grid = img.dct_grid(0);
+    let native = (grid.blocks_wide(), grid.blocks_tall());
+    let geoms = if opts.geometry { super::pipeline::encoder_geometries(img) } else { vec![native] };
+    let mut err = StegoError::FrameCorrupted;
+    for &(bw, bh) in &geoms {
+        match fortress_decode_geom(img, passphrase, bw, bh, opts.erasures, opts.fortress_requant, &opts.fortress_cc) {
+            Ok((p, q)) => return Ok((p, q, (bw, bh), (bw, bh) == native)),
+            Err(e) => err = e,
+        }
+    }
+    // Fortress T on the received grid (also a crop by whole blocks).
+    if opts.fortress_tiled {
+        match super::fortress_tile::decode_aligned(img, passphrase) {
+            Ok((p, q)) => return Ok((p, q, native, true)),
+            Err(StegoError::DecryptionFailed) => err = StegoError::DecryptionFailed,
+            Err(_) => {}
+        }
+    }
+    Err(err)
+}
+
+/// Fortress decode reading the received grid through an encoder geometry
+/// `enc_bw` x `enc_bh` (blocks mapped by row/col). Blocks outside the
+/// received grid, and with `erase_dummy` its MCU-padding blocks, give LLR 0.
+fn fortress_decode_geom(
+    img: &JpegImage,
+    passphrase: &str,
+    enc_bw: usize,
+    enc_bh: usize,
+    erase_dummy: bool,
+    requant: bool,
+    cc: &FortressCcParams,
+) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality), StegoError> {
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
-    let qt_dc = img
+    let qt_vals = img
         .quant_table(qt_id)
         .ok_or(StegoError::NoLuminanceChannel)?
-        .values[0];
+        .values;
+    let real = super::pipeline::real_luma_blocks(img);
+    fortress_decode_grid(img.dct_grid(0), &qt_vals, real, passphrase, enc_bw, enc_bh, erase_dummy, requant, cc)
+}
 
-    let grid = img.dct_grid(0);
-    let blocks_wide = grid.blocks_wide();
-    let blocks_tall = grid.blocks_tall();
-    let total_blocks = blocks_wide * blocks_tall;
+/// [`fortress_decode_geom`] on a bare luma grid and table (also used for a
+/// rescaled image, which has no JPEG of its own).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fortress_decode_grid(
+    grid: &DctGrid,
+    qt_vals: &[u16; 64],
+    (real_bw, real_bh): (usize, usize),
+    passphrase: &str,
+    enc_bw: usize,
+    enc_bh: usize,
+    erase_dummy: bool,
+    requant: bool,
+    cc: &FortressCcParams,
+) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality), StegoError> {
+    let qt_vals = *qt_vals;
+    let qt_dc = qt_vals[0];
+    let blocks_wide = enc_bw;
+    let total_blocks = enc_bw * enc_bh;
+    let erased = |br: usize, bc: usize| -> bool {
+        br >= grid.blocks_tall()
+            || bc >= grid.blocks_wide()
+            || (erase_dummy && (br >= real_bh || bc >= real_bw))
+    };
+    let dc_at = |br: usize, bc: usize| -> i16 {
+        if br < grid.blocks_tall() && bc < grid.blocks_wide() { grid.get(br, bc, 0, 0) } else { 0 }
+    };
 
     if total_blocks <= FORTRESS_HEADER_BLOCKS {
         return Err(StegoError::FrameCorrupted);
@@ -525,18 +648,27 @@ pub fn fortress_decode(
     for &block_idx in &perm[..FORTRESS_HEADER_BLOCKS] {
         let br = block_idx / blocks_wide;
         let bc = block_idx % blocks_wide;
-        let dc = grid.get(br, bc, 0, 0);
-        let avg = dc_to_avg(dc, qt_dc);
+        if erased(br, bc) {
+            header_llrs.push(0.0);
+            continue;
+        }
+        let avg = dc_to_avg(dc_at(br, bc), qt_dc);
         header_llrs.push(qim_extract_soft(avg, HEADER_QIM_STEP));
     }
 
     let magic = extract_magic_byte(&header_llrs);
-    if magic != FORTRESS_MAGIC {
+    if magic != FORTRESS_MAGIC && !(magic == FORTRESS_MAGIC_CC && cc.decode) {
         return Err(StegoError::FrameCorrupted);
     }
 
     // Pre-compute energy ratios once for reuse across adaptive candidates.
-    let energy = compute_energy_ratios(grid);
+    let q75 = super::pipeline::compute_jpeg_qt(&super::pipeline::JPEG_BASE_LUMINANCE_QT, 75);
+    let native = enc_bw == grid.blocks_wide() && enc_bh == grid.blocks_tall();
+    let energy = if native && !requant {
+        compute_energy_ratios(grid)
+    } else {
+        compute_energy_ratios_mapped(grid, enc_bw, enc_bh, requant.then_some((&qt_vals, &q75)))
+    };
     // Pre-compute Watson base factors once per image. These
     // depend only on the energy ratios; only the (lo, hi) remap is
     // per-candidate. Eliminates ~30 redundant runs of the piecewise-
@@ -555,12 +687,20 @@ pub fn fortress_decode(
         .map(|&block_idx| {
             let br = block_idx / blocks_wide;
             let bc = block_idx % blocks_wide;
-            dc_to_avg(grid.get(br, bc, 0, 0), qt_dc)
+            dc_to_avg(dc_at(br, bc), qt_dc)
         })
+        .collect();
+    let block_erased: Vec<bool> = remaining_perm
+        .iter()
+        .map(|&block_idx| erased(block_idx / blocks_wide, block_idx % blocks_wide))
         .collect();
 
     // Determine whether to use compact frame format (empty passphrase).
     let use_compact = passphrase.is_empty();
+
+    if magic == FORTRESS_MAGIC_CC {
+        return fortress_cc_decode(&base_factors, remaining_perm, &block_avgs, &block_erased, passphrase, use_compact, cc);
+    }
 
     // Build all (parity, r) candidates.
     let mut candidates: Vec<(usize, usize)> = Vec::new();
@@ -586,6 +726,9 @@ pub fn fortress_decode(
             .iter()
             .enumerate()
             .map(|(i, &block_idx)| {
+                if block_erased[i] {
+                    return 0.0;
+                }
                 let step = params.base_step * factors[block_idx];
                 qim_extract_soft(block_avgs[i], step)
             })
@@ -663,6 +806,227 @@ fn extract_magic_byte(header_llrs: &[f64]) -> u8 {
         }
     }
     byte
+}
+
+// --- Fortress CC (prototype wire variant, 2026-10-31) ---
+//
+// Same BA-QIM on block averages, same key-permuted blocks and header position as
+// Fortress, magic 0x39 instead of 0xF6 (Hamming distance 7, so either decoder
+// rejects the other's header). The frame is zero-padded to a size tier, coded with
+// a terminated K = 7 convolutional code and repeated r times (copy-major) over the
+// payload blocks; the decoder soft-combines the copies and runs one Viterbi per
+// tier. The QIM step is the Fortress r = 15 setting for every message.
+
+/// Fortress CC header magic.
+pub(crate) const FORTRESS_MAGIC_CC: u8 = 0x39;
+
+/// Prototype parameters of Fortress CC.
+#[derive(Debug, Clone, Copy)]
+pub struct FortressCcParams {
+    /// Code: K = 7 rate 1/2 (`convcode::K7_R2`) or rate 1/4 (`K7_R4`).
+    pub rate4: bool,
+    /// Minimum repetition of the coded stream.
+    pub r_min: usize,
+    /// Repetition at which the step equals the Fortress r = 15 step; more
+    /// repetition shrinks it like Fortress does (adaptive_params(r * this / r_ref)).
+    pub step_r: usize,
+    /// Decoder: read Fortress CC images at all (false = the core <= 0.5.x decoder).
+    pub decode: bool,
+}
+
+impl Default for FortressCcParams {
+    fn default() -> Self {
+        Self { rate4: false, r_min: 3, step_r: 15, decode: true }
+    }
+}
+
+pub(crate) fn cc_code(rate4: bool) -> (usize, &'static [u32]) {
+    if rate4 { super::convcode::K7_R4 } else { super::convcode::K7_R2 }
+}
+
+/// Frame size tiers (bytes) of Fortress CC: 24, then +12.5 % (at least +8).
+pub(crate) fn cc_tiers() -> Vec<usize> {
+    let mut v = vec![24usize];
+    while *v.last().unwrap() < 8192 {
+        let t = *v.last().unwrap();
+        v.push((t + 8).max((t as f64 * 1.125).round() as usize));
+    }
+    v
+}
+
+/// Repetition and coded length of tier `t` in `payload_blocks` (code chosen by `rate4`).
+fn cc_layout(t: usize, payload_blocks: usize, rate4: bool) -> (usize, usize) {
+    let n = super::convcode::coded_len(cc_code(rate4), 8 * t);
+    (payload_blocks / n, n)
+}
+
+/// QIM parameters of Fortress CC: the Fortress parameters at the repetition the
+/// coded stream gets, mapped so `step_r` coded repetitions = Fortress r = 15.
+fn cc_step_params(r: usize, rate4: bool, step_r: usize) -> AdaptiveParams {
+    // A coded bit repeated r times carries about as much as a repetition-only bit
+    // repeated r * (coding gain) times; step_r anchors r_min to the r = 15 step.
+    let _ = rate4;
+    adaptive_params(15 * r / step_r.max(1))
+}
+
+/// Largest frame (bytes) Fortress CC carries in this image.
+pub fn fortress_cc_max_frame_bytes(img: &JpegImage, prm: &FortressCcParams) -> usize {
+    let grid = img.dct_grid(0);
+    let total = grid.blocks_wide() * grid.blocks_tall();
+    if total <= FORTRESS_HEADER_BLOCKS {
+        return 0;
+    }
+    let pb = total - FORTRESS_HEADER_BLOCKS;
+    cc_tiers().into_iter().filter(|&t| cc_layout(t, pb, prm.rate4).0 >= prm.r_min).max().unwrap_or(0)
+}
+
+/// Fortress CC encode (frame already built and encrypted).
+pub fn fortress_cc_encode(
+    img: &mut JpegImage,
+    frame_bytes: &[u8],
+    passphrase: &str,
+    prm: &FortressCcParams,
+) -> Result<FortressEncodeResult, StegoError> {
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt_dc = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?.values[0];
+    let grid = img.dct_grid(0);
+    let blocks_wide = grid.blocks_wide();
+    let total_blocks = blocks_wide * grid.blocks_tall();
+    if total_blocks <= FORTRESS_HEADER_BLOCKS {
+        return Err(StegoError::ImageTooSmall);
+    }
+    let perm = permute_blocks(total_blocks, &crypto::derive_fortress_structural_key(passphrase)?);
+    let pb = total_blocks - FORTRESS_HEADER_BLOCKS;
+    let tier = cc_tiers()
+        .into_iter()
+        .find(|&t| t >= frame_bytes.len())
+        .ok_or(StegoError::MessageTooLarge)?;
+    let (r, n) = cc_layout(tier, pb, prm.rate4);
+    if r < prm.r_min {
+        return Err(StegoError::MessageTooLarge);
+    }
+    let mut padded = frame_bytes.to_vec();
+    padded.resize(tier, 0);
+    let coded = super::convcode::encode(cc_code(prm.rate4), &frame::bytes_to_bits(&padded));
+    debug_assert_eq!(coded.len(), n);
+    let params = cc_step_params(r, prm.rate4, prm.step_r);
+    let energy = compute_energy_ratios(grid);
+    let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
+
+    let grid_mut = img.dct_grid_mut(0);
+    for (bit_idx, &block_idx) in perm[..FORTRESS_HEADER_BLOCKS].iter().enumerate() {
+        let bit = (FORTRESS_MAGIC_CC >> (7 - bit_idx % 8)) & 1;
+        let (br, bc) = (block_idx / blocks_wide, block_idx % blocks_wide);
+        let avg = dc_to_avg(grid_mut.get(br, bc, 0, 0), qt_dc);
+        grid_mut.set(br, bc, 0, 0, avg_to_dc(qim_embed_avg(avg, HEADER_QIM_STEP, bit), qt_dc));
+    }
+    for (i, &block_idx) in perm[FORTRESS_HEADER_BLOCKS..].iter().enumerate().take(r * n) {
+        let bit = coded[i % n];
+        let step = params.base_step * factors[block_idx];
+        let (br, bc) = (block_idx / blocks_wide, block_idx % blocks_wide);
+        let avg = dc_to_avg(grid_mut.get(br, bc, 0, 0), qt_dc);
+        grid_mut.set(br, bc, 0, 0, avg_to_dc(qim_embed_avg(avg, step, bit), qt_dc));
+    }
+    Ok(FortressEncodeResult { repetition_factor: r, parity_symbols: 0 })
+}
+
+/// Fortress CC decode from the per-block data `fortress_decode_geom` prepared.
+fn fortress_cc_decode(
+    base_factors: &[f64],
+    remaining_perm: &[usize],
+    block_avgs: &[f64],
+    block_erased: &[bool],
+    passphrase: &str,
+    use_compact: bool,
+    prm: &FortressCcParams,
+) -> Result<(crate::stego::payload::PayloadData, super::pipeline::DecodeQuality), StegoError> {
+    let pb = remaining_perm.len();
+    {
+        let rate4 = prm.rate4;
+        let code = cc_code(rate4);
+        for tier in cc_tiers() {
+            let (r, n) = cc_layout(tier, pb, rate4);
+            if r < 1 {
+                break;
+            }
+            let params = cc_step_params(r, rate4, prm.step_r);
+            let mut soft = vec![0.0f64; n];
+            for (i, &block_idx) in remaining_perm.iter().enumerate().take(r * n) {
+                if block_erased[i] {
+                    continue;
+                }
+                let step = params.base_step * remap_watson(base_factors[block_idx], params.watson_lo, params.watson_hi);
+                soft[i % n] += qim_extract_soft(block_avgs[i], step) / (step / 2.0);
+            }
+            let bits = super::convcode::decode(code, &soft, 8 * tier);
+            let bytes = frame::bits_to_bytes(&bits);
+            if bytes.len() < 2 {
+                continue;
+            }
+            let pt_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+            let total = if use_compact { 2 + pt_len + 16 + 4 } else { 2 + 16 + 12 + pt_len + 16 + 4 };
+            if pt_len == 0 || total > tier {
+                continue;
+            }
+            let parsed = if use_compact {
+                frame::parse_fortress_compact_frame(&bytes[..total])
+            } else {
+                frame::parse_frame(&bytes[..total])
+            };
+            let Ok(parsed) = parsed else { continue };
+            let Ok(plaintext) = crypto::decrypt(&parsed.ciphertext, passphrase, &parsed.salt, &parsed.nonce) else {
+                continue;
+            };
+            let len = parsed.plaintext_len as usize;
+            if len > plaintext.len() {
+                continue;
+            }
+            let Ok(payload) = crate::stego::payload::decode_payload(&plaintext[..len]) else { continue };
+            let avg_abs = soft.iter().map(|x| x.abs()).sum::<f64>() / (n as f64 * r as f64);
+            let stats = ecc::RsDecodeStats { total_errors: 0, error_capacity: 0, max_block_errors: 0, num_blocks: 1 };
+            let mut q = super::pipeline::DecodeQuality::from_rs_stats_with_signal(&stats, r.min(255) as u8, 0, avg_abs, 1.0);
+            q.fortress_used = true;
+            return Ok((payload, q));
+        }
+    }
+    Err(StegoError::FrameCorrupted)
+}
+
+/// Normalized soft values of the Fortress payload blocks (QIM LLR / (step/2),
+/// in [-1, 1]; + = bit 0) in permutation order, for repetition factor `r`,
+/// on the received grid (measurement only).
+#[doc(hidden)]
+pub fn fortress_debug_llrs(img: &JpegImage, passphrase: &str, r: usize) -> Result<Vec<f64>, StegoError> {
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt_dc = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?.values[0];
+    let grid = img.dct_grid(0);
+    let bw = grid.blocks_wide();
+    let total = bw * grid.blocks_tall();
+    let perm = permute_blocks(total, &crypto::derive_fortress_structural_key(passphrase)?);
+    let energy = compute_energy_ratios(grid);
+    let params = adaptive_params(r);
+    let factors = watson_factors(&energy, params.watson_lo, params.watson_hi);
+    Ok(perm[FORTRESS_HEADER_BLOCKS..]
+        .iter()
+        .map(|&b| {
+            let step = params.base_step * factors[b];
+            qim_extract_soft(dc_to_avg(grid.get(b / bw, b % bw, 0, 0), qt_dc), step) / (step / 2.0)
+        })
+        .collect())
+}
+
+/// Per block (raster order): block average (DC x q / 8) and the Watson base
+/// factor in [0.3, 1.5] (measurement only).
+#[doc(hidden)]
+pub fn fortress_debug_blocks(img: &JpegImage) -> Result<Vec<(f64, f64)>, StegoError> {
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt_dc = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?.values[0];
+    let grid = img.dct_grid(0);
+    let bw = grid.blocks_wide();
+    let energy = compute_energy_ratios(grid);
+    Ok((0..bw * grid.blocks_tall())
+        .map(|b| (dc_to_avg(grid.get(b / bw, b % bw, 0, 0), qt_dc), watson_base_factor(energy.ratios[b])))
+        .collect())
 }
 
 #[cfg(test)]

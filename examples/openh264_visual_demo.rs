@@ -22,10 +22,10 @@
 #[cfg(feature = "h264-encoder")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use phasm_core::codec::h264::openh264::{
-        Encoder, PhasmStegoDomain, Position, StegoHandlers, StegoSession,
+        PhasmStegoDomain, Position, StegoHandlers, StegoSession,
     };
     use std::fs::File;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

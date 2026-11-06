@@ -30,7 +30,7 @@ use crate::codec::h264::stego::{
     record_residual_block_into_cover,
     enumerate_mvd_sign_positions, enumerate_mvd_suffix_lsb_positions,
     extract_mvd_sign_bits, extract_mvd_suffix_lsb_bits,
-    Axis, BinKind, DomainCover, MvdSlot, ResidualPathKind,
+    Axis, DomainCover, MvdSlot, ResidualPathKind,
 };
 use crate::codec::h264::stego::hook::MvdPositionMeta;
 use crate::codec::h264::stego::damage::MbSyntax;

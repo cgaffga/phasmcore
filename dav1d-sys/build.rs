@@ -34,6 +34,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // Declared on every path: the tests read it whether or not the stub is built.
+    println!("cargo:rustc-check-cfg=cfg(phasm_dav1d_stub)");
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
@@ -150,8 +152,8 @@ fn main() {
         // vendor/phasm-rav1e submodule (repo-root .cargo/config.toml),
         // phasmcore builds to github.com/cgaffga/phasm-rav1e at the rev in
         // scripts/video-cargo.sh, and sync-phasmcore.sh keeps that rev equal
-        // to the submodule gitlink. Current pin: abe19cd8 (the
-        // origin/phasm-stego tip as of 2026-10-29).
+        // to the submodule gitlink. Current pin: 5d17e129 (the
+        // origin/phasm-stego tip as of 2026-11-05).
         let head_output = Command::new("git")
             .arg("-C")
             .arg(&submodule_path)
@@ -601,7 +603,6 @@ fn build_stub(manifest_dir: &std::path::Path, searched: &[PathBuf]) {
         .warnings(true)
         .compile("phasm_dav1d_shims");
 
-    println!("cargo:rustc-check-cfg=cfg(phasm_dav1d_stub)");
     println!("cargo:rustc-cfg=phasm_dav1d_stub");
     for p in searched {
         println!("cargo:rerun-if-changed={}", p.display());

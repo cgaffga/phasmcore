@@ -93,6 +93,18 @@ const AC_CHROMA_VALS: [u8; 162] = [
     0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
 ];
 
+/// Standard (Annex K) Huffman table: `class` 0 = DC, 1 = AC; `id` 0 = the
+/// luminance table, otherwise the chrominance one (libjpeg's `std_huff_tables`).
+pub(crate) fn std_huffman_spec(class: u8, id: u8) -> HuffmanSpec {
+    let (bits, huffval) = match (class, id) {
+        (0, 0) => (DC_LUMA_BITS, DC_VALS.to_vec()),
+        (0, _) => (DC_CHROMA_BITS, DC_VALS.to_vec()),
+        (_, 0) => (AC_LUMA_BITS, AC_LUMA_VALS.to_vec()),
+        _ => (AC_CHROMA_BITS, AC_CHROMA_VALS.to_vec()),
+    };
+    HuffmanSpec { class, id, bits, huffval }
+}
+
 /// `jpeg_quality_scaling` (jcparam.c).
 pub fn quality_scaling(quality: u8) -> u32 {
     let q = quality.clamp(1, 100) as u32;
@@ -217,7 +229,7 @@ impl Geometry {
 
 /// Level-shifted luma samples of block (br, bc), edge-replicated.
 #[inline]
-fn luma_block(rgb: &[u8], g: &Geometry, br: usize, bc: usize) -> [i16; 64] {
+pub(crate) fn luma_block(rgb: &[u8], g: &Geometry, br: usize, bc: usize) -> [i16; 64] {
     let mut d = [0i16; 64];
     for row in 0..8 {
         let y = (br * 8 + row).min(g.height - 1);

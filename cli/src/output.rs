@@ -4,17 +4,6 @@
 
 use phasm_core::{DecodeQuality, EncodeQuality, GhostBands, PayloadData};
 
-/// Minimal CLI-side video capacity report (H.264 position counts). Replaces
-/// the old `phasm_core::VideoCapacity`, which was HEVC-specific and was
-/// removed with the HEVC pipeline (2026-06-04).
-#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
-#[derive(Debug, Clone)]
-pub struct CliVideoCapacityInfo {
-    pub num_i_frames: usize,
-    pub total_positions: usize,
-    pub capacity_bytes: usize,
-    pub frame_positions: Vec<usize>,
-}
 use std::time::Duration;
 
 /// Output mode determined by CLI flags.
@@ -53,12 +42,14 @@ impl CoverInfo {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn print_encode_result(
     output_path: &str,
     quality: &EncodeQuality,
     deep_cover: bool,
     mode_name: &str,
     cover: &CoverInfo,
+    kept_metadata: &[&str],
     elapsed: Duration,
     mode: OutputMode,
 ) {
@@ -66,8 +57,9 @@ pub fn print_encode_result(
         OutputMode::Quiet => println!("{output_path}"),
         OutputMode::Json => {
             let dc = if deep_cover { "true" } else { "false" };
+            let kept: Vec<String> = kept_metadata.iter().map(|k| format!("\"{}\"", json_escape(k))).collect();
             println!(
-                "{{\"output\":\"{}\",\"mode\":\"{}\",\"deepCover\":{},\"score\":{},\"hint\":\"{}\",\"width\":{},\"height\":{},\"sourceWidth\":{},\"sourceHeight\":{}}}",
+                "{{\"output\":\"{}\",\"mode\":\"{}\",\"deepCover\":{},\"score\":{},\"hint\":\"{}\",\"width\":{},\"height\":{},\"sourceWidth\":{},\"sourceHeight\":{},\"keptMetadata\":[{}]}}",
                 json_escape(output_path),
                 json_escape(mode_name),
                 dc,
@@ -77,6 +69,7 @@ pub fn print_encode_result(
                 cover.encoded.1,
                 cover.source.0,
                 cover.source.1,
+                kept.join(","),
             );
         }
         OutputMode::Verbose => {
@@ -109,7 +102,7 @@ pub fn print_encode_result(
 pub fn print_decode_result(
     payload: &PayloadData,
     quality: &DecodeQuality,
-    extract_dir: Option<&str>,
+    extracted: Option<&[String]>,
     elapsed: Duration,
     mode: OutputMode,
 ) {
@@ -139,10 +132,14 @@ pub fn print_decode_result(
                         json.push(',');
                     }
                     json.push_str(&format!(
-                        "{{\"name\":\"{}\",\"size\":{}}}",
+                        "{{\"name\":\"{}\",\"size\":{}",
                         json_escape(&f.filename),
                         f.content.len()
                     ));
+                    if let Some(path) = extracted.and_then(|p| p.get(i)) {
+                        json.push_str(&format!(",\"path\":\"{}\"", json_escape(path)));
+                    }
+                    json.push('}');
                 }
                 json.push(']');
             }
@@ -165,24 +162,23 @@ pub fn print_decode_result(
                 );
             }
             println!("Time: {:.1}s", elapsed.as_secs_f64());
-            print_attachments(&payload.files, extract_dir);
+            print_attachments(&payload.files, extracted);
         }
         OutputMode::Default => {
             println!("{}", payload.text);
-            print_attachments(&payload.files, extract_dir);
+            print_attachments(&payload.files, extracted);
         }
     }
 }
 
-fn print_attachments(files: &[phasm_core::FileEntry], extract_dir: Option<&str>) {
+fn print_attachments(files: &[phasm_core::FileEntry], extracted: Option<&[String]>) {
     if files.is_empty() {
         return;
     }
     println!();
-    match extract_dir {
-        Some(dir) => {
-            for f in files {
-                let path = format!("{}/{}", dir, f.filename);
+    match extracted {
+        Some(paths) => {
+            for (f, path) in files.iter().zip(paths) {
                 println!("Extracted: {} ({})", path, format_size(f.content.len()));
             }
         }
@@ -274,33 +270,6 @@ pub fn print_video_encode_result(
 }
 
 // ── Video capacity output ──
-
-#[cfg(any(feature = "h264-encoder", feature = "av1-encoder"))]
-pub fn print_video_capacity(info: &CliVideoCapacityInfo, json: bool) {
-    if json {
-        let frames_json: Vec<String> = info
-            .frame_positions
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
-        println!(
-            "{{\"iFrames\":{},\"totalPositions\":{},\"capacityBytes\":{},\"framePositions\":[{}]}}",
-            info.num_i_frames,
-            info.total_positions,
-            info.capacity_bytes,
-            frames_json.join(","),
-        );
-        return;
-    }
-    println!("I-frames:   {}", info.num_i_frames);
-    println!("Positions:  {}", info.total_positions);
-    println!("Capacity:   {} bytes", info.capacity_bytes);
-    if info.frame_positions.len() > 1 {
-        for (i, count) in info.frame_positions.iter().enumerate() {
-            println!("  Frame {i}: {count} positions");
-        }
-    }
-}
 
 // ── Helpers ──
 

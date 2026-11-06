@@ -1626,7 +1626,7 @@ pub(super) mod wasm {
         // Dequant inline: i16 lane-wise multiply (wrapping; same as
         // NEON `vmul_s16` and AVX2 `vpmullw` — values fit in i16 for
         // valid 8-bit JPEG).
-        let mut rows: [v128; 8] = [
+        let rows: [v128; 8] = [
             i16x8_mul(v128_load(qp), v128_load(tp)),
             i16x8_mul(v128_load(qp.add(1)), v128_load(tp.add(1))),
             i16x8_mul(v128_load(qp.add(2)), v128_load(tp.add(2))),

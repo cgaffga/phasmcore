@@ -33,7 +33,7 @@
 //!   every side), so a border block is priced over its whole window
 //!   exactly like an interior one.
 //!
-//! This is the semantics of Butora & Bas's corrected reference
+//! This is the semantics of Lorch's corrected reference
 //! (`JUNIWARD_FIX_OFF_BY_ONE`, arXiv:2305.19776). The v1 kernel that
 //! shipped up to 0.4.x differed in two ways — it skipped out-of-image
 //! window samples (border blocks priced too cheaply, flips piled into the
@@ -63,15 +63,6 @@
 //!   JPEG Coders" / the J-UNIWARD off-by-one note, arXiv:2305.19776.
 
 use crate::codec::jpeg::dct::{DctGrid, QuantTable};
-// T3.1.F — ghost UNIWARD bulk pixel-domain decompression routes
-// through the integer LL&M IDCT.
-//
-// `precompute_basis_functions` is the exception: it calls
-// `crate::codec::jpeg::pixels::idct_block` EXPLICITLY (the f64
-// reference) because basis impulses require sub-LSB precision that
-// integer LL&M descales to zero. Called once per encode → no perf
-// impact.
-use crate::codec::jpeg::pixels_aan::aan_idct_block as idct_block;
 use crate::stego::error::StegoError;
 use crate::stego::progress;
 use super::CostMap;
@@ -447,10 +438,78 @@ impl PaddedSubbands {
     }
 }
 
+/// `IDCT_BASIS[k][y] = C(k) · cos((2y + 1)kπ/16)`, `C(0) = 1/√8`,
+/// `C(k > 0) = ½` (det_math cosines: identical on every platform).
+fn idct_basis() -> &'static [[f64; 8]; 8] {
+    static T: std::sync::OnceLock<[[f64; 8]; 8]> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut t = [[0.0f64; 8]; 8];
+        for (k, row) in t.iter_mut().enumerate() {
+            let c = if k == 0 { 0.5 * core::f64::consts::FRAC_1_SQRT_2 } else { 0.5 };
+            for (y, v) in row.iter_mut().enumerate() {
+                *v = c * crate::det_math::det_cos(((2 * y + 1) * k) as f64 * core::f64::consts::PI / 16.0);
+            }
+        }
+        t
+    })
+}
+
+/// The cost function's decompression of one block: dequantize and the 2-D
+/// IDCT in f64, **not rounded and not clamped** (`idct2` of the dequantized
+/// block, + 128). Rounded pixels (the integer IDCT a decoder uses) put ±½ of
+/// rounding noise into smooth areas: their wavelet responses grow and the
+/// costliest decile was priced at 0.38× the unrounded cost (fix list R3.17).
+/// Note: the authors' `J_UNIWARD.m` reads the cover with `imread`, i.e.
+/// rounded pixels; the unrounded input is a deliberate choice here.
+///
+/// Separable and sparse (only non-zero coefficients, only columns that hold
+/// one), a fixed order of f64 multiply-adds without FMA: bit-identical on
+/// every platform.
+#[inline]
+fn idct_block(block: &[i16], qt: &[u16; 64]) -> [f64; 64] {
+    let t = idct_basis();
+    // Column pass: tmp[y][u] = Σ_v f[v][u] · T[v][y] over the non-zero f.
+    let mut tmp = [[0.0f64; 8]; 8];
+    let mut cols = 0u8;
+    for (i, &q) in block.iter().enumerate().take(64) {
+        if q == 0 {
+            continue;
+        }
+        let (v, u) = (i >> 3, i & 7);
+        let f = q as f64 * qt[i] as f64;
+        cols |= 1 << u;
+        for y in 0..8 {
+            tmp[y][u] += f * t[v][y];
+        }
+    }
+    let mut out = [128.0f64; 64];
+    if cols == 0 {
+        return out;
+    }
+    // Row pass: out[y][x] = 128 + Σ_u tmp[y][u] · T[u][x].
+    for y in 0..8 {
+        let mut row = [0.0f64; 8];
+        for u in 0..8 {
+            if cols & (1 << u) == 0 {
+                continue;
+            }
+            let a = tmp[y][u];
+            for x in 0..8 {
+                row[x] += a * t[u][x];
+            }
+        }
+        for x in 0..8 {
+            out[y * 8 + x] = 128.0 + row[x];
+        }
+    }
+    out
+}
+
 /// Symmetric-padded pixel rows `[py0, py0 + n_rows)` of the decompressed
-/// grid, `img_w + 2·PIX_MARGIN` samples each (plane column `x` at buffer
-/// column `x + PIX_MARGIN`). Pixel `(x, y)` outside the image is the
-/// pixel at `(symmetric_index(x), symmetric_index(y))`.
+/// grid (unrounded, [`idct_block`]), `img_w + 2·PIX_MARGIN` samples each
+/// (plane column `x` at buffer column `x + PIX_MARGIN`). Pixel `(x, y)`
+/// outside the image is the pixel at `(symmetric_index(x),
+/// symmetric_index(y))`.
 fn padded_pixel_rows(grid: &DctGrid, qt: &QuantTable, py0: isize, n_rows: usize) -> Vec<f32> {
     let mut pix = Vec::new();
     padded_pixel_rows_into(&mut pix, grid, qt, py0, n_rows);
@@ -821,7 +880,7 @@ pub(super) const STRIP_BLOCK_ROWS: usize = 50;
 pub(super) const MIN_SI_COST_F32: f32 = 1e-6;
 
 /// J-UNIWARD cost of a ±1 change for **every** Y AC coefficient, zeros
-/// included (Ghost embedding v3, `ghost::v3`), in flat order
+/// included (Ghost embedding v3, `ghost::v31`), in flat order
 /// (`block_index · 64 + i · 8 + j`; DC entries are `+∞`).
 ///
 /// The J-UNIWARD cost depends only on the block's neighbourhood and the

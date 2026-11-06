@@ -11,7 +11,7 @@
 //! The matrix is generated deterministically from a seed so encoder and
 //! decoder produce identical matrices.
 
-use rand::Rng;
+use crate::stego::rng_compat::Rand08;
 use rand_chacha::ChaCha20Rng;
 use rand::SeedableRng;
 
@@ -26,7 +26,7 @@ pub fn generate_hhat(h: usize, w: usize, seed: &[u8; 32]) -> Vec<Vec<u32>> {
 
     let mut cols: Vec<u32> = Vec::with_capacity(w);
     for _ in 0..w {
-        let mut val = rng.r#gen::<u32>() & mask;
+        let mut val = rng.gen08::<u32>() & mask;
         // Ensure odd Hamming weight so every column contributes to the syndrome.
         if val.count_ones().is_multiple_of(2) {
             val ^= 1; // flip lowest bit

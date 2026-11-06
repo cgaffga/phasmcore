@@ -95,26 +95,6 @@ Fortress survives WhatsApp recompression (QF ~62, resolution resize to 1600px). 
 
 [Watson perceptual masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) adapts the embedding strength per-block based on local texture energy, keeping modifications invisible in textured regions while protecting smooth areas.
 
-### Cover Image Optimizer
-
-`optimize_cover` preprocesses raw pixels before JPEG compression to improve embedding quality and capacity. Each mode has a different pipeline:
-
-- **Ghost**: Texture-adaptive 4-stage pipeline (noise injection, micro-contrast, unsharp mask, smooth-region dithering). Per-pixel 5×5 variance map adapts strength to existing texture — avoids degrading pre-optimized images.
-- **Armor**: Light pipeline (block-boundary smoothing, DC stabilization) for STDM robustness.
-- **Fortress**: Minimal (block-boundary smoothing only) to stabilize DC averages for BA-QIM.
-
-**"Do no harm" guarantee**: if optimization reduces average gradient energy (a proxy for stego capacity), the original pixels are returned unchanged. Modifications are imperceptible (PSNR > 44 dB, SSIM > 0.993).
-
-```rust
-use phasm_core::{optimize_cover, OptimizerConfig, OptimizerMode};
-
-let optimized = optimize_cover(&raw_pixels_rgb, width, height, &OptimizerConfig {
-    strength: 0.85,
-    seed: [0u8; 32], // ChaCha20 seed for deterministic noise
-    mode: OptimizerMode::Ghost,
-});
-```
-
 ### Decode Auto-Detection
 
 `smart_decode` tries all modes automatically — Ghost primary (v3, then v1) → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
@@ -252,9 +232,6 @@ armor_capacity_info(jpeg_bytes) -> Result<ArmorCapacityInfo>
 // Unified decode (auto-detects mode)
 smart_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 
-// Cover image optimizer (preprocessing before JPEG compression)
-optimize_cover(pixels_rgb, width, height, config) -> Vec<u8>
-
 // Capacity estimation with Brotli compression
 compressed_payload_size(text, files) -> usize
 
@@ -279,8 +256,6 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`GhostBands`** — Ghost capacity-bar bands in plaintext bytes (`max_bytes`, `comfort_bytes`, `caution_bytes`)
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
-- **`OptimizerConfig`** — optimizer settings (strength, seed, mode)
-- **`OptimizerMode`** — pipeline variant (Ghost, Armor, Fortress)
 
 The SI-UNIWARD functions (`ghost_encode_si*`, `ghost_bands_si`, `ghost_capacity_si`, `estimate_shadow_capacity_si`) accept additional parameters for the raw uncompressed pixels (`raw_rgb: &[u8]`, `width: u32`, `height: u32`). The side information is exact, and the Deep Cover capacity applies, only when the cover JPEG is `deep_cover_jpeg`'s output for those same pixels; any other cover gets approximate side information and standard Ghost capacity. The decoder does not need side information — `ghost_decode` and `smart_decode` work for both standard and SI-UNIWARD encoded images.
 
@@ -436,6 +411,10 @@ phasm encode photo.jpg --mode ghost -m "secret" -p "pass" -o secret.jpg
 
 # PNG input → auto Deep Cover (SI-UNIWARD)
 phasm encode photo.png --mode ghost -m "hello" -p "pass"
+
+# Strip the metadata (GPS, camera, serial numbers…), like the apps' magic wand.
+# Without --optimize the output keeps it, and encode lists what is kept.
+phasm encode photo.jpg --mode ghost -m "hello" -p "pass" --optimize
 
 # Shadow messages (plausible deniability)
 phasm encode photo.jpg --mode ghost -m "real" -p "main" --shadow-message-2 "decoy" --shadow-passphrase-2 "shadow"
@@ -638,7 +617,6 @@ src/
       side_info.rs  SI-UNIWARD: rounding errors (exact / approximate), cost modulation
       shadow.rs     Shadow messages (keyed-region STC; layout v1 decode)
       capacity.rs   Ghost capacity and capacity-bar bands
-      optimizer.rs  Cover image optimizer (texture-adaptive preprocessing, do-no-harm)
       quality.rs    Encode quality scoring (stealth for Ghost, robustness for Armor)
     cost/
       mod.rs        Cost function trait

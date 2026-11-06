@@ -250,7 +250,7 @@ fn build_mp4_av1_timed_from_path_matches_the_byte_slice_mux() {
 
 #[test]
 fn build_mp4_av1_timed_from_path_without_a_source_is_video_only() {
-    use phasm_core::codec::mp4::build::{build_mp4_av1_timed, build_mp4_av1_timed_from_path};
+    use phasm_core::codec::mp4::build::build_mp4_av1_timed_from_path;
     let stream = make_synthetic_av1_stream(3);
     let timing = FrameTiming { fps_num: 30, fps_den: 1 };
     let from_path = build_mp4_av1_timed_from_path(&stream, 640, 480, timing, &[], None)

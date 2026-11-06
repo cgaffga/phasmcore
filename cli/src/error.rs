@@ -6,6 +6,7 @@ use phasm_core::{JpegError, StegoError};
 use std::fmt;
 
 /// Exit codes for the CLI.
+#[allow(dead_code)] // the exit-code table's success entry (main returns normally)
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_GENERAL: i32 = 1;
 pub const EXIT_STEGO: i32 = 2;
@@ -48,7 +49,7 @@ impl fmt::Display for CliError {
                 write!(f, "Decryption failed — wrong passphrase or not a stego image")
             }
             CliError::Stego(StegoError::MessageTooLarge) => {
-                write!(f, "Message too large for this image")
+                write!(f, "Message too large for this image (`phasm capacity` shows the limits; use a shorter message or a larger image)")
             }
             CliError::Stego(StegoError::ImageTooSmall) => {
                 write!(f, "Image too small for steganography")

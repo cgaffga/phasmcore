@@ -2065,7 +2065,7 @@ fn cap_app_planner_accept_ceiling_vs_displayed_capacity() {
     let cal = AllocationCalibration::H264_1080P_QP26;
 
     // Does the app planner accept `len` raw message bytes on these caps?
-    let accepts = |yuv: &[u8], w: u32, h: u32, n: u32, caps: &[usize], len: usize| -> bool {
+    let accepts = |_yuv: &[u8], w: u32, h: u32, n: u32, caps: &[usize], len: usize| -> bool {
         let params = EncodeSessionParams {
             width: w, height: h, fps_num: 30, fps_den: 1, qp: 26, gop_size: GOP,
             total_frames_hint: n, color: ColorParams::default(),
@@ -2132,7 +2132,6 @@ fn cap_app_planner_accept_ceiling_vs_displayed_capacity() {
         let (mut lo, mut hi) = (0usize, reported + 1); // lo accepts, hi refuses
         if accepts(&yuv, w, h, n, &caps, reported) {
             lo = reported;
-            hi = reported + 1;
         } else {
             while hi - lo > 1 {
                 let mid = lo + (hi - lo) / 2;

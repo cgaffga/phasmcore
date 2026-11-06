@@ -15,13 +15,15 @@
 //! `tests::matches_rand_chacha` pins the scalar path to `ChaCha20Rng`;
 //! `chacha_stream_test_hash_hex` pins the WASM bundle to native.
 
-use rand::RngCore;
+use core::convert::Infallible;
+use rand::TryRng;
 
 const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 const BUF_WORDS: usize = 64;
 
 /// `ChaCha20Rng::from_seed(seed)`'s stream (see the module docs). Only the
-/// `RngCore` methods are provided; `gen_range` etc. come from `rand::Rng`.
+/// word methods are provided (`rand::Rng`, through `TryRng`); samplers come from
+/// [`crate::stego::rng_compat::Rand08`].
 pub struct ChaCha20Stream {
     key: [u32; 8],
     counter: u64,
@@ -45,9 +47,9 @@ impl ChaCha20Stream {
     }
 }
 
-impl RngCore for ChaCha20Stream {
+impl ChaCha20Stream {
     #[inline]
-    fn next_u32(&mut self) -> u32 {
+    fn word(&mut self) -> u32 {
         if self.idx >= BUF_WORDS {
             self.refill();
             self.idx = 0;
@@ -58,7 +60,7 @@ impl RngCore for ChaCha20Stream {
     }
 
     /// As `rand_core::block::BlockRng::next_u64`.
-    fn next_u64(&mut self) -> u64 {
+    fn dword(&mut self) -> u64 {
         let i = self.idx;
         if i < BUF_WORDS - 1 {
             self.idx += 2;
@@ -76,20 +78,36 @@ impl RngCore for ChaCha20Stream {
     }
 
     /// Whole words, little-endian (as `rand_core`'s `fill_via_u32_chunks`).
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn fill(&mut self, dest: &mut [u8]) {
         for chunk in dest.chunks_mut(4) {
-            let w = self.next_u32().to_le_bytes();
+            let w = self.word().to_le_bytes();
             chunk.copy_from_slice(&w[..chunk.len()]);
         }
     }
+}
 
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.fill_bytes(dest);
+impl TryRng for ChaCha20Stream {
+    type Error = Infallible;
+
+    #[inline]
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        Ok(self.word())
+    }
+
+    #[inline]
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        Ok(self.dword())
+    }
+
+    #[inline]
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Infallible> {
+        self.fill(dest);
         Ok(())
     }
 }
 
 #[inline(always)]
+#[allow(dead_code)] // the scalar reference: off the SIMD targets and in the tests
 fn quarter(x: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     x[a] = x[a].wrapping_add(x[b]);
     x[d] = (x[d] ^ x[a]).rotate_left(16);
@@ -111,6 +129,7 @@ fn initial_state(key: &[u32; 8], counter: u64) -> [u32; 16] {
 }
 
 /// One ChaCha20 block (scalar reference).
+#[allow(dead_code)] // off the SIMD targets and in the tests
 fn block(key: &[u32; 8], counter: u64, out: &mut [u32]) {
     let s = initial_state(key, counter);
     let mut x = s;
@@ -197,7 +216,7 @@ fn blocks4(key: &[u32; 8], counter: u64, out: &mut [u32; BUF_WORDS]) {
 /// check the SIMD128 block function.
 #[doc(hidden)]
 pub fn chacha_stream_test_hash_hex() -> String {
-    use rand::Rng;
+    use crate::stego::rng_compat::{Rand08, WordRng as _};
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     let mut r = ChaCha20Stream::from_seed(*b"phasm chacha stream test seed 01");
@@ -205,7 +224,7 @@ pub fn chacha_stream_test_hash_hex() -> String {
         h.update(r.next_u32().to_le_bytes());
     }
     for i in 0..1000u32 {
-        h.update(r.gen_range(0..=i * 7919 + 1).to_le_bytes());
+        h.update(r.gen_range08(0..=i * 7919 + 1).to_le_bytes());
         if i % 7 == 3 {
             h.update(r.next_u64().to_le_bytes());
         }
@@ -216,7 +235,8 @@ pub fn chacha_stream_test_hash_hex() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng};
+    use crate::stego::rng_compat::{Rand08, WordRng as _};
+    use rand::SeedableRng;
 
     #[test]
     fn matches_rand_chacha() {
@@ -226,7 +246,7 @@ mod tests {
             for i in 0..20_000u32 {
                 match i % 11 {
                     3 => assert_eq!(a.next_u64(), b.next_u64(), "u64 at {i}"),
-                    5 => assert_eq!(a.gen_range(0..=i), b.gen_range(0..=i), "range at {i}"),
+                    5 => assert_eq!(a.gen_range08(0..=i), b.gen_range08(0..=i), "range at {i}"),
                     _ => assert_eq!(a.next_u32(), b.next_u32(), "u32 at {i}"),
                 }
             }
@@ -238,7 +258,7 @@ mod tests {
             sha2::Digest::update(&mut h, r.next_u32().to_le_bytes());
         }
         for i in 0..1000u32 {
-            sha2::Digest::update(&mut h, r.gen_range(0..=i * 7919 + 1).to_le_bytes());
+            sha2::Digest::update(&mut h, r.gen_range08(0..=i * 7919 + 1).to_le_bytes());
             if i % 7 == 3 {
                 sha2::Digest::update(&mut h, r.next_u64().to_le_bytes());
             }

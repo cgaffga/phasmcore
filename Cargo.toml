@@ -8,7 +8,7 @@ exclude = ["vendor"]
 
 [package]
 name = "phasm-core"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
@@ -95,19 +95,22 @@ test-hooks = []
 # `docs/design/image/t3.1-integer-aan.md`.
 
 [dependencies]
-aes-gcm-siv = "0.11"
-argon2 = "0.5"
-rand = "0.8"
-rand_chacha = "0.3"
+aes-gcm-siv = "0.12"
+argon2 = "0.6"
+# Wire-critical: every keyed draw goes through `stego::rng_compat` (the
+# rand 0.8 samplers), and the ChaCha20 stream itself is pinned by the
+# golden tests (`stego::rng_golden_tests`). See docs/runbooks/release.md 0.5.
+rand = "0.10"
+rand_chacha = "0.10"
 crc32fast = "1.4"
-hmac = "0.12"
+hmac = "0.13"
 # T2.12 — radix sort u64 ChaCha20 priorities in shadow position
 # selection. Pure Rust, no_std, MIT/Apache, no transitive deps.
 radsort = "0.1"
-sha2 = "0.10"
+sha2 = "0.11"
 num-complex = "0.4"
 rayon = { version = "1", optional = true }
-brotli = { version = "7", default-features = false, features = ["std"] }
+brotli = { version = "9", default-features = false, features = ["std"] }
 zeroize = "1"
 memmap2 = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
@@ -150,11 +153,15 @@ phasm-rav1e = { package = "rav1e", version = "=0.8.0", optional = true, default-
 # arbitrary MP without bundling huge binary blobs in test-vectors/.
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
-# libc for peak-RSS query in the 60 MP memory regression test
-# (`tests/optimizer_memory_60mp.rs`). POSIX `getrusage` via libc is
-# the cleanest cross-Unix way; non-Unix targets fall through with
-# RSS=0 (the test still gates wall time on those).
+# libc for peak-RSS queries in the memory tests and probes
+# (`tests/h264_encode_perf_real.rs`, `examples/mem_probe.rs`). POSIX
+# `getrusage` via libc is the cleanest cross-Unix way.
 libc = "0.2"
+# The real rand 0.8 samplers and rand_chacha 0.3 stream, for the
+# differential tests of `stego::rng_compat` (the rand 0.8 samplers every
+# keyed layout uses). Tests only: never in a shipped build.
+rand08 = { package = "rand", version = "0.8.5" }
+rand_chacha03 = { package = "rand_chacha", version = "0.3.1" }
 
 # `h264_cabac_decoder` is a standalone spec-direct CABAC decoder
 # (debugging aid) that imports the H.264 walker/parser modules at
@@ -236,18 +243,16 @@ lto = "thin"
 [lints.rust]
 # Edition 2024 promotes `unsafe_op_in_unsafe_fn` (calling an unsafe
 # intrinsic in an `unsafe fn` body without an inner `unsafe {}` block).
-# The hand-written SIMD kernels (NEON / SSE / AVX / wasm-simd) trip it
-# ~121× across ~33 fns (uniward_simd, inject, embed, fft2d_simd,
-# embedding_simd, optimizer_simd, pixels_aan_simd, av1_uniward).
+# The hand-written SIMD kernels (NEON / SSE / AVX / wasm-simd) tripped it
+# ~121x across ~33 fns.
 #
-# DELIBERATE POSTURE (decided 2026-06-09, #846): keep at `warn` — the
-# `rust_2024_compatibility` migration default — rather than wrap every
-# intrinsic. The wrapping is purely syntactic (zero behavior change), and
-# these kernels are bit-exact cross-platform; churning 121 edits through
-# determinism-critical SIMD for a cosmetic lint isn't worth the risk.
-# `warn` keeps the migration visible AND lets a FRESH build of the
-# published decode-only mirror compile (without it the staged tree hits
-# E0133). If we ever wrap them, drop this line.
+# 2026-06-09 (#846) kept it at `warn` rather than wrap every intrinsic.
+# Since 2026-11-02 (maintainer: clear the warnings) the image kernels
+# wrap their whole body in one `unsafe {}` block (syntactic only; the
+# SIMD-vs-scalar parity tests are unchanged and pass); the H.264 and AV1
+# kernels follow. `warn` stays so a FRESH build of the published mirror
+# compiles even if one is missed (E0133 otherwise); drop this line once
+# no kernel trips it.
 unsafe_op_in_unsafe_fn = "warn"
 # `examples/mem_probe.rs` builds in the ios-bridge allocator under
 # `--cfg phasm_large_alloc` (footprint measurements).

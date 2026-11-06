@@ -337,7 +337,7 @@ pub fn parse_sequence_header_obu(obu_bytes: &[u8]) -> Option<Av1SequenceHeaderIn
     let _still_picture = br.read_bits(1)?;
     let reduced_still_picture_header = br.read_bits(1)? != 0;
 
-    let mut seq_level_idx_0: u8 = 0;
+    let seq_level_idx_0: u8;
     let mut seq_tier_0: u8 = 0;
 
     if reduced_still_picture_header {

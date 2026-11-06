@@ -5,9 +5,11 @@
 //! Media format codecs — pure I/O parsers with no steganographic logic.
 //!
 //! - [`jpeg`] — JPEG coefficient codec (zero-dependency, byte-for-byte round-trip)
+//! - [`resample`] — the cover resampler (deterministic Lanczos-3 on 8-bit sRGB)
 //! - [`mp4`] — ISO BMFF / QuickTime MP4/MOV container demuxer and muxer
 
 pub mod jpeg;
+pub mod resample;
 
 #[cfg(feature = "video")]
 pub mod h264;

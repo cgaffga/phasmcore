@@ -189,6 +189,7 @@ struct DensityResult {
     actual_density_of_safe: f64,
     actual_density_of_total: f64,
     structural_delta: i64,
+    #[allow(dead_code)] // recorded per row but not reported
     n_unintended_outside_set: usize,
     leak_pct_of_total: f64,
     cliff_band: CliffBand,

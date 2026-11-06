@@ -11,13 +11,17 @@ use phasm_core::{
     compressed_payload_size, ghost_bands, ghost_bands_si, ghost_encode_si_with_shadows_quality,
     ghost_encode_with_shadows_quality, armor_encode_with_quality,
     ghost_encode_si_with_files_quality, ghost_encode_with_files_quality,
-    EncodeQuality, FileEntry, JpegImage, ShadowLayer, ARMOR_TARGET_DIMENSION,
+    EncodeQuality, FileEntry, JpegImage, ShadowLayer, StegoError, ARMOR_TARGET_DIMENSION,
 };
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::{Parser, ArgAction};
+
+/// Ghost encodes tried (each with a fresh salt/nonce) before reporting
+/// `MessageTooLarge`.
+const GHOST_ENCODE_ATTEMPTS: u32 = 3;
 
 #[derive(Parser)]
 pub struct EncodeArgs {
@@ -70,11 +74,15 @@ pub struct EncodeArgs {
     #[arg(long, default_value = "armor")]
     pub mode: String,
 
-    /// JPEG quality factor (default: 92 Ghost, 65 Armor)
+    /// Ghost: JPEG quality of the cover phasm writes (default 92). On a
+    /// JPEG kept at its own size it forces a re-encode (a weaker cover).
+    /// Armor covers are always QF65.
     #[arg(long)]
     pub qf: Option<u8>,
 
-    /// Resize longest edge to max pixels (Armor default: 1600)
+    /// Ghost: shrink the longest edge to at most this many pixels. Armor:
+    /// replaces the channel preset with this size (QF65; not
+    /// recompression-robust above 1600 px)
     #[arg(long)]
     pub resize: Option<u32>,
 
@@ -84,7 +92,18 @@ pub struct EncodeArgs {
     #[arg(long, conflicts_with = "resize")]
     pub full_res: bool,
 
-    /// Run texture-adaptive cover optimizer
+    /// Armor: the channel the message is meant for, which sets the cover
+    /// size: standard (1600 px long side: WhatsApp, Signal, e-mail),
+    /// telegram (1280 px) or instagram (1080 px wide)
+    #[arg(long, value_parser = crate::image_conv::parse_armor_preset, default_value = "standard",
+          conflicts_with_all = ["resize", "full_res"])]
+    pub armor_preset: phasm_core::ArmorCoverPreset,
+
+    /// Strip the metadata, like the apps' magic wand: a JPEG that is used as
+    /// it is gets cleaned losslessly (EXIF orientation applied); a cover
+    /// phasm writes gets none. Without it the output keeps the source's
+    /// metadata (a written cover: its EXIF, cleaned) and `encode` lists what
+    /// is kept. No pixel filter.
     #[arg(long)]
     pub optimize: bool,
 
@@ -131,14 +150,51 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
     if args.full_res && mode != "armor" {
         return Err(CliError::InvalidArgs("--full-res applies to Armor only.".into()));
     }
+    if args.qf.is_some() && mode == "armor" {
+        return Err(CliError::InvalidArgs(
+            "--qf applies to Ghost only: Armor covers are always written at QF65 (what its robustness was measured on).".into(),
+        ));
+    }
 
     // 5. Prepare image (format conversion, resize, optimize; Armor's 1600 px cover)
     let prepared = prepare_image(
-        &args.image, mode, args.qf, args.resize, args.optimize, args.full_res,
+        &args.image, mode, args.qf, args.resize, args.optimize, args.full_res, args.armor_preset,
     )?;
-    // Deep Cover is side-informed Ghost; Armor ignores the raw pixels.
-    let deep_cover = mode == "ghost" && prepared.raw_pixels.is_some();
-    if mode == "armor" && prepared.exceeds_armor_target() && !args.quiet {
+    // Deep Cover is side-informed Ghost; Armor ignores the raw pixels. Core
+    // drops the side information for pixels that are a decoded JPEG on the
+    // cover's grid (e.g. a PNG saved from a JPEG at the same size).
+    let decoded_jpeg = mode == "ghost"
+        && prepared
+            .raw_pixels
+            .as_deref()
+            .is_some_and(|px| phasm_core::is_aligned_jpeg_decode(px, prepared.width, prepared.height));
+    let deep_cover = mode == "ghost" && prepared.raw_pixels.is_some() && !decoded_jpeg;
+    if let (Some(note), false) = (&prepared.color_note, args.quiet) {
+        eprintln!("note: {note}");
+    }
+    if mode == "ghost" && !args.quiet {
+        if prepared.jpeg_reencoded_same_size {
+            eprintln!(
+                "warning: --qf re-encodes this JPEG at its own size, which makes a double-compressed \
+                 cover; it is embedded without Deep Cover side information. Without --qf the \
+                 original file is used as it is, which is the better cover."
+            );
+        }
+        if prepared.lossless_clean {
+            eprintln!(
+                "note: --optimize on a JPEG: metadata removed and EXIF orientation applied without \
+                 re-encoding (the original coefficients are the cover)."
+            );
+        }
+        if decoded_jpeg {
+            eprintln!(
+                "note: these pixels are a decoded JPEG at its own size (same 8x8 grid), so they \
+                 carry no usable side information; embedding as plain Ghost."
+            );
+        }
+    }
+    // (An Instagram cover may be taller than 1600 px; Instagram keeps it.)
+    if mode == "armor" && (args.full_res || args.resize.is_some()) && prepared.exceeds_armor_target() && !args.quiet {
         let why = if args.full_res {
             "--full-res".to_string()
         } else {
@@ -165,19 +221,35 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
         None
     };
 
-    // 7. Encode
+    // 7. Encode. A Ghost payload far above the bands' maximum (over ~2/3 of
+    // the Y AC positions) leaves the trellis so little room that it can be
+    // infeasible for one random salt/nonce and feasible for the next: retry
+    // with fresh ones (the decoder does not care) before giving up.
     let start = Instant::now();
-    let (stego_bytes, quality) = do_encode(
-        mode,
-        &prepared.jpeg_bytes,
-        prepared.raw_pixels.as_deref(),
-        prepared.width,
-        prepared.height,
-        &message,
-        &files,
-        &passphrase,
-        &shadows,
-    )?;
+    let attempts = if mode == "ghost" { GHOST_ENCODE_ATTEMPTS } else { 1 };
+    let mut attempt = 1;
+    let (stego_bytes, quality) = loop {
+        let result = do_encode(
+            mode,
+            &prepared.jpeg_bytes,
+            prepared.raw_pixels.as_deref(),
+            prepared.width,
+            prepared.height,
+            &message,
+            &files,
+            &passphrase,
+            &shadows,
+        );
+        match result {
+            Err(CliError::Stego(StegoError::MessageTooLarge)) if attempt < attempts => {
+                if !args.quiet {
+                    eprintln!("note: the message barely fits this cover; retrying with a fresh salt ({attempt}/{attempts})");
+                }
+                attempt += 1;
+            }
+            other => break other?,
+        }
+    };
     let elapsed = start.elapsed();
 
     // 8. Join progress thread
@@ -188,6 +260,16 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
     // 9. Write output
     let output_path = write_output(&args.image, args.output.as_deref(), &stego_bytes)?;
 
+    // The source's metadata the output keeps (fix list R3.10: kept by
+    // default, but said; `--optimize` strips it).
+    let kept_metadata = crate::metadata::identifying_metadata(&stego_bytes);
+    if !kept_metadata.is_empty() && !args.quiet {
+        eprintln!(
+            "warning: the output keeps the source's metadata: {}. Add --optimize to strip it.",
+            kept_metadata.join(", ")
+        );
+    }
+
     // 10. Display result
     let out_mode = output_mode(&args);
     let mode_name = if mode == "ghost" { "Ghost" } else { "Armor" };
@@ -196,7 +278,7 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
         encoded: (prepared.width, prepared.height),
         qf: prepared.reencoded_qf,
     };
-    output::print_encode_result(&output_path, &quality, deep_cover, mode_name, &cover, elapsed, out_mode);
+    output::print_encode_result(&output_path, &quality, deep_cover, mode_name, &cover, &kept_metadata, elapsed, out_mode);
 
     Ok(())
 }

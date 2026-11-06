@@ -2611,7 +2611,7 @@ fn decode_residual_block_recording(
     mb_addr: u32,
     nal_idx: u32,
     path_kind: ResidualPathKind,
-    recorder: &mut PositionRecorder,
+    _recorder: &mut PositionRecorder,
 ) -> Result<Vec<i32>, WalkError> {
     let mut null = NullLogger;
     let logger: &mut dyn PositionLogger = &mut null;

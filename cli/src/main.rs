@@ -3,10 +3,12 @@
 // https://github.com/cgaffga/phasmcore
 
 mod capacity;
+mod color;
 mod decode;
 mod encode;
 mod error;
 mod image_conv;
+mod metadata;
 mod output;
 mod passphrase;
 mod progress;

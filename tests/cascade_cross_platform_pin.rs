@@ -88,13 +88,17 @@ fn encode_and_hash() -> String {
 /// - `0f2802224f275acc…` (2026-10-27) — Ghost v3
 ///   (`docs/design/image/ghost-embedding-v3.md`): ternary STC over all Y AC
 ///   coefficients (STC height 9), shadows on keyed regions of the all-AC set.
+/// - `bd1c113c411094bc…` (2026-11-03) — Ghost v3.1 (keyed pairs,
+///   mixed-width STCs, costs on the unrounded image; the shadow layout is
+///   unchanged, its costs and the primary moved).
 const EXPECTED_SHADOW_ENCODE_HASH: &str =
-    "0f2802224f275accb98f7b4edec35d66c31ecfdf617b8f20dde8d60d3b98cc20";
+    "bd1c113c411094bc4cb25f517767186611e0909b95e0367361b92657b47e7264";
 
-/// Ghost v3 primary, no shadows (same seed, cover and passphrase as the
+/// Ghost v3.1 primary, no shadows (same seed, cover and passphrase as the
 /// shadow pin's primary).
+/// v3: `0efed1f4b986dae6…`; v3.1 (2026-11-03) below.
 const EXPECTED_PRIMARY_ENCODE_HASH: &str =
-    "0efed1f4b986dae6be0ae280cfda49b15dd6c8434d275f62a819068892076832";
+    "a49f8969aa7437356f927646d28d92283e65f1fa522fc0909eee67d3dcb7d656";
 
 fn hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
@@ -106,7 +110,7 @@ fn primary_encode_hash_matches_cross_platform_pin() {
     let stego = ghost_encode(&load_cover(), &"primary message, pinned ".repeat(20), "primary-pass-m6")
         .expect("ghost_encode");
     unsafe { std::env::remove_var("PHASM_DETERMINISTIC_SEED"); }
-    assert_eq!(hex(&stego), EXPECTED_PRIMARY_ENCODE_HASH, "Ghost v3 primary encode changed; re-pin only if intended");
+    assert_eq!(hex(&stego), EXPECTED_PRIMARY_ENCODE_HASH, "Ghost v3.1 primary encode changed; re-pin only if intended");
 }
 
 #[test]

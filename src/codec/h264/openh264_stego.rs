@@ -43,6 +43,7 @@ thread_local! {
     static ROW_DPB_STATE: RefCell<Option<RowDpbState>> = const { RefCell::new(None) };
 }
 
+#[allow(dead_code)] // deliberately retained dormant D2.2 machinery (see stego/dpb_correction.rs header, #837)
 struct RowDpbState {
     encoder_handle: *mut core_openh264_sys::PhasmEncoderHandle,
     enc_height: u32,
@@ -56,6 +57,7 @@ struct RowDpbState {
 
 unsafe impl Send for RowDpbState {}
 
+#[allow(dead_code)] // deliberately retained dormant D2.2 machinery (see stego/dpb_correction.rs header, #837)
 extern "C" fn row_complete_callback(
     _frame_num: u32, row_y: u16,
     _bs_byte_pos: i32, _bs_bits_left: i32,
@@ -401,7 +403,7 @@ pub(crate) fn produce_gop_cover(
      * path), the two passes take structurally different code paths
      * through the encoder even with empty override_map. That asymmetry
      * — not the override application itself — drives the cascade.
-     * Closed-loop walker test `pass2_walker_sees_N_cs_flips_real_carplane_480p`
+     * Closed-loop walker test `pass2_walker_sees_n_cs_flips_real_carplane_480p`
      * has symmetric wire_only across passes and shows zero positional
      * drift; orchestrator without this line has +95 CS drift. */
     if wire_only {
@@ -1710,6 +1712,7 @@ pub(crate) enum CapCostSource {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(unused_assignments)] // the final lap! reassigns the PHASM_CAP_PROFILE timer that nothing reads afterwards
 pub(crate) fn h264_gop_capacity_with(
     gop_yuv: &[u8],
     width: u32,
@@ -2517,7 +2520,7 @@ fn embed_primary_per_gop_4domain(
     // positions; everything else, including injected shadow LSBs, is preserved).
     // Saves a whole union-sized `Vec<u8>` copy per call vs the old
     // `full_stego = combined_cover.to_vec()`.
-    mut combined_cover: Vec<u8>,
+    combined_cover: Vec<u8>,
     combined_costs: &[f32],
     gop_size: u32,
     n_gops: u32,
@@ -2530,7 +2533,7 @@ fn embed_primary_per_gop_4domain(
     let n_csl = cover.coeff_suffix_lsb.len();
     let n_mvds = cover.mvd_sign_bypass.len();
     let off_csl = n_cs;
-    let off_mvds = n_cs + n_csl;
+    let _off_mvds = n_cs + n_csl;
     let off_mvdsl = n_cs + n_csl + n_mvds;
     debug_assert_eq!(
         combined_cover.len(),
@@ -5568,8 +5571,8 @@ pub fn h264_shadow_loaded_gop_caps(
 pub fn streaming_shadow_verify(
     emitted: &[u8],
     gop_byte_lens: &[usize],
-    width: u32,
-    height: u32,
+    _width: u32,
+    _height: u32,
     gop_size: u32,
     shadows: &[crate::stego::shadow_layer::ShadowLayer<'_>],
     n_totals: &[usize],

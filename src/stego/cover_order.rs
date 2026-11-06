@@ -66,12 +66,13 @@ fn derive(master_half: &[u8], codec: &[u8], role: &[u8], gop: u32) -> [u8; 32] {
 /// draws, as `stego::permute`, so it is identical on every platform).
 /// Position `order[i]` of the canonical cover is the `i`-th STC input.
 pub fn gop_cover_order(n: usize, seed: &[u8; 32]) -> Vec<u32> {
-    use rand::{Rng, SeedableRng};
+    use crate::stego::rng_compat::Rand08;
+    use rand::SeedableRng;
     assert!(u32::try_from(n).is_ok(), "cover of {n} positions exceeds u32");
     let mut order: Vec<u32> = (0..n as u32).collect();
     let mut rng = rand_chacha::ChaCha20Rng::from_seed(*seed);
     for i in (1..n).rev() {
-        let j = rng.gen_range(0..=(i as u32)) as usize;
+        let j = rng.gen_range08(0..=(i as u32)) as usize;
         order.swap(i, j);
     }
     order

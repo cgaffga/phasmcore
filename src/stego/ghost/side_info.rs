@@ -68,7 +68,7 @@ fn decode_error(val: i8) -> f32 {
 /// approaches zero. Clamping to this floor prevents zero-cost embedding
 /// at quantization midpoints, which is a known detectable artifact.
 ///
-/// Test-only: the production SI cost (`ghost::v3`, floor + 0.3 factor
+/// Test-only: the production SI cost (`ghost::v31`, floor + 0.3 factor
 /// floor) is applied inline by the encoder; the tests below pin the formula.
 #[cfg(test)]
 const MIN_SI_COST: f32 = 1e-6;
@@ -95,12 +95,9 @@ impl SideInfo {
         cover_grid: &DctGrid,
         qt_values: &[u16; 64],
     ) -> Result<Self, crate::StegoError> {
+        check_pixels(raw_rgb, pixel_width, pixel_height)?;
         let w = pixel_width as usize;
         let h = pixel_height as usize;
-        let expected_len = w.checked_mul(h).and_then(|n| n.checked_mul(3)).unwrap_or(0);
-        if w == 0 || h == 0 || raw_rgb.len() < expected_len {
-            return Err(crate::StegoError::ImageTooSmall);
-        }
 
         let bw = cover_grid.blocks_wide();
         let bh = cover_grid.blocks_tall();
@@ -168,6 +165,26 @@ impl SideInfo {
             blocks_tall: bh,
             exact: false,
         })
+    }
+
+    /// The side information an embed into `cover_grid` uses: [`Self::compute`],
+    /// or `None` (plain Ghost v3) when the pixels are a JPEG decoded on this
+    /// block grid ([`is_decoded_jpeg_on_grid`]). Errors as `compute` does on
+    /// an empty or short pixel buffer.
+    pub fn for_embed(
+        raw_rgb: &[u8],
+        pixel_width: u32,
+        pixel_height: u32,
+        cover_grid: &DctGrid,
+        qt_values: &[u16; 64],
+    ) -> Result<Option<Self>, crate::StegoError> {
+        check_pixels(raw_rgb, pixel_width, pixel_height)?;
+        if Self::geometry_matches(pixel_width as usize, pixel_height as usize, cover_grid.blocks_wide(), cover_grid.blocks_tall())
+            && is_decoded_jpeg_on_grid(raw_rgb, pixel_width, pixel_height)
+        {
+            return Ok(None);
+        }
+        Self::compute(raw_rgb, pixel_width, pixel_height, cover_grid, qt_values).map(Some)
     }
 
     /// Luma block grid `bw × bh` can hold a `w × h` image (MCU 8 or 16).
@@ -265,6 +282,28 @@ impl SideInfo {
     pub fn is_tie(&self, flat_idx: usize) -> bool {
         self.exact && self.rounding_errors[flat_idx].unsigned_abs() == 127
     }
+}
+
+/// `ImageTooSmall` unless `raw_rgb` holds `w · h` RGB pixels.
+fn check_pixels(raw_rgb: &[u8], w: u32, h: u32) -> Result<(), crate::StegoError> {
+    let expected = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(3)).unwrap_or(0);
+    if w == 0 || h == 0 || raw_rgb.len() < expected {
+        return Err(crate::StegoError::ImageTooSmall);
+    }
+    Ok(())
+}
+
+/// The pixels are a JPEG decoded on the block grid a cover written from them
+/// uses (same size, or a grid-preserving transform), i.e. **not** a precover:
+/// their DCT sits on the source's quantization lattice, the cover is an
+/// aligned double compression, and side information — exact or approximate —
+/// would make the comb-filling changes cheap (histogram attack P_E 0.04 at
+/// 0.20 bpnzAC, `eval/runs/2026-10-31-wand-ghost/RESULTS.md` arm D).
+/// Encodes then embed without side information and the bands use nzAC / 10
+/// ([`super::capacity::SiKind::DecodedJpeg`]).
+/// The test: [`crate::codec::jpeg::history`].
+pub fn is_decoded_jpeg_on_grid(raw_rgb: &[u8], pixel_width: u32, pixel_height: u32) -> bool {
+    crate::codec::jpeg::history::is_aligned_jpeg_decode(raw_rgb, pixel_width, pixel_height)
 }
 
 /// i8 code of the exact rounding error of one coefficient: islow output

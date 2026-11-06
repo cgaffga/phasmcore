@@ -54,7 +54,10 @@ use phasm_core::stego::cost::uniward::{cost_kernel_test_hash_hex, cost_kernel_te
 /// - `52b3740787c356b97d664d896d037379e5c847293e64ec1b6141252c2fc974e9` (2026-10-25): v2. Moved because the cost definition
 ///   changed (both flaws fixed); not a determinism regression. Verified
 ///   identical on aarch64 NEON, x86_64 SSE2 (Rosetta) and wasm32 SIMD128.
-const EXPECTED_HASH: &str = "52b3740787c356b97d664d896d037379e5c847293e64ec1b6141252c2fc974e9";
+/// - `14156ec68d394b4b1b92fdcb796faded67ed0e97f957ca22e2b7733e354d44b5` (2026-11-03, Ghost v3.1): the
+///   costs read the unrounded decompressed image (an f64 IDCT instead of the
+///   rounded integer one, fix list R3.17), as reference J-UNIWARD does.
+const EXPECTED_HASH: &str = "14156ec68d394b4b1b92fdcb796faded67ed0e97f957ca22e2b7733e354d44b5";
 
 /// The 0.4.x (v1) kernel, kept verbatim in `uniward_legacy_v1` for
 /// decoding the shadows of older images. Must never move.

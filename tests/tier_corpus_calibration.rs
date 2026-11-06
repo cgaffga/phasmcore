@@ -105,6 +105,7 @@ const CORPUS: &[Fixture] = &[
 struct TierOutcome {
     encode_ok: bool,
     decode_ok: bool,
+    #[allow(dead_code)] // recorded per tier but not reported
     stego_bytes: usize,
 }
 
@@ -219,13 +220,12 @@ fn d_prime_7_tier_sweep_480p() {
 }
 
 fn run_tier_sweep(w: u32, h: u32, n_frames: u32, gop: u32, msg: &str, pass: &str) {
-    let W = w; let H = h; let N = n_frames; let GOP = gop;
 
     let mut rows: Vec<(String, &'static str, [TierOutcome; 5], [usize; 5])> = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();
 
     for fx in CORPUS {
-        let Some(yuv) = try_scale_yuv(fx.source, fx.tag, W, H, N) else {
+        let Some(yuv) = try_scale_yuv(fx.source, fx.tag, w, h, n_frames) else {
             skipped.push(fx.tag);
             continue;
         };
@@ -236,18 +236,18 @@ fn run_tier_sweep(w: u32, h: u32, n_frames: u32, gop: u32, msg: &str, pass: &str
         // by up to ~32× on OH264 content (lumix/dji/horse_flag), which
         // is why the old table showed a 9247-byte cap next to an
         // encode-fail. qp/intra_period mirror the encode params below.
-        let cap_opts = EncodeOpts { qp: 26, intra_period: GOP as i32 };
-        let capacities = match h264_video_capacity(&yuv, W, H, N as usize, cap_opts, /* full_tiers */ true) {
+        let cap_opts = EncodeOpts { qp: 26, intra_period: gop as i32 };
+        let capacities = match h264_video_capacity(&yuv, w, h, n_frames as usize, cap_opts, /* full_tiers */ true) {
             Ok(info) => info.per_tier_primary_max_message_bytes,
             Err(_) => [0; 5],
         };
 
         let outcomes = [
-            try_tier(&yuv, W, H, N, GOP, msg, pass, 0),
-            try_tier(&yuv, W, H, N, GOP, msg, pass, 1),
-            try_tier(&yuv, W, H, N, GOP, msg, pass, 2),
-            try_tier(&yuv, W, H, N, GOP, msg, pass, 3),
-            try_tier(&yuv, W, H, N, GOP, msg, pass, 4),
+            try_tier(&yuv, w, h, n_frames, gop, msg, pass, 0),
+            try_tier(&yuv, w, h, n_frames, gop, msg, pass, 1),
+            try_tier(&yuv, w, h, n_frames, gop, msg, pass, 2),
+            try_tier(&yuv, w, h, n_frames, gop, msg, pass, 3),
+            try_tier(&yuv, w, h, n_frames, gop, msg, pass, 4),
         ];
 
         rows.push((fx.tag.to_string(), fx.style, outcomes, capacities));
@@ -261,7 +261,7 @@ fn run_tier_sweep(w: u32, h: u32, n_frames: u32, gop: u32, msg: &str, pass: &str
         return;
     }
 
-    eprintln!("\n=== D'.7 tier corpus calibration — {W}x{H}x{N}, gop={GOP} ===");
+    eprintln!("\n=== D'.7 tier corpus calibration — {w}x{h}x{n_frames}, gop={gop} ===");
     eprintln!(
         "{:<14} {:<16} | {:>6} {:>6} {:>6} {:>6} {:>6} | {:>3} {:>3} {:>3} {:>3} {:>3}",
         "fixture", "style",

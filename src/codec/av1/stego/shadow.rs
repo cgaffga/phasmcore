@@ -22,7 +22,7 @@
 
 use std::collections::BinaryHeap;
 
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 use crate::stego::armor::ecc::{
@@ -101,7 +101,7 @@ pub struct Av1ShadowState {
 pub(crate) fn cover_and_buckets_from_stego(
     gop_bytes: &[u8],
 ) -> Result<(Vec<u8>, Vec<Option<u8>>), super::orchestrator::Av1StegoError> {
-    use core_dav1d_sys::{DAV1D_PHASM_TAG_AC_COEFF_SIGN, DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB};
+    use core_dav1d_sys::DAV1D_PHASM_TAG_AC_COEFF_SIGN;
     let rec = super::decoder::decode_with_recording(gop_bytes)?;
     let bits = rec
         .iter()

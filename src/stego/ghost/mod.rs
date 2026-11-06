@@ -10,12 +10,11 @@
 
 pub mod capacity;
 pub mod deep_cover;
-pub mod optimizer;
-pub(crate) mod optimizer_simd;
 pub mod permute;
 pub mod pipeline;
 pub mod quality;
 pub mod session;
 pub mod shadow;
 pub mod side_info;
-pub mod v3;
+pub mod v31;
+pub mod v3_legacy;

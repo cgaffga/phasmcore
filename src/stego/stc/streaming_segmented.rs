@@ -460,23 +460,21 @@ impl<'a> StreamingViterbiPhaseB<'a> {
     // T2.6 accessors — used by `stc_embed_streaming_segmented_parallel`
     // to drive Phase B segments via rayon without going through `step()`.
 
+    #[cfg(feature = "parallel")]
     pub(crate) fn checkpoints(&self) -> &[Vec<f64>] {
         &self.checkpoints
     }
-    pub(crate) fn columns(&self) -> &[usize] {
-        &self.columns
-    }
+    #[cfg(feature = "parallel")]
     pub(crate) fn num_states_(&self) -> usize {
         self.num_states
     }
+    #[cfg(feature = "parallel")]
+    pub(crate) fn columns(&self) -> &[usize] {
+        &self.columns
+    }
+    #[cfg(feature = "parallel")]
     pub(crate) fn k(&self) -> usize {
         self.k
-    }
-    pub(crate) fn w_(&self) -> usize {
-        self.w
-    }
-    pub(crate) fn m_(&self) -> usize {
-        self.m
     }
 
     /// Process one Phase B segment in reverse order. Returns

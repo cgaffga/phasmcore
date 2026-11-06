@@ -724,55 +724,59 @@ unsafe fn cost_accum_kernel_neon(
     w_hh: &[f32],
     sigma: f32,
 ) -> f32 {
-    use core::arch::aarch64::*;
+    // SAFETY: the caller passes six slices of equal length n; every
+    // vector load reads lanes i..i+4 with i + 4 <= n.
+    unsafe {
+        use core::arch::aarch64::*;
 
-    let n = d_lh.len();
-    let sigma_v = vdupq_n_f32(sigma);
-    let mut acc_v = vdupq_n_f32(0.0);
+        let n = d_lh.len();
+        let sigma_v = vdupq_n_f32(sigma);
+        let mut acc_v = vdupq_n_f32(0.0);
 
-    let dlh_ptr = d_lh.as_ptr();
-    let dhl_ptr = d_hl.as_ptr();
-    let dhh_ptr = d_hh.as_ptr();
-    let wlh_ptr = w_lh.as_ptr();
-    let whl_ptr = w_hl.as_ptr();
-    let whh_ptr = w_hh.as_ptr();
+        let dlh_ptr = d_lh.as_ptr();
+        let dhl_ptr = d_hl.as_ptr();
+        let dhh_ptr = d_hh.as_ptr();
+        let wlh_ptr = w_lh.as_ptr();
+        let whl_ptr = w_hl.as_ptr();
+        let whh_ptr = w_hh.as_ptr();
 
-    let mut i = 0;
-    while i + 4 <= n {
-        let dlh = vabsq_f32(vld1q_f32(dlh_ptr.add(i)));
-        let dhl = vabsq_f32(vld1q_f32(dhl_ptr.add(i)));
-        let dhh = vabsq_f32(vld1q_f32(dhh_ptr.add(i)));
-        let wlh = vabsq_f32(vld1q_f32(wlh_ptr.add(i)));
-        let whl = vabsq_f32(vld1q_f32(whl_ptr.add(i)));
-        let whh = vabsq_f32(vld1q_f32(whh_ptr.add(i)));
+        let mut i = 0;
+        while i + 4 <= n {
+            let dlh = vabsq_f32(vld1q_f32(dlh_ptr.add(i)));
+            let dhl = vabsq_f32(vld1q_f32(dhl_ptr.add(i)));
+            let dhh = vabsq_f32(vld1q_f32(dhh_ptr.add(i)));
+            let wlh = vabsq_f32(vld1q_f32(wlh_ptr.add(i)));
+            let whl = vabsq_f32(vld1q_f32(whl_ptr.add(i)));
+            let whh = vabsq_f32(vld1q_f32(whh_ptr.add(i)));
 
-        let denlh = vaddq_f32(wlh, sigma_v);
-        let denhl = vaddq_f32(whl, sigma_v);
-        let denhh = vaddq_f32(whh, sigma_v);
+            let denlh = vaddq_f32(wlh, sigma_v);
+            let denhl = vaddq_f32(whl, sigma_v);
+            let denhh = vaddq_f32(whh, sigma_v);
 
-        let qlh = vdivq_f32(dlh, denlh);
-        let qhl = vdivq_f32(dhl, denhl);
-        let qhh = vdivq_f32(dhh, denhh);
+            let qlh = vdivq_f32(dlh, denlh);
+            let qhl = vdivq_f32(dhl, denhl);
+            let qhh = vdivq_f32(dhh, denhh);
 
-        acc_v = vaddq_f32(acc_v, qlh);
-        acc_v = vaddq_f32(acc_v, qhl);
-        acc_v = vaddq_f32(acc_v, qhh);
+            acc_v = vaddq_f32(acc_v, qlh);
+            acc_v = vaddq_f32(acc_v, qhl);
+            acc_v = vaddq_f32(acc_v, qhh);
 
-        i += 4;
+            i += 4;
+        }
+
+        // Horizontal sum of the 4-lane vector accumulator.
+        let mut cost = vaddvq_f32(acc_v);
+
+        // Tail 0-3 cells.
+        while i < n {
+            cost += d_lh[i].abs() / (w_lh[i].abs() + sigma);
+            cost += d_hl[i].abs() / (w_hl[i].abs() + sigma);
+            cost += d_hh[i].abs() / (w_hh[i].abs() + sigma);
+            i += 1;
+        }
+
+        cost
     }
-
-    // Horizontal sum of the 4-lane vector accumulator.
-    let mut cost = vaddvq_f32(acc_v);
-
-    // Tail 0-3 cells.
-    while i < n {
-        cost += d_lh[i].abs() / (w_lh[i].abs() + sigma);
-        cost += d_hl[i].abs() / (w_hl[i].abs() + sigma);
-        cost += d_hh[i].abs() / (w_hh[i].abs() + sigma);
-        i += 1;
-    }
-
-    cost
 }
 
 /// λ_cascade — multiplicative weight on the cascade-magnitude-proxy

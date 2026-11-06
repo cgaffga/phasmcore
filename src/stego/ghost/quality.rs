@@ -20,6 +20,10 @@ pub struct EncodeQuality {
     pub hint_key: String,
     /// Mode: 1 = Ghost (stealth), 2 = Armor (robustness).
     pub mode: u8,
+    /// Armor: the Fortress sub-mode was used (the encoder's own decision;
+    /// frontends show and share by this, never by a prediction). Always
+    /// false for Ghost.
+    pub fortress: bool,
 }
 
 /// Maximum embedding rate for Ghost stealth scoring.
@@ -131,6 +135,7 @@ pub fn ghost_stealth_score(m: &GhostMetrics) -> EncodeQuality {
         score,
         hint_key: hint_key.to_string(),
         mode: 1,
+        fortress: false,
     }
 }
 
@@ -227,6 +232,7 @@ pub fn armor_robustness_score(m: &ArmorMetrics) -> EncodeQuality {
         score,
         hint_key: hint_key.to_string(),
         mode: 2,
+        fortress: m.fortress,
     }
 }
 

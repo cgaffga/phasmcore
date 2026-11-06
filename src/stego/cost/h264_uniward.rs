@@ -18,6 +18,10 @@
 //! stay on the Phase 1a CSF cost because reconstructing P-frame pixels needs
 //! motion compensation (deferred to Phase 7).
 
+// The only consumer is `codec::h264::stego::content_costs` (h264-decoder and up);
+// the container-only `video` build compiles this module without a caller.
+#![cfg_attr(not(feature = "h264-decoder"), allow(dead_code))]
+
 use crate::codec::h264::tables::ZIGZAG_4X4;
 
 /// 2^(q_bits - 4) for q_bits ∈ [0, 8] (i.e. exponent ∈ [-4, 4]).
@@ -917,6 +921,7 @@ pub(crate) fn accumulate_cost_from_field(
 /// Equivalent to `compute_delta_field` then `accumulate_cost_from_field`;
 /// the hot path in `content_costs` memoises the former and calls the latter
 /// directly, so this reference form is kept for tests + one-shot callers.
+#[cfg(test)]
 pub(crate) fn compute_position_cost(
     unit_basis: &[[[[f64; 4]; 4]; 4]; 4],
     wavelets: &ThreeSubbands,

@@ -4,18 +4,20 @@
 
 //! Ghost mode encode/decode pipeline.
 //!
-//! **Encode** (Ghost embedding v3, `docs/design/image/ghost-embedding-v3.md`):
+//! **Encode** (Ghost embedding v3.1, `docs/design/image/ghost-embedding-v3.md`):
 //! J-UNIWARD costs of every Y AC coefficient (SI-UNIWARD with side
 //! information), a keyed permutation of the whole AC set, and a ternary
-//! (double-layered) STC over the two lowest bit planes of the coefficient
-//! values, in independent lanes. Shadow layers ([`super::shadow`]) take
-//! keyed regions of their own hash orders first; the primary treats them as
-//! wet.
+//! (double-layered, mixed-width) STC over two keyed bit planes of the
+//! coefficient values, in independent lanes ([`super::v31`]). Shadow layers
+//! ([`super::shadow`]) take keyed regions of their own hash orders first;
+//! the primary treats them as wet.
 //!
-//! **Decode** supports exactly two generations: v3, and v1 — what core
-//! ≤ 0.4.3 / apps ≤ 1.8 wrote: a binary STC (h = 7, width 1..10) on `|c| & 1`
-//! of a keyed permutation of the Y non-zero AC set, and shadow layout v1
-//! (legacy tier + cost pools, see `shadow.rs`). Neither decoder computes
+//! **Decode** reads three generations: v3.1; v3 (core 0.5 / apps 1.9,
+//! decode-only, [`super::v3_legacy`]), read from the same keyed order in
+//! the same pass; and v1 (core ≤ 0.4.3 / apps ≤ 1.8, decode-only): a binary
+//! STC (h = 7, width 1..10) on `|c| & 1` of a keyed permutation of the Y
+//! non-zero AC set, and shadow layout v1 (legacy tier + cost pools, see
+//! `shadow.rs`). The shadow layout of v3 is v3.1's. No decoder computes
 //! costs except the v1 cost-pool fallback, which runs only after everything
 //! else failed.
 
@@ -33,7 +35,7 @@ use crate::stego::quality::{self, EncodeQuality, GhostMetrics};
 use crate::stego::shadow;
 use crate::stego::side_info::SideInfo;
 use crate::stego::stc::{extract, hhat};
-use super::v3;
+use super::v31;
 
 /// STC constraint height of the v1 decoder's binary STC.
 const V1_STC_H: usize = 7;
@@ -49,7 +51,7 @@ const LANE_STEPS: u32 = 40;
 const SHADOW_STEPS: u32 = 5;
 
 /// Total number of progress steps reported by [`ghost_decode`]:
-/// parse + v3 attempt (order, search) + v1 attempt (permutation, extraction).
+/// parse + v3.1 / v3 attempt (order, search) + v1 attempt (permutation, extraction).
 pub const GHOST_DECODE_STEPS: u32 = PARSE_STEPS + 2 + 2;
 
 /// Total number of progress steps reported by a Ghost encode without
@@ -192,16 +194,18 @@ pub fn ghost_encode_si_with_files_quality(
     passphrase: &str,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let (img, si) = parse_with_side_info(image_bytes, raw_pixels_rgb, pixel_width, pixel_height)?;
-    ghost_encode_impl(image_bytes, message, files, passphrase, Some(si), Some(img))
+    ghost_encode_impl(image_bytes, message, files, passphrase, si, Some(img))
 }
 
-/// Parse the cover and compute the side information of its Y channel.
+/// Parse the cover and compute the side information of its Y channel:
+/// `None` when the pixels are a JPEG decoded on the cover's block grid
+/// ([`SideInfo::for_embed`]), and the encode is then plain Ghost v3.1.
 pub(super) fn parse_with_side_info(
     image_bytes: &[u8],
     raw_pixels_rgb: &[u8],
     pixel_width: u32,
     pixel_height: u32,
-) -> Result<(JpegImage, SideInfo), StegoError> {
+) -> Result<(JpegImage, Option<SideInfo>), StegoError> {
     let img = JpegImage::from_bytes(image_bytes)?;
     let fi = img.frame_info();
     crate::stego::validate_encode_dimensions(fi.width as u32, fi.height as u32)?;
@@ -210,7 +214,7 @@ pub(super) fn parse_with_side_info(
     }
     let qt_id = fi.components[0].quant_table_id as usize;
     let qt = img.quant_table(qt_id).ok_or(StegoError::NoLuminanceChannel)?;
-    let si = SideInfo::compute(raw_pixels_rgb, pixel_width, pixel_height, img.dct_grid(0), &qt.values)?;
+    let si = SideInfo::for_embed(raw_pixels_rgb, pixel_width, pixel_height, img.dct_grid(0), &qt.values)?;
     Ok((img, si))
 }
 
@@ -283,7 +287,7 @@ pub fn ghost_encode_si_with_shadows_quality(
     shadows: &[ShadowLayer],
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let (img, si) = parse_with_side_info(image_bytes, raw_pixels_rgb, pixel_width, pixel_height)?;
-    shadows_encode(image_bytes, message, files, passphrase, shadows, Some(si), Some(img))
+    shadows_encode(image_bytes, message, files, passphrase, shadows, si, Some(img))
 }
 
 // ---------------------------------------------------------------------------
@@ -345,12 +349,12 @@ fn stego_error_kind(e: &StegoError) -> &'static str {
 }
 
 /// Encoder options for this cover and frame under the memory budget.
-fn encode_opts(mode: ModeId, img: &JpegImage, m_bits: usize) -> (v3::EncodeOpts, GhostRung) {
+fn encode_opts(mode: ModeId, img: &JpegImage, m_bits: usize) -> (v31::EncodeOpts, GhostRung) {
     let fi = img.frame_info();
-    let n_ac = v3::ac_count(img.dct_grid(0));
-    let h = v3::V3_STC_H;
+    let n_ac = v31::ac_count(img.dct_grid(0));
+    let h = v31::V31_STC_H;
     let plan = memory::ghost_lane_plan(mode, fi.width as u32, fi.height as u32, n_ac, m_bits, h);
-    let opts = v3::EncodeOpts {
+    let opts = v31::EncodeOpts {
         h,
         parallel_lanes: plan.parallel_lanes,
         lane_inline_bytes: plan.lane_inline_bytes,
@@ -378,11 +382,11 @@ fn write_jpeg(img: &mut JpegImage) -> Result<Vec<u8>, StegoError> {
     img.to_bytes_with_progress(Some(&progress_cb)).map_err(StegoError::InvalidJpeg)
 }
 
-fn print_stats(stats: &v3::V3Stats) {
+fn print_stats(stats: &v31::V31Stats) {
     if std::env::var_os("PHASM_GHOST_V3_STATS").is_some() {
         eprintln!(
-            "v3stats n={} m={} lanes={} m2={} w1={} w2={} changes={} distortion={:.1} bound={:.1}",
-            stats.n, stats.m, stats.lanes, stats.m2, stats.w1, stats.w2, stats.changes, stats.distortion,
+            "v3stats v31 n={} m={} lanes={} m2={} w1={} w2={} changes={} changes2={} distortion={:.1} bound={:.1}",
+            stats.n, stats.m, stats.lanes, stats.m2, stats.w1, stats.w2, stats.changes, stats.changes2, stats.distortion,
             stats.bound_distortion
         );
     }
@@ -393,7 +397,7 @@ fn print_stats(stats: &v3::V3Stats) {
 pub(super) struct PreparedEncode {
     pub(super) img: JpegImage,
     pub(super) frame_bits: Vec<u8>,
-    pub(super) opts: v3::EncodeOpts,
+    pub(super) opts: v31::EncodeOpts,
     pub(super) rung: GhostRung,
     pub(super) mode: ModeId,
     pub(super) width: u32,
@@ -429,7 +433,7 @@ pub(super) fn prepare_encode(
 }
 
 /// Score an embedded cover and write the stego JPEG.
-pub(super) fn finish_encode(img: &mut JpegImage, stats: &v3::V3Stats, is_si: bool) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
+pub(super) fn finish_encode(img: &mut JpegImage, stats: &v31::V31Stats, is_si: bool) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     print_stats(stats);
     let grid = img.dct_grid(0);
     let encode_quality = quality::ghost_stealth_score(&GhostMetrics {
@@ -460,7 +464,7 @@ pub(super) fn ghost_encode_impl(
     with_telemetry(mode, width, height, rung, move || {
         let structural_key = crypto::derive_structural_key(passphrase)?;
         progress::advance();
-        let stats = v3::encode(&mut img, &frame_bits, &structural_key, si.as_ref(), &opts)?;
+        let stats = v31::encode(&mut img, &frame_bits, &structural_key, si.as_ref(), &opts)?;
         let is_si = si.is_some();
         drop(si);
         finish_encode(&mut img, &stats, is_si)
@@ -523,7 +527,7 @@ pub(super) fn shadows_encode(
     let primary_payload = payload::encode_payload(eff_message, eff_files)?;
     let primary_pass = eff_pass;
 
-    let mut img = match pre_parsed {
+    let img = match pre_parsed {
         Some(img) => img,
         None => JpegImage::from_bytes(image_bytes)?,
     };
@@ -544,7 +548,7 @@ pub(super) fn shadows_encode(
 }
 
 /// The shadow layout: one common width `sw` for all shadows, from the widest
-/// the cover allows (every layer at the same rate) down the v3 ladder; each
+/// the cover allows (every layer at the same rate) down the width ladder; each
 /// shadow plans its region along its hash order with earlier regions wet,
 /// then the primary embeds with every region wet; the first width at which
 /// every trellis is feasible and every shadow verifies wins.
@@ -558,16 +562,16 @@ fn shadows_encode_body(
     frames: &[shadow::ShadowFrame],
     shadow_passes: &[&str],
     si: Option<SideInfo>,
-    opts: v3::EncodeOpts,
+    opts: v31::EncodeOpts,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     let structural_key = crypto::derive_structural_key(passphrase)?;
-    let n = v3::ac_count(img.dct_grid(0));
+    let n = v31::ac_count(img.dct_grid(0));
     let total_coefficients = img.dct_grid(0).blocks_wide() * img.dct_grid(0).blocks_tall() * 64;
 
     let shadow_bits: usize = frames.iter().map(|f| f.rs_bits()).sum();
     let all_bits = frame_bits.len() + shadow_bits;
     let sw_top = n / all_bits.max(1);
-    let candidates: Vec<usize> = v3::shadow_widths(n, shadow::SHADOW_MIN_STC_BITS)
+    let candidates: Vec<usize> = v31::shadow_widths(n, shadow::SHADOW_MIN_STC_BITS)
         .into_iter()
         .rev()
         .filter(|&w| w <= sw_top)
@@ -580,7 +584,7 @@ fn shadows_encode_body(
         .map(|f| shadow::ac_hash_order_prefix(img.dct_grid(0), &f.perm_seed, f.rs_bits() * widest))
         .collect();
     progress::advance();
-    let inline_limit = opts.lane_inline_bytes.min(v3::lane_inline_cap(n, opts.h));
+    let inline_limit = opts.lane_inline_bytes.min(v31::lane_inline_cap(n, opts.h));
 
     let mut attempt = 0u32;
     for &sw in &candidates {
@@ -591,8 +595,8 @@ fn shadows_encode_body(
             progress::set_total(total.max(step) + opts.progress_steps + SHADOW_STEPS * frames.len() as u32);
         }
         attempt += 1;
-        let mut wet = v3::WetMask::new(total_coefficients);
-        let mut overlay = v3::Overlay::default();
+        let mut wet = v31::wet_mask_for(&img);
+        let mut overlay = v31::Overlay::default();
         let mut states = Vec::with_capacity(frames.len());
         let mut shadow_mods = 0;
         let mut feasible = true;
@@ -600,14 +604,14 @@ fn shadows_encode_body(
             let meter = StepMeter::new(f.rs_bits() * sw, SHADOW_STEPS);
             let tick = |d: usize| meter.tick(d);
             let region = &o[..shadow::ShadowState::region_len(f, sw).min(o.len())];
-            let rho = v3::gather_costs(&img, region)?;
+            let rho = v31::gather_costs(&img, region)?;
             let grid = img.dct_grid(0);
             let cost = |i: usize| {
                 let fi = region[i];
                 if wet.get(fi) {
                     f32::INFINITY
                 } else {
-                    v3::binary_cost(grid.coeffs()[fi as usize], rho[i], v3::si_term(si.as_ref(), fi as usize))
+                    v31::binary_cost(grid.coeffs()[fi as usize], rho[i], v31::si_term(si.as_ref(), fi as usize))
                 }
             };
             let Some(st) = shadow::ShadowState::plan(f, o, sw, &img, &overlay, cost, opts.h, inline_limit, &tick)? else {
@@ -624,7 +628,7 @@ fn shadows_encode_body(
         if !feasible {
             continue;
         }
-        let planned = match v3::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts) {
+        let planned = match v31::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts) {
             Ok(p) => p,
             Err(StegoError::MessageTooLarge) => continue,
             Err(e) => return Err(e),
@@ -697,7 +701,7 @@ impl StepMeter {
 // Decode
 // ---------------------------------------------------------------------------
 
-/// Decode a payload from a stego JPEG using Ghost mode (v3, then v1).
+/// Decode a payload from a stego JPEG using Ghost mode (v3.1, then v3, then v1).
 ///
 /// # Errors
 /// - [`StegoError::DecryptionFailed`] if the passphrase is wrong.
@@ -724,8 +728,9 @@ pub fn ghost_decode_from_image(
     }
     progress::check_cancelled()?;
     let structural_key = crypto::derive_structural_key(passphrase)?;
-    // v3 first: it needs no costs, only the AC set and the key.
-    let v3_decrypt_fail = match v3::decode(img, passphrase, &structural_key, try_parse_and_decrypt) {
+    // v3.1, then v3 (decode-only), from one keyed order: they need no costs,
+    // only the AC set and the key.
+    let v3_decrypt_fail = match v31::decode_all(img, passphrase, &structural_key, &try_parse_and_decrypt) {
         Some(Ok(p)) => return Ok(p),
         Some(Err(_)) => true,
         None => false,
@@ -748,8 +753,8 @@ fn ghost_decode_v1(
     let perm_seed: [u8; 32] = structural_key[..32].try_into().unwrap();
     let hhat_seed: [u8; 32] = structural_key[32..].try_into().unwrap();
     // The same Fisher–Yates as `permute::permute_positions` (pinned by
-    // `v3::tests::shuffle_matches_coeffpos_permutation`), on bare indices.
-    v3::shuffle_u32(&mut positions, &perm_seed);
+    // `v31::tests::shuffle_matches_coeffpos_permutation`), on bare indices.
+    v31::shuffle_u32(&mut positions, &perm_seed);
     let n = positions.len();
     progress::advance();
 
@@ -864,16 +869,16 @@ fn w_length_prefix_consistent(
     false
 }
 
-/// Parse a frame (v1 or v3: same format), decrypt it and decode the payload.
+/// Parse a frame (v1, v3 or v3.1: same format), decrypt it and decode the payload.
 ///
 /// The size bound is a decoder-side sanity limit, not wire: any frame the
-/// payload format allows (`PAYLOAD_MAX_FRAME_BYTES`). Ghost v3 needs it (a
+/// payload format allows (`PAYLOAD_MAX_FRAME_BYTES`). Ghost v3 / v3.1 need it (a
 /// 48 MP photo's capacity is ~370 KB), and so do images of the released v1
 /// encoder: it never capped the frame at the 256 KB (`MAX_FRAME_BYTES`) its
 /// own decoder enforced — a CLI message of ≥ 256 KB on a 12 MP photo, or
 /// an app payload near the capacity of a ≥ ~40 MP photo, encoded fine and
 /// then could not be decoded by core ≤ 0.4.3.
-fn try_parse_and_decrypt(
+pub(super) fn try_parse_and_decrypt(
     frame_bytes: &[u8],
     passphrase: &str,
 ) -> Result<PayloadData, StegoError> {
@@ -936,9 +941,9 @@ pub(crate) fn ghost_shadow_decode_current(
     if img.num_components() == 0 {
         return Err(StegoError::NoLuminanceChannel);
     }
-    let t = v3::tstart();
+    let t = v31::tstart();
     let r = shadow::shadow_extract_v3(img, passphrase);
-    v3::tlog("shadow v3 attempt", t);
+    v31::tlog("shadow v3 attempt", t);
     match r {
         Ok(p) => return Ok(p),
         Err(StegoError::Cancelled) => return Err(StegoError::Cancelled),

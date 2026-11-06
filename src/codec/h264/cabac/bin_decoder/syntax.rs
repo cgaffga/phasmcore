@@ -28,8 +28,8 @@ use crate::codec::h264::cabac::ctx_offsets::{
 use crate::codec::h264::cabac::neighbor::{
     ctx_idx_inc_cbp_chroma, ctx_idx_inc_coeff_abs_level,
     ctx_idx_inc_intra_chroma_pred_mode_bin0, ctx_idx_inc_mb_qp_delta_bin0,
-    ctx_idx_inc_mb_skip_flag, ctx_idx_inc_mb_type_bin0, ctx_idx_inc_mvd_bin0,
-    ctx_idx_inc_prior_bin, ctx_idx_inc_ref_idx_bin0, ctx_idx_inc_sig_4x4,
+    ctx_idx_inc_mb_skip_flag, ctx_idx_inc_mb_type_bin0,
+    ctx_idx_inc_prior_bin, ctx_idx_inc_sig_4x4,
     ctx_idx_inc_sig_chroma_dc, compute_cbp_luma_ctx_idx_inc_bin, CabacNeighborContext,
 };
 use crate::codec::h264::stego::{

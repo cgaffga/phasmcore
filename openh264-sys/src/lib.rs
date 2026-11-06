@@ -58,8 +58,12 @@ pub const PHASM_STEGO_ABI_VERSION: u32 = 0x0001_0301;
 ///   - `PHASM_MB_TYPE_INTER`   : keep block_cat ∈ {2, 3, 4}
 ///   - `PHASM_MB_TYPE_SKIP`    : drop ALL coefficient hook fires
 ///   - `PHASM_MB_TYPE_OTHER`   : unknown shape, conservative: keep all
+// The names of the C header's constants (`4x4`, not `4X4`).
+#[allow(non_upper_case_globals)]
 pub const PHASM_MB_TYPE_I_4x4: u8 = 0;
+#[allow(non_upper_case_globals)]
 pub const PHASM_MB_TYPE_I_16x16: u8 = 1;
+#[allow(non_upper_case_globals)]
 pub const PHASM_MB_TYPE_I_8x8: u8 = 2;
 pub const PHASM_MB_TYPE_INTER: u8 = 3;
 pub const PHASM_MB_TYPE_SKIP: u8 = 4;
@@ -71,6 +75,7 @@ pub const PHASM_MB_TYPE_OTHER: u8 = 5;
 /// (the stream includes RDO simulation candidates whose block_cats do
 /// NOT match the winning mode).
 #[inline]
+#[allow(non_upper_case_globals)] // the C names, as above
 pub fn block_cat_matches_mb_type(mb_type: u8, block_cat: u8) -> bool {
     match mb_type {
         PHASM_MB_TYPE_SKIP => false,

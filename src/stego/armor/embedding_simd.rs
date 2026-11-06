@@ -93,6 +93,7 @@ pub fn spread_dot_product(coeffs: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN]) -> 
 /// every SIMD path emits exactly this sequence of IEEE 754 muls and
 /// pairwise adds (no FMA, no cross-pair reduction).
 #[inline]
+#[allow(dead_code)] // the fallback off the SIMD targets, and the tests' reference
 pub(super) fn spread_dot_product_scalar(
     coeffs: &[f64; SPREAD_LEN],
     v: &[f64; SPREAD_LEN],
@@ -125,27 +126,29 @@ unsafe fn spread_dot_product_neon(
     coeffs: &[f64; SPREAD_LEN],
     v: &[f64; SPREAD_LEN],
 ) -> f64 {
-    use core::arch::aarch64::*;
+    unsafe {
+        use core::arch::aarch64::*;
 
-    let cp = coeffs.as_ptr();
-    let vp = v.as_ptr();
+        let cp = coeffs.as_ptr();
+        let vp = v.as_ptr();
 
-    // 4 × f64x2 muls — each produces 2 products.
-    let vp0 = vmulq_f64(vld1q_f64(cp), vld1q_f64(vp));
-    let vp1 = vmulq_f64(vld1q_f64(cp.add(2)), vld1q_f64(vp.add(2)));
-    let vp2 = vmulq_f64(vld1q_f64(cp.add(4)), vld1q_f64(vp.add(4)));
-    let vp3 = vmulq_f64(vld1q_f64(cp.add(6)), vld1q_f64(vp.add(6)));
+        // 4 × f64x2 muls — each produces 2 products.
+        let vp0 = vmulq_f64(vld1q_f64(cp), vld1q_f64(vp));
+        let vp1 = vmulq_f64(vld1q_f64(cp.add(2)), vld1q_f64(vp.add(2)));
+        let vp2 = vmulq_f64(vld1q_f64(cp.add(4)), vld1q_f64(vp.add(4)));
+        let vp3 = vmulq_f64(vld1q_f64(cp.add(6)), vld1q_f64(vp.add(6)));
 
-    // L1 via pairwise add within each pair of vectors.
-    //   vpaddq_f64(a, b) = (a[0]+a[1], b[0]+b[1])
-    let l1_01 = vpaddq_f64(vp0, vp1); // (a0+a1, a2+a3)
-    let l1_23 = vpaddq_f64(vp2, vp3); // (a4+a5, a6+a7)
+        // L1 via pairwise add within each pair of vectors.
+        //   vpaddq_f64(a, b) = (a[0]+a[1], b[0]+b[1])
+        let l1_01 = vpaddq_f64(vp0, vp1); // (a0+a1, a2+a3)
+        let l1_23 = vpaddq_f64(vp2, vp3); // (a4+a5, a6+a7)
 
-    // L2 via pairwise add.
-    let l2 = vpaddq_f64(l1_01, l1_23); // ((a0+a1)+(a2+a3), (a4+a5)+(a6+a7))
+        // L2 via pairwise add.
+        let l2 = vpaddq_f64(l1_01, l1_23); // ((a0+a1)+(a2+a3), (a4+a5)+(a6+a7))
 
-    // L3 via vaddvq_f64 — horizontal add of the 2 lanes.
-    vaddvq_f64(l2)
+        // L3 via vaddvq_f64 — horizontal add of the 2 lanes.
+        vaddvq_f64(l2)
+    }
 }
 
 // ─── x86_64 SSE3 ────────────────────────────────────────────────
@@ -156,30 +159,32 @@ unsafe fn spread_dot_product_sse(
     coeffs: &[f64; SPREAD_LEN],
     v: &[f64; SPREAD_LEN],
 ) -> f64 {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    let cp = coeffs.as_ptr();
-    let vp = v.as_ptr();
+        let cp = coeffs.as_ptr();
+        let vp = v.as_ptr();
 
-    // 4 × _mm_mul_pd — each produces 2 products in a __m128d.
-    let vp0 = _mm_mul_pd(_mm_loadu_pd(cp), _mm_loadu_pd(vp));
-    let vp1 = _mm_mul_pd(_mm_loadu_pd(cp.add(2)), _mm_loadu_pd(vp.add(2)));
-    let vp2 = _mm_mul_pd(_mm_loadu_pd(cp.add(4)), _mm_loadu_pd(vp.add(4)));
-    let vp3 = _mm_mul_pd(_mm_loadu_pd(cp.add(6)), _mm_loadu_pd(vp.add(6)));
+        // 4 × _mm_mul_pd — each produces 2 products in a __m128d.
+        let vp0 = _mm_mul_pd(_mm_loadu_pd(cp), _mm_loadu_pd(vp));
+        let vp1 = _mm_mul_pd(_mm_loadu_pd(cp.add(2)), _mm_loadu_pd(vp.add(2)));
+        let vp2 = _mm_mul_pd(_mm_loadu_pd(cp.add(4)), _mm_loadu_pd(vp.add(4)));
+        let vp3 = _mm_mul_pd(_mm_loadu_pd(cp.add(6)), _mm_loadu_pd(vp.add(6)));
 
-    // L1 via _mm_hadd_pd — horizontal pairwise add.
-    //   _mm_hadd_pd(a, b) = (a[0]+a[1], b[0]+b[1])
-    let l1_01 = _mm_hadd_pd(vp0, vp1); // (a0+a1, a2+a3)
-    let l1_23 = _mm_hadd_pd(vp2, vp3); // (a4+a5, a6+a7)
+        // L1 via _mm_hadd_pd — horizontal pairwise add.
+        //   _mm_hadd_pd(a, b) = (a[0]+a[1], b[0]+b[1])
+        let l1_01 = _mm_hadd_pd(vp0, vp1); // (a0+a1, a2+a3)
+        let l1_23 = _mm_hadd_pd(vp2, vp3); // (a4+a5, a6+a7)
 
-    // L2.
-    let l2 = _mm_hadd_pd(l1_01, l1_23); // ((a0+a1)+(a2+a3), (a4+a5)+(a6+a7))
+        // L2.
+        let l2 = _mm_hadd_pd(l1_01, l1_23); // ((a0+a1)+(a2+a3), (a4+a5)+(a6+a7))
 
-    // L3 — sum the 2 lanes. Extract both and scalar add for
-    // bit-identical pairing with NEON's vaddvq_f64.
-    let mut out = [0.0f64; 2];
-    _mm_storeu_pd(out.as_mut_ptr(), l2);
-    out[0] + out[1]
+        // L3 — sum the 2 lanes. Extract both and scalar add for
+        // bit-identical pairing with NEON's vaddvq_f64.
+        let mut out = [0.0f64; 2];
+        _mm_storeu_pd(out.as_mut_ptr(), l2);
+        out[0] + out[1]
+    }
 }
 
 // ─── WASM SIMD128 ───────────────────────────────────────────────
@@ -190,37 +195,39 @@ unsafe fn spread_dot_product_wasm(
     coeffs: &[f64; SPREAD_LEN],
     v: &[f64; SPREAD_LEN],
 ) -> f64 {
-    use core::arch::wasm32::*;
+    unsafe {
+        use core::arch::wasm32::*;
 
-    let cp = coeffs.as_ptr() as *const v128;
-    let vp = v.as_ptr() as *const v128;
+        let cp = coeffs.as_ptr() as *const v128;
+        let vp = v.as_ptr() as *const v128;
 
-    // 4 × f64x2_mul — each produces 2 products.
-    let vp0 = f64x2_mul(v128_load(cp), v128_load(vp));
-    let vp1 = f64x2_mul(v128_load(cp.add(1)), v128_load(vp.add(1)));
-    let vp2 = f64x2_mul(v128_load(cp.add(2)), v128_load(vp.add(2)));
-    let vp3 = f64x2_mul(v128_load(cp.add(3)), v128_load(vp.add(3)));
+        // 4 × f64x2_mul — each produces 2 products.
+        let vp0 = f64x2_mul(v128_load(cp), v128_load(vp));
+        let vp1 = f64x2_mul(v128_load(cp.add(1)), v128_load(vp.add(1)));
+        let vp2 = f64x2_mul(v128_load(cp.add(2)), v128_load(vp.add(2)));
+        let vp3 = f64x2_mul(v128_load(cp.add(3)), v128_load(vp.add(3)));
 
-    // WASM SIMD128 has no native horizontal pairwise add for f64.
-    // Extract 8 lanes and apply the scalar pinned-pairwise tree —
-    // by-construction bit-equivalent to NEON/SSE outputs because
-    // each lane carries one f64 product computed via the same
-    // IEEE 754 mul.
-    let a0 = f64x2_extract_lane::<0>(vp0);
-    let a1 = f64x2_extract_lane::<1>(vp0);
-    let a2 = f64x2_extract_lane::<0>(vp1);
-    let a3 = f64x2_extract_lane::<1>(vp1);
-    let a4 = f64x2_extract_lane::<0>(vp2);
-    let a5 = f64x2_extract_lane::<1>(vp2);
-    let a6 = f64x2_extract_lane::<0>(vp3);
-    let a7 = f64x2_extract_lane::<1>(vp3);
-    let t0 = a0 + a1;
-    let t1 = a2 + a3;
-    let t2 = a4 + a5;
-    let t3 = a6 + a7;
-    let u0 = t0 + t1;
-    let u1 = t2 + t3;
-    u0 + u1
+        // WASM SIMD128 has no native horizontal pairwise add for f64.
+        // Extract 8 lanes and apply the scalar pinned-pairwise tree —
+        // by-construction bit-equivalent to NEON/SSE outputs because
+        // each lane carries one f64 product computed via the same
+        // IEEE 754 mul.
+        let a0 = f64x2_extract_lane::<0>(vp0);
+        let a1 = f64x2_extract_lane::<1>(vp0);
+        let a2 = f64x2_extract_lane::<0>(vp1);
+        let a3 = f64x2_extract_lane::<1>(vp1);
+        let a4 = f64x2_extract_lane::<0>(vp2);
+        let a5 = f64x2_extract_lane::<1>(vp2);
+        let a6 = f64x2_extract_lane::<0>(vp3);
+        let a7 = f64x2_extract_lane::<1>(vp3);
+        let t0 = a0 + a1;
+        let t1 = a2 + a3;
+        let t2 = a4 + a5;
+        let t3 = a6 + a7;
+        let u0 = t0 + t1;
+        let u1 = t2 + t3;
+        u0 + u1
+    }
 }
 
 // ─── Test/diagnostic helpers ────────────────────────────────────

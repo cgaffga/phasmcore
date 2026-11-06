@@ -68,7 +68,6 @@
 mod common;
 use common::visual_metrics::{count_bad_pixels, psnr_y, ssim_y, worst_mb_psnr_y};
 
-use phasm_core::codec::h264::openh264_stego::EncodeOpts;
 use phasm_core::codec::h264::streaming_session::{
     ColorParams, EncodeEngineChoice, EncodeSessionParams, StreamingEncodeSession,
     StreamingProbeSession, YuvFrameRef,
@@ -264,6 +263,7 @@ fn ffmpeg_decode(annex_b: &[u8], tag: &str, expect_len: usize) -> Option<Vec<u8>
 
 struct GopMetrics {
     mean_psnr: f64,
+    #[allow(dead_code)] // recorded for completeness; the report prints only the mean
     min_psnr: f64,
     mean_ssim: f64,
     min_worst_mb: f64,

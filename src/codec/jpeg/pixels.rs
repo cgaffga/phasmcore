@@ -254,6 +254,31 @@ pub fn jpeg_to_luma_f64(img: &JpegImage) -> Option<(Vec<f64>, usize, usize)> {
     Some((pixels, width, height))
 }
 
+/// [`jpeg_to_luma_f64`] rounded to f32 (half the memory: the Armor grid
+/// sync keeps it whole). Same layout; built strip by strip.
+pub fn jpeg_to_luma_f32(img: &JpegImage) -> Option<(Vec<f32>, usize, usize)> {
+    let grid = img.dct_grid(0);
+    let qt_id = img.frame_info().components[0].quant_table_id as usize;
+    let qt_values = img.quant_table(qt_id)?.values;
+    let width = grid.blocks_wide() * 8;
+    let mut pixels = vec![0.0f32; width * grid.blocks_tall() * 8];
+    let process_strip = |br: usize, strip: &mut [f32]| {
+        let mut row = vec![0.0f64; 8 * width];
+        luma_block_row_f64(grid, &qt_values, br, &mut row);
+        for (o, &v) in strip.iter_mut().zip(&row) {
+            *o = v as f32;
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        pixels.par_chunks_mut(8 * width).enumerate().for_each(|(br, strip)| process_strip(br, strip));
+    }
+    #[cfg(not(feature = "parallel"))]
+    pixels.chunks_mut(8 * width).enumerate().for_each(|(br, strip)| process_strip(br, strip));
+    Some((pixels, width, grid.blocks_tall() * 8))
+}
+
 /// Convert RGB pixel buffer to Y (luminance) 8×8 blocks.
 ///
 /// Uses BT.601: `Y = 0.299*R + 0.587*G + 0.114*B`

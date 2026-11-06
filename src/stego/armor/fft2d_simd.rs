@@ -115,6 +115,7 @@ pub fn butterfly_chunk_4(
 /// byte-equivalence baseline in tests AND as the runtime fallback
 /// on architectures without a SIMD path.
 #[inline]
+#[allow(dead_code)] // the fallback off the SIMD targets, and the tests' reference
 pub(super) fn butterfly_chunk_4_scalar(
     data: &mut [Complex32],
     start: usize,
@@ -142,64 +143,66 @@ unsafe fn butterfly_chunk_4_neon(
     half: usize,
     twiddles: &[Complex32],
 ) {
-    use core::arch::aarch64::*;
+    unsafe {
+        use core::arch::aarch64::*;
 
-    // Pointer to start + k (u values, 4 Complex32 = 8 f32 = 2 × f32x4).
-    // One base pointer for every access: each `data.as_mut_ptr()` call
-    // reborrows `data` mutably and invalidates the pointers taken
-    // before it (UB under Rust's aliasing rules; Miri flags it).
-    let base = data.as_mut_ptr();
-    let u_ptr = base.add(start + k) as *const f32;
-    // Pointer to start + k + half (b values).
-    let b_ptr = base.add(start + k + half) as *const f32;
-    // Pointer to twiddles[0..4].
-    let w_ptr = twiddles.as_ptr() as *const f32;
+        // Pointer to start + k (u values, 4 Complex32 = 8 f32 = 2 × f32x4).
+        // One base pointer for every access: each `data.as_mut_ptr()` call
+        // reborrows `data` mutably and invalidates the pointers taken
+        // before it (UB under Rust's aliasing rules; Miri flags it).
+        let base = data.as_mut_ptr();
+        let u_ptr = base.add(start + k) as *const f32;
+        // Pointer to start + k + half (b values).
+        let b_ptr = base.add(start + k + half) as *const f32;
+        // Pointer to twiddles[0..4].
+        let w_ptr = twiddles.as_ptr() as *const f32;
 
-    // Load 2 × f32x4 each for u, b, w (interleaved re, im).
-    let u_lo = vld1q_f32(u_ptr); // [u0.re, u0.im, u1.re, u1.im]
-    let u_hi = vld1q_f32(u_ptr.add(4)); // [u2.re, u2.im, u3.re, u3.im]
-    let b_lo = vld1q_f32(b_ptr); // [b0.re, b0.im, b1.re, b1.im]
-    let b_hi = vld1q_f32(b_ptr.add(4));
-    let w_lo = vld1q_f32(w_ptr); // [w0.re, w0.im, w1.re, w1.im]
-    let w_hi = vld1q_f32(w_ptr.add(4));
+        // Load 2 × f32x4 each for u, b, w (interleaved re, im).
+        let u_lo = vld1q_f32(u_ptr); // [u0.re, u0.im, u1.re, u1.im]
+        let u_hi = vld1q_f32(u_ptr.add(4)); // [u2.re, u2.im, u3.re, u3.im]
+        let b_lo = vld1q_f32(b_ptr); // [b0.re, b0.im, b1.re, b1.im]
+        let b_hi = vld1q_f32(b_ptr.add(4));
+        let w_lo = vld1q_f32(w_ptr); // [w0.re, w0.im, w1.re, w1.im]
+        let w_hi = vld1q_f32(w_ptr.add(4));
 
-    // Deinterleave: re lanes (even) and im lanes (odd).
-    let u_re = vuzp1q_f32(u_lo, u_hi); // [u0.re, u1.re, u2.re, u3.re]
-    let u_im = vuzp2q_f32(u_lo, u_hi); // [u0.im, u1.im, u2.im, u3.im]
-    let b_re = vuzp1q_f32(b_lo, b_hi);
-    let b_im = vuzp2q_f32(b_lo, b_hi);
-    let w_re = vuzp1q_f32(w_lo, w_hi);
-    let w_im = vuzp2q_f32(w_lo, w_hi);
+        // Deinterleave: re lanes (even) and im lanes (odd).
+        let u_re = vuzp1q_f32(u_lo, u_hi); // [u0.re, u1.re, u2.re, u3.re]
+        let u_im = vuzp2q_f32(u_lo, u_hi); // [u0.im, u1.im, u2.im, u3.im]
+        let b_re = vuzp1q_f32(b_lo, b_hi);
+        let b_im = vuzp2q_f32(b_lo, b_hi);
+        let w_re = vuzp1q_f32(w_lo, w_hi);
+        let w_im = vuzp2q_f32(w_lo, w_hi);
 
-    // Complex multiply v = b * w (no FMA — separate mul + add/sub).
-    // v.re = b.re * w.re - b.im * w.im
-    // v.im = b.re * w.im + b.im * w.re
-    let bw_re_re = vmulq_f32(b_re, w_re);
-    let bw_im_im = vmulq_f32(b_im, w_im);
-    let bw_re_im = vmulq_f32(b_re, w_im);
-    let bw_im_re = vmulq_f32(b_im, w_re);
+        // Complex multiply v = b * w (no FMA — separate mul + add/sub).
+        // v.re = b.re * w.re - b.im * w.im
+        // v.im = b.re * w.im + b.im * w.re
+        let bw_re_re = vmulq_f32(b_re, w_re);
+        let bw_im_im = vmulq_f32(b_im, w_im);
+        let bw_re_im = vmulq_f32(b_re, w_im);
+        let bw_im_re = vmulq_f32(b_im, w_re);
 
-    let v_re = vsubq_f32(bw_re_re, bw_im_im);
-    let v_im = vaddq_f32(bw_re_im, bw_im_re);
+        let v_re = vsubq_f32(bw_re_re, bw_im_im);
+        let v_im = vaddq_f32(bw_re_im, bw_im_re);
 
-    // Butterfly: new_u = u + v, new_b = u - v.
-    let new_u_re = vaddq_f32(u_re, v_re);
-    let new_u_im = vaddq_f32(u_im, v_im);
-    let new_b_re = vsubq_f32(u_re, v_re);
-    let new_b_im = vsubq_f32(u_im, v_im);
+        // Butterfly: new_u = u + v, new_b = u - v.
+        let new_u_re = vaddq_f32(u_re, v_re);
+        let new_u_im = vaddq_f32(u_im, v_im);
+        let new_b_re = vsubq_f32(u_re, v_re);
+        let new_b_im = vsubq_f32(u_im, v_im);
 
-    // Re-interleave for store: zip pairs (re, im) lane-wise.
-    let new_u_lo = vzip1q_f32(new_u_re, new_u_im); // [re0, im0, re1, im1]
-    let new_u_hi = vzip2q_f32(new_u_re, new_u_im); // [re2, im2, re3, im3]
-    let new_b_lo = vzip1q_f32(new_b_re, new_b_im);
-    let new_b_hi = vzip2q_f32(new_b_re, new_b_im);
+        // Re-interleave for store: zip pairs (re, im) lane-wise.
+        let new_u_lo = vzip1q_f32(new_u_re, new_u_im); // [re0, im0, re1, im1]
+        let new_u_hi = vzip2q_f32(new_u_re, new_u_im); // [re2, im2, re3, im3]
+        let new_b_lo = vzip1q_f32(new_b_re, new_b_im);
+        let new_b_hi = vzip2q_f32(new_b_re, new_b_im);
 
-    let u_out = base.add(start + k) as *mut f32;
-    let b_out = base.add(start + k + half) as *mut f32;
-    vst1q_f32(u_out, new_u_lo);
-    vst1q_f32(u_out.add(4), new_u_hi);
-    vst1q_f32(b_out, new_b_lo);
-    vst1q_f32(b_out.add(4), new_b_hi);
+        let u_out = base.add(start + k) as *mut f32;
+        let b_out = base.add(start + k + half) as *mut f32;
+        vst1q_f32(u_out, new_u_lo);
+        vst1q_f32(u_out.add(4), new_u_hi);
+        vst1q_f32(b_out, new_b_lo);
+        vst1q_f32(b_out.add(4), new_b_hi);
+    }
 }
 
 // ─── x86_64 SSE4.1 ──────────────────────────────────────────────
@@ -213,62 +216,64 @@ unsafe fn butterfly_chunk_4_sse(
     half: usize,
     twiddles: &[Complex32],
 ) {
-    use core::arch::x86_64::*;
+    unsafe {
+        use core::arch::x86_64::*;
 
-    // One base pointer for every access: each `data.as_mut_ptr()` call
-    // reborrows `data` mutably and invalidates the pointers taken
-    // before it (UB under Rust's aliasing rules; Miri flags it).
-    let base = data.as_mut_ptr();
-    let u_ptr = base.add(start + k) as *const f32;
-    let b_ptr = base.add(start + k + half) as *const f32;
-    let w_ptr = twiddles.as_ptr() as *const f32;
+        // One base pointer for every access: each `data.as_mut_ptr()` call
+        // reborrows `data` mutably and invalidates the pointers taken
+        // before it (UB under Rust's aliasing rules; Miri flags it).
+        let base = data.as_mut_ptr();
+        let u_ptr = base.add(start + k) as *const f32;
+        let b_ptr = base.add(start + k + half) as *const f32;
+        let w_ptr = twiddles.as_ptr() as *const f32;
 
-    let u_lo = _mm_loadu_ps(u_ptr);
-    let u_hi = _mm_loadu_ps(u_ptr.add(4));
-    let b_lo = _mm_loadu_ps(b_ptr);
-    let b_hi = _mm_loadu_ps(b_ptr.add(4));
-    let w_lo = _mm_loadu_ps(w_ptr);
-    let w_hi = _mm_loadu_ps(w_ptr.add(4));
+        let u_lo = _mm_loadu_ps(u_ptr);
+        let u_hi = _mm_loadu_ps(u_ptr.add(4));
+        let b_lo = _mm_loadu_ps(b_ptr);
+        let b_hi = _mm_loadu_ps(b_ptr.add(4));
+        let w_lo = _mm_loadu_ps(w_ptr);
+        let w_hi = _mm_loadu_ps(w_ptr.add(4));
 
-    // Deinterleave via _mm_shuffle_ps:
-    //   even: lanes (a0, a2, b0, b2) → mask 0b10001000 = 0x88
-    //   odd:  lanes (a1, a3, b1, b3) → mask 0b11011101 = 0xDD
-    let u_re = _mm_shuffle_ps::<0x88>(u_lo, u_hi);
-    let u_im = _mm_shuffle_ps::<0xDD>(u_lo, u_hi);
-    let b_re = _mm_shuffle_ps::<0x88>(b_lo, b_hi);
-    let b_im = _mm_shuffle_ps::<0xDD>(b_lo, b_hi);
-    let w_re = _mm_shuffle_ps::<0x88>(w_lo, w_hi);
-    let w_im = _mm_shuffle_ps::<0xDD>(w_lo, w_hi);
+        // Deinterleave via _mm_shuffle_ps:
+        //   even: lanes (a0, a2, b0, b2) → mask 0b10001000 = 0x88
+        //   odd:  lanes (a1, a3, b1, b3) → mask 0b11011101 = 0xDD
+        let u_re = _mm_shuffle_ps::<0x88>(u_lo, u_hi);
+        let u_im = _mm_shuffle_ps::<0xDD>(u_lo, u_hi);
+        let b_re = _mm_shuffle_ps::<0x88>(b_lo, b_hi);
+        let b_im = _mm_shuffle_ps::<0xDD>(b_lo, b_hi);
+        let w_re = _mm_shuffle_ps::<0x88>(w_lo, w_hi);
+        let w_im = _mm_shuffle_ps::<0xDD>(w_lo, w_hi);
 
-    // Complex multiply v = b * w (no FMA).
-    let bw_re_re = _mm_mul_ps(b_re, w_re);
-    let bw_im_im = _mm_mul_ps(b_im, w_im);
-    let bw_re_im = _mm_mul_ps(b_re, w_im);
-    let bw_im_re = _mm_mul_ps(b_im, w_re);
+        // Complex multiply v = b * w (no FMA).
+        let bw_re_re = _mm_mul_ps(b_re, w_re);
+        let bw_im_im = _mm_mul_ps(b_im, w_im);
+        let bw_re_im = _mm_mul_ps(b_re, w_im);
+        let bw_im_re = _mm_mul_ps(b_im, w_re);
 
-    let v_re = _mm_sub_ps(bw_re_re, bw_im_im);
-    let v_im = _mm_add_ps(bw_re_im, bw_im_re);
+        let v_re = _mm_sub_ps(bw_re_re, bw_im_im);
+        let v_im = _mm_add_ps(bw_re_im, bw_im_re);
 
-    // Butterfly.
-    let new_u_re = _mm_add_ps(u_re, v_re);
-    let new_u_im = _mm_add_ps(u_im, v_im);
-    let new_b_re = _mm_sub_ps(u_re, v_re);
-    let new_b_im = _mm_sub_ps(u_im, v_im);
+        // Butterfly.
+        let new_u_re = _mm_add_ps(u_re, v_re);
+        let new_u_im = _mm_add_ps(u_im, v_im);
+        let new_b_re = _mm_sub_ps(u_re, v_re);
+        let new_b_im = _mm_sub_ps(u_im, v_im);
 
-    // Re-interleave via unpack:
-    //   _mm_unpacklo_ps(re, im) = [re0, im0, re1, im1]
-    //   _mm_unpackhi_ps(re, im) = [re2, im2, re3, im3]
-    let new_u_lo = _mm_unpacklo_ps(new_u_re, new_u_im);
-    let new_u_hi = _mm_unpackhi_ps(new_u_re, new_u_im);
-    let new_b_lo = _mm_unpacklo_ps(new_b_re, new_b_im);
-    let new_b_hi = _mm_unpackhi_ps(new_b_re, new_b_im);
+        // Re-interleave via unpack:
+        //   _mm_unpacklo_ps(re, im) = [re0, im0, re1, im1]
+        //   _mm_unpackhi_ps(re, im) = [re2, im2, re3, im3]
+        let new_u_lo = _mm_unpacklo_ps(new_u_re, new_u_im);
+        let new_u_hi = _mm_unpackhi_ps(new_u_re, new_u_im);
+        let new_b_lo = _mm_unpacklo_ps(new_b_re, new_b_im);
+        let new_b_hi = _mm_unpackhi_ps(new_b_re, new_b_im);
 
-    let u_out = base.add(start + k) as *mut f32;
-    let b_out = base.add(start + k + half) as *mut f32;
-    _mm_storeu_ps(u_out, new_u_lo);
-    _mm_storeu_ps(u_out.add(4), new_u_hi);
-    _mm_storeu_ps(b_out, new_b_lo);
-    _mm_storeu_ps(b_out.add(4), new_b_hi);
+        let u_out = base.add(start + k) as *mut f32;
+        let b_out = base.add(start + k + half) as *mut f32;
+        _mm_storeu_ps(u_out, new_u_lo);
+        _mm_storeu_ps(u_out.add(4), new_u_hi);
+        _mm_storeu_ps(b_out, new_b_lo);
+        _mm_storeu_ps(b_out.add(4), new_b_hi);
+    }
 }
 
 // ─── WASM SIMD128 ───────────────────────────────────────────────
@@ -282,60 +287,62 @@ unsafe fn butterfly_chunk_4_wasm(
     half: usize,
     twiddles: &[Complex32],
 ) {
-    use core::arch::wasm32::*;
+    unsafe {
+        use core::arch::wasm32::*;
 
-    // One base pointer for every access: each `data.as_mut_ptr()` call
-    // reborrows `data` mutably and invalidates the pointers taken
-    // before it (UB under Rust's aliasing rules; Miri flags it).
-    let base = data.as_mut_ptr();
-    let u_ptr = base.add(start + k) as *mut v128;
-    let b_ptr = base.add(start + k + half) as *mut v128;
-    let w_ptr = twiddles.as_ptr() as *const v128;
+        // One base pointer for every access: each `data.as_mut_ptr()` call
+        // reborrows `data` mutably and invalidates the pointers taken
+        // before it (UB under Rust's aliasing rules; Miri flags it).
+        let base = data.as_mut_ptr();
+        let u_ptr = base.add(start + k) as *mut v128;
+        let b_ptr = base.add(start + k + half) as *mut v128;
+        let w_ptr = twiddles.as_ptr() as *const v128;
 
-    let u_lo = v128_load(u_ptr);
-    let u_hi = v128_load(u_ptr.add(1));
-    let b_lo = v128_load(b_ptr);
-    let b_hi = v128_load(b_ptr.add(1));
-    let w_lo = v128_load(w_ptr);
-    let w_hi = v128_load(w_ptr.add(1));
+        let u_lo = v128_load(u_ptr);
+        let u_hi = v128_load(u_ptr.add(1));
+        let b_lo = v128_load(b_ptr);
+        let b_hi = v128_load(b_ptr.add(1));
+        let w_lo = v128_load(w_ptr);
+        let w_hi = v128_load(w_ptr.add(1));
 
-    // Deinterleave via i32x4_shuffle (type-erased 32-bit lane shuffle).
-    // even lanes (re): pick lanes 0, 2, 4, 6 from (a, b)
-    // odd lanes (im):  pick lanes 1, 3, 5, 7
-    let u_re = i32x4_shuffle::<0, 2, 4, 6>(u_lo, u_hi);
-    let u_im = i32x4_shuffle::<1, 3, 5, 7>(u_lo, u_hi);
-    let b_re = i32x4_shuffle::<0, 2, 4, 6>(b_lo, b_hi);
-    let b_im = i32x4_shuffle::<1, 3, 5, 7>(b_lo, b_hi);
-    let w_re = i32x4_shuffle::<0, 2, 4, 6>(w_lo, w_hi);
-    let w_im = i32x4_shuffle::<1, 3, 5, 7>(w_lo, w_hi);
+        // Deinterleave via i32x4_shuffle (type-erased 32-bit lane shuffle).
+        // even lanes (re): pick lanes 0, 2, 4, 6 from (a, b)
+        // odd lanes (im):  pick lanes 1, 3, 5, 7
+        let u_re = i32x4_shuffle::<0, 2, 4, 6>(u_lo, u_hi);
+        let u_im = i32x4_shuffle::<1, 3, 5, 7>(u_lo, u_hi);
+        let b_re = i32x4_shuffle::<0, 2, 4, 6>(b_lo, b_hi);
+        let b_im = i32x4_shuffle::<1, 3, 5, 7>(b_lo, b_hi);
+        let w_re = i32x4_shuffle::<0, 2, 4, 6>(w_lo, w_hi);
+        let w_im = i32x4_shuffle::<1, 3, 5, 7>(w_lo, w_hi);
 
-    // Complex multiply v = b * w (no FMA).
-    let bw_re_re = f32x4_mul(b_re, w_re);
-    let bw_im_im = f32x4_mul(b_im, w_im);
-    let bw_re_im = f32x4_mul(b_re, w_im);
-    let bw_im_re = f32x4_mul(b_im, w_re);
+        // Complex multiply v = b * w (no FMA).
+        let bw_re_re = f32x4_mul(b_re, w_re);
+        let bw_im_im = f32x4_mul(b_im, w_im);
+        let bw_re_im = f32x4_mul(b_re, w_im);
+        let bw_im_re = f32x4_mul(b_im, w_re);
 
-    let v_re = f32x4_sub(bw_re_re, bw_im_im);
-    let v_im = f32x4_add(bw_re_im, bw_im_re);
+        let v_re = f32x4_sub(bw_re_re, bw_im_im);
+        let v_im = f32x4_add(bw_re_im, bw_im_re);
 
-    // Butterfly.
-    let new_u_re = f32x4_add(u_re, v_re);
-    let new_u_im = f32x4_add(u_im, v_im);
-    let new_b_re = f32x4_sub(u_re, v_re);
-    let new_b_im = f32x4_sub(u_im, v_im);
+        // Butterfly.
+        let new_u_re = f32x4_add(u_re, v_re);
+        let new_u_im = f32x4_add(u_im, v_im);
+        let new_b_re = f32x4_sub(u_re, v_re);
+        let new_b_im = f32x4_sub(u_im, v_im);
 
-    // Re-interleave: zip (re, im) lane-wise.
-    //   low half:  [re0, im0, re1, im1] = shuffle::<0, 4, 1, 5>(re, im)
-    //   high half: [re2, im2, re3, im3] = shuffle::<2, 6, 3, 7>(re, im)
-    let new_u_lo = i32x4_shuffle::<0, 4, 1, 5>(new_u_re, new_u_im);
-    let new_u_hi = i32x4_shuffle::<2, 6, 3, 7>(new_u_re, new_u_im);
-    let new_b_lo = i32x4_shuffle::<0, 4, 1, 5>(new_b_re, new_b_im);
-    let new_b_hi = i32x4_shuffle::<2, 6, 3, 7>(new_b_re, new_b_im);
+        // Re-interleave: zip (re, im) lane-wise.
+        //   low half:  [re0, im0, re1, im1] = shuffle::<0, 4, 1, 5>(re, im)
+        //   high half: [re2, im2, re3, im3] = shuffle::<2, 6, 3, 7>(re, im)
+        let new_u_lo = i32x4_shuffle::<0, 4, 1, 5>(new_u_re, new_u_im);
+        let new_u_hi = i32x4_shuffle::<2, 6, 3, 7>(new_u_re, new_u_im);
+        let new_b_lo = i32x4_shuffle::<0, 4, 1, 5>(new_b_re, new_b_im);
+        let new_b_hi = i32x4_shuffle::<2, 6, 3, 7>(new_b_re, new_b_im);
 
-    v128_store(u_ptr, new_u_lo);
-    v128_store(u_ptr.add(1), new_u_hi);
-    v128_store(b_ptr, new_b_lo);
-    v128_store(b_ptr.add(1), new_b_hi);
+        v128_store(u_ptr, new_u_lo);
+        v128_store(u_ptr.add(1), new_u_hi);
+        v128_store(b_ptr, new_b_lo);
+        v128_store(b_ptr.add(1), new_b_hi);
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────

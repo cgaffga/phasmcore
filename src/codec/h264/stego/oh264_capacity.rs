@@ -327,6 +327,7 @@ pub fn h264_video_capacity(
 /// Result of [`validate_n_shadow_inputs`]. Carries the
 /// derived constants the outer encode flow needs after validation
 /// succeeds.
+#[allow(dead_code)] // validated-geometry record; callers only use the validation result
 pub(crate) struct NShadowSetup {
     pub(crate) frame_size: usize,
     pub(crate) gop_size: usize,
@@ -408,6 +409,7 @@ pub(crate) struct NShadowPrimary {
     /// payloads; `total_bytes == frame_bytes.len()`.
     pub(crate) frame_bytes: Vec<u8>,
     pub(crate) keys: H264StcKeys,
+    #[allow(dead_code)] // derived framing record; callers read frame_bits.len() directly
     pub(crate) m_total: usize,
 }
 

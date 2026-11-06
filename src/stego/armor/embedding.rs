@@ -60,6 +60,47 @@ pub const HEADER_UNITS: usize = HEADER_BYTES * 8 * HEADER_COPIES;
 /// Number of copies for header majority voting.
 pub const HEADER_COPIES: usize = 7;
 
+/// Legacy delta multipliers for r = 1, r = 2, r 3-4, r 5-6, r >= 7
+/// (the table of [`compute_delta_from_mean_qt`]).
+pub const LEGACY_MULTS: [f64; 5] = [3.0, 4.0, 6.0, 7.0, 8.0];
+
+/// Armor v2 delta multipliers for r = 1, r = 2, r 3-4, r 5-6, r >= 7
+/// (x max(mean QT, V2_MEAN_QT_FLOOR), DCT units). Falls with r: repetition
+/// absorbs more raw errors (eval/runs/2026-10-31-armor-v2, tune2).
+pub const V2_MULTS: [f64; 5] = [5.0, 4.0, 3.5, 3.0, 2.5];
+
+/// Armor v2 rounding-aware embed tolerance (fraction of delta).
+pub const V2_ROUNDING_TOL: f64 = 0.05;
+
+/// Armor v2 header magic (7 copies precede the 7 mean-QT copies).
+pub const V2_MAGIC: u8 = 0xA2;
+
+/// Armor v2 header units: 7 x magic byte + 7 x mean-QT byte.
+pub const V2_HEADER_UNITS: usize = 2 * 8 * HEADER_COPIES;
+
+/// Armor v2 header step, in DCT units (dequantized coefficients).
+pub const V2_HEADER_DELTA: f64 = 60.0;
+
+/// Armor v2 delta floor: delta = mult x max(mean QT, floor), so a
+/// high-quality cover (small QT) still gets a step that survives a QF75-class
+/// channel. 11.75 = the header value of the IJG QF65 table (mean 11.67).
+pub const V2_MEAN_QT_FLOOR: f64 = 11.75;
+
+/// Multiplier from a 5-entry table (r = 1, 2, 3-4, 5-6, >= 7).
+pub fn mult_for_r(mults: &[f64; 5], r: usize) -> f64 {
+    if r >= 7 {
+        mults[4]
+    } else if r >= 5 {
+        mults[3]
+    } else if r >= 3 {
+        mults[2]
+    } else if r >= 2 {
+        mults[1]
+    } else {
+        mults[0]
+    }
+}
+
 /// Compute delta from mean QT value and repetition factor.
 /// Uses adaptive multipliers scaled by r for larger decision regions.
 pub fn compute_delta_from_mean_qt(mean_qt: f64, r: usize) -> f64 {
@@ -97,6 +138,111 @@ pub fn stdm_embed(coeffs: &mut [f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], bit: u8
     for i in 0..SPREAD_LEN {
         coeffs[i] += dp * v[i];
     }
+}
+
+/// How an STDM embed turns the continuous solution into integer indices.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StdmRounding {
+    /// Round each coefficient independently (the legacy behaviour).
+    Naive,
+    /// Search the floor/ceil choice of all `SPREAD_LEN` coefficients
+    /// (2^8 = 256 combinations): among the combinations whose projection lands
+    /// within `tol * delta` of the target lattice point take the one with the
+    /// least DCT-domain change, else the one closest to the target.
+    Search { tol: f64 },
+}
+
+/// STDM embed on integer JPEG indices with an arbitrary projection domain.
+///
+/// The projection is `p = sum_k v_k * w_k * x_k` (`w_k = 1`: the legacy
+/// index domain; `w_k = q_k`: Armor v2, dequantized DCT units). The target is
+/// the nearest lattice point of `bit` at step `delta`; the continuous
+/// minimum-norm solution moves along `v` in the projection domain, then the
+/// indices are rounded per `rounding`. `q` (quantization steps) only weighs
+/// the distortion. Returns `(projection error after rounding, squared change
+/// in DCT units)`.
+pub fn stdm_embed_int(
+    idx: &mut [i16; SPREAD_LEN],
+    w: &[f64; SPREAD_LEN],
+    q: &[f64; SPREAD_LEN],
+    v: &[f64; SPREAD_LEN],
+    bit: u8,
+    delta: f64,
+    rounding: StdmRounding,
+) -> (f64, f64) {
+    const LIM: f64 = 1023.0;
+    let mut p = 0.0;
+    for k in 0..SPREAD_LEN {
+        p += v[k] * w[k] * idx[k] as f64;
+    }
+    let t = quantize_for_bit(p, delta, bit);
+    let dp = t - p;
+    let mut cont = [0.0f64; SPREAD_LEN];
+    for k in 0..SPREAD_LEN {
+        cont[k] = (idx[k] as f64 + dp * v[k] / w[k]).clamp(-LIM, LIM);
+    }
+    let orig = *idx;
+    let choose = |x: &[f64; SPREAD_LEN]| -> (f64, f64) {
+        let mut pp = 0.0;
+        let mut d = 0.0;
+        for k in 0..SPREAD_LEN {
+            pp += v[k] * w[k] * x[k];
+            let c = (x[k] - orig[k] as f64) * q[k];
+            d += c * c;
+        }
+        (pp - t, d)
+    };
+    match rounding {
+        StdmRounding::Naive => {
+            let mut x = [0.0f64; SPREAD_LEN];
+            for k in 0..SPREAD_LEN {
+                x[k] = cont[k].round();
+                idx[k] = x[k] as i16;
+            }
+            choose(&x)
+        }
+        StdmRounding::Search { tol } => {
+            let lo: [f64; SPREAD_LEN] = std::array::from_fn(|k| cont[k].floor());
+            let mut best_in: Option<(f64, f64, u32)> = None; // (dist, err, mask) within tol
+            let mut best_err: (f64, f64, u32) = (f64::INFINITY, 0.0, 0);
+            let lim = tol * delta;
+            for mask in 0u32..(1 << SPREAD_LEN) {
+                let x: [f64; SPREAD_LEN] = std::array::from_fn(|k| {
+                    let up = (mask >> k) & 1 == 1;
+                    if up && lo[k] < cont[k] { lo[k] + 1.0 } else { lo[k] }
+                });
+                // floor == cont (integer): skip the duplicated "up" choice.
+                if (0..SPREAD_LEN).any(|k| (mask >> k) & 1 == 1 && lo[k] == cont[k]) {
+                    continue;
+                }
+                let (e, d) = choose(&x);
+                if e.abs() <= lim && best_in.is_none_or(|(bd, _, _)| d < bd) {
+                    best_in = Some((d, e, mask));
+                }
+                if e.abs() < best_err.0 {
+                    best_err = (e.abs(), d, mask);
+                }
+            }
+            let mask = best_in.map_or(best_err.2, |b| b.2);
+            let x: [f64; SPREAD_LEN] = std::array::from_fn(|k| {
+                if (mask >> k) & 1 == 1 && lo[k] < cont[k] { lo[k] + 1.0 } else { lo[k] }
+            });
+            for k in 0..SPREAD_LEN {
+                idx[k] = x[k] as i16;
+            }
+            choose(&x)
+        }
+    }
+}
+
+/// Soft STDM extraction on integer indices with projection weights `w`
+/// (`w_k = 1`: legacy index domain, `w_k = q_k`: Armor v2).
+pub fn stdm_extract_soft_w(idx: &[f64; SPREAD_LEN], w: &[f64; SPREAD_LEN], v: &[f64; SPREAD_LEN], delta: f64) -> f64 {
+    let mut c = [0.0f64; SPREAD_LEN];
+    for k in 0..SPREAD_LEN {
+        c[k] = idx[k] * w[k];
+    }
+    stdm_extract_soft(&c, v, delta)
 }
 
 /// Extract a single bit from a group of coefficients using STDM.

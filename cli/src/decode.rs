@@ -147,15 +147,17 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
         let _ = handle.join();
     }
 
-    // Extract files if requested
-    let extract_dir = if let Some(ref dir) = args.extract {
+    // Extract files if requested; report the paths actually written (a
+    // taken name gets a " (1)" suffix).
+    let extracted = if let Some(ref dir) = args.extract {
+        let mut written = Vec::with_capacity(payload.files.len());
         if !payload.files.is_empty() {
             std::fs::create_dir_all(dir)?;
             for f in &payload.files {
-                write_attachment(dir, &f.filename, &f.content)?;
+                written.push(write_attachment(dir, &f.filename, &f.content)?.to_string_lossy().to_string());
             }
         }
-        Some(dir.to_string_lossy().to_string())
+        Some(written)
     } else {
         None
     };
@@ -170,7 +172,7 @@ pub fn run(args: DecodeArgs) -> Result<(), CliError> {
         OutputMode::Default
     };
 
-    output::print_decode_result(&payload, &quality, extract_dir.as_deref(), elapsed, out_mode);
+    output::print_decode_result(&payload, &quality, extracted.as_deref(), elapsed, out_mode);
 
     Ok(())
 }
@@ -275,11 +277,12 @@ fn decode_av1_streaming(
 /// replacing a file that is already there. Core hands out sanitized names
 /// (`phasm_core::safe_filename`); sanitizing again here keeps the CLI safe
 /// on its own, and a name that is taken gets a ` (1)`, ` (2)`, ... suffix.
+/// Returns the path written.
 fn write_attachment(
     dir: &std::path::Path,
     name: &str,
     content: &[u8],
-) -> Result<(), CliError> {
+) -> Result<std::path::PathBuf, CliError> {
     use std::io::Write;
     let refuse = |msg: String| CliError::Io(std::io::Error::other(msg));
     let name = phasm_core::safe_filename(name);
@@ -296,11 +299,35 @@ fn write_attachment(
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 file.write_all(content).map_err(CliError::Io)?;
-                return Ok(());
+                return Ok(path);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(CliError::Io(e)),
         }
     }
     Err(refuse(format!("no free file name for attachment {name:?} in {}", dir.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_attachment;
+
+    /// A taken name gets a suffix, and the path returned is the one written
+    /// (the "Extracted:" line used to print the sanitized name instead).
+    #[test]
+    fn write_attachment_returns_the_path_written() {
+        let base = std::env::var("PHASM_TMP").unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+        let dir = std::path::Path::new(&base).join(format!("phasm-cli-extract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &[u8]| write_attachment(&dir, name, content).unwrap_or_else(|e| panic!("{e}"));
+        let first = write("note.txt", b"a");
+        let second = write("note.txt", b"b");
+        let escaped = write("../profile", b"c");
+        assert_eq!(first, dir.join("note.txt"));
+        assert_eq!(second, dir.join("note (1).txt"));
+        assert_eq!(std::fs::read(&second).unwrap(), b"b");
+        assert_eq!(escaped.parent(), Some(dir.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -18,7 +18,6 @@
 //! `docs/design/video/av1/phase-c-wv-whole-video-shadow.md` § 3.2.
 
 use crate::stego::cover_order::{gop_cover_order, gop_seeds, VideoCodec};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
@@ -27,7 +26,7 @@ use rayon::prelude::*;
 use phasm_rav1e::color::ChromaSampling;
 use phasm_rav1e::ec::{PhasmFrameLoopFilterState, PhasmFrameRecording, WriterEncoder};
 use phasm_rav1e::phasm_stego::{
-    encode_gop_with_phasm_tee, make_frame, AcSignMeta,
+    encode_gop_with_phasm_tee, make_frame,
     PHASM_TAG_AC_COEFF_SIGN, PHASM_TAG_GOLOMB_TAIL_LSB,
 };
 use phasm_rav1e::prelude::Sequence;
@@ -279,11 +278,11 @@ use crate::stego::chunk_frame::{
     build_chunk_frame_v3_1, build_first_chunk_frame_v3_1,
 };
 use crate::stego::cost::av1_uniward::{
-    compute_av1_uniward_costs_with_state, Av1FramePosition, FramePlanes,
+    compute_av1_uniward_costs_with_state, Av1FramePosition,
 };
 use crate::stego::stc::embed::stc_embed;
 use crate::stego::stc::hhat;
-use crate::stego::{frame, payload};
+use crate::stego::frame;
 
 use super::encode_progress::{
     Av1EncodePhase, Av1EncodeProgress, RecomputeForecast, WorkProgress, EMBED_WEIGHT,

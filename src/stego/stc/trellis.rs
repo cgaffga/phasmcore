@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // https://github.com/cgaffga/phasmcore
 
-//! Syndrome-trellis embedding for any constraint height `h` (Ghost v3).
+//! Syndrome-trellis embedding for any constraint height `h` (Ghost v3.1).
 //!
 //! [`super::embed::stc_embed`] packs one trellis step's back pointers into a
 //! `u128`, which limits it to `h ≤ 7`. This module stores them as `2^h / 64`
@@ -10,13 +10,19 @@
 //! same plan bit for bit (same f64 accumulation, same `c1 < c0` tie-break,
 //! same lowest-index terminal state; `matches_stc_embed_at_h7`).
 //!
-//! The trellis walks exactly `m · w` positions (`w` = number of H-hat
-//! columns, one message bit per `w` positions). Every memory schedule gives
-//! the same plan (the forward recursion is the same arithmetic wherever it
-//! runs):
+//! The block structure is a [`Code`]: message bit `b` is the syndrome of the
+//! positions `[start(b), start(b + 1))` under its block's H-hat columns. The
+//! constant-width code ([`Code::uniform`], one message bit per `w`
+//! positions) is the classic STC; Ghost v3.1 uses *mixed widths* (blocks of
+//! `w` and `w + 1` positions spread evenly), so a code of `m` bits uses every
+//! one of its `n` positions however `n / m` falls (Filler, Judas, Fridrich
+//! 2011, the reference implementation's non-integer `1/α`).
+//!
+//! Every memory schedule gives the same plan (the forward recursion is the
+//! same arithmetic wherever it runs):
 //!
 //! - **inline**: one forward pass that keeps every step's back pointers
-//!   (`m · w · max(2^h / 8, 8)` bytes);
+//!   (`n · max(2^h / 8, 8)` bytes);
 //! - **checkpointed**: a forward pass that keeps only the state costs at
 //!   every `K`-th message boundary, then segment by segment from the end:
 //!   recompute that segment's back pointers from its checkpoint and trace it
@@ -26,11 +32,11 @@
 //!     the blocks before them are recomputed, in segments that reuse the tail
 //!     buffer — `1 + head/total` of the inline work;
 //!   - *waves*: with idle workers (`threads > 1`) up to `threads` segments
-//!     are recomputed at once, each into its own buffer, then traced back in
-//!     order — `1 + 1/threads` of the inline work.
+//!     are recomputed at once, each into its own part of the buffer, then
+//!     traced back in order — `1 + 1/threads` of the inline work.
 //!
-//! [`embed`] uses the inline schedule when its back-pointer table fits
-//! `inline_limit_bytes`.
+//! [`embed`] / [`embed_code`] use the inline schedule when the back-pointer
+//! table fits `inline_limit_bytes`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -46,12 +52,135 @@ const TICK: usize = 1 << 16;
 /// A planned embedding.
 #[derive(Debug, Clone)]
 pub struct Plan {
-    /// Stego bit of each of the `m · w` walked positions.
+    /// Stego bit of each of the `n` walked positions.
     pub stego_bits: Vec<u8>,
     /// Σ cost of the flipped positions (the trellis optimum).
     pub total_cost: f64,
     /// Number of flipped positions.
     pub changes: usize,
+}
+
+/// Block structure of a syndrome-trellis code: message bit `b` is the
+/// syndrome of positions `[start(b), start(b + 1))` under the H-hat columns
+/// of its block.
+///
+/// - The first `head` blocks have `head_cols.len()` positions each.
+/// - The other `m − head` blocks share the next `rest_n` positions evenly:
+///   block `head + r` starts at `head · w_head + ⌊r · rest_n / (m − head)⌋`,
+///   so its width is `⌊rest_n / (m − head)⌋` (columns `short_cols`) or one
+///   more (`long_cols`).
+///
+/// [`Code::uniform`] is the constant-width code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Code {
+    m: usize,
+    head: usize,
+    head_cols: Vec<u32>,
+    rest_n: usize,
+    short_cols: Vec<u32>,
+    long_cols: Vec<u32>,
+}
+
+impl Code {
+    /// `m` blocks of `cols.len()` positions, all with columns `cols`.
+    pub fn uniform(cols: &[u32], m: usize) -> Self {
+        Self { m, head: 0, head_cols: Vec::new(), rest_n: m * cols.len(), short_cols: cols.to_vec(), long_cols: Vec::new() }
+    }
+
+    /// The code described in the type docs; `None` if the column sets do not
+    /// match the widths (`short_cols.len() = ⌊rest_n / (m − head)⌋ ≥ 1`,
+    /// `long_cols.len() = short + 1` when some blocks are long, `head_cols`
+    /// non-empty when `head > 0`).
+    pub fn new(
+        m: usize,
+        head: usize,
+        head_cols: Vec<u32>,
+        rest_n: usize,
+        short_cols: Vec<u32>,
+        long_cols: Vec<u32>,
+    ) -> Option<Self> {
+        if head > m || (head > 0 && head_cols.is_empty()) {
+            return None;
+        }
+        let rm = m - head;
+        if rm > 0 {
+            let s = rest_n / rm;
+            if s == 0 || short_cols.len() != s || (rest_n % rm != 0 && long_cols.len() != s + 1) {
+                return None;
+            }
+        }
+        Some(Self { m, head, head_cols, rest_n, short_cols, long_cols })
+    }
+
+    /// Message bits (blocks).
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Positions the code covers (`start(m)`).
+    pub fn n(&self) -> usize {
+        self.start(self.m)
+    }
+
+    /// Leading blocks of the head width, the head width.
+    pub fn head(&self) -> (usize, usize) {
+        (self.head, self.head_cols.len())
+    }
+
+    /// Positions shared by the blocks after the head.
+    pub fn rest_n(&self) -> usize {
+        self.rest_n
+    }
+
+    /// Column sets: head, short, long.
+    pub fn column_sets(&self) -> [&[u32]; 3] {
+        [&self.head_cols, &self.short_cols, &self.long_cols]
+    }
+
+    /// First position of block `b` (`b ≤ m`).
+    #[inline]
+    pub fn start(&self, b: usize) -> usize {
+        let hw = self.head_cols.len();
+        if b <= self.head {
+            b * hw
+        } else {
+            let rm = (self.m - self.head) as u128;
+            self.head * hw + ((b - self.head) as u128 * self.rest_n as u128 / rm) as usize
+        }
+    }
+
+    /// Positions of block `b`.
+    #[inline]
+    pub fn width(&self, b: usize) -> usize {
+        self.start(b + 1) - self.start(b)
+    }
+
+    /// Index into [`Self::column_sets`] of block `b`'s columns.
+    #[inline]
+    fn set_of(&self, b: usize, width: usize) -> usize {
+        if b < self.head {
+            0
+        } else if width == self.short_cols.len() {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// H-hat columns of block `b`.
+    pub fn cols(&self, b: usize) -> &[u32] {
+        self.column_sets()[self.set_of(b, self.width(b))]
+    }
+
+    /// Widest block.
+    pub fn max_width(&self) -> usize {
+        let rest = if self.m > self.head { self.short_cols.len() + usize::from(!self.long_cols.is_empty()) } else { 0 };
+        self.head_cols.len().max(rest).max(1)
+    }
+
+    fn masked_sets(&self, h: usize) -> [Vec<usize>; 3] {
+        [masked_cols(&self.head_cols, h), masked_cols(&self.short_cols, h), masked_cols(&self.long_cols, h)]
+    }
 }
 
 /// Back-pointer words per trellis step.
@@ -73,7 +202,7 @@ struct Schedule {
     tail: usize,
     /// Message blocks per recomputed segment of the blocks before the tail.
     seg: usize,
-    /// Segments recomputed at once (one buffer each).
+    /// Segments recomputed at once (one buffer part each).
     wave: usize,
 }
 
@@ -84,9 +213,10 @@ impl Schedule {
     }
 }
 
-/// Schedule of a trellis of `m` blocks of `w` steps; `None` = inline.
-fn schedule(m: usize, w: usize, h: usize, inline_limit_bytes: usize, threads: usize) -> Option<Schedule> {
-    if inline_bytes(m.saturating_mul(w), h) <= inline_limit_bytes {
+/// Schedule of a trellis of `m` blocks of (about) `w` steps, the widest
+/// `w_max`; `None` = inline.
+fn schedule(m: usize, n: usize, w: usize, w_max: usize, h: usize, inline_limit_bytes: usize, threads: usize) -> Option<Schedule> {
+    if inline_bytes(n, h) <= inline_limit_bytes {
         return None;
     }
     // m ≥ 1 here (an empty table always fits).
@@ -94,7 +224,7 @@ fn schedule(m: usize, w: usize, h: usize, inline_limit_bytes: usize, threads: us
     if threads == 1 {
         // A tail at least as long as the optimal segment of the rest also
         // serves as the segment buffer.
-        let tail = (inline_limit_bytes / inline_bytes(w, h).max(1)).min(m - 1);
+        let tail = (inline_limit_bytes / inline_bytes(w_max, h).max(1)).min(m - 1);
         if tail > 0 && tail >= segment_blocks(m - tail, w, h, 1) {
             return Some(Schedule { tail, seg: tail, wave: 1 });
         }
@@ -104,22 +234,31 @@ fn schedule(m: usize, w: usize, h: usize, inline_limit_bytes: usize, threads: us
     Some(Schedule { tail: 0, seg, wave: threads.min(m.div_ceil(seg)) })
 }
 
-/// Peak working memory of [`embed`] for `positions` steps (back pointers or
-/// segment buffers + checkpoints, excluding the caller's inputs and the
-/// returned plan).
+/// Schedule of `code`.
+fn code_schedule(code: &Code, h: usize, inline_limit_bytes: usize, threads: usize) -> Option<Schedule> {
+    let (m, n) = (code.m(), code.n());
+    schedule(m, n, n.div_ceil(m.max(1)).max(1), code.max_width(), h, inline_limit_bytes, threads)
+}
+
+/// Peak working memory of [`embed`] for `positions` steps of width `w`
+/// (back pointers or segment buffers + checkpoints, excluding the caller's
+/// inputs and the returned plan). For a mixed-width code pass its average
+/// width: an estimate within one position per block.
 pub fn working_bytes(positions: usize, w: usize, h: usize, inline_limit_bytes: usize, threads: usize) -> usize {
-    let m = positions / w.max(1);
-    match schedule(m, w.max(1), h, inline_limit_bytes, threads) {
+    let w = w.max(1);
+    let m = positions / w;
+    match schedule(m, positions, w, w, h, inline_limit_bytes, threads) {
         None => inline_bytes(positions, h),
         Some(s) => inline_bytes(s.buffer_blocks() * w, h) + (m - s.tail).div_ceil(s.seg) * (1usize << h) * 8,
     }
 }
 
 /// Positions an [`embed`] call walks (forward passes and recomputation):
-/// `m · w` inline, up to twice that checkpointed.
+/// `positions` inline, up to twice that checkpointed.
 pub fn walked_positions(positions: usize, w: usize, h: usize, inline_limit_bytes: usize, threads: usize) -> usize {
-    let m = positions / w.max(1);
-    match schedule(m, w.max(1), h, inline_limit_bytes, threads) {
+    let w = w.max(1);
+    let m = positions / w;
+    match schedule(m, positions, w, w, h, inline_limit_bytes, threads) {
         None => positions,
         Some(s) => positions + (m - s.tail) * w,
     }
@@ -138,20 +277,8 @@ fn segment_blocks(m: usize, w: usize, h: usize, p: usize) -> usize {
 }
 
 /// Plan the minimum-cost stego bits whose syndrome under the H-hat columns
-/// `cols` (bit `r` of `cols[c]` = row `r`, column `c`) equals `message`.
-///
-/// - `cover`: cover bits (LSB used), at least `message.len() · cols.len()`.
-/// - `costs`: flip cost per position (`f32::INFINITY` = wet), same length.
-/// - `inline_limit_bytes`: back-pointer bytes the call may keep (above:
-///   checkpointed schedule).
-/// - `threads`: workers the checkpointed schedule may use for recomputation
-///   (rayon; 1 = this thread only). The plan does not depend on it.
-/// - `tick(n)`: called with the number of positions processed (summing to
-///   exactly `m · w` over the whole call, in any schedule; from any thread).
-///
-/// `Ok(None)` if infeasible (every path hits a wet position against its
-/// constraint) or the cover is shorter than `m · w`; `Err(Cancelled)` if the
-/// encode channel was cancelled.
+/// `cols` (bit `r` of `cols[c]` = row `r`, column `c`) equals `message`:
+/// [`embed_code`] with the constant-width code [`Code::uniform`].
 #[allow(clippy::too_many_arguments)]
 pub fn embed(
     cover: &[u8],
@@ -163,33 +290,71 @@ pub fn embed(
     threads: usize,
     tick: &(dyn Fn(usize) + Sync),
 ) -> Result<Option<Plan>, StegoError> {
-    let w = cols.len();
-    let m = message.len();
-    if h == 0 || h > MAX_H || w == 0 {
+    if cols.is_empty() {
         return Ok(None);
     }
-    let n = match m.checked_mul(w) {
-        Some(n) if n <= cover.len() && n <= costs.len() => n,
-        _ => return Ok(None),
-    };
+    embed_code(cover, costs, message, &Code::uniform(cols, message.len()), h, inline_limit_bytes, threads, tick)
+}
+
+/// Plan the minimum-cost stego bits whose syndrome under `code` equals
+/// `message` (`code.m()` bits).
+///
+/// - `cover`: cover bits (LSB used), at least `code.n()`.
+/// - `costs`: flip cost per position (`f32::INFINITY` = wet), same length.
+/// - `inline_limit_bytes`: back-pointer bytes the call may keep (above:
+///   checkpointed schedule).
+/// - `threads`: workers the checkpointed schedule may use for recomputation
+///   (rayon; 1 = this thread only). The plan does not depend on it.
+/// - `tick(n)`: called with the number of positions processed (summing to
+///   exactly `code.n()` over the whole call, in any schedule; from any
+///   thread).
+///
+/// `Ok(None)` if infeasible (every path hits a wet position against its
+/// constraint), the cover is shorter than `code.n()` or `message` does not
+/// have `code.m()` bits; `Err(Cancelled)` if the encode channel was
+/// cancelled.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_code(
+    cover: &[u8],
+    costs: &[f32],
+    message: &[u8],
+    code: &Code,
+    h: usize,
+    inline_limit_bytes: usize,
+    threads: usize,
+    tick: &(dyn Fn(usize) + Sync),
+) -> Result<Option<Plan>, StegoError> {
+    let m = message.len();
+    if h == 0 || h > MAX_H || m != code.m() {
+        return Ok(None);
+    }
+    let n = code.n();
+    if n > cover.len() || n > costs.len() {
+        return Ok(None);
+    }
     if m == 0 {
         return Ok(Some(Plan { stego_bits: Vec::new(), total_cost: 0.0, changes: 0 }));
     }
-    let cols: Vec<usize> = cols.iter().map(|&c| (c as usize) & ((1 << h) - 1)).collect();
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, cols: &cols, h, w };
-    match schedule(m, w, h, inline_limit_bytes, threads) {
+    let sets = code.masked_sets(h);
+    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: 0, p_off: 0, h };
+    match code_schedule(code, h, inline_limit_bytes, threads) {
         None => t.inline(&Progress::new(n, n, tick)),
-        Some(s) => t.checkpointed(s, &Progress::new(n + (m - s.tail) * w, n, tick)),
+        Some(s) => t.checkpointed(s, &Progress::new(n + t.pos(m - s.tail), n, tick)),
     }
 }
 
+/// A trellis over the blocks `[b_off, b_off + message.len())` of `code`:
+/// local block `b` is code block `b_off + b`, local position `j` is code
+/// position `p_off + j` (`p_off = code.start(b_off)`).
 struct Trellis<'a> {
     cover: &'a [u8],
     costs: &'a [f32],
     message: &'a [u8],
-    cols: &'a [usize],
+    code: &'a Code,
+    sets: &'a [Vec<usize>; 3],
+    b_off: usize,
+    p_off: usize,
     h: usize,
-    w: usize,
 }
 
 /// Maps the positions walked (`walked`, all passes) onto `report` progress
@@ -256,10 +421,26 @@ impl Trellis<'_> {
         if self.cover[j] & 1 == 0 { (0.0, c) } else { (c, 0.0) }
     }
 
+    /// Local first position of local block `b` (`b ≤ message.len()`).
+    #[inline]
+    fn pos(&self, b: usize) -> usize {
+        self.code.start(self.b_off + b) - self.p_off
+    }
+
+    /// Local block `b`: first local position, width, columns.
+    #[inline]
+    fn block(&self, b: usize) -> (usize, usize, &[usize]) {
+        let g = self.b_off + b;
+        let s0 = self.code.start(g);
+        let w = self.code.start(g + 1) - s0;
+        (s0 - self.p_off, w, &self.sets[self.code.set_of(g, w)])
+    }
+
     /// Forward over message blocks `[b0, b1)` from `prev` (state costs at the
     /// start of block `b0`); `rows`, if given, receives each step's back
-    /// pointers (`words_per_step(h)` words per step, block `b0` first). On
-    /// return `prev` holds the costs after block `b1 − 1`'s message shift.
+    /// pointers (`words_per_step(h)` words per step, block `b0`'s first
+    /// position first). On return `prev` holds the costs after block
+    /// `b1 − 1`'s message shift.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -273,13 +454,15 @@ impl Trellis<'_> {
     ) -> Result<(), StegoError> {
         let ns = 1usize << self.h;
         let wps = words_per_step(self.h);
+        let base = self.pos(b0);
         for b in b0..b1 {
             on_block_start(b, prev);
+            let (j0, w, cols) = self.block(b);
             let block_rows = rows.as_deref_mut().map(|r| {
-                let k = (b - b0) * self.w * wps;
-                &mut r[k..k + self.w * wps]
+                let k = (j0 - base) * wps;
+                &mut r[k..k + w * wps]
             });
-            self.forward_block(prev, cur, b, block_rows, ticker)?;
+            self.forward_block(prev, cur, j0, cols, block_rows, ticker)?;
             // Message shift: keep states whose low bit is the message bit.
             let bit = (self.message[b] & 1) as usize;
             for t in 0..ns / 2 {
@@ -293,8 +476,9 @@ impl Trellis<'_> {
         Ok(())
     }
 
-    /// The `w` trellis steps of message block `b` (before its message shift),
-    /// back pointers into `rows` (`w · words_per_step(h)` words) if given.
+    /// The trellis steps of one message block (its positions from `j0`, one
+    /// per column of `cols`, before its message shift), back pointers into
+    /// `rows` (`cols.len() · words_per_step(h)` words) if given.
     ///
     /// Not inlined on wasm32, like [`step`]: a trellis is one `forward` call,
     /// and V8 keeps a call in baseline code (Liftoff) until it returns, so
@@ -305,17 +489,17 @@ impl Trellis<'_> {
         &self,
         prev: &mut Vec<f64>,
         cur: &mut Vec<f64>,
-        b: usize,
+        j0: usize,
+        cols: &[usize],
         mut rows: Option<&mut [u64]>,
         ticker: &mut Ticker<'_>,
     ) -> Result<(), StegoError> {
         let wps = words_per_step(self.h);
-        for c in 0..self.w {
-            let j = b * self.w + c;
-            let (c0, c1) = self.costs_at(j);
+        for (c, &col) in cols.iter().enumerate() {
+            let (c0, c1) = self.costs_at(j0 + c);
             match rows.as_deref_mut() {
-                Some(r) => step::<true>(prev, cur, &mut r[c * wps..(c + 1) * wps], self.cols[c], c0, c1),
-                None => step::<false>(prev, cur, &mut [], self.cols[c], c0, c1),
+                Some(r) => step::<true>(prev, cur, &mut r[c * wps..(c + 1) * wps], col, c0, c1),
+                None => step::<false>(prev, cur, &mut [], col, c0, c1),
             }
             std::mem::swap(prev, cur);
             ticker.step()?;
@@ -324,22 +508,25 @@ impl Trellis<'_> {
     }
 
     /// Trace blocks `[b0, b1)` back from `state` (the state after block
-    /// `b1 − 1`'s shift) through `rows` (back pointers of those blocks),
-    /// writing their stego bits. Returns the state at the start of `b0`.
+    /// `b1 − 1`'s shift) through `rows` (back pointers of those blocks, from
+    /// block `b0`'s first position), writing their stego bits into `out`
+    /// (local positions). Returns the state at the start of `b0`.
     fn traceback(&self, rows: &[u64], b0: usize, b1: usize, mut state: usize, out: &mut [u8]) -> usize {
         let ns = 1usize << self.h;
         let mask = ns - 1;
         let wps = words_per_step(self.h);
+        let base = self.pos(b0);
         for b in (b0..b1).rev() {
             state = ((state << 1) | (self.message[b] & 1) as usize) & mask;
-            for c in (0..self.w).rev() {
-                let j = b * self.w + c;
-                let k = (j - b0 * self.w) * wps;
+            let (j0, w, cols) = self.block(b);
+            for c in (0..w).rev() {
+                let j = j0 + c;
+                let k = (j - base) * wps;
                 let (wi, bi) = bp_bit(state, ns);
                 let bit = ((rows[k + wi] >> bi) & 1) as u8;
                 out[j] = bit;
                 if bit == 1 {
-                    state ^= self.cols[c];
+                    state ^= cols[c];
                 }
             }
         }
@@ -360,7 +547,7 @@ impl Trellis<'_> {
 
     fn inline(&self, progress: &Progress<'_>) -> Result<Option<Plan>, StegoError> {
         let m = self.message.len();
-        let n = m * self.w;
+        let n = self.pos(m);
         let mut ticker = progress.ticker();
         let (mut prev, mut cur) = self.initial();
         let mut rows = vec![0u64; n * words_per_step(self.h)];
@@ -378,12 +565,21 @@ impl Trellis<'_> {
 
     fn checkpointed(&self, s: Schedule, progress: &Progress<'_>) -> Result<Option<Plan>, StegoError> {
         let m = self.message.len();
-        let n = m * self.w;
+        let n = self.pos(m);
         let head = m - s.tail;
         let k = s.seg;
         let nseg = head.div_ceil(k);
-        let seg_words = k * self.w * words_per_step(self.h);
-        let mut buf = vec![0u64; s.buffer_blocks() * self.w * words_per_step(self.h)];
+        let wps = words_per_step(self.h);
+        let span = |sg: usize| (sg * k, ((sg + 1) * k).min(head));
+        // Buffer: the tail, or the widest wave (consecutive segments).
+        let mut buf_pos = n - self.pos(head);
+        let mut hi = nseg;
+        while hi > 0 {
+            let lo = hi.saturating_sub(s.wave);
+            buf_pos = buf_pos.max(self.pos(span(hi - 1).1) - self.pos(span(lo).0));
+            hi = lo;
+        }
+        let mut buf = vec![0u64; buf_pos * wps];
         let mut ticker = progress.ticker();
 
         // Pass A: checkpoints at every segment start of the head, back
@@ -403,7 +599,7 @@ impl Trellis<'_> {
             },
             &mut ticker,
         )?;
-        let tail_words = s.tail * self.w * words_per_step(self.h);
+        let tail_words = (n - self.pos(head)) * wps;
         self.forward(&mut prev, &mut cur, head, m, Some(&mut buf[..tail_words]), &mut |_, _| {}, &mut ticker)?;
         ticker.flush()?;
         let (best, cost) = best_state(&prev);
@@ -418,42 +614,46 @@ impl Trellis<'_> {
         let mut hi = nseg;
         while hi > 0 {
             let lo = hi.saturating_sub(s.wave);
-            let span = |sg: usize| (sg * k, ((sg + 1) * k).min(head));
             let recompute = |sg: usize, rows: &mut [u64]| -> Result<(), StegoError> {
                 let (b0, b1) = span(sg);
                 let mut prev = checkpoints[sg].clone();
                 let mut cur = vec![0.0; prev.len()];
                 let mut t = progress.ticker();
-                let len = (b1 - b0) * self.w * words_per_step(self.h);
-                self.forward(&mut prev, &mut cur, b0, b1, Some(&mut rows[..len]), &mut |_, _| {}, &mut t)?;
+                self.forward(&mut prev, &mut cur, b0, b1, Some(rows), &mut |_, _| {}, &mut t)?;
                 t.flush()
             };
-            let chunks = buf[..(hi - lo) * seg_words].chunks_mut(seg_words);
+            // Each segment's rows in its own part of the buffer, in order
+            // (consecutive segments: consecutive parts).
+            let base = self.pos(span(lo).0);
+            let mut parts: Vec<&mut [u64]> = Vec::with_capacity(hi - lo);
+            let mut rest = &mut buf[..];
+            for sg in lo..hi {
+                let (b0, b1) = span(sg);
+                let (part, r) = rest.split_at_mut((self.pos(b1) - self.pos(b0)) * wps);
+                parts.push(part);
+                rest = r;
+            }
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
                 if hi - lo > 1 {
-                    let res: Vec<Result<(), StegoError>> = chunks
-                        .collect::<Vec<_>>()
-                        .into_par_iter()
-                        .enumerate()
-                        .map(|(i, rows)| recompute(lo + i, rows))
-                        .collect();
+                    let res: Vec<Result<(), StegoError>> =
+                        parts.into_par_iter().enumerate().map(|(i, rows)| recompute(lo + i, rows)).collect();
                     res.into_iter().collect::<Result<(), StegoError>>()?;
                 } else {
-                    for (i, rows) in chunks.enumerate() {
+                    for (i, rows) in parts.into_iter().enumerate() {
                         recompute(lo + i, rows)?;
                     }
                 }
             }
             #[cfg(not(feature = "parallel"))]
-            for (i, rows) in chunks.enumerate() {
+            for (i, rows) in parts.into_iter().enumerate() {
                 recompute(lo + i, rows)?;
             }
             for sg in (lo..hi).rev() {
                 let (b0, b1) = span(sg);
-                let off = (sg - lo) * seg_words;
-                let len = (b1 - b0) * self.w * words_per_step(self.h);
+                let off = (self.pos(b0) - base) * wps;
+                let len = (self.pos(b1) - self.pos(b0)) * wps;
                 state = self.traceback(&buf[off..off + len], b0, b1, state, &mut bits);
             }
             checkpoints.truncate(lo);
@@ -567,9 +767,9 @@ fn step_scalar<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mut [u64],
 
 /// NEON kernel: states in pairs. With `col`'s low bit set (always, for the
 /// end-set H-hat) `prev[s ^ col]` for the pair `(2p, 2p+1)` is the pair
-/// `2(p ^ col>>1)` with its lanes swapped. The comparison masks are shifted
-/// into a two-lane accumulator (even states, odd states): two words per
-/// 128 states, the layout of `bp_bit`.
+/// `2(p ^ col>>1)` with its lanes swapped. The comparison masks go into a
+/// two-lane accumulator (even states, odd states), eight pairs at a time:
+/// two words per 128 states, the layout of `bp_bit`.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[inline]
 unsafe fn step_neon<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mut [u64], col: usize, c0: f64, c1: f64) {
@@ -582,26 +782,53 @@ unsafe fn step_neon<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mut [
         let vc1 = vdupq_n_f64(c1);
         let pp = prev.as_ptr();
         let cp = cur.as_mut_ptr();
+        // One pair: its new state costs stored, its comparison mask returned.
+        macro_rules! pair {
+            ($p:expr, $swap:expr) => {{
+                let p = $p;
+                let q = p ^ half;
+                let mut gq = vld1q_f64(pp.add(2 * q));
+                if $swap {
+                    gq = vextq_f64(gq, gq, 1);
+                }
+                let a = vaddq_f64(vld1q_f64(pp.add(2 * p)), vc0);
+                let b = vaddq_f64(gq, vc1);
+                let mk = vcltq_f64(b, a);
+                vst1q_f64(cp.add(2 * p), vbslq_f64(mk, b, a));
+                mk
+            }};
+        }
         macro_rules! body {
             ($swap:expr) => {
-                for g in 0..ns / 128 {
-                    let mut acc = vdupq_n_u64(0);
-                    for p in 64 * g..64 * g + 64 {
-                        let q = p ^ half;
-                        let mut gq = vld1q_f64(pp.add(2 * q));
-                        if $swap {
-                            gq = vextq_f64(gq, gq, 1);
+                if ROWS {
+                    // Eight pairs' mask bits at once (bits 7..0, first pair
+                    // highest), then shifted into the accumulator: its
+                    // dependency chain is one shift and one OR per eight
+                    // pairs. Per pair (shift, shift-accumulate) the chain
+                    // bounded the kernel: 22 % slower at h = 9 (M-series).
+                    let k: [uint64x2_t; 8] = core::array::from_fn(|i| vdupq_n_u64(128 >> i));
+                    for g in 0..ns / 128 {
+                        let mut acc = vdupq_n_u64(0);
+                        let mut p = 64 * g;
+                        while p < 64 * g + 64 {
+                            let m7 = vandq_u64(pair!(p, $swap), k[0]);
+                            let m6 = vandq_u64(pair!(p + 1, $swap), k[1]);
+                            let m5 = vandq_u64(pair!(p + 2, $swap), k[2]);
+                            let m4 = vandq_u64(pair!(p + 3, $swap), k[3]);
+                            let m3 = vandq_u64(pair!(p + 4, $swap), k[4]);
+                            let m2 = vandq_u64(pair!(p + 5, $swap), k[5]);
+                            let m1 = vandq_u64(pair!(p + 6, $swap), k[6]);
+                            let m0 = vandq_u64(pair!(p + 7, $swap), k[7]);
+                            // An OR tree, not a chain.
+                            let x = vorrq_u64(vorrq_u64(vorrq_u64(m7, m6), vorrq_u64(m5, m4)), vorrq_u64(vorrq_u64(m3, m2), vorrq_u64(m1, m0)));
+                            acc = vorrq_u64(vshlq_n_u64(acc, 8), x);
+                            p += 8;
                         }
-                        let a = vaddq_f64(vld1q_f64(pp.add(2 * p)), vc0);
-                        let b = vaddq_f64(gq, vc1);
-                        let mk = vcltq_f64(b, a);
-                        vst1q_f64(cp.add(2 * p), vbslq_f64(mk, b, a));
-                        if ROWS {
-                            acc = vsraq_n_u64(vshlq_n_u64(acc, 1), mk, 63);
-                        }
-                    }
-                    if ROWS {
                         vst1q_u64(row.as_mut_ptr().add(2 * g), acc);
+                    }
+                } else {
+                    for p in 0..ns / 2 {
+                        pair!(p, $swap);
                     }
                 }
             };
@@ -620,8 +847,9 @@ unsafe fn step_neon<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mut [
 /// shifted into a two-lane accumulator (even states, odd states) stored as
 /// the group's two words. Bit-identical to [`step_scalar`]:
 ///
-/// - `f64x2_pmin(a, b)` is `b < a ? b : a` lane-wise and the mask is the same
-///   `b < a`, so ties keep the `c0` branch;
+/// - the new cost is `v128_bitselect(b, a, b < a)`, i.e. `b < a ? b : a`
+///   lane-wise, and the back pointer is the same mask, so ties keep the `c0`
+///   branch;
 /// - one of `c0`, `c1` is zero at every position (`costs_at`), and adding
 ///   ±0.0 is the identity on every state cost (a state cost is +0.0, a sum of
 ///   non-negative costs or +∞, never −0.0), so that add is skipped.
@@ -638,28 +866,55 @@ unsafe fn step_simd128<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mu
         let pp = prev.as_ptr();
         let cp = cur.as_mut_ptr();
         let (vc0, vc1) = (f64x2_splat(c0), f64x2_splat(c1));
+        // One pair: its new state costs stored, its comparison mask returned.
+        macro_rules! pair {
+            ($p:expr, $swap:expr, $add0:expr, $add1:expr) => {{
+                let p = $p;
+                let q = p ^ half;
+                let mut gq = v128_load(pp.add(2 * q) as *const v128);
+                if $swap {
+                    gq = i64x2_shuffle::<1, 0>(gq, gq);
+                }
+                let mut a = v128_load(pp.add(2 * p) as *const v128);
+                if $add0 {
+                    a = f64x2_add(a, vc0);
+                }
+                let b = if $add1 { f64x2_add(gq, vc1) } else { gq };
+                let mk = f64x2_lt(b, a);
+                v128_store(cp.add(2 * p) as *mut v128, v128_bitselect(b, a, mk));
+                mk
+            }};
+        }
         macro_rules! body {
             ($swap:expr, $add0:expr, $add1:expr) => {
-                for g in 0..ns / 128 {
-                    let mut acc = u64x2_splat(0);
-                    for p in 64 * g..64 * g + 64 {
-                        let q = p ^ half;
-                        let mut gq = v128_load(pp.add(2 * q) as *const v128);
-                        if $swap {
-                            gq = i64x2_shuffle::<1, 0>(gq, gq);
+                if ROWS {
+                    // As the NEON kernel: eight pairs' mask bits at once
+                    // (bits 7..0, first pair highest), then shifted into the
+                    // accumulator, whose dependency chain is one shift and
+                    // one OR per eight pairs. Per pair the chain bounded the
+                    // kernel: 31 % slower at h = 9 (Node 25, M-series).
+                    let k: [v128; 8] = core::array::from_fn(|i| u64x2_splat(128 >> i));
+                    for g in 0..ns / 128 {
+                        let mut acc = u64x2_splat(0);
+                        let mut p = 64 * g;
+                        while p < 64 * g + 64 {
+                            let m7 = v128_and(pair!(p, $swap, $add0, $add1), k[0]);
+                            let m6 = v128_and(pair!(p + 1, $swap, $add0, $add1), k[1]);
+                            let m5 = v128_and(pair!(p + 2, $swap, $add0, $add1), k[2]);
+                            let m4 = v128_and(pair!(p + 3, $swap, $add0, $add1), k[3]);
+                            let m3 = v128_and(pair!(p + 4, $swap, $add0, $add1), k[4]);
+                            let m2 = v128_and(pair!(p + 5, $swap, $add0, $add1), k[5]);
+                            let m1 = v128_and(pair!(p + 6, $swap, $add0, $add1), k[6]);
+                            let m0 = v128_and(pair!(p + 7, $swap, $add0, $add1), k[7]);
+                            let x = v128_or(v128_or(v128_or(m7, m6), v128_or(m5, m4)), v128_or(v128_or(m3, m2), v128_or(m1, m0)));
+                            acc = v128_or(i64x2_shl(acc, 8), x);
+                            p += 8;
                         }
-                        let mut a = v128_load(pp.add(2 * p) as *const v128);
-                        if $add0 {
-                            a = f64x2_add(a, vc0);
-                        }
-                        let b = if $add1 { f64x2_add(gq, vc1) } else { gq };
-                        v128_store(cp.add(2 * p) as *mut v128, f64x2_pmin(a, b));
-                        if ROWS {
-                            acc = v128_or(i64x2_shl(acc, 1), u64x2_shr(f64x2_lt(b, a), 63));
-                        }
-                    }
-                    if ROWS {
                         v128_store(row.as_mut_ptr().add(2 * g) as *mut v128, acc);
+                    }
+                } else {
+                    for p in 0..ns / 2 {
+                        pair!(p, $swap, $add0, $add1);
                     }
                 }
             };
@@ -690,31 +945,30 @@ pub struct PassA {
 }
 
 /// The checkpointed schedule split up: the forward pass over all `m`
-/// blocks keeping the state costs at every `k`-th block boundary. `Ok(None)`
-/// if infeasible or the cover is too short. With [`segment_rows`] and
-/// [`segment_trace`] run over the segments `[s·k, min((s+1)·k, m))` from the
-/// last to the first, the stego bits are bit for bit [`embed`]'s.
+/// blocks of `code` keeping the state costs at every `k`-th block boundary.
+/// `Ok(None)` if infeasible or the cover is too short. With [`segment_rows`]
+/// and [`segment_trace`] run over the segments `[s·k, min((s+1)·k, m))` from
+/// the last to the first, the stego bits are bit for bit [`embed_code`]'s.
 pub fn pass_a(
     cover: &[u8],
     costs: &[f32],
     message: &[u8],
-    cols: &[u32],
+    code: &Code,
     h: usize,
     k: usize,
     tick: &(dyn Fn(usize) + Sync),
 ) -> Result<Option<PassA>, StegoError> {
-    let w = cols.len();
     let m = message.len();
     let k = k.max(1);
-    if h == 0 || h > MAX_H || w == 0 || m == 0 {
+    if h == 0 || h > MAX_H || m == 0 || m != code.m() {
         return Ok(None);
     }
-    let n = match m.checked_mul(w) {
-        Some(n) if n <= cover.len() && n <= costs.len() => n,
-        _ => return Ok(None),
-    };
-    let cols = masked_cols(cols, h);
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, cols: &cols, h, w };
+    let n = code.n();
+    if n > cover.len() || n > costs.len() {
+        return Ok(None);
+    }
+    let sets = code.masked_sets(h);
+    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: 0, p_off: 0, h };
     let progress = Progress::new(n, n, tick);
     let mut ticker = progress.ticker();
     let (mut prev, mut cur) = t.initial();
@@ -741,27 +995,31 @@ pub fn pass_a(
     Ok(Some(PassA { checkpoints, best, cost }))
 }
 
-/// Back pointers of one segment (`message.len()` blocks, `cover` / `costs`
-/// its `message.len() · cols.len()` positions) from its checkpoint (the
-/// segment's `2^h` state costs from [`pass_a`]): `words_per_step(h)` words
-/// per position.
+/// Back pointers of one segment — blocks `[b0, b0 + message.len())` of
+/// `code`, `cover` / `costs` their positions `[code.start(b0), …)` — from
+/// its checkpoint (the segment's `2^h` state costs from [`pass_a`]):
+/// `words_per_step(h)` words per position.
 pub fn segment_rows(
     cover: &[u8],
     costs: &[f32],
     message: &[u8],
-    cols: &[u32],
+    code: &Code,
+    b0: usize,
     h: usize,
     checkpoint: &[f64],
 ) -> Result<Vec<u64>, StegoError> {
-    let w = cols.len();
     let nb = message.len();
-    let n = nb * w;
-    let ns = 1usize << h;
-    if h == 0 || h > MAX_H || w == 0 || cover.len() < n || costs.len() < n || checkpoint.len() != ns {
+    let ns = 1usize << h.min(MAX_H);
+    if h == 0 || h > MAX_H || b0 + nb > code.m() || checkpoint.len() != ns {
         return Err(StegoError::MessageTooLarge);
     }
-    let cols = masked_cols(cols, h);
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, cols: &cols, h, w };
+    let p_off = code.start(b0);
+    let n = code.start(b0 + nb) - p_off;
+    if cover.len() < n || costs.len() < n {
+        return Err(StegoError::MessageTooLarge);
+    }
+    let sets = code.masked_sets(h);
+    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: b0, p_off, h };
     let progress = Progress::new(n, n, &|_| {});
     let mut ticker = progress.ticker();
     let mut prev = checkpoint.to_vec();
@@ -771,16 +1029,16 @@ pub fn segment_rows(
     Ok(rows)
 }
 
-/// Trace one segment back from `state` (the state after its last block's
-/// message shift: [`PassA::best`] for the last segment, else the previous
-/// call's return value) through its [`segment_rows`], writing its stego
-/// bits into `out` (`message.len() · cols.len()` positions). Returns the
-/// state at the segment's start.
-pub fn segment_trace(rows: &[u64], message: &[u8], cols: &[u32], h: usize, state: usize, out: &mut [u8]) -> usize {
-    let w = cols.len();
-    let cols = masked_cols(cols, h);
-    let n = message.len() * w;
-    let t = Trellis { cover: &[], costs: &[], message, cols: &cols, h, w };
+/// Trace one segment (blocks `[b0, b0 + message.len())` of `code`) back
+/// from `state` (the state after its last block's message shift:
+/// [`PassA::best`] for the last segment, else the previous call's return
+/// value) through its [`segment_rows`], writing its stego bits into `out`
+/// (the segment's positions). Returns the state at the segment's start.
+pub fn segment_trace(rows: &[u64], message: &[u8], code: &Code, b0: usize, h: usize, state: usize, out: &mut [u8]) -> usize {
+    let sets = code.masked_sets(h);
+    let p_off = code.start(b0);
+    let n = code.start(b0 + message.len()) - p_off;
+    let t = Trellis { cover: &[], costs: &[], message, code, sets: &sets, b_off: b0, p_off, h };
     t.traceback(rows, 0, message.len(), state, &mut out[..n])
 }
 
@@ -794,6 +1052,25 @@ fn masked_cols(cols: &[u32], h: usize) -> Vec<usize> {
     cols.iter().map(|&c| (c as usize) & ((1 << h) - 1)).collect()
 }
 
+/// Syndrome of `code`'s first `k` blocks over the stego bits `bit(j)`
+/// (code positions), e.g. a decoder reading a frame header.
+pub fn syndrome_prefix(code: &Code, k: usize, bit: impl Fn(usize) -> bool) -> Vec<u8> {
+    let k = k.min(code.m());
+    let mut out = Vec::with_capacity(k);
+    let mut state = 0u32;
+    for b in 0..k {
+        let s0 = code.start(b);
+        for (c, &col) in code.cols(b).iter().enumerate() {
+            if bit(s0 + c) {
+                state ^= col;
+            }
+        }
+        out.push((state & 1) as u8);
+        state >>= 1;
+    }
+    out
+}
+
 /// Cross-platform pin of the trellis kernel: SHA-256 over the plans
 /// (stego bits, total cost bits, change count) of deterministic random
 /// cases at h = 1, 6, 7, 9 and 10, both schedules, wet and zero costs
@@ -801,7 +1078,8 @@ fn masked_cols(cols: &[u32], h: usize) -> Vec<usize> {
 /// check the SIMD128 kernel against the native (NEON / scalar) value.
 #[doc(hidden)]
 pub fn trellis_test_hash_hex() -> String {
-    use rand::{Rng, SeedableRng};
+    use crate::stego::rng_compat::Rand08;
+    use rand::SeedableRng;
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     for (seed, h, m, w, wet) in [
@@ -815,20 +1093,20 @@ pub fn trellis_test_hash_hex() -> String {
     ] {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
         let n = m * w;
-        let cover: Vec<u8> = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
+        let cover: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
         let costs: Vec<f32> = (0..n)
             .map(|_| {
-                let r = rng.r#gen::<f64>();
+                let r = rng.gen08::<f64>();
                 if r < wet {
                     f32::INFINITY
                 } else if r < wet + 0.02 {
                     0.0
                 } else {
-                    rng.r#gen::<f32>() * 50.0
+                    rng.gen08::<f32>() * 50.0
                 }
             })
             .collect();
-        let msg: Vec<u8> = (0..m).map(|_| rng.r#gen::<u8>() & 1).collect();
+        let msg: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
         let hh = crate::stego::stc::hhat::generate_hhat_end_set(h, w, &[seed as u8; 32]);
         let mut cols: Vec<u32> = (0..w).map(|c| crate::stego::stc::hhat::column_packed(&hh, c)).collect();
         if seed == 4 {
@@ -848,23 +1126,67 @@ pub fn trellis_test_hash_hex() -> String {
             }
         }
     }
+    // Mixed-width codes (Ghost v3.1): a head of fixed width, then blocks of
+    // w and w + 1.
+    for (seed, h, m, n, head, hw, wet) in [
+        (8u64, 9usize, 300usize, 300 * 5 + 137usize, 48usize, 4usize, 0.05f64),
+        (9, 9, 50, 50 * 31 + 49, 0, 0, 0.1),
+        (10, 9, 400, 400 + 399, 48, 1, 0.0),
+    ] {
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
+        let cover: Vec<u8> = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
+        let costs: Vec<f32> = (0..n)
+            .map(|_| if rng.gen08::<f64>() < wet { f32::INFINITY } else { rng.gen08::<f32>() * 50.0 })
+            .collect();
+        let msg: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
+        let code = test_mixed_code(h, m, n, head, hw, seed as u8);
+        for limit in [usize::MAX, 0] {
+            match embed_code(&cover, &costs, &msg, &code, h, limit, 1, &|_| {}).expect("not cancelled") {
+                Some(p) => {
+                    hash.update(&p.stego_bits);
+                    hash.update(p.total_cost.to_bits().to_le_bytes());
+                    hash.update((p.changes as u64).to_le_bytes());
+                }
+                None => hash.update(b"infeasible"),
+            }
+        }
+    }
     hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A mixed-width code of `m` blocks over `n` positions with `head` blocks
+/// of width `hw` (end-set H-hats seeded by `seed` and the width).
+#[doc(hidden)]
+pub fn test_mixed_code(h: usize, m: usize, n: usize, head: usize, hw: usize, seed: u8) -> Code {
+    let cols = |w: usize| -> Vec<u32> {
+        if w == 0 {
+            return Vec::new();
+        }
+        let hh = crate::stego::stc::hhat::generate_hhat_end_set(h, w, &[seed ^ (w as u8); 32]);
+        (0..w).map(|c| crate::stego::stc::hhat::column_packed(&hh, c)).collect()
+    };
+    let rest_n = n - head * hw;
+    let rm = m - head;
+    let s = if rm > 0 { rest_n / rm } else { 0 };
+    let long = if rm > 0 && rest_n % rm != 0 { cols(s + 1) } else { Vec::new() };
+    Code::new(m, head, cols(hw), rest_n, cols(s), long).expect("consistent test code")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::stego::stc::{embed as stc, extract, hhat};
-    use rand::{Rng, SeedableRng};
+    use crate::stego::rng_compat::Rand08;
+    use rand::SeedableRng;
 
     fn case(seed: u64, n_blocks: usize, w: usize, wet_frac: f64) -> (Vec<u8>, Vec<f32>, Vec<u8>) {
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
         let n = n_blocks * w;
-        let cover = (0..n).map(|_| rng.r#gen::<u8>() & 1).collect();
+        let cover = (0..n).map(|_| rng.gen08::<u8>() & 1).collect();
         let costs = (0..n)
-            .map(|_| if rng.r#gen::<f64>() < wet_frac { f32::INFINITY } else { (rng.r#gen::<f32>() * 6.0).exp() })
+            .map(|_| if rng.gen08::<f64>() < wet_frac { f32::INFINITY } else { (rng.gen08::<f32>() * 6.0).exp() })
             .collect();
-        let msg = (0..n_blocks).map(|_| rng.r#gen::<u8>() & 1).collect();
+        let msg = (0..n_blocks).map(|_| rng.gen08::<u8>() & 1).collect();
         (cover, costs, msg)
     }
 
@@ -876,7 +1198,7 @@ mod tests {
     /// return the same value.
     #[test]
     fn trellis_hash_pinned() {
-        assert_eq!(trellis_test_hash_hex(), "0c3d837eb654c347a0e7a31996e3d077989dfb76b6ebb6341f046a349b46bb00");
+        assert_eq!(trellis_test_hash_hex(), "2390518fe2b3f2c1748932a72423fcd1e25d6e0817ed5964521e940fafdf25e8");
     }
 
     /// The split checkpointed schedule (pass A, segment rows, traces from
@@ -887,20 +1209,39 @@ mod tests {
             let (cover, costs, msg) = case(seed, m, w, wet);
             let hh = hhat::generate_hhat_end_set(h, w, &[seed as u8; 32]);
             let cols = packed(&hh, w);
-            let want = embed(&cover, &costs, &msg, &cols, h, usize::MAX, 1, &|_| {}).unwrap();
+            split_equals_embed(&cover, &costs, &msg, &Code::uniform(&cols, m), h, seed);
+        }
+        // Mixed widths: head, short and long blocks.
+        for (seed, h, m, n, head, hw, wet) in [
+            (31u64, 9usize, 300usize, 300 * 5 + 137usize, 48usize, 4usize, 0.05f64),
+            (32, 9, 50, 50 * 31 + 49, 0, 0, 0.1),
+            (33, 9, 400, 799, 48, 1, 0.0),
+            (34, 7, 120, 120 * 9 + 1, 48, 8, 0.2),
+        ] {
+            let (cover, costs, _) = case(seed, n, 1, wet);
+            let msg: Vec<u8> = case(seed + 100, m, 1, 0.0).2;
+            let code = test_mixed_code(h, m, n, head, hw, seed as u8);
+            split_equals_embed(&cover, &costs, &msg, &code, h, seed);
+        }
+    }
+
+    fn split_equals_embed(cover: &[u8], costs: &[f32], msg: &[u8], code: &Code, h: usize, seed: u64) {
+        let m = msg.len();
+        {
+            let want = embed_code(cover, costs, msg, code, h, usize::MAX, 1, &|_| {}).unwrap();
             for k in [1usize, 2, 7, 64, m, m + 3] {
-                let got = pass_a(&cover, &costs, &msg, &cols, h, k, &|_| {}).unwrap().map(|pa| {
+                let got = pass_a(cover, costs, msg, code, h, k, &|_| {}).unwrap().map(|pa| {
                     let ns = 1usize << h;
-                    let mut bits = vec![0u8; m * w];
+                    let mut bits = vec![0u8; code.n()];
                     let mut state = pa.best;
                     for seg in (0..m.div_ceil(k)).rev() {
                         let (b0, b1) = (seg * k, ((seg + 1) * k).min(m));
-                        let (p0, p1) = (b0 * w, b1 * w);
-                        let rows = segment_rows(&cover[p0..p1], &costs[p0..p1], &msg[b0..b1], &cols, h, &pa.checkpoints[seg * ns..(seg + 1) * ns]).unwrap();
-                        state = segment_trace(&rows, &msg[b0..b1], &cols, h, state, &mut bits[p0..p1]);
+                        let (p0, p1) = (code.start(b0), code.start(b1));
+                        let rows = segment_rows(&cover[p0..p1], &costs[p0..p1], &msg[b0..b1], code, b0, h, &pa.checkpoints[seg * ns..(seg + 1) * ns]).unwrap();
+                        state = segment_trace(&rows, &msg[b0..b1], code, b0, h, state, &mut bits[p0..p1]);
                     }
                     assert_eq!(state, 0);
-                    plan_of(&cover, bits, pa.cost)
+                    plan_of(cover, bits, pa.cost)
                 });
                 match (&want, got) {
                     (None, None) => {}
@@ -1010,6 +1351,44 @@ mod tests {
         }
     }
 
+    /// Mixed-width codes: every position is used (`n` exactly), widths are
+    /// `w` / `w + 1` after the head, every schedule gives the inline plan, and
+    /// the syndrome of the plan is the message.
+    #[test]
+    fn mixed_codes_schedules_and_syndrome() {
+        for (seed, h, m, n, head, hw, wet) in [
+            (41u64, 9usize, 700usize, 700 * 6 + 333usize, 48usize, 5usize, 0.05f64),
+            (42, 9, 90, 90 * 40 + 89, 48, 33, 0.0),
+            (43, 9, 3000, 3000 * 2 - 1, 48, 1, 0.02),
+            (44, 9, 7, 7 * 300 + 5, 0, 0, 0.0),
+        ] {
+            let code = test_mixed_code(h, m, n, head, hw, seed as u8);
+            assert_eq!(code.n(), n);
+            let rm = m - head;
+            for b in 0..m {
+                let wb = code.width(b);
+                if b < head {
+                    assert_eq!(wb, hw);
+                } else {
+                    assert!(wb == (n - head * hw) / rm || wb == (n - head * hw) / rm + 1, "b {b} width {wb}");
+                }
+            }
+            let (cover, costs, _) = case(seed, n, 1, wet);
+            let msg: Vec<u8> = case(seed + 7, m, 1, 0.0).2;
+            let base = embed_code(&cover, &costs, &msg, &code, h, usize::MAX, 1, &|_| {}).unwrap().unwrap();
+            let syn = syndrome_prefix(&code, m, |j| base.stego_bits[j] & 1 == 1);
+            assert_eq!(syn, msg, "seed {seed}");
+            let full = inline_bytes(n, h);
+            for limit in [0, full / 3, full - 1] {
+                for threads in [1usize, 3] {
+                    let p = embed_code(&cover, &costs, &msg, &code, h, limit, threads, &|_| {}).unwrap().unwrap();
+                    assert_eq!(p.stego_bits, base.stego_bits, "seed {seed} limit {limit} threads {threads}");
+                    assert_eq!(p.total_cost.to_bits(), base.total_cost.to_bits());
+                }
+            }
+        }
+    }
+
     /// The tail cuts the recomputation: a limit of half the table walks
     /// ~1.5× the positions, nothing kept walks 2×, waves keep it at 2×
     /// (spread over the threads); the working set never exceeds the limit
@@ -1035,15 +1414,16 @@ mod tests {
     /// state costs and the same back-pointer words at every height.
     #[test]
     fn kernels_agree() {
-        use rand::{Rng, SeedableRng};
+        use crate::stego::rng_compat::Rand08;
+        use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(99);
         for h in 1..=MAX_H {
             let ns = 1usize << h;
             for _ in 0..20 {
                 let prev: Vec<f64> =
-                    (0..ns).map(|_| if rng.gen_bool(0.1) { f64::INFINITY } else { rng.r#gen::<f64>() * 100.0 }).collect();
-                let col = (rng.r#gen::<usize>() & (ns - 1)) | 1 | (ns >> 1);
-                let (c0, c1) = if rng.gen_bool(0.5) { (0.0, rng.r#gen::<f64>() * 9.0) } else { (rng.r#gen::<f64>() * 9.0, 0.0) };
+                    (0..ns).map(|_| if rng.gen_bool08(0.1) { f64::INFINITY } else { rng.gen08::<f64>() * 100.0 }).collect();
+                let col = (rng.gen08::<usize>() & (ns - 1)) | 1 | (ns >> 1);
+                let (c0, c1) = if rng.gen_bool08(0.5) { (0.0, rng.gen08::<f64>() * 9.0) } else { (rng.gen08::<f64>() * 9.0, 0.0) };
                 let wps = words_per_step(h);
                 let (mut ca, mut ra) = (vec![0.0; ns], vec![0u64; wps]);
                 let (mut cb, mut rb) = (vec![0.0; ns], vec![0u64; wps]);

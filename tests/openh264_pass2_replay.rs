@@ -2958,7 +2958,7 @@ fn pass2_walker_sees_single_cs_flip_real_carplane_480p() {
 /// If walker sees >> N diffs: patch insufficient at scale, there's another
 /// asymmetric-pass bug.
 #[test]
-fn pass2_walker_sees_N_cs_flips_real_carplane_480p() {
+fn pass2_walker_sees_n_cs_flips_real_carplane_480p() {
     use phasm_core::codec::h264::openh264::extract_cover_bits_via_decoder;
 
     let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());
@@ -3086,7 +3086,7 @@ fn pass2_walker_sees_N_cs_flips_real_carplane_480p() {
 /// bug is fork-level MVD cascade. If it stays symmetric, the bug is in
 /// the orchestrator wrapper code, not the fork.
 #[test]
-fn pass2_walker_sees_N_4domain_flips_real_carplane_480p() {
+fn pass2_walker_sees_n_4domain_flips_real_carplane_480p() {
     use phasm_core::codec::h264::openh264::extract_cover_bits_via_decoder;
 
     let _lock = SESSION_GUARD.lock().unwrap_or_else(|e| e.into_inner());

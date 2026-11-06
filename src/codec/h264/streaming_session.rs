@@ -42,8 +42,8 @@ use super::openh264_stego::{
 };
 #[cfg(feature = "h264-encoder")]
 use super::stego::tier_filter::{CascadeTier, DEFAULT_HEADROOM};
-// chunk_frame helpers — needed by BOTH the OH264 encode path and (post
-// #472.2) the pure-Rust encode path, so unconditional.
+// chunk_frame builders — encode-side only.
+#[cfg(feature = "h264-encoder")]
 use super::stego::chunk_frame::{build_chunk_frame_v3_1, build_first_chunk_frame_v3_1};
 
 // Decode-side imports (available within the h264-encoder gate that
@@ -251,6 +251,7 @@ enum SessionImpl {
     /// Requested engine isn't compiled in. push_frame / finish will
     /// error explicitly. Used when caller asks for OH264 but the
     /// crate was built without `h264-encoder`.
+    #[cfg_attr(feature = "h264-encoder", allow(dead_code))] // only built without the encoder
     EngineDisabled(EncodeEngineChoice),
 }
 
@@ -321,6 +322,7 @@ impl StreamingEncodeSession {
     /// payload — the per-GOP stego channel is byte-identical to the
     /// text-only path; only `payload::encode_payload` differs. The decoder
     /// recovers them via `StreamingDecodeSession::finish().files`.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(unused_variables))]
     pub fn create_with_files(
         params: EncodeSessionParams,
         message_text: &str,
@@ -369,6 +371,7 @@ impl StreamingEncodeSession {
     /// Push one YUV frame. Emits Annex-B bytes for a closing GOP into
     /// `out` (appended) when the frame completes a GOP. The OH264 path
     /// drains per-GOP; finish() handles the tail.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(unused_variables))]
     pub fn push_frame(
         &mut self,
         frame: YuvFrameRef<'_>,
@@ -586,6 +589,7 @@ impl StreamingEncodeSession {
     /// For OH264Shadow: runs the n-shadow orchestrator on the
     /// buffered clip. Errors if no frames were pushed or (OH264 only)
     /// fewer than `total_chunks` chunks emitted.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(unused_variables))]
     pub fn finish(self, out: &mut Vec<u8>) -> Result<(), StegoError> {
         match self.inner {
             #[cfg(feature = "h264-encoder")]
@@ -1117,6 +1121,7 @@ fn drain_one_gop(
 
 // Used by the OH264 shadow buffer-on-finish path — strips row-padding
 // from the input strides into a tight I420 layout the encoder expects.
+#[cfg(feature = "h264-encoder")]
 fn pack_frame_into_buffer(
     width: u32,
     height: u32,
@@ -1359,6 +1364,7 @@ impl CapacityProbeResult {
 /// Memory bound: O(gop_size × frame_size) — same as encode session.
 /// Wall-clock: ~50% of the actual stego encode (no STC plan, no
 /// override application).
+#[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // fields are used only by the encoder-gated probe path
 pub struct StreamingProbeSession {
     params: EncodeSessionParams,
     inner: ProbeImpl,
@@ -1403,6 +1409,7 @@ pub struct StreamingProbeSession {
 /// whole framed message under the rate ceiling, probing the rest cannot change
 /// the plan `allocate_chunks_concentrate_tail` will produce, so it stops.
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // fields are used only by the encoder-gated probe path
 struct ProbePlanTarget {
     /// `StreamingEncodeSession::framed_message_len()` — the exact byte count
     /// the plan must account for. An over-estimate is safe (it only probes
@@ -1428,6 +1435,7 @@ enum ProbeImpl {
     #[cfg(feature = "h264-encoder")]
     Oh264(Oh264ProbeState),
     /// Engine requested but compiled out.
+    #[cfg_attr(feature = "h264-encoder", allow(dead_code))] // only built without the encoder
     EngineDisabled(EncodeEngineChoice),
 }
 
@@ -1640,6 +1648,7 @@ impl StreamingProbeSession {
     /// final number are therefore the SAME quantity — without that, the HUD
     /// would drop ~9% at the end, reintroducing the retraction CAP2.5 #821 was
     /// fixed to remove.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // only the encoder-gated probe path calls it
     fn achievable_bytes_from_probed(&self) -> usize {
         let total_gops = self
             .params
@@ -1669,6 +1678,7 @@ impl StreamingProbeSession {
     /// `extrapolate_dry`, the dry cover is scaled from the GOPs probed to
     /// `total_frames_hint / gop_size`, so the α bands of a partial probe
     /// estimate the whole clip; `finish` passes `false`.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // only the encoder-gated probe path calls it
     fn result_from_probed(&self, extrapolate_dry: bool, max_alpha_64: u32) -> CapacityProbeResult {
         let total_gops = self.params.total_frames_hint.div_ceil(self.params.gop_size).max(1);
         let dry_cover_bits = if extrapolate_dry && self.n_gops > 0 && self.n_gops < total_gops {
@@ -1688,6 +1698,7 @@ impl StreamingProbeSession {
     }
 
     /// The adaptive red end (spec § 4a) from the GOPs probed so far.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // only the encoder-gated probe path calls it
     fn adaptive_max_alpha64(&self) -> u32 {
         super::stego::quality_predict::adaptive_max_alpha64(
             &self.quality_curves,
@@ -1701,6 +1712,7 @@ impl StreamingProbeSession {
     /// Report the running policy maximum (`max_message_bytes`), the figure
     /// the UI shows once the probe is done. `extrapolate_dry` is `false`
     /// only for the final event, which then equals the result exactly.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(dead_code))] // only the encoder-gated probe path calls it
     fn emit_estimate(&self, extrapolate_dry: bool) {
         if let Some(cb) = self.progress_callback.as_ref() {
             // Total GOPs target = ceil(total_frames_hint / gop_size).
@@ -1725,6 +1737,7 @@ impl StreamingProbeSession {
     /// Push one YUV frame. When the in-flight GOP fills, runs the
     /// per-GOP probe (baseline OH264 encode + walker) and accumulates
     /// the cover-bits count.
+    #[cfg_attr(not(feature = "h264-encoder"), allow(unused_variables))]
     pub fn push_frame(&mut self, frame: YuvFrameRef<'_>) -> Result<(), StegoError> {
         match &mut self.inner {
             #[cfg(feature = "h264-encoder")]
@@ -1971,6 +1984,7 @@ pub struct StreamingDecodeSession {
     /// chunk_bits. `create(passphrase)` defaults to `CostWeights::default()`
     /// (same as the encoder default); callers using non-default
     /// weights should use `create_with_weights`.
+    #[allow(dead_code)] // stored for create_with_weights API compatibility; decode does not read it
     cost_weights: CostWeights,
     /// #474.1 — optional progress callback. Emit sites in `finish`
     /// invoke this on each `DecodePhase` transition. Wrapped in
@@ -2203,7 +2217,7 @@ impl StreamingDecodeSession {
     /// AES-authenticates, or `FrameCorrupted` / a crypto error if none match.
     fn try_shadow_streaming(&self) -> Result<DecodeSessionResult, StegoError> {
         use super::stego::inject::remap_cover_frame_idx;
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         use rand_chacha::ChaCha20Rng;
 
         let perm_seed = crate::stego::crypto::derive_shadow_structural_key(&self.passphrase)?;
@@ -2322,6 +2336,7 @@ fn split_annex_b_into_gops(annex_b: &[u8]) -> Vec<&[u8]> {
 /// v2 STC order (`GopSeeds::order`, spec § 3). Returns the cover bit vector
 /// the v3 STC extract operates on. Shared by both v3 extract variants + the
 /// encode-time round-trip verify.
+#[cfg(feature = "h264-encoder")]
 fn h264_gop_cover_bits(slab: &[u8], order_seed: &[u8; 32]) -> Option<Vec<u8>> {
     // #493.5 Phase 4 — walk with MVD recording so the 4-domain combine
     // sees all 4 cover vectors (default walker leaves MVD cover empty).
@@ -2474,6 +2489,7 @@ fn extract_chunk_frame_match(
 /// Encode-time round-trip verify for one GOP's v3 chunk: re-walk the
 /// just-encoded `gop` slab and confirm it extracts back to `expected`.
 /// GOP 0 verifies as a first chunk; GOP ≥ 1 as a subsequent chunk.
+#[cfg(feature = "h264-encoder")]
 fn verify_chunk_v3(
     gop: &[u8],
     seeds: &GopSeeds,
@@ -2521,6 +2537,7 @@ fn first_variant_match<T>(
 /// [`verify_chunk_v3`] through the decoder's variant search: the GOP must
 /// extract back to `expected` under the FIRST variant that yields a chunk,
 /// which is the one the decoder will take.
+#[cfg(feature = "h264-encoder")]
 fn verify_chunk_v3_variants(
     gop: &[u8],
     variants: &[GopSeeds],

@@ -40,13 +40,14 @@ pub use codec::jpeg::frame::FrameInfo;
 pub use codec::jpeg::JpegImage;
 pub use stego::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, ghost_capacity, ghost_capacity_si, StegoError, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};
 pub use stego::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
-pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, estimate_shadow_capacity_si, ghost_capacity_with_shadows, ghost_bands, ghost_bands_si, GhostBands};
+pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, estimate_shadow_capacity_si, ghost_capacity_with_shadows, ghost_bands, ghost_bands_si, ghost_bands_and_shadow_capacity, GhostBands};
 pub use stego::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
-pub use stego::{armor_encode, armor_encode_with_quality, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo};
+pub use stego::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo};
 pub use stego::EncodeQuality;
 pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET};
 pub use stego::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION, ARMOR_TARGET_DIMENSION};
+pub use stego::{armor_cover_dimensions, ArmorCoverDims, ArmorCoverPreset, ARMOR_COVER_STEP};
 pub use stego::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
 pub use stego::progress;
 pub use stego::memory;
@@ -55,7 +56,12 @@ pub use stego::{
     set_memory_budget, set_telemetry_hook,
     GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
-pub use stego::{optimize_cover, OptimizerConfig, OptimizerMode};
+pub use codec::jpeg::history::{grid_evidence, is_aligned_jpeg_decode, GridEvidence};
+pub use codec::resample::{fit_long_side, resample_rgb};
+pub use stego::cover_builder::{build_cover, cover_needs_pixels, CoverMode, CoverOut, CoverRequest, ARMOR_COVER_QUALITY};
+pub use codec::jpeg::exif::{cover_with_source_metadata, exif_for_cover, source_exif, with_exif};
+pub use codec::jpeg::lossless::{upright_and_clean as jpeg_upright_and_clean, Transform as JpegTransform};
+pub use codec::jpeg::quality::{estimate_jpeg_quality, QualityEstimate as JpegQualityEstimate};
 
 // H.264 decode dispatch re-exports. (Production H.264 video encode is the
 // OpenH264 streaming session below; the legacy CAVLC encode/capacity pipeline

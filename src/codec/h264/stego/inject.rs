@@ -255,6 +255,7 @@ fn suffix_lsb_bit_for_magnitude(abs: u32) -> u8 {
 /// changes by ±1; direction prefers -1 except at the threshold
 /// where it must be +1 to preserve eligibility.
 #[inline]
+#[allow(dead_code)] // reference for the flip-direction policy cited in dpb_correction / openh264_stego
 fn flipped_magnitude(abs: u32, threshold: u32) -> u32 {
     if abs == threshold { abs + 1 } else { abs - 1 }
 }
@@ -470,29 +471,31 @@ fn simd_disabled_via_env() -> bool {
 #[cfg(all(target_arch = "aarch64", feature = "simd"))]
 #[inline]
 unsafe fn nonzero_mask_neon_16(scan: &[i32]) -> u16 {
-    use core::arch::aarch64::*;
-    debug_assert!(scan.len() >= 16);
-    let p = scan.as_ptr();
-    let v0 = vld1q_s32(p);
-    let v1 = vld1q_s32(p.add(4));
-    let v2 = vld1q_s32(p.add(8));
-    let v3 = vld1q_s32(p.add(12));
-    let nz0 = vmvnq_u32(vceqzq_s32(v0));
-    let nz1 = vmvnq_u32(vceqzq_s32(v1));
-    let nz2 = vmvnq_u32(vceqzq_s32(v2));
-    let nz3 = vmvnq_u32(vceqzq_s32(v3));
-    // Lane-specific bit stamps. Lane 0..3 of v0 → bits 0..3, etc.
-    let bits01: [u32; 4] = [1, 2, 4, 8];
-    let bits23: [u32; 4] = [16, 32, 64, 128];
-    let bits45: [u32; 4] = [256, 512, 1024, 2048];
-    let bits67: [u32; 4] = [4096, 8192, 16384, 32768];
-    let m0 = vandq_u32(nz0, vld1q_u32(bits01.as_ptr()));
-    let m1 = vandq_u32(nz1, vld1q_u32(bits23.as_ptr()));
-    let m2 = vandq_u32(nz2, vld1q_u32(bits45.as_ptr()));
-    let m3 = vandq_u32(nz3, vld1q_u32(bits67.as_ptr()));
-    let combined = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
-    // Each lane has unique bits set → sum-across == OR-across.
-    vaddvq_u32(combined) as u16
+    unsafe {
+        use core::arch::aarch64::*;
+        debug_assert!(scan.len() >= 16);
+        let p = scan.as_ptr();
+        let v0 = vld1q_s32(p);
+        let v1 = vld1q_s32(p.add(4));
+        let v2 = vld1q_s32(p.add(8));
+        let v3 = vld1q_s32(p.add(12));
+        let nz0 = vmvnq_u32(vceqzq_s32(v0));
+        let nz1 = vmvnq_u32(vceqzq_s32(v1));
+        let nz2 = vmvnq_u32(vceqzq_s32(v2));
+        let nz3 = vmvnq_u32(vceqzq_s32(v3));
+        // Lane-specific bit stamps. Lane 0..3 of v0 → bits 0..3, etc.
+        let bits01: [u32; 4] = [1, 2, 4, 8];
+        let bits23: [u32; 4] = [16, 32, 64, 128];
+        let bits45: [u32; 4] = [256, 512, 1024, 2048];
+        let bits67: [u32; 4] = [4096, 8192, 16384, 32768];
+        let m0 = vandq_u32(nz0, vld1q_u32(bits01.as_ptr()));
+        let m1 = vandq_u32(nz1, vld1q_u32(bits23.as_ptr()));
+        let m2 = vandq_u32(nz2, vld1q_u32(bits45.as_ptr()));
+        let m3 = vandq_u32(nz3, vld1q_u32(bits67.as_ptr()));
+        let combined = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
+        // Each lane has unique bits set → sum-across == OR-across.
+        vaddvq_u32(combined) as u16
+    }
 }
 
 // ─── MvdSuffixLsb injection primitives ───────────────────────────
@@ -513,6 +516,7 @@ pub(super) const MVD_SUFFIX_LSB_THRESHOLD: u32 = 9;
 /// eligibility boundary (`abs == 9`), must return `abs + 1` to keep
 /// the target magnitude in the UEG3 suffix-emitting range.
 #[inline]
+#[allow(dead_code)] // reference for the flip-direction policy cited in dpb_correction / openh264_stego
 pub(super) fn mvd_flipped_magnitude(abs: u32) -> u32 {
     flipped_magnitude(abs, MVD_SUFFIX_LSB_THRESHOLD)
 }
@@ -604,10 +608,6 @@ fn with_sign_kind(path: SyntaxPath) -> SyntaxPath {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn luma4x4_path(coeff_idx: u8) -> SyntaxPath {
-        SyntaxPath::Luma4x4 { block_idx: 0, coeff_idx, kind: BinKind::Sign }
-    }
 
 
     #[test]

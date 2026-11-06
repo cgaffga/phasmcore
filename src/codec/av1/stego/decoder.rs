@@ -1062,7 +1062,6 @@ mod tests {
         /// on it.
         #[test]
         fn w3103_strict_cursor_parity_via_writer_tee() {
-            use core_dav1d_sys::DAV1D_PHASM_TAG_AC_COEFF_SIGN;
             use phasm_rav1e::color::ChromaSampling;
             use phasm_rav1e::ec::WriterBase;
             use phasm_rav1e::phasm_stego::{

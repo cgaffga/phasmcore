@@ -41,7 +41,8 @@ use crate::stego::side_info::SideInfo;
 use crate::stego::stc::trellis::{self, PassA};
 
 use super::pipeline::{self, PreparedEncode};
-use super::v3::{self, LaneCache, LaneGeom, LaneInput, LanePlan, Rho, V3Seeds};
+use super::v31::{self, LaneCache, LaneGeom, LaneInput, LanePlan, Rho, V31Seeds};
+use crate::stego::stc::trellis::Code;
 
 const TASK_COST_BAND: u8 = 1;
 const TASK_TRELLIS: u8 = 2;
@@ -209,40 +210,72 @@ fn unpack_bits(packed: &[u8], out: &mut [u8]) {
     }
 }
 
-/// A layer's trellis input.
+/// A layer's trellis input: blocks `[b0, b0 + msg.len())` of `code`, their
+/// positions' cover bits and costs.
 struct LayerInput<'a> {
-    cols: &'a [u32],
+    code: &'a Code,
+    b0: usize,
     msg: &'a [u8],
     cover: &'a [u8],
     costs: &'a [f32],
 }
 
+fn write_code(w: &mut W, code: &Code) {
+    let (head, _) = code.head();
+    w.u32(code.m() as u32);
+    w.u32(head as u32);
+    w.u64(code.rest_n() as u64);
+    for set in code.column_sets() {
+        w.u32(set.len() as u32);
+        w.u32s(set);
+    }
+}
+
+fn read_code(r: &mut R<'_>) -> Result<Code, StegoError> {
+    let m = r.u32()? as usize;
+    let head = r.u32()? as usize;
+    let rest_n = r.u64()? as usize;
+    let mut sets = Vec::with_capacity(3);
+    for _ in 0..3 {
+        let len = r.len(4)?;
+        sets.push(r.u32s(len)?);
+    }
+    let long = sets.pop().ok_or_else(bad)?;
+    let short = sets.pop().ok_or_else(bad)?;
+    let head_cols = sets.pop().ok_or_else(bad)?;
+    Code::new(m, head, head_cols, rest_n, short, long).ok_or_else(bad)
+}
+
 fn write_layer(w: &mut W, li: &LayerInput<'_>) {
-    w.u32(li.cols.len() as u32);
-    w.u32s(li.cols);
+    write_code(w, li.code);
+    w.u32(li.b0 as u32);
     w.u32(li.msg.len() as u32);
     w.bytes(li.msg);
-    let n = li.msg.len() * li.cols.len();
+    let n = li.code.start(li.b0 + li.msg.len()) - li.code.start(li.b0);
     w.bytes(&li.cover[..n]);
     w.f32s(&li.costs[..n]);
 }
 
 struct OwnedLayer {
-    cols: Vec<u32>,
+    code: Code,
+    b0: usize,
     msg: Vec<u8>,
     cover: Vec<u8>,
     costs: Vec<f32>,
 }
 
 fn read_layer(r: &mut R<'_>) -> Result<OwnedLayer, StegoError> {
-    let w = r.len(4)?;
-    let cols = r.u32s(w)?;
+    let code = read_code(r)?;
+    let b0 = r.u32()? as usize;
     let m = r.len(1)?;
+    if b0.checked_add(m).is_none_or(|e| e > code.m()) {
+        return Err(bad());
+    }
     let msg = r.take(m)?.to_vec();
-    let n = m.checked_mul(w).ok_or_else(bad)?;
+    let n = code.start(b0 + m) - code.start(b0);
     let cover = r.take(n)?.to_vec();
     let costs = r.f32s(n)?;
-    Ok(OwnedLayer { cols, msg, cover, costs })
+    Ok(OwnedLayer { code, b0, msg, cover, costs })
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +286,8 @@ fn read_layer(r: &mut R<'_>) -> Result<OwnedLayer, StegoError> {
 struct Held {
     rows: Vec<u64>,
     msg: Vec<u8>,
-    cols: Vec<u32>,
+    code: Code,
+    b0: usize,
     h: usize,
 }
 
@@ -304,7 +338,7 @@ impl GhostTaskRunner {
                 let limit = r.u64()?;
                 let li = read_layer(&mut r)?;
                 drop(task);
-                let plan = trellis::embed(&li.cover, &li.costs, &li.msg, &li.cols, h, limit as usize, 1, &|_| {})?;
+                let plan = trellis::embed_code(&li.cover, &li.costs, &li.msg, &li.code, h, limit as usize, 1, &|_| {})?;
                 let mut w = W::new(reply, li.cover.len() / 8 + 16);
                 match plan {
                     Some(p) => {
@@ -320,7 +354,7 @@ impl GhostTaskRunner {
                 let k = r.u32()? as usize;
                 let li = read_layer(&mut r)?;
                 drop(task);
-                let pa = trellis::pass_a(&li.cover, &li.costs, &li.msg, &li.cols, h, k, &|_| {})?;
+                let pa = trellis::pass_a(&li.cover, &li.costs, &li.msg, &li.code, h, k, &|_| {})?;
                 let mut w = W::new(reply, pa.as_ref().map_or(0, |p| p.checkpoints.len() * 8) + 32);
                 match pa {
                     Some(p) => {
@@ -340,16 +374,16 @@ impl GhostTaskRunner {
                 let ns = 1usize << h.min(trellis::MAX_H);
                 let checkpoint = r.f64s(ns)?;
                 drop(task);
-                let rows = trellis::segment_rows(&li.cover, &li.costs, &li.msg, &li.cols, h, &checkpoint)?;
-                self.held.insert((hd.lane, hd.layer, hd.seg), Held { rows, msg: li.msg, cols: li.cols, h });
+                let rows = trellis::segment_rows(&li.cover, &li.costs, &li.msg, &li.code, li.b0, h, &checkpoint)?;
+                self.held.insert((hd.lane, hd.layer, hd.seg), Held { rows, msg: li.msg, code: li.code, b0: li.b0, h });
                 Ok(W::new(reply, 0).0)
             }
             TASK_TRACE => {
                 let state = r.u32()? as usize;
                 drop(task);
                 let held = self.held.remove(&(hd.lane, hd.layer, hd.seg)).ok_or_else(bad)?;
-                let mut bits = vec![0u8; held.msg.len() * held.cols.len()];
-                let start = trellis::segment_trace(&held.rows, &held.msg, &held.cols, held.h, state, &mut bits);
+                let mut bits = vec![0u8; held.code.start(held.b0 + held.msg.len()) - held.code.start(held.b0)];
+                let start = trellis::segment_trace(&held.rows, &held.msg, &held.code, held.b0, held.h, state, &mut bits);
                 let mut w = W::new(reply, bits.len() / 8 + 8);
                 w.u32(start as u32);
                 w.bytes(&pack_bits(&bits));
@@ -391,14 +425,13 @@ enum LayerRun {
 
 struct ActiveLayer {
     layer: u8,
-    w: usize,
-    cols: Vec<u32>,
+    code: Code,
     cover: Vec<u8>,
     costs: Vec<f32>,
     /// Stego bits (filled by the trellis result or the traces).
     stego: Vec<u8>,
     run: LayerRun,
-    /// Back-pointer bytes its trellis task may keep (as `v3::plan` shares
+    /// Back-pointer bytes its trellis task may keep (as `v31::plan` shares
     /// the large-frame working set among the lanes in flight).
     limit: usize,
     /// Run as pass A + segments.
@@ -430,13 +463,17 @@ pub struct GhostEncodeSession {
     img: JpegImage,
     frame_bits: Vec<u8>,
     si: Option<SideInfo>,
-    seeds: V3Seeds,
+    seeds: V31Seeds,
+    /// v3.1 pair bits of the cover.
+    pairs: v31::PairKey,
     h: usize,
     /// Back-pointer bytes any lane trellis may keep (the memory plan's).
     inline_limit: usize,
     helpers: usize,
     bound: bool,
     costs: Vec<f32>,
+    /// The dummy (MCU-padding) blocks, never changed (`v31::dummy_block_wet`).
+    wet: Option<v31::WetMask>,
     bands: Vec<(usize, usize)>,
     next_band: usize,
     bands_left: usize,
@@ -445,7 +482,7 @@ pub struct GhostEncodeSession {
     lane_tasks_out: usize,
     work_total: u64,
     work_done: u64,
-    stats: Option<v3::V3Stats>,
+    stats: Option<v31::V31Stats>,
     /// Input size above which a split layer's pass A runs here.
     local_pass_a_bytes: usize,
     /// Pass A runs done in the coordinator (tests).
@@ -469,17 +506,17 @@ impl GhostEncodeSession {
         let (pre, si) = match pixels {
             Some((rgb, w, h)) => {
                 let (img, si) = pipeline::parse_with_side_info(image_bytes, rgb, w, h)?;
-                (Some(img), Some(si))
+                (Some(img), si)
             }
             None => (None, None),
         };
         let PreparedEncode { img, frame_bits, opts, .. } =
             pipeline::prepare_encode(image_bytes, message, files, passphrase, si.is_some(), pre)?;
         let key = crypto::derive_structural_key(passphrase)?;
-        let seeds = v3::v3_seeds(&key);
+        let seeds = v31::v31_seeds(&key);
         let grid = img.dct_grid(0);
         let (bw, bt) = (grid.blocks_wide(), grid.blocks_tall());
-        let n = v3::ac_count(grid);
+        let n = v31::ac_count(grid);
         let m = frame_bits.len();
         if m == 0 || m > n {
             return Err(StegoError::MessageTooLarge);
@@ -487,10 +524,13 @@ impl GhostEncodeSession {
         let helpers = helpers.max(1);
         let nb = (2 * helpers).min(bt.div_ceil(MIN_BAND_ROWS)).max(1);
         let bands: Vec<(usize, usize)> = (0..nb).map(|i| (i * bt / nb, (i + 1) * bt / nb)).filter(|(a, b)| a < b).collect();
-        let l = v3::lanes(n, m);
+        let l = v31::lanes(n, m);
         let work_total = (n / 4) as u64
-            + (0..l).map(|k| lane_work(v3::share(n, l, k).len(), v3::share(m, l, k).len()) as u64).sum::<u64>();
+            + (0..l).map(|k| lane_work(v31::share(n, l, k).len(), v31::share(m, l, k).len()) as u64).sum::<u64>();
+        let wet = v31::dummy_block_wet(&img);
+        let pairs = v31::PairKey::new(&seeds.pair, grid.coeffs().len());
         Ok(Self {
+            pairs,
             inline_limit: opts.lane_inline_bytes,
             h: opts.h,
             bound: opts.bound,
@@ -500,6 +540,7 @@ impl GhostEncodeSession {
             seeds,
             helpers,
             costs: vec![f32::INFINITY; bw * bt * 64],
+            wet,
             bands_left: bands.len(),
             bands,
             next_band: 0,
@@ -529,7 +570,7 @@ impl GhostEncodeSession {
     /// order. Done on demand otherwise.
     pub fn run_local(&mut self) -> Result<(), StegoError> {
         if self.ord.is_none() {
-            self.ord = Some(v3::order(self.img.dct_grid(0), &self.seeds));
+            self.ord = Some(v31::order(self.img.dct_grid(0), &self.seeds));
         }
         self.maybe_start_lanes()
     }
@@ -568,7 +609,7 @@ impl GhostEncodeSession {
                 self.costs[br0 * bw * 64..br1 * bw * 64].copy_from_slice(&costs);
                 self.bands_left -= 1;
                 let bt = self.img.dct_grid(0).blocks_tall();
-                self.work_done += (v3::ac_count(self.img.dct_grid(0)) / 4 * (br1 - br0) / bt) as u64;
+                self.work_done += (v31::ac_count(self.img.dct_grid(0)) / 4 * (br1 - br0) / bt) as u64;
                 if self.bands_left == 0 && self.ord.is_none() {
                     self.run_local()?;
                 }
@@ -598,8 +639,8 @@ impl GhostEncodeSession {
                 let cost = r.f64()?;
                 let nck = r.len(8)?;
                 let checkpoints = r.f64s(nck)?;
-                let m = act.cover.len() / act.w;
-                let kb = segment_blocks(act.w);
+                let m = act.code.m();
+                let kb = segment_blocks(&act.code);
                 let done = (act.cover.len() / 2) as u64;
                 self.start_split(k, hd.layer, m, kb, PassA { checkpoints, best, cost }, done)
             }
@@ -614,8 +655,7 @@ impl GhostEncodeSession {
                 self.lane_tasks_out = self.lane_tasks_out.saturating_sub(1);
                 let k = hd.lane as usize;
                 let act = self.active_mut(k, hd.layer)?;
-                let w = act.w;
-                let m = act.cover.len() / w;
+                let m = act.code.m();
                 let LayerRun::Split(sp) = &mut act.run else { return Err(bad()) };
                 let seg = hd.seg as usize;
                 if seg != sp.trace_seg || !sp.tracing {
@@ -623,7 +663,7 @@ impl GhostEncodeSession {
                 }
                 let start = r.u32()? as usize;
                 let (b0, b1) = (seg * sp.k, ((seg + 1) * sp.k).min(m));
-                let (p0, p1) = (b0 * w, b1 * w);
+                let (p0, p1) = (act.code.start(b0), act.code.start(b1));
                 let packed = r.take((p1 - p0).div_ceil(8))?;
                 unpack_bits(packed, &mut act.stego[p0..p1]);
                 sp.tracing = false;
@@ -668,7 +708,7 @@ impl GhostEncodeSession {
         w.u32(bt as u32);
         w.u32(br0 as u32);
         w.u32(br1 as u32);
-        let qt = v3::luma_qt(&self.img).expect("checked at parse");
+        let qt = v31::luma_qt(&self.img).expect("checked at parse");
         for q in qt.values {
             w.0.extend_from_slice(&q.to_le_bytes());
         }
@@ -686,11 +726,11 @@ impl GhostEncodeSession {
         let grid = self.img.dct_grid(0);
         let n = ord.len();
         let m = self.frame_bits.len();
-        let (samples, n_med) = v3::sample_positions(n);
+        let (samples, n_med) = v31::sample_positions(n);
         let sample_rho: Vec<f32> = samples.iter().map(|&k| self.costs[ord[k] as usize]).collect();
         let (lam, median_cost, sample_ab) =
-            v3::sample_stats(ord, &samples, n_med, &sample_rho, m, grid, None, None, self.si.as_ref());
-        let l = v3::lanes(n, m);
+            v31::sample_stats(ord, &samples, n_med, &sample_rho, m, grid, None, self.wet.as_ref(), self.si.as_ref(), &self.pairs);
+        let l = v31::lanes(n, m);
         self.lanes = Some(Lanes {
             l,
             lam,
@@ -707,21 +747,22 @@ impl GhostEncodeSession {
     fn lane_input<'a>(&'a self, k: usize, cache: Option<&'a LaneCache>) -> LaneInput<'a> {
         let ord = self.ord.as_ref().expect("lanes start after the order");
         let lanes = self.lanes.as_ref().expect("lanes started");
-        let lr = v3::share(ord.len(), lanes.l, k);
+        let lr = v31::share(ord.len(), lanes.l, k);
         LaneInput {
             grid: self.img.dct_grid(0),
             overlay: None,
-            wet: None,
+            wet: self.wet.as_ref(),
             si: self.si.as_ref(),
             ord: &ord[lr],
             rho: Rho::Flat(&self.costs),
+            pairs: &self.pairs,
             cache,
         }
     }
 
     fn lane_bits(&self, k: usize) -> &[u8] {
         let l = self.lanes.as_ref().expect("lanes started").l;
-        &self.frame_bits[v3::share(self.frame_bits.len(), l, k)]
+        &self.frame_bits[v31::share(self.frame_bits.len(), l, k)]
     }
 
     fn active_mut(&mut self, k: usize, layer: u8) -> Result<&mut ActiveLayer, StegoError> {
@@ -736,23 +777,21 @@ impl GhostEncodeSession {
     /// Build a lane layer's input (layer 2 first, unless the lane has none).
     fn build_layer(&self, k: usize, geom: &LaneGeom, layer: u8, flip2: &[bool], cache: Option<&LaneCache>) -> ActiveLayer {
         let inp = self.lane_input(k, cache);
-        let (cover, costs, w) = if layer == 2 {
+        let (cover, costs) = if layer == 2 {
             let lam = self.lanes.as_ref().expect("lanes started").lam;
-            let (c, s) = v3::layer2_input(&inp, geom, lam);
-            (c, s, geom.w2)
+            v31::layer2_input(&inp, geom, lam)
         } else {
-            let (c, s) = v3::layer1_input(&inp, geom, flip2);
-            (c, s, geom.w1)
+            v31::layer1_input(&inp, geom, flip2)
         };
         let n = cover.len();
-        let cols = v3::layer_cols(&self.seeds, layer, w, self.h);
+        let code = v31::layer_code(&self.seeds, layer, geom, self.h);
         let lanes = self.lanes.as_ref().expect("lanes started");
         let unfinished = lanes.left;
         let total = self.ord.as_ref().expect("order").len();
         let in_flight = self.helpers.min(lanes.l);
-        let limit = self.inline_limit.min(v3::lane_inline_share(total, geom.nk, in_flight, self.h, self.helpers));
+        let limit = self.inline_limit.min(v31::lane_inline_share(total, geom.nk, in_flight, self.h, self.helpers));
         let split = trellis::inline_bytes(n, self.h) > limit && unfinished < self.helpers;
-        ActiveLayer { layer, w, cols, cover, costs, stego: vec![0u8; n], run: LayerRun::Pending, limit, split }
+        ActiveLayer { layer, code, cover, costs, stego: vec![0u8; n], run: LayerRun::Pending, limit, split }
     }
 
     fn layer_msg(&self, k: usize, geom: &LaneGeom, layer: u8) -> &[u8] {
@@ -778,7 +817,7 @@ impl GhostEncodeSession {
         let lanes = self.lanes.as_ref().expect("lanes started");
         if lanes.next_lane < l {
             let k = lanes.next_lane;
-            let geom = LaneGeom::new(v3::share(self.ord.as_ref().expect("order").len(), l, k).len(), self.lane_bits(k).len())?;
+            let geom = LaneGeom::new(v31::share(self.ord.as_ref().expect("order").len(), l, k).len(), self.lane_bits(k).len())?;
             let first = if geom.m2 > 0 { 2 } else { 1 };
             let flip2 = vec![false; geom.nk];
             let walked = geom.nk.min(geom.n1().max(geom.n2()));
@@ -805,28 +844,28 @@ impl GhostEncodeSession {
         }
         let msg = self.layer_msg(k, &st.geom, act.layer);
         if act.split && act.cover.len() * 5 > self.local_pass_a_bytes {
-            let kb = segment_blocks(act.w);
-            let pa = trellis::pass_a(&act.cover, &act.costs, msg, &act.cols, h, kb, &|_| {})?
+            let kb = segment_blocks(&act.code);
+            let pa = trellis::pass_a(&act.cover, &act.costs, msg, &act.code, h, kb, &|_| {})?
                 .ok_or(StegoError::MessageTooLarge)?;
-            let m = act.cover.len() / act.w;
+            let m = act.code.m();
             let done = (act.cover.len() / 2) as u64;
             let layer = act.layer;
             self.local_pass_a_count += 1;
             self.start_split(k, layer, m, kb, pa, done)?;
             return self.split_task(k);
         }
-        let li = LayerInput { cols: &act.cols, msg, cover: &act.cover, costs: &act.costs };
+        let li = LayerInput { code: &act.code, b0: 0, msg, cover: &act.cover, costs: &act.costs };
         let n = act.cover.len();
         let task = if act.split {
             let hd = Header { kind: TASK_PASS_A, lane: k as u32, layer: act.layer, seg: 0, target: -1 };
-            let mut w = W::new(hd, n * 5 + act.cols.len() * 4 + msg.len() + 16);
+            let mut w = W::new(hd, n * 5 + act.code.max_width() * 12 + 32 + msg.len() + 16);
             w.u8(h as u8);
-            w.u32(segment_blocks(act.w) as u32);
+            w.u32(segment_blocks(&act.code) as u32);
             write_layer(&mut w, &li);
             w.0
         } else {
             let hd = Header { kind: TASK_TRELLIS, lane: k as u32, layer: act.layer, seg: 0, target: -1 };
-            let mut w = W::new(hd, n * 5 + act.cols.len() * 4 + msg.len() + 16);
+            let mut w = W::new(hd, n * 5 + act.code.max_width() * 12 + 32 + msg.len() + 16);
             w.u8(h as u8);
             w.u64(act.limit as u64);
             write_layer(&mut w, &li);
@@ -869,8 +908,7 @@ impl GhostEncodeSession {
         let Some(st) = lanes.states[k].as_ref() else { return Ok(None) };
         let Some(act) = st.active.as_ref() else { return Ok(None) };
         let LayerRun::Split(sp) = &act.run else { return Ok(None) };
-        let w = act.w;
-        let m = act.cover.len() / w;
+        let m = act.code.m();
         if !sp.tracing
             && let Some(&holder) = sp.ready.get(&sp.trace_seg)
         {
@@ -890,16 +928,16 @@ impl GhostEncodeSession {
             return Ok(None);
         }
         let (b0, b1) = (seg * sp.k, ((seg + 1) * sp.k).min(m));
-        let (p0, p1) = (b0 * w, b1 * w);
+        let (p0, p1) = (act.code.start(b0), act.code.start(b1));
         let msg = &self.layer_msg(k, &st.geom, act.layer)[b0..b1];
-        let li = LayerInput { cols: &act.cols, msg, cover: &act.cover[p0..p1], costs: &act.costs[p0..p1] };
+        let li = LayerInput { code: &act.code, b0, msg, cover: &act.cover[p0..p1], costs: &act.costs[p0..p1] };
         // Round robin from the last segment: each helper computes its
         // segments in the order the trace chain needs them, so the chain
         // waits at most for one segment per helper (with random placement it
         // kept waiting for helpers busy with segments it needed much later).
         let target = ((sp.trace_seg_end - seg) % self.helpers) as i32;
         let hd = Header { kind: TASK_SEGMENT, lane: k as u32, layer: act.layer, seg: seg as u32, target };
-        let mut wr = W::new(hd, (p1 - p0) * 5 + act.cols.len() * 4 + msg.len() + ns * 8 + 16);
+        let mut wr = W::new(hd, (p1 - p0) * 5 + act.code.max_width() * 12 + 32 + msg.len() + ns * 8 + 16);
         wr.u8(h as u8);
         write_layer(&mut wr, &li);
         wr.f64s(&sp.pass_a.checkpoints[seg * ns..(seg + 1) * ns]);
@@ -916,14 +954,14 @@ impl GhostEncodeSession {
         let mut st = lanes.states[k].take().ok_or_else(bad)?;
         let act = st.active.take().ok_or_else(bad)?;
         if act.layer == 2 {
-            st.flip2 = v3::layer2_flips(&st.geom, &act.cover, &act.stego);
+            st.flip2 = v31::layer2_flips(&st.geom, &act.cover, &act.stego);
             drop(act);
             let next = self.build_layer(k, &st.geom, 1, &st.flip2, st.cache.as_ref());
             st.active = Some(next);
             self.lanes.as_mut().expect("lanes").states[k] = Some(st);
             return Ok(());
         }
-        let plan = v3::lane_plan(&self.lane_input(k, st.cache.as_ref()), &st.geom, &st.flip2, &act.cover, &act.stego);
+        let plan = v31::lane_plan(&self.lane_input(k, st.cache.as_ref()), &st.geom, &st.flip2, &act.cover, &act.stego);
         drop((act, st));
         let lanes = self.lanes.as_mut().expect("lanes");
         lanes.plans[k] = Some(plan);
@@ -938,7 +976,7 @@ impl GhostEncodeSession {
         let lanes = self.lanes.take().ok_or_else(bad)?;
         let ord = self.ord.take().ok_or_else(bad)?;
         let plans: Vec<LanePlan> = lanes.plans.into_iter().map(|p| p.ok_or_else(bad)).collect::<Result<_, _>>()?;
-        let p = v3::assemble(plans, &ord, self.img.dct_grid(0), None, self.frame_bits.len(), lanes.median_cost, &lanes.sample_ab, self.bound);
+        let p = v31::assemble(plans, &ord, self.img.dct_grid(0), None, self.frame_bits.len(), lanes.median_cost, &lanes.sample_ab, self.bound);
         drop(ord);
         let coeffs = self.img.dct_grid_mut(0).coeffs_mut();
         for &(fi, v) in &p.changes {
@@ -950,8 +988,8 @@ impl GhostEncodeSession {
 }
 
 /// Message blocks per segment of a split trellis of width `w`.
-fn segment_blocks(w: usize) -> usize {
-    (SEGMENT_POSITIONS / w.max(1)).max(1)
+fn segment_blocks(code: &Code) -> usize {
+    (SEGMENT_POSITIONS / code.n().div_ceil(code.m().max(1)).max(1)).max(1)
 }
 
 /// Trellis positions of a lane (both layers), for the progress fraction.

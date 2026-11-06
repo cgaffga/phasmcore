@@ -21,7 +21,6 @@ use phasm_core::det_math::{det_sin, det_cos, det_sincos, det_atan2, det_hypot};
 use phasm_core::stego::permute::select_and_permute;
 use phasm_core::stego::cost::CostMap;
 use phasm_core::stego::armor::fft2d;
-use phasm_core::stego::armor::template::generate_template_peaks;
 use phasm_core::{ghost_encode, ghost_decode, armor_encode, armor_decode, smart_decode};
 
 fn load_test_image(name: &str) -> Vec<u8> {
@@ -362,48 +361,6 @@ fn fft_roundtrip_deterministic() {
             "FFT roundtrip mismatch at [{i}]: {:.6} vs {:.6}",
             pixels[i], recovered[i]
         );
-    }
-}
-
-// ===========================================================================
-// 11. Template peak positions — pinned for fixed passphrase
-// ===========================================================================
-
-/// Pin the first 5 template peak positions for a known passphrase.
-/// These peaks are used for DFT template embedding in Armor mode.
-#[test]
-fn pin_template_peaks() {
-    let peaks = generate_template_peaks("determinism-test", 256, 256).unwrap();
-    assert_eq!(peaks.len(), 32);
-
-    let expected: &[(u64, u64)] = &[
-        (0x4030685798345b94, 0xc02cf16958a18bcc),
-        (0xc020723de9ad4fd4, 0xc023ddccdc1eb324),
-        (0x403504dc96d68438, 0x402bab49b7c2b4d2),
-        (0x403b7eb6a3415fe5, 0x4033d431bc2293d7),
-        (0x40366bc957e159d9, 0x403a9705f70d67ef),
-    ];
-
-    for (i, &(eu, ev)) in expected.iter().enumerate() {
-        assert_eq!(
-            peaks[i].u.to_bits(), eu,
-            "peak[{i}].u bit mismatch: got {:#018x}", peaks[i].u.to_bits()
-        );
-        assert_eq!(
-            peaks[i].v.to_bits(), ev,
-            "peak[{i}].v bit mismatch: got {:#018x}", peaks[i].v.to_bits()
-        );
-    }
-}
-
-/// Same passphrase + dimensions must produce identical peaks every time.
-#[test]
-fn template_peaks_deterministic() {
-    let a = generate_template_peaks("det-test-2", 512, 384).unwrap();
-    let b = generate_template_peaks("det-test-2", 512, 384).unwrap();
-    for i in 0..a.len() {
-        assert_eq!(a[i].u.to_bits(), b[i].u.to_bits(), "peak[{i}].u differs");
-        assert_eq!(a[i].v.to_bits(), b[i].v.to_bits(), "peak[{i}].v differs");
     }
 }
 

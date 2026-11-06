@@ -28,7 +28,7 @@
 // their own cascade-safety filter (`cascade_safety::analyze_safe_mvd_subset`)
 // which composes trivially AND with the tier filter (disjoint domains).
 
-use super::hook::{BinKind, EmbedDomain, PositionKey, SyntaxPath};
+use super::hook::{BinKind, EmbedDomain, SyntaxPath};
 use super::inject::{DomainBits, DomainCover};
 
 /// Discrete cascade-safety tier. Auto selects the highest tier whose
@@ -94,18 +94,6 @@ impl CascadeTier {
 pub const DEFAULT_HEADROOM: f32 = 1.2;
 
 // ─── Pixel-delta primitives ──────────────────────────────────────
-
-/// H.264 4×4 quant scale (spec § 8.5.8, indexed by `qp % 6` and class).
-/// Duplicated from `dpb_correction.rs` for module-locality; both refer to
-/// the same spec table. Class indexing matches H.264's LevelScale4x4.
-const LEVEL_SCALE_4X4: [[i32; 3]; 6] = [
-    [160, 256, 208],
-    [176, 288, 224],
-    [208, 320, 256],
-    [224, 368, 288],
-    [256, 400, 320],
-    [288, 464, 368],
-];
 
 /// Approximate quantization step for the given QP. Per H.264 spec the
 /// dequant scale is `LevelScale4x4[qp%6][class] << (qp/6)` (for q_bits ≥ 4);
@@ -320,6 +308,20 @@ pub fn auto_select_tier(
     let conservative = std::env::var("PHASM_AUTO_TIER_CONSERVATIVE")
         .map(|v| v == "1")
         .unwrap_or(false);
+    auto_select_tier_with(cover, csb_qp, csl_qp, msg_bytes, headroom, conservative)
+}
+
+/// [`auto_select_tier`] with the conservative switch passed in instead of
+/// read from the environment, so tests never have to set the process-wide
+/// variable (tests run in parallel threads).
+fn auto_select_tier_with(
+    cover: &DomainCover,
+    csb_qp: &[i32],
+    csl_qp: &[i32],
+    msg_bytes: usize,
+    headroom: f32,
+    conservative: bool,
+) -> CascadeTier {
     if conservative {
         return CascadeTier::Tier0;
     }
@@ -335,7 +337,7 @@ pub fn auto_select_tier(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::h264::stego::hook::{SyntaxPath, BinKind};
+    use crate::codec::h264::stego::hook::{SyntaxPath, BinKind, PositionKey};
 
     fn mk_pos(domain: EmbedDomain, coeff_idx: u8) -> PositionKey {
         let path = match domain {
@@ -445,18 +447,16 @@ mod tests {
     }
 
     #[test]
-    fn auto_select_conservative_env_pins_tier0() {
+    fn auto_select_conservative_pins_tier0() {
         let mut cover = DomainCover::default();
         cover.coeff_sign_bypass = mk_domain_bits_dc(
             EmbedDomain::CoeffSignBypass, &[1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
         );
         let csb_qp = vec![26; 10];
         let csl_qp: Vec<i32> = vec![];
-        // SAFETY: single-threaded test; no other thread reads env concurrently.
-        // (edition-2024 made set_var/remove_var unsafe.)
-        unsafe { std::env::set_var("PHASM_AUTO_TIER_CONSERVATIVE", "1"); }
-        let tier = auto_select_tier(&cover, &csb_qp, &csl_qp, 0, 1.2);
-        unsafe { std::env::remove_var("PHASM_AUTO_TIER_CONSERVATIVE"); }
+        // The switch is passed in: setting PHASM_AUTO_TIER_CONSERVATIVE here
+        // raced with auto_select_picks_highest_fit on another test thread.
+        let tier = auto_select_tier_with(&cover, &csb_qp, &csl_qp, 0, 1.2, true);
         assert_eq!(tier.as_u8(), 0);
     }
 

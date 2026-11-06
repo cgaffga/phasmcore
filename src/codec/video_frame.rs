@@ -662,6 +662,8 @@ impl RoundDiv {
 /// [`video_target_resolve`] size ([`I420Scaler`], in the coded orientation)
 /// and yields them oriented by code `orientation` ([`orient_i420`]), at
 /// [`output_dims`](Self::output_dims).
+// Read by the encoders' `GopYuvSource` impls below.
+#[cfg_attr(not(any(feature = "h264-encoder", all(feature = "av1-encoder", feature = "av1-decoder"))), allow(dead_code))]
 pub struct OrientedGopSource<S> {
     inner: S,
     width: u32,
@@ -713,6 +715,7 @@ impl<S> OrientedGopSource<S> {
     /// Scale and turn one GOP of coded frames. A GOP that is not whole
     /// coded frames is an error rather than a panic (a panic aborts the
     /// mobile apps); untouched GOPs pass through as they always have.
+    #[cfg_attr(not(any(feature = "h264-encoder", all(feature = "av1-encoder", feature = "av1-decoder"))), allow(dead_code))]
     fn turn(&mut self, gop: Vec<u8>) -> Result<Vec<u8>, crate::stego::error::StegoError> {
         if self.scaler.is_none() && self.orientation == 0 {
             return Ok(gop);
@@ -1087,6 +1090,7 @@ mod tests {
     }
 
     /// Two GOPs of 2 frames plus a trailing 1-frame GOP, 6x4.
+    #[cfg(any(feature = "h264-encoder", all(feature = "av1-encoder", feature = "av1-decoder")))]
     fn three_gop_clip() -> (Vec<u8>, u32, u32, u32, u32) {
         let (w, h, n, gop) = (6u32, 4u32, 5u32, 2u32);
         let clip = (0..n).flat_map(|f| numbered_frame(w, h, f as u8 * 31)).collect();
@@ -1678,6 +1682,7 @@ mod tests {
     // ─── OrientedGopSource with scaling ──────────────────────────
 
     /// Two GOPs of 2 frames plus a trailing 1-frame GOP, 12x8.
+    #[cfg(any(feature = "h264-encoder", all(feature = "av1-encoder", feature = "av1-decoder")))]
     fn scalable_clip() -> (Vec<u8>, u32, u32, u32, u32) {
         let (w, h, n, gop) = (12u32, 8u32, 5u32, 2u32);
         let clip = (0..n).flat_map(|f| noisy_frame(w, h, f)).collect();

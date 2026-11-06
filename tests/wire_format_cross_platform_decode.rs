@@ -50,7 +50,8 @@ const TEST_MESSAGE: &str = "Hello from the wire-format gate!";
 /// checked into `test-vectors/image/wire-format/` and committed to
 /// the repo; the CI matrix decodes them on every supported arch.
 const FIXTURES: &[(&str, &str, u8)] = &[
-    // Format: (relative_path, expected_message, expected_mode_id)
+    // Format: (relative_path, expected_message, expected_mode_id); every
+    // fixture is read with TEST_PASSPHRASE (shadows: see SHADOW_FIXTURES).
     //
     // 2026-05-22: aarch64 fixture captured on M-series Apple Silicon
     // (Mac Studio M2 Max). PHASM_DETERMINISTIC_SEED=42 fixed the
@@ -62,7 +63,35 @@ const FIXTURES: &[(&str, &str, u8)] = &[
         TEST_MESSAGE,
         MODE_GHOST,
     ),
+    // 2026-11-03: Ghost v3 (core 0.5 / apps 1.9, decode-only since v3.1),
+    // written by the core 0.5.1 CLI (commit 86bdc1c0, aarch64) with
+    // PHASM_DETERMINISTIC_SEED=42 from photo_640x480_q75_420.jpg; the second
+    // one carries a v3 shadow too. They pin the legacy v3 decoder
+    // (`ghost::v3_legacy`).
+    ("test-vectors/image/wire-format/ghost_v3_2026_11_03.jpg", TEST_MESSAGE, MODE_GHOST),
+    ("test-vectors/image/wire-format/ghost_v3_shadow_2026_11_03.jpg", TEST_MESSAGE, MODE_GHOST),
+    // 2026-11-03: Ghost v3.1 (the current encoder), aarch64, same recipe
+    // (`wire_format_capture_aarch64_fixture`).
+    ("test-vectors/image/wire-format/ghost_v31_2026_11_03.jpg", TEST_MESSAGE, MODE_GHOST),
+    ("test-vectors/image/wire-format/ghost_v31_shadow_2026_11_03.jpg", TEST_MESSAGE, MODE_GHOST),
 ];
+
+/// Shadow layers of the fixtures: (path, shadow passphrase, shadow message).
+const SHADOW_FIXTURES: &[(&str, &str, &str)] = &[
+    ("test-vectors/image/wire-format/ghost_v3_shadow_2026_11_03.jpg", "wire-format-shadow", "A v3 shadow layer."),
+    ("test-vectors/image/wire-format/ghost_v31_shadow_2026_11_03.jpg", "wire-format-shadow", "A v3.1 shadow layer."),
+];
+
+#[test]
+fn wire_format_shadow_fixtures_decode_on_this_arch() {
+    for (path, pass, msg) in SHADOW_FIXTURES {
+        let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("could not read fixture {path}: {e}"));
+        let (payload, quality) = smart_decode(&bytes, pass).unwrap_or_else(|e| panic!("decode failed for {path}: {e:?}"));
+        assert_eq!(payload.text, *msg, "{path}");
+        assert_eq!(quality.mode, MODE_GHOST, "{path}");
+        assert!(ghost_decode(&bytes, "not-the-passphrase").is_err(), "{path}");
+    }
+}
 
 #[test]
 fn wire_format_fixtures_decode_on_this_arch() {

@@ -35,6 +35,10 @@ pub mod pixels;
 pub mod pixels_aan;
 pub mod pixels_aan_simd;
 pub mod cover_writer;
+pub mod history;
+pub mod lossless;
+pub mod exif;
+pub mod quality;
 
 use dct::DctGrid;
 use error::{JpegError, Result};
@@ -215,6 +219,16 @@ impl JpegImage {
 
         let fi = frame_info.ok_or(JpegError::InvalidMarkerData("no SOF marker found"))?;
 
+        // A sequential file whose first scan does not carry every component
+        // in frame order (one scan per component, `jpegtran -scans`, or a
+        // reordered scan) has more scans: the multi-scan path decodes them
+        // all into per-component grids.
+        let one_full_scan = scan_components.len() == fi.components.len()
+            && scan_components.iter().enumerate().all(|(i, sc)| sc.comp_idx == i);
+        if !one_full_scan {
+            return Self::from_bytes_progressive(data);
+        }
+
         let (grids, _end_pos) = scan::decode_scan(
             data,
             scan_start,
@@ -238,11 +252,13 @@ impl JpegImage {
         })
     }
 
-    /// Parse a progressive (SOF2) JPEG file.
+    /// Parse a multi-scan JPEG file: progressive (SOF2), or sequential
+    /// (SOF0) with more than one scan.
     ///
-    /// Progressive JPEG files have multiple SOS markers, each contributing
-    /// partial coefficient data. We accumulate all scans into DctGrids,
-    /// then store the result as if it were a baseline image.
+    /// Such files have multiple SOS markers, each contributing partial
+    /// coefficient data. We accumulate all scans into DctGrids (one per
+    /// frame component, MCU-padded; blocks no scan codes stay zero), then
+    /// store the result as if it were a baseline image.
     fn from_bytes_progressive(data: &[u8]) -> Result<Self> {
         let (entries, scan_starts) = iterate_markers_all(data)?;
 
@@ -375,9 +391,14 @@ impl JpegImage {
         let mut scan_dc_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
         let mut scan_ac_specs: [Option<HuffmanSpec>; 4] = [None, None, None, None];
         let mut scan_idx = 0usize;
+        // A DRI may sit between scans and applies to the scans after it.
+        let mut scan_restart_interval: u16 = 0;
 
         for entry in &entries {
             match entry.marker {
+                marker::DRI => {
+                    scan_restart_interval = parse_dri(&entry.data)?;
+                }
                 marker::DHT => {
                     let specs = parse_dht(&entry.data)?;
                     for spec in specs {
@@ -399,7 +420,7 @@ impl JpegImage {
                             &scan.components,
                             &scan_dc_specs,
                             &scan_ac_specs,
-                            restart_interval,
+                            scan_restart_interval,
                             &scan.params,
                             &mut grids,
                         )?;
@@ -407,6 +428,23 @@ impl JpegImage {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // Padding blocks no scan coded: fill them like libjpeg would. An
+        // interleaved DC scan (Ss = 0, several components) codes the padding
+        // blocks' DC itself; any other component's padding is uncoded.
+        let mut padding_coded = vec![false; fi.components.len()];
+        for scan in &scans {
+            if scan.components.len() > 1 && scan.params.ss == 0 {
+                for sc in &scan.components {
+                    padding_coded[sc.comp_idx] = true;
+                }
+            }
+        }
+        for (comp_idx, grid) in grids.iter_mut().enumerate() {
+            if !padding_coded[comp_idx] {
+                fill_uncoded_padding_blocks(&fi, comp_idx, grid);
             }
         }
 
@@ -523,6 +561,21 @@ impl JpegImage {
         &mut self.grids[component]
     }
 
+    /// Re-derive the MCU-padding (dummy) blocks of every component from the
+    /// real blocks, by libjpeg's rule (`fill_uncoded_padding_blocks`). For an
+    /// encoder that changes real blocks of a written cover: Armor Fortress
+    /// moves block DCs, and padding left at the cover's values no longer
+    /// matches its neighbours, which no libjpeg-style encoder writes (fix
+    /// list R3.27). No decoder reads padding blocks.
+    pub fn refill_padding_blocks(&mut self) {
+        if self.frame.components.len() < 2 {
+            return; // one non-interleaved component: no padding blocks
+        }
+        for (ci, grid) in self.grids.iter_mut().enumerate() {
+            fill_uncoded_padding_blocks(&self.frame, ci, grid);
+        }
+    }
+
     /// Get the frame information.
     pub fn frame_info(&self) -> &FrameInfo {
         &self.frame
@@ -557,69 +610,58 @@ impl JpegImage {
             }
         }
 
-        // Count symbols by simulating the scan encoding.
-        // Must match encode_scan exactly, including restart interval DC pred resets.
-        let mut dc_pred = vec![0i16; self.scan_components.len()];
-        let mut mcu_count = 0usize;
-
-        for mcu_row in 0..self.frame.mcus_tall as usize {
-            for mcu_col in 0..self.frame.mcus_wide as usize {
-                // Reset DC predictors at restart boundaries (must match encode_scan)
-                if self.restart_interval > 0
-                    && mcu_count > 0
-                    && mcu_count.is_multiple_of(self.restart_interval as usize)
-                {
+        // The block order (non-interleaved single-component scans) is the
+        // one place in `scan::walk_scan`.
+        let mut dc_pred = vec![0i32; self.scan_components.len()];
+        let grids = &self.grids;
+        let scs = &self.scan_components;
+        let _ = scan::walk_scan(&self.frame, scs, self.restart_interval, |step| -> std::result::Result<(), ()> {
+            let (sci, br, bc) = match step {
+                scan::ScanStep::Row(_) => return Ok(()),
+                scan::ScanStep::Restart => {
                     dc_pred.fill(0);
+                    return Ok(());
                 }
-
-                for (sci, sc) in self.scan_components.iter().enumerate() {
-                    let comp = &self.frame.components[sc.comp_idx];
-                    for v in 0..comp.v_sampling as usize {
-                        for h in 0..comp.h_sampling as usize {
-                            let br = mcu_row * comp.v_sampling as usize + v;
-                            let bc = mcu_col * comp.h_sampling as usize + h;
-                            let block = self.grids[sci].block(br, bc);
-                            let mut zz = [0i16; 64];
-                            for ni in 0..64 {
-                                zz[NATURAL_TO_ZIGZAG[ni]] = block[ni];
-                            }
-
-                            // DC symbol
-                            let dc_diff = zz[0] - dc_pred[sci];
-                            dc_pred[sci] = zz[0];
-                            let (_, dc_size) = encode_value(dc_diff);
-                            dc_freq[sc.dc_table][dc_size as usize] += 1;
-
-                            // AC symbols
-                            let mut k = 1;
-                            while k < 64 {
-                                let mut run = 0usize;
-                                while k + run < 64 && zz[k + run] == 0 {
-                                    run += 1;
-                                }
-                                if k + run >= 64 {
-                                    // EOB
-                                    ac_freq[sc.ac_table][0x00] += 1;
-                                    break;
-                                }
-                                while run >= 16 {
-                                    ac_freq[sc.ac_table][0xF0] += 1;
-                                    run -= 16;
-                                    k += 16;
-                                }
-                                k += run;
-                                let (_, ac_size) = encode_value(zz[k]);
-                                let rs = ((run as u8) << 4) | ac_size;
-                                ac_freq[sc.ac_table][rs as usize] += 1;
-                                k += 1;
-                            }
-                        }
-                    }
-                }
-
-                mcu_count += 1;
+                scan::ScanStep::Block { sci, br, bc } => (sci, br, bc),
+            };
+            let sc = &scs[sci];
+            let block = grids[sci].block(br, bc);
+            let mut zz = [0i16; 64];
+            for ni in 0..64 {
+                zz[NATURAL_TO_ZIGZAG[ni]] = block[ni];
             }
-        }
+
+            // DC symbol (same arithmetic as encode_scan)
+            let dc_diff = (zz[0] as i32 - dc_pred[sci]) as i16;
+            dc_pred[sci] = zz[0] as i32;
+            let (_, dc_size) = encode_value(dc_diff);
+            dc_freq[sc.dc_table][dc_size as usize] += 1;
+
+            // AC symbols
+            let mut k = 1;
+            while k < 64 {
+                let mut run = 0usize;
+                while k + run < 64 && zz[k + run] == 0 {
+                    run += 1;
+                }
+                if k + run >= 64 {
+                    // EOB
+                    ac_freq[sc.ac_table][0x00] += 1;
+                    break;
+                }
+                while run >= 16 {
+                    ac_freq[sc.ac_table][0xF0] += 1;
+                    run -= 16;
+                    k += 16;
+                }
+                k += run;
+                let (_, ac_size) = encode_value(zz[k]);
+                let rs = ((run as u8) << 4) | ac_size;
+                ac_freq[sc.ac_table][rs as usize] += 1;
+                k += 1;
+            }
+            Ok(())
+        });
 
         // Build Huffman specs from frequency counts and update state.
         for (id, freq) in dc_freq.iter().enumerate() {
@@ -728,6 +770,60 @@ impl JpegImage {
                 data: dqt_data,
             },
         );
+    }
+}
+
+/// Give the MCU-padding (dummy) blocks of component `comp_idx` that no scan
+/// coded the values libjpeg-turbo gives them, so a baseline re-write of a
+/// multi-scan (progressive, one-scan-per-component) file does not carry
+/// all-zero padding blocks, which no libjpeg-style encoder or transcoder
+/// writes. AC stays zero; the DC is set as follows, per MCU of `Hi x Vi`
+/// blocks (libjpeg-turbo `jccoefct.c` `compress_data`, and `jctrans.c`
+/// `compress_output`, which `jpegtran` uses: "Dummy blocks are filled in the
+/// same way as in jccoefct.c: all zeroes in the AC entries, and the DC
+/// entries equal the DC of the last real block"):
+///
+/// - Right edge, in a block row of the image: block `bi` past the last real
+///   block of the MCU gets the DC of block `bi - 1` (the left neighbour, so
+///   it chains from the last real block).
+/// - Bottom edge, a block row of the MCU past the last real block row: every
+///   block of that MCU row gets the DC of the last block of the MCU's
+///   preceding block row (`MCU_buffer[blkn - 1][0][0]`, the rightmost block
+///   of that row inside this MCU, itself real or already filled).
+///
+/// The caller skips a component whose padding an interleaved scan coded; the
+/// baseline single-scan path never gets here (its padding is coded data).
+fn fill_uncoded_padding_blocks(fi: &FrameInfo, comp_idx: usize, grid: &mut DctGrid) {
+    let comp = &fi.components[comp_idx];
+    let (hs, vs) = (comp.h_sampling as usize, comp.v_sampling as usize);
+    let (bw, bt) = (grid.blocks_wide(), grid.blocks_tall());
+    let (rw, rt) = (fi.comp_blocks_wide(comp_idx), fi.comp_blocks_tall(comp_idx));
+    if rw >= bw && rt >= bt {
+        return;
+    }
+    for br in 0..bt {
+        let yindex = br % vs;
+        for mcu_col in 0..bw / hs {
+            let c0 = mcu_col * hs;
+            if br < rt {
+                // Real block row: dummy blocks only past the right edge.
+                for bc in c0.max(rw)..c0 + hs {
+                    let dc = grid.block(br, bc - 1)[0];
+                    let b = grid.block_mut(br, bc);
+                    b.fill(0);
+                    b[0] = dc;
+                }
+            } else if yindex > 0 {
+                // Dummy row at the bottom: DC of the previous row's last
+                // block of this MCU.
+                let dc = grid.block(br - 1, c0 + hs - 1)[0];
+                for bc in c0..c0 + hs {
+                    let b = grid.block_mut(br, bc);
+                    b.fill(0);
+                    b[0] = dc;
+                }
+            }
+        }
     }
 }
 

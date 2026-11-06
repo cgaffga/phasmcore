@@ -27,6 +27,12 @@ pub struct CapacityArgs {
     #[arg(long)]
     pub full_res: bool,
 
+    /// Armor: measure the cover of this channel preset (standard, telegram,
+    /// instagram), as `encode --armor-preset`
+    #[arg(long, value_parser = crate::image_conv::parse_armor_preset, default_value = "standard",
+          conflicts_with = "full_res")]
+    pub armor_preset: phasm_core::ArmorCoverPreset,
+
     /// JSON output
     #[arg(long)]
     pub json: bool,
@@ -37,7 +43,7 @@ pub fn run(args: CapacityArgs) -> Result<(), CliError> {
     // JPEG as is; any other input as the Deep Cover cover phasm writes from
     // its pixels, whose exact side information earns the larger maximum
     // (nzAC / 4 instead of nzAC / 5 frame bits).
-    let ghost_cover = prepare_image(&args.image, "ghost", None, None, false, false)?;
+    let ghost_cover = prepare_image(&args.image, "ghost", None, None, false, false, phasm_core::ArmorCoverPreset::Standard)?;
     let img = JpegImage::from_bytes(&ghost_cover.jpeg_bytes)?;
     let ghost = ghost_capacity(&img)?;
     // The bands the apps show (no shadows): for a Deep Cover cover, with the
@@ -56,7 +62,7 @@ pub fn run(args: CapacityArgs) -> Result<(), CliError> {
     };
 
     // Armor is measured on the cover `encode` would actually embed into.
-    let cover = prepare_image(&args.image, "armor", None, None, false, args.full_res)?;
+    let cover = prepare_image(&args.image, "armor", None, None, false, args.full_res, args.armor_preset)?;
     let armor_img = JpegImage::from_bytes(&cover.jpeg_bytes)?;
     let armor = armor_capacity(&armor_img)?;
     let fortress = match armor_capacity_info(&cover.jpeg_bytes) {
@@ -68,7 +74,12 @@ pub fn run(args: CapacityArgs) -> Result<(), CliError> {
         ghost,
         ghost_si,
         &bands,
-        ghost_cover.raw_pixels.is_some(),
+        // Pixels that are a decoded JPEG on the cover's grid get no side
+        // information (core's decoded-JPEG guard), as `encode` reports.
+        ghost_cover
+            .raw_pixels
+            .as_deref()
+            .is_some_and(|px| !phasm_core::is_aligned_jpeg_decode(px, ghost_cover.width, ghost_cover.height)),
         armor,
         fortress,
         shadow,

@@ -81,7 +81,7 @@ pub struct GhostLanePlan {
     pub parallel_lanes: usize,
     /// Back-pointer bytes one lane may keep (above: segmented trellis).
     pub lane_inline_bytes: usize,
-    /// Most positions whose costs are held at once (`v3::EncodeOpts::group_positions`).
+    /// Most positions whose costs are held at once (`v31::EncodeOpts::group_positions`).
     pub group_positions: usize,
 }
 
@@ -109,7 +109,7 @@ pub fn ghost_fixed_bytes(mode: ModeId, pixels: usize) -> usize {
 
 /// Back-pointer table one lane may keep in memory (in-memory Viterbi), on
 /// top of the share of the cover's in-flight working set
-/// (`v3::lane_inline_share`): a full-length lane (< 2²¹ positions, 64 B each
+/// (`v31::lane_inline_share`): a full-length lane (< 2²¹ positions, 64 B each
 /// at the wire's h = 9) always fits; longer lanes (short frames) keep what
 /// their share allows and recompute the rest.
 pub const LANE_INLINE_BYTES: usize = 128 << 20;
@@ -163,7 +163,7 @@ pub fn predict_peak_memory(
         // Lanes: a typical heavy payload (frame ≈ AC/16) on this cover.
         let n_ac = pixels / 64 * 63;
         let m = n_ac / 16;
-        let l = crate::stego::ghost::v3::lanes(n_ac, m);
+        let l = crate::stego::ghost::v31::lanes(n_ac, m);
         let nk = n_ac.div_ceil(l);
         let (k, inline) = match rung {
             GhostRung::FullParallel => (n_workers.max(1).min(l), LANE_INLINE_BYTES),
@@ -171,10 +171,10 @@ pub fn predict_peak_memory(
             GhostRung::SingleLane => (1, LANE_INLINE_BYTES),
             GhostRung::Segmented => (1, 0),
         };
-        let h = crate::stego::ghost::v3::V3_STC_H;
-        let inline = inline.min(crate::stego::ghost::v3::lane_inline_share(n_ac, nk, k, h, n_workers));
-        let threads = crate::stego::ghost::v3::lane_threads(k, n_workers);
-        raw = raw.saturating_add(k.saturating_mul(crate::stego::ghost::v3::lane_bytes(nk, m.div_ceil(l), h, inline, threads)));
+        let h = crate::stego::ghost::v31::V31_STC_H;
+        let inline = inline.min(crate::stego::ghost::v31::lane_inline_share(n_ac, nk, k, h, n_workers));
+        let threads = crate::stego::ghost::v31::lane_threads(k, n_workers);
+        raw = raw.saturating_add(k.saturating_mul(crate::stego::ghost::v31::lane_bytes(nk, m.div_ceil(l), h, inline, threads)));
         // One cost group of the lanes in flight (8 B per position).
         raw = raw.saturating_add(k.saturating_mul(nk).saturating_mul(8));
     }
@@ -309,13 +309,24 @@ pub fn get_memory_budget() -> Option<usize> {
     *budget_cell().lock().unwrap()
 }
 
+/// Test-only: every lib test that sets the process-global budget or
+/// telemetry hook holds this lock, so tests that assert on a plan under
+/// their own budget don't run under another test's. (Encodes running
+/// concurrently without it only change speed: their output does not depend
+/// on the budget — `ghost::v31::tests::encode_bytes_independent_of_budget_and_workers`.)
+#[cfg(test)]
+pub(crate) fn budget_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: Mutex<()> = Mutex::new(());
+    M.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Heap two `smart_decode` stages may hold at once, beyond the parsed
 /// image, when the `parallel` build runs them side by side (lowered to a
 /// quarter of the memory budget if one is set): on inputs above
 /// `ARMOR_TARGET_DIMENSION`, the v1 cost pass + pools next to Armor.
 /// Stages whose estimated peaks ([`DecodeStageHeap`]) add up to more run
 /// one after another, so overlap never raises the decode's peak above
-/// parse + this cap: typical photos up to ~16–18 MP overlap, a 48 MP cover
+/// parse + this cap: typical photos up to about 12–14 MP overlap, a 48 MP cover
 /// keeps its serial peak.
 pub const DECODE_OVERLAP_BYTES: usize = 192 << 20;
 
@@ -329,8 +340,9 @@ pub const DECODE_OVERLAP_BYTES: usize = 192 << 20;
 /// - the v1 cost pools: the held order (8 B) + one-pass priorities of the
 ///   largest pool (8 B + 4 B per member, half the order) + bitmaps
 ///   → 14 `nz` + `n` / 4;
-/// - Armor (Fortress, STDM, geometric): ≤ 3.9 B per coefficient + one
-///   Argon2 (19 MiB) → 4 `n` + 20 MiB.
+/// - Armor (Fortress, STDM, grid sync): the grid sync's luma and its
+///   whitened copy (f32, 4 B per pixel each) dominate; the rest is ≤ 3.9 B
+///   per coefficient; + one Argon2 (19 MiB) → 8 `n` + 20 MiB.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeStageHeap {
     /// The v1 cost order (cost pass + sort).
@@ -347,7 +359,7 @@ impl DecodeStageHeap {
         Self {
             legacy_order: nz.saturating_mul(20),
             legacy_pools: nz.saturating_mul(14).saturating_add(n / 4),
-            armor: n.saturating_mul(4).saturating_add(20 << 20),
+            armor: n.saturating_mul(8).saturating_add(20 << 20),
         }
     }
 }
@@ -453,16 +465,16 @@ pub(crate) fn emit(event: TelemetryEvent) {
 ///
 /// No budget (CLI, crate, tests) → [`GhostRung::FullParallel`], one cost
 /// group, lanes in memory as far as the cover's in-flight working set
-/// allows (`v3::lane_inline_share`, applied by the planner). With a budget,
+/// allows (`v31::lane_inline_share`, applied by the planner). With a budget,
 /// the encoder's own allocations stay within
 /// `min(budget / 1.5, GHOST_TARGET_BYTES)`: the fastest of — in-memory lanes
 /// on every worker with one cost pass; the same with more cost passes
 /// (smaller groups); checkpointed lanes; fewer lanes at once. Every choice
 /// writes the same bytes.
 pub fn ghost_lane_plan(mode: ModeId, width: u32, height: u32, n_ac: usize, m_bits: usize, h: usize) -> GhostLanePlan {
-    use crate::stego::ghost::v3;
+    use crate::stego::ghost::v31;
     let workers = encode_workers();
-    let l = v3::lanes(n_ac, m_bits.max(1));
+    let l = v31::lanes(n_ac, m_bits.max(1));
     let k_max = workers.min(l).max(1);
     let full = GhostLanePlan {
         rung: GhostRung::FullParallel,
@@ -481,9 +493,9 @@ pub fn ghost_lane_plan(mode: ModeId, width: u32, height: u32, n_ac: usize, m_bit
     // One lane's working set with `k` lanes at once: its table as far as its
     // share allows (`inline(k)`, the plan's `lane_inline_bytes`), or
     // checkpointed; idle workers help recompute.
-    let inline = |k: usize| LANE_INLINE_BYTES.min(v3::lane_inline_share(n_ac, nk, k, h, workers));
-    let lane_in = |k: usize| v3::lane_bytes(nk, bits, h, inline(k), v3::lane_threads(k, workers));
-    let lane_seg = |k: usize| v3::lane_bytes(nk, bits, h, 0, v3::lane_threads(k, workers));
+    let inline = |k: usize| LANE_INLINE_BYTES.min(v31::lane_inline_share(n_ac, nk, k, h, workers));
+    let lane_in = |k: usize| v31::lane_bytes(nk, bits, h, inline(k), v31::lane_threads(k, workers));
+    let lane_seg = |k: usize| v31::lane_bytes(nk, bits, h, 0, v31::lane_threads(k, workers));
     // Cost-group positions that fit, at least one lane's worth. A group is
     // gathered (8 B per position: sort index + costs, plus one cost strip),
     // then its lanes run `k` at a time next to its costs (4 B per position).
@@ -566,16 +578,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Each API test takes this lock so concurrent test runners don't
-    /// trip over the process-global budget + hook state.
-    fn api_lock() -> std::sync::MutexGuard<'static, ()> {
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
     #[test]
     fn budget_set_get_roundtrip() {
-        let _g = api_lock();
+        let _g = budget_test_lock();
         set_memory_budget(None);
         assert_eq!(get_memory_budget(), None);
         set_memory_budget(Some(1_500_000_000));
@@ -588,7 +593,7 @@ mod tests {
 
     #[test]
     fn lane_plan_no_budget_is_full_parallel() {
-        let _g = api_lock();
+        let _g = budget_test_lock();
         set_memory_budget(None);
         let p = ghost_lane_plan(ModeId::GhostShadow, 4032, 3024, N12, 700_000, 9);
         assert_eq!(p.rung, GhostRung::FullParallel);
@@ -601,8 +606,8 @@ mod tests {
     /// target can hold; tiny budgets fall back to one checkpointed lane.
     #[test]
     fn lane_plan_fits_the_budget() {
-        use crate::stego::ghost::v3;
-        let _g = api_lock();
+        use crate::stego::ghost::v31;
+        let _g = budget_test_lock();
         for budget in [400usize << 20, 1200 << 20, 1674 << 20, 3 << 30] {
             set_memory_budget(Some(budget));
             let limit = (budget * 2 / 3).min(GHOST_TARGET_BYTES);
@@ -610,13 +615,13 @@ mod tests {
                 let n = (w as usize / 8) * (hgt as usize / 8) * 63;
                 for m in [25_000usize, n / 40, n / 6] {
                     let p = ghost_lane_plan(ModeId::GhostNoShadow, w, hgt, n, m, 9);
-                    let l = v3::lanes(n, m);
+                    let l = v31::lanes(n, m);
                     let nk = n.div_ceil(l);
                     // As the planner runs a batch of `parallel_lanes` lanes.
                     let workers = encode_workers();
                     let k = p.parallel_lanes.min(workers).min(l);
-                    let inline = p.lane_inline_bytes.min(v3::lane_inline_share(n, nk, k, 9, workers));
-                    let lane = v3::lane_bytes(nk, m.div_ceil(l), 9, inline, v3::lane_threads(k, workers));
+                    let inline = p.lane_inline_bytes.min(v31::lane_inline_share(n, nk, k, 9, workers));
+                    let lane = v31::lane_bytes(nk, m.div_ceil(l), 9, inline, v31::lane_threads(k, workers));
                     // Gather phase (8 B per group position + a cost strip),
                     // then lanes next to the group's costs (4 B per position).
                     let g = p.group_positions.min(n);
@@ -639,12 +644,12 @@ mod tests {
 
     /// A checkpointed lane plus a one-lane cost group (test helper bound).
     fn lane_bytes_min(nk: usize) -> usize {
-        crate::stego::ghost::v3::lane_bytes(nk, nk / 8, 9, 0, 1) + nk * 8
+        crate::stego::ghost::v31::lane_bytes(nk, nk / 8, 9, 0, 1) + nk * 8
     }
 
     #[test]
     fn lane_plan_generous_budget_keeps_full() {
-        let _g = api_lock();
+        let _g = budget_test_lock();
         set_memory_budget(Some(8 << 30));
         let p = ghost_lane_plan(ModeId::GhostShadow, 4032, 3024, N12, 700_000, 9);
         assert_eq!(p.rung, GhostRung::FullParallel);
@@ -653,7 +658,7 @@ mod tests {
 
     #[test]
     fn telemetry_hook_invoked_when_set() {
-        let _g = api_lock();
+        let _g = budget_test_lock();
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
         set_telemetry_hook(Some(Box::new(move |_e| {
@@ -680,7 +685,7 @@ mod tests {
 
     #[test]
     fn telemetry_hook_unregistered_no_crash() {
-        let _g = api_lock();
+        let _g = budget_test_lock();
         set_telemetry_hook(None);
         // Without a hook, emit() is a no-op in release / eprintln in debug.
         // Should never panic regardless.

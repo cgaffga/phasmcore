@@ -7,6 +7,11 @@ baseline 4:4:4 / 4:2:2 / 4:2:0, grayscale, non-MCU-aligned and 8×8 images.
 
 - `ghost-cost-v1-compat/` — Ghost v1 stego images (primary + shadows)
   from the released 0.4.3 CLI; they must keep decoding.
+- `multiscan/` — progressive, separate-DC-scan, sequential multi-scan and
+  2x2-sampled grayscale files at odd block counts, each with a baseline
+  twin from libjpeg's transcoder, plus an Armor (Fortress) stego re-saved
+  as progressive (`core/tests/jpeg_multiscan.rs`, which documents how they
+  were made).
 - `wire-format/` — Ghost stego images encoded on a known platform that
   must decode on every platform (`core/tests/wire_format_cross_platform_decode.rs`).
 

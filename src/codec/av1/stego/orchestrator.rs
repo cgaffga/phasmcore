@@ -52,7 +52,9 @@ use crate::stego::error::StegoError;
 #[cfg(feature = "av1-decoder")]
 use crate::stego::stc::extract::stc_extract;
 use crate::stego::stc::hhat;
-use crate::stego::{crypto, frame};
+#[cfg(feature = "av1-encoder")]
+use crate::stego::crypto;
+use crate::stego::frame;
 
 /// STC matrix height — fixed at 7 (matches phasm-core's standard).
 const STC_H: usize = 7;
@@ -523,9 +525,7 @@ pub(crate) fn split_av1_into_gops(bytes: &[u8]) -> Vec<Vec<u8>> {
 pub fn harvest_cover_bits_from_stego(
     stego_av1_bytes: &[u8],
 ) -> Result<Vec<u8>, Av1StegoError> {
-    use core_dav1d_sys::{
-        DAV1D_PHASM_TAG_AC_COEFF_SIGN, DAV1D_PHASM_TAG_GOLOMB_TAIL_LSB,
-    };
+    use core_dav1d_sys::DAV1D_PHASM_TAG_AC_COEFF_SIGN;
     let decoded = decode_with_recording(stego_av1_bytes)?;
     let bits: Vec<u8> = decoded
         .iter()

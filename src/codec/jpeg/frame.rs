@@ -61,6 +61,24 @@ impl FrameInfo {
         let comp = &self.components[comp_idx];
         (self.mcus_tall as usize) * (comp.v_sampling as usize)
     }
+
+    /// Blocks per row a **non-interleaved** scan of this component codes:
+    /// `ceil(ceil(X · Hᵢ / Hmax) / 8)` (T.81 A.1.1 and A.2.2). The grid
+    /// ([`Self::blocks_wide`]) is MCU-padded and may be wider; the extra
+    /// (dummy) blocks are coded only by interleaved scans.
+    pub fn comp_blocks_wide(&self, comp_idx: usize) -> usize {
+        let comp = &self.components[comp_idx];
+        let x = (self.width as usize * comp.h_sampling as usize).div_ceil(self.max_h_sampling as usize);
+        x.div_ceil(8)
+    }
+
+    /// Block rows a non-interleaved scan of this component codes
+    /// (see [`Self::comp_blocks_wide`]).
+    pub fn comp_blocks_tall(&self, comp_idx: usize) -> usize {
+        let comp = &self.components[comp_idx];
+        let y = (self.height as usize * comp.v_sampling as usize).div_ceil(self.max_v_sampling as usize);
+        y.div_ceil(8)
+    }
 }
 
 /// Parse a SOF0/SOF2 marker segment body (after the 2-byte length).
@@ -176,6 +194,26 @@ mod tests {
         // Blocks for Cb: 40*1=40 wide, 30*1=30 tall
         assert_eq!(fi.blocks_wide(1), 40);
         assert_eq!(fi.blocks_tall(1), 30);
+    }
+
+    #[test]
+    fn non_interleaved_block_counts_follow_t81() {
+        // 648x488 4:2:0: the MCU grid is 41x31 MCUs (82x62 luma blocks), a
+        // non-interleaved luma scan codes 81x61 blocks, chroma 41x31.
+        let data = [8, 0x01, 0xE8, 0x02, 0x88, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+        let fi = parse_sof(&data).unwrap();
+        assert_eq!((fi.blocks_wide(0), fi.blocks_tall(0)), (82, 62));
+        assert_eq!((fi.comp_blocks_wide(0), fi.comp_blocks_tall(0)), (81, 61));
+        assert_eq!((fi.comp_blocks_wide(1), fi.comp_blocks_tall(1)), (41, 31));
+        // 4:2:0 chroma of a 650-wide image: ceil(650/2) = 325 samples → 41 blocks.
+        let data = [8, 0x01, 0xE8, 0x02, 0x8A, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1];
+        let fi = parse_sof(&data).unwrap();
+        assert_eq!((fi.comp_blocks_wide(0), fi.comp_blocks_wide(1)), (82, 41));
+        // Grayscale with a 2x2 sampling factor: one block per 8 px all the same.
+        let data = [8, 0, 24, 0, 40, 1, 1, 0x22, 0];
+        let fi = parse_sof(&data).unwrap();
+        assert_eq!((fi.blocks_wide(0), fi.blocks_tall(0)), (6, 4));
+        assert_eq!((fi.comp_blocks_wide(0), fi.comp_blocks_tall(0)), (5, 3));
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod stc;
 pub mod crypto;
 #[doc(hidden)]
 pub mod chacha_stream;
+pub mod rng_compat;
 pub mod frame;
 pub mod chunk_frame;
 pub mod gop_cache;
@@ -40,6 +41,7 @@ pub mod memory;
 pub mod cost;
 pub(crate) mod ghost;
 pub mod armor;
+pub mod cover_builder;
 #[cfg(feature = "video")]
 pub mod video;
 
@@ -51,15 +53,11 @@ pub use memory::{
     set_memory_budget, set_telemetry_hook,
     GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
-pub use ghost::optimizer::{optimize_cover, OptimizerConfig, OptimizerMode};
-#[doc(hidden)]
-pub use ghost::optimizer::optimizer_test_hash_hex;
 
 // Backward-compatible re-exports at original paths
 pub use ghost::capacity;
 pub use ghost::side_info;
 pub use ghost::shadow;
-pub use ghost::optimizer;
 
 /// Maximum pixel dimension (width or height) for encode.
 /// Images exceeding this are downsampled by the frontend before reaching Rust.
@@ -111,10 +109,14 @@ pub use capacity::estimate_capacity as ghost_capacity;
 pub use capacity::estimate_capacity_si as ghost_capacity_si;
 pub use ghost::deep_cover::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
-pub use capacity::{ghost_bands, ghost_bands_si, GhostBands};
-pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
+pub use capacity::{ghost_bands, ghost_bands_si, ghost_bands_and_shadow_capacity, GhostBands};
+pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
+pub use armor::cover_dims::{armor_cover_dimensions, ArmorCoverDims, ArmorCoverPreset, ARMOR_COVER_STEP};
 pub use payload::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
+
+#[cfg(test)]
+mod rng_golden_tests;
 
 #[cfg(test)]
 mod dimension_tests {
@@ -215,9 +217,9 @@ fn try_armor_modes_unless(
         return Some(Some(result));
     }
 
-    // Armor STDM + geometric recovery. Both read this parse; the geometric
-    // stage streams its spectrum and corrected image with a bounded working
-    // set instead of re-parsing or copying the image.
+    // Armor v2, the grid sync + Fortress T, legacy STDM, the rescaled decode.
+    // All read this parse; the grid sync adds a luma plane and its whitened
+    // copy (8 B per pixel, `memory::DecodeStageHeap`).
     match armor_decode_no_fortress_unless(img, passphrase, stop)? {
         Ok(result) => Some(Some(result)),
         Err(StegoError::DecryptionFailed) => {
@@ -239,12 +241,12 @@ fn try_armor_modes_unless(
 ///
 /// Progress steps: 1 (fortress) + ~21 (phase1) + ~21 (phase2) +
 ///   1 (phase3) + GHOST_DECODE_STEPS (102). Actual total set by
-/// try_armor_decode once candidate count is known.
+/// try_legacy_stdm once candidate count is known.
 #[cfg(not(feature = "parallel"))]
 fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadData, DecodeQuality), StegoError> {
     use crate::codec::jpeg::JpegImage;
 
-    progress::init(0); // reset; try_armor_decode sets real total
+    progress::init(0); // reset; try_legacy_stdm sets real total
     progress::check_cancelled()?;
 
     // Parse JPEG once and share across all mode attempts.
@@ -259,8 +261,8 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     //
     // So order the attempts by likelihood rather than skipping: large inputs try
     // Ghost first and fall back to Armor/Fortress at the end. That keeps the
-    // expensive Armor attempt (STDM sweep + geometric recovery: FFT, resample;
-    // bounded working set, but seconds of work at 48 MP) off the common path
+    // expensive Armor attempt (STDM sweep + grid sync: a luma plane, FFT,
+    // seconds of work at 48 MP) off the common path
     // without ever making a real payload undecodable.
     //
     // Regression: an earlier version *skipped* Armor above this size, which
@@ -282,7 +284,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     let (armor_done, _) = progress::get();
     progress::set_total(armor_done + GHOST_DECODE_STEPS);
 
-    // Ghost primary (v3, then v1), then the shadow layouts (v3, layout v1).
+    // Ghost primary (v3.1, then v3, then v1), then the shadow layouts (v3 / v3.1, layout v1).
     // No decoder computes costs, except the v1 cost-pool fallback inside the
     // shadow attempt, which runs only after everything else in it failed.
     match ghost::pipeline::ghost_decode_from_image(&img, passphrase) {
@@ -345,7 +347,7 @@ fn smart_decode_inner(stego_bytes: &[u8], passphrase: &str) -> Result<(PayloadDa
     use crate::codec::jpeg::JpegImage;
 
     // In parallel mode the attempts advance the same global counter
-    // concurrently.  We init with 0 (indeterminate) — try_armor_decode will
+    // concurrently.  We init with 0 (indeterminate) — try_legacy_stdm will
     // set a real total once it knows the candidate count.  The cap in
     // advance() prevents step from ever exceeding total.
     progress::init(0);
@@ -411,7 +413,7 @@ fn decode_armor_first(
                     return (None, None);
                 }
                 // Primary, then — only if it found nothing — the cost-free
-                // shadow layouts (v3, layout v1 legacy tier). The v1
+                // shadow layouts (v3 / v3.1, layout v1 legacy tier). The v1
                 // cost-pool retry waits until every attempt failed (below).
                 let primary = ghost::pipeline::ghost_decode_from_image(img, passphrase);
                 if primary.is_ok() || matches!(primary, Err(StegoError::Cancelled)) {
@@ -480,7 +482,7 @@ fn decode_armor_first(
 
 /// [`smart_decode_inner`] (parallel) for inputs above
 /// [`ARMOR_TARGET_DIMENSION`]: Armor deferred to the end. Preference: Ghost
-/// primary > Ghost shadow (v3, legacy tier) > v1 cost pools > Fortress >
+/// primary (v3.1, v3, v1) > Ghost shadow (v3 / v3.1, legacy tier) > v1 cost pools > Fortress >
 /// Armor STDM (+ geometric) — the serial order.
 #[cfg(feature = "parallel")]
 fn decode_armor_deferred(
@@ -491,11 +493,9 @@ fn decode_armor_deferred(
     use crypto::DecodeKey;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Keys the Armor chain derives one after another once it runs (Fortress,
-    // then STDM, then — if STDM failed — geometric recovery's template).
-    // The ring key is left to geometric recovery: a wrong passphrase rarely
-    // gets that far.
-    const ARMOR_KEYS: [DecodeKey; 3] = [DecodeKey::Fortress, DecodeKey::Armor, DecodeKey::Template];
+    // Keys the Armor chain derives one after another once it runs (Fortress
+    // and the grid sync's Fortress T, then STDM).
+    const ARMOR_KEYS: [DecodeKey; 2] = [DecodeKey::Fortress, DecodeKey::Armor];
 
     // Ghost primary, alone: a primary passphrase never shares the cores.
     let ghost_result = ghost::pipeline::ghost_decode_from_image(img, passphrase);
@@ -503,7 +503,7 @@ fn decode_armor_deferred(
         return Ok((payload, DecodeQuality::ghost()));
     }
 
-    // The shadow layouts (v3, layout v1's legacy tier), alone — skipped (as
+    // The shadow layouts (v3 / v3.1, layout v1's legacy tier), alone — skipped (as
     // the dummy `FrameCorrupted`) when the primary was cancelled.
     let shadow_result = if matches!(ghost_result, Err(StegoError::Cancelled)) {
         Err(StegoError::FrameCorrupted)

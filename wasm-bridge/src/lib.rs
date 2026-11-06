@@ -24,10 +24,10 @@
 use wasm_bindgen::prelude::*;
 
 use phasm_core::{
-    armor_capacity, armor_capacity_info, armor_decode, armor_encode, estimate_shadow_capacity_si,
+    armor_capacity, armor_capacity_info, armor_decode, estimate_shadow_capacity_si,
     ghost_capacity, ghost_capacity_si, ghost_capacity_with_shadows, ghost_decode, ghost_shadow_decode,
     ghost_encode, ghost_encode_si, ghost_encode_si_with_files,
-    ghost_encode_with_files, optimize_cover, OptimizerConfig, OptimizerMode,
+    ghost_encode_with_files,
     deep_cover_jpeg as core_deep_cover_jpeg,
     smart_decode, DecodeQuality, FileEntry, JpegImage, PayloadData, StegoError,
     GHOST_DECODE_STEPS,
@@ -311,8 +311,9 @@ fn extract_json_string_field(obj: &str, field: &str) -> Result<Option<String>, J
 /// - `image_bytes`: Raw JPEG bytes of the cover image.
 /// - `message`: The secret plaintext message to embed.
 /// - `passphrase`: Passphrase for AES-256-GCM encryption (Argon2id KDF).
-/// - `mode`: `1` = Ghost (stealth), `2` = Armor (robust). Any other value
-///   defaults to Ghost.
+/// - `mode`: `1` = Ghost (stealth), `2` = Armor (robust; Fortress when it
+///   fits), `3` = Armor forced to Standard. Any other value defaults to Ghost.
+///   After an Armor encode, [`last_encode_fortress`] says which one core wrote.
 ///
 /// # Returns
 /// The stego JPEG as a `Uint8Array` (via wasm-bindgen), or throws a JS
@@ -325,12 +326,28 @@ pub fn encode(
     mode: u8,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    LAST_ENCODE_FORTRESS.with(|c| c.set(None));
     let stego = match mode {
-        2 => armor_encode(image_bytes, message, passphrase),
+        // 3 = Armor with the user's Standard switch (Fortress off).
+        2 | 3 => phasm_core::armor_encode_with_options(image_bytes, message, passphrase, mode == 3).map(|(b, q)| {
+            LAST_ENCODE_FORTRESS.with(|c| c.set(Some(q.fortress)));
+            b
+        }),
         _ => ghost_encode(image_bytes, message, passphrase),
     }
     .map_err(|e| JsError::new(&stego_error_message(&e)))?;
     Ok(stego)
+}
+
+thread_local! {
+    static LAST_ENCODE_FORTRESS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the last [`encode`] wrote Fortress (`undefined` when it was not an
+/// Armor encode or failed), so the page shows the sub-mode core actually used.
+#[wasm_bindgen]
+pub fn last_encode_fortress() -> Option<bool> {
+    LAST_ENCODE_FORTRESS.with(|c| c.get())
 }
 
 /// Encode a secret message with file attachments into a JPEG image (Ghost mode only).
@@ -443,7 +460,7 @@ pub fn encode_with_progress(
     check_domain()?;
     phasm_core::progress::set_wasm_callback(Some(on_progress.clone()));
     let result = match mode {
-        2 => armor_encode(image_bytes, message, passphrase),
+        2 | 3 => phasm_core::armor_encode_with_options(image_bytes, message, passphrase, mode == 3).map(|(b, _)| b),
         _ => ghost_encode(image_bytes, message, passphrase),
     }
     .map_err(|e| JsError::new(&stego_error_message(&e)));
@@ -839,6 +856,147 @@ pub fn deep_cover_jpeg(pixels: &[u8], width: u32, height: u32, quality: u8) -> R
     core_deep_cover_jpeg(pixels, width, height, quality).map_err(|e| JsError::new(&stego_error_message(&e)))
 }
 
+/// The JPEG made upright (EXIF orientation applied losslessly in the DCT
+/// domain, edge MCU trimmed) and stripped of metadata, without re-encoding:
+/// the magic wand on a JPEG source (fix list 2d). Mirrors iOS
+/// `phasm_jpeg_upright_and_clean`.
+#[wasm_bindgen]
+pub fn jpeg_upright_and_clean(jpeg: &[u8], keep_icc: bool) -> Result<Vec<u8>, JsError> {
+    check_domain()?;
+    phasm_core::jpeg_upright_and_clean(jpeg, keep_icc).map_err(|e| JsError::new(&format!("INVALID_JPEG:{e}")))
+}
+
+/// The IJG quality (1..100) a JPEG's quantization tables correspond to
+/// (exact for IJG tables, the closest IJG quality for others), -1 when the
+/// bytes are no readable JPEG. Reads the header only. Mirrors iOS
+/// `phasm_jpeg_quality_estimate`.
+#[wasm_bindgen]
+pub fn jpeg_quality_estimate(jpeg: &[u8]) -> Result<i32, JsError> {
+    check_domain()?;
+    Ok(phasm_core::estimate_jpeg_quality(jpeg).map_or(-1, |e| e.quality as i32))
+}
+
+/// Whether RGB pixels are a JPEG decoded on the cover's own 8x8 grid (no Deep
+/// Cover side information; bands at nzAC/10). False on a bad buffer.
+#[wasm_bindgen]
+pub fn is_aligned_jpeg_decode(pixels: &[u8], width: u32, height: u32) -> Result<bool, JsError> {
+    check_domain()?;
+    let expected = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(3));
+    Ok(expected == Some(pixels.len()) && phasm_core::is_aligned_jpeg_decode(pixels, width, height))
+}
+
+/// RGB pixels resampled with core's deterministic Lanczos-3 cover resampler
+/// (the same bytes as the apps; fix list 2.3).
+#[wasm_bindgen]
+pub fn resample_rgb(pixels: &[u8], width: u32, height: u32, dst_width: u32, dst_height: u32) -> Result<Vec<u8>, JsError> {
+    check_domain()?;
+    phasm_core::resample_rgb(pixels, width, height, dst_width, dst_height).map_err(|e| JsError::new(&stego_error_message(&e)))
+}
+
+fn cover_request(mode: u32, wand: bool, ghost_quality: u32, ghost_max_side: u32, armor_preset: u32) -> Result<phasm_core::CoverRequest, JsError> {
+    Ok(phasm_core::CoverRequest {
+        mode: match mode {
+            1 => phasm_core::CoverMode::Ghost,
+            2 => phasm_core::CoverMode::Armor,
+            _ => return Err(JsError::new("INTERNAL:Unknown mode")),
+        },
+        wand,
+        ghost_quality: (1..=100).contains(&ghost_quality).then_some(ghost_quality as u8),
+        ghost_max_side: (ghost_max_side > 0).then_some(ghost_max_side),
+        armor_preset: phasm_core::ArmorCoverPreset::from_id(armor_preset).ok_or_else(|| JsError::new("INTERNAL:Unknown preset"))?,
+    })
+}
+
+/// Whether `build_cover` needs the source's upright sRGB pixels. `mode` 1 =
+/// Ghost, 2 = Armor; `ghost_quality` 0 = default; `ghost_max_side` 0 =
+/// original size; `armor_preset` 0 / 1 / 2 = WhatsApp 1600 / Telegram 1280 /
+/// Instagram 1080.
+#[wasm_bindgen]
+pub fn cover_needs_pixels(original: &[u8], mode: u32, wand: bool, ghost_quality: u32, ghost_max_side: u32, armor_preset: u32) -> Result<bool, JsError> {
+    check_domain()?;
+    Ok(phasm_core::cover_needs_pixels(original, &cover_request(mode, wand, ghost_quality, ghost_max_side, armor_preset)?))
+}
+
+/// The cover to encode (`build_cover`).
+#[wasm_bindgen]
+pub struct CoverResult {
+    jpeg: Vec<u8>,
+    si_pixels: Option<Vec<u8>>,
+    si_is_input: bool,
+    info: [u32; 8],
+    deep_cover: bool,
+}
+
+#[wasm_bindgen]
+impl CoverResult {
+    /// The cover JPEG.
+    #[wasm_bindgen(getter)]
+    pub fn jpeg(&self) -> Vec<u8> {
+        self.jpeg.clone()
+    }
+    /// Pixels for the `*_si` calls when core made them (a resample), else
+    /// `undefined`: the plain calls, or `si_is_input`.
+    #[wasm_bindgen(getter)]
+    pub fn si_pixels(&self) -> Option<Vec<u8>> {
+        self.si_pixels.clone()
+    }
+    /// The `*_si` pixels are exactly the pixels passed to `build_cover`
+    /// (a same-size Ghost cover): reuse that buffer, core returns no copy.
+    #[wasm_bindgen(getter)]
+    pub fn si_is_input(&self) -> bool {
+        self.si_is_input
+    }
+    /// width, height, passThrough, hasCrop, cropX, cropY, cropW, cropH.
+    #[wasm_bindgen(getter)]
+    pub fn info(&self) -> Vec<u32> {
+        self.info.to_vec()
+    }
+    /// Core found exact side information: the only case a "Deep Cover"
+    /// label may show (`si_pixels` alone are not enough).
+    #[wasm_bindgen(getter)]
+    pub fn deep_cover(&self) -> bool {
+        self.deep_cover
+    }
+}
+
+/// The cover to encode for the picked file and the user's settings (rules in
+/// core: docs/design/app/encode-cover-pipeline.md). `pixels` = the source's
+/// upright sRGB RGB (empty when `cover_needs_pixels` is false).
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn build_cover(
+    original: &[u8],
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    mode: u32,
+    wand: bool,
+    ghost_quality: u32,
+    ghost_max_side: u32,
+    armor_preset: u32,
+) -> Result<CoverResult, JsError> {
+    check_domain()?;
+    let req = cover_request(mode, wand, ghost_quality, ghost_max_side, armor_preset)?;
+    let px = (!pixels.is_empty()).then_some((pixels, width, height));
+    let c = phasm_core::build_cover(original, px, &req).map_err(|e| JsError::new(&stego_error_message(&e)))?;
+    let crop = c.crop.unwrap_or([0; 4]);
+    Ok(CoverResult {
+        info: [c.width, c.height, c.pass_through as u32, c.crop.is_some() as u32, crop[0], crop[1], crop[2], crop[3]],
+        jpeg: c.jpeg,
+        si_pixels: c.si_pixels,
+        si_is_input: c.si_is_input,
+        deep_cover: c.deep_cover,
+    })
+}
+
+/// The cover JPEG with the source file's metadata, cleaned (the magic wand
+/// off; fix list 1.2).
+#[wasm_bindgen]
+pub fn cover_with_source_metadata(cover: &[u8], source: &[u8]) -> Result<Vec<u8>, JsError> {
+    check_domain()?;
+    phasm_core::cover_with_source_metadata(cover, source).map_err(|e| JsError::new(&format!("INVALID_JPEG:{e}")))
+}
+
 /// Estimate Ghost primary capacity accounting for shadow position overhead.
 ///
 /// Returns accurate primary capacity when shadows are present, subtracting
@@ -878,8 +1036,9 @@ pub fn capacity_info(image_bytes: &[u8]) -> Result<String, JsError> {
     let info = armor_capacity_info(image_bytes)
         .map_err(|e| JsError::new(&stego_error_message(&e)))?;
     Ok(format!(
-        r#"{{"fortress":{},"stdm":{}}}"#,
+        r#"{{"fortress":{},"fortressCompact":{},"stdm":{}}}"#,
         info.fortress_capacity,
+        info.fortress_capacity_compact,
         info.stdm_capacity,
     ))
 }
@@ -923,6 +1082,31 @@ pub fn ghost_bands_si(
     )
     .map_err(|e| JsError::new(&stego_error_message(&e)))?;
     Ok(bands_json(&b))
+}
+
+/// The Ghost capacity bar's numbers in one call (A#31): [`ghost_bands`] /
+/// [`ghost_bands_si`] and the largest single shadow message
+/// ([`shadow_capacity_si`]), as JSON `{"max","comfort","caution","shadowMax"}`.
+/// `raw_pixels` empty = JPEG input (the plain figures); else the Deep Cover
+/// pixels, as for [`ghost_bands_si`].
+#[wasm_bindgen]
+pub fn ghost_bands_and_shadow_capacity(
+    image_bytes: &[u8],
+    raw_pixels: &[u8],
+    pixel_width: u32,
+    pixel_height: u32,
+    shadow_count: u32,
+    shadow_total_bytes: u32,
+) -> Result<String, JsError> {
+    check_domain()?;
+    let img = JpegImage::from_bytes(image_bytes).map_err(|e| JsError::new(&format!("INVALID_JPEG:{e:?}")))?;
+    let si = (!raw_pixels.is_empty()).then_some((raw_pixels, pixel_width, pixel_height));
+    let (b, shadow) = phasm_core::ghost_bands_and_shadow_capacity(&img, si, shadow_count as usize, shadow_total_bytes as usize)
+        .map_err(|e| JsError::new(&stego_error_message(&e)))?;
+    Ok(format!(
+        "{{\"max\":{},\"comfort\":{},\"caution\":{},\"shadowMax\":{}}}",
+        b.max_bytes, b.comfort_bytes, b.caution_bytes, shadow
+    ))
 }
 
 fn bands_json(b: &phasm_core::GhostBands) -> String {
@@ -972,55 +1156,16 @@ pub fn armor_target_dimension() -> u32 {
     phasm_core::ARMOR_TARGET_DIMENSION
 }
 
-/// Optimize raw RGB pixels for steganographic embedding.
-///
-/// Preprocesses the pixel buffer to improve embedding quality and capacity.
-/// The optimizer is mode-aware: Ghost (1) gets a full 4-stage pipeline,
-/// Armor (2) gets block-boundary smoothing + DC stabilization,
-/// Fortress (3) gets block-boundary smoothing only.
-///
-/// # Parameters
-/// - `pixels`: Raw RGB pixel data (3 bytes per pixel, row-major).
-/// - `width`, `height`: Image dimensions in pixels.
-/// - `mode`: `1` = Ghost, `2` = Armor, `3` = Fortress.
-/// - `seed`: 32-byte ChaCha20 seed for deterministic noise.
-///
-/// # Returns
-/// Optimized pixel buffer as `Uint8Array` (same dimensions/format).
+/// The Armor cover size for an upright `src_w` x `src_h` source and a channel
+/// preset (0 = Standard 1600 px, 1 = Telegram 1280 px, 2 = Instagram 1080 px
+/// wide), as `[width, height, scaled_width, scaled_height, crop_x, crop_y]`
+/// (a `Uint32Array`). Draw the source at scaled_width x scaled_height, offset
+/// by (-crop_x, -crop_y), on a width x height canvas.
 #[wasm_bindgen]
-pub fn optimize_pixels(
-    pixels: &[u8],
-    width: u32,
-    height: u32,
-    mode: u8,
-    seed: &[u8],
-) -> Result<Vec<u8>, JsError> {
-    check_domain()?;
-
-    if seed.len() < 32 {
-        return Err(JsError::new("INTERNAL:Seed must be 32 bytes"));
-    }
-    let mut seed_arr = [0u8; 32];
-    seed_arr.copy_from_slice(&seed[..32]);
-
-    let expected_len = width as usize * height as usize * 3;
-    if pixels.len() != expected_len {
-        return Err(JsError::new("INTERNAL:Pixel buffer size mismatch"));
-    }
-
-    let optimizer_mode = match mode {
-        2 => OptimizerMode::Armor,
-        3 => OptimizerMode::Fortress,
-        _ => OptimizerMode::Ghost,
-    };
-
-    let config = OptimizerConfig {
-        strength: 0.85,
-        seed: seed_arr,
-        mode: optimizer_mode,
-    };
-
-    Ok(optimize_cover(pixels, width, height, &config))
+pub fn armor_cover_dimensions(src_w: u32, src_h: u32, preset: u32) -> Result<Vec<u32>, JsError> {
+    let p = phasm_core::ArmorCoverPreset::from_id(preset)
+        .ok_or_else(|| JsError::new(&format!("INVALID_ARGUMENT:unknown Armor cover preset {preset}")))?;
+    Ok(phasm_core::armor_cover_dimensions(src_w, src_h, p).to_array().to_vec())
 }
 
 /// Cross-platform empirical STDM LLR byte-equivalence hook.
@@ -1116,12 +1261,13 @@ pub fn __bench_split(m: usize, w: usize, h: usize, which: u8) -> f64 {
     let hh = phasm_core::stego::stc::hhat::generate_hhat_end_set(h, w, &[7u8; 32]);
     let cols: Vec<u32> = (0..w).map(|c| phasm_core::stego::stc::hhat::column_packed(&hh, c)).collect();
     use phasm_core::stego::stc::trellis as t;
+    let code = t::Code::uniform(&cols, m);
     match which {
-        0 => t::pass_a(&cover, &costs, &msg, &cols, h, m, &|_| {}).ok().flatten().map_or(-1.0, |p| p.cost),
+        0 => t::pass_a(&cover, &costs, &msg, &code, h, m, &|_| {}).ok().flatten().map_or(-1.0, |p| p.cost),
         1 => {
             let mut cp = vec![f64::INFINITY; 1 << h];
             cp[0] = 0.0;
-            t::segment_rows(&cover, &costs, &msg, &cols, h, &cp).map_or(-1.0, |r| r[r.len() / 2] as f64)
+            t::segment_rows(&cover, &costs, &msg, &code, 0, h, &cp).map_or(-1.0, |r| r[r.len() / 2] as f64)
         }
         _ => t::embed(&cover, &costs, &msg, &cols, h, usize::MAX, 1, &|_| {}).ok().flatten().map_or(-1.0, |p| p.total_cost),
     }
@@ -1145,9 +1291,9 @@ pub fn __test_chacha_hash() -> String {
     phasm_core::stego::chacha_stream::chacha_stream_test_hash_hex()
 }
 
-/// Cross-platform J-UNIWARD cost-kernel byte-equivalence hook: the v2
+/// Cross-platform J-UNIWARD cost-kernel byte-equivalence hook: the
 /// kernel hash pinned in `core/tests/cost_kernel_cross_platform.rs`
-/// (`52b37407…`) and the legacy v1 one (`059a4a47…`). Verifies WASM
+/// (`14156ec6…`, Ghost v3.1) and the legacy v1 one (`059a4a47…`). Verifies WASM
 /// SIMD128 produces bit-identical costs to NEON / SSE2 / scalar.
 #[wasm_bindgen]
 #[doc(hidden)]

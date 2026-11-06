@@ -129,9 +129,18 @@ fn argon2_derive_cached(
     Ok(())
 }
 
+/// The Argon2 instance every phasm key comes from: Argon2id v0x13, 19 MiB,
+/// 2 passes, 1 lane. Spelled out rather than `Argon2::default()`, so a change
+/// of the crate's defaults can never change the keys (and with them every
+/// message); `tests/crypto_kat.rs` pins the output.
+fn phasm_argon2() -> Argon2<'static> {
+    let params = argon2::Params::new(19 * 1024, 2, 1, None).expect("valid Argon2 parameters");
+    Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+}
+
 /// One uncached Argon2id run.
 fn argon2_raw(passphrase: &str, salt: &[u8; 16], output: &mut [u8]) -> Result<(), StegoError> {
-    Argon2::default()
+    phasm_argon2()
         .hash_password_into(passphrase.as_bytes(), salt, output)
         .map_err(|_| StegoError::KeyDerivationFailed)
 }
@@ -148,16 +157,11 @@ pub(crate) enum DecodeKey {
     Fortress,
     /// Armor STDM ([`derive_armor_structural_key`]).
     Armor,
-    /// Armor DFT template ([`derive_template_key`]).
-    Template,
-    /// Armor DFT ring payload ([`derive_ring_key`]).
-    Ring,
 }
 
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 impl DecodeKey {
-    pub(crate) const ALL: [DecodeKey; 6] =
-        [DecodeKey::Ghost, DecodeKey::Shadow, DecodeKey::Fortress, DecodeKey::Armor, DecodeKey::Template, DecodeKey::Ring];
+    pub(crate) const ALL: [DecodeKey; 4] = [DecodeKey::Ghost, DecodeKey::Shadow, DecodeKey::Fortress, DecodeKey::Armor];
 
     fn salt_and_len(self) -> (&'static [u8; 16], usize) {
         match self {
@@ -165,8 +169,6 @@ impl DecodeKey {
             DecodeKey::Shadow => (SHADOW_STRUCTURAL_SALT, 32),
             DecodeKey::Fortress => (FORTRESS_STRUCTURAL_SALT, 32),
             DecodeKey::Armor => (ARMOR_STRUCTURAL_SALT, 64),
-            DecodeKey::Template => (TEMPLATE_SALT, 32),
-            DecodeKey::Ring => (RING_SALT, 32),
         }
     }
 }
@@ -283,10 +285,6 @@ const STRUCTURAL_SALT: &[u8; 16] = b"phasm-ghost-v1\0\0";
 /// Different from Ghost so the same passphrase produces different permutations.
 const ARMOR_STRUCTURAL_SALT: &[u8; 16] = b"phasm-armor-v1\0\0";
 
-/// Fixed salt for DFT template key derivation (Armor geometry resilience).
-/// Independent from structural/armor keys so the template peaks are uncorrelated.
-const TEMPLATE_SALT: &[u8; 16] = b"phasm-tmpl-v1\0\0\0";
-
 /// Fixed salt for Fortress structural key derivation (BA-QIM block permutation).
 /// Independent from Armor STDM keys so the block order is uncorrelated.
 const FORTRESS_STRUCTURAL_SALT: &[u8; 16] = b"phasm-fort-v1\0\0\0";
@@ -299,9 +297,6 @@ pub const SALT_LEN: usize = 16;
 /// Fixed salt for Shadow layer structural key derivation (repetition coding).
 /// Independent from all other keys so shadow permutations are uncorrelated.
 const SHADOW_STRUCTURAL_SALT: &[u8; 16] = b"phasm-shdw-v1\0\0\0";
-
-/// Fixed salt for the Armor DFT ring key (independent from STDM).
-const RING_SALT: &[u8; 16] = b"phasm-ring-v1\0\0\0";
 
 /// Fixed salt for the H.264 MVD-domain structural key. Independent from
 /// the Ghost structural salt so the MVD-domain permutation + STC matrix do
@@ -385,20 +380,10 @@ pub fn derive_armor_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 64
     Ok(output)
 }
 
-/// Derive the DFT template key from a passphrase.
-///
-/// Returns a 32-byte key used as a ChaCha20 seed for generating template
-/// peak positions. Independent from Ghost/Armor structural keys.
-pub fn derive_template_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
-    let mut output = [0u8; 32];
-    argon2_derive_cached(passphrase, TEMPLATE_SALT, &mut output)?;
-    Ok(output)
-}
-
 /// Derive the Fortress structural key from a passphrase.
 ///
 /// Returns a 32-byte key used as a ChaCha20 seed for generating block
-/// permutation. Independent from Ghost/Armor/Template structural keys.
+/// permutation. Independent from the Ghost and Armor structural keys.
 pub fn derive_fortress_structural_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
     let mut output = [0u8; 32];
     argon2_derive_cached(passphrase, FORTRESS_STRUCTURAL_SALT, &mut output)?;
@@ -417,17 +402,10 @@ pub fn derive_shadow_structural_key(passphrase: &str) -> Result<Zeroizing<[u8; 3
     Ok(output)
 }
 
-/// Derive the Armor DFT ring key from a passphrase.
-pub fn derive_ring_key(passphrase: &str) -> Result<[u8; 32], StegoError> {
-    let mut output = [0u8; 32];
-    argon2_derive_cached(passphrase, RING_SALT, &mut output)?;
-    Ok(output)
-}
-
 /// Derive the AES-256 encryption key (Tier 2) from passphrase + random salt.
 pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, StegoError> {
     let mut key = Zeroizing::new([0u8; 32]);
-    Argon2::default()
+    phasm_argon2()
         .hash_password_into(passphrase.as_bytes(), salt, &mut *key)
         .map_err(|_| StegoError::KeyDerivationFailed)?;
     Ok(key)
@@ -438,7 +416,7 @@ pub fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> Result<Zeroizing<
 /// Returns (ciphertext_with_tag, nonce, salt).
 /// The ciphertext includes the 16-byte authentication tag appended by AES-GCM-SIV.
 pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONCE_LEN], [u8; SALT_LEN]), StegoError> {
-    use rand::RngCore;
+    use rand::Rng;
 
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -448,7 +426,7 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONC
     // consecutive encode runs produce byte-identical output (modulo
     // any other non-determinism in the encoder). Diagnostic-only:
     // production paths leave the env var unset, falling back to
-    // `rand::thread_rng` for cryptographic salt+nonce per spec.
+    // `rand::rng` (ThreadRng) for cryptographic salt+nonce per spec.
     let env_seed = std::env::var("PHASM_DETERMINISTIC_SEED").ok().and_then(|s| s.parse::<u64>().ok());
     #[cfg(feature = "test-hooks")]
     let env_seed = env_seed.or_else(test_hooks::deterministic_seed);
@@ -458,16 +436,16 @@ pub fn encrypt(plaintext: &[u8], passphrase: &str) -> Result<(Vec<u8>, [u8; NONC
         rng.fill_bytes(&mut salt);
         rng.fill_bytes(&mut nonce_bytes);
     } else {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         rng.fill_bytes(&mut salt);
         rng.fill_bytes(&mut nonce_bytes);
     }
 
     let key = derive_encryption_key(passphrase, &salt)?;
     let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
+    let ciphertext = cipher.encrypt(&nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail");
 
     Ok((ciphertext, nonce_bytes, salt))
 }
@@ -503,9 +481,9 @@ pub fn encrypt_with(
 ) -> Result<Vec<u8>, StegoError> {
     let key = derive_encryption_key(passphrase, salt)?;
     let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from(*nonce_bytes);
 
-    Ok(cipher.encrypt(nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail"))
+    Ok(cipher.encrypt(&nonce, plaintext).expect("AES-GCM-SIV encrypt should not fail"))
 }
 
 /// Decrypt ciphertext with AES-256-GCM-SIV.
@@ -520,10 +498,10 @@ pub fn decrypt(
 ) -> Result<Vec<u8>, StegoError> {
     let key = derive_encryption_key(passphrase, salt)?;
     let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::from(*nonce_bytes);
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|_| StegoError::DecryptionFailed)
 }
 
@@ -540,7 +518,9 @@ pub(crate) static SEED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// clears the var (and releases the lock) on drop. Use in any lib test that
 /// needs a deterministic salt+nonce.
 #[cfg(test)]
-pub(crate) struct DeterministicSeedGuard(std::sync::MutexGuard<'static, ()>);
+pub(crate) struct DeterministicSeedGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(test)]
 impl DeterministicSeedGuard {
@@ -548,7 +528,7 @@ impl DeterministicSeedGuard {
         let g = SEED_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: writes are serialized by SEED_ENV_LOCK; cleared on drop.
         unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", seed) };
-        Self(g)
+        Self { _lock: g }
     }
 }
 
@@ -620,13 +600,6 @@ mod tests {
     }
 
     #[test]
-    fn template_key_deterministic() {
-        let a = derive_template_key("mypass").unwrap();
-        let b = derive_template_key("mypass").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn fortress_key_deterministic() {
         let a = derive_fortress_structural_key("mypass").unwrap();
         let b = derive_fortress_structural_key("mypass").unwrap();
@@ -645,12 +618,10 @@ mod tests {
         let ghost = derive_structural_key("same_pass").unwrap();
         let armor = derive_armor_structural_key("same_pass").unwrap();
         let fortress = derive_fortress_structural_key("same_pass").unwrap();
-        let template = derive_template_key("same_pass").unwrap();
         let shadow = derive_shadow_structural_key("same_pass").unwrap();
         assert_ne!(&ghost[..32], &shadow[..]);
         assert_ne!(&armor[..32], &shadow[..]);
         assert_ne!(&fortress[..], &shadow[..]);
-        assert_ne!(&template[..], &shadow[..]);
     }
 
     #[test]
@@ -658,19 +629,8 @@ mod tests {
         let ghost = derive_structural_key("same_pass").unwrap();
         let armor = derive_armor_structural_key("same_pass").unwrap();
         let fortress = derive_fortress_structural_key("same_pass").unwrap();
-        let template = derive_template_key("same_pass").unwrap();
         assert_ne!(&ghost[..32], &fortress[..]);
         assert_ne!(&armor[..32], &fortress[..]);
-        assert_ne!(&template[..], &fortress[..]);
-    }
-
-    #[test]
-    fn template_key_differs_from_structural() {
-        let ghost = derive_structural_key("same_pass").unwrap();
-        let armor = derive_armor_structural_key("same_pass").unwrap();
-        let template = derive_template_key("same_pass").unwrap();
-        assert_ne!(&ghost[..32], &template[..]);
-        assert_ne!(&armor[..32], &template[..]);
     }
 
     #[test]
@@ -742,11 +702,9 @@ mod tests {
             let armor = derive_armor_structural_key("same").unwrap();
             let shadow = derive_shadow_structural_key("same").unwrap();
             let fortress = derive_fortress_structural_key("same").unwrap();
-            let template = derive_template_key("same").unwrap();
             assert_ne!(*ghost, *armor);
             assert_ne!(&(*ghost)[..32], &(*shadow)[..]);
             assert_ne!(&(*ghost)[..32], &fortress[..]);
-            assert_ne!(&(*ghost)[..32], &template[..]);
         })
         .join()
         .unwrap();
@@ -779,11 +737,11 @@ mod tests {
         std::thread::spawn(|| {
             clear_key_cache();
             // Populate one extra past capacity using distinct
-            // passphrases. derive_template_key is fastest (32-byte
-            // output) so this stays under a few seconds.
+            // passphrases. derive_fortress_structural_key is fastest
+            // (32-byte output) so this stays under a few seconds.
             for i in 0..KEY_CACHE_CAPACITY + 1 {
                 let pass = format!("cap-test-{i}");
-                let _ = derive_template_key(&pass).unwrap();
+                let _ = derive_fortress_structural_key(&pass).unwrap();
             }
             // Cache should hold exactly KEY_CACHE_CAPACITY entries.
             KEY_CACHE.with(|c| {
@@ -795,8 +753,8 @@ mod tests {
             });
             // First passphrase should have been evicted — re-deriving
             // it works (no caching artifact corruption).
-            let first = derive_template_key("cap-test-0").unwrap();
-            let again = derive_template_key("cap-test-0").unwrap();
+            let first = derive_fortress_structural_key("cap-test-0").unwrap();
+            let again = derive_fortress_structural_key("cap-test-0").unwrap();
             assert_eq!(first, again, "evicted-then-rederived key still consistent");
         })
         .join()

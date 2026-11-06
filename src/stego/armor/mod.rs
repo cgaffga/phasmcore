@@ -25,16 +25,18 @@
 //! The pipeline: encrypt -> frame -> RS encode -> [repeat r×] -> STDM embed.
 
 pub mod ecc;
+pub mod convcode;
 pub mod selection;
 pub mod spreading;
 pub mod embedding;
 pub mod repetition;
 pub mod capacity;
+pub mod cover_dims;
 pub mod embedding_simd;
 pub mod fft2d;
 pub(crate) mod fft2d_simd;
-pub mod template;
-pub mod resample;
-pub mod dft_payload;
+pub mod gridsync;
+pub mod fortress_tile;
+pub mod fortress_tl;
 pub mod fortress;
 pub mod pipeline;

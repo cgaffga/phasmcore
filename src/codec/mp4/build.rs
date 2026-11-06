@@ -1113,6 +1113,7 @@ mod tests {
     // ─── LavfOpenH264 profile ────────────────────────────────────────
 
     /// Samples of the first track as NAL-unit lists (4-byte length prefixes).
+    #[cfg(feature = "h264-encoder")]
     fn sample_nals(mp4: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let parsed = super::super::demux::demux(mp4).unwrap();
         let v = parsed.tracks.iter().find(|t| &t.handler_type == b"vide").unwrap();

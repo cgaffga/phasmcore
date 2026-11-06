@@ -91,9 +91,11 @@ static ENC_TRIES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static ENC_WINS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static DEC_TRIES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
+#[cfg(feature = "h264-encoder")]
 pub(crate) fn note_enc_try(a: u8) {
     ENC_TRIES[a as usize & 3].fetch_add(1, Ordering::Relaxed);
 }
+#[cfg(feature = "h264-encoder")]
 pub(crate) fn note_enc_win(a: u8) {
     ENC_WINS[a as usize & 3].fetch_add(1, Ordering::Relaxed);
 }

@@ -9,7 +9,12 @@
 //! passphrase. The system auto-sorts messages by size: the largest becomes
 //! the primary, smaller messages become shadow layers.
 //!
-//! ## Layout (Ghost v3, core 0.5)
+//! ## Layout (Ghost v3 and v3.1)
+//!
+//! v3.1 (fix list R3.16-18) changed only the primary; its shadows use the
+//! layout v3 (core 0.5 / apps 1.9) introduced, so one shadow decoder reads
+//! both generations. The costs of the shadow trellises are v3.1's (J-UNIWARD
+//! on the unrounded decompressed image).
 //!
 //! Every shadow reads along a **keyed hash order** of the Y AC coefficients
 //! (zeros included): position `fi` has priority `ChaCha20(seed)` word pair
@@ -56,7 +61,7 @@ use crate::stego::permute::CoeffPos;
 use crate::stego::progress;
 use crate::stego::stc::{extract as stc_extract, hhat, trellis};
 use super::side_info::SideInfo;
-use super::v3;
+use super::v31;
 use crate::stego::shadow_layer::{
     build_shadow_frame, parse_shadow_frame, peek_shadow_fdl, SHADOW_FRAME_OVERHEAD_V1,
 };
@@ -196,7 +201,7 @@ fn peek_fdl_from_first_block(
 /// position `fi`). Equal priorities keep raster order. Memory: the result
 /// plus a bounded working set (see [`ac_hash_order_visit`]).
 pub fn ac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u32> {
-    let mut out = Vec::with_capacity(k.min(v3::ac_count(grid)));
+    let mut out = Vec::with_capacity(k.min(v31::ac_count(grid)));
     ac_hash_order_visit(grid, seed, k, ORDER_GROUP_CANDIDATES, |fi| out.push(fi));
     out
 }
@@ -205,7 +210,7 @@ pub fn ac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u3
 /// (`parity_along(ac_hash_order_prefix(..))` without holding the order).
 fn ac_hash_order_parities(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u8> {
     let c = grid.coeffs();
-    let mut out = Vec::with_capacity(k.min(v3::ac_count(grid)));
+    let mut out = Vec::with_capacity(k.min(v31::ac_count(grid)));
     ac_hash_order_visit(grid, seed, k, ORDER_GROUP_CANDIDATES, |fi| out.push((c[fi as usize] & 1) as u8));
     out
 }
@@ -233,7 +238,7 @@ fn scan_ac_priorities<T: Send>(
     init: impl Fn() -> T + Sync,
     step: impl Fn(&mut T, u64, u32) + Sync,
 ) -> Vec<T> {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     let run = |c: usize| -> T {
         let mut acc = init();
         let b0 = c * ORDER_CHUNK_BLOCKS;
@@ -366,7 +371,7 @@ pub fn hash_order(positions: &[CoeffPos], seed: &[u8; 32]) -> Vec<CoeffPos> {
 /// The H-hat seed of a shadow's STC: 32 bytes of ChaCha20 stream 1 under the
 /// shadow's structural key (the hash priorities use stream 0).
 fn stc_hhat_seed(perm_seed: &[u8; 32]) -> [u8; 32] {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     let mut rng = rand_chacha::ChaCha20Rng::from_seed(*perm_seed);
     rng.set_stream(1);
     let mut out = [0u8; 32];
@@ -408,7 +413,7 @@ impl ShadowFrame {
         let (ciphertext, nonce, salt) = crypto::encrypt(&payload_bytes, shadow_pass)?;
         let frame_bytes = build_shadow_frame(payload_bytes.len(), &salt, &nonce, &ciphertext);
         let perm_seed = crypto::derive_shadow_structural_key(shadow_pass)?;
-        Ok(Self { frame_bytes, perm_seed: *perm_seed, dir_seed: v3::dir_seed_from_salt(&salt) })
+        Ok(Self { frame_bytes, perm_seed: *perm_seed, dir_seed: v31::dir_seed_from_salt(&salt) })
     }
 
     /// RS-coded bit count (parity [`SHADOW_STC_PARITY`]).
@@ -456,7 +461,7 @@ impl ShadowState {
         order: &[u32],
         w: usize,
         img: &JpegImage,
-        overlay: &v3::Overlay,
+        overlay: &v31::Overlay,
         cost: impl Fn(usize) -> f32,
         h: usize,
         inline_limit: usize,
@@ -471,9 +476,9 @@ impl ShadowState {
         }
         let region = &order[..region_len];
         let grid = img.dct_grid(0);
-        let cover_bits: Vec<u8> = region.iter().map(|&fi| (v3::value(grid, Some(overlay), fi) & 1) as u8).collect();
+        let cover_bits: Vec<u8> = region.iter().map(|&fi| (v31::value(grid, Some(overlay), fi) & 1) as u8).collect();
         let costs: Vec<f32> = (0..region_len).map(&cost).collect();
-        let cols = v3::packed_cols(&shadow_hhat(w, &frame.perm_seed, h), w);
+        let cols = v31::packed_cols(&shadow_hhat(w, &frame.perm_seed, h), w);
         let threads = crate::stego::memory::encode_workers();
         let Some(planned) = trellis::embed(&cover_bits, &costs, &bits, &cols, h, inline_limit, threads, tick)? else {
             return Ok(None);
@@ -494,13 +499,13 @@ impl ShadowState {
 /// parity by a ±1 change in the v3 direction (toward the precover with side
 /// information, else a keyed coin). Returns the number of coefficients
 /// changed.
-pub fn embed_shadow(img: &JpegImage, overlay: &mut v3::Overlay, state: &ShadowState, si: Option<&SideInfo>) -> usize {
+pub fn embed_shadow(img: &JpegImage, overlay: &mut v31::Overlay, state: &ShadowState, si: Option<&SideInfo>) -> usize {
     let mut changed = 0;
     let grid = img.dct_grid(0);
     for (&fi, &bit) in state.positions.iter().zip(&state.embed_bits) {
-        let c = v3::value(grid, Some(overlay), fi);
+        let c = v31::value(grid, Some(overlay), fi);
         if (c & 1) as u8 != bit {
-            overlay.set(fi, v3::modify_pm1(c, si.map(|s| s.error_at(fi as usize)), state.dir_seed, fi as u64));
+            overlay.set(fi, v31::modify_pm1(c, si.map(|s| s.error_at(fi as usize)), state.dir_seed, fi as u64));
             changed += 1;
         }
     }
@@ -593,20 +598,20 @@ pub fn shadow_extract_v3(img: &JpegImage, passphrase: &str) -> Result<PayloadDat
         return Err(StegoError::NoLuminanceChannel);
     }
     let grid = img.dct_grid(0);
-    let n = v3::ac_count(grid);
-    let widths = v3::shadow_widths(n, SHADOW_MIN_STC_BITS);
+    let n = v31::ac_count(grid);
+    let widths = v31::shadow_widths(n, SHADOW_MIN_STC_BITS);
     if widths.is_empty() {
         return Err(StegoError::FrameCorrupted);
     }
-    let h = v3::V3_STC_H;
-    let t = v3::tstart();
+    let h = v31::V31_STC_H;
+    let t = v31::tstart();
     let perm_seed = crypto::derive_shadow_structural_key(passphrase)?;
-    v3::tlog("shadow key", t);
+    v31::tlog("shadow key", t);
     progress::check_cancelled()?;
 
     // Stage 1: every width's header.
     let mut lsbs = ac_hash_order_parities(grid, &perm_seed, 48 * widths[widths.len() - 1]);
-    v3::tlog("shadow order", t);
+    v31::tlog("shadow order", t);
     let mut cand: Vec<(usize, Vec<Vec<u32>>, usize, usize)> = Vec::new(); // (w, hh, fdl, rs_len)
     for &w in &widths {
         let hh = shadow_hhat(w, &perm_seed, h);
@@ -615,7 +620,7 @@ pub fn shadow_extract_v3(img: &JpegImage, passphrase: &str) -> Result<PayloadDat
             cand.push((w, hh, fdl, rs_len));
         }
     }
-    v3::tlog("shadow headers", t);
+    v31::tlog("shadow headers", t);
     progress::check_cancelled()?;
 
     // Stage 2: first RS block of the plausible widths.
@@ -651,7 +656,7 @@ pub fn shadow_extract_v3(img: &JpegImage, passphrase: &str) -> Result<PayloadDat
 /// keyed hash order (the order `hash_order` gives the nzAC set): one
 /// sequential keystream pass, `O(k)` memory.
 pub fn nzac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<u32> {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     let coeffs = grid.coeffs();
     let nb = grid.blocks_wide() * grid.blocks_tall();
     let n = coeffs.chunks_exact(64).map(|b| b[1..].iter().filter(|&&c| c != 0).count()).sum::<usize>();
@@ -690,7 +695,7 @@ pub fn nzac_hash_order_prefix(grid: &DctGrid, seed: &[u8; 32], k: usize) -> Vec<
 /// threshold selection, `O(k)` memory (as `select_shadow_positions`, which
 /// sorts the whole pool).
 fn pool_hash_order_prefix(pool: &[CoeffPos], seed: &[u8; 32], k: usize) -> Vec<u32> {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     let n = pool.len();
     let k = k.min(n);
     if k == 0 {
@@ -733,7 +738,7 @@ fn pool_hash_order_prefix(pool: &[CoeffPos], seed: &[u8; 32], k: usize) -> Vec<u
 /// `None` if a flat index repeats or lies outside the grid (no real cost
 /// list does): the caller then reads per position, as before.
 fn pool_priorities(grid: &DctGrid, cost_sorted: &[CoeffPos], len: usize, seed: &[u8; 32]) -> Option<Vec<u64>> {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     let len = len.min(cost_sorted.len());
     let nb = grid.coeffs().len() / 64;
     // One bitmap word per 8×8 block (bit k = coefficient k of the block).
@@ -1059,7 +1064,7 @@ pub(crate) fn select_shadow_positions(
     n_total: usize,
     seed: &[u8; 32],
 ) -> Vec<CoeffPos> {
-    use rand::{RngCore, SeedableRng};
+    use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha20Rng;
 
     // Tier 1: cost pool — cheapest 1/fraction of all positions.
@@ -1164,7 +1169,7 @@ mod tests {
         let grid = img.dct_grid(0);
         let seed = [9u8; 32];
         let all: Vec<CoeffPos> =
-            v3::ac_flat_indices(grid).into_iter().map(|fi| CoeffPos { flat_idx: fi, cost: 0.0 }).collect();
+            v31::ac_flat_indices(grid).into_iter().map(|fi| CoeffPos { flat_idx: fi, cost: 0.0 }).collect();
         let full: Vec<u32> = hash_order(&all, &seed).iter().map(|p| p.flat_idx).collect();
         for k in [0usize, 1, 7, 100, 999, 5_000, 37_000, 75_599, 75_600, 80_000] {
             let pre = ac_hash_order_prefix(grid, &seed, k);
@@ -1218,7 +1223,7 @@ mod tests {
     #[test]
     #[ignore]
     fn ac_order_timing() {
-        use rand::{RngCore, SeedableRng};
+        use rand::{Rng, SeedableRng};
         let Ok(b) = std::fs::read("test-vectors/image/photo_original_3557.jpg") else { return };
         let img = JpegImage::from_bytes(&b).unwrap();
         let grid = img.dct_grid(0);

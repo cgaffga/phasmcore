@@ -28,6 +28,47 @@ use crate::stego::frame::{FRAME_OVERHEAD, FRAME_OVERHEAD_EXT};
 /// Returns [`StegoError::NoLuminanceChannel`] if the image has no Y component
 /// or its quantization table is missing.
 pub fn estimate_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
+    v2_stdm_capacity(img)
+}
+
+/// Exact Armor v2 STDM capacity in payload bytes (the size of
+/// `payload::encode_payload`'s output): the largest P whose frame
+/// (P + FRAME_OVERHEAD), Reed-Solomon encoded with the Phase 1 code
+/// (191 + 64), fits the v2 payload units (real ceil(W/8) x ceil(H/8) block
+/// grid, 15 positions per block, 8 per unit, minus the 112 header units).
+/// A payload of exactly this size encodes; one byte more does not.
+pub fn v2_stdm_capacity(img: &JpegImage) -> Result<usize, StegoError> {
+    if img.num_components() == 0 {
+        return Err(StegoError::NoLuminanceChannel);
+    }
+    let (bw, bh) = super::pipeline::real_luma_blocks(img);
+    let units = bw * bh * super::embedding::MAX_ARMOR_ZIGZAG / SPREAD_LEN;
+    let header = super::embedding::V2_HEADER_UNITS;
+    if units <= header {
+        return Ok(0);
+    }
+    let payload_bits = units - header;
+    let fits = |p: usize| ecc::rs_encoded_len(p + FRAME_OVERHEAD) * 8 <= payload_bits;
+    if !fits(0) {
+        return Ok(0);
+    }
+    // Armor frames carry a 16-bit plaintext length (the decoder parses no
+    // extended frames), and the frame is capped at MAX_FRAME_BYTES.
+    let max_p = (u16::MAX as usize).min(crate::stego::frame::MAX_FRAME_BYTES - FRAME_OVERHEAD);
+    let (mut lo, mut hi) = (0usize, max_p);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    Ok(lo)
+}
+
+/// The shipped (legacy STDM) estimate on the MCU-padded grid, kept for reference.
+pub fn estimate_legacy_armor_capacity(img: &JpegImage) -> Result<usize, StegoError> {
     let grid = img.dct_grid(0);
     let qt_id = img.frame_info().components[0].quant_table_id as usize;
     let qt = img

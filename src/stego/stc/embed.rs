@@ -123,40 +123,42 @@ unsafe fn viterbi_step_neon(
     cost_s0: f64,
     cost_s1: f64,
 ) -> u128 {
-    use core::arch::aarch64::*;
-    let num_states = prev_cost.len();
-    // Pass 1: scalar gather.
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
+    unsafe {
+        use core::arch::aarch64::*;
+        let num_states = prev_cost.len();
+        // Pass 1: scalar gather.
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        // Pass 2+3: SIMD SAXPY + select + bit-pack.
+        let v_cost_s0 = vdupq_n_f64(cost_s0);
+        let v_cost_s1 = vdupq_n_f64(cost_s1);
+        let mut packed_bp: u128 = 0;
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = vld1q_f64(prev_ptr.add(s));
+            let v_perm = vld1q_f64(perm_ptr.add(s));
+            let v_c0 = vaddq_f64(v_prev, v_cost_s0);
+            let v_c1 = vaddq_f64(v_perm, v_cost_s1);
+            // c1 < c0 per lane → all-1 mask on true, all-0 on false.
+            let cmp_mask = vcltq_f64(v_c1, v_c0);
+            // vbslq_f64(mask, a, b): mask-bit-1 → a, else b. So select c1
+            // when c1 < c0 (mask=all-1), c0 otherwise.
+            let v_curr = vbslq_f64(cmp_mask, v_c1, v_c0);
+            vst1q_f64(curr_ptr.add(s), v_curr);
+            // Bit-pack: vcltq_f64 lanes are 0 or u64::MAX. Extract per
+            // lane and OR into packed_bp at bit `s` / `s+1`.
+            let lane0 = vgetq_lane_u64(cmp_mask, 0);
+            let lane1 = vgetq_lane_u64(cmp_mask, 1);
+            packed_bp |= ((lane0 != 0) as u128) << s;
+            packed_bp |= ((lane1 != 0) as u128) << (s + 1);
+        }
+        packed_bp
     }
-    // Pass 2+3: SIMD SAXPY + select + bit-pack.
-    let v_cost_s0 = vdupq_n_f64(cost_s0);
-    let v_cost_s1 = vdupq_n_f64(cost_s1);
-    let mut packed_bp: u128 = 0;
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = vld1q_f64(prev_ptr.add(s));
-        let v_perm = vld1q_f64(perm_ptr.add(s));
-        let v_c0 = vaddq_f64(v_prev, v_cost_s0);
-        let v_c1 = vaddq_f64(v_perm, v_cost_s1);
-        // c1 < c0 per lane → all-1 mask on true, all-0 on false.
-        let cmp_mask = vcltq_f64(v_c1, v_c0);
-        // vbslq_f64(mask, a, b): mask-bit-1 → a, else b. So select c1
-        // when c1 < c0 (mask=all-1), c0 otherwise.
-        let v_curr = vbslq_f64(cmp_mask, v_c1, v_c0);
-        vst1q_f64(curr_ptr.add(s), v_curr);
-        // Bit-pack: vcltq_f64 lanes are 0 or u64::MAX. Extract per
-        // lane and OR into packed_bp at bit `s` / `s+1`.
-        let lane0 = vgetq_lane_u64(cmp_mask, 0);
-        let lane1 = vgetq_lane_u64(cmp_mask, 1);
-        packed_bp |= ((lane0 != 0) as u128) << s;
-        packed_bp |= ((lane1 != 0) as u128) << (s + 1);
-    }
-    packed_bp
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -169,26 +171,28 @@ unsafe fn viterbi_step_neon_no_bp(
     cost_s0: f64,
     cost_s1: f64,
 ) {
-    use core::arch::aarch64::*;
-    let num_states = prev_cost.len();
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
-    }
-    let v_cost_s0 = vdupq_n_f64(cost_s0);
-    let v_cost_s1 = vdupq_n_f64(cost_s1);
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = vld1q_f64(prev_ptr.add(s));
-        let v_perm = vld1q_f64(perm_ptr.add(s));
-        let v_c0 = vaddq_f64(v_prev, v_cost_s0);
-        let v_c1 = vaddq_f64(v_perm, v_cost_s1);
-        let cmp_mask = vcltq_f64(v_c1, v_c0);
-        let v_curr = vbslq_f64(cmp_mask, v_c1, v_c0);
-        vst1q_f64(curr_ptr.add(s), v_curr);
+    unsafe {
+        use core::arch::aarch64::*;
+        let num_states = prev_cost.len();
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        let v_cost_s0 = vdupq_n_f64(cost_s0);
+        let v_cost_s1 = vdupq_n_f64(cost_s1);
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = vld1q_f64(prev_ptr.add(s));
+            let v_perm = vld1q_f64(perm_ptr.add(s));
+            let v_c0 = vaddq_f64(v_prev, v_cost_s0);
+            let v_c1 = vaddq_f64(v_perm, v_cost_s1);
+            let cmp_mask = vcltq_f64(v_c1, v_c0);
+            let v_curr = vbslq_f64(cmp_mask, v_c1, v_c0);
+            vst1q_f64(curr_ptr.add(s), v_curr);
+        }
     }
 }
 
@@ -207,35 +211,37 @@ unsafe fn viterbi_step_simd128(
     cost_s0: f64,
     cost_s1: f64,
 ) -> u128 {
-    use core::arch::wasm32::*;
-    let num_states = prev_cost.len();
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
+    unsafe {
+        use core::arch::wasm32::*;
+        let num_states = prev_cost.len();
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        let v_cost_s0 = f64x2_splat(cost_s0);
+        let v_cost_s1 = f64x2_splat(cost_s1);
+        let mut packed_bp: u128 = 0;
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = v128_load(prev_ptr.add(s) as *const v128);
+            let v_perm = v128_load(perm_ptr.add(s) as *const v128);
+            let v_c0 = f64x2_add(v_prev, v_cost_s0);
+            let v_c1 = f64x2_add(v_perm, v_cost_s1);
+            let cmp_mask = f64x2_lt(v_c1, v_c0);
+            // v128_bitselect(a, b, mask): mask-bit-1 → a, else b.
+            let v_curr = v128_bitselect(v_c1, v_c0, cmp_mask);
+            v128_store(curr_ptr.add(s) as *mut v128, v_curr);
+            // i64x2_bitmask extracts the high bit (sign) of each lane.
+            // For an all-1 (true) lane, high bit = 1 → match
+            // _mm_movemask_pd / vbslq mask-extraction semantics.
+            let mask_bits = i64x2_bitmask(cmp_mask) as u128;
+            packed_bp |= mask_bits << s;
+        }
+        packed_bp
     }
-    let v_cost_s0 = f64x2_splat(cost_s0);
-    let v_cost_s1 = f64x2_splat(cost_s1);
-    let mut packed_bp: u128 = 0;
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = v128_load(prev_ptr.add(s) as *const v128);
-        let v_perm = v128_load(perm_ptr.add(s) as *const v128);
-        let v_c0 = f64x2_add(v_prev, v_cost_s0);
-        let v_c1 = f64x2_add(v_perm, v_cost_s1);
-        let cmp_mask = f64x2_lt(v_c1, v_c0);
-        // v128_bitselect(a, b, mask): mask-bit-1 → a, else b.
-        let v_curr = v128_bitselect(v_c1, v_c0, cmp_mask);
-        v128_store(curr_ptr.add(s) as *mut v128, v_curr);
-        // i64x2_bitmask extracts the high bit (sign) of each lane.
-        // For an all-1 (true) lane, high bit = 1 → match
-        // _mm_movemask_pd / vbslq mask-extraction semantics.
-        let mask_bits = i64x2_bitmask(cmp_mask) as u128;
-        packed_bp |= mask_bits << s;
-    }
-    packed_bp
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -248,26 +254,28 @@ unsafe fn viterbi_step_simd128_no_bp(
     cost_s0: f64,
     cost_s1: f64,
 ) {
-    use core::arch::wasm32::*;
-    let num_states = prev_cost.len();
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
-    }
-    let v_cost_s0 = f64x2_splat(cost_s0);
-    let v_cost_s1 = f64x2_splat(cost_s1);
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = v128_load(prev_ptr.add(s) as *const v128);
-        let v_perm = v128_load(perm_ptr.add(s) as *const v128);
-        let v_c0 = f64x2_add(v_prev, v_cost_s0);
-        let v_c1 = f64x2_add(v_perm, v_cost_s1);
-        let cmp_mask = f64x2_lt(v_c1, v_c0);
-        let v_curr = v128_bitselect(v_c1, v_c0, cmp_mask);
-        v128_store(curr_ptr.add(s) as *mut v128, v_curr);
+    unsafe {
+        use core::arch::wasm32::*;
+        let num_states = prev_cost.len();
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        let v_cost_s0 = f64x2_splat(cost_s0);
+        let v_cost_s1 = f64x2_splat(cost_s1);
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = v128_load(prev_ptr.add(s) as *const v128);
+            let v_perm = v128_load(perm_ptr.add(s) as *const v128);
+            let v_c0 = f64x2_add(v_prev, v_cost_s0);
+            let v_c1 = f64x2_add(v_perm, v_cost_s1);
+            let cmp_mask = f64x2_lt(v_c1, v_c0);
+            let v_curr = v128_bitselect(v_c1, v_c0, cmp_mask);
+            v128_store(curr_ptr.add(s) as *mut v128, v_curr);
+        }
     }
 }
 
@@ -295,34 +303,36 @@ unsafe fn viterbi_step_sse(
     cost_s0: f64,
     cost_s1: f64,
 ) -> u128 {
-    use core::arch::x86_64::*;
-    let num_states = prev_cost.len();
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
+    unsafe {
+        use core::arch::x86_64::*;
+        let num_states = prev_cost.len();
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        let v_cost_s0 = _mm_set1_pd(cost_s0);
+        let v_cost_s1 = _mm_set1_pd(cost_s1);
+        let mut packed_bp: u128 = 0;
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = _mm_loadu_pd(prev_ptr.add(s));
+            let v_perm = _mm_loadu_pd(perm_ptr.add(s));
+            let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
+            let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
+            let cmp_mask = _mm_cmplt_pd(v_c1, v_c0); // c1 < c0 → all-1 lanes
+            // Bitwise select: mask lanes are all-1 or all-0, so
+            // (mask & c1) | (!mask & c0) picks c1 exactly where c1 < c0.
+            let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
+            _mm_storeu_pd(curr_ptr.add(s), v_curr);
+            // movmskpd returns 2-bit integer (0b{lane1}{lane0}).
+            let mask_bits = _mm_movemask_pd(cmp_mask) as u128;
+            packed_bp |= mask_bits << s;
+        }
+        packed_bp
     }
-    let v_cost_s0 = _mm_set1_pd(cost_s0);
-    let v_cost_s1 = _mm_set1_pd(cost_s1);
-    let mut packed_bp: u128 = 0;
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = _mm_loadu_pd(prev_ptr.add(s));
-        let v_perm = _mm_loadu_pd(perm_ptr.add(s));
-        let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
-        let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
-        let cmp_mask = _mm_cmplt_pd(v_c1, v_c0); // c1 < c0 → all-1 lanes
-        // Bitwise select: mask lanes are all-1 or all-0, so
-        // (mask & c1) | (!mask & c0) picks c1 exactly where c1 < c0.
-        let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
-        _mm_storeu_pd(curr_ptr.add(s), v_curr);
-        // movmskpd returns 2-bit integer (0b{lane1}{lane0}).
-        let mask_bits = _mm_movemask_pd(cmp_mask) as u128;
-        packed_bp |= mask_bits << s;
-    }
-    packed_bp
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -335,26 +345,28 @@ unsafe fn viterbi_step_sse_no_bp(
     cost_s0: f64,
     cost_s1: f64,
 ) {
-    use core::arch::x86_64::*;
-    let num_states = prev_cost.len();
-    for s in 0..num_states {
-        prev_cost_perm[s] = prev_cost[s ^ col];
-    }
-    let v_cost_s0 = _mm_set1_pd(cost_s0);
-    let v_cost_s1 = _mm_set1_pd(cost_s1);
-    let chunks = num_states / 2;
-    let prev_ptr = prev_cost.as_ptr();
-    let perm_ptr = prev_cost_perm.as_ptr();
-    let curr_ptr = curr_cost.as_mut_ptr();
-    for chunk in 0..chunks {
-        let s = chunk * 2;
-        let v_prev = _mm_loadu_pd(prev_ptr.add(s));
-        let v_perm = _mm_loadu_pd(perm_ptr.add(s));
-        let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
-        let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
-        let cmp_mask = _mm_cmplt_pd(v_c1, v_c0);
-        let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
-        _mm_storeu_pd(curr_ptr.add(s), v_curr);
+    unsafe {
+        use core::arch::x86_64::*;
+        let num_states = prev_cost.len();
+        for s in 0..num_states {
+            prev_cost_perm[s] = prev_cost[s ^ col];
+        }
+        let v_cost_s0 = _mm_set1_pd(cost_s0);
+        let v_cost_s1 = _mm_set1_pd(cost_s1);
+        let chunks = num_states / 2;
+        let prev_ptr = prev_cost.as_ptr();
+        let perm_ptr = prev_cost_perm.as_ptr();
+        let curr_ptr = curr_cost.as_mut_ptr();
+        for chunk in 0..chunks {
+            let s = chunk * 2;
+            let v_prev = _mm_loadu_pd(prev_ptr.add(s));
+            let v_perm = _mm_loadu_pd(perm_ptr.add(s));
+            let v_c0 = _mm_add_pd(v_prev, v_cost_s0);
+            let v_c1 = _mm_add_pd(v_perm, v_cost_s1);
+            let cmp_mask = _mm_cmplt_pd(v_c1, v_c0);
+            let v_curr = _mm_or_pd(_mm_and_pd(cmp_mask, v_c1), _mm_andnot_pd(cmp_mask, v_c0));
+            _mm_storeu_pd(curr_ptr.add(s), v_curr);
+        }
     }
 }
 

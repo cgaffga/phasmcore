@@ -206,6 +206,7 @@ fn container_child_offset(box_type: &[u8; 4]) -> Option<usize> {
 #[derive(Debug)]
 struct Ftyp {
     major_brand: [u8; 4],
+    #[allow(dead_code)] // parsed for Debug output only
     minor_version: u32,
     compatibles: Vec<[u8; 4]>,
 }

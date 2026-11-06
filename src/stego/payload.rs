@@ -44,8 +44,11 @@ const BROTLI_QUALITY: u32 = 11;
 /// For small payloads this is fine — Brotli auto-adjusts.
 const BROTLI_LG_WINDOW_SIZE: u32 = 22;
 
-/// Maximum raw file size before compression (hard reject).
-pub const MAX_RAW_FILE_SIZE: usize = 2 * 1024 * 1024; // 2 MB
+/// Maximum raw size of one attached file (hard reject), the same as the whole
+/// payload's bound: the carrier's capacity is the real limit (a photo holds far
+/// less; a long video can hold more than the 2 MB this was until 2026-11-03).
+/// Decoders only ever enforced [`MAX_INNER_PAYLOAD_BYTES`].
+pub const MAX_RAW_FILE_SIZE: usize = MAX_INNER_PAYLOAD_BYTES; // 16 MiB
 
 /// Maximum serialized inner payload (text + file entries, before compression).
 ///
@@ -110,8 +113,17 @@ pub fn encode_payload(text: &str, files: &[FileEntry]) -> Result<Vec<u8>, StegoE
 /// Falls back to `text.as_bytes().len() + 1` (raw text + flags byte) if
 /// `encode_payload` fails for any reason (e.g. file too large).
 pub fn compressed_payload_size(text: &str, files: &[FileEntry]) -> usize {
-    encode_payload(text, files).map_or_else(|_| text.len() + 1, |v| v.len())
+    encode_payload(text, files).map_or(PAYLOAD_SIZE_OVER_LIMIT, |v| v.len())
 }
+
+/// What [`compressed_payload_size`] reports for a payload `encode_payload`
+/// refuses (over [`MAX_INNER_PAYLOAD_BYTES`] raw, a file over
+/// [`MAX_RAW_FILE_SIZE`] or a name over 255 bytes): larger than any
+/// carrier's capacity (a compressed payload is at most the inner bound plus
+/// its flags byte), so a capacity bar shows it as too large. It used to be
+/// the text length + 1, which showed an over-limit attachment as fitting.
+/// Fits an `i32` (the JNI return type).
+pub const PAYLOAD_SIZE_OVER_LIMIT: usize = MAX_INNER_PAYLOAD_BYTES + 2;
 
 /// Make an attachment name safe to use as a file name.
 ///
@@ -446,6 +458,17 @@ mod tests {
         let decoded = decode_payload(&encoded).unwrap();
         assert_eq!(decoded.text, "see attached");
         assert_eq!(decoded.files[0].content, content);
+    }
+
+    #[test]
+    fn over_limit_payload_reports_more_than_any_capacity() {
+        let big = FileEntry { filename: "a.bin".into(), content: vec![7u8; MAX_INNER_PAYLOAD_BYTES / 2 + 1] };
+        let two = [big.clone(), FileEntry { filename: "b.bin".into(), ..big }];
+        assert!(encode_payload("hi", &two).is_err());
+        assert_eq!(compressed_payload_size("hi", &two), PAYLOAD_SIZE_OVER_LIMIT);
+        assert!(PAYLOAD_SIZE_OVER_LIMIT > MAX_INNER_PAYLOAD_BYTES + 1);
+        assert!(PAYLOAD_SIZE_OVER_LIMIT <= i32::MAX as usize);
+        assert!(compressed_payload_size("hi", &[]) < 16);
     }
 
     #[test]
