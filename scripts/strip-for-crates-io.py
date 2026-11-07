@@ -26,7 +26,12 @@ What it removes, from `Cargo.toml` and `cli/Cargo.toml`:
     `required-features` names a removed feature, and the `src/bin/*.rs`
     source of each removed bin;
   * and it adds `exclude = ["vendor/"]` to `[package]`, so the vendored C of
-    a recursive clone can never end up inside the .crate.
+    a recursive clone can never end up inside the .crate;
+  * it declares the removed features to rustc (`[lints.rust]
+    unexpected_cfgs` check-cfg): the source keeps its
+    `#[cfg(feature = "h264-encoder")]` gates, which are then always off, and
+    without the declaration every one of them warns "unexpected `cfg`
+    condition value" (91 warnings in a `h264-decoder` build).
 
 Why each piece cannot go to crates.io
 -------------------------------------
@@ -82,6 +87,7 @@ STRIPPED_DEPS = ("core-openh264-sys", "core-dav1d-sys", "phasm-rav1e")
 STRIPPED_MEMBERS = ("openh264-sys", "dav1d-sys")
 DROP_PREFIXES = tuple(f"{name} =" for name in STRIPPED_FEATURES + STRIPPED_DEPS)
 TARGET_HEADERS = ("[[test]]", "[[bin]]", "[[example]]", "[[bench]]")
+CHECK_CFG_FEATURES = "cfg(feature, values(" + ",".join(f'"{n}"' for n in STRIPPED_FEATURES) + "))"
 
 
 def drop_lines(lines: list[str], log: list[str]) -> list[str]:
@@ -184,6 +190,43 @@ def add_vendor_exclude(text: str, log: list[str]) -> str:
     return text[: pkg.end()] + section + text[end:].lstrip("\n")
 
 
+def declare_stripped_features(text: str, log: list[str]) -> str:
+    """Tell rustc the stripped features exist, so their `#[cfg]` gates stay quiet.
+
+    The source still carries `#[cfg(feature = "h264-encoder")]` and friends
+    (they are simply never on); a manifest that no longer declares the feature
+    makes rustc warn at each one. Declared through `check-cfg` in
+    `[lints.rust] unexpected_cfgs`: appended to the existing list when the
+    manifest has one, else the line (and table, if need be) is added.
+    """
+    entry = f"'{CHECK_CFG_FEATURES}'"
+    existing = re.search(
+        r"^unexpected_cfgs\s*=\s*\{[^\n]*?check-cfg\s*=\s*\[([^\]\n]*)\][^\n]*\}[ \t]*$",
+        text,
+        re.M,
+    )
+    if existing:
+        if CHECK_CFG_FEATURES in existing.group(0):
+            return text
+        items = existing.group(1).rstrip()
+        sep = "" if not items or items.endswith(",") else ","
+        line = (
+            existing.group(0)[: existing.start(1) - existing.start(0)]
+            + items + sep + (" " if items else "") + entry
+            + existing.group(0)[existing.end(1) - existing.start(0):]
+        )
+        text = text[: existing.start()] + line + text[existing.end():]
+    else:
+        line = f'unexpected_cfgs = {{ level = "warn", check-cfg = [{entry}] }}\n'
+        table = re.search(r"^\[lints\.rust\]\s*$", text, re.M)
+        if table:
+            text = text[: table.end()] + "\n" + line.rstrip("\n") + text[table.end():]
+        else:
+            text = text.rstrip("\n") + "\n\n[lints.rust]\n" + line
+    log.append("lints: unexpected_cfgs check-cfg for the stripped features")
+    return text
+
+
 def strip_manifest(path: pathlib.Path, root: pathlib.Path, is_root: bool) -> list[str]:
     log: list[str] = []
     lines = path.read_text().splitlines(keepends=True)
@@ -192,6 +235,7 @@ def strip_manifest(path: pathlib.Path, root: pathlib.Path, is_root: bool) -> lis
     text = drop_members("".join(lines), log)
     if is_root:
         text = add_vendor_exclude(text, log)
+    text = declare_stripped_features(text, log)
     path.write_text(text)
     for rel in bin_sources:
         src = path.parent / rel
