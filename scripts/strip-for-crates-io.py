@@ -18,10 +18,11 @@ checkout, undo it with `git checkout -- .`.
 
 What it removes, from `Cargo.toml` and `cli/Cargo.toml`:
 
-  * the features `h264-encoder`, `av1-encoder`, `av1-decoder`;
+  * the features `h264-encoder`, `av1-encoder`, `av1-decoder`, `photo-encoder`;
   * the dependencies behind them: `core-openh264-sys`, `core-dav1d-sys`,
-    `phasm-rav1e` (plus the comment block that describes each line);
-  * `openh264-sys` and `dav1d-sys` from `[workspace] members`;
+    `phasm-rav1e`, `core-aom-sys` (plus the comment block that describes each
+    line; `core-aom-sys` is path-only and builds libaom from vendor/libaom);
+  * `openh264-sys`, `dav1d-sys` and `aom-sys` from `[workspace] members`;
   * every `[[bin]]` / `[[test]]` / `[[example]]` / `[[bench]]` target whose
     `required-features` names a removed feature, and the `src/bin/*.rs`
     source of each removed bin;
@@ -82,9 +83,9 @@ import pathlib
 import re
 import sys
 
-STRIPPED_FEATURES = ("h264-encoder", "av1-encoder", "av1-decoder")
-STRIPPED_DEPS = ("core-openh264-sys", "core-dav1d-sys", "phasm-rav1e")
-STRIPPED_MEMBERS = ("openh264-sys", "dav1d-sys")
+STRIPPED_FEATURES = ("h264-encoder", "av1-encoder", "av1-decoder", "photo-encoder")
+STRIPPED_DEPS = ("core-openh264-sys", "core-dav1d-sys", "phasm-rav1e", "core-aom-sys")
+STRIPPED_MEMBERS = ("openh264-sys", "dav1d-sys", "aom-sys")
 DROP_PREFIXES = tuple(f"{name} =" for name in STRIPPED_FEATURES + STRIPPED_DEPS)
 TARGET_HEADERS = ("[[test]]", "[[bin]]", "[[example]]", "[[bench]]")
 CHECK_CFG_FEATURES = "cfg(feature, values(" + ",".join(f'"{n}"' for n in STRIPPED_FEATURES) + "))"

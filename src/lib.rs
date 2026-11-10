@@ -30,6 +30,7 @@
 pub mod codec;
 pub mod det_math;
 pub mod stego;
+pub mod photo;
 
 // Backward-compatible re-exports: `phasm_core::jpeg::*` still works
 pub use codec::jpeg as jpeg;

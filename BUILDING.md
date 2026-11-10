@@ -7,6 +7,7 @@ video steganography. The three video codecs are phasm forks:
 |------|---------|---------|------------|---------|
 | [phasm-openh264](https://github.com/cgaffga/phasm-openh264) | Cisco OpenH264 (C/C++) | `h264-encoder` | git submodule `vendor/phasm-openh264` | BSD-2-Clause |
 | [phasm-dav1d](https://github.com/cgaffga/phasm-dav1d) | VideoLAN dav1d (C) | `av1-decoder` | git submodule `vendor/phasm-dav1d` | BSD-2-Clause |
+| [libaom](https://aomedia.googlesource.com/aom) | AOMedia libaom (C), unmodified, at a release tag | `photo-encoder` | git submodule `vendor/libaom` | BSD-2-Clause + AOMedia Patent License 1.0 |
 | [phasm-rav1e](https://github.com/cgaffga/phasm-rav1e) | xiph rav1e (Rust + asm) | `av1-encoder` | fetched by cargo from GitHub ([The rav1e fork](#the-rav1e-fork)) | BSD-2-Clause |
 
 Each is pinned to an exact commit of its `phasm-stego` branch. None of them is
@@ -51,6 +52,7 @@ The video features build C code with meson and ninja:
 | `h264-encoder` | meson, ninja, a C and a C++ compiler; nasm on x86 / x86_64 |
 | `av1-decoder` | meson, ninja, a C compiler; nasm 2.14 or newer on x86 / x86_64 |
 | `av1-encoder` | nasm on x86_64, a C compiler on aarch64 (rav1e's `asm` kernels); plus everything `av1-decoder` needs, which it implies; network access to github.com, where cargo fetches the rav1e fork |
+| `photo-encoder` | CMake 3.16 or newer, ninja, a C compiler; nasm on x86_64 |
 
 On Apple Silicon and other aarch64 machines nasm is not needed.
 
@@ -107,6 +109,7 @@ phasm-core features (the library, `Cargo.toml` at the repo root):
 | `h264-encoder` | H.264 stego **encode** through phasm-openh264; implies `h264-decoder`, `parallel`, `simd` | meson, ninja, C/C++, nasm (x86) | **no** |
 | `av1-decoder` | AV1 stego decode through phasm-dav1d | meson, ninja, C, nasm (x86) | **no** |
 | `av1-encoder` | AV1 stego encode through phasm-rav1e; implies `av1-decoder`, `parallel` | as `av1-decoder`, plus nasm on x86_64 | **no** |
+| `photo-encoder` | photo attachments: fit a photo into a message as a small AVIF file (`photo::fit`, libaom). Showing one (`photo::decode`) needs `av1-decoder` | CMake, ninja, C, nasm (x86_64) | **no** |
 | `simd` | NEON kernel for the H.264 stego walker (aarch64) | none | yes |
 | `wasm` | wasm-bindgen glue for the web build (image stego only, never video) | none | yes |
 

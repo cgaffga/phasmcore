@@ -418,6 +418,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "core-aom-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "core-dav1d-sys"
 version = "0.1.0"
 dependencies = [
@@ -1011,7 +1018,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "phasm-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "image",
@@ -1024,11 +1031,12 @@ dependencies = [
 
 [[package]]
 name = "phasm-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes-gcm-siv",
  "argon2",
  "brotli",
+ "core-aom-sys",
  "core-dav1d-sys",
  "core-openh264-sys",
  "crc32fast",

@@ -6,3 +6,6 @@
 	path = vendor/phasm-dav1d
 	url = https://github.com/cgaffga/phasm-dav1d.git
 	branch = phasm-stego
+[submodule "vendor/libaom"]
+	path = vendor/libaom
+	url = https://aomedia.googlesource.com/aom

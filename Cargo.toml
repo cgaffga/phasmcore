@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "openh264-sys", "dav1d-sys"]
+members = ["cli", "openh264-sys", "dav1d-sys", "aom-sys"]
 # On the phasmcore mirror (core/ is the repo root) the C codec forks are git
 # submodules under vendor/, inside this workspace's directory. Keep cargo
 # from ever treating anything under vendor/ as part of this workspace. No-op
@@ -8,7 +8,7 @@ exclude = ["vendor"]
 
 [package]
 name = "phasm-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Pure-Rust steganography engine — hide encrypted messages in JPEG photos"
@@ -64,6 +64,11 @@ h264-encoder = ["h264-decoder", "parallel", "simd", "dep:core-openh264-sys"]
 # Patent posture: AV1 royalty-free by AOMedia design. No Via LA
 # equivalent. Can ship enabled in crates.io publishes.
 av1-decoder = ["dep:core-dav1d-sys"]
+# `photo-encoder` fits photo attachments ("photo in photo", `photo::fit`): still-image AV1 through
+# libaom (upstream, vendor/libaom submodule, via core-aom-sys; CMake from tools/fetch_cmake.sh).
+# Showing them (`photo::decode`) needs only `av1-decoder`. Off by default; the mobile bridges turn
+# it on. See docs/design/app/photo-attachments.md.
+photo-encoder = ["dep:core-aom-sys"]
 # `av1-encoder` enables the cgaffga/phasm-rav1e fork (pure-Rust AV1
 # encoder + phasm-stego hooks), patched in from GitHub at a pinned commit
 # (see the `phasm-rav1e` dependency below and BUILDING.md). The dep key
@@ -117,6 +122,7 @@ js-sys = { version = "0.3", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 core-openh264-sys = { path = "openh264-sys", optional = true }
 core-dav1d-sys = { path = "dav1d-sys", optional = true }
+core-aom-sys = { path = "aom-sys", optional = true }
 # `phasm-rav1e` is the cgaffga/phasm-rav1e fork (rav1e + the phasm-stego
 # hooks), consumed from GitHub source only; it is never published to
 # crates.io. The line names the crates.io package `rav1e` so that every

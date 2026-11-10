@@ -250,7 +250,7 @@ unsafe extern "C" fn meta_hook_cb(
 pub fn decode_with_recording(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, true, false, None)
+    decode_with_recording_inner(av1_bytes, true, false, 0, None)
 }
 
 /// Variant of [`decode_with_recording`] that also extracts the last
@@ -265,7 +265,7 @@ pub fn decode_with_recording(
 pub fn decode_with_recording_with_pixels(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, true, true, None)
+    decode_with_recording_inner(av1_bytes, true, true, 0, None)
 }
 
 /// Layout mirror of dav1d's `Dav1dPicture` prefix (through
@@ -338,7 +338,7 @@ pub fn decode_luma_block_grids(
     let mut bad: Option<Av1DecodeError> = None;
     // Pixels only: no symbol recording (it would hold every 50/50 bit of the
     // GOP, ~100 MB at 1080p, for nothing).
-    decode_with_recording_inner(av1_bytes, false, false, Some(&mut |view: &Dav1dPictureView| {
+    decode_with_recording_inner(av1_bytes, false, false, 0, Some(&mut |view: &Dav1dPictureView| {
         if view.p_layout != 1 || view.p_bpc != 8 {
             bad.get_or_insert(Av1DecodeError::UnsupportedPicture { layout: view.p_layout, bpc: view.p_bpc });
             return;
@@ -356,10 +356,69 @@ pub fn decode_luma_block_grids(
     }
 }
 
+/// The planes of a decoded still picture (photo attachments, [`crate::photo`]): `layout` is
+/// dav1d's (0 = mono, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4), the planes are tight (no stride padding),
+/// `u` and `v` empty for mono.
+pub(crate) struct StillPlanes {
+    pub layout: i32,
+    pub width: usize,
+    pub height: usize,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+/// Decode the first picture of `av1_bytes` (an AV1 still image), 8-bit only.
+/// Pictures over `max_pixels` are refused by dav1d itself (`frame_size_limit`), before it allocates
+/// them: the input is someone else's file.
+pub(crate) fn decode_still_planes(av1_bytes: &[u8], max_pixels: u32) -> Result<StillPlanes, Av1DecodeError> {
+    let mut out: Option<StillPlanes> = None;
+    let mut bad: Option<Av1DecodeError> = None;
+    decode_with_recording_inner(av1_bytes, false, false, max_pixels, Some(&mut |view: &Dav1dPictureView| {
+        if out.is_some() || bad.is_some() {
+            return;
+        }
+        let too_big = (view.p_w as i64) * (view.p_h as i64) > max_pixels as i64;
+        if too_big || view.p_bpc != 8 || !(0..=3).contains(&view.p_layout) || view.p_w <= 0 || view.p_h <= 0 {
+            // layout -2: over the size limit
+            let layout = if too_big { -2 } else { view.p_layout };
+            bad = Some(Av1DecodeError::UnsupportedPicture { layout, bpc: view.p_bpc });
+            return;
+        }
+        let (w, h) = (view.p_w as usize, view.p_h as usize);
+        let (cw, ch) = match view.p_layout {
+            1 => (w.div_ceil(2), h.div_ceil(2)),
+            2 => (w.div_ceil(2), h),
+            _ => (w, h),
+        };
+        // SAFETY: the picture is live for the call; dav1d's planes hold the visible
+        // `w` x `h` (luma) and `cw` x `ch` (chroma) samples at these strides.
+        let (y, u, v) = unsafe {
+            let y = copy_plane(view.data[0] as *const u8, view.stride[0], w, h);
+            if view.p_layout == 0 {
+                (y, Vec::new(), Vec::new())
+            } else {
+                (
+                    y,
+                    copy_plane(view.data[1] as *const u8, view.stride[1], cw, ch),
+                    copy_plane(view.data[2] as *const u8, view.stride[1], cw, ch),
+                )
+            }
+        };
+        out = Some(StillPlanes { layout: view.p_layout, width: w, height: h, y, u, v });
+    }))?;
+    if let Some(e) = bad {
+        return Err(e);
+    }
+    out.ok_or(Av1DecodeError::UnsupportedPicture { layout: -1, bpc: 0 })
+}
+
 fn decode_with_recording_inner(
     av1_bytes: &[u8],
     record: bool,
     capture_pixels: bool,
+    // dav1d's `frame_size_limit` (pixels per frame), 0 for none
+    frame_size_limit: u32,
     mut on_picture: Option<&mut dyn FnMut(&Dav1dPictureView)>,
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
     let mut recorder = RecorderState::default();
@@ -380,6 +439,7 @@ fn decode_with_recording_inner(
         dav1d_default_settings(&mut settings);
         settings.n_threads = 1;
         settings.max_frame_delay = 1;
+        settings.frame_size_limit = frame_size_limit;
 
         // Register the recording hook with cookie pointing at our
         // stack-allocated recorder.

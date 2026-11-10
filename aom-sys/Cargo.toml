@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (c) 2026, Christoph Gaffga
+
+[package]
+name = "core-aom-sys"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Still-image AV1 encode through libaom (upstream, vendor/libaom) for Phasm's photo attachments"
+publish = false
+links = "aom"
+
+[lib]
+crate-type = ["rlib"]
+
+[build-dependencies]
+# Compiles shim/phasm_aom.c, the one-call still-image encoder over libaom's API.
+cc = "1"
