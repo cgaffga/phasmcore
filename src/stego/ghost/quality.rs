@@ -24,6 +24,9 @@ pub struct EncodeQuality {
     /// frontends show and share by this, never by a prediction). Always
     /// false for Ghost.
     pub fortress: bool,
+    /// Armor: Fortress TL (the AC-lane payload) was written, rather than
+    /// Fortress T. False for Standard and Ghost.
+    pub fortress_tl: bool,
 }
 
 /// Maximum embedding rate for Ghost stealth scoring.
@@ -136,6 +139,7 @@ pub fn ghost_stealth_score(m: &GhostMetrics) -> EncodeQuality {
         hint_key: hint_key.to_string(),
         mode: 1,
         fortress: false,
+        fortress_tl: false,
     }
 }
 
@@ -233,6 +237,7 @@ pub fn armor_robustness_score(m: &ArmorMetrics) -> EncodeQuality {
         hint_key: hint_key.to_string(),
         mode: 2,
         fortress: m.fortress,
+        fortress_tl: false,
     }
 }
 

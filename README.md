@@ -81,7 +81,7 @@ Use `deep_cover_jpeg` to write the cover, then pass the same pixels to `ghost_en
 
 ### Armor (Robust)
 
-Optimizes for **survivability**. Uses Spread Transform Dither Modulation (STDM) to embed bits into stable low-frequency DCT coefficients, protected by [adaptive Reed-Solomon ECC](https://phasm.app/blog/surviving-jpeg-recompression) with [soft-decision decoding via log-likelihood ratios](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes). A [DFT magnitude template](https://phasm.app/blog/dft-template-geometric-resilience-steganography) provides geometric synchronization against rotation, scaling, and cropping.
+Optimizes for **survivability**. A message that fits goes to **Fortress** (below), which also survives crops, rotation and rescaling. Longer messages use Spread Transform Dither Modulation (STDM, "Standard") on stable low-frequency DCT coefficients, protected by [adaptive Reed-Solomon ECC](https://phasm.app/blog/surviving-jpeg-recompression) with [soft-decision decoding via log-likelihood ratios](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes): it survives recompression and a messenger's resize, but not crops or rotation.
 
 Armor is the **default mode** on all platforms.
 
@@ -89,29 +89,32 @@ Armor's robustness depends on the cover: it survives recompression and resizing 
 
 #### Fortress Sub-Mode
 
-For short messages, Armor automatically activates **Fortress** — a [BA-QIM (Block-Average Quantization Index Modulation)](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) scheme that embeds one bit per 8x8 block into the block-average brightness. Fortress exploits [three invariants of JPEG recompression](https://phasm.app/blog/jpeg-recompression-invariants) — block averages, brightness ordering, and coefficient signs — that persist even through aggressive re-encoding.
+For messages that fit, Armor writes **Fortress**, a K7 convolutional code on a keyed tile of 128 x 128 blocks with pilot blocks, a header and a key-free checkerboard sync pattern. The decoder needs neither the image size nor the crop offset, so Fortress survives crops at any offset, rotation within ±10° of any quarter turn, mirroring, rescaling (0.4-2.6x) and Instagram's 4:5 crop, on top of messenger recompression (WhatsApp, Telegram, Instagram). It exploits [three invariants of JPEG recompression](https://phasm.app/blog/jpeg-recompression-invariants). Two payloads share that layout:
 
-Fortress survives WhatsApp recompression (QF ~62, resolution resize to 1600px). See [how 15 messaging platforms process your photos](https://phasm.app/blog/how-15-platforms-process-your-photos) for a comprehensive platform analysis.
+- **Fortress T** (short messages, about 560 B at 1600 px): [BA-QIM (Block-Average Quantization Index Modulation)](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) on the 8x8 block averages, with [Watson perceptual masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography). Shorter messages survive smaller crop pieces (down to strips 192 px wide). It uses every block, so smooth areas (sky, water) can show a faint 8x8 block pattern.
+- **Fortress TL** (longer messages, up to about 1-1.5 KB at 1600 px when the cover has texture): QIM on the five lowest AC coefficients of textured blocks only. Flat areas keep only the pilots, the header and the sync pattern.
 
-[Watson perceptual masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) adapts the embedding strength per-block based on local texture energy, keeping modifications invisible in textured regions while protecting smooth areas.
+By default a message takes Fortress T when it fits, else Fortress TL, else STDM. `armor_encode_with_fortress_tl` (CLI: `--fortress auto|t|tl`) chooses: `EncodePreference::Forced` writes Fortress TL whenever the cover holds the message, `Never` keeps to Fortress T. Measured on 48 photos with short messages, Fortress TL showed about 85 % fewer visible block steps in flat areas and much better survival of heavy crops (from about 80 characters on), slightly more misses after a 0.5x downscale, some ringing next to edges, and it cannot hold longer messages on very flat covers. Every decoder since core 0.6 reads both: the header carries the format.
+
+See [how 15 messaging platforms process your photos](https://phasm.app/blog/how-15-platforms-process-your-photos) for a platform analysis.
 
 ### Decode Auto-Detection
 
-`smart_decode` tries all modes automatically — Ghost primary (v3, then v1) → Ghost shadow → Armor → Fortress — no mode selector needed on the decode side.
+`smart_decode` tries all modes automatically — Ghost primary (v3.1, v3, v1) → Ghost shadow → Armor (Fortress on the received block grid, STDM, then the grid sync for rotated, rescaled or cropped images, legacy STDM, a rescaled decode) — no mode selector needed on the decode side.
 
 ### Which Mode Should I Use?
 
 | | Ghost | Armor | Fortress |
 |---|---|---|---|
 | **Goal** | Undetectable | Survives recompression | Survives WhatsApp |
-| **Algorithm** | J-UNIWARD + ternary STC | STDM + Reed-Solomon | BA-QIM + Watson masking |
+| **Algorithm** | J-UNIWARD + ternary STC | STDM + Reed-Solomon | Tiled QIM + convolutional code (T: block averages, TL: AC lanes of textured blocks) |
 | **Best for** | Direct sharing, AirDrop, email, "send as file" | Social media, cloud storage, cross-platform | WhatsApp, messaging apps with aggressive compression |
 | **Capacity** | High (12 MP photo: ~2.6 KB comfort band, ~96 KB max) | Medium | Low (short messages only) |
 | **Resists detection** | Yes (steganalysis-resistant) | Moderate | Moderate |
-| **Resists recompression** | No | Yes (>95% at mild QF drop) | Yes (survives QF ~62) |
+| **Resists recompression** | No | Yes (>95% at mild QF drop) | Yes (survives QF ~62), plus crops, rotation, rescaling |
 | **Plausible deniability** | Yes (shadow messages) | No | No |
 | **File attachments** | Yes (up to 2 MB) | No | No |
-| **Activation** | `--mode ghost` | Default | Auto (short messages in Armor) |
+| **Activation** | `--mode ghost` | Default | Auto (messages that fit, in Armor); `--fortress t\|tl` to choose |
 
 **Rule of thumb:** If the image stays intact → Ghost. If it gets recompressed → Armor. If it goes through WhatsApp → Fortress auto-activates.
 
@@ -225,6 +228,8 @@ DEEP_COVER_DEFAULT_QUALITY = 92
 // Armor mode (robust)
 armor_encode(jpeg_bytes, message, passphrase) -> Result<Vec<u8>>
 armor_encode_with_quality(jpeg_bytes, message, passphrase) -> Result<(Vec<u8>, EncodeQuality)>
+armor_encode_with_options(jpeg_bytes, message, passphrase, force_standard) -> Result<(Vec<u8>, EncodeQuality)>  // the apps' "Standard" switch
+armor_encode_with_fortress_tl(jpeg_bytes, message, passphrase, EncodePreference) -> Result<(Vec<u8>, EncodeQuality)>  // Fortress T or TL
 armor_decode(jpeg_bytes, passphrase) -> Result<(PayloadData, DecodeQuality)>
 armor_capacity(jpeg_image) -> Result<usize>
 armor_capacity_info(jpeg_bytes) -> Result<ArmorCapacityInfo>
@@ -252,7 +257,8 @@ progress::check_cancelled() -> Result<()> // returns Err(Cancelled) if set
 - **`PayloadData`** — decoded message text + optional file attachments
 - **`FileEntry`** — file attachment (filename + content bytes)
 - **`ShadowLayer`** — shadow message for plausible deniability (message + passphrase + optional files)
-- **`EncodeQuality`** — encode-time score (0-100), contextual hint key, mode (stealth for Ghost, robustness for Armor)
+- **`EncodeQuality`** — encode-time score (0-100), contextual hint key, mode (stealth for Ghost, robustness for Armor), and what Armor wrote (`fortress`, `fortress_tl`)
+- **`EncodePreference`** — Fortress TL for `armor_encode_with_fortress_tl`: `ByFrameSize` (default: Fortress T when it fits, else TL), `Forced` (TL or `MessageTooLarge`), `Never` (Fortress T, else STDM)
 - **`DecodeQuality`** — signal integrity percentage, RS error count/capacity, fortress flag
 - **`GhostBands`** — Ghost capacity-bar bands in plaintext bytes (`max_bytes`, `comfort_bytes`, `caution_bytes`)
 - **`ArmorCapacityInfo`** — capacity breakdown by encoding tier (Phase 1/2/3, Fortress)
@@ -422,6 +428,12 @@ phasm encode photo.jpg --mode ghost -m "real" -p "main" --shadow-message-2 "deco
 # File attachments
 phasm encode photo.jpg --mode ghost -m "see attached" -p "pass" --attach plans.pdf
 
+# Armor sized for a channel: standard (1600 px: WhatsApp, Signal, e-mail), telegram, instagram
+phasm encode photo.jpg -m "hello" -p "pass" --armor-preset instagram
+
+# Armor: Fortress TL even for a short message (no block pattern in skies; needs texture)
+phasm encode photo.jpg -m "hello" -p "pass" --fortress tl
+
 # Decode (auto-detects mode)
 phasm decode stego.jpg -p "passphrase"
 
@@ -492,7 +504,7 @@ All payloads are encrypted before embedding:
 - **Key derivation**: Argon2id (RFC 9106) — two tiers:
   - *Structural key* (deterministic from passphrase + fixed salt): drives coefficient permutation and STC matrix generation
   - *Encryption key* (passphrase + random salt): AES-256-GCM-SIV (RFC 8452) with nonce-misuse resistance
-- **PRNG**: ChaCha20 for all key-derived randomness (permutations, spreading vectors, template peaks)
+- **PRNG**: ChaCha20 for all key-derived randomness (permutations, spreading vectors, Fortress tile keys)
 - **Payload compression**: Brotli (RFC 7932) for compact payloads; flags byte indicates compression
 
 ### Ghost Pipeline
@@ -554,13 +566,11 @@ Capacity estimation is instantaneous: the capacity policy is stated in frame bit
 
 ### Armor Pipeline
 
-1. Parse JPEG, derive structural keys
-2. Compute stability map (select low-frequency AC coefficients)
-3. Encrypt and frame payload with adaptive RS parity
-4. Embed via STDM with spreading vectors (ChaCha20-derived)
-5. For short messages: activate Fortress ([BA-QIM](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) on block averages with [Watson masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography))
-6. Embed [DFT magnitude template](https://phasm.app/blog/dft-template-geometric-resilience-steganography) for geometric resilience
-7. Decode: three-phase parallel sweep with [soft-decision concatenated codes](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes)
+1. The cover: at most 1600 px (1280 for Telegram, 1080 wide for Instagram), re-encoded at QF65 (`build_cover`; the apps and the CLI do this, library callers prepare it)
+2. Encrypt and frame the payload
+3. If Fortress holds it: pre-settle to QF75, then Fortress T ([BA-QIM](https://phasm.app/blog/watson-perceptual-masking-qim-steganography) on block averages with [Watson masking](https://phasm.app/blog/watson-perceptual-masking-qim-steganography)) or Fortress TL (QIM on 5 AC lanes of textured blocks), K7 convolutional code, on the keyed 128-block tile with pilots, a 9-bit header and the checkerboard sync pattern
+4. Otherwise STDM: stable low-frequency coefficients, spreading vectors (ChaCha20-derived), adaptive RS parity
+5. Decode: Fortress on the received grid, STDM, then the grid sync (affine map from the checkerboard, tile offset from the pilots) for rotated, rescaled or cropped images, with [soft-decision decoding](https://phasm.app/blog/soft-majority-voting-llr-concatenated-codes)
 
 ### Progress Reporting
 
@@ -631,7 +641,7 @@ src/
       hhat.rs       H-hat submatrix generation (ChaCha20-derived)
     armor/
       mod.rs        Armor mode re-exports
-      pipeline.rs   Armor encode/decode (STDM + Fortress + DFT template)
+      pipeline.rs   Armor encode/decode (STDM + Fortress T / TL)
       embedding.rs  STDM embed/extract with adaptive delta
       selection.rs  Coefficient stability map
       spreading.rs  ChaCha20-derived spreading vectors
@@ -639,10 +649,12 @@ src/
       repetition.rs Repetition coding with soft majority voting
       capacity.rs   Armor capacity estimation
       fortress.rs   BA-QIM block-average embedding + Watson masking
-      template.rs   DFT magnitude template (geometric resilience)
-      dft_payload.rs DFT ring-based payload embedding
+      fortress_tile.rs Fortress T: keyed tile, pilots, header, sync pattern, geometric decode
+      fortress_tl.rs Fortress TL: the AC-lane payload of textured blocks
+      gridsync.rs   Checkerboard grid sync (rotation, rescale, crop offset)
+      convcode.rs   K7 convolutional code + Viterbi
+      cover_dims.rs Armor cover sizes per channel
       fft2d.rs      2D FFT (Cooley-Tukey + Bluestein)
-      resample.rs   Bilinear resampling for geometric correction
 cli/                Command-line interface (phasm binary)
 openh264-sys/       OpenH264 fork build + FFI (h264-encoder)
 dav1d-sys/          dav1d fork build + FFI (AV1)
@@ -666,7 +678,7 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 - [Perceptual Masking Meets QIM: Adaptive Embedding Strength for Invisible Robust Steganography](https://phasm.app/blog/watson-perceptual-masking-qim-steganography)
 
 ### Geometric Resilience
-- [Fourier-Domain Template Embedding: How Phasm Survives Rotation, Scaling, and Cropping](https://phasm.app/blog/dft-template-geometric-resilience-steganography)
+- [Fourier-Domain Template Embedding: How Phasm Survives Rotation, Scaling, and Cropping](https://phasm.app/blog/dft-template-geometric-resilience-steganography) (the approach of core 0.5 and earlier; Fortress's tiled layout replaced it)
 
 ### Plausible Deniability
 - [Shadow Messages: How Phasm Hides Multiple Secrets in a Single Photo](https://phasm.app/blog/shadow-messages-plausible-deniability-steganography)
@@ -693,7 +705,7 @@ The algorithms in phasm-core are documented in detail on the [Phasm blog](https:
 | **Plausible deniability** | Yes (shadow messages) | No | No | No |
 | **Side-informed mode** | Yes (SI-UNIWARD with exact side information, +25% capacity) | No | No | No |
 | **File attachments** | Yes (Ghost, up to 2 MB) | No | Yes | No |
-| **Geometric resilience** | Yes (DFT template) | No | No | No |
+| **Geometric resilience** | Yes (Fortress: tiled layout, pilots, sync pattern) | No | No | No |
 | **Platforms** | iOS, Android, Web (WASM), CLI | Desktop (Java) | Linux / Windows CLI | Java |
 | **Web (no install)** | Yes (WebAssembly) | No | No | No |
 | **Image format** | JPEG (any input auto-converted) | PNG, BMP | JPEG, BMP, WAV, AU | JPEG |

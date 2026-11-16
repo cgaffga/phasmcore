@@ -43,7 +43,7 @@ pub use stego::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encod
 pub use stego::{ghost_encode_with_quality, ghost_encode_with_files_quality, ghost_encode_si_with_quality, ghost_encode_si_with_files_quality};
 pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_shadow_decode, ShadowLayer, GHOST_ENCODE_WITH_SHADOWS_STEPS, shadow_capacity, estimate_shadow_capacity, estimate_shadow_capacity_si, ghost_capacity_with_shadows, ghost_bands, ghost_bands_si, ghost_bands_and_shadow_capacity, GhostBands};
 pub use stego::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
-pub use stego::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo};
+pub use stego::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_encode_with_fortress_tl, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo, EncodePreference};
 pub use stego::EncodeQuality;
 pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET};
 pub use stego::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};

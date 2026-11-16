@@ -58,8 +58,15 @@ pub fn print_encode_result(
         OutputMode::Json => {
             let dc = if deep_cover { "true" } else { "false" };
             let kept: Vec<String> = kept_metadata.iter().map(|k| format!("\"{}\"", json_escape(k))).collect();
+            // Armor: which sub-mode core wrote ("fortress": "T" / "TL", null = Standard).
+            let fortress = match (quality.mode, quality.fortress, quality.fortress_tl) {
+                (2, true, true) => ",\"fortress\":\"TL\"",
+                (2, true, false) => ",\"fortress\":\"T\"",
+                (2, false, _) => ",\"fortress\":null",
+                _ => "",
+            };
             println!(
-                "{{\"output\":\"{}\",\"mode\":\"{}\",\"deepCover\":{},\"score\":{},\"hint\":\"{}\",\"width\":{},\"height\":{},\"sourceWidth\":{},\"sourceHeight\":{},\"keptMetadata\":[{}]}}",
+                "{{\"output\":\"{}\",\"mode\":\"{}\"{fortress},\"deepCover\":{},\"score\":{},\"hint\":\"{}\",\"width\":{},\"height\":{},\"sourceWidth\":{},\"sourceHeight\":{},\"keptMetadata\":[{}]}}",
                 json_escape(output_path),
                 json_escape(mode_name),
                 dc,
@@ -73,7 +80,7 @@ pub fn print_encode_result(
             );
         }
         OutputMode::Verbose => {
-            let dc_label = if deep_cover { " (Deep Cover)" } else { "" };
+            let dc_label = if deep_cover { " (Deep Cover)" } else { armor_label(quality) };
             println!("Encoded: {output_path}");
             println!("Mode: {mode_name}{dc_label}");
             if let Some(c) = cover.summary() {
@@ -85,7 +92,7 @@ pub fn print_encode_result(
             println!("Time: {:.1}s", elapsed.as_secs_f64());
         }
         OutputMode::Default => {
-            let dc_label = if deep_cover { " (Deep Cover)" } else { "" };
+            let dc_label = if deep_cover { " (Deep Cover)" } else { armor_label(quality) };
             println!("Encoded: {output_path}");
             println!("Mode: {mode_name}{dc_label}");
             if let Some(c) = cover.summary() {
@@ -272,6 +279,16 @@ pub fn print_video_encode_result(
 // ── Video capacity output ──
 
 // ── Helpers ──
+
+/// The Armor sub-mode core wrote, for the text output.
+fn armor_label(q: &EncodeQuality) -> &'static str {
+    match (q.mode, q.fortress, q.fortress_tl) {
+        (2, true, true) => " (Fortress TL)",
+        (2, true, false) => " (Fortress T)",
+        (2, false, _) => " (Standard)",
+        _ => "",
+    }
+}
 
 fn score_word(score: u8) -> &'static str {
     match score {

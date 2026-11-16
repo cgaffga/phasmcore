@@ -12,8 +12,8 @@
 //! the encoder itself removes them) and never rescued an image
 //! (eval/runs/2026-11-02-armor-geometry/RESULTS.md).
 
-use phasm_core::stego::armor::pipeline::{armor_encode_opts, ArmorEncodeOpts};
-use phasm_core::{armor_decode, armor_encode, deep_cover_jpeg};
+use phasm_core::stego::armor::pipeline::{armor_encode_opts, ArmorEncodeInfo, ArmorEncodeOpts};
+use phasm_core::{armor_decode, armor_encode, armor_encode_with_fortress_tl, deep_cover_jpeg, EncodePreference, StegoError};
 
 fn rgb_of(jpeg: &[u8]) -> (Vec<u8>, u32, u32) {
     let img = image::load_from_memory(jpeg).unwrap().to_rgb8();
@@ -461,4 +461,158 @@ fn fortress_padding_blocks_follow_libjpeg() {
     assert!(info.fortress);
     assert_eq!(padding_rule_violations(&stego), (n, 0));
     assert_eq!(armor_decode(&stego, "pw").unwrap().0.text, "padding stays libjpeg");
+}
+
+// --- EncodePreference for Fortress TL (`ArmorEncodeOpts::fortress_tl`) ---
+
+/// Encode with Fortress TL set to `pref`; the rest is the production encoder.
+fn encode_tl(
+    cover: &[u8],
+    message: &str,
+    pref: EncodePreference,
+) -> Result<(Vec<u8>, ArmorEncodeInfo), StegoError> {
+    let opts = ArmorEncodeOpts { fortress_tl: pref, ..ArmorEncodeOpts::default() };
+    armor_encode_opts(cover, message, "pw", &opts)
+}
+
+/// A 1280 x 960 cover with a smooth gradient: no block has the directional
+/// activity Fortress TL needs, while Fortress T (block averages) is unaffected.
+fn flat_cover() -> Vec<u8> {
+    let (w, h) = (1280u32, 960u32);
+    let px: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (60 + x * 120 / w + y * 20 / h) as u8))
+        .flat_map(|g| [g, g, g])
+        .collect();
+    deep_cover_jpeg(&px, w, h, 65).unwrap()
+}
+
+fn assert_decodes(stego: &[u8], message: &str, what: &str) {
+    let r = armor_decode(stego, "pw");
+    assert!(matches!(&r, Ok((p, _)) if p.text == message), "{what}: {:?}", r.as_ref().err());
+}
+
+/// Forced puts a message Fortress T would take on the AC lanes instead, and
+/// it still survives the geometry Fortress TL is built for.
+#[test]
+fn forced_tl_takes_a_short_message_and_survives_geometry() {
+    let cover = textured_cover();
+    let msg = "short";
+    let (_, auto) = encode_tl(&cover, msg, EncodePreference::ByFrameSize).unwrap();
+    assert!(auto.fortress && !auto.fortress_tl, "by frame size, a short message takes Fortress T");
+    let (st, info) = encode_tl(&cover, msg, EncodePreference::Forced).unwrap();
+    assert!(info.fortress && info.fortress_tl, "forced, it takes Fortress TL");
+    let (px, w, h) = rgb_of(&st);
+    assert_decodes(&st, msg, "untouched");
+    assert_decodes(&jpeg(&px, w, h, 75), msg, "re-save q75");
+    assert_decodes(&jpeg(&rotate(&px, w, h, 3.0), w, h, 85), msg, "rotate 3 deg");
+    assert_decodes(&jpeg(&crop(&px, w, 37, 21, w - 200, h - 150), w - 200, h - 150, 85), msg, "crop at (37, 21)");
+    let (sw, sh) = (w * 3 / 4, h * 3 / 4);
+    assert_decodes(&jpeg(&phasm_core::resample_rgb(&px, w, h, sw, sh).unwrap(), sw, sh, 85), msg, "rescale 0.75");
+    let (t, tw, th) = turn(&px, w, h, 1, true);
+    assert_decodes(&jpeg(&t, tw, th, 85), msg, "1 quarter turn, mirror");
+}
+
+/// On a cover without texture Fortress TL holds nothing: Forced fails even
+/// for a short message, where the default takes Fortress T.
+#[test]
+fn forced_tl_fails_on_a_flat_cover() {
+    let cover = flat_cover();
+    let msg = "hi";
+    assert!(matches!(encode_tl(&cover, msg, EncodePreference::Forced), Err(StegoError::MessageTooLarge)));
+    let (st, info) = encode_tl(&cover, msg, EncodePreference::ByFrameSize).unwrap();
+    assert!(info.fortress && !info.fortress_tl, "by frame size, Fortress T takes it");
+    assert_decodes(&st, msg, "Fortress T on the flat cover");
+}
+
+/// Beyond the Fortress TL capacity, Forced fails rather than falling back to
+/// STDM, which the default does.
+#[test]
+fn forced_tl_beyond_its_capacity_fails_instead_of_using_stdm() {
+    let cover = textured_cover();
+    let (_, cap) = t_and_fortress_caps(&cover);
+    let msg = text_of_payload(cap + 40, 13);
+    assert!(phasm_core::stego::payload::compressed_payload_size(&msg, &[]) > cap);
+    assert!(matches!(encode_tl(&cover, &msg, EncodePreference::Forced), Err(StegoError::MessageTooLarge)));
+    let (st, info) = encode_tl(&cover, &msg, EncodePreference::ByFrameSize).unwrap();
+    assert!(!info.fortress, "by frame size, the message goes to STDM");
+    assert_decodes(&st, &msg, "STDM");
+}
+
+/// Never keeps a message between the two capacities off Fortress TL; it goes
+/// to STDM.
+#[test]
+fn never_tl_sends_a_message_between_the_capacities_to_stdm() {
+    let cover = textured_cover();
+    let (t_cap, cap) = t_and_fortress_caps(&cover);
+    let msg = text_of_payload((t_cap + cap) / 2, 7);
+    let (_, auto) = encode_tl(&cover, &msg, EncodePreference::ByFrameSize).unwrap();
+    assert!(auto.fortress && auto.fortress_tl, "by frame size, the message takes Fortress TL");
+    let (st, info) = encode_tl(&cover, &msg, EncodePreference::Never).unwrap();
+    assert!(!info.fortress && !info.fortress_tl, "never TL: STDM");
+    assert_decodes(&st, &msg, "STDM");
+}
+
+/// Documented: `force_stdm` wins over Forced.
+#[test]
+fn forced_tl_with_force_stdm_writes_stdm() {
+    let opts = ArmorEncodeOpts { fortress_tl: EncodePreference::Forced, force_stdm: true, ..ArmorEncodeOpts::default() };
+    let (st, info) = armor_encode_opts(&textured_cover(), "short", "pw", &opts).unwrap();
+    assert!(!info.fortress && !info.fortress_tl);
+    assert_decodes(&st, "short", "STDM");
+}
+
+/// Documented: without the tiled layout Forced cannot select Fortress TL. A
+/// message that fits Fortress CC (or the original Fortress) is written there;
+/// one that does not fails rather than falling back to STDM.
+#[test]
+fn forced_tl_without_the_tiled_layout() {
+    use phasm_core::stego::armor::fortress::{fortress_cc_max_frame_bytes, fortress_max_frame_bytes, FortressCcParams};
+    let cover = textured_cover();
+    let img = phasm_core::JpegImage::from_bytes(&cover).unwrap();
+    let stdm_cap = phasm_core::armor_capacity_info(&cover).unwrap().stdm_capacity;
+    for fortress_cc in [Some(FortressCcParams::default()), None] {
+        let max_frame = match &fortress_cc {
+            Some(prm) => fortress_cc_max_frame_bytes(&img, prm),
+            None => fortress_max_frame_bytes(&img).unwrap(),
+        };
+        let what = if fortress_cc.is_some() { "Fortress CC" } else { "original Fortress" };
+        let opts = ArmorEncodeOpts {
+            fortress_tl: EncodePreference::Forced,
+            fortress_tiled: false,
+            fortress_cc,
+            ..ArmorEncodeOpts::default()
+        };
+        let (st, info) = armor_encode_opts(&cover, "short", "pw", &opts).unwrap();
+        assert!(info.fortress && !info.fortress_tl, "{what}: a short message takes it, not TL");
+        assert_decodes(&st, "short", what);
+
+        // The payload alone exceeds the frame capacity; STDM could still take it.
+        let long = text_of_payload(max_frame + 40, 17);
+        assert!(phasm_core::stego::payload::compressed_payload_size(&long, &[]) < stdm_cap);
+        let r = armor_encode_opts(&cover, &long, "pw", &opts);
+        assert!(matches!(r, Err(StegoError::MessageTooLarge)), "{what}: too long fails, not STDM");
+    }
+}
+
+/// The public `armor_encode_with_fortress_tl`: Forced writes Fortress TL, also
+/// with the compact frame of an empty passphrase, and the quality reports
+/// Fortress; Never keeps the short message on Fortress T.
+#[test]
+fn armor_encode_with_fortress_tl_public_api() {
+    let cover = textured_cover();
+    let msg = "Meet at the old bridge at seven.";
+    for pass in ["pw", ""] {
+        let (st, q) = armor_encode_with_fortress_tl(&cover, msg, pass, EncodePreference::Forced).unwrap();
+        assert!(q.fortress, "{pass:?}: the quality reports Fortress");
+        let tl = armor_encode_opts(&cover, msg, pass, &ArmorEncodeOpts { fortress_tl: EncodePreference::Forced, ..ArmorEncodeOpts::default() }).unwrap();
+        assert!(tl.1.fortress_tl, "{pass:?}: Forced writes Fortress TL");
+        let (px, w, h) = rgb_of(&st);
+        for (what, b) in [("untouched", st.clone()), ("re-save q75", jpeg(&px, w, h, 75)), ("rotate 2 deg", jpeg(&rotate(&px, w, h, 2.0), w, h, 85))] {
+            let r = armor_decode(&b, pass);
+            assert!(matches!(&r, Ok((p, _)) if p.text == msg), "{pass:?} {what}: {:?}", r.as_ref().err());
+        }
+    }
+    let (st, q) = armor_encode_with_fortress_tl(&cover, msg, "pw", EncodePreference::Never).unwrap();
+    assert!(q.fortress);
+    assert!(matches!(armor_decode(&st, "pw"), Ok((p, _)) if p.text == msg));
 }

@@ -9,9 +9,10 @@ use crate::passphrase::get_passphrase;
 use crate::progress::spawn_progress_bar;
 use phasm_core::{
     compressed_payload_size, ghost_bands, ghost_bands_si, ghost_encode_si_with_shadows_quality,
-    ghost_encode_with_shadows_quality, armor_encode_with_quality,
+    ghost_encode_with_shadows_quality,
     ghost_encode_si_with_files_quality, ghost_encode_with_files_quality,
-    EncodeQuality, FileEntry, JpegImage, ShadowLayer, StegoError, ARMOR_TARGET_DIMENSION,
+    armor_encode_with_fortress_tl, EncodePreference, EncodeQuality, FileEntry, JpegImage, ShadowLayer,
+    StegoError, ARMOR_TARGET_DIMENSION,
 };
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -99,6 +100,16 @@ pub struct EncodeArgs {
           conflicts_with_all = ["resize", "full_res"])]
     pub armor_preset: phasm_core::ArmorCoverPreset,
 
+    /// Armor: which Fortress carries the message: auto (Fortress T when the
+    /// message fits it, else Fortress TL, else Standard, as the apps do), t
+    /// (never Fortress TL: Fortress T, block means, survives the smallest
+    /// crops; a message longer than Fortress T holds goes to Standard) or tl
+    /// (Fortress TL only: textured blocks, keeps skies and other flat areas
+    /// free of a block pattern; fails when the image cannot hold the message
+    /// that way)
+    #[arg(long, value_parser = parse_fortress, default_value = "auto")]
+    pub fortress: EncodePreference,
+
     /// Strip the metadata, like the apps' magic wand: a JPEG that is used as
     /// it is gets cleaned losslessly (EXIF orientation applied); a cover
     /// phasm writes gets none. Without it the output keeps the source's
@@ -149,6 +160,9 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
 
     if args.full_res && mode != "armor" {
         return Err(CliError::InvalidArgs("--full-res applies to Armor only.".into()));
+    }
+    if args.fortress != EncodePreference::ByFrameSize && mode != "armor" {
+        return Err(CliError::InvalidArgs("--fortress applies to Armor only.".into()));
     }
     if args.qf.is_some() && mode == "armor" {
         return Err(CliError::InvalidArgs(
@@ -239,6 +253,7 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
             &files,
             &passphrase,
             &shadows,
+            args.fortress,
         );
         match result {
             Err(CliError::Stego(StegoError::MessageTooLarge)) if attempt < attempts => {
@@ -410,6 +425,7 @@ fn do_encode(
     files: &[FileEntry],
     passphrase: &str,
     shadows: &[ShadowLayer],
+    fortress: EncodePreference,
 ) -> Result<(Vec<u8>, EncodeQuality), CliError> {
     let has_shadows = !shadows.is_empty();
     let has_si = raw_pixels.is_some();
@@ -451,8 +467,12 @@ fn do_encode(
                     "File attachments are only supported in Ghost mode.".into(),
                 ));
             }
-            let (bytes, q) = armor_encode_with_quality(jpeg_bytes, message, passphrase)?;
-            Ok((bytes, q))
+            match armor_encode_with_fortress_tl(jpeg_bytes, message, passphrase, fortress) {
+                Err(StegoError::MessageTooLarge) if fortress == EncodePreference::Forced => {
+                    Err(CliError::FortressTlTooLarge)
+                }
+                r => Ok(r?),
+            }
         }
     }
 }
@@ -494,5 +514,15 @@ fn output_mode(args: &EncodeArgs) -> OutputMode {
         OutputMode::Verbose
     } else {
         OutputMode::Default
+    }
+}
+
+/// `--fortress`: auto, t or tl.
+fn parse_fortress(s: &str) -> Result<EncodePreference, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(EncodePreference::ByFrameSize),
+        "t" => Ok(EncodePreference::Never),
+        "tl" => Ok(EncodePreference::Forced),
+        other => Err(format!("unknown Fortress choice {other}: use auto, t or tl")),
     }
 }

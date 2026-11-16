@@ -21,6 +21,8 @@ pub enum CliError {
     ImageLoad(image::ImageError),
     UnsupportedFormat(String),
     InvalidArgs(String),
+    /// `--fortress tl` and the image's Fortress TL capacity cannot hold the message.
+    FortressTlTooLarge,
     NoMessage,
     PassphraseMismatch,
 }
@@ -30,7 +32,7 @@ impl CliError {
         match self {
             CliError::Io(_) => EXIT_GENERAL,
             CliError::Stego(StegoError::DecryptionFailed) => EXIT_WRONG_PASSPHRASE,
-            CliError::Stego(StegoError::MessageTooLarge) => EXIT_MESSAGE_TOO_LARGE,
+            CliError::Stego(StegoError::MessageTooLarge) | CliError::FortressTlTooLarge => EXIT_MESSAGE_TOO_LARGE,
             CliError::Stego(_) => EXIT_STEGO,
             CliError::ImageLoad(_) => EXIT_GENERAL,
             CliError::UnsupportedFormat(_) => EXIT_UNSUPPORTED_FORMAT,
@@ -64,6 +66,12 @@ impl fmt::Display for CliError {
                 write!(f, "Unsupported image format: {ext}. Convert to JPEG/PNG/WebP/BMP/TIFF/GIF first.")
             }
             CliError::InvalidArgs(msg) => write!(f, "{msg}"),
+            CliError::FortressTlTooLarge => write!(
+                f,
+                "Fortress TL cannot hold this message on this image: it writes only into textured areas, \
+                 so a small or flat image holds less (use a shorter message, a larger or busier image, \
+                 or --fortress auto)"
+            ),
             CliError::NoMessage => {
                 write!(f, "No message provided. Use -m <text> or pipe via stdin.")
             }

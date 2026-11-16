@@ -110,7 +110,7 @@ pub use capacity::estimate_capacity_si as ghost_capacity_si;
 pub use ghost::deep_cover::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use capacity::estimate_capacity_with_shadows as ghost_capacity_with_shadows;
 pub use capacity::{ghost_bands, ghost_bands_si, ghost_bands_and_shadow_capacity, GhostBands};
-pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_decode, DecodeQuality, ArmorCapacityInfo, armor_capacity_info};
+pub use armor::pipeline::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_encode_with_fortress_tl, armor_decode, DecodeQuality, ArmorCapacityInfo, EncodePreference, armor_capacity_info};
 pub use armor::capacity::estimate_armor_capacity as armor_capacity;
 pub use armor::cover_dims::{armor_cover_dimensions, ArmorCoverDims, ArmorCoverPreset, ARMOR_COVER_STEP};
 pub use payload::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
