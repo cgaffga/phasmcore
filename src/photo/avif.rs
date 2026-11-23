@@ -6,9 +6,11 @@
 //!
 //! Written: one AV1 image item, the boxes libavif writes for a plain still image (`ftyp`; `meta` with
 //! `hdlr`, `pitm`, `iloc`, `iinf`/`infe`, `iprp` holding `ispe`, `pixi`, `av1C`, `colr` nclx; `mdat`), no
-//! metadata. Read: the primary item of any single-image AVIF whose data is one `av01` item (no grids,
-//! no alpha handling); anything else is [`PhotoError::UnsupportedAvif`] and the apps show the file as
-//! a plain attachment.
+//! metadata. Read: the primary item of any single-image AVIF (brand `avif`, or `avis` for its still)
+//! whose data is one `av01` item (no grids, no alpha handling); anything else is
+//! [`PhotoError::UnsupportedAvif`] and the apps show the file as a plain attachment (or, for a cover,
+//! decode it with the platform). Transforms (`irot` / `imir` / `clap`), an ICC profile and a bit depth
+//! over 8 are reported, not applied: [`crate::photo::decode::decode_avif_rgb`] refuses them.
 
 use super::PhotoError;
 
@@ -31,6 +33,14 @@ pub struct AvifImage {
     pub width: u32,
     pub height: u32,
     pub nclx: Option<Nclx>,
+    /// A `colr` ICC profile (`prof` / `rICC`) is attached: the samples are not plain sRGB as far
+    /// as this reader knows.
+    pub icc: bool,
+    /// A transformative property (`irot`, `imir`, `clap`) is attached: the stored picture is not
+    /// the picture as shown, and this reader does not apply it.
+    pub transformed: bool,
+    /// `av1C` says more than 8 bits per sample.
+    pub high_bit_depth: bool,
     pub av1: Vec<u8>,
 }
 
@@ -196,6 +206,12 @@ fn full(ty: &[u8; 4], version: u8, flags: u32, body: &[u8]) -> Vec<u8> {
 /// Wrap the AV1 output of the encoder (8-bit 4:2:0, `width` x `height`) in an AVIF file. The
 /// temporal delimiter is dropped; the sequence header goes into `av1C` and stays in the item data.
 pub fn write_avif(av1: &[u8], width: u32, height: u32, nclx: Nclx) -> Result<Vec<u8>, PhotoError> {
+    write_avif_with(av1, width, height, nclx, &[])
+}
+
+/// [`write_avif`] with more properties (whole boxes) associated with the item, for the reader's
+/// tests.
+fn write_avif_with(av1: &[u8], width: u32, height: u32, nclx: Nclx, extra: &[Vec<u8>]) -> Result<Vec<u8>, PhotoError> {
     let units = obus(av1)?;
     let seq = units
         .iter()
@@ -239,9 +255,11 @@ pub fn write_avif(av1: &[u8], width: u32, height: u32, nclx: Nclx) -> Result<Vec
         b.push(if nclx.full_range { 0x80 } else { 0 });
         bx(b"colr", &b)
     };
-    let ipco = bx(b"ipco", &[ispe, pixi, av1c, colr].concat());
-    // item 1: ispe, pixi, av1C (essential), colr
-    let ipma = full(b"ipma", 0, 0, &[0, 0, 0, 1, 0, 1, 4, 0x01, 0x02, 0x83, 0x04]);
+    let ipco = bx(b"ipco", &[[ispe, pixi, av1c, colr].concat(), extra.concat()].concat());
+    // item 1: ispe, pixi, av1C (essential), colr, then the extra ones
+    let mut assoc = vec![0, 0, 0, 1, 0, 1, 4 + extra.len() as u8, 0x01, 0x02, 0x83, 0x04];
+    assoc.extend((0..extra.len()).map(|k| 5 + k as u8));
+    let ipma = full(b"ipma", 0, 0, &assoc);
     let iprp = bx(b"iprp", &[ipco, ipma].concat());
     let iloc = |offset: u32| {
         let mut b = vec![0x44, 0x00];
@@ -314,9 +332,22 @@ pub fn is_avif(bytes: &[u8]) -> bool {
     size >= 16 && bytes[8..size].chunks_exact(4).enumerate().any(|(k, c)| k != 1 && c == b"avif")
 }
 
+/// Whether `bytes` start with an `ftyp` box naming `avif` (still image) or `avis` (image sequence,
+/// whose primary item is its still) as a brand.
+fn is_avif_or_avis(bytes: &[u8]) -> bool {
+    if is_avif(bytes) {
+        return true;
+    }
+    if bytes.len() < 16 || &bytes[4..8] != b"ftyp" {
+        return false;
+    }
+    let size = (u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize).min(bytes.len());
+    size >= 16 && bytes[8..size].chunks_exact(4).enumerate().any(|(k, c)| k != 1 && c == b"avis")
+}
+
 /// The primary image of an AVIF file.
 pub fn read_avif(file: &[u8]) -> Result<AvifImage, PhotoError> {
-    if !is_avif(file) {
+    if !is_avif_or_avis(file) {
         return Err(PhotoError::UnsupportedAvif("not an AVIF file"));
     }
     let top = boxes(file)?;
@@ -381,6 +412,7 @@ pub fn read_avif(file: &[u8]) -> Result<AvifImage, PhotoError> {
         }
     }
     let (mut width, mut height, mut nclx, mut config) = (0, 0, None, Vec::new());
+    let (mut icc, mut transformed, mut high_bit_depth) = (false, false, false);
     for p in props {
         let Some((ty, body)) = ipco.get(p) else { continue };
         match ty {
@@ -389,7 +421,13 @@ pub fn read_avif(file: &[u8]) -> Result<AvifImage, PhotoError> {
                 width = e.n(4)? as u32;
                 height = e.n(4)? as u32;
             }
-            b"av1C" => config = body.get(4..).unwrap_or_default().to_vec(),
+            b"av1C" => {
+                // byte 2: seq_tier_0, high_bitdepth, twelve_bit, ...
+                high_bit_depth = body.get(2).is_some_and(|b| b & 0x40 != 0);
+                config = body.get(4..).unwrap_or_default().to_vec();
+            }
+            b"colr" if body.len() >= 4 && (&body[0..4] == b"prof" || &body[0..4] == b"rICC") => icc = true,
+            b"irot" | b"imir" | b"clap" => transformed = true,
             b"colr" if body.len() >= 11 && &body[0..4] == b"nclx" => {
                 nclx = Some(Nclx {
                     primaries: u16::from_be_bytes([body[4], body[5]]),
@@ -466,7 +504,7 @@ pub fn read_avif(file: &[u8]) -> Result<AvifImage, PhotoError> {
     if width == 0 || height == 0 {
         return Err(PhotoError::UnsupportedAvif("no image size"));
     }
-    Ok(AvifImage { width, height, nclx, av1: [config, data].concat() })
+    Ok(AvifImage { width, height, nclx, icc, transformed, high_bit_depth, av1: [config, data].concat() })
 }
 
 #[cfg(test)]
@@ -533,6 +571,47 @@ mod tests {
         let meta_size = u32::from_be_bytes(hostile[meta..meta + 4].try_into().unwrap()) as usize + iloc.len() - old;
         hostile[meta..meta + 4].copy_from_slice(&(meta_size as u32).to_be_bytes());
         assert!(read_avif(&hostile).is_err());
+    }
+
+    #[test]
+    fn plain_file_reports_no_transform_icc_or_high_bit_depth() {
+        let img = read_avif(&write_avif(&av1_stub(), 64, 48, NCLX_SRGB_BT601_FULL).unwrap()).unwrap();
+        assert!(!img.transformed && !img.icc && !img.high_bit_depth);
+    }
+
+    #[test]
+    fn transforms_and_icc_are_reported() {
+        for (prop, transformed, icc) in [
+            (bx(b"irot", &[1]), true, false),
+            (bx(b"imir", &[0]), true, false),
+            (bx(b"clap", &[0; 32]), true, false),
+            (bx(b"colr", b"prof\0\0\0\0"), false, true),
+            (bx(b"colr", b"rICC\0\0\0\0"), false, true),
+        ] {
+            let file = write_avif_with(&av1_stub(), 64, 48, NCLX_SRGB_BT601_FULL, &[prop]).unwrap();
+            let img = read_avif(&file).unwrap();
+            assert_eq!((img.transformed, img.icc), (transformed, icc));
+            assert_eq!((img.width, img.height), (64, 48));
+        }
+    }
+
+    #[test]
+    fn high_bit_depth_is_reported() {
+        let mut file = write_avif(&av1_stub(), 64, 48, NCLX_SRGB_BT601_FULL).unwrap();
+        let at = file.windows(4).position(|w| w == b"av1C").unwrap() + 4;
+        file[at + 2] |= 0x40;
+        assert!(read_avif(&file).unwrap().high_bit_depth);
+    }
+
+    #[test]
+    fn image_sequence_brand_is_read() {
+        let mut file = write_avif(&av1_stub(), 64, 48, NCLX_SRGB_BT601_FULL).unwrap();
+        // ftyp "avif 0 avif mif1 miaf" -> "avis 0 avis msf1 miaf"
+        file[8..12].copy_from_slice(b"avis");
+        file[16..20].copy_from_slice(b"avis");
+        file[20..24].copy_from_slice(b"msf1");
+        assert!(!is_avif(&file));
+        assert_eq!(read_avif(&file).unwrap().width, 64);
     }
 
     #[test]

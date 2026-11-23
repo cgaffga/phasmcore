@@ -36,6 +36,7 @@ pub mod payload;
 pub mod progress;
 pub mod shadow_layer;
 pub mod memory;
+pub mod spill;
 
 // --- Steganographic algorithms ---
 pub mod cost;
@@ -48,10 +49,11 @@ pub mod video;
 pub use error::StegoError;
 pub use ghost::quality;
 pub use ghost::quality::EncodeQuality;
+pub use spill::{set_spill_dir, spill_dir};
 pub use memory::{
-    get_memory_budget, ghost_lane_plan, predict_peak_memory,
+    decode_peak_bytes, get_memory_budget, ghost_encode_peak_bytes, ghost_lane_plan, ghost_plan_peak, predict_peak_memory,
     set_memory_budget, set_telemetry_hook,
-    GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
+    GhostEncodeShape, GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
 
 // Backward-compatible re-exports at original paths
@@ -96,7 +98,7 @@ pub fn validate_encode_dimensions(width: u32, height: u32) -> Result<(), StegoEr
     }
     Ok(())
 }
-pub use ghost::session::{GhostEncodeSession, GhostTaskRunner, TASK_TARGET_OFFSET as GHOST_TASK_TARGET_OFFSET};
+pub use ghost::session::{GhostEncodeSession, GhostTaskRunner, TASK_TARGET_OFFSET as GHOST_TASK_TARGET_OFFSET, is_protocol_error as ghost_task_protocol_error};
 #[doc(hidden)]
 pub use ghost::session::run_split_encode_locally;
 pub use ghost::pipeline::{ghost_encode, ghost_decode, ghost_encode_with_files, ghost_encode_si, ghost_encode_si_with_files, GHOST_DECODE_STEPS, GHOST_ENCODE_STEPS};

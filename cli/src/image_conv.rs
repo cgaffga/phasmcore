@@ -30,10 +30,15 @@ pub struct PreparedImage {
     /// A JPEG input was cleaned without re-encoding (`--optimize`: metadata
     /// dropped, EXIF orientation applied in the DCT domain).
     pub lossless_clean: bool,
-    /// Ghost: a JPEG input was re-encoded at its own size (`--qf` without a
-    /// real downscale): an aligned double-compressed cover, embedded
-    /// without side information.
+    /// Ghost: a written cover without exact side information (pixels core
+    /// still sees as a JPEG decoded on the cover's grid after realigning
+    /// them; rare since 2026-11-21).
     pub jpeg_reencoded_same_size: bool,
+    /// Ghost: core realigned a same-size cover (an AVIF source, or pixels
+    /// that are a JPEG decoded on the cover's grid, e.g. `--qf` on a JPEG at
+    /// its own size): 4 px cropped off the top and left, resampled back to
+    /// the same size, so the source's block grid is off the cover's.
+    pub realigned: bool,
     /// What happened to the source's colours (ICC conversion, an ignored
     /// profile), for a note; None when the pixels were taken as they are.
     pub color_note: Option<String>,
@@ -99,8 +104,9 @@ fn cover_request(
 ///
 /// - Ghost, JPEG, original size, no `--qf`: the file as it is (with
 ///   `--optimize`: cleaned losslessly, orientation applied in the DCT domain).
-/// - Ghost, JPEG, `--qf` at its own size: a plain re-encode, no side
-///   information (a decoded JPEG is no precover).
+/// - Ghost, JPEG, `--qf` at its own size: the decoded pixels realigned by
+///   core (4 px crop, resampled back to the same size; a decoded JPEG on its
+///   own grid is no precover), then Deep Cover from those pixels.
 /// - Ghost, JPEG made smaller (`--resize`), or any other format: the Deep
 ///   Cover cover phasm writes (IJG 92 or `--qf`), with its pixels for
 ///   SI-UNIWARD.
@@ -130,6 +136,8 @@ pub fn prepare_image(
         Some(s) => (s.width, s.height, s.color_note, Some(s.rgb)),
         None => (out.width, out.height, None, None),
     };
+    // Core's own pixels at the source's size: the realignment.
+    let realigned = ghost && !out.si_is_input && out.si_pixels.is_some() && (out.width, out.height) == (source_width, source_height);
     // The SI pixels are the source's own when core returns no copy.
     let raw_pixels = if !ghost {
         None
@@ -141,9 +149,10 @@ pub fn prepare_image(
     let default_quality = if req.mode == CoverMode::Armor { ARMOR_COVER_QUALITY } else { DEEP_COVER_DEFAULT_QUALITY };
     Ok(PreparedImage {
         jpeg_bytes: out.jpeg,
-        // A written Ghost cover without exact side information: a JPEG
-        // re-encoded at its own size (core's decoded-JPEG guard caps it).
+        // A written Ghost cover without exact side information (core's
+        // decoded-JPEG guard caps it).
         jpeg_reencoded_same_size: ghost && needs_pixels && !out.deep_cover,
+        realigned,
         raw_pixels,
         width: out.width,
         height: out.height,
@@ -327,19 +336,26 @@ mod tests {
     }
 
     #[test]
-    fn ghost_qf_on_a_jpeg_is_a_plain_re_encode() {
-        // A same-size re-encode of a decoded JPEG is no Deep Cover precover
-        // (aligned double compression): core gets the pixels so its
-        // decoded-JPEG guard applies, and encodes plain Ghost.
+    fn ghost_qf_on_a_jpeg_is_realigned() {
+        // A same-size re-encode of a decoded JPEG would be an aligned double
+        // compression: core realigns the pixels (4 px crop, resampled back)
+        // and they are a Deep Cover precover with exact side information.
         let p = write("ghost-qf.jpg", &textured_jpeg(640, 480));
         let c = prep(&p, "ghost", Some(85), None, false, false);
-        assert!(c.raw_pixels.is_some());
+        let px = c.raw_pixels.as_deref().expect("the realigned pixels");
         assert_eq!(c.reencoded_qf, Some(85));
-        assert!(c.jpeg_reencoded_same_size);
+        assert!(c.realigned && !c.jpeg_reencoded_same_size);
         assert_eq!(jpeg_dims(&c.jpeg_bytes), (640, 480));
+        assert!(!phasm_core::is_aligned_jpeg_decode(px, 640, 480));
+        let img = phasm_core::JpegImage::from_bytes(&c.jpeg_bytes).unwrap();
+        let (si, plain) = (phasm_core::ghost_bands_si(&img, px, 640, 480, 0, 0).unwrap(), phasm_core::ghost_bands(&img, 0, 0).unwrap());
+        assert!(si.max_bytes * 100 >= plain.max_bytes * 124, "exact SI: nzAC/4, not nzAC/5 or /10");
         // A --resize that does not shrink adds nothing: same answer.
         let c = prep(&p, "ghost", Some(85), Some(4000), false, false);
-        assert!(c.raw_pixels.is_some() && c.jpeg_reencoded_same_size);
+        assert!(c.raw_pixels.is_some() && c.realigned && !c.jpeg_reencoded_same_size);
+        // A real downscale resamples (no realignment).
+        let c = prep(&p, "ghost", Some(85), Some(320), false, false);
+        assert!(!c.realigned && !c.jpeg_reencoded_same_size);
     }
 
     #[test]

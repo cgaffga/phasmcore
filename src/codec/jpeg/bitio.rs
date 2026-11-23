@@ -181,8 +181,13 @@ impl Default for BitWriter {
 
 impl BitWriter {
     pub fn new() -> Self {
+        Self::with_output(Vec::new())
+    }
+
+    /// A writer that appends to `output` (its bytes kept, its capacity used).
+    pub fn with_output(output: Vec<u8>) -> Self {
         Self {
-            output: Vec::new(),
+            output,
             buf: 0,
             bits_used: 0,
         }

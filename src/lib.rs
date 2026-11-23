@@ -45,21 +45,22 @@ pub use stego::{ghost_encode_with_shadows, ghost_encode_si_with_shadows, ghost_s
 pub use stego::{ghost_encode_with_shadows_quality, ghost_encode_si_with_shadows_quality};
 pub use stego::{armor_encode, armor_encode_with_quality, armor_encode_with_options, armor_encode_with_fortress_tl, armor_decode, armor_capacity, armor_capacity_info, smart_decode, DecodeQuality, ArmorCapacityInfo, EncodePreference};
 pub use stego::EncodeQuality;
-pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET};
+pub use stego::{GhostEncodeSession, GhostTaskRunner, GHOST_TASK_TARGET_OFFSET, ghost_task_protocol_error};
 pub use stego::{deep_cover_jpeg, ghost_encode_deep_cover, ghost_encode_deep_cover_with_shadows, ghost_capacity_deep_cover, DEEP_COVER_DEFAULT_QUALITY};
 pub use stego::{validate_encode_dimensions, MAX_DIMENSION, MAX_PIXELS, MIN_ENCODE_DIMENSION, ARMOR_TARGET_DIMENSION};
 pub use stego::{armor_cover_dimensions, ArmorCoverDims, ArmorCoverPreset, ARMOR_COVER_STEP};
 pub use stego::{PayloadData, FileEntry, compressed_payload_size, safe_filename};
 pub use stego::progress;
 pub use stego::memory;
+pub use stego::{set_spill_dir, spill_dir};
 pub use stego::{
-    get_memory_budget, ghost_lane_plan, predict_peak_memory,
+    decode_peak_bytes, get_memory_budget, ghost_encode_peak_bytes, ghost_lane_plan, ghost_plan_peak, predict_peak_memory,
     set_memory_budget, set_telemetry_hook,
-    GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
+    GhostEncodeShape, GhostLanePlan, GhostRung, ModeId, TelemetryEvent, TelemetryHook,
 };
 pub use codec::jpeg::history::{grid_evidence, is_aligned_jpeg_decode, GridEvidence};
 pub use codec::resample::{fit_long_side, resample_rgb};
-pub use stego::cover_builder::{build_cover, cover_needs_pixels, CoverMode, CoverOut, CoverRequest, ARMOR_COVER_QUALITY};
+pub use stego::cover_builder::{build_cover, cover_needs_pixels, is_avif_source, CoverMode, CoverOut, CoverRequest, ARMOR_COVER_QUALITY, REALIGN_CROP};
 pub use codec::jpeg::exif::{cover_with_source_metadata, exif_for_cover, source_exif, with_exif};
 pub use codec::jpeg::lossless::{upright_and_clean as jpeg_upright_and_clean, Transform as JpegTransform};
 pub use codec::jpeg::quality::{estimate_jpeg_quality, QualityEstimate as JpegQualityEstimate};

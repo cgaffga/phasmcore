@@ -52,7 +52,7 @@ use crate::stego::side_info::SideInfo;
 use crate::stego::stc::trellis::Code;
 use crate::stego::stc::{hhat, trellis};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// STC constraint height of every v3.1 trellis (primary layers and
 /// shadows). Part of the wire format; v3's height (frozen at 9 on
@@ -548,7 +548,12 @@ pub fn lanes_in_flight_bytes(n: usize, h: usize, workers: usize) -> usize {
 }
 
 /// Back-pointer bytes each of `k` lanes of `nk` positions planned at once may
-/// keep ([`lanes_in_flight_bytes`] shared out, less their vectors).
+/// keep ([`lanes_in_flight_bytes`] shared out, less their vectors). Both
+/// still charge 8 B per lane position for the vectors — what a lane held
+/// before it computed its trellis inputs on demand (2026-11, now 3 bits:
+/// [`lane_bytes`]) — so the trellis schedules, and the speed of every
+/// plan, stayed as they were; a lane's real working set is smaller than
+/// its share by the difference.
 pub fn lane_inline_share(n: usize, nk: usize, k: usize, h: usize, workers: usize) -> usize {
     (lanes_in_flight_bytes(n, h, workers) / k.max(1)).saturating_sub(nk * 8)
 }
@@ -585,21 +590,27 @@ fn lane_work(nk: usize, bits: usize) -> usize {
     LaneGeom::new(nk, bits).map_or(0, |g| g.n1() + g.n2())
 }
 
-/// Working memory of one lane: per position the flip map (1 B), one layer's
-/// cover and cost vectors (5 B, the layers run one after the other) and the
-/// trellis plan (1 B) — 8 B with slack — plus the trellis back pointers
-/// (in-memory table, or tail / segment buffers + checkpoints).
+/// Working memory of one lane of `nk` positions and `bits` frame bits
+/// ([`plan`]): its bit-packed P2 flips and one layer's cover and stego bits
+/// (3 bits per position; the layers run one after the other), the scratch
+/// of each of its `threads` computing a chunk of its trellis input
+/// ([`LANE_CHUNK`] positions × 5 B), its changes (8 B each, at most one per
+/// two frame bits, reserved exactly) and a layer's trellis: its code's
+/// columns (4 B per column of the head, short and long widths, 8 B more as
+/// the trellis masks them: a wide code is one short message's lane over a
+/// large cover, 6 MB at 60 MP) and back pointers (in-memory table, or tail
+/// / segment buffers + checkpoints).
 pub fn lane_bytes(nk: usize, bits: usize, h: usize, inline_limit: usize, threads: usize) -> usize {
     let trellis = match LaneGeom::new(nk, bits) {
         Ok(g) => [g.s1, g.s2]
             .iter()
             .flatten()
-            .map(|s| trellis::working_bytes(s.n(), s.avg_w(), h, inline_limit, threads))
+            .map(|s| 12 * (s.head_w + 2 * s.short_w + 1) + trellis::working_bytes(s.n(), s.avg_w(), h, inline_limit, threads))
             .max()
             .unwrap_or(0),
         Err(_) => trellis::working_bytes(nk, 1, h, inline_limit, threads),
     };
-    nk * 8 + trellis
+    3 * nk.div_ceil(64) * 8 + threads.max(1) * LANE_CHUNK * 5 + bits * 4 + trellis
 }
 
 /// Encoder knobs that do not change the output.
@@ -622,6 +633,10 @@ pub struct EncodeOpts {
     pub progress_steps: u32,
     /// Also estimate the rate-distortion bound (measurement).
     pub bound: bool,
+    /// Keep the keyed order on disk (`stego::spill`) once it is generated:
+    /// the memory ladder's lowest rung (`GhostRung::SpilledOrder`), only with
+    /// a spill directory set. Same plan.
+    pub spill_order: bool,
 }
 
 impl Default for EncodeOpts {
@@ -633,6 +648,7 @@ impl Default for EncodeOpts {
             group_positions: usize::MAX,
             progress_steps: 0,
             bound: false,
+            spill_order: false,
         }
     }
 }
@@ -739,8 +755,8 @@ pub(crate) struct LanePlan {
 }
 
 /// A lane's position costs: aligned with its slice of the order (the cost
-/// groups of [`plan`]), or the whole Y channel's by flat index (a plan with
-/// one cost group; the split encode, `session.rs`).
+/// groups of [`plan`] and the split encode, `session.rs`), or the whole Y
+/// channel's by flat index (a plan with one cost group).
 #[derive(Clone, Copy)]
 pub(crate) enum Rho<'a> {
     Lane(&'a [f32]),
@@ -766,107 +782,28 @@ pub(crate) struct LaneInput<'a> {
     pub(crate) rho: Rho<'a>,
     /// The pair bits `s` (by flat index).
     pub(crate) pairs: &'a PairKey,
-    /// Every position's value and `(a, b)` up to the cache's length, read
-    /// once (the split encode's coordinator; `LaneCache`).
-    pub(crate) cache: Option<&'a LaneCache>,
-}
-
-/// A lane's values, pair bits and `(a, b)` costs, gathered in one pass: the
-/// layer inputs and the lane's changes then read them in order instead of
-/// each gathering every position from the grid, the costs and the side
-/// information again (random access; on WASM the coordinator's three such
-/// passes paced the helpers). 11 B per position. Same values as
-/// [`LaneInput`] computes, so the same plan.
-pub(crate) struct LaneCache {
-    vals: Vec<i16>,
-    pairs: Vec<u8>,
-    a: Vec<f32>,
-    b: Vec<f32>,
-}
-
-impl LaneCache {
-    /// The first `len` positions of `inp`'s lane.
-    pub(crate) fn build(inp: &LaneInput<'_>, len: usize) -> Self {
-        let mut vals = Vec::with_capacity(len);
-        let mut pairs = Vec::with_capacity(len);
-        let mut a = Vec::with_capacity(len);
-        let mut b = Vec::with_capacity(len);
-        for_each_index(len, |i| {
-            vals.push(inp.value(i));
-            pairs.push(inp.pair(i) as u8);
-            let (x, y) = inp.ab(i);
-            a.push(x);
-            b.push(y);
-        });
-        Self { vals, pairs, a, b }
-    }
-}
-
-/// Indices per call of [`each_chunk`].
-const LOOP_CHUNK: usize = 1 << 16;
-
-/// `f(i)` for `i` in `0..n`, `LOOP_CHUNK` indices per call of a function
-/// that is not inlined on wasm32: V8 keeps a call in baseline code (Liftoff)
-/// until it returns (no on-stack replacement for Wasm), so a lane-long loop
-/// in one call (12 M positions) never ran optimized.
-#[inline]
-fn for_each_index(n: usize, mut f: impl FnMut(usize)) {
-    let mut lo = 0;
-    while lo < n {
-        let hi = (lo + LOOP_CHUNK).min(n);
-        each_chunk(lo, hi, &mut f);
-        lo = hi;
-    }
-}
-
-#[cfg_attr(target_arch = "wasm32", inline(never))]
-fn each_chunk<F: FnMut(usize)>(lo: usize, hi: usize, f: &mut F) {
-    for i in lo..hi {
-        f(i);
-    }
 }
 
 impl LaneInput<'_> {
+    /// `(value, pair bit s, a, b)` of position `i` of the lane, whose flat
+    /// index `fi` the caller read through the lane's [`LaneSrc`] (the order
+    /// in memory or on disk): its current value, and the costs of the
+    /// P2-flipping direction (a) and of the other one (b); the overlay and
+    /// the pair key read once.
     #[inline]
-    fn value(&self, i: usize) -> i16 {
-        if let Some(c) = self.cache
-            && i < c.vals.len()
-        {
-            return c.vals[i];
-        }
-        value(self.grid, self.overlay, self.ord[i])
-    }
-
-    /// The pair bit `s` of position `i`.
-    #[inline]
-    fn pair(&self, i: usize) -> i16 {
-        if let Some(c) = self.cache
-            && i < c.pairs.len()
-        {
-            return c.pairs[i] as i16;
-        }
-        self.pairs.get(self.ord[i])
-    }
-
-    /// `(a, b)`: the cost of the P2-flipping direction, of the other one.
-    #[inline]
-    fn ab(&self, i: usize) -> (f32, f32) {
-        if let Some(c) = self.cache
-            && i < c.a.len()
-        {
-            return (c.a[i], c.b[i]);
-        }
-        let fi = self.ord[i];
+    fn at_fi(&self, i: usize, fi: u32) -> (i16, i16, f32, f32) {
+        let c = value(self.grid, self.overlay, fi);
+        let s = self.pairs.get(fi);
         if self.wet.is_some_and(|w| w.get(fi)) {
-            return (f32::INFINITY, f32::INFINITY);
+            return (c, s, f32::INFINITY, f32::INFINITY);
         }
-        let c = self.value(i);
         let rho = match self.rho {
             Rho::Lane(r) => r[i],
             Rho::Flat(r) => r[fi as usize],
         };
         let (rp, rm) = pm_costs(rho, c, si_term(self.si, fi as usize));
-        if dir2(c, self.pairs.get(fi)) > 0 { (rp, rm) } else { (rm, rp) }
+        let (a, b) = if dir2(c, s) > 0 { (rp, rm) } else { (rm, rp) };
+        (c, s, a, b)
     }
 }
 
@@ -907,87 +844,327 @@ impl LaneGeom {
     }
 }
 
-/// Layer 2's trellis input: every P2 flip forces the P2-flipping direction
-/// (cost a); binary cost from the marginal flip probability,
-/// `a + ln(1 + e^{−λb})/λ`.
-pub(crate) fn layer2_input(inp: &LaneInput<'_>, g: &LaneGeom, lam: f64) -> (Vec<u8>, Vec<f32>) {
-    let (mut cover2, mut cost2) = (Vec::with_capacity(g.n2()), Vec::with_capacity(g.n2()));
-    layer2_input_into(inp, g, lam, &mut cover2, &mut cost2);
-    (cover2, cost2)
+/// Layer 2's cover bit and cost of a lane position (value `c`, pair bit `s`,
+/// costs `a`, `b`: [`LaneInput::at_fi`]): every P2 flip forces the
+/// P2-flipping direction (cost a); binary cost from the marginal flip
+/// probability, `a + ln(1 + e^{−λb})/λ`.
+#[inline]
+fn layer2_of(c: i16, s: i16, a: f32, b: f32, lam: f64) -> (u8, f32) {
+    let bit = plane2(c, s);
+    let cost = if !a.is_finite() {
+        f32::INFINITY
+    } else if !b.is_finite() {
+        a
+    } else {
+        (a as f64 + softplus_neg(lam * b as f64) / lam) as f32
+    };
+    (bit, cost)
 }
 
-/// [`layer2_input`] into `cover2` / `cost2` (cleared; their allocations
-/// reused).
-fn layer2_input_into(inp: &LaneInput<'_>, g: &LaneGeom, lam: f64, cover2: &mut Vec<u8>, cost2: &mut Vec<f32>) {
-    let n2 = g.n2();
-    cover2.clear();
-    cost2.clear();
-    cover2.reserve(n2);
-    cost2.reserve(n2);
-    for_each_index(n2, |i| {
-        cover2.push(plane2(inp.value(i), inp.pair(i)));
-        let (a, b) = inp.ab(i);
-        cost2.push(if !a.is_finite() {
-            f32::INFINITY
-        } else if !b.is_finite() {
-            a
-        } else {
-            (a as f64 + softplus_neg(lam * b as f64) / lam) as f32
-        });
-    });
+/// Layer 1's cover bit and cost of a lane position (its P1 bit `p`, cost `b`;
+/// `flipped`: P2-flipped by layer 2): P2-flipped positions are fixed (their
+/// P1 flips with them); every other change takes the P2-preserving
+/// direction (cost b).
+#[inline]
+fn layer1_of(p: u8, b: f32, flipped: bool) -> (u8, f32) {
+    if flipped { (p ^ 1, f32::INFINITY) } else { (p, b) }
 }
 
-/// The P2 flips of a planned layer 2 (`nk` entries).
-pub(crate) fn layer2_flips(g: &LaneGeom, cover2: &[u8], stego2: &[u8]) -> Vec<bool> {
-    let mut flip2 = vec![false; g.nk];
-    for (i, (&cb, &sb)) in cover2.iter().zip(stego2).enumerate() {
-        flip2[i] = cb != sb;
+/// What layer 1 reads of a lane, kept by its layer-2 input as it hands out
+/// its chunks: each position's P1 bit and cost b, 4⅛ B per position. Layer 1
+/// then reads them in order instead of computing them from the cover and the
+/// costs again (the split encode's coordinator, `session.rs`, which computes
+/// every lane input itself: one random-access pass per lane instead of two).
+/// Values are the same however often a position is recorded.
+pub(crate) struct Layer1Keep {
+    p1: Vec<AtomicU64>,
+    b: Vec<AtomicU32>,
+}
+
+impl Layer1Keep {
+    /// Room for positions `0..n`.
+    pub(crate) fn new(n: usize) -> Self {
+        let mut p1 = Vec::with_capacity(n.div_ceil(64));
+        p1.resize_with(n.div_ceil(64), || AtomicU64::new(0));
+        let mut b = Vec::with_capacity(n);
+        b.resize_with(n, || AtomicU32::new(0));
+        Self { p1, b }
     }
-    flip2
+
+    /// Bytes of [`Self::new`]`(n)`.
+    pub(crate) fn bytes(n: usize) -> usize {
+        n.div_ceil(64) * 8 + n * 4
+    }
 }
 
-/// Layer 1's trellis input: P2-flipped positions are fixed (their P1 flips
-/// with them); every other change takes the P2-preserving direction (cost b).
-pub(crate) fn layer1_input(inp: &LaneInput<'_>, g: &LaneGeom, flip2: &[bool]) -> (Vec<u8>, Vec<f32>) {
-    let (mut cover1, mut cost1) = (Vec::with_capacity(g.n1()), Vec::with_capacity(g.n1()));
-    layer1_input_into(inp, g, flip2, &mut cover1, &mut cost1);
-    (cover1, cost1)
+/// Positions a lane computes per chunk of its trellis input
+/// ([`trellis::TrellisInput`]): ~20 KB of scratch per pass.
+const LANE_CHUNK: usize = 1 << 12;
+
+/// Bit `i` of a bit-packed array (bit `i mod 64` of word `i / 64`).
+#[inline]
+fn bit_at(words: &[u64], i: usize) -> bool {
+    (words[i >> 6] >> (i & 63)) & 1 == 1
 }
 
-/// [`layer1_input`] into `cover1` / `cost1` (cleared; their allocations
-/// reused).
-fn layer1_input_into(inp: &LaneInput<'_>, g: &LaneGeom, flip2: &[bool], cover1: &mut Vec<u8>, cost1: &mut Vec<f32>) {
-    let n1 = g.n1();
-    cover1.clear();
-    cost1.clear();
-    cover1.reserve(n1);
-    cost1.reserve(n1);
-    for_each_index(n1, |i| {
-        let p = plane1(inp.value(i));
-        if flip2[i] {
-            cover1.push(p ^ 1);
-            cost1.push(f32::INFINITY);
-        } else {
-            cover1.push(p);
-            cost1.push(inp.ab(i).1);
+/// OR the LSBs of `bits` (positions `j0 ..`) into the packed `words`. A
+/// position's bit is the same however often it is computed, so concurrent
+/// and repeated calls (recomputed trellis segments) are harmless.
+fn record_bits(words: &[AtomicU64], j0: usize, bits: &[u8]) {
+    let mut acc = 0u64;
+    let mut w = j0 >> 6;
+    for (k, &b) in bits.iter().enumerate() {
+        let j = j0 + k;
+        if j >> 6 != w {
+            words[w].fetch_or(acc, Ordering::Relaxed);
+            acc = 0;
+            w = j >> 6;
         }
-    });
+        acc |= ((b & 1) as u64) << (j & 63);
+    }
+    if !bits.is_empty() {
+        words[w].fetch_or(acc, Ordering::Relaxed);
+    }
 }
 
-/// The lane's changes from its planned layers.
-pub(crate) fn lane_plan(inp: &LaneInput<'_>, g: &LaneGeom, flip2: &[bool], cover1: &[u8], stego1: &[u8]) -> LanePlan {
-    let n1 = g.n1();
-    let mut plan = LanePlan { changes: Vec::new(), distortion: 0.0, w1: g.w1(), w2: g.w2(), changes2: 0 };
-    for_each_index(g.nk.min(n1.max(g.n2())), |i| {
-        if flip2[i] {
-            plan.distortion += inp.ab(i).0 as f64;
-            plan.changes.push((i as u32, dir2(inp.value(i), inp.pair(i))));
-            plan.changes2 += 1;
-        } else if i < n1 && stego1[i] != cover1[i] {
-            plan.distortion += inp.ab(i).1 as f64;
-            plan.changes.push((i as u32, -dir2(inp.value(i), inp.pair(i))));
+/// Where a lane reads its positions' flat indices: its slice of the order in
+/// memory ([`LaneInput::ord`]) or the order on disk ([`SpilledLane`], the
+/// memory ladder's lowest rung). Both hand the same indices to the same
+/// computations, so the plan is the same.
+pub(crate) trait LaneSrc: Sync {
+    /// The lane's input (grid, overlay, costs, pair key).
+    fn inp(&self) -> &LaneInput<'_>;
+    /// Positions in the lane.
+    fn len(&self) -> usize;
+    /// The flat indices of lane positions `j0 .. j1` (`j1 − j0 ≤
+    /// LANE_CHUNK`): borrowed from the order in memory, or read into `buf`.
+    fn fis<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32];
+    /// The whole order slice when it is in memory.
+    fn direct(&self) -> Option<&[u32]>;
+    /// Whether a disk read failed: the trellis ran on zeros, so its plan must
+    /// not be used (`ImageTooLarge`).
+    fn failed(&self) -> bool {
+        false
+    }
+}
+
+impl LaneSrc for LaneInput<'_> {
+    fn inp(&self) -> &LaneInput<'_> {
+        self
+    }
+
+    fn len(&self) -> usize {
+        self.ord.len()
+    }
+
+    fn fis<'s>(&'s self, j0: usize, j1: usize, _buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32] {
+        &self.ord[j0..j1]
+    }
+
+    fn direct(&self) -> Option<&[u32]> {
+        Some(self.ord)
+    }
+}
+
+/// A lane whose slice of the order is on disk (`start .. start + len` of the
+/// spilled order); `inp.ord` is empty.
+pub(crate) struct SpilledLane<'a> {
+    pub(crate) inp: LaneInput<'a>,
+    pub(crate) spill: &'a crate::stego::spill::OrderSpill,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
+}
+
+impl LaneSrc for SpilledLane<'_> {
+    fn inp(&self) -> &LaneInput<'_> {
+        &self.inp
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn fis<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32] {
+        let k = j1 - j0;
+        self.spill.read(self.start + j0, &mut buf[..k]);
+        &buf[..k]
+    }
+
+    fn direct(&self) -> Option<&[u32]> {
+        None
+    }
+
+    fn failed(&self) -> bool {
+        self.spill.failed()
+    }
+}
+
+/// Flat indices of a lane at increasing positions (its changes): the order
+/// in memory directly, the one on disk a window of [`LANE_CHUNK`] at a time.
+struct FiWindow {
+    buf: Box<[u32; LANE_CHUNK]>,
+    lo: usize,
+    hi: usize,
+}
+
+impl FiWindow {
+    fn new() -> Self {
+        Self { buf: Box::new([0; LANE_CHUNK]), lo: 0, hi: 0 }
+    }
+
+    fn get<S: LaneSrc + ?Sized>(&mut self, src: &S, i: usize) -> u32 {
+        if let Some(o) = src.direct() {
+            return o[i];
         }
-    });
+        if i < self.lo || i >= self.hi {
+            let hi = (i + LANE_CHUNK).min(src.len());
+            let n = src.fis(i, hi, &mut self.buf).len();
+            (self.lo, self.hi) = (i, i + n);
+        }
+        self.buf[i - self.lo]
+    }
+}
+
+/// A layer's stego bits (bit-packed) → its flips: `bits ⊕= cover`, the
+/// cover bits it was given (recorded by its [`LaneLayerInput`]).
+pub(crate) fn flips_in_place(bits: &mut [u64], cover: &[AtomicU64]) {
+    for (f, c) in bits.iter_mut().zip(cover) {
+        *f ^= c.load(Ordering::Relaxed);
+    }
+}
+
+/// A lane layer's trellis input computed on demand, [`LANE_CHUNK`]
+/// positions at a time (no per-position arrays), recording the cover bits it
+/// hands out into `cover` (bit-packed; the P2 flips and the lane's changes
+/// are the stego bits that differ). Lane positions read through the lane's
+/// [`LaneSrc`] (the order in memory or on disk); [`lane_layer_input`].
+pub(crate) struct LaneLayerInput<'a, S: ?Sized = LaneInput<'a>> {
+    src: &'a S,
+    layer: LayerSource<'a>,
+    cover: &'a [AtomicU64],
+    /// Layer 2: keeps layer 1's input here; layer 1: reads it from here.
+    keep: Option<&'a Layer1Keep>,
+}
+
+enum LayerSource<'a> {
+    /// Layer 2 ([`layer2_of`]) at λ.
+    Two(f64),
+    /// Layer 1 ([`layer1_of`]) after layer 2's P2 flips (bit-packed).
+    One(&'a [u64]),
+}
+
+/// Layer `layer` (2: P2, at `lam`; 1: P1, after the P2 flips `flip2`) of the
+/// lane `src` as a trellis input ([`LaneLayerInput`]) recording its cover
+/// bits into `cover` (at least the layer's positions). With `keep`, layer 2
+/// keeps layer 1's input there (at least layer 1's positions, which layer 2
+/// must cover) and layer 1 reads it from there (the same values).
+pub(crate) fn lane_layer_input<'a, S: LaneSrc + ?Sized>(
+    src: &'a S,
+    layer: u8,
+    lam: f64,
+    flip2: &'a [u64],
+    cover: &'a [AtomicU64],
+    keep: Option<&'a Layer1Keep>,
+) -> LaneLayerInput<'a, S> {
+    let layer = if layer == 2 { LayerSource::Two(lam) } else { LayerSource::One(flip2) };
+    LaneLayerInput { src, layer, cover, keep }
+}
+
+impl<S: LaneSrc + ?Sized> trellis::TrellisInput for LaneLayerInput<'_, S> {
+    fn chunk<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut trellis::TrellisChunk) -> (&'s [u8], &'s [f32]) {
+        let j1 = j1.min(j0 + LANE_CHUNK);
+        buf.cover.clear();
+        buf.costs.clear();
+        let inp = self.src.inp();
+        let mut fbuf = [0u32; LANE_CHUNK];
+        match (&self.layer, self.keep) {
+            (LayerSource::Two(lam), None) => {
+                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
+                    let (c, s, a, b) = inp.at_fi(j0 + k, fi);
+                    let (bit, cost) = layer2_of(c, s, a, b, *lam);
+                    buf.cover.push(bit);
+                    buf.costs.push(cost);
+                }
+            }
+            (LayerSource::Two(lam), Some(keep)) => {
+                let mut p1 = Vec::with_capacity(j1 - j0);
+                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
+                    let i = j0 + k;
+                    let (c, s, a, b) = inp.at_fi(i, fi);
+                    let (bit, cost) = layer2_of(c, s, a, b, *lam);
+                    buf.cover.push(bit);
+                    buf.costs.push(cost);
+                    keep.b[i].store(b.to_bits(), Ordering::Relaxed);
+                    p1.push(plane1(c));
+                }
+                record_bits(&keep.p1, j0, &p1);
+            }
+            (LayerSource::One(flip2), None) => {
+                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
+                    let i = j0 + k;
+                    let (c, _, _, b) = inp.at_fi(i, fi);
+                    let (bit, cost) = layer1_of(plane1(c), b, bit_at(flip2, i));
+                    buf.cover.push(bit);
+                    buf.costs.push(cost);
+                }
+            }
+            (LayerSource::One(flip2), Some(keep)) => {
+                for i in j0..j1 {
+                    let p = ((keep.p1[i >> 6].load(Ordering::Relaxed) >> (i & 63)) & 1) as u8;
+                    let b = f32::from_bits(keep.b[i].load(Ordering::Relaxed));
+                    let (bit, cost) = layer1_of(p, b, bit_at(flip2, i));
+                    buf.cover.push(bit);
+                    buf.costs.push(cost);
+                }
+            }
+        }
+        record_bits(self.cover, j0, &buf.cover);
+        (&buf.cover, &buf.costs)
+    }
+}
+
+/// The lane's changes from its planned layers, bit-packed: `flip2` (P2
+/// flips, layer 2) and `flip1` (layer 1's stego bits ≠ its cover bits).
+/// Visits only the changed positions, in lane order; their flat indices
+/// through the lane's [`LaneSrc`].
+pub(crate) fn lane_plan_bits<S: LaneSrc + ?Sized>(src: &S, g: &LaneGeom, flip2: &[u64], flip1: &[u64]) -> LanePlan {
+    let inp = src.inp();
+    let mut window = FiWindow::new();
+    let n1 = g.n1();
+    let end = g.nk.min(n1.max(g.n2()));
+    // The changes, reserved exactly (a grown vector holds up to twice them
+    // until the encode ends): every flipped position below `end`.
+    let words = end.div_ceil(64);
+    let count: usize = (0..words)
+        .map(|wi| {
+            let w = flip2.get(wi).copied().unwrap_or(0) | flip1.get(wi).copied().unwrap_or(0);
+            let w = if (wi + 1) * 64 > end { w & ((1u64 << (end - wi * 64)) - 1) } else { w };
+            w.count_ones() as usize
+        })
+        .sum();
+    let mut plan = LanePlan { changes: Vec::with_capacity(count), distortion: 0.0, w1: g.w1(), w2: g.w2(), changes2: 0 };
+    for wi in 0..end.div_ceil(64) {
+        let f2 = flip2.get(wi).copied().unwrap_or(0);
+        let f1 = flip1.get(wi).copied().unwrap_or(0);
+        let mut any = f2 | f1;
+        if (wi + 1) * 64 > end {
+            any &= (1u64 << (end - wi * 64)) - 1;
+        }
+        while any != 0 {
+            let b = any.trailing_zeros() as usize;
+            any &= any - 1;
+            let i = wi * 64 + b;
+            let (c, s, pa, pb) = inp.at_fi(i, window.get(src, i));
+            if (f2 >> b) & 1 == 1 {
+                plan.distortion += pa as f64;
+                plan.changes.push((i as u32, dir2(c, s)));
+                plan.changes2 += 1;
+            } else if i < n1 {
+                plan.distortion += pb as f64;
+                plan.changes.push((i as u32, -dir2(c, s)));
+            }
+        }
+    }
     plan
 }
 
@@ -1007,27 +1184,35 @@ pub fn layer_code(seeds: &V31Seeds, layer: u8, g: &LaneGeom, h: usize) -> Code {
 /// maps a new block and keeps the old one).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct LaneCaps {
-    /// Trellis input (cover bits, costs) of either layer.
-    layer: usize,
-    /// Positions of the lane (its P2 flips).
+    /// Positions of the largest lane (its bit-packed flips and cover bits).
     nk: usize,
 }
 
 impl LaneCaps {
-    /// The largest layer and lane of the `l` lanes splitting `n` positions
-    /// and `m` frame bits.
-    pub(crate) fn of(n: usize, m: usize, l: usize) -> Self {
-        (0..l).fold(Self::default(), |c, k| {
-            let nk = share(n, l, k).len();
-            let layer = LaneGeom::new(nk, share(m, l, k).len()).map_or(0, |g| g.n1().max(g.n2()));
-            Self { layer: c.layer.max(layer), nk: c.nk.max(nk) }
-        })
+    /// The largest lane of the `l` lanes splitting `n` positions.
+    pub(crate) fn of(n: usize, l: usize) -> Self {
+        Self { nk: (0..l).map(|k| share(n, l, k).len()).max().unwrap_or(0) }
+    }
+
+    /// A zeroed bit-packed array of `n` positions, with the capacity of the
+    /// largest lane's.
+    pub(crate) fn bits(&self, n: usize) -> Vec<u64> {
+        let mut v = Vec::with_capacity(self.nk.max(n).div_ceil(64));
+        v.resize(n.div_ceil(64), 0);
+        v
+    }
+
+    /// [`Self::bits`] for concurrent recording ([`record_bits`]).
+    pub(crate) fn atomic_bits(&self, n: usize) -> Vec<AtomicU64> {
+        let mut v = Vec::with_capacity(self.nk.max(n).div_ceil(64));
+        v.resize_with(n.div_ceil(64), || AtomicU64::new(0));
+        v
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_lane(
-    inp: &LaneInput<'_>,
+fn plan_lane<S: LaneSrc + ?Sized>(
+    src: &S,
     bits: &[u8],
     lam: f64,
     seeds: &V31Seeds,
@@ -1037,33 +1222,59 @@ fn plan_lane(
     caps: LaneCaps,
     meter: &Meter,
 ) -> Result<LanePlan, StegoError> {
-    let g = LaneGeom::new(inp.ord.len(), bits.len())?;
+    let g = LaneGeom::new(src.len(), bits.len())?;
     let h = opts.h;
     let (l1, l2) = bits.split_at(g.m1);
     let tick = |k: usize| meter.tick(k);
 
-    // One trellis input buffer pair for both layers.
-    let cap = caps.layer.max(g.n1()).max(g.n2());
-    let (mut cover, mut cost) = (Vec::with_capacity(cap), Vec::with_capacity(cap));
-    let r2 = if g.m2 > 0 {
-        layer2_input_into(inp, &g, lam, &mut cover, &mut cost);
+    // The trellises compute their inputs chunk by chunk (no per-position
+    // cost or cover arrays: [`LaneLayerInput`]); a lane keeps only
+    // bit-packed flips and cover bits, 1/8 B per position each.
+    let mut flip2 = caps.bits(g.nk);
+    if g.m2 > 0 {
+        let cover2 = caps.atomic_bits(g.n2());
+        let input = lane_layer_input(src, 2, lam, &[], &cover2, None);
         let code2 = layer_code(seeds, 2, &g, h);
-        Some(trellis::embed_code(&cover, &cost, l2, &code2, h, inline, threads, &tick)?.ok_or(StegoError::MessageTooLarge)?)
-    } else {
-        None
-    };
-    let mut flip2 = Vec::with_capacity(caps.nk.max(g.nk));
-    flip2.resize(g.nk, false);
-    if let Some(r2) = r2 {
-        for (f, (&cb, &sb)) in flip2.iter_mut().zip(cover.iter().zip(&r2.stego_bits)) {
-            *f = cb != sb;
+        let planned = trellis::embed_packed(&input, g.n2(), l2, &code2, h, inline, threads, &tick)?;
+        if src.failed() {
+            return Err(StegoError::ImageTooLarge);
         }
+        let (mut stego2, _) = planned.ok_or(StegoError::MessageTooLarge)?;
+        flips_in_place(&mut stego2, &cover2);
+        flip2[..stego2.len()].copy_from_slice(&stego2);
     }
-    layer1_input_into(inp, &g, &flip2, &mut cover, &mut cost);
+    let cover1 = caps.atomic_bits(g.n1());
+    let input = lane_layer_input(src, 1, lam, &flip2, &cover1, None);
     let code1 = layer_code(seeds, 1, &g, h);
-    let r1 = trellis::embed_code(&cover, &cost, l1, &code1, h, inline, threads, &tick)?
-        .ok_or(StegoError::MessageTooLarge)?;
-    Ok(lane_plan(inp, &g, &flip2, &cover, &r1.stego_bits))
+    let planned = trellis::embed_packed(&input, g.n1(), l1, &code1, h, inline, threads, &tick)?;
+    if src.failed() {
+        return Err(StegoError::ImageTooLarge);
+    }
+    let (mut flip1, _) = planned.ok_or(StegoError::MessageTooLarge)?;
+    flips_in_place(&mut flip1, &cover1);
+    drop(cover1);
+    let plan = lane_plan_bits(src, &g, &flip2, &flip1);
+    if src.failed() {
+        return Err(StegoError::ImageTooLarge);
+    }
+    Ok(plan)
+}
+
+/// The cost groups of `l` lanes over `n` positions ([`plan`], the split
+/// encode): runs of consecutive lanes whose positions fit `group_positions`,
+/// at least one lane each.
+pub(crate) fn lane_groups(n: usize, l: usize, group_positions: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut k0 = 0;
+    while k0 < l {
+        let mut k1 = k0 + 1;
+        while k1 < l && share(n, l, k1).end - share(n, l, k0).start <= group_positions {
+            k1 += 1;
+        }
+        groups.push(k0..k1);
+        k0 = k1;
+    }
+    groups
 }
 
 /// Order positions whose costs feed the median (first `n_med`) and the λ
@@ -1090,10 +1301,27 @@ pub(crate) fn sample_stats(
     si: Option<&SideInfo>,
     pairs: &PairKey,
 ) -> (f64, f32, Vec<(f64, f64)>) {
-    let n = ord.len();
+    let fis: Vec<u32> = samples.iter().map(|&k| ord[k]).collect();
+    sample_stats_fis(&fis, ord.len(), n_med, sample_rho, m, grid, overlay, wet, si, pairs)
+}
+
+/// [`sample_stats`] from the samples' flat indices (`fis`, aligned with
+/// `sample_rho`) and the order's length `n`.
+#[allow(clippy::too_many_arguments)]
+fn sample_stats_fis(
+    fis: &[u32],
+    n: usize,
+    n_med: usize,
+    sample_rho: &[f32],
+    m: usize,
+    grid: &DctGrid,
+    overlay: Option<&Overlay>,
+    wet: Option<&WetMask>,
+    si: Option<&SideInfo>,
+    pairs: &PairKey,
+) -> (f64, f32, Vec<(f64, f64)>) {
     // Sample costs → (a, b) pairs exactly as the lanes form them.
-    let ab_at = |k: usize, rho: f32| -> (f32, f32) {
-        let fi = ord[k];
+    let ab_at = |fi: u32, rho: f32| -> (f32, f32) {
         if wet.is_some_and(|w| w.get(fi)) {
             return (f32::INFINITY, f32::INFINITY);
         }
@@ -1102,11 +1330,11 @@ pub(crate) fn sample_stats(
         if dir2(c, pairs.get(fi)) > 0 { (rp, rm) } else { (rm, rp) }
     };
     let mut median_cost = 0.0;
-    let mut med: Vec<f32> = samples[..n_med]
+    let mut med: Vec<f32> = fis[..n_med]
         .iter()
         .zip(&sample_rho[..n_med])
-        .map(|(&k, &rho)| {
-            let (a, b) = ab_at(k, rho);
+        .map(|(&fi, &rho)| {
+            let (a, b) = ab_at(fi, rho);
             a.min(b)
         })
         .filter(|c| c.is_finite())
@@ -1116,11 +1344,11 @@ pub(crate) fn sample_stats(
         med.select_nth_unstable_by(mid, f32::total_cmp);
         median_cost = med[mid];
     }
-    let sample_ab: Vec<(f64, f64)> = samples[n_med..]
+    let sample_ab: Vec<(f64, f64)> = fis[n_med..]
         .iter()
         .zip(&sample_rho[n_med..])
-        .map(|(&k, &rho)| {
-            let (a, b) = ab_at(k, rho);
+        .map(|(&fi, &rho)| {
+            let (a, b) = ab_at(fi, rho);
             (a as f64, b as f64)
         })
         .collect();
@@ -1140,7 +1368,23 @@ pub(crate) fn assemble(
     sample_ab: &[(f64, f64)],
     bound: bool,
 ) -> V31Plan {
-    let n = ord.len();
+    assemble_by(plans, ord.len(), |k| ord[k], grid, overlay, m, median_cost, sample_ab, bound)
+}
+
+/// [`assemble`] with the order's positions from `fi_of` (called at
+/// increasing positions: a cursor over the order on disk).
+#[allow(clippy::too_many_arguments)]
+fn assemble_by(
+    plans: Vec<LanePlan>,
+    n: usize,
+    mut fi_of: impl FnMut(usize) -> u32,
+    grid: &DctGrid,
+    overlay: Option<&Overlay>,
+    m: usize,
+    median_cost: f32,
+    sample_ab: &[(f64, f64)],
+    bound: bool,
+) -> V31Plan {
     let l = plans.len();
     let mut stats = V31Stats { n, m, median_cost, lanes: l, ..Default::default() };
     if bound {
@@ -1155,7 +1399,7 @@ pub(crate) fn assemble(
         }
         let base = share(n, l, k).start;
         for (i, d) in p.changes {
-            let fi = ord[base + i as usize];
+            let fi = fi_of(base + i as usize);
             changes.push((fi, value(grid, overlay, fi) + d));
         }
         stats.changes += changes.len() - stats.changes;
@@ -1200,39 +1444,40 @@ pub fn plan(
     let grid = cover.dct_grid(0);
     let ord = order(grid, &seeds);
     tlog("order", t);
-    let pairs = PairKey::new(&seeds.pair, grid.coeffs().len());
     let n = ord.len();
     let m = frame_bits.len();
     if m == 0 || m > n {
         return Err(StegoError::MessageTooLarge);
     }
+    // The cost samples (median for the quality score, λ for the payload
+    // split), gathered with the first group, by flat index.
+    let (samples, n_med) = sample_positions(n);
+    let sample_fis: Vec<u32> = samples.iter().map(|&k| ord[k]).collect();
+    drop(samples);
+    // The lowest memory rung: the order goes to disk now, before the costs,
+    // and the lanes read it back in lane order (`LaneSrc`).
+    let (ord, spill) = if opts.spill_order {
+        let spill = crate::stego::spill::OrderSpill::write(&ord)?;
+        drop(ord);
+        tlog("order spilled", t);
+        (Vec::new(), Some(spill))
+    } else {
+        (ord, None)
+    };
+    let pairs = PairKey::new(&seeds.pair, grid.coeffs().len());
     progress::check_cancelled()?;
 
     let l = lanes(n, m);
-    let caps = LaneCaps::of(n, m, l);
+    let caps = LaneCaps::of(n, l);
     let workers = crate::stego::memory::encode_workers();
 
-    // Groups of consecutive lanes whose positions fit `group_positions`.
-    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    let mut k0 = 0;
-    while k0 < l {
-        let mut k1 = k0 + 1;
-        while k1 < l && share(n, l, k1).end - share(n, l, k0).start <= opts.group_positions {
-            k1 += 1;
-        }
-        groups.push(k0..k1);
-        k0 = k1;
-    }
+    let groups = lane_groups(n, l, opts.group_positions);
     let meter = Meter {
         total: (0..l).map(|k| lane_work(share(n, l, k).len(), share(m, l, k).len()) as u64).sum::<u64>()
             + groups.len() as u64 * gather_work(n),
         steps: opts.progress_steps as u64,
         done: AtomicU64::new(0),
     };
-
-    // The cost samples (median for the quality score, λ for the payload
-    // split) are gathered with the first group.
-    let (samples, n_med) = sample_positions(n);
 
     let mut lam = 1.0;
     let mut median_cost = 0.0;
@@ -1249,25 +1494,35 @@ pub fn plan(
             // reuse it — +46 MB of footprint at 12 MP for no live data.
             // Same values as the gather, so the same plan.
             let dense = crate::stego::cost::uniward::dense_ac_costs(grid, luma_qt(cover)?)?;
-            let tail: Vec<f32> = samples.iter().map(|&k| dense[ord[k] as usize]).collect();
-            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si, &pairs);
+            let tail: Vec<f32> = sample_fis.iter().map(|&fi| dense[fi as usize]).collect();
+            (lam, median_cost, sample_ab) = sample_stats_fis(&sample_fis, n, n_med, &tail, m, grid, overlay, wet, si, &pairs);
             tlog("lambda", t);
             GroupCosts::Flat(dense)
-        } else if g == 0 {
-            // The group's positions and the samples in one cost pass, without
-            // copying the group's order (a copy grown by the samples was 8 B
-            // per position on top of the gather's 8).
-            let sample_fis: Vec<u32> = samples.iter().map(|&k| ord[k]).collect();
-            let mut all = crate::stego::cost::uniward::gather_ac_costs_parts(
-                grid, luma_qt(cover)?, &ord[r.clone()], &sample_fis,
-            )?;
-            drop(sample_fis);
-            let tail = all.split_off(r.len());
-            (lam, median_cost, sample_ab) = sample_stats(&ord, &samples, n_med, &tail, m, grid, overlay, wet, si, &pairs);
-            tlog("lambda", t);
-            GroupCosts::Lane(all)
         } else {
-            GroupCosts::Lane(gather_costs(cover, &ord[r.clone()])?)
+            // The group's positions: its slice of the order in memory, or read
+            // from disk for the gather only (the lanes read it again).
+            let read;
+            let group: &[u32] = match &spill {
+                Some(sp) => {
+                    read = sp.read_vec(r.clone())?;
+                    &read
+                }
+                None => &ord[r.clone()],
+            };
+            if g == 0 {
+                // The group's positions and the samples in one cost pass,
+                // without copying the group's order (a copy grown by the
+                // samples was 8 B per position on top of the gather's 8).
+                let mut all =
+                    crate::stego::cost::uniward::gather_ac_costs_parts(grid, luma_qt(cover)?, group, &sample_fis)?;
+                let tail = all.split_off(r.len());
+                (lam, median_cost, sample_ab) =
+                    sample_stats_fis(&sample_fis, n, n_med, &tail, m, grid, overlay, wet, si, &pairs);
+                tlog("lambda", t);
+                GroupCosts::Lane(all)
+            } else {
+                GroupCosts::Lane(gather_costs(cover, group)?)
+            }
         };
         meter.tick(gather_work(n) as usize);
 
@@ -1281,16 +1536,22 @@ pub fn plan(
                 overlay,
                 wet,
                 si,
-                ord: &ord[lr.clone()],
+                ord: if spill.is_some() { &[] } else { &ord[lr.clone()] },
                 rho: match &rho {
                     GroupCosts::Lane(v) => Rho::Lane(&v[lr.start - r.start..lr.end - r.start]),
                     GroupCosts::Flat(d) => Rho::Flat(d),
                 },
                 pairs: &pairs,
-                cache: None,
             };
             let threads = lane_threads(nb, workers);
-            plan_lane(&inp, &frame_bits[share(m, l, k)], lam, &seeds, opts, inline, threads, caps, &meter)
+            let bits = &frame_bits[share(m, l, k)];
+            match &spill {
+                Some(sp) => {
+                    let src = SpilledLane { inp, spill: sp, start: lr.start, len: lr.len() };
+                    plan_lane(&src, bits, lam, &seeds, opts, inline, threads, caps, &meter)
+                }
+                None => plan_lane(&inp, bits, lam, &seeds, opts, inline, threads, caps, &meter),
+            }
         };
         let batch = opts.parallel_lanes.min(workers).clamp(1, ks.len());
         for b0 in (ks.start..ks.end).step_by(batch) {
@@ -1310,11 +1571,23 @@ pub fn plan(
     }
     meter.finish();
     tlog("lanes", t);
-    Ok(assemble(plans, &ord, grid, overlay, m, median_cost, &sample_ab, opts.bound))
+    match &spill {
+        Some(sp) => {
+            let mut cursor = crate::stego::spill::OrderCursor::new(sp);
+            let p = assemble_by(plans, n, |k| cursor.get(k), grid, overlay, m, median_cost, &sample_ab, opts.bound);
+            if sp.failed() {
+                return Err(StegoError::ImageTooLarge);
+            }
+            Ok(p)
+        }
+        None => Ok(assemble(plans, &ord, grid, overlay, m, median_cost, &sample_ab, opts.bound)),
+    }
 }
 
 /// Embed `frame_bits` into `img`'s Y channel (no shadow layers): [`plan`]
-/// against the image, then write the changes.
+/// against the image, then write the changes. (The pipeline writes the
+/// changes into a fresh parse of the cover instead: `pipeline::stego_image`.)
+#[cfg(test)]
 pub fn encode(
     img: &mut JpegImage,
     frame_bits: &[u8],
@@ -2107,7 +2380,7 @@ mod tests {
     fn encode_bytes_independent_of_budget_and_workers() {
         use crate::stego::crypto::DeterministicSeedGuard;
         use crate::stego::ghost::pipeline::{ghost_decode, ghost_encode};
-        use crate::stego::memory::{budget_test_lock, ghost_lane_plan, set_memory_budget, ModeId};
+        use crate::stego::memory::{budget_test_lock, ghost_lane_plan, set_memory_budget, GhostEncodeShape};
         let cover = synth_jpeg(1600, 1600);
         let img = JpegImage::from_bytes(&cover).unwrap();
         let n = ac_count(img.dct_grid(0));
@@ -2151,7 +2424,7 @@ mod tests {
             for &b in &budgets {
                 set_memory_budget(b);
                 let p = run(&|| {
-                    let p = ghost_lane_plan(ModeId::GhostNoShadow, 1600, 1600, n, m, V31_STC_H);
+                    let p = ghost_lane_plan(&GhostEncodeShape::of_cover(&img, false, m, &[]), V31_STC_H);
                     format!("{:?}/{}/{}/{}", p.rung, p.parallel_lanes, p.lane_inline_bytes, p.group_positions).into_bytes()
                 });
                 let out = run(&|| ghost_encode(&cover, &msg, "budget").unwrap());
@@ -2174,28 +2447,26 @@ mod tests {
     /// Peak lane memory does not grow as the message shrinks: at every frame
     /// size the lanes of a batch (as `plan` runs them, on 4 or 6 workers)
     /// stay within the large-frame case, because longer lanes keep only their
-    /// share of a table and recompute the rest. (The one exception is the
-    /// lane vectors alone, 8 B per position: one lane over a whole 48 MP
-    /// cover holds 384 MB of them, over the 4-worker large-frame case.)
+    /// share of a table and recompute the rest (a lane keeps no per-position
+    /// vectors: 3 bits per position).
     #[test]
     fn lane_memory_does_not_grow_for_small_frames() {
         for workers in [4usize, 6] {
-            for n in [12_002_256usize, 48_009_024] {
-                // (lanes' working set, their vectors alone)
+            for n in [12_002_256usize, 48_009_024, 147_225_600] {
                 let total = |m: usize| {
                     let l = lanes(n, m);
                     let k = workers.min(l);
                     let nk = share(n, l, 0).len();
                     let inline = crate::stego::memory::LANE_INLINE_BYTES.min(lane_inline_share(n, nk, k, V31_STC_H, workers));
-                    (k * lane_bytes(nk, m.div_ceil(l), V31_STC_H, inline, lane_threads(k, workers)), k * nk * 8)
+                    k * lane_bytes(nk, m.div_ceil(l), V31_STC_H, inline, lane_threads(k, workers))
                 };
-                let full = [n / 16, n / 8, n / 5].into_iter().map(|m| total(m).0).max().unwrap();
+                let full = [n / 16, n / 8, n / 5].into_iter().map(total).max().unwrap();
                 // Checkpoints and the wave buffers of the recomputed part
                 // (one message block each: 12 MB for a 64-byte frame on 48 MP).
                 let slack = n * 2;
                 for m in [500usize, 4_000, 9_000, 25_000, 50_000, 400_000] {
-                    let (t, vectors) = total(m);
-                    assert!(t <= full.max(vectors) + slack, "workers {workers} n={n} m={m}: lanes {t} B > full-lane {full} B");
+                    let t = total(m);
+                    assert!(t <= full + slack, "workers {workers} n={n} m={m}: lanes {t} B > full-lane {full} B");
                 }
             }
         }
@@ -2240,6 +2511,76 @@ mod tests {
         }
     }
 
+    /// The lowest memory rung (the keyed order on disk, read back in lane
+    /// order) plans the same changes: with and without shadow layers' wet
+    /// positions and overlay, across cost groups, lanes at once, in-memory and
+    /// checkpointed trellises and worker counts; and leaves no file behind.
+    /// A failing read ends the plan with `ImageTooLarge`, never a panic.
+    #[cfg(unix)]
+    #[test]
+    fn plan_with_the_order_on_disk_is_the_same() {
+        use crate::stego::rng_compat::Rand08;
+        use crate::stego::spill;
+        use rand::SeedableRng;
+        let _guard = crate::stego::memory::budget_test_lock();
+        let dir = spill::tests::test_dir("v31");
+        spill::set_spill_dir(Some(dir.clone()), spill::tests::plenty);
+        let cover = JpegImage::from_bytes(&synth_jpeg(1600, 1600)).unwrap();
+        let grid = cover.dct_grid(0);
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(11);
+        let key = [0x5au8; 64];
+        // A shadow-like layer: wet positions with values of their own.
+        let mut wet = wet_mask_for(&cover);
+        let mut overlay = Overlay::default();
+        let blocks = (grid.coeffs().len() / 64) as u32;
+        for _ in 0..5000 {
+            let fi = (rng.gen08::<u32>() % blocks) * 64 + 1 + rng.gen08::<u32>() % 63;
+            wet.set(fi);
+            overlay.set(fi, value(grid, None, fi) + 1);
+        }
+        let spilled = |o: EncodeOpts| EncodeOpts { spill_order: true, ..o };
+        for m in [3_000usize, 40_000] {
+            let bits: Vec<u8> = (0..m).map(|_| rng.gen08::<u8>() & 1).collect();
+            for (w, o) in [(None, None), (Some(&wet), Some(&overlay))] {
+                let base = plan(&cover, &bits, &key, None, w, o, &EncodeOpts::default()).unwrap();
+                let cases = [
+                    spilled(EncodeOpts::default()),
+                    spilled(EncodeOpts { group_positions: 1, ..Default::default() }),
+                    spilled(EncodeOpts { parallel_lanes: 1, lane_inline_bytes: 0, ..Default::default() }),
+                    spilled(EncodeOpts { group_positions: 1_500_000, parallel_lanes: 2, lane_inline_bytes: 0, ..Default::default() }),
+                ];
+                for opts in &cases {
+                    let p = plan(&cover, &bits, &key, None, w, o, opts).unwrap();
+                    assert_eq!(p.changes, base.changes, "m={m} shadows={} {opts:?}", w.is_some());
+                    assert_eq!(p.stats.distortion.to_bits(), base.stats.distortion.to_bits());
+                    assert_eq!(p.stats.median_cost.to_bits(), base.stats.median_cost.to_bits());
+                }
+                #[cfg(feature = "parallel")]
+                {
+                    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+                    for opts in [&cases[0], &cases[2]] {
+                        let p = one.install(|| plan(&cover, &bits, &key, None, w, o, opts)).unwrap();
+                        assert_eq!(p.changes, base.changes, "m={m} one worker {opts:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "no spill file left");
+        // A read that fails mid-plan: a clean error.
+        let bits: Vec<u8> = (0..3_000).map(|_| rng.gen08::<u8>() & 1).collect();
+        spill::tests::FAIL_READS.store(true, Ordering::Relaxed);
+        for opts in [spilled(EncodeOpts::default()), spilled(EncodeOpts { group_positions: 1, ..Default::default() })] {
+            let r = plan(&cover, &bits, &key, None, None, None, &opts);
+            assert!(matches!(r, Err(StegoError::ImageTooLarge)), "{:?}", r.err());
+        }
+        spill::tests::FAIL_READS.store(false, Ordering::Relaxed);
+        // No spill directory: the rung cannot write its file.
+        spill::set_spill_dir(None, spill::tests::plenty);
+        let r = plan(&cover, &bits, &key, None, None, None, &spilled(EncodeOpts::default()));
+        assert!(matches!(r, Err(StegoError::ImageTooLarge)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn lane_geometry() {
         assert_eq!(lanes(258_048, 10_000), 1);
@@ -2281,16 +2622,71 @@ mod tests {
         }
     }
 
-    /// The split encode (`session.rs`: cost bands, lane layers, split
-    /// trellises with segments traced on their helpers, results out of
-    /// order) gives exactly `ghost_encode_with_files`'s bytes, for any
-    /// number of helpers, with and without Deep Cover side information.
+    /// A lane's kept layer-1 input (`Layer1Keep`, the split encode's
+    /// coordinator) gives exactly the inputs computed from the cover: layer 2
+    /// with a keep hands out what it hands out without one, and layer 1 read
+    /// from the keep equals layer 1 computed again. The keep is sized for
+    /// layer 2's positions, which can outnumber layer 1's (header-only
+    /// layers of short lanes: 300 positions, 3 bits = 252 / 260).
+    #[test]
+    fn layer1_keep_matches_direct_inputs() {
+        use trellis::{TrellisChunk, TrellisInput};
+        fn collect(input: &dyn TrellisInput, n: usize) -> (Vec<u8>, Vec<u32>) {
+            let (mut cover, mut costs) = (Vec::new(), Vec::new());
+            let mut buf = TrellisChunk::default();
+            let mut j = 0;
+            while j < n {
+                let (c, f) = input.chunk(j, n, &mut buf);
+                cover.extend_from_slice(c);
+                costs.extend(f.iter().map(|x| x.to_bits()));
+                j += c.len();
+            }
+            (cover, costs)
+        }
+        let cover = synth_jpeg(480, 320);
+        let img = JpegImage::from_bytes(&cover).unwrap();
+        let grid = img.dct_grid(0);
+        let seeds = v31_seeds(&[7u8; 64]);
+        let ord = order(grid, &seeds);
+        let pairs = PairKey::new(&seeds.pair, grid.coeffs().len());
+        let dense = crate::stego::cost::uniward::dense_ac_costs(grid, luma_qt(&img).unwrap()).unwrap();
+        let mut checked_longer_layer2 = false;
+        for (nk, bits) in [(300usize, 3usize), (300, 9), (4000, 9), (5000, 90), (19000, 2000)] {
+            let g = LaneGeom::new(nk, bits).unwrap();
+            if g.m2 == 0 || g.n2() < g.n1() {
+                continue; // the session keeps layer 1's input only then
+            }
+            checked_longer_layer2 |= g.n2() > g.n1();
+            let inp = LaneInput { grid, overlay: None, wet: None, si: None, ord: &ord[..nk], rho: Rho::Flat(&dense), pairs: &pairs };
+            let caps = LaneCaps::of(nk, 1);
+            let keep = Layer1Keep::new(g.n2());
+            let (c2a, c2b) = (caps.atomic_bits(g.n2()), caps.atomic_bits(g.n2()));
+            let kept2 = collect(&lane_layer_input(&inp, 2, 1.7, &[], &c2a, Some(&keep)), g.n2());
+            assert_eq!(kept2, collect(&lane_layer_input(&inp, 2, 1.7, &[], &c2b, None), g.n2()), "layer 2, {nk}/{bits}");
+            let mut flip2 = caps.bits(g.nk);
+            for (i, w) in flip2.iter_mut().enumerate() {
+                *w = 0x9E37_79B9_7F4A_7C15u64.rotate_left(i as u32);
+            }
+            let (c1a, c1b) = (caps.atomic_bits(g.n1()), caps.atomic_bits(g.n1()));
+            let kept1 = collect(&lane_layer_input(&inp, 1, 1.7, &flip2, &c1a, Some(&keep)), g.n1());
+            assert_eq!(kept1, collect(&lane_layer_input(&inp, 1, 1.7, &flip2, &c1b, None), g.n1()), "layer 1, {nk}/{bits}");
+        }
+        assert!(checked_longer_layer2, "no geometry with a longer layer 2");
+    }
+
+    /// The split encode (`session.rs`: cost bands, whole lane layers, split
+    /// layers as forward chains and segments traced on their helpers,
+    /// results out of order) gives exactly `ghost_encode_with_files`'s
+    /// bytes, for any number of helpers, with and without Deep Cover side
+    /// information, and under budgets whose plans have several cost groups.
     #[test]
     fn split_encode_is_byte_identical() {
         use crate::stego::crypto::DeterministicSeedGuard;
         use crate::stego::ghost::pipeline::{ghost_encode_si_with_files, ghost_encode_with_files};
         use crate::stego::ghost::session::run_split_encode_locally;
+        use crate::stego::memory::{budget_test_lock, set_memory_budget};
         use crate::stego::payload::FileEntry;
+        let _b = budget_test_lock();
         let _g = DeterministicSeedGuard::set("31");
         let small = load("photo_640x480_q75_420.jpg");
         let big = synth_jpeg(2400, 1800);
@@ -2307,8 +2703,8 @@ mod tests {
                 })
                 .collect()
         };
-        // (cover, message, files, helper counts, split trellises expected
-        // at the largest count)
+        // (cover, message, files, helper counts, split layers expected at
+        // the largest count)
         for (cover, msg, fl, helper_counts, split) in [
             (&small, "short".to_string(), &[][..], &[1usize, 2, 5][..], false), // one in-memory lane
             (&small, noise(600), &files[..], &[1, 3][..], false),
@@ -2324,11 +2720,26 @@ mod tests {
                     assert_eq!(counts[3] > 0 && counts[5] > 0, split, "split use, msg len {} {counts:?}", msg.len());
                 }
             }
-            if split {
-                // Pass A in the coordinator (the large-cover rule, forced).
+            // Every layer split (as a layer larger than the plan's lane
+            // working set is).
+            if !split {
                 let (got, _, counts) = run_split_encode_locally(cover, &msg, fl, "split", None, 3, Some(0)).unwrap();
-                assert!(got == want, "local pass A, msg len {}", msg.len());
-                assert!(counts[0] > 0 && counts[3] == 0 && counts[5] > 0, "local pass A use {counts:?}");
+                assert!(got == want, "all split, msg len {}", msg.len());
+                assert!(counts[2] == 0 && counts[3] > 0 && counts[4] > 0 && counts[5] > 0, "all split {counts:?}");
+            }
+            // Budgets whose plans gather the costs in several groups (1 MB:
+            // one lane per group) or keep one (64 MB).
+            if cover == &big && msg.len() == 1500 {
+                for budget in [1usize << 20, 64 << 20] {
+                    set_memory_budget(Some(budget));
+                    let r = run_split_encode_locally(cover, &msg, fl, "split", None, 3, None);
+                    set_memory_budget(None);
+                    let (got, _, counts) = r.unwrap();
+                    assert!(got == want, "budget {budget}, msg len {}", msg.len());
+                    if budget == 1 << 20 {
+                        assert!(counts[1] > 8, "one cost pass per group {counts:?}");
+                    }
+                }
             }
         }
         let img = JpegImage::from_bytes(&small).unwrap();
@@ -2338,6 +2749,10 @@ mod tests {
             let (got, _, _) = run_split_encode_locally(&small, &"si ".repeat(50), &[], "split", Some((&rgb, w, h)), helpers, None).unwrap();
             assert!(got == want, "si helpers {helpers}");
         }
+        set_memory_budget(Some(1 << 20));
+        let r = run_split_encode_locally(&small, &"si ".repeat(50), &[], "split", Some((&rgb, w, h)), 2, None);
+        set_memory_budget(None);
+        assert!(r.unwrap().0 == want, "si, 1 MB budget");
     }
 
     /// Deep Cover (SI) primary round trip.

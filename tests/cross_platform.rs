@@ -379,3 +379,28 @@ fn sincos_pythagorean_identity_full_range() {
         assert!(err < 1e-14, "sin²+cos² = {} at x={x} (err={err})", s * s + c * c);
     }
 }
+
+// ===========================================================================
+// 13. Realigned Deep Cover cover (crop 4 px + resample back) is pinned
+// ===========================================================================
+
+/// A same-size Ghost cover of an AVIF source is realigned by `build_cover`
+/// (4 px cropped off the top and left, `resample_rgb` back to the same size)
+/// and those pixels are the exact side information the encode gets. The
+/// resampler's weights come from `det_sin` and its passes are integer, so
+/// the pixels and the cover must be the same bytes on every target (WASM
+/// checked through `wasm-bridge` `build_cover` in Node, 2026-11-21).
+#[test]
+fn pin_realigned_cover() {
+    use phasm_core::{build_cover, ArmorCoverPreset, CoverMode, CoverRequest};
+    use sha2::{Digest, Sha256};
+    let hex = |b: &[u8]| -> String { Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect() };
+    let (w, h) = (211u32, 203u32);
+    let rgb: Vec<u8> = (0..(w * h * 3) as usize).map(|i| ((i * 37 + (i / 7) * 11 + (i / 633) * 5) % 251) as u8).collect();
+    let avif = b"\0\0\0\x14ftypavif\0\0\0\0avif";
+    let req = CoverRequest { mode: CoverMode::Ghost, wand: true, ghost_quality: None, ghost_max_side: None, armor_preset: ArmorCoverPreset::Standard };
+    let out = build_cover(avif, Some((&rgb, w, h)), &req).unwrap();
+    assert_eq!((out.width, out.height, out.si_is_input), (w, h, false));
+    assert_eq!(hex(out.si_pixels.as_deref().unwrap()), "26e955932d57b399bdc1504640f74ddfc47972c3a086eaa300f1514414b3d83a");
+    assert_eq!(hex(&out.jpeg), "43ed5aa9a7a841249239b89caa1a33482c5f1b1e324f440d72d55ec375157506");
+}

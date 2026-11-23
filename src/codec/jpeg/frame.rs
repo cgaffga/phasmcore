@@ -102,7 +102,9 @@ pub fn parse_sof_ext(data: &[u8], progressive: bool) -> Result<FrameInfo> {
     let width = u16::from_be_bytes([data[3], data[4]]);
     let num_components = data[5] as usize;
 
-    if width == 0 || height == 0 {
+    // No component: no sampling factor to size an MCU by (the MCU size below
+    // divides by it; a crafted header used to panic here).
+    if width == 0 || height == 0 || num_components == 0 {
         return Err(JpegError::InvalidDimensions);
     }
     if data.len() < 6 + num_components * 3 {
@@ -247,5 +249,28 @@ mod tests {
             parse_sof(&data),
             Err(JpegError::UnsupportedPrecision(12))
         ));
+    }
+
+    /// A frame with no component (or a zero size, or a sampling factor of 0)
+    /// is invalid, never a division by zero: the MCU size divides by the
+    /// largest sampling factor. Through the whole file too (the parse, the
+    /// coefficient count and the decode estimate).
+    #[test]
+    fn reject_frame_without_components() {
+        assert!(matches!(parse_sof(&[8, 0, 8, 0, 8, 0]), Err(JpegError::InvalidDimensions)));
+        assert!(matches!(parse_sof_ext(&[8, 0, 8, 0, 8, 0], true), Err(JpegError::InvalidDimensions)));
+        assert!(matches!(parse_sof(&[8, 0, 0, 0, 8, 1, 1, 0x11, 0]), Err(JpegError::InvalidDimensions)));
+        assert!(matches!(parse_sof(&[8, 0, 8, 0, 8, 1, 1, 0x01, 0]), Err(JpegError::InvalidDimensions)));
+        assert!(matches!(parse_sof(&[8, 0, 8, 0, 8, 1, 1, 0x10, 0]), Err(JpegError::InvalidDimensions)));
+        for marker in [0xC0u8, 0xC2] {
+            // SOI, the frame (8 x 8, no component), SOS, EOI
+            let file = [
+                0xFF, 0xD8, 0xFF, marker, 0, 8, 8, 0, 8, 0, 8, 0, 0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0, 0xFF, 0xD9,
+            ];
+            assert!(crate::codec::jpeg::JpegImage::from_bytes(&file).is_err());
+            assert!(crate::codec::jpeg::count::coefficient_shape(&file).is_err());
+            assert!(crate::codec::jpeg::count::frame_shape(&file).is_err());
+            assert_eq!(crate::stego::decode_peak_bytes(&file), 1 << 20);
+        }
     }
 }

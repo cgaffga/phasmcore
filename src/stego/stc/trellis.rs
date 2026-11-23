@@ -324,22 +324,132 @@ pub fn embed_code(
     threads: usize,
     tick: &(dyn Fn(usize) + Sync),
 ) -> Result<Option<Plan>, StegoError> {
-    let m = message.len();
-    if h == 0 || h > MAX_H || m != code.m() {
-        return Ok(None);
-    }
     let n = code.n();
     if n > cover.len() || n > costs.len() {
         return Ok(None);
     }
+    let input = Slices { cover: &cover[..n], costs: &costs[..n] };
+    let mut bits = vec![0u8; n];
+    let Some(total_cost) = run(&input, n, message, code, h, inline_limit_bytes, threads, tick, &mut bits[..])? else {
+        return Ok(None);
+    };
+    Ok(Some(plan_of(&cover[..n], bits, total_cost)))
+}
+
+/// Where a trellis reads the cover bit (LSB) and the flip cost of each
+/// position: stored ([`embed_code`]'s slices) or computed on demand, a chunk
+/// of consecutive positions at a time (the Ghost lanes, which keep no
+/// per-position arrays: `ghost::v31`). The trellis asks for every position at
+/// least once, in increasing order within a pass, possibly from several
+/// threads at once (recomputed segments); a position's values must not
+/// depend on when or how often they are asked for.
+pub trait TrellisInput: Sync {
+    /// Cover bits and costs of positions `j0 .. j0 + k` for some
+    /// `1 ≤ k ≤ j1 − j0` (`j0 < j1`): borrowed from the input, or computed
+    /// into `buf` (whose allocations a pass reuses).
+    fn chunk<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut TrellisChunk) -> (&'s [u8], &'s [f32]);
+}
+
+/// Scratch of a [`TrellisInput`] that computes its chunks.
+#[derive(Default)]
+pub struct TrellisChunk {
+    pub cover: Vec<u8>,
+    pub costs: Vec<f32>,
+}
+
+/// Stored cover bits and costs (equal lengths).
+pub struct Slices<'a> {
+    cover: &'a [u8],
+    costs: &'a [f32],
+}
+
+impl<'a> Slices<'a> {
+    /// The first `min(cover.len(), costs.len())` positions of `cover` and
+    /// `costs`.
+    pub fn new(cover: &'a [u8], costs: &'a [f32]) -> Self {
+        let n = cover.len().min(costs.len());
+        Self { cover: &cover[..n], costs: &costs[..n] }
+    }
+}
+
+impl TrellisInput for Slices<'_> {
+    fn chunk<'s>(&'s self, j0: usize, j1: usize, _buf: &'s mut TrellisChunk) -> (&'s [u8], &'s [f32]) {
+        (&self.cover[j0..j1], &self.costs[j0..j1])
+    }
+}
+
+/// [`embed_code`] over a [`TrellisInput`] of `n_avail` positions, the stego
+/// bits bit-packed (bit `j mod 64` of word `j / 64`; 1/8 B per position
+/// instead of 1 B), with the trellis optimum. The same plan as `embed_code`
+/// on the same cover bits and costs.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_packed(
+    input: &dyn TrellisInput,
+    n_avail: usize,
+    message: &[u8],
+    code: &Code,
+    h: usize,
+    inline_limit_bytes: usize,
+    threads: usize,
+    tick: &(dyn Fn(usize) + Sync),
+) -> Result<Option<(Vec<u64>, f64)>, StegoError> {
+    let n = code.n();
+    if n > n_avail {
+        return Ok(None);
+    }
+    let mut words = vec![0u64; n.div_ceil(64)];
+    let Some(total_cost) = run(input, n, message, code, h, inline_limit_bytes, threads, tick, &mut words[..])? else {
+        return Ok(None);
+    };
+    Ok(Some((words, total_cost)))
+}
+
+/// Plan into `out` (zeroed, `code.n()` positions); `None` if infeasible.
+#[allow(clippy::too_many_arguments)]
+fn run<S: BitSink + ?Sized>(
+    input: &dyn TrellisInput,
+    n: usize,
+    message: &[u8],
+    code: &Code,
+    h: usize,
+    inline_limit_bytes: usize,
+    threads: usize,
+    tick: &(dyn Fn(usize) + Sync),
+    out: &mut S,
+) -> Result<Option<f64>, StegoError> {
+    let m = message.len();
+    if h == 0 || h > MAX_H || m != code.m() {
+        return Ok(None);
+    }
     if m == 0 {
-        return Ok(Some(Plan { stego_bits: Vec::new(), total_cost: 0.0, changes: 0 }));
+        return Ok(Some(0.0));
     }
     let sets = code.masked_sets(h);
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: 0, p_off: 0, h };
+    let t = Trellis { input, message, code, sets: &sets, b_off: 0, p_off: 0, h };
     match code_schedule(code, h, inline_limit_bytes, threads) {
-        None => t.inline(&Progress::new(n, n, tick)),
-        Some(s) => t.checkpointed(s, &Progress::new(n + t.pos(m - s.tail), n, tick)),
+        None => t.inline(&Progress::new(n, n, tick), out),
+        Some(s) => t.checkpointed(s, &Progress::new(n + t.pos(m - s.tail), n, tick), out),
+    }
+}
+
+/// Where a traceback writes the stego bits (local positions; each written
+/// exactly once).
+trait BitSink {
+    fn put(&mut self, j: usize, bit: u8);
+}
+
+impl BitSink for [u8] {
+    #[inline]
+    fn put(&mut self, j: usize, bit: u8) {
+        self[j] = bit;
+    }
+}
+
+/// Bit-packed, zero-initialised.
+impl BitSink for [u64] {
+    #[inline]
+    fn put(&mut self, j: usize, bit: u8) {
+        self[j >> 6] |= (bit as u64) << (j & 63);
     }
 }
 
@@ -347,8 +457,7 @@ pub fn embed_code(
 /// local block `b` is code block `b_off + b`, local position `j` is code
 /// position `p_off + j` (`p_off = code.start(b_off)`).
 struct Trellis<'a> {
-    cover: &'a [u8],
-    costs: &'a [f32],
+    input: &'a dyn TrellisInput,
     message: &'a [u8],
     code: &'a Code,
     sets: &'a [Vec<usize>; 3],
@@ -415,12 +524,6 @@ impl Ticker<'_> {
 }
 
 impl Trellis<'_> {
-    #[inline]
-    fn costs_at(&self, j: usize) -> (f64, f64) {
-        let c = self.costs[j] as f64;
-        if self.cover[j] & 1 == 0 { (0.0, c) } else { (c, 0.0) }
-    }
-
     /// Local first position of local block `b` (`b ≤ message.len()`).
     #[inline]
     fn pos(&self, b: usize) -> usize {
@@ -455,14 +558,33 @@ impl Trellis<'_> {
         let ns = 1usize << self.h;
         let wps = words_per_step(self.h);
         let base = self.pos(b0);
+        let end = self.pos(b1);
+        // The input's current chunk: positions `[lo, hi)`.
+        let mut buf = TrellisChunk::default();
+        let (mut lo, mut hi) = (0usize, 0usize);
+        let (mut wc, mut wf): (&[u8], &[f32]) = (&[], &[]);
         for b in b0..b1 {
             on_block_start(b, prev);
             let (j0, w, cols) = self.block(b);
-            let block_rows = rows.as_deref_mut().map(|r| {
+            let mut block_rows = rows.as_deref_mut().map(|r| {
                 let k = (j0 - base) * wps;
                 &mut r[k..k + w * wps]
             });
-            self.forward_block(prev, cur, j0, cols, block_rows, ticker)?;
+            // The block's steps, a chunk of the input at a time.
+            let mut c = 0;
+            while c < w {
+                let j = j0 + c;
+                if j >= hi {
+                    (wc, wf) = self.input.chunk(j, end, &mut buf);
+                    debug_assert!(!wc.is_empty() && wc.len() == wf.len() && j + wc.len() <= end);
+                    (lo, hi) = (j, j + wc.len());
+                }
+                let take = (w - c).min(hi - j);
+                let k = j - lo;
+                let part_rows = block_rows.as_deref_mut().map(|r| &mut r[c * wps..(c + take) * wps]);
+                self.forward_steps(prev, cur, &wc[k..k + take], &wf[k..k + take], &cols[c..c + take], part_rows, ticker)?;
+                c += take;
+            }
             // Message shift: keep states whose low bit is the message bit.
             let bit = (self.message[b] & 1) as usize;
             for t in 0..ns / 2 {
@@ -476,27 +598,31 @@ impl Trellis<'_> {
         Ok(())
     }
 
-    /// The trellis steps of one message block (its positions from `j0`, one
-    /// per column of `cols`, before its message shift), back pointers into
-    /// `rows` (`cols.len() · words_per_step(h)` words) if given.
+    /// Trellis steps of consecutive positions of one message block (before
+    /// its message shift): cover bits `cover`, costs `costs`, one column of
+    /// `cols` each; back pointers into `rows` (`cols.len() ·
+    /// words_per_step(h)` words) if given.
     ///
     /// Not inlined on wasm32, like [`step`]: a trellis is one `forward` call,
     /// and V8 keeps a call in baseline code (Liftoff) until it returns, so
     /// the per-step bookkeeping ran unoptimized for a whole first pass
     /// (measured: pass A of a 12 MP single-lane layer 5.1 s cold, 2.5 s warm).
+    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(target_arch = "wasm32", inline(never))]
-    fn forward_block(
+    fn forward_steps(
         &self,
         prev: &mut Vec<f64>,
         cur: &mut Vec<f64>,
-        j0: usize,
+        cover: &[u8],
+        costs: &[f32],
         cols: &[usize],
         mut rows: Option<&mut [u64]>,
         ticker: &mut Ticker<'_>,
     ) -> Result<(), StegoError> {
         let wps = words_per_step(self.h);
         for (c, &col) in cols.iter().enumerate() {
-            let (c0, c1) = self.costs_at(j0 + c);
+            let cost = costs[c] as f64;
+            let (c0, c1) = if cover[c] & 1 == 0 { (0.0, cost) } else { (cost, 0.0) };
             match rows.as_deref_mut() {
                 Some(r) => step::<true>(prev, cur, &mut r[c * wps..(c + 1) * wps], col, c0, c1),
                 None => step::<false>(prev, cur, &mut [], col, c0, c1),
@@ -511,7 +637,7 @@ impl Trellis<'_> {
     /// `b1 − 1`'s shift) through `rows` (back pointers of those blocks, from
     /// block `b0`'s first position), writing their stego bits into `out`
     /// (local positions). Returns the state at the start of `b0`.
-    fn traceback(&self, rows: &[u64], b0: usize, b1: usize, mut state: usize, out: &mut [u8]) -> usize {
+    fn traceback<S: BitSink + ?Sized>(&self, rows: &[u64], b0: usize, b1: usize, mut state: usize, out: &mut S) -> usize {
         let ns = 1usize << self.h;
         let mask = ns - 1;
         let wps = words_per_step(self.h);
@@ -524,18 +650,13 @@ impl Trellis<'_> {
                 let k = (j - base) * wps;
                 let (wi, bi) = bp_bit(state, ns);
                 let bit = ((rows[k + wi] >> bi) & 1) as u8;
-                out[j] = bit;
+                out.put(j, bit);
                 if bit == 1 {
                     state ^= cols[c];
                 }
             }
         }
         state
-    }
-
-    fn finish(&self, stego_bits: Vec<u8>, total_cost: f64) -> Plan {
-        let changes = stego_bits.iter().zip(self.cover).filter(|(s, c)| (**s ^ **c) & 1 != 0).count();
-        Plan { stego_bits, total_cost, changes }
     }
 
     fn initial(&self) -> (Vec<f64>, Vec<f64>) {
@@ -545,7 +666,8 @@ impl Trellis<'_> {
         (prev, vec![0.0; ns])
     }
 
-    fn inline(&self, progress: &Progress<'_>) -> Result<Option<Plan>, StegoError> {
+    /// The stego bits into `out` (zeroed); the optimum, `None` if infeasible.
+    fn inline<S: BitSink + ?Sized>(&self, progress: &Progress<'_>, out: &mut S) -> Result<Option<f64>, StegoError> {
         let m = self.message.len();
         let n = self.pos(m);
         let mut ticker = progress.ticker();
@@ -557,13 +679,13 @@ impl Trellis<'_> {
         if cost == f64::INFINITY {
             return Ok(None);
         }
-        let mut bits = vec![0u8; n];
-        let s0 = self.traceback(&rows, 0, m, best, &mut bits);
+        let s0 = self.traceback(&rows, 0, m, best, out);
         debug_assert_eq!(s0, 0);
-        Ok(Some(self.finish(bits, cost)))
+        Ok(Some(cost))
     }
 
-    fn checkpointed(&self, s: Schedule, progress: &Progress<'_>) -> Result<Option<Plan>, StegoError> {
+    /// [`Self::inline`] on the checkpointed schedule `s`.
+    fn checkpointed<S: BitSink + ?Sized>(&self, s: Schedule, progress: &Progress<'_>, out: &mut S) -> Result<Option<f64>, StegoError> {
         let m = self.message.len();
         let n = self.pos(m);
         let head = m - s.tail;
@@ -606,8 +728,7 @@ impl Trellis<'_> {
         if cost == f64::INFINITY {
             return Ok(None);
         }
-        let mut bits = vec![0u8; n];
-        let mut state = self.traceback(&buf[..tail_words], head, m, best, &mut bits);
+        let mut state = self.traceback(&buf[..tail_words], head, m, best, out);
 
         // Pass B: the head's segments from the end, `wave` at a time, back
         // pointers recomputed from their checkpoints.
@@ -654,18 +775,20 @@ impl Trellis<'_> {
                 let (b0, b1) = span(sg);
                 let off = (self.pos(b0) - base) * wps;
                 let len = (self.pos(b1) - self.pos(b0)) * wps;
-                state = self.traceback(&buf[off..off + len], b0, b1, state, &mut bits);
+                state = self.traceback(&buf[off..off + len], b0, b1, state, out);
             }
             checkpoints.truncate(lo);
             hi = lo;
         }
         debug_assert_eq!(state, 0);
-        Ok(Some(self.finish(bits, cost)))
+        Ok(Some(cost))
     }
 }
 
-/// Lowest-index state of minimum cost (as `embed::find_best_state`).
-fn best_state(costs: &[f64]) -> (usize, f64) {
+/// Lowest-index state of minimum cost (as `embed::find_best_state`): the
+/// terminal state of a trellis from its final state costs, and its cost
+/// (`+∞`: infeasible).
+pub fn best_state(costs: &[f64]) -> (usize, f64) {
     let mut best = 0;
     let mut best_cost = f64::INFINITY;
     for (s, &c) in costs.iter().enumerate() {
@@ -930,115 +1053,106 @@ unsafe fn step_simd128<const ROWS: bool>(prev: &[f64], cur: &mut [f64], row: &mu
     }
 }
 
-/// Pass A of the checkpointed schedule, for a host that recomputes the
-/// segments elsewhere ([`segment_rows`], [`segment_trace`]; the website's
-/// Web Workers, `ghost::session`): state costs at the start of every `k`-th
-/// message block, and the terminal state.
-#[derive(Debug, Clone)]
-pub struct PassA {
-    /// `2^h` state costs at the start of blocks `0, k, 2k, …` (segment order).
-    pub checkpoints: Vec<f64>,
-    /// Lowest-index terminal state of minimum cost.
-    pub best: usize,
-    /// Its cost (the trellis optimum).
-    pub cost: f64,
+/// The state costs a trellis starts from (state 0 at cost 0, every other
+/// state unreachable): the checkpoint of its first segment
+/// ([`segment_forward`]).
+pub fn initial_costs(h: usize) -> Vec<f64> {
+    let mut c = vec![f64::INFINITY; 1usize << h.min(MAX_H)];
+    c[0] = 0.0;
+    c
 }
 
-/// The checkpointed schedule split up: the forward pass over all `m`
-/// blocks of `code` keeping the state costs at every `k`-th block boundary.
-/// `Ok(None)` if infeasible or the cover is too short. With [`segment_rows`]
-/// and [`segment_trace`] run over the segments `[s·k, min((s+1)·k, m))` from
-/// the last to the first, the stego bits are bit for bit [`embed_code`]'s.
-pub fn pass_a(
-    cover: &[u8],
-    costs: &[f32],
+/// The trellis of a segment of `code` (see [`segment_forward`]).
+fn segment<'a>(
+    input: &'a dyn TrellisInput,
+    message: &'a [u8],
+    code: &'a Code,
+    b0: usize,
+    h: usize,
+    sets: &'a [Vec<usize>; 3],
+) -> Result<Trellis<'a>, StegoError> {
+    if h == 0 || h > MAX_H || b0.checked_add(message.len()).is_none_or(|e| e > code.m()) {
+        return Err(StegoError::MessageTooLarge);
+    }
+    Ok(Trellis { input, message, code, sets, b_off: b0, p_off: code.start(b0), h })
+}
+
+/// The checkpointed schedule split up, for a host that runs it in pieces
+/// elsewhere (the website's Web Workers, `ghost::session`). A *segment* of
+/// `code` is its blocks `[b0, b0 + message.len())` (`message`: their message
+/// bits), `input` its positions `[code.start(b0), …)` counted from the
+/// segment's first one. [`segment_forward`] chained over the segments from
+/// the first gives every segment's checkpoint (the state costs at its first
+/// block) and the final costs ([`best_state`]); [`segment_rows`] and
+/// [`segment_trace`] then trace the segments from the last to the first.
+/// The stego bits and the optimum are bit for bit [`embed_code`]'s (the same
+/// arithmetic in the same order; `split_schedule_equals_embed`).
+///
+/// This function: the forward pass of one segment from `start`, the state
+/// costs at its first block (`2^h` values: [`initial_costs`] for the first
+/// segment, else the previous segment's return value); returns the state
+/// costs after its last block's message shift.
+pub fn segment_forward(
+    input: &dyn TrellisInput,
     message: &[u8],
     code: &Code,
+    b0: usize,
     h: usize,
-    k: usize,
-    tick: &(dyn Fn(usize) + Sync),
-) -> Result<Option<PassA>, StegoError> {
-    let m = message.len();
-    let k = k.max(1);
-    if h == 0 || h > MAX_H || m == 0 || m != code.m() {
-        return Ok(None);
-    }
-    let n = code.n();
-    if n > cover.len() || n > costs.len() {
-        return Ok(None);
-    }
+    start: &[f64],
+) -> Result<Vec<f64>, StegoError> {
     let sets = code.masked_sets(h);
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: 0, p_off: 0, h };
-    let progress = Progress::new(n, n, tick);
-    let mut ticker = progress.ticker();
-    let (mut prev, mut cur) = t.initial();
-    let ns = 1usize << h;
-    let mut checkpoints = Vec::with_capacity(m.div_ceil(k) * ns);
-    t.forward(
-        &mut prev,
-        &mut cur,
-        0,
-        m,
-        None,
-        &mut |b, p| {
-            if b % k == 0 {
-                checkpoints.extend_from_slice(p);
-            }
-        },
-        &mut ticker,
-    )?;
-    ticker.flush()?;
-    let (best, cost) = best_state(&prev);
-    if cost == f64::INFINITY {
-        return Ok(None);
+    let t = segment(input, message, code, b0, h, &sets)?;
+    if start.len() != 1usize << h {
+        return Err(StegoError::MessageTooLarge);
     }
-    Ok(Some(PassA { checkpoints, best, cost }))
+    let progress = Progress::new(t.pos(message.len()), 0, &|_| {});
+    let mut ticker = progress.ticker();
+    let mut prev = start.to_vec();
+    let mut cur = vec![0.0; prev.len()];
+    t.forward(&mut prev, &mut cur, 0, message.len(), None, &mut |_, _| {}, &mut ticker)?;
+    ticker.flush()?;
+    Ok(prev)
 }
 
-/// Back pointers of one segment — blocks `[b0, b0 + message.len())` of
-/// `code`, `cover` / `costs` their positions `[code.start(b0), …)` — from
-/// its checkpoint (the segment's `2^h` state costs from [`pass_a`]):
-/// `words_per_step(h)` words per position.
+/// Back pointers of one segment (see [`segment_forward`]) from its checkpoint
+/// (its state costs from [`segment_forward`]): `words_per_step(h)` words per
+/// position.
 pub fn segment_rows(
-    cover: &[u8],
-    costs: &[f32],
+    input: &dyn TrellisInput,
     message: &[u8],
     code: &Code,
     b0: usize,
     h: usize,
     checkpoint: &[f64],
 ) -> Result<Vec<u64>, StegoError> {
-    let nb = message.len();
-    let ns = 1usize << h.min(MAX_H);
-    if h == 0 || h > MAX_H || b0 + nb > code.m() || checkpoint.len() != ns {
-        return Err(StegoError::MessageTooLarge);
-    }
-    let p_off = code.start(b0);
-    let n = code.start(b0 + nb) - p_off;
-    if cover.len() < n || costs.len() < n {
-        return Err(StegoError::MessageTooLarge);
-    }
     let sets = code.masked_sets(h);
-    let t = Trellis { cover: &cover[..n], costs: &costs[..n], message, code, sets: &sets, b_off: b0, p_off, h };
-    let progress = Progress::new(n, n, &|_| {});
+    let t = segment(input, message, code, b0, h, &sets)?;
+    if checkpoint.len() != 1usize << h {
+        return Err(StegoError::MessageTooLarge);
+    }
+    let n = t.pos(message.len());
+    let progress = Progress::new(n, 0, &|_| {});
     let mut ticker = progress.ticker();
     let mut prev = checkpoint.to_vec();
-    let mut cur = vec![0.0; ns];
+    let mut cur = vec![0.0; prev.len()];
     let mut rows = vec![0u64; n * words_per_step(h)];
-    t.forward(&mut prev, &mut cur, 0, nb, Some(&mut rows), &mut |_, _| {}, &mut ticker)?;
+    t.forward(&mut prev, &mut cur, 0, message.len(), Some(&mut rows), &mut |_, _| {}, &mut ticker)?;
+    ticker.flush()?;
     Ok(rows)
 }
 
 /// Trace one segment (blocks `[b0, b0 + message.len())` of `code`) back
 /// from `state` (the state after its last block's message shift:
-/// [`PassA::best`] for the last segment, else the previous call's return
-/// value) through its [`segment_rows`], writing its stego bits into `out`
-/// (the segment's positions). Returns the state at the segment's start.
+/// [`best_state`] of the final costs for the last segment, else the previous
+/// call's return value) through its [`segment_rows`], writing its stego bits
+/// into `out` (the segment's positions). Returns the state at the segment's
+/// start.
 pub fn segment_trace(rows: &[u64], message: &[u8], code: &Code, b0: usize, h: usize, state: usize, out: &mut [u8]) -> usize {
     let sets = code.masked_sets(h);
     let p_off = code.start(b0);
     let n = code.start(b0 + message.len()) - p_off;
-    let t = Trellis { cover: &[], costs: &[], message, code, sets: &sets, b_off: b0, p_off, h };
+    let input = Slices { cover: &[], costs: &[] };
+    let t = Trellis { input: &input, message, code, sets: &sets, b_off: b0, p_off, h };
     t.traceback(rows, 0, message.len(), state, &mut out[..n])
 }
 
@@ -1230,18 +1344,32 @@ mod tests {
         {
             let want = embed_code(cover, costs, msg, code, h, usize::MAX, 1, &|_| {}).unwrap();
             for k in [1usize, 2, 7, 64, m, m + 3] {
-                let got = pass_a(cover, costs, msg, code, h, k, &|_| {}).unwrap().map(|pa| {
-                    let ns = 1usize << h;
+                let nseg = m.div_ceil(k);
+                let span = |seg: usize| (seg * k, ((seg + 1) * k).min(m));
+                let input = |seg: usize| {
+                    let (b0, b1) = span(seg);
+                    let (p0, p1) = (code.start(b0), code.start(b1));
+                    Slices::new(&cover[p0..p1], &costs[p0..p1])
+                };
+                // The forward chain: every segment's checkpoint, the final costs.
+                let mut checkpoints = vec![initial_costs(h)];
+                for seg in 0..nseg {
+                    let (b0, b1) = span(seg);
+                    let next = segment_forward(&input(seg), &msg[b0..b1], code, b0, h, &checkpoints[seg]).unwrap();
+                    checkpoints.push(next);
+                }
+                let (best, cost) = best_state(&checkpoints[nseg]);
+                let got = (cost < f64::INFINITY).then(|| {
                     let mut bits = vec![0u8; code.n()];
-                    let mut state = pa.best;
-                    for seg in (0..m.div_ceil(k)).rev() {
-                        let (b0, b1) = (seg * k, ((seg + 1) * k).min(m));
+                    let mut state = best;
+                    for seg in (0..nseg).rev() {
+                        let (b0, b1) = span(seg);
                         let (p0, p1) = (code.start(b0), code.start(b1));
-                        let rows = segment_rows(&cover[p0..p1], &costs[p0..p1], &msg[b0..b1], code, b0, h, &pa.checkpoints[seg * ns..(seg + 1) * ns]).unwrap();
+                        let rows = segment_rows(&input(seg), &msg[b0..b1], code, b0, h, &checkpoints[seg]).unwrap();
                         state = segment_trace(&rows, &msg[b0..b1], code, b0, h, state, &mut bits[p0..p1]);
                     }
                     assert_eq!(state, 0);
-                    plan_of(cover, bits, pa.cost)
+                    plan_of(cover, bits, cost)
                 });
                 match (&want, got) {
                     (None, None) => {}
@@ -1348,6 +1476,62 @@ mod tests {
                     assert_eq!(p.changes, base.changes);
                 }
             }
+        }
+    }
+
+    /// An input computed in chunks of any size (copies of the stored bits
+    /// and costs) plans exactly what the stored slices plan, packed, on every
+    /// schedule.
+    #[test]
+    fn chunked_input_equals_slices() {
+        struct Chunked<'a> {
+            cover: &'a [u8],
+            costs: &'a [f32],
+            k: usize,
+        }
+        impl TrellisInput for Chunked<'_> {
+            fn chunk<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut TrellisChunk) -> (&'s [u8], &'s [f32]) {
+                let j1 = j1.min(j0 + self.k);
+                buf.cover.clear();
+                buf.costs.clear();
+                // Other bits than the LSB must not matter.
+                buf.cover.extend(self.cover[j0..j1].iter().map(|&b| b | 0xF0));
+                buf.costs.extend_from_slice(&self.costs[j0..j1]);
+                (&buf.cover, &buf.costs)
+            }
+        }
+        for (seed, h, m, n, head, hw, wet) in [
+            (51u64, 9usize, 700usize, 700 * 6 + 333usize, 48usize, 5usize, 0.05f64),
+            (52, 9, 90, 90 * 40 + 89, 48, 33, 0.0),
+            (53, 7, 300, 300 * 3 + 7, 0, 0, 0.2),
+        ] {
+            let code = test_mixed_code(h, m, n, head, hw, seed as u8);
+            let (cover, costs, _) = case(seed, n, 1, wet);
+            let msg: Vec<u8> = case(seed + 7, m, 1, 0.0).2;
+            let base = embed_code(&cover, &costs, &msg, &code, h, usize::MAX, 1, &|_| {}).unwrap();
+            let full = inline_bytes(n, h);
+            for k in [1usize, 7, 64, 1000, n] {
+                let input = Chunked { cover: &cover, costs: &costs, k };
+                for limit in [usize::MAX, 0, full / 3] {
+                    for threads in [1usize, 3] {
+                        let got = embed_packed(&input, n, &msg, &code, h, limit, threads, &|_| {}).unwrap();
+                        match (&base, got) {
+                            (None, None) => {}
+                            (Some(p), Some((words, cost))) => {
+                                let bits: Vec<u8> = (0..n).map(|j| ((words[j >> 6] >> (j & 63)) & 1) as u8).collect();
+                                assert_eq!(bits, p.stego_bits, "seed {seed} k {k} limit {limit} threads {threads}");
+                                assert_eq!(cost.to_bits(), p.total_cost.to_bits());
+                                assert!(words.len() == n.div_ceil(64) && (n % 64 == 0 || words[n / 64] >> (n % 64) == 0));
+                            }
+                            _ => panic!("feasibility differs, seed {seed} k {k}"),
+                        }
+                    }
+                }
+            }
+            // Fewer positions than the code: infeasible, as for short slices.
+            assert!(embed_packed(&Chunked { cover: &cover, costs: &costs, k: 9 }, n - 1, &msg, &code, h, usize::MAX, 1, &|_| {})
+                .unwrap()
+                .is_none());
         }
     }
 

@@ -264,6 +264,24 @@ pub fn encode_scan_with_progress(
     restart_interval: u16,
     on_progress: Option<&dyn Fn()>,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_scan_into(&mut out, frame, scan_components, grids, dc_specs, ac_specs, restart_interval, on_progress)?;
+    Ok(out)
+}
+
+/// [`encode_scan_with_progress`] appended to `out`: the scan is written into
+/// `out` itself (its capacity used, no second copy of the scan).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_scan_into(
+    out: &mut Vec<u8>,
+    frame: &FrameInfo,
+    scan_components: &[ScanComponent],
+    grids: &[DctGrid],
+    dc_specs: &[Option<HuffmanSpec>; 4],
+    ac_specs: &[Option<HuffmanSpec>; 4],
+    restart_interval: u16,
+    on_progress: Option<&dyn Fn()>,
+) -> Result<()> {
     // Build Huffman encode tables
     let mut dc_tables: [Option<HuffmanEncodeTable>; 4] = [None, None, None, None];
     let mut ac_tables: [Option<HuffmanEncodeTable>; 4] = [None, None, None, None];
@@ -283,9 +301,9 @@ pub fn encode_scan_with_progress(
         }
     }
 
-    // Use a byte accumulator so we can insert restart markers between segments
-    let mut output = Vec::new();
-    let mut writer = BitWriter::new();
+    // The writer appends to `out`; at a restart its segment is flushed and
+    // the marker written after it.
+    let mut writer = BitWriter::with_output(std::mem::take(out));
     let mut dc_pred = vec![0i32; scan_components.len()];
     let mut restart_count = 0u16;
     let unit_rows = scan_unit_rows(frame, scan_components);
@@ -302,14 +320,14 @@ pub fn encode_scan_with_progress(
             }
             ScanStep::Restart => {
                 // Flush current segment
-                let segment = std::mem::take(&mut writer).flush();
-                output.extend_from_slice(&segment);
+                let mut output = std::mem::take(&mut writer).flush();
 
                 // Write RST marker (not byte-stuffed — markers are outside entropy data)
                 let rst_marker = 0xD0 + (restart_count % 8) as u8;
                 output.push(0xFF);
                 output.push(rst_marker);
                 restart_count += 1;
+                writer = BitWriter::with_output(output);
 
                 // Reset DC predictors
                 dc_pred.fill(0);
@@ -376,8 +394,8 @@ pub fn encode_scan_with_progress(
     })?;
 
     // Flush final segment
-    output.extend_from_slice(&writer.flush());
-    Ok(output)
+    *out = writer.flush();
+    Ok(())
 }
 
 /// Decode one scan of a multi-scan (progressive, or sequential with

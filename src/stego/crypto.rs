@@ -497,7 +497,12 @@ pub fn decrypt(
     nonce_bytes: &[u8; NONCE_LEN],
 ) -> Result<Vec<u8>, StegoError> {
     let key = derive_encryption_key(passphrase, salt)?;
-    let cipher = Aes256GcmSiv::new_from_slice(&*key).expect("valid key length");
+    decrypt_with_key(ciphertext, &key, nonce_bytes)
+}
+
+/// [`decrypt`] with the key already derived ([`derive_encryption_key`]).
+pub fn decrypt_with_key(ciphertext: &[u8], key: &[u8; 32], nonce_bytes: &[u8; NONCE_LEN]) -> Result<Vec<u8>, StegoError> {
+    let cipher = Aes256GcmSiv::new_from_slice(key).expect("valid key length");
     let nonce = Nonce::from(*nonce_bytes);
 
     cipher

@@ -989,9 +989,27 @@ const COST_STRIP_BYTES: usize = 8 << 20;
 /// joins, and one or two block rows per strip cost ~10 % more CPU at 48 MP.
 const MIN_STRIP_BLOCK_ROWS: usize = 4;
 
-/// What one cost strip actually holds at its peak (measured 50-54 MB at
-/// 12-110 MP), with margin: the memory plan charges this for a cost pass.
+/// Upper bound of what a cost pass holds at once over 12-110 MP covers
+/// (measured 50-54 MB before the buffers were kept per pass, 2026-10-30;
+/// [`cost_strip_working_bytes`] gives a cover's own).
 pub const COST_STRIP_WORKING_BYTES: usize = 64 << 20;
+
+/// What a cost pass over a grid `blocks_wide` blocks wide holds at once: its
+/// buffers ([`CostStripBuffers`], sized by the first strip of
+/// [`cost_strip_rows`] block rows, which no later strip exceeds) — 7.7 MB at
+/// 4032 px wide, 19 MB at 9504 px, 31 MB at 15 000 px — plus 1 MiB for the
+/// filters and the threads' stacks. The memory model charges it for every
+/// cost pass (`memory::ghost_plan_peak`).
+pub fn cost_strip_working_bytes(blocks_wide: usize) -> usize {
+    let bw = blocks_wide.max(1);
+    let stride = bw * 8 + 2 * WAV_MARGIN;
+    let rows = cost_strip_rows(bw);
+    // As `cost_strip_rows` sizes the first strip.
+    let pix_and_rows = (8 * rows + 30) * 12 * stride;
+    let reciprocals = (8 * rows + 15) * 24 * stride;
+    let costs = rows * bw * 64 * 4;
+    pix_and_rows + reciprocals + costs + (1 << 20)
+}
 
 /// Block rows per strip of the separable cost pass, so that its buffers
 /// ([`CostStripBuffers`], sized by the first strip) stay near

@@ -146,12 +146,21 @@ fn try_single_fdl_with_rs_bytes(
 
 /// Parse a decoded shadow frame and decrypt it.
 fn decrypt_frame(decoded: &[u8], passphrase: &str) -> Option<Result<PayloadData, StegoError>> {
+    decrypt_frame_with(decoded, &|fr| crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce))
+}
+
+/// [`decrypt_frame`] with the decryption supplied (a cached key:
+/// [`ShadowKeyCache`]).
+fn decrypt_frame_with(
+    decoded: &[u8],
+    decrypt: &dyn Fn(&crate::stego::shadow_layer::ParsedShadowFrame) -> Result<Vec<u8>, StegoError>,
+) -> Option<Result<PayloadData, StegoError>> {
     let fr = match parse_shadow_frame(decoded) {
         Ok(f) => f,
         Err(_) => return None,
     };
 
-    match crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce) {
+    match decrypt(&fr) {
         Ok(plaintext) => {
             let len = fr.plaintext_len as usize;
             if len > plaintext.len() {
@@ -315,11 +324,16 @@ fn ac_hash_order_visit(grid: &DctGrid, seed: &[u8; 32], k: usize, group_cap: usi
         }
         if count > 0 {
             let (lo, hi) = (g0 as u64, g1 as u64);
+            // A chunk's share of the group's candidates (keyed priorities are
+            // uniform), with room for its spread: grown vectors would hold up
+            // to twice the candidates' 16 B.
+            let expect = count as f64 * ORDER_CHUNK_BLOCKS.min(blocks) as f64 / blocks as f64;
+            let reserve = (expect + 4.0 * expect.sqrt()) as usize + 16;
             let mut parts = scan_ac_priorities(
                 seed,
                 blocks,
                 0..chunks,
-                Vec::new,
+                || Vec::with_capacity(reserve),
                 |v: &mut Vec<(u64, u32)>, prio, fi| {
                     let b = prio >> shift;
                     if b >= lo && b < hi {
@@ -516,12 +530,72 @@ pub fn embed_shadow(img: &JpegImage, overlay: &mut v31::Overlay, state: &ShadowS
 /// reads it: the STC syndrome along the region, RS-decode with zero
 /// corrections, decrypt.
 pub fn verify_shadow(img: &JpegImage, state: &ShadowState, passphrase: &str) -> Result<(), StegoError> {
-    let lsbs = parity_along(img.dct_grid(0), &state.positions);
+    verify_parities(&parity_along(img.dct_grid(0), &state.positions), state, passphrase)
+}
+
+/// The parities a planned shadow's region holds (the cover's values and
+/// `overlay`'s, the planned layers), bit-packed: what the decoder will read
+/// there once every layer is written (the later layers keep the region),
+/// for [`verify_shadow_parities`].
+pub fn planned_parities(img: &JpegImage, overlay: &v31::Overlay, state: &ShadowState) -> Vec<u64> {
+    let grid = img.dct_grid(0);
+    let mut words = vec![0u64; state.positions.len().div_ceil(64)];
+    for (i, &fi) in state.positions.iter().enumerate() {
+        words[i >> 6] |= ((v31::value(grid, Some(overlay), fi) & 1) as u64) << (i & 63);
+    }
+    words
+}
+
+/// [`verify_shadow`] from a region's [`planned_parities`] (`len` positions;
+/// `state` without its region is enough). `key`: the shadow's frame key,
+/// derived once for every width the layout tries.
+pub fn verify_shadow_parities(parities: &[u64], len: usize, state: &ShadowState, key: &ShadowKeyCache) -> Result<(), StegoError> {
+    let lsbs: Vec<u8> = (0..len).map(|i| ((parities[i >> 6] >> (i & 63)) & 1) as u8).collect();
+    verify_parities_with(&lsbs, state, &|fr| key.decrypt(fr))
+}
+
+fn verify_parities(lsbs: &[u8], state: &ShadowState, passphrase: &str) -> Result<(), StegoError> {
+    verify_parities_with(lsbs, state, &|fr| crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce))
+}
+
+fn verify_parities_with(
+    lsbs: &[u8],
+    state: &ShadowState,
+    decrypt: &dyn Fn(&crate::stego::shadow_layer::ParsedShadowFrame) -> Result<Vec<u8>, StegoError>,
+) -> Result<(), StegoError> {
     let hh = shadow_hhat(state.stc_w, &state.perm_seed, state.h);
-    match try_stc_tier(&lsbs, &hh, state.stc_w, passphrase, lsbs.len() / state.stc_w) {
+    match try_stc_tier_with(lsbs, &hh, state.stc_w, lsbs.len() / state.stc_w, decrypt) {
         Some(Ok(_)) => Ok(()),
         Some(Err(e)) => Err(e),
         None => Err(StegoError::FrameCorrupted),
+    }
+}
+
+/// A shadow's frame key for [`verify_shadow_planned`]: the AES key of its
+/// frame (passphrase and the frame's salt, Argon2id), derived on first use
+/// and kept for the frame's salt; a frame with another salt (cannot happen
+/// for a verified frame) derives its own. The same decryption as
+/// [`crypto::decrypt`], without one Argon2id per width the layout tries.
+pub struct ShadowKeyCache {
+    passphrase: zeroize::Zeroizing<String>,
+    key: std::sync::OnceLock<([u8; crypto::SALT_LEN], zeroize::Zeroizing<[u8; 32]>)>,
+}
+
+impl ShadowKeyCache {
+    pub fn new(passphrase: &str) -> Self {
+        Self { passphrase: zeroize::Zeroizing::new(passphrase.to_string()), key: std::sync::OnceLock::new() }
+    }
+
+    fn decrypt(&self, fr: &crate::stego::shadow_layer::ParsedShadowFrame) -> Result<Vec<u8>, StegoError> {
+        if let Some((salt, key)) = self.key.get()
+            && *salt == fr.salt
+        {
+            return crypto::decrypt_with_key(&fr.ciphertext, key, &fr.nonce);
+        }
+        let key = crypto::derive_encryption_key(&self.passphrase, &fr.salt)?;
+        let out = crypto::decrypt_with_key(&fr.ciphertext, &key, &fr.nonce);
+        let _ = self.key.set((fr.salt, key));
+        out
     }
 }
 
@@ -557,6 +631,17 @@ fn try_stc_tier(
     passphrase: &str,
     max_bits: usize,
 ) -> Option<Result<PayloadData, StegoError>> {
+    try_stc_tier_with(lsbs, hh, w, max_bits, &|fr| crypto::decrypt(&fr.ciphertext, passphrase, &fr.salt, &fr.nonce))
+}
+
+/// [`try_stc_tier`] with the decryption supplied.
+fn try_stc_tier_with(
+    lsbs: &[u8],
+    hh: &[Vec<u32>],
+    w: usize,
+    max_bits: usize,
+    decrypt: &dyn Fn(&crate::stego::shadow_layer::ParsedShadowFrame) -> Result<Vec<u8>, StegoError>,
+) -> Option<Result<PayloadData, StegoError>> {
     let head = stc_extract::stc_extract_prefix(lsbs, hh, w, 48);
     let (fdl, rs_len) = tier_fdl(&head, max_bits)?;
     if lsbs.len() < rs_len * 8 * w {
@@ -568,7 +653,7 @@ fn try_stc_tier(
     if stats.total_errors != 0 {
         return None;
     }
-    decrypt_frame(&decoded, passphrase)
+    decrypt_frame_with(&decoded, decrypt)
 }
 
 /// Whether the first RS block of a tier's frame decodes with zero

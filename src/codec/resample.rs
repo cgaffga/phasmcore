@@ -95,19 +95,43 @@ pub fn resample_rgb(
     dst_width: u32,
     dst_height: u32,
 ) -> Result<Vec<u8>, crate::StegoError> {
-    let (sw, sh, dw, dh) = (width as usize, height as usize, dst_width as usize, dst_height as usize);
-    let need = sw.checked_mul(sh).and_then(|n| n.checked_mul(3)).unwrap_or(usize::MAX);
-    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || pixels.len() < need {
+    resample_rgb_window(pixels, width, height, [0, 0, width, height], dst_width, dst_height)
+}
+
+/// [`resample_rgb`] of the rectangle `[x, y, w, h]` of `pixels`
+/// (`width × height`), without copying it out first: the same bytes as
+/// cropping the rectangle and resampling the crop.
+///
+/// # Errors
+/// [`crate::StegoError::ImageTooSmall`] if a size is 0, the rectangle is not
+/// inside the image, or the buffer is shorter than `width · height · 3`.
+pub(crate) fn resample_rgb_window(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    window: [u32; 4],
+    dst_width: u32,
+    dst_height: u32,
+) -> Result<Vec<u8>, crate::StegoError> {
+    let stride = width as usize;
+    let [x0, y0, sw, sh] = window.map(|v| v as usize);
+    let (dw, dh) = (dst_width as usize, dst_height as usize);
+    let need = stride.checked_mul(height as usize).and_then(|n| n.checked_mul(3)).unwrap_or(usize::MAX);
+    let inside = x0.checked_add(sw).is_some_and(|r| r <= stride) && y0.checked_add(sh).is_some_and(|b| b <= height as usize);
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 || !inside || pixels.len() < need {
         return Err(crate::StegoError::ImageTooSmall);
     }
+    let row = |y: usize| &pixels[((y0 + y) * stride + x0) * 3..((y0 + y) * stride + x0 + sw) * 3];
     if (sw, sh) == (dw, dh) {
-        return Ok(pixels[..need].to_vec());
+        let mut out = Vec::with_capacity(sw * sh * 3);
+        (0..sh).for_each(|y| out.extend_from_slice(row(y)));
+        return Ok(out);
     }
     // Horizontal pass into an 8-bit intermediate (dw × sh), then vertical.
     let xt = axis_taps(sw, dw);
     let mut mid = vec![0u8; dw * sh * 3];
     let row_h = |y: usize, out: &mut [u8]| {
-        let src = &pixels[y * sw * 3..(y + 1) * sw * 3];
+        let src = row(y);
         for (x, t) in xt.iter().enumerate() {
             let mut acc = [0i64; 3];
             for (k, &wt) in t.weights.iter().enumerate() {
@@ -203,6 +227,22 @@ mod tests {
         assert_eq!(fit_long_side(1000, 800, 1600), (1000, 800));
         assert!(resample_rgb(&px, 640, 480, 0, 10).is_err());
         assert!(resample_rgb(&px[..10], 640, 480, 10, 10).is_err());
+    }
+
+    #[test]
+    fn a_window_is_the_crop_resampled() {
+        let (w, h) = (61usize, 47usize);
+        let px = textured(w, h);
+        let crop = |x: usize, y: usize, cw: usize, ch: usize| -> Vec<u8> {
+            (y..y + ch).flat_map(|r| px[(r * w + x) * 3..(r * w + x + cw) * 3].to_vec()).collect()
+        };
+        for (win, (dw, dh)) in [([4u32, 4, 57, 43], (61u32, 47u32)), ([0, 0, 61, 47], (30, 20)), ([3, 5, 20, 11], (20, 11)), ([7, 0, 54, 47], (90, 70))] {
+            let [x, y, cw, ch] = win;
+            let want = resample_rgb(&crop(x as usize, y as usize, cw as usize, ch as usize), cw, ch, dw, dh).unwrap();
+            assert_eq!(resample_rgb_window(&px, w as u32, h as u32, win, dw, dh).unwrap(), want, "{win:?}");
+        }
+        assert!(resample_rgb_window(&px, w as u32, h as u32, [4, 4, 58, 43], 61, 47).is_err(), "outside the image");
+        assert!(resample_rgb_window(&px, w as u32, h as u32, [0, 0, 0, 43], 61, 47).is_err());
     }
 
     /// Close to an independent Lanczos-3 (the `image` crate's) on a

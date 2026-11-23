@@ -250,7 +250,7 @@ unsafe extern "C" fn meta_hook_cb(
 pub fn decode_with_recording(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, true, false, 0, None)
+    decode_with_recording_inner(av1_bytes, true, false, 0, 1, None)
 }
 
 /// Variant of [`decode_with_recording`] that also extracts the last
@@ -265,7 +265,7 @@ pub fn decode_with_recording(
 pub fn decode_with_recording_with_pixels(
     av1_bytes: &[u8],
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
-    decode_with_recording_inner(av1_bytes, true, true, 0, None)
+    decode_with_recording_inner(av1_bytes, true, true, 0, 1, None)
 }
 
 /// Layout mirror of dav1d's `Dav1dPicture` prefix (through
@@ -338,7 +338,7 @@ pub fn decode_luma_block_grids(
     let mut bad: Option<Av1DecodeError> = None;
     // Pixels only: no symbol recording (it would hold every 50/50 bit of the
     // GOP, ~100 MB at 1080p, for nothing).
-    decode_with_recording_inner(av1_bytes, false, false, 0, Some(&mut |view: &Dav1dPictureView| {
+    decode_with_recording_inner(av1_bytes, false, false, 0, 1, Some(&mut |view: &Dav1dPictureView| {
         if view.p_layout != 1 || view.p_bpc != 8 {
             bad.get_or_insert(Av1DecodeError::UnsupportedPicture { layout: view.p_layout, bpc: view.p_bpc });
             return;
@@ -356,25 +356,42 @@ pub fn decode_luma_block_grids(
     }
 }
 
-/// The planes of a decoded still picture (photo attachments, [`crate::photo`]): `layout` is
-/// dav1d's (0 = mono, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4), the planes are tight (no stride padding),
-/// `u` and `v` empty for mono.
-pub(crate) struct StillPlanes {
+/// A decoded still picture as dav1d holds it (photo decoding, [`crate::photo`]): `layout` is
+/// dav1d's (0 = mono, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4), 8-bit samples; each plane is borrowed from
+/// dav1d's picture with its stride (rows of `y_stride` / `c_stride` bytes, the first `width` /
+/// chroma width visible), `u` and `v` empty for mono. Valid only inside the callback of
+/// [`decode_still_view`]: no copy of the planes is made.
+pub(crate) struct StillView<'a> {
     pub layout: i32,
     pub width: usize,
     pub height: usize,
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
+    pub y: &'a [u8],
+    pub y_stride: usize,
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+    pub c_stride: usize,
 }
 
-/// Decode the first picture of `av1_bytes` (an AV1 still image), 8-bit only.
-/// Pictures over `max_pixels` are refused by dav1d itself (`frame_size_limit`), before it allocates
-/// them: the input is someone else's file.
-pub(crate) fn decode_still_planes(av1_bytes: &[u8], max_pixels: u32) -> Result<StillPlanes, Av1DecodeError> {
-    let mut out: Option<StillPlanes> = None;
+/// dav1d worker threads for a plain decode (no stego hooks): the hooks need one thread, a plain
+/// still decode does not, and a 150 MP picture on one thread takes seconds. dav1d's output does
+/// not depend on the thread count (bit-exact), so the pixels are the same on every device.
+pub(crate) fn plain_decode_threads() -> i32 {
+    std::thread::available_parallelism().map(|n| n.get().min(8) as i32).unwrap_or(1)
+}
+
+/// Decode the first picture of `av1_bytes` (an AV1 still image, 8-bit only) and hand it to `f`
+/// straight from dav1d's buffers. Pictures over `max_pixels` are refused by dav1d itself
+/// (`frame_size_limit`), before it allocates them: the input can be someone else's file.
+/// `threads`: dav1d worker threads ([`plain_decode_threads`]).
+pub(crate) fn decode_still_view<R>(
+    av1_bytes: &[u8],
+    max_pixels: u32,
+    threads: i32,
+    mut f: impl FnMut(&StillView<'_>) -> R,
+) -> Result<R, Av1DecodeError> {
+    let mut out: Option<R> = None;
     let mut bad: Option<Av1DecodeError> = None;
-    decode_with_recording_inner(av1_bytes, false, false, max_pixels, Some(&mut |view: &Dav1dPictureView| {
+    decode_with_recording_inner(av1_bytes, false, false, max_pixels, threads, Some(&mut |view: &Dav1dPictureView| {
         if out.is_some() || bad.is_some() {
             return;
         }
@@ -391,21 +408,31 @@ pub(crate) fn decode_still_planes(av1_bytes: &[u8], max_pixels: u32) -> Result<S
             2 => (w.div_ceil(2), h),
             _ => (w, h),
         };
-        // SAFETY: the picture is live for the call; dav1d's planes hold the visible
-        // `w` x `h` (luma) and `cw` x `ch` (chroma) samples at these strides.
+        let mono = view.p_layout == 0;
+        let (ys, cs) = (view.stride[0], view.stride[1]);
+        if ys < w as isize || (!mono && cs < cw as isize) {
+            bad = Some(Av1DecodeError::UnsupportedPicture { layout: view.p_layout, bpc: view.p_bpc });
+            return;
+        }
+        let (ys, cs) = (ys as usize, cs as usize);
+        // SAFETY: the picture is live for the call; dav1d's planes hold `h` rows of `ys` bytes
+        // (luma, the first `w` visible) and `ch` rows of `cs` bytes (chroma, `cw` visible), and
+        // the last row is readable up to its visible end.
         let (y, u, v) = unsafe {
-            let y = copy_plane(view.data[0] as *const u8, view.stride[0], w, h);
-            if view.p_layout == 0 {
-                (y, Vec::new(), Vec::new())
+            let y = core::slice::from_raw_parts(view.data[0] as *const u8, ys * (h - 1) + w);
+            if mono {
+                (y, &[][..], &[][..])
             } else {
+                let n = cs * (ch - 1) + cw;
                 (
                     y,
-                    copy_plane(view.data[1] as *const u8, view.stride[1], cw, ch),
-                    copy_plane(view.data[2] as *const u8, view.stride[1], cw, ch),
+                    core::slice::from_raw_parts(view.data[1] as *const u8, n),
+                    core::slice::from_raw_parts(view.data[2] as *const u8, n),
                 )
             }
         };
-        out = Some(StillPlanes { layout: view.p_layout, width: w, height: h, y, u, v });
+        let still = StillView { layout: view.p_layout, width: w, height: h, y, y_stride: ys, u, v, c_stride: if mono { 0 } else { cs } };
+        out = Some(f(&still));
     }))?;
     if let Some(e) = bad {
         return Err(e);
@@ -419,6 +446,8 @@ fn decode_with_recording_inner(
     capture_pixels: bool,
     // dav1d's `frame_size_limit` (pixels per frame), 0 for none
     frame_size_limit: u32,
+    // dav1d worker threads: 1 whenever the hooks record (they are not thread-safe)
+    threads: i32,
     mut on_picture: Option<&mut dyn FnMut(&Dav1dPictureView)>,
 ) -> Result<DecodedCoverPositions, Av1DecodeError> {
     let mut recorder = RecorderState::default();
@@ -437,7 +466,7 @@ fn decode_with_recording_inner(
         // (fills allocator + logger but NOT phasm_hooks or reserved).
         let mut settings: Dav1dSettings = core::mem::zeroed();
         dav1d_default_settings(&mut settings);
-        settings.n_threads = 1;
+        settings.n_threads = if record { 1 } else { threads.max(1) };
         settings.max_frame_delay = 1;
         settings.frame_size_limit = frame_size_limit;
 

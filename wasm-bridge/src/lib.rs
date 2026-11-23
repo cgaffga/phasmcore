@@ -35,11 +35,12 @@ use phasm_core::{
 
 const ALLOWED_HOSTS: &[&str] = &["phasm.app", "phasm.link", "localhost", "127.0.0.1"];
 
-/// Browser tab memory ceiling for the rung selector. 800 MB chosen as
-/// a compromise: Safari mobile gets the most aggressive degradation
-/// (~1.5 GB tab limit on iPhone with browser overhead); Chrome/Firefox
-/// desktop have more headroom but extreme-MP cases still benefit
-/// from the streaming ladder. See
+/// Memory budget until the page sets one (`set_memory_budget`). The web tool
+/// sets one per device before every Ghost encode (`ghostMemoryPlan` in
+/// `website-phasm-app/js/tool.js`: from Chromium's `navigator.deviceMemory`,
+/// split between the coordinator and the helper workers); where the device's
+/// memory is unknown (Safari, Firefox) it keeps this conservative 800 MB
+/// (~1.5 GB tab limit on iPhone with browser overhead). See
 /// `docs/design/image/memory-budget-2026-05.md` § 8 Phase 3.
 const WASM_DEFAULT_MEMORY_BUDGET_BYTES: usize = 800 * 1024 * 1024;
 
@@ -50,17 +51,103 @@ const WASM_DEFAULT_MEMORY_BUDGET_BYTES: usize = 800 * 1024 * 1024;
 #[wasm_bindgen(start)]
 pub fn wasm_init() {
     phasm_core::set_memory_budget(Some(WASM_DEFAULT_MEMORY_BUDGET_BYTES));
+    // Core aborts on a panic (panic = "abort"), and the page sees the same
+    // trap ("unreachable") as for a failed allocation, which aborts without
+    // a panic. The hook records the panic first, so the page can tell a bug
+    // from running out of memory (`panicked`, after the trap).
+    std::panic::set_hook(Box::new(|info| {
+        PANICKED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let msg = info.to_string();
+        PANIC_MESSAGE.with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                *m = msg;
+            }
+        });
+    }));
 }
 
-/// Override the default memory budget. Pass `0` to disable.
-///
-/// JS callers can use this when running on a host they know has
-/// different memory characteristics — but the default 800 MB is
-/// suitable for production browser tabs.
+static PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static PANIC_MESSAGE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Whether core panicked in this instance (a bug: its call trapped after
+/// the panic hook ran). A failed allocation traps without it. Allocates
+/// nothing, so it can be called after any trap.
+#[wasm_bindgen]
+pub fn panicked() -> bool {
+    PANICKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The recorded panic's message (empty if none).
+#[wasm_bindgen]
+pub fn panic_message() -> String {
+    PANIC_MESSAGE.with(|m| m.try_borrow().map(|m| m.clone()).unwrap_or_default())
+}
+
+/// Test builds only: a message or passphrase of exactly this text makes the
+/// encode or decode entry points panic (the page's panic handling).
+#[cfg(feature = "test-hooks")]
+const TEST_PANIC_TRIGGER: &str = "__phasm_test_panic__";
+
+#[cfg(feature = "test-hooks")]
+fn test_panic(text: &str) {
+    if text == TEST_PANIC_TRIGGER {
+        panic!("test panic (test-hooks build)");
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+#[inline(always)]
+fn test_panic(_text: &str) {}
+
+/// Override the default memory budget (bytes; `0` = none). The web tool
+/// passes its per-device budget to every instance (the page's and each
+/// encode worker's).
 #[wasm_bindgen]
 pub fn set_memory_budget(bytes: u64) {
-    let opt = if bytes == 0 { None } else { Some(bytes as usize) };
+    let opt = if bytes == 0 { None } else { Some(bytes.min(usize::MAX as u64) as usize) };
     phasm_core::set_memory_budget(opt);
+}
+
+/// Peak heap (bytes) a Ghost encode of a `width × height` cover allocates in
+/// core: `si` = the side-informed calls (`encode_si*`, a Deep Cover cover),
+/// `shadow_count` shadow messages, `payload_bytes` the compressed payloads of
+/// all layers together (`payload_size` of each), for the plan core's memory
+/// ladder picks under the current budget (800 MB unless `set_memory_budget`
+/// changed it). Excludes the caller's buffers (the cover JPEG, the SI
+/// pixels). Same as iOS `phasm_ghost_encode_peak_bytes` / Android
+/// `NativeBridge.ghostEncodePeakBytes` (`docs/design/app/large-samples.md`,
+/// "Memory"). Counts and sizes beyond any real encode are clamped (64
+/// shadows, 256 MiB of payload) so the estimate cannot overflow; wasm32 has
+/// 4 GB of address space, so it saturates there.
+///
+/// It is the peak of the one-call encode (`encode`, `encode_si`,
+/// `encode_with_files`, `encode_si_with_files`, `encode_with_progress`: the
+/// web's main-thread fallback and its one-worker plan for low memory) and of the
+/// coordinator of the Web Worker encode (`GhostEncodeJob`, core's
+/// `GhostEncodeSession`), which runs the same plan and holds the same
+/// working set: the cover's luma (not the chroma; `finish` parses the cover
+/// file again), the side information, the keyed order, the plan's cost
+/// group, 3 bits per position of each lane in flight, and one task at a time
+/// (a lane layer's input, 4⅛ B per position) next to the lanes' kept layer-1
+/// inputs, together at most what the plan lets a lane's trellis hold;
+/// measured, the coordinator never holds more than the one-call encode. The
+/// estimate counts live heap: an instance's linear memory (its high-water
+/// mark, never returned) also keeps the allocator's holes; the one-call
+/// encode's ran 3-21 % above it at 12-64 MP (more with Deep Cover pixels,
+/// whose copy is in the instance during the call). The helper workers'
+/// instances come on top: each holds a cost band or one task and its
+/// trellis (back pointers within the cover's in-flight share, or up to a few
+/// 16 MB segments), 54-134 MB measured
+/// (`docs/design/image/ghost-embedding-v3.md`, "Web encode on the lean
+/// internals").
+#[wasm_bindgen]
+pub fn ghost_encode_peak_bytes(width: u32, height: u32, si: bool, shadow_count: u32, payload_bytes: u32) -> usize {
+    let shadows = (shadow_count as usize).min(64);
+    let payload = (payload_bytes as usize).min(1 << 28);
+    phasm_core::ghost_encode_peak_bytes(width, height, si, shadows, payload)
 }
 
 fn check_domain() -> Result<(), JsError> {
@@ -326,6 +413,7 @@ pub fn encode(
     mode: u8,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    test_panic(message);
     LAST_ENCODE_FORTRESS.with(|c| c.set(None));
     let stego = match mode {
         // 3 = Armor with the user's Standard switch (Fortress off).
@@ -372,6 +460,7 @@ pub fn encode_with_files(
     passphrase: &str,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    test_panic(message);
     let files = parse_files_json(files_json)?;
     let stego = ghost_encode_with_files(image_bytes, message, &files, passphrase)
         .map_err(|e| JsError::new(&stego_error_message(&e)))?;
@@ -404,6 +493,7 @@ pub fn encode_si(
     passphrase: &str,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    test_panic(message);
     let stego = ghost_encode_si(
         image_bytes, raw_pixels_rgb, pixel_width, pixel_height, message, passphrase,
     )
@@ -433,6 +523,7 @@ pub fn encode_si_with_files(
     passphrase: &str,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    test_panic(message);
     let files = parse_files_json(files_json)?;
     let stego = ghost_encode_si_with_files(
         image_bytes, raw_pixels_rgb, pixel_width, pixel_height, message, &files, passphrase,
@@ -458,6 +549,7 @@ pub fn encode_with_progress(
     on_progress: &js_sys::Function,
 ) -> Result<Vec<u8>, JsError> {
     check_domain()?;
+    test_panic(message);
     phasm_core::progress::set_wasm_callback(Some(on_progress.clone()));
     let result = match mode {
         2 | 3 => phasm_core::armor_encode_with_options(image_bytes, message, passphrase, mode == 3).map(|(b, _)| b),
@@ -483,7 +575,14 @@ pub struct GhostEncodeJob {
     inner: Option<phasm_core::GhostEncodeSession>,
 }
 
+/// A session or task error for JS: the engine's "CODE:detail", except a
+/// protocol fault (a task or result that does not belong to the job, a wrong
+/// cover at `finish`), which has no code: the page treats it as the
+/// workers' own failure and encodes on its main thread instead.
 fn job_err(e: StegoError) -> JsError {
+    if phasm_core::ghost_task_protocol_error(&e) {
+        return JsError::new("Ghost encode job: protocol fault (a task, result or cover that does not belong to the job)");
+    }
     JsError::new(&stego_error_message(&e))
 }
 
@@ -505,6 +604,7 @@ impl GhostEncodeJob {
         helpers: u32,
     ) -> Result<GhostEncodeJob, JsError> {
         check_domain()?;
+        test_panic(message);
         let files = parse_files_json(files_json)?;
         let pixels = (!raw_pixels_rgb.is_empty()).then_some((raw_pixels_rgb, pixel_width, pixel_height));
         let inner = phasm_core::GhostEncodeSession::new(image_bytes, message, &files, passphrase, pixels, helpers as usize)
@@ -513,16 +613,18 @@ impl GhostEncodeJob {
     }
 
     fn session(&mut self) -> Result<&mut phasm_core::GhostEncodeSession, JsError> {
-        self.inner.as_mut().ok_or_else(|| JsError::new("INVALID_INPUT:encode job already finished"))
+        self.inner.as_mut().ok_or_else(|| JsError::new("Ghost encode job: already finished"))
     }
 
     /// Tasks ready for helpers: an array of `Uint8Array`. A task's int32
     /// (little-endian) at `ghost_task_target_offset()` is the helper it must
-    /// run on, or −1 for any.
+    /// run on, or −1 for any. Each task is copied out as it is written, so
+    /// the instance holds one at a time (a cost pass's bands together are
+    /// about the cover's luma).
     pub fn take_tasks(&mut self) -> Result<js_sys::Array, JsError> {
-        let tasks = self.session()?.take_tasks().map_err(job_err)?;
+        let session = self.session()?;
         let arr = js_sys::Array::new();
-        for t in tasks {
+        while let Some(t) = session.next_task().map_err(job_err)? {
             arr.push(&js_sys::Uint8Array::from(&t[..]));
         }
         Ok(arr)
@@ -548,10 +650,16 @@ impl GhostEncodeJob {
         self.inner.as_ref().map_or(0.0, |s| s.progress())
     }
 
-    /// The stego JPEG (after `is_done()`).
-    pub fn finish(&mut self) -> Result<Vec<u8>, JsError> {
-        let s = self.inner.take().ok_or_else(|| JsError::new("INVALID_INPUT:encode job already finished"))?;
-        s.finish().map(|(bytes, _)| bytes).map_err(job_err)
+    /// The stego JPEG (after `is_done()`), written into `image_bytes`: the
+    /// cover the job was started with (checked; the job does not keep the
+    /// cover's chroma, it parses the file again, as the one-call encode does).
+    pub fn finish(&mut self, image_bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        // Checked before the job is given up, so a wrong cover leaves it usable.
+        if !self.session()?.cover_matches(image_bytes) {
+            return Err(JsError::new("Ghost encode job: finish got another cover than the job started with"));
+        }
+        let s = self.inner.take().ok_or_else(|| JsError::new("Ghost encode job: already finished"))?;
+        s.finish(image_bytes).map(|(bytes, _)| bytes).map_err(job_err)
     }
 }
 
@@ -578,6 +686,19 @@ pub fn ghost_task_target_offset() -> u32 {
 // Decode
 // ---------------------------------------------------------------------------
 
+/// Peak heap (bytes) a decode (`decode`, `decode_with_quality`) of the JPEG
+/// `image_bytes` allocates in core over every attempt it may make — a wrong
+/// passphrase tries them all — excluding the caller's copy of the file. Reads
+/// the header and counts the luma's non-zero AC coefficients (one Huffman
+/// pass, about a parse's time). Uses the current budget as the decode will
+/// (`set_memory_budget`). Same as iOS `phasm_decode_peak_bytes` / Android
+/// `NativeBridge.decodePeakBytes` (`docs/design/app/large-samples.md`,
+/// "Memory"); wasm32 has 4 GB of address space, so it saturates there.
+#[wasm_bindgen]
+pub fn decode_peak_bytes(image_bytes: &[u8]) -> usize {
+    phasm_core::decode_peak_bytes(image_bytes)
+}
+
 /// Decode a hidden message from a stego JPEG image.
 ///
 /// Auto-detects the embedding mode (Ghost or Armor) by trying both.
@@ -592,6 +713,7 @@ pub fn ghost_task_target_offset() -> u32 {
 #[wasm_bindgen]
 pub fn decode(image_bytes: &[u8], passphrase: &str) -> Result<String, JsError> {
     check_domain()?;
+    test_panic(passphrase);
     let (payload, _quality) =
         smart_decode(image_bytes, passphrase).map_err(|e| JsError::new(&stego_error_message(&e)))?;
     Ok(payload.text)
@@ -605,6 +727,7 @@ pub fn decode(image_bytes: &[u8], passphrase: &str) -> Result<String, JsError> {
 #[wasm_bindgen]
 pub fn decode_with_quality(image_bytes: &[u8], passphrase: &str) -> Result<String, JsError> {
     check_domain()?;
+    test_panic(passphrase);
     let (payload, quality) =
         smart_decode(image_bytes, passphrase).map_err(|e| JsError::new(&stego_error_message(&e)))?;
     Ok(format_decode_result(&payload, &quality))
@@ -622,6 +745,7 @@ pub fn decode_with_progress(
     on_progress: &js_sys::Function,
 ) -> Result<String, JsError> {
     check_domain()?;
+    test_panic(passphrase);
     phasm_core::progress::set_wasm_callback(Some(on_progress.clone()));
     let result = smart_decode(image_bytes, passphrase)
         .map(|(p, q)| format_decode_result(&p, &q))
@@ -643,6 +767,7 @@ pub fn ghost_decode_only(
     on_progress: &js_sys::Function,
 ) -> Result<String, JsError> {
     check_domain()?;
+    test_panic(passphrase);
     phasm_core::progress::set_wasm_callback(Some(on_progress.clone()));
     phasm_core::progress::init(GHOST_DECODE_STEPS);
     // Try primary Ghost decode first, then shadow decode as fallback
@@ -677,6 +802,7 @@ pub fn armor_decode_only(
     on_progress: &js_sys::Function,
 ) -> Result<String, JsError> {
     check_domain()?;
+    test_panic(passphrase);
     phasm_core::progress::set_wasm_callback(Some(on_progress.clone()));
     let result = armor_decode(image_bytes, passphrase)
         .map(|(payload, quality)| format_decode_result(&payload, &quality))
@@ -934,14 +1060,16 @@ impl CoverResult {
     pub fn jpeg(&self) -> Vec<u8> {
         self.jpeg.clone()
     }
-    /// Pixels for the `*_si` calls when core made them (a resample), else
+    /// Pixels for the `*_si` calls when core made them (a resample, or the
+    /// realignment of a same-size AVIF / decoded-JPEG cover), else
     /// `undefined`: the plain calls, or `si_is_input`.
     #[wasm_bindgen(getter)]
     pub fn si_pixels(&self) -> Option<Vec<u8>> {
         self.si_pixels.clone()
     }
     /// The `*_si` pixels are exactly the pixels passed to `build_cover`
-    /// (a same-size Ghost cover): reuse that buffer, core returns no copy.
+    /// (a same-size Ghost cover core did not realign): reuse that buffer,
+    /// core returns no copy.
     #[wasm_bindgen(getter)]
     pub fn si_is_input(&self) -> bool {
         self.si_is_input
@@ -1241,8 +1369,8 @@ pub fn __bench_trellis(m: usize, w: usize, h: usize, inline: bool) -> f64 {
 }
 
 /// Test builds only: time-able split-trellis pieces on random input
-/// (`which`: 0 = pass A over `m` blocks, 1 = one segment's back pointers of
-/// `m` blocks, 2 = `embed` inline).
+/// (`which`: 0 = the forward pass over `m` blocks as one segment, 1 = one
+/// segment's back pointers of `m` blocks, 2 = `embed` inline).
 #[cfg(feature = "test-hooks")]
 #[wasm_bindgen]
 #[doc(hidden)]
@@ -1262,13 +1390,10 @@ pub fn __bench_split(m: usize, w: usize, h: usize, which: u8) -> f64 {
     let cols: Vec<u32> = (0..w).map(|c| phasm_core::stego::stc::hhat::column_packed(&hh, c)).collect();
     use phasm_core::stego::stc::trellis as t;
     let code = t::Code::uniform(&cols, m);
+    let input = t::Slices::new(&cover, &costs);
     match which {
-        0 => t::pass_a(&cover, &costs, &msg, &code, h, m, &|_| {}).ok().flatten().map_or(-1.0, |p| p.cost),
-        1 => {
-            let mut cp = vec![f64::INFINITY; 1 << h];
-            cp[0] = 0.0;
-            t::segment_rows(&cover, &costs, &msg, &code, 0, h, &cp).map_or(-1.0, |r| r[r.len() / 2] as f64)
-        }
+        0 => t::segment_forward(&input, &msg, &code, 0, h, &t::initial_costs(h)).map_or(-1.0, |c| t::best_state(&c).1),
+        1 => t::segment_rows(&input, &msg, &code, 0, h, &t::initial_costs(h)).map_or(-1.0, |r| r[r.len() / 2] as f64),
         _ => t::embed(&cover, &costs, &msg, &cols, h, usize::MAX, 1, &|_| {}).ok().flatten().map_or(-1.0, |p| p.total_cost),
     }
 }

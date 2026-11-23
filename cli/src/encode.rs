@@ -175,8 +175,9 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
         &args.image, mode, args.qf, args.resize, args.optimize, args.full_res, args.armor_preset,
     )?;
     // Deep Cover is side-informed Ghost; Armor ignores the raw pixels. Core
-    // drops the side information for pixels that are a decoded JPEG on the
-    // cover's grid (e.g. a PNG saved from a JPEG at the same size).
+    // realigns pixels that are a decoded JPEG on the cover's grid (e.g. a PNG
+    // saved from a JPEG at the same size) and drops the side information
+    // only if they still are one after that.
     let decoded_jpeg = mode == "ghost"
         && prepared
             .raw_pixels
@@ -192,6 +193,13 @@ pub fn run(args: EncodeArgs) -> Result<(), CliError> {
                 "warning: --qf re-encodes this JPEG at its own size, which makes a double-compressed \
                  cover; it is embedded without Deep Cover side information. Without --qf the \
                  original file is used as it is, which is the better cover."
+            );
+        }
+        if prepared.realigned {
+            eprintln!(
+                "note: the source's 8x8 block grid matched the cover's (a decoded JPEG or AVIF), so the \
+                 cover was realigned: 4 px cropped off the top and left and scaled back to {}x{}.",
+                prepared.width, prepared.height,
             );
         }
         if prepared.lossless_clean {

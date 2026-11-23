@@ -39,6 +39,7 @@ pub mod history;
 pub mod lossless;
 pub mod exif;
 pub mod quality;
+pub mod count;
 
 use dct::DctGrid;
 use error::{JpegError, Result};
@@ -77,6 +78,9 @@ pub struct JpegImage {
     raw_segments: Vec<MarkerSegment>,
     /// Raw SOS header data (for exact reconstruction).
     sos_data: Vec<u8>,
+    /// Length of the file this image was parsed from: [`Self::to_bytes`]
+    /// reserves about that much for the file it writes.
+    source_len: usize,
 }
 
 impl JpegImage {
@@ -249,6 +253,7 @@ impl JpegImage {
             restart_interval,
             raw_segments,
             sos_data,
+            source_len: data.len(),
         })
     }
 
@@ -488,6 +493,7 @@ impl JpegImage {
             restart_interval,
             raw_segments,
             sos_data: final_sos_data,
+            source_len: data.len(),
         };
 
         // Rebuild Huffman tables from the actual coefficient data so they
@@ -507,7 +513,12 @@ impl JpegImage {
     /// that fires approximately [`scan::JPEG_WRITE_STEPS`] times during scan
     /// encoding.
     pub fn to_bytes_with_progress(&self, on_progress: Option<&dyn Fn()>) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+        // The file is about as long as the one parsed (the same coefficients
+        // but for an embedding's changes; a progressive file written as
+        // baseline is up to ~10 % longer): reserve that, so the writer does
+        // not double its buffer and copy it at the end (up to 3× the file at
+        // once). The bytes do not depend on it.
+        let mut out = Vec::with_capacity(Self::write_reserve(self.source_len));
 
         // SOI
         out.push(0xFF);
@@ -532,7 +543,8 @@ impl JpegImage {
         out.extend_from_slice(&self.sos_data);
 
         // Re-encode scan data
-        let scan_bytes = scan::encode_scan_with_progress(
+        scan::encode_scan_into(
+            &mut out,
             &self.frame,
             &self.scan_components,
             &self.grids,
@@ -541,13 +553,23 @@ impl JpegImage {
             self.restart_interval,
             on_progress,
         )?;
-        out.extend_from_slice(&scan_bytes);
 
         // EOI
         out.push(0xFF);
         out.push(marker::EOI);
 
         Ok(out)
+    }
+
+    /// Bytes [`Self::to_bytes`] reserves for the file of an image parsed
+    /// from `source_len` bytes: that plus an eighth and 64 KiB.
+    pub fn write_reserve(source_len: usize) -> usize {
+        source_len.saturating_add(source_len / 8).saturating_add(64 << 10)
+    }
+
+    /// Length of the file this image was parsed from.
+    pub fn source_len(&self) -> usize {
+        self.source_len
     }
 
     /// Get a reference to the DCT coefficient grid for a component.

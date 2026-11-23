@@ -294,16 +294,17 @@ pub fn ghost_encode_si_with_shadows_quality(
 // Encode implementation
 // ---------------------------------------------------------------------------
 
-/// Run an encode body with the memory telemetry around it.
+/// Run an encode body with the memory telemetry around it (`predicted`: the
+/// plan's peak, [`memory::ghost_plan_peak`]).
 fn with_telemetry<T>(
     mode: ModeId,
     width: u32,
     height: u32,
     rung: GhostRung,
+    predicted: usize,
     body: impl FnOnce() -> Result<T, StegoError>,
 ) -> Result<T, StegoError> {
-    let workers = memory::encode_workers();
-    let predicted_mb = (memory::predict_peak_memory(mode, width, height, rung, workers) / (1024 * 1024)) as u32;
+    let predicted_mb = (predicted / (1024 * 1024)).min(u32::MAX as usize) as u32;
     let budget_mb = memory::get_memory_budget().map(|b| (b / (1024 * 1024)) as u32);
     memory::emit(TelemetryEvent::LadderRungSelected {
         mode, width, height, predicted_peak_mb: predicted_mb, budget_mb, rung: rung.as_u8(),
@@ -348,12 +349,12 @@ fn stego_error_kind(e: &StegoError) -> &'static str {
     }
 }
 
-/// Encoder options for this cover and frame under the memory budget.
-fn encode_opts(mode: ModeId, img: &JpegImage, m_bits: usize) -> (v31::EncodeOpts, GhostRung) {
-    let fi = img.frame_info();
-    let n_ac = v31::ac_count(img.dct_grid(0));
+/// Encoder options for an encode of `shape` under the memory budget, its
+/// rung and its predicted peak ([`memory::ghost_plan_peak`]).
+fn encode_opts(shape: &memory::GhostEncodeShape) -> (v31::EncodeOpts, GhostRung, usize) {
     let h = v31::V31_STC_H;
-    let plan = memory::ghost_lane_plan(mode, fi.width as u32, fi.height as u32, n_ac, m_bits, h);
+    let plan = memory::ghost_lane_plan(shape, h);
+    let predicted = memory::ghost_plan_peak(shape, &plan, h, memory::encode_workers());
     let opts = v31::EncodeOpts {
         h,
         parallel_lanes: plan.parallel_lanes,
@@ -361,8 +362,12 @@ fn encode_opts(mode: ModeId, img: &JpegImage, m_bits: usize) -> (v31::EncodeOpts
         group_positions: plan.group_positions,
         progress_steps: crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + LANE_STEPS,
         bound: std::env::var_os("PHASM_GHOST_V3_STATS").is_some(),
+        spill_order: plan.rung == GhostRung::SpilledOrder,
     };
-    (opts, plan.rung)
+    if std::env::var_os("PHASM_GHOST_V3_STATS").is_some() {
+        eprintln!("v3plan {plan:?} predicted peak {} MB", predicted >> 20);
+    }
+    (opts, plan.rung, predicted)
 }
 
 /// Encrypt a payload and build its Ghost frame bits.
@@ -399,6 +404,7 @@ pub(super) struct PreparedEncode {
     pub(super) frame_bits: Vec<u8>,
     pub(super) opts: v31::EncodeOpts,
     pub(super) rung: GhostRung,
+    pub(super) predicted: usize,
     pub(super) mode: ModeId,
     pub(super) width: u32,
     pub(super) height: u32,
@@ -428,8 +434,9 @@ pub(super) fn prepare_encode(
     let mode = if is_si { ModeId::GhostSi } else { ModeId::GhostNoShadow };
     // The frame length is known before any heavy work: size the lanes now.
     let frame_bits = frame_bits_for(&payload_bytes, passphrase)?;
-    let (opts, rung) = encode_opts(mode, &img, frame_bits.len());
-    Ok(PreparedEncode { img, frame_bits, opts, rung, mode, width, height })
+    let shape = memory::GhostEncodeShape::of_cover(&img, is_si, frame_bits.len(), &[]);
+    let (opts, rung, predicted) = encode_opts(&shape);
+    Ok(PreparedEncode { img, frame_bits, opts, rung, predicted, mode, width, height })
 }
 
 /// Score an embedded cover and write the stego JPEG.
@@ -458,17 +465,42 @@ pub(super) fn ghost_encode_impl(
     pre_parsed: Option<JpegImage>,
 ) -> Result<(Vec<u8>, EncodeQuality), StegoError> {
     progress::init(GHOST_ENCODE_STEPS);
-    let PreparedEncode { mut img, frame_bits, opts, rung, mode, width, height } =
+    let PreparedEncode { mut img, frame_bits, opts, rung, predicted, mode, width, height } =
         prepare_encode(image_bytes, message, files, passphrase, si.is_some(), pre_parsed)?;
 
-    with_telemetry(mode, width, height, rung, move || {
+    with_telemetry(mode, width, height, rung, predicted, move || {
         let structural_key = crypto::derive_structural_key(passphrase)?;
         progress::advance();
-        let stats = v31::encode(&mut img, &frame_bits, &structural_key, si.as_ref(), &opts)?;
+        drop_chroma(&mut img);
+        let v31::V31Plan { stats, changes } = v31::plan(&img, &frame_bits, &structural_key, si.as_ref(), None, None, &opts)?;
         let is_si = si.is_some();
-        drop(si);
+        drop((si, img));
+        let mut img = stego_image(image_bytes, changes)?;
         finish_encode(&mut img, &stats, is_si)
     })
+}
+
+/// Drop the cover's chroma for the embedding: Ghost changes only the luma,
+/// and the chroma grids (1 B per pixel at 4:2:0, 4 B at 4:4:4) would sit
+/// idle through the embedding's peak. `img` cannot be written afterwards:
+/// [`stego_image`] makes the image to write.
+pub(super) fn drop_chroma(img: &mut JpegImage) {
+    for c in 1..img.num_components() {
+        *img.dct_grid_mut(c) = DctGrid::new(0, 0);
+    }
+}
+
+/// The stego image: a fresh parse of the cover file `image_bytes` (the file
+/// the embedding's cover was parsed from: the same coefficients, tables and
+/// headers) with the luma `changes` (`(flat index, value)`) written in. The
+/// embedding's own image is dropped before, so the luma is not held twice.
+pub(super) fn stego_image(image_bytes: &[u8], changes: impl IntoIterator<Item = (u32, i16)>) -> Result<JpegImage, StegoError> {
+    let mut img = JpegImage::from_bytes(image_bytes)?;
+    let coeffs = img.dct_grid_mut(0).coeffs_mut();
+    for (fi, v) in changes {
+        coeffs[fi as usize] = v;
+    }
+    Ok(img)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -540,10 +572,12 @@ pub(super) fn shadows_encode(
     }
     let mode = if si.is_some() { ModeId::GhostSiShadow } else { ModeId::GhostShadow };
     let frame_bits = frame_bits_for(&primary_payload, primary_pass)?;
-    let (opts, rung) = encode_opts(mode, &img, frame_bits.len());
+    let shadow_bits: Vec<usize> = frames.iter().map(|f| f.rs_bits()).collect();
+    let shape = memory::GhostEncodeShape::of_cover(&img, si.is_some(), frame_bits.len(), &shadow_bits);
+    let (opts, rung, predicted) = encode_opts(&shape);
 
-    with_telemetry(mode, width, height, rung, move || {
-        shadows_encode_body(img, &frame_bits, primary_pass, &frames, &shadow_passes, si, opts)
+    with_telemetry(mode, width, height, rung, predicted, move || {
+        shadows_encode_body(img, image_bytes, &frame_bits, primary_pass, &frames, &shadow_passes, si, opts)
     })
 }
 
@@ -555,8 +589,10 @@ pub(super) fn shadows_encode(
 ///
 /// The image keeps the cover during planning (every cost is the cover's);
 /// planned layers live in an overlay and are written only at the end.
+#[allow(clippy::too_many_arguments)]
 fn shadows_encode_body(
     mut img: JpegImage,
+    image_bytes: &[u8],
     frame_bits: &[u8],
     passphrase: &str,
     frames: &[shadow::ShadowFrame],
@@ -567,6 +603,7 @@ fn shadows_encode_body(
     let structural_key = crypto::derive_structural_key(passphrase)?;
     let n = v31::ac_count(img.dct_grid(0));
     let total_coefficients = img.dct_grid(0).blocks_wide() * img.dct_grid(0).blocks_tall() * 64;
+    drop_chroma(&mut img);
 
     let shadow_bits: usize = frames.iter().map(|f| f.rs_bits()).sum();
     let all_bits = frame_bits.len() + shadow_bits;
@@ -576,15 +613,23 @@ fn shadows_encode_body(
         .rev()
         .filter(|&w| w <= sw_top)
         .collect();
-    let Some(&widest) = candidates.first() else {
+    if candidates.is_empty() {
         return Err(StegoError::MessageTooLarge);
-    };
-    let orders: Vec<Vec<u32>> = frames
-        .iter()
-        .map(|f| shadow::ac_hash_order_prefix(img.dct_grid(0), &f.perm_seed, f.rs_bits() * widest))
-        .collect();
+    }
+    // Each shadow's region (the first `region_len` positions of its hash
+    // order) is built when the shadow is planned and verified as the decoder
+    // reads it once the shadow is in the overlay; the layers after it never
+    // change it (the region is wet for them, and the checks below make
+    // sure). The regions are kept through the shadow planning — a layout that
+    // fails at a shadow is retried at a narrower width, whose regions are
+    // prefixes of these — and dropped before the primary is planned (4 B per
+    // position, together up to the whole cover for short primaries).
+    let mut orders: Vec<Vec<u32>> = vec![Vec::new(); frames.len()];
     progress::advance();
     let inline_limit = opts.lane_inline_bytes.min(v31::lane_inline_cap(n, opts.h));
+    // Each shadow's frame key, derived on its first verification and reused
+    // by the narrower widths a retried layout tries.
+    let keys: Vec<shadow::ShadowKeyCache> = shadow_passes.iter().map(|p| shadow::ShadowKeyCache::new(p)).collect();
 
     let mut attempt = 0u32;
     for &sw in &candidates {
@@ -597,13 +642,19 @@ fn shadows_encode_body(
         attempt += 1;
         let mut wet = v31::wet_mask_for(&img);
         let mut overlay = v31::Overlay::default();
-        let mut states = Vec::with_capacity(frames.len());
         let mut shadow_mods = 0;
         let mut feasible = true;
-        for (f, o) in frames.iter().zip(&orders) {
+        let mut planned = Vec::with_capacity(frames.len());
+        for ((f, key), o) in frames.iter().zip(&keys).zip(orders.iter_mut()) {
             let meter = StepMeter::new(f.rs_bits() * sw, SHADOW_STEPS);
             let tick = |d: usize| meter.tick(d);
-            let region = &o[..shadow::ShadowState::region_len(f, sw).min(o.len())];
+            let len = shadow::ShadowState::region_len(f, sw);
+            if o.len() < len {
+                *o = shadow::ac_hash_order_prefix(img.dct_grid(0), &f.perm_seed, len);
+            }
+            o.truncate(len);
+            let o = &*o;
+            let region = &o[..len.min(o.len())];
             let rho = v31::gather_costs(&img, region)?;
             let grid = img.dct_grid(0);
             let cost = |i: usize| {
@@ -619,45 +670,52 @@ fn shadows_encode_body(
                 break;
             };
             drop(rho);
+            // Cannot happen by construction (a wet position costs ∞, so the
+            // trellis keeps its parity); treat as infeasible at this width
+            // rather than change an earlier layer or a dummy block.
+            let keeps_wet = st.positions.iter().zip(&st.embed_bits).all(|(&fi, &bit)| {
+                !wet.get(fi) || (v31::value(img.dct_grid(0), Some(&overlay), fi) & 1) as u8 == bit
+            });
+            if !keeps_wet {
+                feasible = false;
+                break;
+            }
             shadow_mods += shadow::embed_shadow(&img, &mut overlay, &st, si.as_ref());
+            // The region's parities as the decoder will read them (its values
+            // are final: the later layers keep them), verified once the
+            // primary is planned too (1 bit per position until then).
+            let parities = shadow::planned_parities(&img, &overlay, &st);
             for &fi in &st.positions {
                 wet.set(fi);
             }
-            states.push(st);
+            let len = st.positions.len();
+            let state = shadow::ShadowState { positions: Vec::new(), embed_bits: Vec::new(), ..st };
+            planned.push((state, parities, len, key));
         }
         if !feasible {
             continue;
         }
-        let planned = match v31::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts) {
+        orders = vec![Vec::new(); frames.len()];
+        let primary = match v31::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts) {
             Ok(p) => p,
             Err(StegoError::MessageTooLarge) => continue,
             Err(e) => return Err(e),
         };
-        print_stats(&planned.stats);
-        // Write the layers and the primary; keep the cover values to undo.
-        let mut undo: Vec<(u32, i16)> = Vec::with_capacity(overlay.len() + planned.changes.len());
+        print_stats(&primary.stats);
+        // Cannot happen by construction (the shadow regions are wet for the
+        // primary, and each shadow's region is wet for the later ones); treat
+        // as infeasible at this width rather than emit an unreadable shadow.
+        if primary.changes.iter().any(|&(fi, _)| wet.get(fi))
+            || !planned.iter().all(|(st, parities, len, key)| shadow::verify_shadow_parities(parities, *len, st, key).is_ok())
         {
-            let coeffs = img.dct_grid_mut(0).coeffs_mut();
-            for (fi, v) in overlay.iter().chain(planned.changes.iter().copied()) {
-                undo.push((fi, coeffs[fi as usize]));
-                coeffs[fi as usize] = v;
-            }
-        }
-        let verified = states
-            .iter()
-            .zip(shadow_passes)
-            .all(|(st, pass)| shadow::verify_shadow(&img, st, pass).is_ok());
-        if !verified {
-            // Cannot happen by construction (regions are wet for every other
-            // layer); treat as infeasible at this width rather than emit an
-            // unreadable shadow.
-            let coeffs = img.dct_grid_mut(0).coeffs_mut();
-            for &(fi, v) in undo.iter().rev() {
-                coeffs[fi as usize] = v;
-            }
             continue;
         }
-        let stats = planned.stats;
+        drop(planned);
+        // Write the layers and the primary.
+        drop(img);
+        let mut img = stego_image(image_bytes, overlay.iter().chain(primary.changes.iter().copied()))?;
+        drop(primary.changes);
+        let stats = primary.stats;
         let encode_quality = quality::ghost_stealth_score(&GhostMetrics {
             num_modifications: stats.changes,
             n_used: stats.n,
@@ -669,7 +727,7 @@ fn shadows_encode_body(
             total_coefficients,
         });
         drop(si);
-        drop((wet, overlay, undo));
+        drop((wet, overlay));
         return Ok((write_jpeg(&mut img)?, encode_quality));
     }
     Err(StegoError::MessageTooLarge)
@@ -972,7 +1030,9 @@ pub(crate) fn ghost_shadow_decode_legacy_v1(
 /// set.
 pub(crate) fn nzac_indices(grid: &DctGrid) -> Vec<u32> {
     let c = grid.coeffs();
-    let mut out = Vec::with_capacity(c.len() / 4);
+    // Reserved exactly (4 B each): growing it would hold the old and the new
+    // block at once in a copying allocator (`memory::decode_peak_for`).
+    let mut out = Vec::with_capacity(crate::stego::ghost::capacity::count_nonzero_ac(grid));
     for (b, blk) in c.chunks_exact(64).enumerate() {
         for (k, &v) in blk.iter().enumerate().skip(1) {
             if v != 0 {
