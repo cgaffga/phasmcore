@@ -1343,7 +1343,7 @@ impl GhostEncodeSession {
         let lanes = self.lanes.take().ok_or_else(bad)?;
         let ord = self.ord.take().ok_or_else(bad)?;
         let plans: Vec<LanePlan> = lanes.plans.into_iter().map(|p| p.ok_or_else(bad)).collect::<Result<_, _>>()?;
-        let p = v31::assemble(plans, &ord, self.img.dct_grid(0), None, self.m, lanes.median_cost, &lanes.sample_ab, self.bound);
+        let p = v31::assemble(plans, &ord, self.m, lanes.median_cost, &lanes.sample_ab, self.bound);
         self.changes = p.changes;
         self.stats = Some(p.stats);
         Ok(())

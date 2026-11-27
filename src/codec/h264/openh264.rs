@@ -277,6 +277,9 @@ impl Drop for StegoSession {
 /// `SESSION_ALIVE` is global to the process so concurrent tests in
 /// different modules (e.g. `openh264::tests` and `openh264_stego::tests`)
 /// must serialise through this mutex to avoid `AlreadyRegistered` races.
+/// Tests that only write the OpenH264 stego globals (`set_frame_num`,
+/// `set_pass_mode`) take it as well: those globals feed every position
+/// key and pass of a concurrent encode.
 #[cfg(test)]
 pub(crate) static SESSION_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1238,7 +1241,13 @@ mod tests {
 
     #[test]
     fn set_frame_num_callable() {
-        // Doesn't touch SESSION_ALIVE, so no mutex needed.
+        // The frame number is process-global C state, and every stego
+        // position key carries it: a write here between another test's
+        // set_frame_num(0) and its encode gives all that test's positions
+        // the wrong frame (the 1.13.4 gate saw b8_full_translation_validates
+        // match 0 of 106 725 walker slots). So this takes the mutex too,
+        // although it never registers a session.
+        let _guard = SESSION_TEST_MUTEX.lock().unwrap();
         set_frame_num(0);
         set_frame_num(u32::MAX);
         set_frame_num(42);

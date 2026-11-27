@@ -59,16 +59,25 @@ pub enum GhostRung {
     /// Rung 3: one lane at a time, segmented trellis (back pointers
     /// recomputed per segment: `O(√n)` memory, twice the trellis work).
     Segmented,
-    /// Rung 4, the lowest: the keyed order (4 B per AC coefficient) is
-    /// written to disk once generated and read back in lane order
-    /// (`stego::spill`), with the most lanes and the largest cost groups the
-    /// budget then allows. Only when no other rung fits and a spill
-    /// directory with room is set ([`crate::stego::spill::set_spill_dir`]).
+    /// Rung 4: the keyed order (4 B per AC coefficient) is written to disk
+    /// once generated and read back in lane order (`stego::spill`), with the
+    /// most lanes and the largest cost groups the budget then allows. Only
+    /// when no in-memory rung fits and a spill directory with room is set
+    /// ([`crate::stego::spill::set_spill_dir`]).
     SpilledOrder,
+    /// Rung 5, the lowest: the streamed encode (`ghost::stream`). The costs,
+    /// cover values and side information go to disk in one cost pass, are
+    /// sorted into lane order by an external permutation and read front to
+    /// back by the lanes; the luma is dropped after the cost pass and parsed
+    /// again for the write. Peak about the keyed order's 4 B per AC
+    /// coefficient (or the parse and the write), ~24 B per AC coefficient on
+    /// disk. Only when even the leanest [`GhostRung::SpilledOrder`] plan is
+    /// over the budget and the spill directory has room for its files.
+    Streamed,
 }
 
 impl GhostRung {
-    /// Telemetry code (0..=4).
+    /// Telemetry code (0..=5).
     pub fn as_u8(self) -> u8 {
         match self {
             GhostRung::FullParallel => 0,
@@ -76,6 +85,7 @@ impl GhostRung {
             GhostRung::SingleLane => 2,
             GhostRung::Segmented => 3,
             GhostRung::SpilledOrder => 4,
+            GhostRung::Streamed => 5,
         }
     }
 }
@@ -367,6 +377,9 @@ fn order_working_bytes(r: usize) -> usize {
 /// "Memory").
 pub fn ghost_plan_peak(shape: &GhostEncodeShape, plan: &GhostLanePlan, h: usize, workers: usize) -> usize {
     use crate::stego::ghost::v31;
+    if plan.rung == GhostRung::Streamed {
+        return streamed_plan_peak(shape, plan, h, workers);
+    }
     let n = shape.n_ac();
     let m = shape.m_bits.max(1);
     let l = v31::lanes(n, m);
@@ -413,6 +426,90 @@ pub fn ghost_plan_peak(shape: &GhostEncodeShape, plan: &GhostLanePlan, h: usize,
 /// while it is written (`stego::spill::OrderSpill::write`).
 const SPILL_WRITE_BYTES: usize = 2 << 20;
 
+/// [`ghost_plan_peak`] of the streamed rung ([`GhostRung::Streamed`],
+/// `ghost::stream::plan_streamed`), phase by phase (`n` AC positions, `y`
+/// luma coefficients, `m` frame bits). Throughout: the frame (1 B per bit),
+/// the shadows' held values and, with shadows, the caller's wet mask (1 bit
+/// per coefficient).
+/// - the cost pass writing the records: the cover's luma, side information
+///   and wet mask ([`ghost_cover_bytes`]), the pair key (1 bit), a cost
+///   strip, one strip's records (8 B per position) and the writer's buffer;
+/// - the keyed order generated and written (4 B per position);
+/// - its inverse (4 B per position) while the records are distributed: one
+///   write buffer per bucket, a read chunk;
+/// - one bucket put in order (`stream::BUCKET_BYTES`), the samples' records;
+/// - the lanes ([`crate::stego::ghost::v31::lane_bytes`] each, as
+///   [`ghost_plan_peak`] counts them), a record window per lane in flight,
+///   the finished lanes' changes (≤ 4 B per frame bit) and the λ sample;
+/// - the assembly (the lanes' changes and their copy, 4 B per frame bit
+///   each);
+/// - the shadows' verification without the cover (it is not held);
+///
+/// and the phases the cover is held in as on every rung: before the
+/// embedding, the shadows' planning, the write.
+fn streamed_plan_peak(shape: &GhostEncodeShape, plan: &GhostLanePlan, h: usize, workers: usize) -> usize {
+    use crate::stego::ghost::{stream, v31};
+    let n = shape.n_ac();
+    let y = shape.y_coeffs;
+    let m = shape.m_bits.max(1);
+    let l = v31::lanes(n, m);
+    let workers = workers.max(1);
+    let wet = if shape.shadows > 0 { y / 8 } else { 0 };
+    let base = shape.m_bits.saturating_add(shadow_held_bytes(shape)).saturating_add(wet).saturating_add(FIXED_OVERHEAD_BYTES);
+    let writer = crate::stego::spill::WRITER_BYTES;
+    // The cover's wet mask is the caller's with shadows (in `base`).
+    let records = ghost_cover_bytes(shape)
+        .saturating_sub(wet)
+        .saturating_add(y / 8)
+        .saturating_add(strip_bytes(shape))
+        .saturating_add(stream::strip_record_bytes(shape.y_blocks_wide))
+        .saturating_add(writer);
+    let order = n.saturating_mul(4).saturating_add(SPILL_WRITE_BYTES);
+    let bsize = stream::bucket_positions(n);
+    let buckets = n.div_ceil(bsize.max(1));
+    // The samples' order positions (8 B each) from the distribution on; in the
+    // buckets also their sort (16 B) and records (8 B).
+    let distribute = n
+        .saturating_mul(4)
+        .saturating_add(buckets.saturating_mul(stream::dist_buffer_records(buckets) * stream::DIST_BYTES + 8))
+        .saturating_add(STREAM_READ_CHUNK_BYTES)
+        .saturating_add(STREAM_SAMPLES * 8);
+    let samples = STREAM_SAMPLES.saturating_mul(8 + 16 + stream::REC_BYTES);
+    let bucket = bsize.min(n).saturating_mul(stream::DIST_BYTES + stream::REC_BYTES).saturating_add(samples).saturating_add(writer);
+    let nk = n.div_ceil(l);
+    let bits = m.div_ceil(l);
+    let nb = plan.parallel_lanes.min(workers).clamp(1, l);
+    let inline = plan.lane_inline_bytes.min(v31::lane_inline_share(n, nk, nb, h, workers));
+    let lanes = nb
+        .saturating_mul(v31::lane_bytes(nk, bits, h, inline, v31::lane_threads(nb, workers)).saturating_add(STREAM_WINDOW_BYTES))
+        .saturating_add(shape.m_bits.saturating_mul(4))
+        .saturating_add(STREAM_SAMPLES * 16);
+    let assemble = shape.m_bits.saturating_mul(8);
+    let verify = if shape.shadows == 0 {
+        0
+    } else {
+        shape.m_bits.saturating_mul(4).saturating_add(shape.max_shadow_positions()).saturating_add(ARGON2_WORKING_BYTES)
+    };
+    let streamed = records.max(order).max(distribute).max(bucket).max(lanes).max(assemble).max(verify).saturating_add(base);
+    let peak = streamed
+        .max(prep_phase_bytes(shape))
+        .max(shadow_phase_bytes(shape, plan.lane_inline_bytes, h, workers))
+        .max(write_phase_bytes(shape));
+    peak.saturating_add(peak / 100 * GHOST_MODEL_MARGIN_PERCENT)
+}
+
+/// The streamed encode's read chunks while it inverts the order and
+/// distributes the records (`ghost::stream`: 256 KiB and 1 MiB).
+const STREAM_READ_CHUNK_BYTES: usize = (1 << 20) + (256 << 10);
+
+/// A lane's record window on disk (`stream::RecordLane`: 4 096 records of
+/// 8 B for its changes; its trellis chunks' reads are on the stack).
+const STREAM_WINDOW_BYTES: usize = 32 << 10;
+
+/// The λ and median samples of an encode, at most (`v31::sample_positions`:
+/// 65 536 for the median, 32 768 for λ).
+const STREAM_SAMPLES: usize = (1 << 16) + (1 << 15);
+
 /// A lane's window of the order on disk (`v31::FiWindow`, the trellis
 /// chunks' reads are on the stack).
 const SPILL_WINDOW_BYTES: usize = 64 << 10;
@@ -428,8 +525,9 @@ const GHOST_MODEL_MARGIN_PERCENT: usize = 3;
 /// (primary and shadows, compressed payload as `compressed_payload_size`
 /// reports it): the plan [`ghost_lane_plan`] picks under the current memory
 /// budget, the process's rayon workers and spill directory (with one set and
-/// memory tight, the lowest rung's plan: the keyed order on disk,
-/// [`GhostRung::SpilledOrder`]), and its [`ghost_plan_peak`].
+/// memory tight, a disk rung's plan: the keyed order on disk,
+/// [`GhostRung::SpilledOrder`], or, tighter still, the streamed encode,
+/// [`GhostRung::Streamed`]), and its [`ghost_plan_peak`].
 ///
 /// For an app to check memory before an encode. It counts everything core
 /// allocates during the call — the parse and side information, the
@@ -543,7 +641,7 @@ pub fn predict_peak_memory(
             GhostRung::FullParallel => (n_workers.max(1), LANE_INLINE_BYTES, usize::MAX),
             GhostRung::CappedParallel => (2, LANE_INLINE_BYTES, usize::MAX),
             GhostRung::SingleLane => (1, LANE_INLINE_BYTES, usize::MAX),
-            GhostRung::Segmented | GhostRung::SpilledOrder => (1, 0, n.div_ceil(l)),
+            GhostRung::Segmented | GhostRung::SpilledOrder | GhostRung::Streamed => (1, 0, n.div_ceil(l)),
         };
         let plan = GhostLanePlan { rung, parallel_lanes: k, lane_inline_bytes: inline, group_positions: group };
         return ghost_plan_peak(&shape, &plan, crate::stego::ghost::v31::V31_STC_H, n_workers);
@@ -997,16 +1095,28 @@ pub(crate) fn emit(event: TelemetryEvent) {
 /// per cost group is over the budget's own bound (`budget / 1.5`): the same
 /// search with the keyed order on disk ([`GhostRung::SpilledOrder`], if a
 /// spill directory with room for it is set:
-/// [`crate::stego::spill::spill_room`]), else its leanest plan. Otherwise the
-/// leanest in-memory plan (its peak is over the limit:
+/// [`crate::stego::spill::spill_room`]). When even its leanest plan is over
+/// that bound: the streamed encode ([`GhostRung::Streamed`], if the
+/// directory has room for its files, ~24 B per AC coefficient, and its
+/// leanest plan is leaner), the fastest of its plans that fits, else its
+/// leanest; else the leanest spilled-order plan. Without a spill directory
+/// the leanest in-memory plan (its peak is over the limit:
 /// [`ghost_encode_peak_bytes`] tells the apps before they start). Every
 /// choice writes the same bytes.
 ///
 /// `PHASM_GHOST_FORCE_SPILL` (measurement, the identity runs) keeps the plan
-/// but puts its order on disk whenever a spill directory has room.
+/// but puts its order on disk whenever a spill directory has room;
+/// `PHASM_GHOST_FORCE_STREAM` likewise streams it ([`GhostRung::Streamed`]).
 pub fn ghost_lane_plan(shape: &GhostEncodeShape, h: usize) -> GhostLanePlan {
     let plan = ghost_lane_plan_inner(shape, h);
+    if plan.rung != GhostRung::Streamed
+        && std::env::var_os("PHASM_GHOST_FORCE_STREAM").is_some()
+        && crate::stego::spill::spill_room(stream_bytes(shape))
+    {
+        return GhostLanePlan { rung: GhostRung::Streamed, ..plan };
+    }
     if plan.rung != GhostRung::SpilledOrder
+        && plan.rung != GhostRung::Streamed
         && std::env::var_os("PHASM_GHOST_FORCE_SPILL").is_some()
         && crate::stego::spill::spill_room(spill_bytes(shape))
     {
@@ -1020,6 +1130,25 @@ fn spill_bytes(shape: &GhostEncodeShape) -> u64 {
     shape.n_ac() as u64 * 4
 }
 
+/// Disk the streamed encode of `shape` takes at once
+/// (`stream::stream_disk_bytes`), and with shadows and side information the
+/// side information's copy (1 B per luma coefficient, kept while a narrower
+/// shadow layout may follow).
+fn stream_bytes(shape: &GhostEncodeShape) -> u64 {
+    let si = if shape.si && shape.shadows > 0 { shape.y_coeffs as u64 } else { 0 };
+    crate::stego::ghost::stream::stream_disk_bytes(shape.n_ac()) + si
+}
+
+/// Where a plan keeps what it would otherwise hold in memory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disk {
+    None,
+    /// The keyed order ([`GhostRung::SpilledOrder`]).
+    Order,
+    /// Everything the lanes read ([`GhostRung::Streamed`]).
+    Stream,
+}
+
 fn ghost_lane_plan_inner(shape: &GhostEncodeShape, h: usize) -> GhostLanePlan {
     use crate::stego::ghost::v31;
     let workers = encode_workers();
@@ -1028,10 +1157,15 @@ fn ghost_lane_plan_inner(shape: &GhostEncodeShape, h: usize) -> GhostLanePlan {
     let k_max = workers.min(l).max(1);
     let nk = n.div_ceil(l);
     let inline = |k: usize| LANE_INLINE_BYTES.min(v31::lane_inline_share(n, nk, k, h, workers));
-    // `spill`: the same plan with the order on disk (the lowest rung).
-    let in_memory = |k: usize, g: usize, spill: bool| GhostLanePlan {
-        rung: if spill {
-            GhostRung::SpilledOrder
+    // `disk`: the same plan with the order on disk, or streamed.
+    let on_disk = |disk: Disk| match disk {
+        Disk::None => None,
+        Disk::Order => Some(GhostRung::SpilledOrder),
+        Disk::Stream => Some(GhostRung::Streamed),
+    };
+    let in_memory = |k: usize, g: usize, disk: Disk| GhostLanePlan {
+        rung: if let Some(r) = on_disk(disk) {
+            r
         } else if k == k_max {
             GhostRung::FullParallel
         } else if k > 1 {
@@ -1043,14 +1177,14 @@ fn ghost_lane_plan_inner(shape: &GhostEncodeShape, h: usize) -> GhostLanePlan {
         lane_inline_bytes: inline(k),
         group_positions: g,
     };
-    let segmented = |k: usize, g: usize, spill: bool| GhostLanePlan {
-        rung: if spill { GhostRung::SpilledOrder } else { GhostRung::Segmented },
+    let segmented = |k: usize, g: usize, disk: Disk| GhostLanePlan {
+        rung: on_disk(disk).unwrap_or(GhostRung::Segmented),
         parallel_lanes: k,
         lane_inline_bytes: 0,
         group_positions: g,
     };
     let Some(budget) = get_memory_budget() else {
-        return GhostLanePlan { lane_inline_bytes: LANE_INLINE_BYTES, ..in_memory(k_max, usize::MAX, false) };
+        return GhostLanePlan { lane_inline_bytes: LANE_INLINE_BYTES, ..in_memory(k_max, usize::MAX, Disk::None) };
     };
     // In u64: on wasm32 `budget * 2` saturates usize above 2 GiB.
     let limit = ((budget as u64 * SAFETY_FACTOR_DEN as u64 / SAFETY_FACTOR_NUM as u64).min(usize::MAX as u64) as usize)
@@ -1075,48 +1209,65 @@ fn ghost_lane_plan_inner(shape: &GhostEncodeShape, h: usize) -> GhostLanePlan {
         Some(lo)
     };
     let passes = |g: usize| ghost_groups(n, l, g).len();
-    // The fastest plan that fits, the order in memory or (`spill`) on disk.
-    let search = |spill: bool| -> Option<GhostLanePlan> {
-        if let Some(g) = largest_group(&|g| in_memory(k_max, g, spill)) {
+    // The fastest plan that fits, the order in memory or on disk (`disk`).
+    // (The streamed plan holds no costs: every group size has its peak.)
+    let search = |disk: Disk| -> Option<GhostLanePlan> {
+        if let Some(g) = largest_group(&|g| in_memory(k_max, g, disk)) {
             // Prefer checkpointed lanes on every worker in one or two cost
             // passes over in-memory lanes with many more passes.
             if g != usize::MAX
-                && let Some(gs) = largest_group(&|g| segmented(k_max, g, spill))
+                && let Some(gs) = largest_group(&|g| segmented(k_max, g, disk))
                 && passes(gs) + 1 < passes(g)
             {
-                return Some(segmented(k_max, gs, spill));
+                return Some(segmented(k_max, gs, disk));
             }
-            return Some(in_memory(k_max, g, spill));
+            return Some(in_memory(k_max, g, disk));
         }
-        if let Some(g) = largest_group(&|g| segmented(k_max, g, spill)) {
-            return Some(segmented(k_max, g, spill));
+        if let Some(g) = largest_group(&|g| segmented(k_max, g, disk)) {
+            return Some(segmented(k_max, g, disk));
         }
         for k in (1..k_max).rev() {
-            if let Some(g) = largest_group(&|g| in_memory(k, g, spill)) {
-                return Some(in_memory(k, g, spill));
+            if let Some(g) = largest_group(&|g| in_memory(k, g, disk)) {
+                return Some(in_memory(k, g, disk));
             }
-            if let Some(g) = largest_group(&|g| segmented(k, g, spill)) {
-                return Some(segmented(k, g, spill));
+            if let Some(g) = largest_group(&|g| segmented(k, g, disk)) {
+                return Some(segmented(k, g, disk));
             }
         }
         None
     };
-    if let Some(p) = search(false) {
+    if let Some(p) = search(Disk::None) {
         return p;
     }
     // Nothing fits `limit`. The order goes to disk only when memory is short
     // — the leanest in-memory plan is over the budget's own bound — not when
     // only `GHOST_TARGET_BYTES` capped the limit (a large cover with a
     // generous budget: the leanest in-memory plan, as before).
-    let leanest = segmented(1, nk, false);
+    let leanest = segmented(1, nk, Disk::None);
     // In u64, as `limit` (wasm32's usize saturates `budget * 2` above 2 GiB).
     let budget_limit = (budget as u64 * SAFETY_FACTOR_DEN as u64 / SAFETY_FACTOR_NUM as u64).min(usize::MAX as u64) as usize;
-    let short = ghost_plan_peak(shape, &leanest, h, workers) > budget_limit;
-    if short && crate::stego::spill::spill_room(spill_bytes(shape)) {
-        return search(true).unwrap_or(segmented(1, nk, true));
+    let peak = |p: &GhostLanePlan| ghost_plan_peak(shape, p, h, workers);
+    let short = peak(&leanest) > budget_limit;
+    if !short || !crate::stego::spill::spill_room(spill_bytes(shape)) {
+        // Over the limit whatever we do (very large covers): the leanest plan.
+        return leanest;
     }
-    // Over the limit whatever we do (very large covers): the leanest plan.
-    leanest
+    if let Some(p) = search(Disk::Order) {
+        return p;
+    }
+    // Nothing fits with the order on disk either. The encode streams only
+    // when memory is short for that too — the leanest spilled-order plan is
+    // over the budget's own bound — the streamed plan is leaner, and the
+    // spill directory has room for its files.
+    let leanest_spilled = segmented(1, nk, Disk::Order);
+    let leanest_streamed = segmented(1, nk, Disk::Stream);
+    if peak(&leanest_spilled) > budget_limit
+        && peak(&leanest_streamed) < peak(&leanest_spilled)
+        && crate::stego::spill::spill_room(stream_bytes(shape))
+    {
+        return search(Disk::Stream).unwrap_or(leanest_streamed);
+    }
+    leanest_spilled
 }
 
 /// The cost groups `v31::plan` forms for `l` lanes over `n` positions with
@@ -1151,9 +1302,14 @@ mod tests {
         let r1 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::CappedParallel, 6);
         let r2 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::SingleLane, 6);
         let r3 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::Segmented, 6);
+        let r4 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::SpilledOrder, 6);
+        let r5 = predict_peak_memory(ModeId::GhostShadow, w, h, GhostRung::Streamed, 6);
         assert!(r0 > r1, "rung 0 ({r0}) > rung 1 ({r1})");
         assert!(r1 > r2, "rung 1 ({r1}) > rung 2 ({r2})");
         assert!(r2 > r3, "rung 2 ({r2}) > rung 3 ({r3})");
+        assert!(r3 > r4, "rung 3 ({r3}) > rung 4 ({r4})");
+        // The write (a fresh parse and the file) can be both disk rungs' peak.
+        assert!(r4 >= r5, "rung 4 ({r4}) ≥ rung 5 ({r5})");
     }
 
     /// 12 MP: ~0.1 GB of fixed buffers (luma, keyed order) and a one-lane
@@ -1333,13 +1489,21 @@ mod tests {
         assert!((11.0..13.0).contains(&per_px), "{per_px} B/px");
     }
 
-    /// The lowest rung (the order on disk) is chosen only when no other rung
-    /// fits the budget and a spill directory has room for the order; it
-    /// lowers the estimate by about the order (4 B per AC coefficient).
+    /// The spilled-order rung is chosen only when no in-memory rung fits the
+    /// budget and a spill directory has room for the order; it lowers the
+    /// estimate by about the order (4 B per AC coefficient). The streamed
+    /// rung only when even the leanest spilled-order plan is over the budget
+    /// and the directory has room for the streamed files (~24 B per AC
+    /// coefficient); it lowers the estimate to about the order's 4 B per AC
+    /// coefficient (the shuffle) or the cover's parse and write.
     #[test]
-    fn spill_rung_only_when_nothing_else_fits() {
+    fn disk_rungs_only_when_nothing_else_fits() {
         use crate::stego::spill::{self, tests::plenty};
         let _guard = budget_test_lock();
+        // Room for the order (0.6 GB × 1.25 + 64 MiB), not for the streamed files.
+        fn order_only(_: &std::path::Path) -> Option<u64> {
+            Some(1 << 30)
+        }
         fn tight_disk(_: &std::path::Path) -> Option<u64> {
             Some(256 << 20)
         }
@@ -1351,28 +1515,81 @@ mod tests {
             let shape = GhostEncodeShape::yuv420(w, h, true, 648, &[]);
             (ghost_lane_plan(&shape, 9).rung, ghost_encode_peak_bytes(w, h, true, 0, 31))
         };
-        // No spill directory: today's ladder at any budget.
+        let order = (w as usize / 8) * (h as usize / 8) * 63 * 4;
+        // No spill directory: the in-memory ladder at any budget.
         spill::set_spill_dir(None, plenty);
         let (roomy, roomy_peak) = rung_and_peak(4096);
         let (tight, tight_peak) = rung_and_peak(900);
         assert_ne!(roomy, GhostRung::SpilledOrder);
+        assert_ne!(roomy, GhostRung::Streamed);
         assert_eq!(tight, GhostRung::Segmented);
         // With one: a budget that fits keeps its plan and estimate.
-        spill::set_spill_dir(Some(dir.clone()), plenty);
-        assert_eq!(rung_and_peak(4096), (roomy, roomy_peak));
-        let (rung, peak) = rung_and_peak(900);
+        for free in [order_only as spill::FreeSpace, plenty] {
+            spill::set_spill_dir(Some(dir.clone()), free);
+            assert_eq!(rung_and_peak(4096), (roomy, roomy_peak));
+        }
+        // Room for the order only: the spilled-order rung.
+        spill::set_spill_dir(Some(dir.clone()), order_only);
+        let (rung, spilled_peak) = rung_and_peak(900);
         if cfg!(unix) {
             assert_eq!(rung, GhostRung::SpilledOrder);
-            let order = (w as usize / 8) * (h as usize / 8) * 63 * 4;
-            assert!(peak + order / 2 < tight_peak && peak + order + order / 10 > tight_peak, "{peak} vs {tight_peak}");
+            assert!(spilled_peak + order / 2 < tight_peak && spilled_peak + order + order / 10 > tight_peak, "{spilled_peak} vs {tight_peak}");
+            // A budget the spilled-order plan fits: no streaming, whatever the disk.
+            let fits = (spilled_peak * 3 / 2 >> 20) + 64;
+            spill::set_spill_dir(Some(dir.clone()), plenty);
+            assert_eq!(rung_and_peak(fits).0, GhostRung::SpilledOrder);
         } else {
             assert_eq!(rung, GhostRung::Segmented);
         }
-        // Too little free space for the order: not available.
+        // Room for the streamed files too: the streamed rung, about the
+        // order's peak (the shuffle; 4:2:0 Deep Cover: the parse and side
+        // information before it are about as large).
+        spill::set_spill_dir(Some(dir.clone()), plenty);
+        let (rung, streamed_peak) = rung_and_peak(900);
+        if cfg!(unix) {
+            assert_eq!(rung, GhostRung::Streamed);
+            assert!(streamed_peak < spilled_peak * 6 / 10, "{streamed_peak} vs {spilled_peak}");
+            let px = w as usize * h as usize;
+            assert!(streamed_peak > px * 4 && streamed_peak < px * 5, "{} B/px", streamed_peak as f64 / px as f64);
+            assert_eq!(rung_and_peak(4096), (roomy, roomy_peak));
+        } else {
+            assert_eq!(rung, GhostRung::Segmented);
+        }
+        // Too little free space for the order: neither disk rung.
         spill::set_spill_dir(Some(dir), tight_disk);
         assert_eq!(rung_and_peak(900), (tight, tight_peak));
         spill::set_spill_dir(None, plenty);
         set_memory_budget(before);
+    }
+
+    /// The streamed rung's estimate never exceeds the spilled-order rung's
+    /// for the same lanes at once, nor its leanest plan's one lane
+    /// (12-150 MP, plain, side information, shadows, short to long frames,
+    /// 1-8 workers).
+    #[test]
+    fn streamed_peak_is_below_the_spilled_order_peak() {
+        let _guard = budget_test_lock();
+        for workers in [1usize, 4, 8] {
+            for (w, hgt) in [(4032u32, 3024u32), (8064, 6048), (11_552, 8_672), (14_144, 10_608)] {
+                for (si, shadows) in [(false, &[][..]), (true, &[][..]), (true, &[2000usize, 2000][..])] {
+                    let n = GhostEncodeShape::yuv420(w, hgt, si, 0, &[]).n_ac();
+                    for m in [800usize, 25_000, n / 40, n / 6] {
+                        let shape = GhostEncodeShape::yuv420(w, hgt, si, m, shadows);
+                        let nk = n.div_ceil(crate::stego::ghost::v31::lanes(n, m));
+                        for (k, inline) in [(1usize, 0usize), (workers, LANE_INLINE_BYTES)] {
+                            let p = |rung, group| GhostLanePlan { rung, parallel_lanes: k, lane_inline_bytes: inline, group_positions: group };
+                            let streamed = ghost_plan_peak(&shape, &p(GhostRung::Streamed, usize::MAX), 9, workers);
+                            // The same lanes at once: one cost group (a group of one
+                            // lane plans one lane at a time).
+                            let spilled = ghost_plan_peak(&shape, &p(GhostRung::SpilledOrder, usize::MAX), 9, workers);
+                            let leanest = ghost_plan_peak(&shape, &p(GhostRung::SpilledOrder, nk), 9, workers);
+                            assert!(k > 1 || streamed <= leanest, "{w}x{hgt} si {si} m={m} workers {workers}: {streamed} > {leanest}");
+                            assert!(streamed <= spilled, "{w}x{hgt} si {si} m={m} k={k} workers {workers}: {streamed} > {spilled}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The apps' header bound (`ImageMemory.decodeBoundBytes`, Android and iOS;

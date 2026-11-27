@@ -363,6 +363,7 @@ fn encode_opts(shape: &memory::GhostEncodeShape) -> (v31::EncodeOpts, GhostRung,
         progress_steps: crate::stego::cost::uniward::UNIWARD_PROGRESS_STEPS + LANE_STEPS,
         bound: std::env::var_os("PHASM_GHOST_V3_STATS").is_some(),
         spill_order: plan.rung == GhostRung::SpilledOrder,
+        stream: plan.rung == GhostRung::Streamed,
     };
     if std::env::var_os("PHASM_GHOST_V3_STATS").is_some() {
         eprintln!("v3plan {plan:?} predicted peak {} MB", predicted >> 20);
@@ -472,8 +473,16 @@ pub(super) fn ghost_encode_impl(
         let structural_key = crypto::derive_structural_key(passphrase)?;
         progress::advance();
         drop_chroma(&mut img);
-        let v31::V31Plan { stats, changes } = v31::plan(&img, &frame_bits, &structural_key, si.as_ref(), None, None, &opts)?;
         let is_si = si.is_some();
+        let mut si = si;
+        let planned = if opts.stream {
+            // The lowest rung: the luma and the side information are dropped
+            // after the cost pass (the stego image below is a fresh parse).
+            super::stream::plan_streamed(&mut img, &frame_bits, &structural_key, &mut si, None, None, &opts)
+        } else {
+            v31::plan(&img, &frame_bits, &structural_key, si.as_ref(), None, None, &opts)
+        };
+        let v31::V31Plan { stats, changes } = planned?;
         drop((si, img));
         let mut img = stego_image(image_bytes, changes)?;
         finish_encode(&mut img, &stats, is_si)
@@ -604,6 +613,12 @@ fn shadows_encode_body(
     let n = v31::ac_count(img.dct_grid(0));
     let total_coefficients = img.dct_grid(0).blocks_wide() * img.dct_grid(0).blocks_tall() * 64;
     drop_chroma(&mut img);
+    let is_si = si.is_some();
+    let mut si = si;
+    // The streamed primary (the lowest rung) drops the luma and the side
+    // information; a layout retried at a narrower width parses the cover
+    // again and reads the side information back from disk.
+    let mut si_on_disk: Option<super::stream::SiOnDisk> = None;
 
     let shadow_bits: usize = frames.iter().map(|f| f.rs_bits()).sum();
     let all_bits = frame_bits.len() + shadow_bits;
@@ -632,8 +647,13 @@ fn shadows_encode_body(
     let keys: Vec<shadow::ShadowKeyCache> = shadow_passes.iter().map(|p| shadow::ShadowKeyCache::new(p)).collect();
 
     let mut attempt = 0u32;
-    for &sw in &candidates {
+    for (ci, &sw) in candidates.iter().enumerate() {
         progress::check_cancelled()?;
+        if opts.stream && img.dct_grid(0).coeffs().is_empty() {
+            img = JpegImage::from_bytes(image_bytes)?;
+            drop_chroma(&mut img);
+            si = si_on_disk.as_ref().map(super::stream::SiOnDisk::read).transpose()?;
+        }
         if attempt > 0 {
             // A retried layout: budget another round of trellises + write.
             let (step, total) = progress::get();
@@ -696,7 +716,16 @@ fn shadows_encode_body(
             continue;
         }
         orders = vec![Vec::new(); frames.len()];
-        let primary = match v31::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts) {
+        let primary_plan = if opts.stream {
+            // A narrower width may follow: keep the side information on disk.
+            if ci + 1 < candidates.len() && si_on_disk.is_none() {
+                si_on_disk = si.as_ref().map(super::stream::SiOnDisk::write).transpose()?;
+            }
+            super::stream::plan_streamed(&mut img, frame_bits, &structural_key, &mut si, Some(&wet), Some(&overlay), &opts)
+        } else {
+            v31::plan(&img, frame_bits, &structural_key, si.as_ref(), Some(&wet), Some(&overlay), &opts)
+        };
+        let primary = match primary_plan {
             Ok(p) => p,
             Err(StegoError::MessageTooLarge) => continue,
             Err(e) => return Err(e),
@@ -722,11 +751,11 @@ fn shadows_encode_body(
             w: stats.w1,
             total_cost: stats.distortion,
             median_cost: stats.median_cost,
-            is_si: si.is_some(),
+            is_si,
             shadow_modifications: shadow_mods,
             total_coefficients,
         });
-        drop(si);
+        drop((si, si_on_disk));
         drop((wet, overlay));
         return Ok((write_jpeg(&mut img)?, encode_quality));
     }

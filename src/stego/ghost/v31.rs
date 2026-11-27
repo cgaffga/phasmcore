@@ -184,8 +184,14 @@ impl LayerShape {
 // ---------------------------------------------------------------------------
 
 /// Every Y AC flat index (`block · 64 + k`, k = 1..63), raster order.
+#[cfg(test)]
 pub fn ac_flat_indices(grid: &DctGrid) -> Vec<u32> {
-    let nb = grid.blocks_wide() * grid.blocks_tall();
+    ac_flat_indices_of_blocks(grid.blocks_wide() * grid.blocks_tall())
+}
+
+/// Every Y AC flat index of a grid of `nb` blocks (`block · 64 + k`, k =
+/// 1..63), raster order.
+fn ac_flat_indices_of_blocks(nb: usize) -> Vec<u32> {
     let mut out = Vec::with_capacity(nb * 63);
     for b in 0..nb as u32 {
         for k in 1..64u32 {
@@ -204,9 +210,22 @@ pub use crate::stego::permute::shuffle_u32;
 
 /// The keyed embedding order: all AC flat indices, permuted.
 pub fn order(grid: &DctGrid, seeds: &V31Seeds) -> Vec<u32> {
-    let mut o = ac_flat_indices(grid);
+    order_of_blocks(grid.blocks_wide() * grid.blocks_tall(), seeds)
+}
+
+/// [`order`] of a grid of `nb` blocks (the streamed encode generates it
+/// after dropping the grid).
+pub(crate) fn order_of_blocks(nb: usize, seeds: &V31Seeds) -> Vec<u32> {
+    let mut o = ac_flat_indices_of_blocks(nb);
     shuffle_u32(&mut o, &seeds.perm);
     o
+}
+
+/// The position of the AC flat index `fi` among the AC positions in raster
+/// order (its index in `ac_flat_indices_of_blocks`).
+#[inline]
+pub(crate) fn ac_index(fi: u32) -> usize {
+    (fi as usize >> 6) * 63 + (fi as usize & 63) - 1
 }
 
 #[inline]
@@ -254,7 +273,7 @@ pub fn plane2(c: i16, s: i16) -> u8 {
 
 /// The direction (+1/−1) of the ±1 change that also flips P2.
 #[inline]
-fn dir2(c: i16, s: i16) -> i16 {
+pub(crate) fn dir2(c: i16, s: i16) -> i16 {
     if c.wrapping_add(s) & 1 != 0 { 1 } else { -1 }
 }
 
@@ -390,7 +409,7 @@ const SI_FACTOR_FLOOR_APPROX: f32 = 0.3;
 /// measured worse (Δ P_E −0.040 at 0.20), as were an away cost `ρ(1 + 2|e|)`
 /// and a 0.3 floor (`eval/runs/2026-10-27-deep-cover-exact-si/RESULTS.md` §3).
 #[inline]
-fn pm_costs(rho: f32, c: i16, si: Option<SiTerm>) -> (f32, f32) {
+pub(crate) fn pm_costs(rho: f32, c: i16, si: Option<SiTerm>) -> (f32, f32) {
     let (mut rp, mut rm) = match si {
         None => (rho, rho),
         Some(t) if t.exact && t.tie => (rho, rho),
@@ -586,7 +605,7 @@ pub fn layer_split(c: usize) -> (usize, usize) {
 
 /// Trellis positions a lane of `nk` positions walks for `bits` frame bits
 /// (both layers; the unit of the lane progress meter).
-fn lane_work(nk: usize, bits: usize) -> usize {
+pub(crate) fn lane_work(nk: usize, bits: usize) -> usize {
     LaneGeom::new(nk, bits).map_or(0, |g| g.n1() + g.n2())
 }
 
@@ -634,9 +653,14 @@ pub struct EncodeOpts {
     /// Also estimate the rate-distortion bound (measurement).
     pub bound: bool,
     /// Keep the keyed order on disk (`stego::spill`) once it is generated:
-    /// the memory ladder's lowest rung (`GhostRung::SpilledOrder`), only with
-    /// a spill directory set. Same plan.
+    /// the memory ladder's spilled-order rung (`GhostRung::SpilledOrder`),
+    /// only with a spill directory set. Same plan.
     pub spill_order: bool,
+    /// The streamed encode (`GhostRung::Streamed`, the lowest rung): the
+    /// pipeline plans with [`super::stream::plan_streamed`], which keeps the
+    /// costs, cover values and side information on disk in lane order and
+    /// drops the luma. [`plan`] does not read it. Same plan.
+    pub stream: bool,
 }
 
 impl Default for EncodeOpts {
@@ -649,20 +673,21 @@ impl Default for EncodeOpts {
             progress_steps: 0,
             bound: false,
             spill_order: false,
+            stream: false,
         }
     }
 }
 
 /// Spreads `steps` progress advances over `total` units of work reported
 /// from any thread.
-struct Meter {
-    total: u64,
-    steps: u64,
-    done: AtomicU64,
+pub(crate) struct Meter {
+    pub(crate) total: u64,
+    pub(crate) steps: u64,
+    pub(crate) done: AtomicU64,
 }
 
 impl Meter {
-    fn tick(&self, k: usize) {
+    pub(crate) fn tick(&self, k: usize) {
         if self.steps == 0 || self.total == 0 {
             return;
         }
@@ -676,7 +701,7 @@ impl Meter {
     }
 
     /// Advance whatever is left (rounding, infeasible lanes).
-    fn finish(&self) {
+    pub(crate) fn finish(&self) {
         if self.steps == 0 || self.total == 0 {
             return;
         }
@@ -740,11 +765,12 @@ pub fn gather_costs(cover: &JpegImage, fis: &[u32]) -> Result<Vec<f32>, StegoErr
 }
 
 /// Work units of one cost pass, in trellis positions (progress meter).
-fn gather_work(n: usize) -> u64 {
+pub(crate) fn gather_work(n: usize) -> u64 {
     (n / 4) as u64
 }
 
-/// One lane's planned changes: `(order index within lane, ±1)`.
+/// One lane's planned changes: `(order index within lane, new value)` (the
+/// position's current value — the overlay's, else the cover's — ±1).
 pub(crate) struct LanePlan {
     changes: Vec<(u32, i16)>,
     distortion: f64,
@@ -899,7 +925,7 @@ impl Layer1Keep {
 
 /// Positions a lane computes per chunk of its trellis input
 /// ([`trellis::TrellisInput`]): ~20 KB of scratch per pass.
-const LANE_CHUNK: usize = 1 << 12;
+pub(crate) const LANE_CHUNK: usize = 1 << 12;
 
 /// Bit `i` of a bit-packed array (bit `i mod 64` of word `i / 64`).
 #[inline]
@@ -927,20 +953,20 @@ fn record_bits(words: &[AtomicU64], j0: usize, bits: &[u8]) {
     }
 }
 
-/// Where a lane reads its positions' flat indices: its slice of the order in
-/// memory ([`LaneInput::ord`]) or the order on disk ([`SpilledLane`], the
-/// memory ladder's lowest rung). Both hand the same indices to the same
-/// computations, so the plan is the same.
+/// Where a lane reads its positions: its slice of the order in memory
+/// ([`LaneInput`]), the order on disk ([`SpilledLane`], the spilled-order
+/// rung) or the positions' records on disk in lane order (the streamed
+/// encode, `stream::RecordLane`). Every source hands the same values to the
+/// same computations ([`LaneInput::at_fi`]), so the plan is the same.
 pub(crate) trait LaneSrc: Sync {
-    /// The lane's input (grid, overlay, costs, pair key).
-    fn inp(&self) -> &LaneInput<'_>;
     /// Positions in the lane.
     fn len(&self) -> usize;
-    /// The flat indices of lane positions `j0 .. j1` (`j1 − j0 ≤
-    /// LANE_CHUNK`): borrowed from the order in memory, or read into `buf`.
-    fn fis<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32];
-    /// The whole order slice when it is in memory.
-    fn direct(&self) -> Option<&[u32]>;
+    /// `f(i, value, s, a, b)` ([`LaneInput::at_fi`]) for the lane positions
+    /// `i` in `j0 .. j1` (`j1 − j0 ≤ LANE_CHUNK`), in order.
+    fn each(&self, j0: usize, j1: usize, f: impl FnMut(usize, i16, i16, f32, f32));
+    /// `(value, s, a, b)` of lane position `i`, read at increasing `i` (a
+    /// lane's changes): through `window` when on disk.
+    fn at(&self, window: &mut LaneWindow, i: usize) -> (i16, i16, f32, f32);
     /// Whether a disk read failed: the trellis ran on zeros, so its plan must
     /// not be used (`ImageTooLarge`).
     fn failed(&self) -> bool {
@@ -949,20 +975,21 @@ pub(crate) trait LaneSrc: Sync {
 }
 
 impl LaneSrc for LaneInput<'_> {
-    fn inp(&self) -> &LaneInput<'_> {
-        self
-    }
-
     fn len(&self) -> usize {
         self.ord.len()
     }
 
-    fn fis<'s>(&'s self, j0: usize, j1: usize, _buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32] {
-        &self.ord[j0..j1]
+    #[inline]
+    fn each(&self, j0: usize, j1: usize, mut f: impl FnMut(usize, i16, i16, f32, f32)) {
+        for (k, &fi) in self.ord[j0..j1].iter().enumerate() {
+            let (c, s, a, b) = self.at_fi(j0 + k, fi);
+            f(j0 + k, c, s, a, b);
+        }
     }
 
-    fn direct(&self) -> Option<&[u32]> {
-        Some(self.ord)
+    #[inline]
+    fn at(&self, _window: &mut LaneWindow, i: usize) -> (i16, i16, f32, f32) {
+        self.at_fi(i, self.ord[i])
     }
 }
 
@@ -976,22 +1003,28 @@ pub(crate) struct SpilledLane<'a> {
 }
 
 impl LaneSrc for SpilledLane<'_> {
-    fn inp(&self) -> &LaneInput<'_> {
-        &self.inp
-    }
-
     fn len(&self) -> usize {
         self.len
     }
 
-    fn fis<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut [u32; LANE_CHUNK]) -> &'s [u32] {
-        let k = j1 - j0;
-        self.spill.read(self.start + j0, &mut buf[..k]);
-        &buf[..k]
+    fn each(&self, j0: usize, j1: usize, mut f: impl FnMut(usize, i16, i16, f32, f32)) {
+        let mut fbuf = [0u32; LANE_CHUNK];
+        let fis = &mut fbuf[..j1 - j0];
+        self.spill.read(self.start + j0, fis);
+        for (k, &fi) in fis.iter().enumerate() {
+            let (c, s, a, b) = self.inp.at_fi(j0 + k, fi);
+            f(j0 + k, c, s, a, b);
+        }
     }
 
-    fn direct(&self) -> Option<&[u32]> {
-        None
+    fn at(&self, window: &mut LaneWindow, i: usize) -> (i16, i16, f32, f32) {
+        if i < window.lo || i >= window.hi {
+            let hi = (i + LANE_CHUNK).min(self.len);
+            window.fis.resize(LANE_CHUNK, 0);
+            self.spill.read(self.start + i, &mut window.fis[..hi - i]);
+            (window.lo, window.hi) = (i, hi);
+        }
+        self.inp.at_fi(i, window.fis[i - window.lo])
     }
 
     fn failed(&self) -> bool {
@@ -999,30 +1032,15 @@ impl LaneSrc for SpilledLane<'_> {
     }
 }
 
-/// Flat indices of a lane at increasing positions (its changes): the order
-/// in memory directly, the one on disk a window of [`LANE_CHUNK`] at a time.
-struct FiWindow {
-    buf: Box<[u32; LANE_CHUNK]>,
-    lo: usize,
-    hi: usize,
-}
-
-impl FiWindow {
-    fn new() -> Self {
-        Self { buf: Box::new([0; LANE_CHUNK]), lo: 0, hi: 0 }
-    }
-
-    fn get<S: LaneSrc + ?Sized>(&mut self, src: &S, i: usize) -> u32 {
-        if let Some(o) = src.direct() {
-            return o[i];
-        }
-        if i < self.lo || i >= self.hi {
-            let hi = (i + LANE_CHUNK).min(src.len());
-            let n = src.fis(i, hi, &mut self.buf).len();
-            (self.lo, self.hi) = (i, i + n);
-        }
-        self.buf[i - self.lo]
-    }
+/// A window of a lane's positions on disk, [`LANE_CHUNK`] at a time, for
+/// reads at increasing positions ([`LaneSrc::at`]): flat indices (the
+/// spilled order) or records (the streamed encode). Allocated on first use.
+#[derive(Default)]
+pub(crate) struct LaneWindow {
+    pub(crate) fis: Vec<u32>,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) lo: usize,
+    pub(crate) hi: usize,
 }
 
 /// A layer's stego bits (bit-packed) → its flips: `bits ⊕= cover`, the
@@ -1038,7 +1056,7 @@ pub(crate) fn flips_in_place(bits: &mut [u64], cover: &[AtomicU64]) {
 /// hands out into `cover` (bit-packed; the P2 flips and the lane's changes
 /// are the stego bits that differ). Lane positions read through the lane's
 /// [`LaneSrc`] (the order in memory or on disk); [`lane_layer_input`].
-pub(crate) struct LaneLayerInput<'a, S: ?Sized = LaneInput<'a>> {
+pub(crate) struct LaneLayerInput<'a, S = LaneInput<'a>> {
     src: &'a S,
     layer: LayerSource<'a>,
     cover: &'a [AtomicU64],
@@ -1058,7 +1076,7 @@ enum LayerSource<'a> {
 /// bits into `cover` (at least the layer's positions). With `keep`, layer 2
 /// keeps layer 1's input there (at least layer 1's positions, which layer 2
 /// must cover) and layer 1 reads it from there (the same values).
-pub(crate) fn lane_layer_input<'a, S: LaneSrc + ?Sized>(
+pub(crate) fn lane_layer_input<'a, S: LaneSrc>(
     src: &'a S,
     layer: u8,
     lam: f64,
@@ -1070,43 +1088,36 @@ pub(crate) fn lane_layer_input<'a, S: LaneSrc + ?Sized>(
     LaneLayerInput { src, layer, cover, keep }
 }
 
-impl<S: LaneSrc + ?Sized> trellis::TrellisInput for LaneLayerInput<'_, S> {
+impl<S: LaneSrc> trellis::TrellisInput for LaneLayerInput<'_, S> {
     fn chunk<'s>(&'s self, j0: usize, j1: usize, buf: &'s mut trellis::TrellisChunk) -> (&'s [u8], &'s [f32]) {
         let j1 = j1.min(j0 + LANE_CHUNK);
         buf.cover.clear();
         buf.costs.clear();
-        let inp = self.src.inp();
-        let mut fbuf = [0u32; LANE_CHUNK];
         match (&self.layer, self.keep) {
             (LayerSource::Two(lam), None) => {
-                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
-                    let (c, s, a, b) = inp.at_fi(j0 + k, fi);
+                self.src.each(j0, j1, |_, c, s, a, b| {
                     let (bit, cost) = layer2_of(c, s, a, b, *lam);
                     buf.cover.push(bit);
                     buf.costs.push(cost);
-                }
+                });
             }
             (LayerSource::Two(lam), Some(keep)) => {
                 let mut p1 = Vec::with_capacity(j1 - j0);
-                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
-                    let i = j0 + k;
-                    let (c, s, a, b) = inp.at_fi(i, fi);
+                self.src.each(j0, j1, |i, c, s, a, b| {
                     let (bit, cost) = layer2_of(c, s, a, b, *lam);
                     buf.cover.push(bit);
                     buf.costs.push(cost);
                     keep.b[i].store(b.to_bits(), Ordering::Relaxed);
                     p1.push(plane1(c));
-                }
+                });
                 record_bits(&keep.p1, j0, &p1);
             }
             (LayerSource::One(flip2), None) => {
-                for (k, &fi) in self.src.fis(j0, j1, &mut fbuf).iter().enumerate() {
-                    let i = j0 + k;
-                    let (c, _, _, b) = inp.at_fi(i, fi);
+                self.src.each(j0, j1, |i, c, _, _, b| {
                     let (bit, cost) = layer1_of(plane1(c), b, bit_at(flip2, i));
                     buf.cover.push(bit);
                     buf.costs.push(cost);
-                }
+                });
             }
             (LayerSource::One(flip2), Some(keep)) => {
                 for i in j0..j1 {
@@ -1125,11 +1136,10 @@ impl<S: LaneSrc + ?Sized> trellis::TrellisInput for LaneLayerInput<'_, S> {
 
 /// The lane's changes from its planned layers, bit-packed: `flip2` (P2
 /// flips, layer 2) and `flip1` (layer 1's stego bits ≠ its cover bits).
-/// Visits only the changed positions, in lane order; their flat indices
-/// through the lane's [`LaneSrc`].
-pub(crate) fn lane_plan_bits<S: LaneSrc + ?Sized>(src: &S, g: &LaneGeom, flip2: &[u64], flip1: &[u64]) -> LanePlan {
-    let inp = src.inp();
-    let mut window = FiWindow::new();
+/// Visits only the changed positions, in lane order, through the lane's
+/// [`LaneSrc`].
+pub(crate) fn lane_plan_bits<S: LaneSrc>(src: &S, g: &LaneGeom, flip2: &[u64], flip1: &[u64]) -> LanePlan {
+    let mut window = LaneWindow::default();
     let n1 = g.n1();
     let end = g.nk.min(n1.max(g.n2()));
     // The changes, reserved exactly (a grown vector holds up to twice them
@@ -1154,14 +1164,14 @@ pub(crate) fn lane_plan_bits<S: LaneSrc + ?Sized>(src: &S, g: &LaneGeom, flip2: 
             let b = any.trailing_zeros() as usize;
             any &= any - 1;
             let i = wi * 64 + b;
-            let (c, s, pa, pb) = inp.at_fi(i, window.get(src, i));
+            let (c, s, pa, pb) = src.at(&mut window, i);
             if (f2 >> b) & 1 == 1 {
                 plan.distortion += pa as f64;
-                plan.changes.push((i as u32, dir2(c, s)));
+                plan.changes.push((i as u32, c + dir2(c, s)));
                 plan.changes2 += 1;
             } else if i < n1 {
                 plan.distortion += pb as f64;
-                plan.changes.push((i as u32, -dir2(c, s)));
+                plan.changes.push((i as u32, c - dir2(c, s)));
             }
         }
     }
@@ -1174,9 +1184,6 @@ pub fn layer_code(seeds: &V31Seeds, layer: u8, g: &LaneGeom, h: usize) -> Code {
     shape.expect("the layer exists").code(seed, h)
 }
 
-/// Plan one lane: layer 2 (P2) then layer 1 (P1).
-/// `inline` / `threads`: the trellis memory schedule (no effect on the plan).
-#[allow(clippy::too_many_arguments)]
 /// Capacities of a lane's buffers, the same for every lane of a plan
 /// ([`LaneCaps::of`]): lanes differ by a few positions, and a freed buffer
 /// can serve the next lane only if that one is no larger (an allocator
@@ -1210,8 +1217,10 @@ impl LaneCaps {
     }
 }
 
+/// Plan one lane: layer 2 (P2) then layer 1 (P1).
+/// `inline` / `threads`: the trellis memory schedule (no effect on the plan).
 #[allow(clippy::too_many_arguments)]
-fn plan_lane<S: LaneSrc + ?Sized>(
+pub(crate) fn plan_lane<S: LaneSrc>(
     src: &S,
     bits: &[u8],
     lam: f64,
@@ -1321,7 +1330,8 @@ fn sample_stats_fis(
     pairs: &PairKey,
 ) -> (f64, f32, Vec<(f64, f64)>) {
     // Sample costs → (a, b) pairs exactly as the lanes form them.
-    let ab_at = |fi: u32, rho: f32| -> (f32, f32) {
+    let ab_at = |j: usize| -> (f32, f32) {
+        let (fi, rho) = (fis[j], sample_rho[j]);
         if wet.is_some_and(|w| w.get(fi)) {
             return (f32::INFINITY, f32::INFINITY);
         }
@@ -1329,12 +1339,24 @@ fn sample_stats_fis(
         let (rp, rm) = pm_costs(rho, c, si_term(si, fi as usize));
         if dir2(c, pairs.get(fi)) > 0 { (rp, rm) } else { (rm, rp) }
     };
+    sample_stats_ab(n, n_med, fis.len().min(sample_rho.len()), m, ab_at)
+}
+
+/// λ, the median cost and the λ sample's `(a, b)` pairs from the `(a, b)`
+/// cost pairs of the `count` samples of [`sample_positions`] (`ab(j)`, as
+/// the lanes form them: the first `n_med` for the median, the rest for λ)
+/// over `n` positions, for a frame of `m` bits.
+pub(crate) fn sample_stats_ab(
+    n: usize,
+    n_med: usize,
+    count: usize,
+    m: usize,
+    ab: impl Fn(usize) -> (f32, f32),
+) -> (f64, f32, Vec<(f64, f64)>) {
     let mut median_cost = 0.0;
-    let mut med: Vec<f32> = fis[..n_med]
-        .iter()
-        .zip(&sample_rho[..n_med])
-        .map(|(&fi, &rho)| {
-            let (a, b) = ab_at(fi, rho);
+    let mut med: Vec<f32> = (0..n_med.min(count))
+        .map(|j| {
+            let (a, b) = ab(j);
             a.min(b)
         })
         .filter(|c| c.is_finite())
@@ -1344,11 +1366,9 @@ fn sample_stats_fis(
         med.select_nth_unstable_by(mid, f32::total_cmp);
         median_cost = med[mid];
     }
-    let sample_ab: Vec<(f64, f64)> = fis[n_med..]
-        .iter()
-        .zip(&sample_rho[n_med..])
-        .map(|(&fi, &rho)| {
-            let (a, b) = ab_at(fi, rho);
+    let sample_ab: Vec<(f64, f64)> = (n_med.min(count)..count)
+        .map(|j| {
+            let (a, b) = ab(j);
             (a as f64, b as f64)
         })
         .collect();
@@ -1357,29 +1377,24 @@ fn sample_stats_fis(
 }
 
 /// The plan of all lanes (in lane order) as coefficient changes.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     plans: Vec<LanePlan>,
     ord: &[u32],
-    grid: &DctGrid,
-    overlay: Option<&Overlay>,
     m: usize,
     median_cost: f32,
     sample_ab: &[(f64, f64)],
     bound: bool,
 ) -> V31Plan {
-    assemble_by(plans, ord.len(), |k| ord[k], grid, overlay, m, median_cost, sample_ab, bound)
+    assemble_by(plans, ord.len(), |k| ord[k], m, median_cost, sample_ab, bound)
 }
 
 /// [`assemble`] with the order's positions from `fi_of` (called at
-/// increasing positions: a cursor over the order on disk).
-#[allow(clippy::too_many_arguments)]
-fn assemble_by(
+/// increasing positions: a cursor over the order on disk). The lanes' plans
+/// carry each change's new value ([`lane_plan_bits`]).
+pub(crate) fn assemble_by(
     plans: Vec<LanePlan>,
     n: usize,
     mut fi_of: impl FnMut(usize) -> u32,
-    grid: &DctGrid,
-    overlay: Option<&Overlay>,
     m: usize,
     median_cost: f32,
     sample_ab: &[(f64, f64)],
@@ -1398,15 +1413,40 @@ fn assemble_by(
             stats.m2 = layer_split(share(m, l, 0).len()).1;
         }
         let base = share(n, l, k).start;
-        for (i, d) in p.changes {
-            let fi = fi_of(base + i as usize);
-            changes.push((fi, value(grid, overlay, fi) + d));
+        for (i, v) in p.changes {
+            changes.push((fi_of(base + i as usize), v));
         }
         stats.changes += changes.len() - stats.changes;
         stats.changes2 += p.changes2;
         stats.distortion += p.distortion;
     }
     V31Plan { stats, changes }
+}
+
+/// Plan the lanes `ks` in batches of `batch` lanes at once (in parallel with
+/// the `parallel` feature; `plan_k(k, lanes in its batch)`), appending their
+/// plans to `plans` in lane order.
+pub(crate) fn plan_batches(
+    ks: std::ops::Range<usize>,
+    batch: usize,
+    plan_k: impl Fn(usize, usize) -> Result<LanePlan, StegoError> + Sync,
+    plans: &mut Vec<LanePlan>,
+) -> Result<(), StegoError> {
+    for b0 in ks.clone().step_by(batch.max(1)) {
+        let kb = b0..(b0 + batch.max(1)).min(ks.end);
+        let nb = kb.len();
+        #[cfg(feature = "parallel")]
+        let res: Vec<Result<LanePlan, StegoError>> = {
+            use rayon::prelude::*;
+            kb.into_par_iter().map(|k| plan_k(k, nb)).collect()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let res: Vec<Result<LanePlan, StegoError>> = kb.map(|k| plan_k(k, nb)).collect();
+        for p in res {
+            plans.push(p?);
+        }
+    }
+    Ok(())
 }
 
 /// A planned embedding: statistics and the new value of every changed
@@ -1554,33 +1594,20 @@ pub fn plan(
             }
         };
         let batch = opts.parallel_lanes.min(workers).clamp(1, ks.len());
-        for b0 in (ks.start..ks.end).step_by(batch) {
-            let kb = b0..(b0 + batch).min(ks.end);
-            let nb = kb.len();
-            #[cfg(feature = "parallel")]
-            let res: Vec<Result<LanePlan, StegoError>> = {
-                use rayon::prelude::*;
-                kb.into_par_iter().map(|k| plan_k(k, nb)).collect()
-            };
-            #[cfg(not(feature = "parallel"))]
-            let res: Vec<Result<LanePlan, StegoError>> = kb.map(|k| plan_k(k, nb)).collect();
-            for p in res {
-                plans.push(p?);
-            }
-        }
+        plan_batches(ks.clone(), batch, plan_k, &mut plans)?;
     }
     meter.finish();
     tlog("lanes", t);
     match &spill {
         Some(sp) => {
             let mut cursor = crate::stego::spill::OrderCursor::new(sp);
-            let p = assemble_by(plans, n, |k| cursor.get(k), grid, overlay, m, median_cost, &sample_ab, opts.bound);
+            let p = assemble_by(plans, n, |k| cursor.get(k), m, median_cost, &sample_ab, opts.bound);
             if sp.failed() {
                 return Err(StegoError::ImageTooLarge);
             }
             Ok(p)
         }
-        None => Ok(assemble(plans, &ord, grid, overlay, m, median_cost, &sample_ab, opts.bound)),
+        None => Ok(assemble(plans, &ord, m, median_cost, &sample_ab, opts.bound)),
     }
 }
 
@@ -1860,7 +1887,7 @@ pub fn decode_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::stego::stc::{embed, extract};
 
@@ -2280,7 +2307,7 @@ mod tests {
     }
 
     /// A synthetic textured JPEG big enough for several lanes.
-    fn synth_jpeg(w: u32, h: u32) -> Vec<u8> {
+    pub(crate) fn synth_jpeg(w: u32, h: u32) -> Vec<u8> {
         use image::codecs::jpeg::JpegEncoder;
         let mut px = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {

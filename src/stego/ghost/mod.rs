@@ -16,5 +16,6 @@ pub mod quality;
 pub mod session;
 pub mod shadow;
 pub mod side_info;
+pub(crate) mod stream;
 pub mod v31;
 pub mod v3_legacy;

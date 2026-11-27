@@ -16,7 +16,8 @@
 //               c<N>: N characters)
 //   GI_BUDGETS  none,1,64,256,1674       (MB, set_memory_budget)
 //   GI_THREADS  1,4                      (rayon pool of the encode)
-//   GI_SPILL    <dir>                    (keyed order on disk, the lowest rung forced)
+//   GI_SPILL    <dir>                    (keyed order on disk, the spilled-order rung forced)
+//   GI_STREAM   <dir>                    (the streamed encode, the lowest rung forced)
 // One line per encode: cover, mode, shadows, message, budget, threads, the
 // ladder rung the encode chose, the output's SHA-256 (or the error).
 
@@ -35,12 +36,19 @@ fn main() {
     unsafe { std::env::set_var("PHASM_DETERMINISTIC_SEED", "20261121") };
     // GI_SPILL=<dir>: every encode with its keyed order on disk (the lowest
     // memory rung forced, `PHASM_GHOST_FORCE_SPILL`), spilled to <dir>.
+    fn plenty(_: &std::path::Path) -> Option<u64> {
+        Some(u64::MAX / 2)
+    }
     if let Some(dir) = std::env::var_os("GI_SPILL") {
         // SAFETY: as above.
         unsafe { std::env::set_var("PHASM_GHOST_FORCE_SPILL", "1") };
-        fn plenty(_: &std::path::Path) -> Option<u64> {
-            Some(u64::MAX / 2)
-        }
+        phasm_core::set_spill_dir(Some(dir.into()), plenty);
+    }
+    // GI_STREAM=<dir>: every encode streamed (the lowest rung forced,
+    // `PHASM_GHOST_FORCE_STREAM`), its files in <dir>.
+    if let Some(dir) = std::env::var_os("GI_STREAM") {
+        // SAFETY: as above.
+        unsafe { std::env::set_var("PHASM_GHOST_FORCE_STREAM", "1") };
         phasm_core::set_spill_dir(Some(dir.into()), plenty);
     }
     static RUNG: AtomicU8 = AtomicU8::new(255);

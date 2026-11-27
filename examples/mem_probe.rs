@@ -25,8 +25,9 @@
 // to the old until the copy is done: Android's Scudo); MEM_PROBE_REALLOC=delta
 // counts only the size change.
 // MEM_PROBE_SAMPLE_S=<s>: the live heap and its peak every <s> seconds.
-// MEM_PROBE_SPILL_DIR=<dir>: the Ghost encoder's spill directory (the lowest
-// memory rung; PHASM_GHOST_FORCE_SPILL forces it).
+// MEM_PROBE_SPILL_DIR=<dir>: the Ghost encoder's spill directory (the two
+// lowest memory rungs; PHASM_GHOST_FORCE_SPILL / PHASM_GHOST_FORCE_STREAM
+// force them).
 // MEM_PROBE_OUT=<path> writes the encoded image (with PHASM_DETERMINISTIC_SEED
 // for byte comparisons between builds). MEM_PROBE_REPS=<n> repeats the
 // operation n times in the process (the device bench runs two encodes).
@@ -217,14 +218,23 @@ fn main() {
         LARGE_IX.store(ix, Ordering::Relaxed);
     }
     // MEM_PROBE_SPILL_DIR=<dir>: the Ghost encoder may spill its keyed order
-    // there (the lowest memory rung; free space from statvfs), as the apps
-    // set it; with PHASM_GHOST_FORCE_SPILL every encode does.
+    // there, or stream (the two lowest memory rungs; free space from
+    // statvfs), as the apps set it; with PHASM_GHOST_FORCE_SPILL /
+    // PHASM_GHOST_FORCE_STREAM every encode does.
+    // MEM_PROBE_SPILL_FREE_MB=<n>: report at most n MB free there (room for
+    // the keyed order but not for the streamed files: the spilled-order
+    // rung at a budget where the streamed one would be picked).
     if let Some(dir) = std::env::var_os("MEM_PROBE_SPILL_DIR") {
+        static CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+        if let Some(mb) = std::env::var("MEM_PROBE_SPILL_FREE_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            CAP.store(mb << 20, Ordering::Relaxed);
+        }
         fn free(dir: &std::path::Path) -> Option<u64> {
             use std::os::unix::ffi::OsStrExt;
             let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
             let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-            (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+            (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0)
+                .then(|| (s.f_bavail as u64 * s.f_frsize as u64).min(CAP.load(Ordering::Relaxed)))
         }
         phasm_core::set_spill_dir(Some(dir.into()), free);
     }
@@ -736,8 +746,18 @@ fn app_flow(file: &[u8], pass: &str, msg_file: Option<&String>) -> String {
     out += &format!("  bands max {} B, comfort {} B, shadow max {} B\n", bands.0.max_bytes, bands.0.comfort_bytes, bands.1);
 
     // 6. Deep Cover encode (ImageEngine.encodeCover -> encodeSi).
+    use std::sync::atomic::{AtomicU32, AtomicU8};
+    static RUNG: AtomicU8 = AtomicU8::new(255);
+    static PLAN_MB: AtomicU32 = AtomicU32::new(0);
+    phasm_core::memory::set_telemetry_hook(Some(Box::new(|e| {
+        if let phasm_core::memory::TelemetryEvent::EncodeStarted { ladder_rung, predicted_peak_mb, .. } = e {
+            RUNG.store(*ladder_rung, Ordering::Relaxed);
+            PLAN_MB.store(*predicted_peak_mb, Ordering::Relaxed);
+        }
+    })));
     begin();
     let live_before = CUR.load(Ordering::Relaxed);
+    let (t_enc, cpu_enc) = (std::time::Instant::now(), cpu_seconds().0);
     let stego = {
         let copy = heap_flow.then(|| si.map(<[u8]>::to_vec)).flatten();
         let px = copy.as_deref().or(si).unwrap_or_default();
@@ -755,9 +775,16 @@ fn app_flow(file: &[u8], pass: &str, msg_file: Option<&String>) -> String {
         }
     };
     let encode_peak = peak();
+    let (wall_enc, cpu_enc) = (t_enc.elapsed().as_secs_f64(), cpu_seconds().0 - cpu_enc);
+    phasm_core::memory::set_telemetry_hook(None);
     overall = overall.max(encode_peak);
     out += &stage_line("encode", java, encode_peak, java);
     out += &relief_after("encode");
+    out += &format!(
+        "  encode: rung {}, plan's estimate {} MB, {wall_enc:.1} s, CPU {cpu_enc:.1} s\n",
+        RUNG.load(Ordering::Relaxed),
+        PLAN_MB.load(Ordering::Relaxed)
+    );
     out += &format!(
         "  encode: core's own peak {} MB = {:.2} B/px (above the {} MB live before it)\n",
         mb(encode_peak - live_before),

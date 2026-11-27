@@ -262,12 +262,42 @@ impl SideInfo {
     /// Get the rounding error at a flat index, decoded from i8 to f32.
     #[inline]
     pub fn error_at(&self, flat_idx: usize) -> f32 {
-        let v = self.rounding_errors[flat_idx];
-        if self.exact {
+        Self::error_of_code(self.rounding_errors[flat_idx], self.exact)
+    }
+
+    /// The rounding error a stored code `v` stands for ([`Self::error_at`]),
+    /// exact or approximate side information.
+    #[inline]
+    pub(crate) fn error_of_code(v: i8, exact: bool) -> f32 {
+        if exact {
             if v.unsigned_abs() == 127 { v.signum() as f32 * 0.5 } else { v as f32 / 252.0 }
         } else {
             decode_error(v)
         }
+    }
+
+    /// Whether the stored code `v` is an exact tie ([`Self::is_tie`]).
+    #[inline]
+    pub(crate) fn tie_of_code(v: i8, exact: bool) -> bool {
+        exact && v.unsigned_abs() == 127
+    }
+
+    /// The stored code at a flat index (the streamed encode keeps it on disk
+    /// with the position's other data).
+    #[inline]
+    pub(crate) fn code_at(&self, flat_idx: usize) -> i8 {
+        self.rounding_errors[flat_idx]
+    }
+
+    /// Every stored code, flat order (a copy kept on disk while the encode
+    /// does not hold the side information).
+    pub(crate) fn codes(&self) -> &[i8] {
+        &self.rounding_errors
+    }
+
+    /// Side information from its stored codes ([`Self::codes`]) and kind.
+    pub(crate) fn from_codes(rounding_errors: Vec<i8>, blocks_wide: usize, blocks_tall: usize, exact: bool) -> Self {
+        SideInfo { rounding_errors, blocks_wide, blocks_tall, exact }
     }
 
     /// Whether the errors are the cover encoder's own (see [`Self::compute_exact`]).
@@ -280,7 +310,7 @@ impl SideInfo {
     /// precover (only meaningful when [`Self::is_exact`]).
     #[inline]
     pub fn is_tie(&self, flat_idx: usize) -> bool {
-        self.exact && self.rounding_errors[flat_idx].unsigned_abs() == 127
+        Self::tie_of_code(self.rounding_errors[flat_idx], self.exact)
     }
 }
 
